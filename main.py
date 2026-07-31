@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from google import genai
+from google.genai import Client
 
 # Load Secrets from Environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -32,8 +32,8 @@ def main():
     
     roles = ", ".join(config["job_search_params"]["target_roles"])
     
-    # Initialize Gemini AI Client using current SDK
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    # Initialize Gemini AI Client
+    client = Client(api_key=GEMINI_API_KEY)
     
     summary_prompt = f"System online. Monitoring for roles: {roles}. Pipeline active and waiting for incoming data triggers."
     response = client.models.generate_content(
