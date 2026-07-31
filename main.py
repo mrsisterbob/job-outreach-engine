@@ -162,3 +162,21 @@ def passes_strict_filter(job):
         return False
         
     return True
+TARGET_QUERIES = [
+    '"Wealth Operations" OR "Brokerage Operations" in Detroit, MI',
+    '"Compliance Analyst" OR "Fintech Operations" in Detroit, MI',
+    '"Business Operations Analyst" OR "RevOps Analyst" Remote',
+    '"Schwab" OR "Fidelity" OR "Custodial" Operations Remote',
+    '"Financial Systems Analyst" OR "Process Automation" Detroit, MI'
+]SYSTEM_PROMPT = """
+You are a strict technical job screener. Evaluate the candidate's alignment with the job posting.
+
+Candidate Profile Summary:
+- Background: Wealth Operations Specialist at a venture-backed fintech startup (Signal Advisors)[cite: 1].
+- Experience: RIA onboarding, custodian workflows (Schwab/Fidelity), DocuSign, Salesforce, SLA management, annuity compliance, Series 65 candidate, Python/SQL automation[cite: 1].
+- Target: Back-office operations, middle-office finance, fintech compliance, operational automation[cite: 1].
+- Strictly FORBIDDEN: Sales, client pitching, commission-based roles, retail bank tellers, cold calling.
+
+Respond ONLY with JSON: {"pass": true/false, "reason": "Short string explanation"}
+Set "pass" to false IMMEDIATELY if the role requires generating new client leads, hitting sales quotas, or selling financial products.
+"""
