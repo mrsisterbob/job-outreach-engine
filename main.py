@@ -1,127 +1,18 @@
 import os
-import sys
 import requests
 
-# ==========================================
-# 1. ENVIRONMENT & KEYS
-# ==========================================
-API_KEY = os.getenv("RAPIDAPI_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ---------------------------------------------------------------------------
+# Environment Variables & Secrets
+# ---------------------------------------------------------------------------
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Fail fast if secrets are missing in GitHub Actions
-if not API_KEY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("❌ Error: One or more environment secrets are missing.")
-    sys.exit(1)
+JSEARCH_URL = "https://jsearch.p.rapidapi.com/search"
 
-# ==========================================
-# 2. CONFIGURATION & SEARCH TARGETS
-# ==========================================
-# OpenWeb Ninja JSearch Endpoint
-JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
-
-# Target roles across your core locations and domains
-SEARCH_QUERIES = [
-    "Finance Operations Detroit MI",
-    "Compliance Operations Detroit MI",
-    "Wealth Operations Remote",
-    "Real Estate Tokenization Compliance"
-]
-
-# ==========================================
-# 3. HELPER FUNCTIONS
-# ==========================================
-def send_telegram_alert(message: str):
-    """Pushes formatted Markdown text to your Telegram chat."""
-    telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False
-    }
-    try:
-        res = requests.post(telegram_url, json=payload, timeout=10)
-        res.raise_for_status()
-    except Exception as e:
-        print(f"Failed to send Telegram alert: {e}")
-
-def fetch_jobs(query_string: str):
-    """Queries JSearch for jobs posted within the last 24 hours."""
-    headers = {
-        "x-api-key": API_KEY,
-        "Content-Type": "application/json"
-    }
-    params = {
-        "query": query_string,
-        "page": "1",
-        "num_pages": "1",
-        "date_posted": "today"  # Pulls fresh listings only
-    }
-    
-    try:
-        response = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=15)
-        response.raise_for_status()
-        res_json = response.json()
-        
-        # Handle varying data payload wrappers (dict vs list)
-        data = res_json.get("data", [])
-        if isinstance(data, dict):
-            return data.get("jobs", [])
-        elif isinstance(data, list):
-            return data
-        return []
-        
-    except requests.exceptions.RequestException as e:
-        print(f"⚠️ API Error for query '{query_string}': {e}")
-        return []
-
-# ==========================================
-# 4. MAIN PIPELINE EXECUTION
-# ==========================================
-def main():
-    print("🚀 Starting Job Automation Engine...")
-    total_found = 0
-    
-    # Simple set to deduplicate listings across multiple search strings
-    seen_job_ids = set()
-
-    for query in SEARCH_QUERIES:
-        print(f"🔍 Searching for: '{query}'...")
-        jobs = fetch_jobs(query)
-        
-        for job in jobs:
-            job_id = job.get("job_id")
-            if not job_id or job_id in seen_job_ids:
-                continue
-            
-            seen_job_ids.add(job_id)
-            total_found += 1
-            
-            # Key JSON fields from OpenWeb Ninja
-            title = job.get("job_title", "N/A")
-            company = job.get("employer_name", "N/A")
-            location = job.get("job_city") or job.get("job_country") or "Location Not Specified"
-            apply_link = job.get("job_apply_link", "#")
-            is_remote = "Yes" if job.get("job_is_remote") else "No"
-
-            # Construct clean Telegram alert format
-            alert_text = (
-                f"🎯 *New Job Alert*\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"*Role:* {title}\n"
-                f"*Company:* {company}\n"
-                f"*Location:* {location} (Remote: {is_remote})\n\n"
-                f"🔗 [Apply Directly Here]({apply_link})"
-            )
-            
-            send_telegram_alert(alert_text)
-
-    print(f"✅ Pipeline complete. Processed {total_found} fresh listings.")
-
-if __name__ == "__main__":
-    main()
-# Absolute NO-SALES and Irrelevant Role Blocklist
+# ---------------------------------------------------------------------------
+# Filter Arrays & Target Search Queries
+# ---------------------------------------------------------------------------
 TITLE_EXCLUSIONS = [
     # Sales & Pitch Roles
     "sales", "account executive", "business development", "bdr", "sdr", 
@@ -138,12 +29,39 @@ TITLE_EXCLUSIONS = [
     "intern", "internship", "customer service representative", "call center"
 ]
 
-# High-Noise Recruiter Aggregators (Optional, filter if clogging feed)
 COMPANY_EXCLUSIONS = [
     "cybercoders", "robert half", "kforce", "jobot", "actalent", "insight global"
 ]
 
+TARGET_QUERIES = [
+    "Wealth Operations OR Brokerage Operations Detroit, MI",
+    "Compliance Analyst OR Fintech Operations Detroit, MI",
+    "Business Operations Analyst OR RevOps Analyst Remote",
+    "Schwab OR Fidelity OR Custodial Operations Remote",
+    "Financial Systems Analyst OR Process Automation Detroit, MI"
+]
+
+SYSTEM_PROMPT = """
+You are a strict technical job screener. Evaluate the candidate's alignment with the job posting.
+
+Candidate Profile Summary:
+- Background: Wealth Operations Specialist at a venture-backed fintech startup (Signal Advisors).
+- Experience: RIA onboarding, custodian workflows (Schwab/Fidelity), DocuSign, Salesforce, SLA management, annuity compliance, Series 65 candidate, Python/SQL automation.
+- Target: Back-office operations, middle-office finance, fintech compliance, operational automation.
+- Strictly FORBIDDEN: Sales, client pitching, commission-based roles, retail bank tellers, cold calling.
+
+Respond ONLY with JSON: {"pass": true/false, "reason": "Short string explanation"}
+Set "pass" to false IMMEDIATELY if the role requires generating new client leads, hitting sales quotas, or selling financial products.
+"""
+
+# ---------------------------------------------------------------------------
+# Pipeline Functions
+# ---------------------------------------------------------------------------
 def passes_strict_filter(job):
+    """
+    Evaluates job metadata against deterministic blocklists to eliminate sales,
+    retail banking, senior executive positions, and agency spam.
+    """
     title = job.get("job_title", "").lower()
     description = job.get("job_description", "").lower()
     company = job.get("employer_name", "").lower()
@@ -162,21 +80,95 @@ def passes_strict_filter(job):
         return False
         
     return True
-TARGET_QUERIES = [
-    '"Wealth Operations" OR "Brokerage Operations" in Detroit, MI',
-    '"Compliance Analyst" OR "Fintech Operations" in Detroit, MI',
-    '"Business Operations Analyst" OR "RevOps Analyst" Remote',
-    '"Schwab" OR "Fidelity" OR "Custodial" Operations Remote',
-    '"Financial Systems Analyst" OR "Process Automation" Detroit, MI'
-]SYSTEM_PROMPT = """
-You are a strict technical job screener. Evaluate the candidate's alignment with the job posting.
 
-Candidate Profile Summary:
-- Background: Wealth Operations Specialist at a venture-backed fintech startup (Signal Advisors)[cite: 1].
-- Experience: RIA onboarding, custodian workflows (Schwab/Fidelity), DocuSign, Salesforce, SLA management, annuity compliance, Series 65 candidate, Python/SQL automation[cite: 1].
-- Target: Back-office operations, middle-office finance, fintech compliance, operational automation[cite: 1].
-- Strictly FORBIDDEN: Sales, client pitching, commission-based roles, retail bank tellers, cold calling.
+def fetch_jobs(query):
+    """
+    Queries JSearch endpoint via RapidAPI.
+    """
+    headers = {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com"
+    }
+    params = {
+        "query": query,
+        "page": "1",
+        "num_pages": "1",
+        "date_posted": "3days"
+    }
+    
+    try:
+        response = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("data", [])
+    except Exception as e:
+        print(f"Error fetching jobs for query '{query}': {e}")
+        return []
 
-Respond ONLY with JSON: {"pass": true/false, "reason": "Short string explanation"}
-Set "pass" to false IMMEDIATELY if the role requires generating new client leads, hitting sales quotas, or selling financial products.
-"""
+def send_telegram_message(message):
+    """
+    Dispatches formatted job alert to Telegram chat API.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Error posting to Telegram: {e}")
+
+def format_job_payload(job):
+    """
+    Formats parsed job payload into clean Telegram Markdown.
+    """
+    title = job.get("job_title", "N/A")
+    company = job.get("employer_name", "N/A")
+    location = job.get("job_city", "") or ("Remote" if job.get("job_is_remote") else "N/A")
+    state = job.get("job_state", "")
+    full_loc = f"{location}, {state}".strip(", ")
+    apply_link = job.get("job_apply_link", "#")
+    
+    return (
+        f"🎯 *New Matched Role*\n"
+        f"• *Title:* {title}\n"
+        f"• *Company:* {company}\n"
+        f"• *Location:* {full_loc}\n"
+        f"• *Apply Direct:* [Link]({apply_link})"
+    )
+
+# ---------------------------------------------------------------------------
+# Main Execution Entrypoint
+# ---------------------------------------------------------------------------
+def main():
+    if not all([RAPIDAPI_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+        print("Error: Missing required environment variables.")
+        return
+
+    seen_job_ids = set()
+    matched_jobs_count = 0
+
+    for query in TARGET_QUERIES:
+        print(f"Searching: {query}")
+        jobs = fetch_jobs(query)
+        
+        for job in jobs:
+            job_id = job.get("job_id")
+            if job_id in seen_job_ids:
+                continue
+                
+            seen_job_ids.add(job_id)
+            
+            if passes_strict_filter(job):
+                message = format_job_payload(job)
+                send_telegram_message(message)
+                matched_jobs_count += 1
+
+    print(f"Execution finished. Dispatched {matched_jobs_count} non-sales ops roles.")
+
+if __name__ == "__main__":
+    main()
