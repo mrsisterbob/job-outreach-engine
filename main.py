@@ -1,9 +1,9 @@
 import os
 import json
 import requests
-from google.genai import Client
+import google.generativeai as genai
 
-# Load Secrets from Environment
+# Load Secrets from Environment Variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -26,22 +26,20 @@ def send_telegram_message(message):
 def main():
     print("Starting Job Outreach Engine...")
     
-    # Load configuration
+    # Load configuration parameters
     with open("config.json", "r") as f:
         config = json.load(f)
     
     roles = ", ".join(config["job_search_params"]["target_roles"])
     
-    # Initialize Gemini AI Client
-    client = Client(api_key=GEMINI_API_KEY)
+    # Configure Gemini API
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
     
     summary_prompt = f"System online. Monitoring for roles: {roles}. Pipeline active and waiting for incoming data triggers."
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=summary_prompt
-    )
+    response = model.generate_content(summary_prompt)
     
-    # Notify Telegram of successful pipeline run
+    # Send confirmation alert to Telegram
     message = f"🚀 *Job Outreach Engine Active*\n\n{response.text}"
     send_telegram_message(message)
     print("Execution complete. Telegram alert sent.")
