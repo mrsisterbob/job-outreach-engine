@@ -1,10 +1,8 @@
 import os
 import json
 import requests
-from google import genai
 
 # Load Secrets from Environment Variables
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -31,20 +29,19 @@ def main():
         config = json.load(f)
     
     roles = ", ".join(config["job_search_params"]["target_roles"])
+    locations = ", ".join(config["job_search_params"]["locations"])
     
-    # Initialize modern Google GenAI Client
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    
-    summary_prompt = f"System online. Monitoring for roles: {roles}. Pipeline active and waiting for incoming data triggers."
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=summary_prompt
+    # Static test message verifying environment and config loading
+    message = (
+        f"🚀 *Job Outreach Engine Active*\n\n"
+        f"**Pipeline Status:** Operational\n"
+        f"**Target Roles:** {roles}\n"
+        f"**Target Locations:** {locations}"
     )
     
     # Send confirmation alert to Telegram
-    message = f"🚀 *Job Outreach Engine Active*\n\n{response.text}"
-    send_telegram_message(message)
-    print("Execution complete. Telegram alert sent.")
+    res = send_telegram_message(message)
+    print("Execution complete. Telegram response:", res)
 
 if __name__ == "__main__":
     main()
