@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-import google.generativeai as genai
+from google import genai
 
 # Load Secrets from Environment
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -32,12 +32,14 @@ def main():
     
     roles = ", ".join(config["job_search_params"]["target_roles"])
     
-    # Initialize Gemini AI
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Initialize Gemini AI Client using current SDK
+    client = genai.Client(api_key=GEMINI_API_KEY)
     
     summary_prompt = f"System online. Monitoring for roles: {roles}. Pipeline active and waiting for incoming data triggers."
-    response = model.generate_content(summary_prompt)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=summary_prompt
+    )
     
     # Notify Telegram of successful pipeline run
     message = f"🚀 *Job Outreach Engine Active*\n\n{response.text}"
