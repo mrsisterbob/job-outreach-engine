@@ -1,0 +1,16 @@
+{
+  "job_search_params": {
+    "target_roles": [
+      "Financial Operations Analyst",
+      "Compliance Operations Manager",
+      "Fintech Operations Analyst",
+      "Real Estate Tokenization Specialist"
+    ],
+    "locations": [
+      "Detroit, MI",
+      "Remote"
+    ],
+    "min_match_score": 75
+  },
+  "max_results_per_run": 10
+}
