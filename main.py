@@ -121,3 +121,44 @@ def main():
 
 if __name__ == "__main__":
     main()
+# Absolute NO-SALES and Irrelevant Role Blocklist
+TITLE_EXCLUSIONS = [
+    # Sales & Pitch Roles
+    "sales", "account executive", "business development", "bdr", "sdr", 
+    "advisor", "wealth advisor", "financial planner", "client relationship manager",
+    "relationship manager", "agent", "wholesaler", "producer", "insurance agent",
+    
+    # Retail / Branch Banking
+    "teller", "branch", "personal banker", "loan officer", "mortgage", 
+    
+    # Management / Senior Out-of-Scope
+    "director", "vice president", "vp", "head of", "lead manager",
+    
+    # Low-Level / Unrelated
+    "intern", "internship", "customer service representative", "call center"
+]
+
+# High-Noise Recruiter Aggregators (Optional, filter if clogging feed)
+COMPANY_EXCLUSIONS = [
+    "cybercoders", "robert half", "kforce", "jobot", "actalent", "insight global"
+]
+
+def passes_strict_filter(job):
+    title = job.get("job_title", "").lower()
+    description = job.get("job_description", "").lower()
+    company = job.get("employer_name", "").lower()
+    
+    # 1. Reject matching excluded titles
+    if any(term in title for term in TITLE_EXCLUSIONS):
+        return False
+        
+    # 2. Reject matching excluded companies
+    if any(comp in company for comp in COMPANY_EXCLUSIONS):
+        return False
+        
+    # 3. Reject commission / quota flags in job description body
+    sales_triggers = ["quota", "cold call", "commission", "business development", "prospecting"]
+    if any(trigger in description for trigger in sales_triggers):
+        return False
+        
+    return True
