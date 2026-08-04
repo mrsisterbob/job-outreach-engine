@@ -1,4 +1,21 @@
-import dns.resolver
+# Extracted from Gemini Stage 1
+company_domain = extracted_vars.get("company_domain", "acme.com")
+hiring_manager = extracted_vars.get("hiring_manager_name", None)
+
+# Run MX-validated pattern resolution
+target_email = resolve_target_email(company_domain, hiring_manager)
+
+# Attach to payload sent to Google Apps Script / Sheet
+payload = {
+    "action": "log_job",
+    "job_id": job_id,
+    "company_name": extracted_vars["company_name"],
+    "job_title": extracted_vars["job_title"],
+    "primary_responsibility": extracted_vars["primary_responsibility"],
+    "core_tool": extracted_vars["core_tool"],
+    "key_qualification": extracted_vars["key_qualification"],
+    "target_email": target_email  # Dynamic email destination
+}import dns.resolver
 import re
 
 def resolve_target_email(company_domain, contact_name=None):
