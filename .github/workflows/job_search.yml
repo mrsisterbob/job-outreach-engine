@@ -2,8 +2,8 @@ name: Job Search Engine Workflow
 
 on:
   schedule:
-    - cron: '0 13 * * *' # Runs daily at 13:00 UTC
-  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+    - cron: '0 13 * * *'
+  workflow_dispatch:
 
 jobs:
   run-engine:
@@ -23,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-     - name: Run Job Outreach Engine
+      - name: Run Job Outreach Engine
         env:
           CRM_WEBHOOK_URL: ${{ secrets.CRM_WEBHOOK_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
