@@ -117,7 +117,7 @@ def evaluate_job_with_gemini(job):
     if not GEMINI_API_KEY:
         return True, "Gemini key not configured; skipping AI evaluation."
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = f"{SYSTEM_PROMPT}\n\nJob Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{job.get('job_description', '')[:3000]}"
         response = model.generate_content(
             prompt,
@@ -142,7 +142,7 @@ def extract_variables_with_gemini(job):
             "hiring_manager_name": None
         }
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = (
             "Extract these variables from the job posting in JSON: "
             "company_name, company_domain (e.g. acme.com), job_title, primary_responsibility, "
