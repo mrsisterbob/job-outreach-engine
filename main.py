@@ -5,7 +5,6 @@ import re
 import time
 from email.message import EmailMessage
 import dns.resolver
-import google.generativeai as genai
 import requests
 
 # Environment Variables & Secrets
@@ -21,10 +20,6 @@ CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL")
 
 # OpenWeb Ninja Direct Endpoint
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
-
-# Initialize Gemini Client
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 
 # Filter Arrays & Target Search Queries
 TITLE_EXCLUSIONS = [
@@ -113,58 +108,66 @@ def passes_strict_filter(job):
     return True
 
 def evaluate_job_with_gemini(job):
-    """AI evaluation using Gemini to confirm candidate fit."""
+    """AI evaluation using direct REST HTTP requests (bypasses SDK deprecations)."""
     if not GEMINI_API_KEY:
         return True, "Gemini key not configured; skipping AI evaluation."
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    prompt = f"{SYSTEM_PROMPT}\n\nJob Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{job.get('job_description', '')[:3000]}"
+    
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+    
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        prompt = f"{SYSTEM_PROMPT}\n\nJob Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{job.get('job_description', '')[:3000]}"
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
-        )
-        res_data = json.loads(response.text.strip())
-        return res_data.get("pass", False), res_data.get("reason", "No reason provided")
+        res = requests.post(url, json=payload, timeout=15)
+        if res.status_code == 200:
+            res_data = json.loads(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+            return res_data.get("pass", False), res_data.get("reason", "No reason provided")
+        print(f"Gemini Evaluation Error ({res.status_code}): {res.text}")
+        return True, "Fallback pass on API error"
     except Exception as e:
-        print(f"Gemini Evaluation Error: {e}")
-        return True, "Fallback pass on AI error"
+        print(f"Gemini Evaluation Exception: {e}")
+        return True, "Fallback pass on exception"
 
 def extract_variables_with_gemini(job):
-    """Extracts structured fields from job posting for Apps Script & MX Lookup."""
+    """Extracts structured fields using direct REST HTTP requests."""
+    default_payload = {
+        "company_name": job.get("employer_name", "N/A"),
+        "company_domain": f"{job.get('employer_name', 'company').lower().replace(' ', '')}.com",
+        "job_title": job.get("job_title", "N/A"),
+        "primary_responsibility": "Operations Management",
+        "core_tool": "Python/SQL",
+        "key_qualification": "Workflow Optimization",
+        "hiring_manager_name": None
+    }
+    
     if not GEMINI_API_KEY:
-        return {
-            "company_name": job.get("employer_name", "N/A"),
-            "company_domain": f"{job.get('employer_name', 'company').lower().replace(' ', '')}.com",
-            "job_title": job.get("job_title", "N/A"),
-            "primary_responsibility": "Operations Management",
-            "core_tool": "Python/SQL",
-            "key_qualification": "Workflow Optimization",
-            "hiring_manager_name": None
-        }
+        return default_payload
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    prompt = (
+        "Extract these variables from the job posting in JSON: "
+        "company_name, company_domain (e.g. acme.com), job_title, primary_responsibility, "
+        "core_tool, key_qualification, hiring_manager_name (return null if not found).\n\n"
+        f"Employer: {job.get('employer_name')}\nTitle: {job.get('job_title')}\nDescription:\n{job.get('job_description', '')[:2500]}"
+    )
+    
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        prompt = (
-            "Extract these variables from the job posting in JSON: "
-            "company_name, company_domain (e.g. acme.com), job_title, primary_responsibility, "
-            "core_tool, key_qualification, hiring_manager_name (return null if not found).\n\n"
-            f"Employer: {job.get('employer_name')}\nTitle: {job.get('job_title')}\nDescription:\n{job.get('job_description', '')[:2500]}"
-        )
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
-        )
-        return json.loads(response.text.strip())
+        res = requests.post(url, json=payload, timeout=15)
+        if res.status_code == 200:
+            return json.loads(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+        print(f"Gemini Extraction Error ({res.status_code}): {res.text}")
+        return default_payload
     except Exception as e:
-        print(f"Gemini Extraction Error: {e}")
-        return {
-            "company_name": job.get("employer_name", "N/A"),
-            "company_domain": f"{job.get('employer_name', 'company').lower().replace(' ', '')}.com",
-            "job_title": job.get("job_title", "N/A"),
-            "primary_responsibility": "Operations Management",
-            "core_tool": "Python/SQL",
-            "key_qualification": "Workflow Optimization",
-            "hiring_manager_name": None
-        }
+        print(f"Gemini Extraction Exception: {e}")
+        return default_payload
 
 def log_to_sheets_crm(payload):
     """Logs job record directly to Google Sheets via Apps Script Webhook."""
@@ -243,21 +246,17 @@ def main():
             seen_job_ids.add(job_id)
             
             if passes_strict_filter(job):
-                # Executed immediately without free-tier sleep delay
                 ai_pass, reason = evaluate_job_with_gemini(job)
                 if not ai_pass:
                     print(f"Skipped by AI: {job.get('job_title')} @ {job.get('employer_name')} - Reason: {reason}")
                     continue
                     
-                # Stage 1: Extract JSON variables via Gemini
                 extracted_vars = extract_variables_with_gemini(job)
                 
-                # Stage 2: Lead Enrichment (MX Lookup)
                 domain = extracted_vars.get("company_domain") or f"{extracted_vars.get('company_name', 'company').lower().replace(' ', '')}.com"
                 hiring_manager = extracted_vars.get("hiring_manager_name")
                 target_email = resolve_target_email(domain, hiring_manager)
                 
-                # Stage 3: Send Payload to Apps Script / Google Sheets
                 payload = {
                     "action": "log_job",
                     "job_id": job_id,
@@ -270,7 +269,6 @@ def main():
                 }
                 log_to_sheets_crm(payload)
                 
-                # Stage 4: Send Telegram Alert with Approval Callback
                 apply_link = job.get("job_apply_link", "#")
                 send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
                 matched_jobs_count += 1
