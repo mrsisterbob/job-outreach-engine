@@ -11,7 +11,9 @@ import requests
 # ---------------------------------------------------------------------------
 # Environment Variables & Secrets
 # ---------------------------------------------------------------------------
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+# Fallback logic to accept either OPENWEBNINJA_KEY or RAPIDAPI_KEY
+API_KEY = os.environ.get("OPENWEBNINJA_KEY") or os.environ.get("RAPIDAPI_KEY")
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -21,7 +23,8 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL")
 
-JSEARCH_URL = "https://jsearch.p.rapidapi.com/search"
+# OpenWeb Ninja Native Direct Endpoint
+JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 
 # Initialize Gemini Client
 if GEMINI_API_KEY:
@@ -195,10 +198,9 @@ def log_to_sheets_crm(payload):
 
 
 def fetch_jobs(query):
-    """Retrieves listings from JSearch API."""
+    """Retrieves listings directly from OpenWeb Ninja JSearch API."""
     headers = {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "jsearch.p.rapidapi.com"
+        "x-api-key": API_KEY
     }
     params = {
         "query": query,
@@ -253,7 +255,7 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
 # Main Execution Entrypoint
 # ---------------------------------------------------------------------------
 def main():
-    if not all([RAPIDAPI_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CRM_WEBHOOK_URL]):
+    if not all([API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CRM_WEBHOOK_URL]):
         print("Error: Missing required basic environment variables.")
         return
 
