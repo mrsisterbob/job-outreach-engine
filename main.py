@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import time
 from email.message import EmailMessage
 
 import dns.resolver
@@ -11,9 +12,8 @@ import requests
 # ---------------------------------------------------------------------------
 # Environment Variables & Secrets
 # ---------------------------------------------------------------------------
-# Fallback logic to accept either OPENWEBNINJA_KEY or RAPIDAPI_KEY
+# Accepts either OPENWEBNINJA_KEY or RAPIDAPI_KEY from environment
 API_KEY = os.environ.get("OPENWEBNINJA_KEY") or os.environ.get("RAPIDAPI_KEY")
-
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -23,7 +23,7 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL")
 
-# OpenWeb Ninja Native Direct Endpoint
+# OpenWeb Ninja Direct Endpoint
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 
 # Initialize Gemini Client
@@ -209,7 +209,8 @@ def fetch_jobs(query):
         "date_posted": "3days"
     }
     try:
-        response = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=10)
+        # Increased timeout to 20 seconds to prevent read timeouts
+        response = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=20)
         response.raise_for_status()
         return response.json().get("data", [])
     except Exception as e:
@@ -274,12 +275,15 @@ def main():
             seen_job_ids.add(job_id)
 
             if passes_strict_filter(job):
+                # Pause 12 seconds to respect Gemini free-tier rate limits (5 RPM)
+                time.sleep(12)
                 ai_pass, reason = evaluate_job_with_gemini(job)
                 if not ai_pass:
                     print(f"Skipped by AI: {job.get('job_title')} @ {job.get('employer_name')} - Reason: {reason}")
                     continue
 
-                # Stage 1: Extract JSON variables via Gemini
+                # Stage 1: Pause & Extract JSON variables via Gemini
+                time.sleep(12)
                 extracted_vars = extract_variables_with_gemini(job)
 
                 # Stage 2: Lead Enrichment (MX Lookup)
