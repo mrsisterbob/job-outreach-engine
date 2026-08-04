@@ -1,4 +1,48 @@
-import base64
+import dns.resolver
+import re
+
+def resolve_target_email(company_domain, contact_name=None):
+    """
+    1. Verifies if the domain has active MX records.
+    2. Generates probabilistic corporate email patterns.
+    3. Falls back to deterministic department aliases if no person is named.
+    """
+    # Clean domain input
+    domain = company_domain.lower().replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
+    
+    # Check for valid MX records via DNS
+    try:
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        if not mx_records:
+            return f"careers@{domain}" # Fallback if DNS query fails
+    except Exception:
+        # Domain has no valid mail server
+        return f"contact@{domain}"
+
+    # If no contact name was extracted by Gemini, use target roles
+    if not contact_name or contact_name.lower() in ["unknown", "n/a", "none"]:
+        return f"talent@{domain}"
+
+    # Clean name input
+    name_parts = re.sub(r'[^a-zA-Z\s]', '', contact_name).lower().split()
+    if len(name_parts) < 2:
+        first = name_parts[0] if name_parts else "recruiting"
+        return f"{first}@{domain}"
+    
+    first, last = name_parts[0], name_parts[-1]
+
+    # Standard corporate pattern order:
+    # 1. first.last@domain.com (Most common corporate format)
+    # 2. first@domain.com
+    # 3. f.last@domain.com
+    patterns = [
+        f"{first}.{last}@{domain}",
+        f"{first}@{domain}",
+        f"{first[0]}{last}@{domain}"
+    ]
+
+    # Return top statistical pattern (since MX is validated)
+    return patterns[0]import base64
 import json
 import os
 from email.message import EmailMessage
