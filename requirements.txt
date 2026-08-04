@@ -2,3 +2,4 @@ requests>=2.31.0
 google-generativeai
 google-api-python-client
 google-auth
+pip install dnspython
