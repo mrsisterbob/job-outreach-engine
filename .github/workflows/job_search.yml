@@ -2,8 +2,8 @@ name: Job Search Engine Workflow
 
 on:
   schedule:
-    - cron: '0 13 * * *' # Runs daily
-  workflow_dispatch: # Allows manual trigger
+    - cron: '0 13 * * *' # Runs daily at 13:00 UTC
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 
 jobs:
   run-engine:
@@ -33,5 +33,4 @@ jobs:
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
-        run: |
-          python main.py
+        run: python main.py
