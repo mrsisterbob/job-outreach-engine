@@ -3,7 +3,6 @@ name: Job Search Engine Workflow
 on:
   workflow_dispatch:
   schedule:
-    # Runs every 6 hours automatically
     - cron: '0 */6 * * *'
 
 jobs:
@@ -32,8 +31,8 @@ jobs:
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          OPENWEBNINJA_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          OPENWEBNINJA_KEY: ${{ secrets.OPENWEBNINJA_KEY }}
+          RAPIDAPI_KEY: ${{ secrets.OPENWEBNINJA_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
