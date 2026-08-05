@@ -58,16 +58,15 @@ def call_gemini_api(prompt, system_prompt=None):
     """Executes direct REST request against the stable auto-updating Flash-Lite endpoint."""
     if not GEMINI_API_KEY:
         return None
-    
+
     full_prompt = f"{system_prompt}\n\n{prompt}".strip() if system_prompt else prompt
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
-    
-    # Direct target to auto-updating flash-lite alias
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={GEMINI_API_KEY}"
-    
+
     try:
         res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
@@ -75,7 +74,7 @@ def call_gemini_api(prompt, system_prompt=None):
         print(f"Gemini API Error ({res.status_code}): {res.text}")
     except Exception as e:
         print(f"Gemini API Exception: {e}")
-        
+
     return None
 
 # Lead Enrichment & MX Lookup
@@ -134,7 +133,7 @@ def evaluate_job_with_gemini(job):
 
     prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{job.get('job_description', '')[:3000]}"
     raw_text = call_gemini_api(prompt, SYSTEM_PROMPT)
-    
+
     if raw_text:
         try:
             res_data = json.loads(raw_text.strip())
@@ -142,7 +141,7 @@ def evaluate_job_with_gemini(job):
         except Exception as e:
             print(f"Gemini Evaluation JSON Parsing Error: {e}")
             return True, "Fallback pass on AI error"
-            
+
     return True, "Fallback pass on API failure"
 
 def extract_variables_with_gemini(job):
@@ -174,7 +173,7 @@ def extract_variables_with_gemini(job):
         except Exception as e:
             print(f"Gemini Extraction JSON Parsing Error: {e}")
             return default_payload
-            
+
     return default_payload
 
 def log_to_sheets_crm(payload):
@@ -212,13 +211,20 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
         print("Telegram tokens missing; skipping message.")
         return
 
+    # Strip characters that break Telegram Markdown formatting (prevents silent HTTP 400 errors)
+    company = str(extracted_vars.get('company_name', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
+    title = str(extracted_vars.get('job_title', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
+    tool = str(extracted_vars.get('core_tool', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
+    email = str(target_email).replace('*', '').replace('_', '')
+    link = str(apply_link)
+
     text = (
         f"🎯 *New Matched Role*\n"
-        f"🏢 *Company:* {extracted_vars.get('company_name')}\n"
-        f"💼 *Title:* {extracted_vars.get('job_title')}\n"
-        f"📧 *Target Email:* {target_email}\n"
-        f"🛠 *Tool:* {extracted_vars.get('core_tool')}\n"
-        f"🔗 *Apply Direct:* [Link]({apply_link})"
+        f"🏢 *Company:* {company}\n"
+        f"💼 *Title:* {title}\n"
+        f"📧 *Target Email:* {email}\n"
+        f"🛠 *Tool:* {tool}\n"
+        f"🔗 *Apply Direct:* [Link]({link})"
     )
 
     payload = {
@@ -235,7 +241,11 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            print(f"Successfully posted job {job_id} to Telegram.")
+        else:
+            print(f"Telegram API Error ({res.status_code}): {res.text}")
     except Exception as e:
         print(f"Error posting to Telegram: {e}")
 
