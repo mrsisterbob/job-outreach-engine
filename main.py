@@ -43,94 +43,39 @@ TARGET_QUERIES = [
     "Financial Systems Analyst OR Process Automation Detroit, MI"
 ]
 
-SYSTEM_PROMPT = """
-You are a strict technical job screener. Evaluate the candidate's alignment with the job posting.
-
+SYSTEM_PROMPT = """You are a strict technical job screener. Evaluate the candidate's alignment with the job posting.
 Candidate Profile Summary:
 - Background: Wealth Operations Specialist at a venture-backed fintech startup (Signal Advisors).
 - Experience: RIA onboarding, custodian workflows (Schwab/Fidelity), DocuSign, Salesforce, SLA management, annuity compliance, Series 65 candidate, Python/SQL automation.
-- Target: Back-office operations, middle-office finance, fintech compliance, operational automation.
-
+Target: Back-office operations, middle-office finance, fintech compliance, operational automation.
 Strictly FORBIDDEN: Sales, client pitching, commission-based roles, retail bank tellers, cold calling.
 
 Respond ONLY with JSON matching this structure: {"pass": true/false, "reason": "Short string explanation"}
 Set "pass" to false IMMEDIATELY if the role requires generating new client leads, hitting sales quotas, or selling financial products.
 """
 
-_CACHED_GEMINI_MODEL = None
-
-def get_active_gemini_model():
-    """Queries Google AI Studio API to retrieve an active model string for this API key."""
-    global _CACHED_GEMINI_MODEL
-    if _CACHED_GEMINI_MODEL:
-        return _CACHED_GEMINI_MODEL
-
-    if not GEMINI_API_KEY:
-        return "gemini-1.5-flash"
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
-    try:
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            models = res.json().get("models", [])
-            # Priority 1: Active Flash models supporting text generation
-            for m in models:
-                name = m.get("name", "").replace("models/", "")
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods and "flash" in name.lower():
-                    _CACHED_GEMINI_MODEL = name
-                    print(f"Auto-detected active Gemini Flash model: {name}")
-                    return name
-            # Priority 2: Any active model supporting text generation
-            for m in models:
-                name = m.get("name", "").replace("models/", "")
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods:
-                    _CACHED_GEMINI_MODEL = name
-                    print(f"Auto-detected active Gemini model: {name}")
-                    return name
-    except Exception as e:
-        print(f"Model discovery error: {e}")
-
-    _CACHED_GEMINI_MODEL = "gemini-1.5-flash"
-    return _CACHED_GEMINI_MODEL
-
 def call_gemini_api(prompt, system_prompt=None):
-    """Executes REST request against dynamically discovered Gemini endpoint with automatic failover."""
+    """Executes direct REST request against the stable auto-updating Flash-Lite endpoint."""
     if not GEMINI_API_KEY:
         return None
-
-    model_name = get_active_gemini_model()
+    
     full_prompt = f"{system_prompt}\n\n{prompt}".strip() if system_prompt else prompt
-
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
-
-    # Primary Request using auto-detected active model
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+    
+    # Direct target to auto-updating flash-lite alias
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={GEMINI_API_KEY}"
+    
     try:
         res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
             return res.json()["candidates"][0]["content"]["parts"][0]["text"]
-        print(f"Gemini API Error ({res.status_code}) on model '{model_name}': {res.text}")
+        print(f"Gemini API Error ({res.status_code}): {res.text}")
     except Exception as e:
-        print(f"Gemini API Exception on model '{model_name}': {e}")
-
-    # Fallback retry loop across known standard model endpoints
-    for fallback_model in ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]:
-        if fallback_model == model_name:
-            continue
-        fb_url = f"https://generativelanguage.googleapis.com/v1beta/models/{fallback_model}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            res = requests.post(fb_url, json=payload, timeout=15)
-            if res.status_code == 200:
-                print(f"Fallback succeeded using model '{fallback_model}'")
-                return res.json()["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            pass
-
+        print(f"Gemini API Exception: {e}")
+        
     return None
 
 # Lead Enrichment & MX Lookup
@@ -141,22 +86,21 @@ def resolve_target_email(company_domain, contact_name=None):
     3. Falls back to deterministic department aliases if no person is named.
     """
     domain = company_domain.lower().replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
-    
     try:
         mx_records = dns.resolver.resolve(domain, 'MX')
         if not mx_records:
             return f"careers@{domain}"
     except Exception:
         return f"contact@{domain}"
-        
-    if not contact_name or contact_name.lower() in ["unknown", "n/a", "none"]:
+
+    if not contact_name or str(contact_name).lower() in ["unknown", "n/a", "none"]:
         return f"talent@{domain}"
-        
+
     name_parts = re.sub(r'[^a-zA-Z\s]', '', contact_name).lower().split()
     if len(name_parts) < 2:
         first = name_parts[0] if name_parts else "recruiting"
         return f"{first}@{domain}"
-        
+
     first, last = name_parts[0], name_parts[-1]
     patterns = [
         f"{first}.{last}@{domain}",
@@ -171,23 +115,23 @@ def passes_strict_filter(job):
     title = job.get("job_title", "").lower()
     description = job.get("job_description", "").lower()
     company = job.get("employer_name", "").lower()
-    
+
     if any(term in title for term in TITLE_EXCLUSIONS):
         return False
     if any(comp in company for comp in COMPANY_EXCLUSIONS):
         return False
-        
+
     sales_triggers = ["quota", "cold call", "commission", "business development", "prospecting"]
     if any(trigger in description for trigger in sales_triggers):
         return False
-        
+
     return True
 
 def evaluate_job_with_gemini(job):
     """AI evaluation using dynamic Gemini REST call."""
     if not GEMINI_API_KEY:
         return True, "Gemini key not configured; skipping AI evaluation."
-    
+
     prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{job.get('job_description', '')[:3000]}"
     raw_text = call_gemini_api(prompt, SYSTEM_PROMPT)
     
@@ -197,11 +141,12 @@ def evaluate_job_with_gemini(job):
             return res_data.get("pass", False), res_data.get("reason", "No reason provided")
         except Exception as e:
             print(f"Gemini Evaluation JSON Parsing Error: {e}")
+            return True, "Fallback pass on AI error"
             
-    return True, "Fallback pass on AI error"
+    return True, "Fallback pass on API failure"
 
 def extract_variables_with_gemini(job):
-    """Extracts structured fields using dynamic Gemini REST call."""
+    """Extracts structured fields using Gemini REST call."""
     default_payload = {
         "company_name": job.get("employer_name", "N/A"),
         "company_domain": f"{job.get('employer_name', 'company').lower().replace(' ', '')}.com",
@@ -211,7 +156,7 @@ def extract_variables_with_gemini(job):
         "key_qualification": "Workflow Optimization",
         "hiring_manager_name": None
     }
-    
+
     if not GEMINI_API_KEY:
         return default_payload
 
@@ -221,14 +166,15 @@ def extract_variables_with_gemini(job):
         "core_tool, key_qualification, hiring_manager_name (return null if not found).\n\n"
         f"Employer: {job.get('employer_name')}\nTitle: {job.get('job_title')}\nDescription:\n{job.get('job_description', '')[:2500]}"
     )
-    
+
     raw_text = call_gemini_api(prompt)
     if raw_text:
         try:
             return json.loads(raw_text.strip())
         except Exception as e:
             print(f"Gemini Extraction JSON Parsing Error: {e}")
-
+            return default_payload
+            
     return default_payload
 
 def log_to_sheets_crm(payload):
@@ -251,6 +197,7 @@ def fetch_jobs(query):
         "num_pages": "1",
         "date_posted": "3days"
     }
+
     try:
         response = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=20)
         response.raise_for_status()
@@ -264,14 +211,16 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("Telegram tokens missing; skipping message.")
         return
+
     text = (
         f"🎯 *New Matched Role*\n"
         f"🏢 *Company:* {extracted_vars.get('company_name')}\n"
         f"💼 *Title:* {extracted_vars.get('job_title')}\n"
         f"📧 *Target Email:* {target_email}\n"
-        f"🛠️ *Tool:* {extracted_vars.get('core_tool')}\n"
+        f"🛠 *Tool:* {extracted_vars.get('core_tool')}\n"
         f"🔗 *Apply Direct:* [Link]({apply_link})"
     )
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -283,6 +232,7 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
             ]]
         }
     }
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         requests.post(url, json=payload, timeout=10)
@@ -294,10 +244,10 @@ def main():
     if not all([API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CRM_WEBHOOK_URL]):
         print("Error: Missing required basic environment variables.")
         return
-        
+
     seen_job_ids = set()
     matched_jobs_count = 0
-    
+
     for query in TARGET_QUERIES:
         print(f"Searching: {query}")
         jobs = fetch_jobs(query)
@@ -306,19 +256,18 @@ def main():
             if not job_id or job_id in seen_job_ids:
                 continue
             seen_job_ids.add(job_id)
-            
+
             if passes_strict_filter(job):
                 ai_pass, reason = evaluate_job_with_gemini(job)
                 if not ai_pass:
                     print(f"Skipped by AI: {job.get('job_title')} @ {job.get('employer_name')} - Reason: {reason}")
                     continue
-                    
+
                 extracted_vars = extract_variables_with_gemini(job)
-                
                 domain = extracted_vars.get("company_domain") or f"{extracted_vars.get('company_name', 'company').lower().replace(' ', '')}.com"
                 hiring_manager = extracted_vars.get("hiring_manager_name")
                 target_email = resolve_target_email(domain, hiring_manager)
-                
+
                 payload = {
                     "action": "log_job",
                     "job_id": job_id,
@@ -329,12 +278,12 @@ def main():
                     "key_qualification": extracted_vars.get("key_qualification", "N/A"),
                     "target_email": target_email
                 }
+
                 log_to_sheets_crm(payload)
-                
                 apply_link = job.get("job_apply_link", "#")
                 send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
                 matched_jobs_count += 1
-                
+
     print(f"Finished pipeline execution. Matched {matched_jobs_count} roles.")
 
 if __name__ == "__main__":
