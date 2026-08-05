@@ -3,11 +3,14 @@ import json
 import os
 import re
 import time
+import urllib.parse
 from email.message import EmailMessage
 import dns.resolver
 import requests
 
-# Environment Variables & Secrets
+# ===========================================================================
+# ENVIRONMENT VARIABLES & SECRETS
+# ===========================================================================
 API_KEY = os.environ.get("OPENWEBNINJA_KEY") or os.environ.get("RAPIDAPI_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -21,13 +24,14 @@ CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL")
 # OpenWeb Ninja Direct Endpoint
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 
-# Filter Arrays & Target Search Queries
+# ===========================================================================
+# FILTER ARRAYS & TARGET SEARCH QUERIES
+# ===========================================================================
 TITLE_EXCLUSIONS = [
-    "sales", "account executive", "business development", "bdr", "sdr",
-    "advisor", "wealth advisor", "financial planner", "client relationship manager",
-    "relationship manager", "agent", "wholesaler", "producer", "insurance agent",
+    "sales", "account executive", "bdr", "sdr",
+    "financial planner", "client relationship manager",
+    "agent", "wholesaler", "producer", "insurance agent",
     "teller", "branch", "personal banker", "loan officer", "mortgage",
-    "director", "vice president", "vp", "head of", "lead manager",
     "intern", "internship", "customer service representative", "call center"
 ]
 
@@ -37,9 +41,9 @@ COMPANY_EXCLUSIONS = [
 
 TARGET_QUERIES = [
     "Wealth Operations OR Brokerage Operations Detroit, MI",
-    "Compliance Analyst OR Fintech Operations Detroit, MI",
-    "Business Operations Analyst OR RevOps Analyst Remote",
-    "Schwab OR Fidelity OR Custodial Operations Remote",
+    "Compliance Analyst OR Fintech Operations Michigan",
+    "Business Operations Analyst OR RevOps Analyst Remote Michigan",
+    "Schwab OR Fidelity OR Custodial Operations Michigan",
     "Financial Systems Analyst OR Process Automation Detroit, MI"
 ]
 
@@ -54,6 +58,9 @@ Respond ONLY with JSON matching this structure: {"pass": true/false, "reason": "
 Set "pass" to false IMMEDIATELY if the role requires generating new client leads, hitting sales quotas, or selling financial products.
 """
 
+# ===========================================================================
+# HELPER FUNCTIONS
+# ===========================================================================
 def call_gemini_api(prompt, system_prompt=None):
     """Executes direct REST request against the stable auto-updating Flash-Lite endpoint."""
     if not GEMINI_API_KEY:
@@ -77,14 +84,18 @@ def call_gemini_api(prompt, system_prompt=None):
 
     return None
 
-# Lead Enrichment & MX Lookup
-def resolve_target_email(company_domain, contact_name=None):
-    """
-    1. Verifies if the domain has active MX records via DNS.
-    2. Generates probabilistic corporate email patterns.
-    3. Falls back to deterministic department aliases if no person is named.
-    """
+def build_linkedin_exec_url(company_name):
+    """Generates a pre-filtered LinkedIn search URL for target VPs and Directors."""
+    clean_company = re.sub(r'[^a-zA-Z0-9\s]', '', company_name).strip()
+    query = f'"{clean_company}" ("VP" OR "Director" OR "Head") ("Operations" OR "Compliance")'
+    encoded = urllib.parse.quote(query)
+    return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
+
+def resolve_target_email(company_domain, contact_name=None, job_title=""):
+    """Generates named email pattern or department-specific operational fallbacks."""
     domain = company_domain.lower().replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
+    
+    # Check MX Records
     try:
         mx_records = dns.resolver.resolve(domain, 'MX')
         if not mx_records:
@@ -92,35 +103,48 @@ def resolve_target_email(company_domain, contact_name=None):
     except Exception:
         return f"contact@{domain}"
 
-    if not contact_name or str(contact_name).lower() in ["unknown", "n/a", "none"]:
-        return f"talent@{domain}"
+    # Priority 1: Named Contact Pattern
+    if contact_name and str(contact_name).lower() not in ["unknown", "n/a", "none", "null"]:
+        name_parts = re.sub(r'[^a-zA-Z\s]', '', contact_name).lower().split()
+        if len(name_parts) >= 2:
+            return f"{name_parts[0]}.{name_parts[-1]}@{domain}"
+        elif len(name_parts) == 1:
+            return f"{name_parts[0]}@{domain}"
 
-    name_parts = re.sub(r'[^a-zA-Z\s]', '', contact_name).lower().split()
-    if len(name_parts) < 2:
-        first = name_parts[0] if name_parts else "recruiting"
-        return f"{first}@{domain}"
+    # Priority 2: Department-Specific Operational Routing
+    title_lower = job_title.lower()
+    if "compliance" in title_lower:
+        return f"compliance@{domain}"
+    elif any(kw in title_lower for kw in ["wealth", "custody", "brokerage", "ria"]):
+        return f"wealthops@{domain}"
+    elif any(kw in title_lower for kw in ["systems", "automation", "revops"]):
+        return f"bizops@{domain}"
 
-    first, last = name_parts[0], name_parts[-1]
-    patterns = [
-        f"{first}.{last}@{domain}",
-        f"{first}@{domain}",
-        f"{first[0]}{last}@{domain}"
-    ]
-    return patterns[0]
+    return f"operations@{domain}"
 
-# Core Integration Functions
 def passes_strict_filter(job):
-    """Deterministic filter against title, company, and description."""
+    """Deterministic filter against title, company, sales triggers, and Michigan location."""
     title = job.get("job_title", "").lower()
     description = job.get("job_description", "").lower()
     company = job.get("employer_name", "").lower()
+    state = str(job.get("job_state", "")).upper()
+    country = str(job.get("job_country", "")).upper()
+    city = str(job.get("job_city", "")).lower()
 
+    # Location Lock: Michigan residents only
+    is_mi = state == "MI" or "michigan" in city or "detroit" in city or "mi" in state
+    is_remote = job.get("job_is_remote", False) or "remote" in description[:300]
+    
+    if not (is_mi or is_remote) and country == "US":
+        return False
+
+    # Exclusions
     if any(term in title for term in TITLE_EXCLUSIONS):
         return False
     if any(comp in company for comp in COMPANY_EXCLUSIONS):
         return False
 
-    sales_triggers = ["quota", "cold call", "commission", "business development", "prospecting"]
+    sales_triggers = ["cold call", "commission", "prospecting", "lead generation quota"]
     if any(trigger in description for trigger in sales_triggers):
         return False
 
@@ -206,17 +230,17 @@ def fetch_jobs(query):
         return []
 
 def send_telegram_notification(job_id, extracted_vars, target_email, apply_link):
-    """Sends notification with inline Approve button to Telegram."""
+    """Sends notification with inline Approve button and LinkedIn Exec Search to Telegram."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("Telegram tokens missing; skipping message.")
         return
 
-    # Strip characters that break Telegram Markdown formatting
     company = str(extracted_vars.get('company_name', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
     title = str(extracted_vars.get('job_title', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
     tool = str(extracted_vars.get('core_tool', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
     email = str(target_email).replace('*', '').replace('_', '')
     link = str(apply_link)
+    linkedin_url = build_linkedin_exec_url(company)
 
     text = (
         f"🎯 *New Matched Role*\n"
@@ -224,10 +248,10 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
         f"💼 *Title:* {title}\n"
         f"📧 *Target Email:* {email}\n"
         f"🛠 *Tool:* {tool}\n"
-        f"🔗 *Apply Direct:* [Link]({link})"
+        f"🔗 *Apply Direct:* [Job Link]({link})\n"
+        f"👤 *Find Decision-Maker:* [LinkedIn Exec Search]({linkedin_url})"
     )
 
-    # Telegram callback_data MUST be <= 64 bytes
     safe_callback = f"approve_{str(job_id)[:50]}"
 
     payload = {
@@ -252,7 +276,9 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
     except Exception as e:
         print(f"Error posting to Telegram: {e}")
 
-# Main Execution Entrypoint
+# ===========================================================================
+# MAIN EXECUTION ENTRYPOINT
+# ===========================================================================
 def main():
     if not all([API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CRM_WEBHOOK_URL]):
         print("Error: Missing required basic environment variables.")
@@ -279,13 +305,15 @@ def main():
                 extracted_vars = extract_variables_with_gemini(job)
                 domain = extracted_vars.get("company_domain") or f"{extracted_vars.get('company_name', 'company').lower().replace(' ', '')}.com"
                 hiring_manager = extracted_vars.get("hiring_manager_name")
-                target_email = resolve_target_email(domain, hiring_manager)
+                job_title = extracted_vars.get("job_title", job.get("job_title", ""))
+                
+                target_email = resolve_target_email(domain, hiring_manager, job_title)
 
                 payload = {
                     "action": "log_job",
                     "job_id": job_id,
                     "company_name": extracted_vars.get("company_name", job.get("employer_name")),
-                    "job_title": extracted_vars.get("job_title", job.get("job_title")),
+                    "job_title": job_title,
                     "primary_responsibility": extracted_vars.get("primary_responsibility", "N/A"),
                     "core_tool": extracted_vars.get("core_tool", "N/A"),
                     "key_qualification": extracted_vars.get("key_qualification", "N/A"),
