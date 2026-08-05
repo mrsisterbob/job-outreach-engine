@@ -211,7 +211,7 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
         print("Telegram tokens missing; skipping message.")
         return
 
-    # Strip characters that break Telegram Markdown formatting (prevents silent HTTP 400 errors)
+    # Strip characters that break Telegram Markdown formatting
     company = str(extracted_vars.get('company_name', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
     title = str(extracted_vars.get('job_title', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
     tool = str(extracted_vars.get('core_tool', 'N/A')).replace('*', '').replace('_', '').replace('[', '').replace(']', '')
@@ -227,6 +227,9 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
         f"🔗 *Apply Direct:* [Link]({link})"
     )
 
+    # Telegram callback_data MUST be <= 64 bytes
+    safe_callback = f"approve_{str(job_id)[:50]}"
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -234,7 +237,7 @@ def send_telegram_notification(job_id, extracted_vars, target_email, apply_link)
         "disable_web_page_preview": True,
         "reply_markup": {
             "inline_keyboard": [[
-                {"text": "Approve & Draft Email", "callback_data": f"approve_{job_id}"}
+                {"text": "Approve & Draft Email", "callback_data": safe_callback}
             ]]
         }
     }
