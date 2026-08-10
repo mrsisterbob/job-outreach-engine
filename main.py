@@ -316,7 +316,7 @@ def send_telegram_card(job, score, reason, target_email):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(url, json=payload, timeout=10)
 
-def run_job_pipeline(top_n=5):
+def run_job_pipeline(top_n=3):
     """Scans ~225 raw roles, applies rate-limit delays, ranks candidates, and dispatches Top N."""
     seen_ids = set()
     candidate_pool = []
