@@ -52,12 +52,15 @@ SENIORITY_EXCLUSIONS = [
     "senior", "lead", "manager", "director", "vp", "executive", "principal", "head of"
 ]
 
+# 7 Expanded Target Queries (~210 raw jobs scanned per run)
 TARGET_QUERIES = [
     "Wealth Operations Detroit MI",
     "Fintech Operations Michigan",
     "Business Operations Analyst Detroit MI",
     "Custodial Operations Schwab Fidelity Michigan",
-    "Financial Systems Process Automation Detroit MI"
+    "Financial Systems Process Automation Detroit MI",
+    "Brokerage Operations Analyst Detroit MI",
+    "Trade Operations Specialist Michigan"
 ]
 
 SYSTEM_PROMPT = """You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience).
@@ -240,9 +243,9 @@ def process_manual_email(chat_id, company_name, found_email, job_title="Operatio
     )
 
 def fetch_jobs(query):
-    """Fetches jobs up to a 14-day window using JSearch API."""
+    """Fetches jobs pulling 2 pages per query (~30 jobs per term)."""
     headers = {"x-api-key": API_KEY}
-    params = {"query": query, "page": "1", "num_pages": "1", "date_posted": "month"}
+    params = {"query": query, "page": "1", "num_pages": "2", "date_posted": "month"}
     try:
         res = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=20)
         if res.status_code == 200:
@@ -252,7 +255,7 @@ def fetch_jobs(query):
     return []
 
 def send_telegram_card(job, score, reason, target_email):
-    """Sends a clean HTML-formatted job card with dual inline buttons."""
+    """Sends a clean HTML-formatted job card displaying score and dual inline buttons."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
 
@@ -278,7 +281,6 @@ def send_telegram_card(job, score, reason, target_email):
         f"🔍 <a href='{linkedin_url}'>3. Open People on LinkedIn</a>"
     )
 
-    # Payload format for callbacks
     safe_company = re.sub(r'[^a-zA-Z0-9\s]', '', job.get("employer_name", "Company"))[:15].strip()
     safe_email = target_email[:30]
 
@@ -300,10 +302,10 @@ def send_telegram_card(job, score, reason, target_email):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(url, json=payload, timeout=10)
 
-def run_job_pipeline():
-    """Main execution loop for scanning, filtering, scoring, logging, and alerting."""
+def run_job_pipeline(top_n=5):
+    """Scans ~210 raw roles, ranks candidate pool by score, and dispatches ONLY the top N."""
     seen_ids = set()
-    matches = 0
+    candidate_pool = []
 
     for query in TARGET_QUERIES:
         jobs = fetch_jobs(query)
@@ -316,20 +318,41 @@ def run_job_pipeline():
             if passes_strict_filter(job):
                 ai_pass, score, reason = evaluate_job_with_gemini(job)
                 if ai_pass:
-                    target_email = resolve_target_email(job.get("employer_name", "company"), job.get("job_title", ""))
-                    send_telegram_card(job, score, reason, target_email)
-                    
-                    log_to_sheets_crm({
-                        "action": "log_job",
-                        "job_id": job_id,
-                        "company": job.get("employer_name"),
-                        "title": job.get("job_title"),
-                        "target_email": target_email,
-                        "job_url": job.get("job_apply_link", "")
+                    target_email = resolve_target_email(
+                        job.get("employer_name", "company"), 
+                        job.get("job_title", "")
+                    )
+                    candidate_pool.append({
+                        "job": job,
+                        "score": score,
+                        "reason": reason,
+                        "target_email": target_email
                     })
-                    matches += 1
 
-    return matches
+    # "Best Man Wins" Leaderboard Sort (Descending)
+    candidate_pool.sort(key=lambda x: x["score"], reverse=True)
+
+    # Slice top N winners
+    top_matches = candidate_pool[:top_n]
+
+    # Dispatch and Log ONLY the winning top 5 roles
+    for item in top_matches:
+        job = item["job"]
+        score = item["score"]
+        reason = item["reason"]
+        target_email = item["target_email"]
+
+        send_telegram_card(job, score, reason, target_email)
+        log_to_sheets_crm({
+            "action": "log_job",
+            "job_id": job.get("job_id"),
+            "company": job.get("employer_name"),
+            "title": job.get("job_title"),
+            "target_email": target_email,
+            "job_url": job.get("job_apply_link", "")
+        })
+
+    return len(top_matches)
 
 # ==========================================
 # 4. FLASK SERVER & TELEGRAM WEBHOOK ROUTES
