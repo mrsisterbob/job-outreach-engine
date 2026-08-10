@@ -52,15 +52,13 @@ SENIORITY_EXCLUSIONS = [
     "senior", "lead", "manager", "director", "vp", "executive", "principal", "head of"
 ]
 
-# 7 Expanded Target Queries (~210 raw jobs scanned per run)
+# 5 Core Queries x 3 Pages = ~225 Raw Jobs Scanned
 TARGET_QUERIES = [
     "Wealth Operations Detroit MI",
     "Fintech Operations Michigan",
     "Business Operations Analyst Detroit MI",
     "Custodial Operations Schwab Fidelity Michigan",
-    "Financial Systems Process Automation Detroit MI",
-    "Brokerage Operations Analyst Detroit MI",
-    "Trade Operations Specialist Michigan"
+    "Financial Systems Process Automation Detroit MI"
 ]
 
 SYSTEM_PROMPT = """You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience).
@@ -108,7 +106,6 @@ def build_linkedin_url(company_name):
     return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
 
 def resolve_target_email(company_name, job_title=""):
-    """Generates a clean domain-based email routing fallback."""
     clean_domain = re.sub(r'[^a-zA-Z0-9]', '', company_name).lower() + ".com"
     title_lower = job_title.lower()
     
@@ -128,9 +125,15 @@ def passes_strict_filter(job):
     state = str(job.get("job_state", "")).upper()
     city = str(job.get("job_city", "")).lower()
 
-    # Geographical boundary (Metro Detroit / SE Michigan)
-    valid_cities = ["farmington", "detroit", "ann arbor", "novi", "troy", "southfield", "auburn hills", "plymouth", "royal oak"]
-    is_se_mi = state == "MI" or any(c in city for c in valid_cities)
+    # Complete SE Michigan / Metro Detroit geographical boundary
+    valid_cities = [
+        "farmington", "detroit", "ann arbor", "novi", "troy", "southfield", 
+        "auburn hills", "plymouth", "royal oak", "livonia", "dearborn", 
+        "birmingham", "bloomfield", "warren", "sterling heights", "canton", 
+        "rochester", "wixom", "madison heights"
+    ]
+    
+    is_se_mi = (state == "MI") or any(c in city for c in valid_cities)
     if not is_se_mi:
         return False
 
@@ -149,7 +152,7 @@ def passes_strict_filter(job):
     return True
 
 def evaluate_job_with_gemini(job):
-    """Stage 2: AI Scoring (0-100 scale, threshold >= 70)."""
+    """Stage 2: AI Scoring with backtick cleaning."""
     if not GEMINI_API_KEY:
         return True, 75, "Gemini key missing; fallback pass."
 
@@ -158,12 +161,13 @@ def evaluate_job_with_gemini(job):
 
     if raw_text:
         try:
-            res_data = json.loads(raw_text.strip())
+            cleaned_text = re.sub(r'```(?:json)?\s*|\s*```', '', raw_text).strip()
+            res_data = json.loads(cleaned_text)
             score = int(res_data.get("score", 0))
             reason = res_data.get("reason", "No reason provided")
             return (score >= 70), score, reason
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Gemini Parse Error: {e}")
             
     return True, 70, "Fallback pass on parse error"
 
@@ -177,10 +181,10 @@ def log_to_sheets_crm(payload):
         print(f"CRM Log Error: {e}")
 
 def create_gmail_draft(to_email, company_name, job_title):
-    """Refreshes OAuth token and injects a draft email into Gmail."""
-    if not all([GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_USER]):
-        print("Gmail OAuth credentials missing.")
-        return False
+    """Refreshes OAuth token and injects draft email with explicit error returns."""
+    missing_vars = [var for var in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(var)]
+    if missing_vars:
+        return False, f"Missing Env Vars: {', '.join(missing_vars)}"
 
     token_url = "https://oauth2.googleapis.com/token"
     token_data = {
@@ -192,10 +196,12 @@ def create_gmail_draft(to_email, company_name, job_title):
 
     try:
         token_res = requests.post(token_url, data=token_data, timeout=10)
-        access_token = token_res.json().get("access_token")
+        token_json = token_res.json()
+        access_token = token_json.get("access_token")
+        
         if not access_token:
-            print("Failed to acquire Gmail access token.")
-            return False
+            err_msg = token_json.get("error_description") or token_json.get("error") or "OAuth failed"
+            return False, f"OAuth Token Refused: {err_msg}"
 
         message = EmailMessage()
         message["To"] = to_email
@@ -220,22 +226,30 @@ def create_gmail_draft(to_email, company_name, job_title):
         }
         draft_payload = {"message": {"raw": raw_message}}
         res = requests.post(draft_url, headers=headers, json=draft_payload, timeout=10)
-        return res.status_code == 200
+        
+        if res.status_code in [200, 201]:
+            return True, "Success"
+        else:
+            return False, f"Gmail API Error {res.status_code}: {res.text[:100]}"
+            
     except Exception as e:
-        print(f"Error creating Gmail draft: {e}")
-        return False
+        return False, f"Exception: {str(e)}"
 
 def process_manual_email(chat_id, company_name, found_email, job_title="Operations Role"):
-    """Background worker for drafting Gmail and updating Google Sheets CRM."""
-    draft_success = create_gmail_draft(found_email, company_name, job_title)
+    """Background worker with diagnostic feedback to Telegram."""
+    draft_success, error_detail = create_gmail_draft(found_email, company_name, job_title)
     log_to_sheets_crm({"action": "update_email", "email": found_email})
 
-    msg_text = (
-        f"✅ <b>Draft created in Gmail</b> for <code>{found_email}</code>!\n"
-        f"📊 Updated CRM Sheet for <b>{html.escape(company_name)}</b>."
-        if draft_success else
-        f"⚠️ Updated CRM Sheet with <code>{found_email}</code>, but Gmail draft failed. Check OAuth credentials."
-    )
+    if draft_success:
+        msg_text = (
+            f"✅ <b>Draft created in Gmail</b> for <code>{found_email}</code>!\n"
+            f"📊 Updated CRM Sheet for <b>{html.escape(company_name)}</b>."
+        )
+    else:
+        msg_text = (
+            f"📊 <b>Updated CRM Sheet</b> with <code>{found_email}</code>.\n"
+            f"⚠️ <b>Gmail Draft Failed:</b> <code>{html.escape(error_detail)}</code>"
+        )
 
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -243,9 +257,9 @@ def process_manual_email(chat_id, company_name, found_email, job_title="Operatio
     )
 
 def fetch_jobs(query):
-    """Fetches jobs pulling 2 pages per query (~30 jobs per term)."""
+    """Pulls 3 pages per query (~45 jobs per search term)."""
     headers = {"x-api-key": API_KEY}
-    params = {"query": query, "page": "1", "num_pages": "2", "date_posted": "month"}
+    params = {"query": query, "page": "1", "num_pages": "3", "date_posted": "month"}
     try:
         res = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=20)
         if res.status_code == 200:
@@ -255,7 +269,7 @@ def fetch_jobs(query):
     return []
 
 def send_telegram_card(job, score, reason, target_email):
-    """Sends a clean HTML-formatted job card displaying score and dual inline buttons."""
+    """Sends clean HTML job card."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
 
@@ -303,12 +317,14 @@ def send_telegram_card(job, score, reason, target_email):
     requests.post(url, json=payload, timeout=10)
 
 def run_job_pipeline(top_n=5):
-    """Scans ~210 raw roles, ranks candidate pool by score, and dispatches ONLY the top N."""
+    """Scans ~225 raw roles, applies rate-limit delays, ranks candidates, and dispatches Top N."""
     seen_ids = set()
     candidate_pool = []
 
     for query in TARGET_QUERIES:
         jobs = fetch_jobs(query)
+        time.sleep(0.5)  # Pacing delay between API queries
+        
         for job in jobs:
             job_id = job.get("job_id")
             if not job_id or job_id in seen_ids:
@@ -317,6 +333,8 @@ def run_job_pipeline(top_n=5):
 
             if passes_strict_filter(job):
                 ai_pass, score, reason = evaluate_job_with_gemini(job)
+                time.sleep(1.2)  # Gemini Rate-Limit Pacing Delay (15 RPM cap)
+                
                 if ai_pass:
                     target_email = resolve_target_email(
                         job.get("employer_name", "company"), 
@@ -329,13 +347,13 @@ def run_job_pipeline(top_n=5):
                         "target_email": target_email
                     })
 
-    # "Best Man Wins" Leaderboard Sort (Descending)
+    # Sort candidates descending by fit score
     candidate_pool.sort(key=lambda x: x["score"], reverse=True)
 
     # Slice top N winners
     top_matches = candidate_pool[:top_n]
 
-    # Dispatch and Log ONLY the winning top 5 roles
+    # Dispatch and log winning roles
     for item in top_matches:
         job = item["job"]
         score = item["score"]
@@ -367,7 +385,7 @@ def telegram_webhook():
     if not data:
         return jsonify({"status": "ignored"}), 200
 
-    # 1. Handle Inline Button Clicks
+    # 1. Inline Button Clicks
     if "callback_query" in data:
         callback = data["callback_query"]
         callback_id = callback.get("id")
@@ -401,7 +419,7 @@ def telegram_webhook():
             )
             return jsonify({"status": "prompted"}), 200
 
-    # 2. Handle Text Commands & Direct Email Replies
+    # 2. Text Commands & Direct Email Replies
     if "message" in data:
         message = data["message"]
         text = message.get("text", "").strip()
@@ -410,7 +428,7 @@ def telegram_webhook():
         if text in ["/run", "/start"]:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": "🚀 Pipeline started in background. Scanning Metro Detroit..."}
+                json={"chat_id": chat_id, "text": "🚀 Pipeline started in background. Scanning ~225 Metro Detroit roles..."}
             )
             threading.Thread(target=run_job_pipeline).start()
             return jsonify({"status": "started"}), 200
@@ -432,9 +450,6 @@ def telegram_webhook():
 
     return jsonify({"status": "ignored"}), 200
 
-# ==========================================
-# 5. EXECUTION ENTRYPOINT (RENDER VS GITHUB)
-# ==========================================
 if __name__ == '__main__':
     if os.environ.get("GITHUB_ACTIONS") == "true":
         print("Running pipeline directly via GitHub Actions...")
