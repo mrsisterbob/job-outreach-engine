@@ -62,7 +62,9 @@ TARGET_QUERIES = [
     "Fintech Operations Michigan",
     "Business Operations Analyst Detroit MI",
     "Custodial Operations Schwab Fidelity Michigan",
-    "Financial Systems Process Automation Detroit MI"
+    "Financial Systems Process Automation Detroit MI",
+    "Operations Specialist Detroit MI",
+    "Financial Operations Analyst Remote"
 ]
 
 SYSTEM_PROMPT = """You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience).
@@ -217,7 +219,7 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
         "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {"response_mime_type": response_mime}
     }
-    # Configured specifically for Gemini 3.1 Flash Lite
+    # Explicitly using Gemini 3.1 Flash Lite REST endpoint
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_API_KEY}"
     try:
         res = requests.post(url, json=payload, timeout=15)
@@ -338,12 +340,14 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
 
     company = html.escape(str(job.get("employer_name") or "N/A"))
     title = html.escape(str(job.get("job_title") or "N/A"))
-    apply_link = job.get("job_apply_link") or "#"
+    
+    # Properly escape URLs to prevent Telegram HTML 400 parsing errors from unescaped '&'
+    apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
     job_id = str(job.get("job_id") or "0")
 
-    apollo_url = build_apollo_url(company)
-    linkedin_url = build_linkedin_url(company)
-    recruiter_url = build_linkedin_recruiter_url(company)
+    apollo_url = html.escape(build_apollo_url(company), quote=True)
+    linkedin_url = html.escape(build_linkedin_url(company), quote=True)
+    recruiter_url = html.escape(build_linkedin_recruiter_url(company), quote=True)
 
     matched_str = ", ".join(matched_skills[:4]).title() if matched_skills else "General Ops"
 
@@ -378,22 +382,32 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         ]
     }
 
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": card_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-            "reply_markup": reply_markup
-        },
-        timeout=10
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": card_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": reply_markup
+    }
+
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"Telegram Card Error ({res.status_code}): {res.text}", flush=True)
+            # Fallback to plain text if HTML entity parsing fails
+            payload["parse_mode"] = None
+            payload["text"] = f"{job.get('job_title')} @ {job.get('employer_name')}\nApply: {job.get('job_apply_link')}"
+            requests.post(url, json=payload, timeout=5)
+        else:
+            print(f"Successfully posted card for {company} to Telegram.", flush=True)
+    except Exception as e:
+        print(f"Failed to post card to Telegram: {e}", flush=True)
 
 def run_job_pipeline(chat_id=None, top_n=5):
     print(">>> Starting Job Search Pipeline...", flush=True)
     if chat_id:
-        send_status_update(chat_id, "Fetching raw listings from JSearch across 5 query clusters...")
+        send_status_update(chat_id, "Fetching raw listings from JSearch across expanded query clusters...")
 
     seen_hashes = set()
     candidate_pool = []
@@ -402,7 +416,7 @@ def run_job_pipeline(chat_id=None, top_n=5):
     raw_jobs_count = 0
 
     for query in TARGET_QUERIES:
-        for page in range(1, 3):
+        for page in range(1, 6):  # Increased pagination depth to capture ~225+ listings
             try:
                 params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
                 res = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=20)
