@@ -1,3 +1,4 @@
+```python
 import base64
 import hashlib
 import html
@@ -128,6 +129,10 @@ def generate_dedup_hash(company, title):
     clean_str = f"{clean_company}_{clean_title}"
     return hashlib.md5(clean_str.encode()).hexdigest()
 
+def generate_short_key(raw_id):
+    """Generates a short 12-char hash to stay within Telegram's 64-byte button limit."""
+    return hashlib.md5(str(raw_id or time.time()).encode()).hexdigest()[:12]
+
 def parse_posted_hours(posted_utc_str):
     if not posted_utc_str:
         return 48
@@ -219,7 +224,6 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
         "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {"response_mime_type": response_mime}
     }
-    # Explicitly using Gemini 3.1 Flash Lite REST endpoint
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_API_KEY}"
     try:
         res = requests.post(url, json=payload, timeout=15)
@@ -334,16 +338,13 @@ def passes_strict_filter(job):
 
     return True
 
-def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills):
+def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
 
     company = html.escape(str(job.get("employer_name") or "N/A"))
     title = html.escape(str(job.get("job_title") or "N/A"))
-    
-    # Properly escape URLs to prevent Telegram HTML 400 parsing errors from unescaped '&'
     apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
-    job_id = str(job.get("job_id") or "0")
 
     apollo_url = html.escape(build_apollo_url(company), quote=True)
     linkedin_url = html.escape(build_linkedin_url(company), quote=True)
@@ -366,18 +367,15 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"<a href='{recruiter_url}'>4. Open Recruiters on LinkedIn</a>"
     )
 
-    safe_company = re.sub(r'[^a-zA-Z0-9\s]', '', str(job.get("employer_name") or "Company"))[:15].strip()
-    safe_email = str(target_email)[:30]
-
     reply_markup = {
         "inline_keyboard": [
             [
-                {"text": "📌 Mark Applied", "callback_data": f"apply_tc:{job_id}"},
-                {"text": "⚡ Draft Email", "callback_data": f"approve:{safe_company}:{safe_email}"}
+                {"text": "📌 Mark Applied", "callback_data": f"apply:{short_id}"},
+                {"text": "⚡ Draft Email", "callback_data": f"approve:{short_id}"}
             ],
             [
-                {"text": "🎯 Tailor Resume", "callback_data": f"resume:{job_id}"},
-                {"text": "❌ Mark Dead", "callback_data": f"dead_tc:{job_id}"}
+                {"text": "🎯 Tailor Resume", "callback_data": f"resume:{short_id}"},
+                {"text": "❌ Mark Dead", "callback_data": f"dead:{short_id}"}
             ]
         ]
     }
@@ -395,10 +393,6 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         res = requests.post(url, json=payload, timeout=10)
         if res.status_code != 200:
             print(f"Telegram Card Error ({res.status_code}): {res.text}", flush=True)
-            # Fallback to plain text if HTML entity parsing fails
-            payload["parse_mode"] = None
-            payload["text"] = f"{job.get('job_title')} @ {job.get('employer_name')}\nApply: {job.get('job_apply_link')}"
-            requests.post(url, json=payload, timeout=5)
         else:
             print(f"Successfully posted card for {company} to Telegram.", flush=True)
     except Exception as e:
@@ -407,22 +401,45 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
 def run_job_pipeline(chat_id=None, top_n=5):
     print(">>> Starting Job Search Pipeline...", flush=True)
     if chat_id:
-        send_status_update(chat_id, "Fetching raw listings from JSearch across expanded query clusters...")
+        send_status_update(chat_id, "Fetching raw listings from JSearch across query clusters...")
 
     seen_hashes = set()
     candidate_pool = []
     today_str = datetime.now().strftime("%Y-%m-%d")
-    headers = {"x-api-key": API_KEY} if API_KEY else {}
+
+    rapidapi_key = os.environ.get("RAPIDAPI_KEY")
+    openweb_key = os.environ.get("OPENWEBNINJA_KEY")
+    
+    if rapidapi_key:
+        headers = {
+            "X-RapidAPI-Key": rapidapi_key,
+            "X-RapidAPI-Host": "jsearch.p.rapidapi.com"
+        }
+        api_url = "https://jsearch.p.rapidapi.com/search"
+    else:
+        headers = {"x-api-key": openweb_key} if openweb_key else {}
+        api_url = JSEARCH_URL
+
     raw_jobs_count = 0
 
     for query in TARGET_QUERIES:
-        for page in range(1, 6):  # Increased pagination depth to capture ~225+ listings
-            try:
-                params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
-                res = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=20)
-                if res.status_code == 200:
+        for page in range(1, 4):  # Fetch 3 pages per query cluster
+            for attempt in range(2):
+                try:
+                    params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
+                    res = requests.get(api_url, headers=headers, params=params, timeout=35)
+                    
+                    if res.status_code != 200:
+                        err_msg = f"JSearch API Error ({res.status_code}) on '{query}' page {page}: {res.text[:80]}"
+                        print(err_msg, flush=True)
+                        if chat_id and page == 1:
+                            send_status_update(chat_id, f"⚠️ {err_msg}")
+                        time.sleep(1.0)
+                        break  # Don't retry HTTP errors like 401 or 429
+
                     jobs = res.json().get("data", [])
                     raw_jobs_count += len(jobs)
+                    
                     for job in jobs:
                         company = job.get("employer_name") or ""
                         title = job.get("job_title") or ""
@@ -437,8 +454,16 @@ def run_job_pipeline(chat_id=None, top_n=5):
 
                         if passes_strict_filter(job):
                             candidate_pool.append(job)
-            except Exception as e:
-                print(f"Fetch Error: {e}", flush=True)
+
+                    time.sleep(0.5)
+                    break  # Success! Exit retry loop and move to next page
+
+                except requests.exceptions.Timeout:
+                    print(f"JSearch Timeout on '{query}' (Attempt {attempt+1}/2). Retrying...", flush=True)
+                    time.sleep(2.0)
+                except Exception as e:
+                    print(f"Fetch Exception: {e}", flush=True)
+                    break
 
     if chat_id:
         send_status_update(chat_id, f"Scanned {raw_jobs_count} total postings. {len(candidate_pool)} roles passed Stage 1 location/title filters. Running Gemini AI evaluation...")
@@ -448,8 +473,10 @@ def run_job_pipeline(chat_id=None, top_n=5):
         ai_pass, score, reason = evaluate_job_with_gemini(job)
         time.sleep(1.0)
         if ai_pass:
-            job_id = str(job.get("job_id") or time.time())
-            JOB_CACHE[job_id] = job
+            raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
+            short_id = generate_short_key(raw_id)
+            JOB_CACHE[short_id] = job
+
             target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"))
             age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
             salary_str = extract_salary(job)
@@ -460,7 +487,8 @@ def run_job_pipeline(chat_id=None, top_n=5):
                 "job": job, "score": score, "reason": reason,
                 "target_email": target_email, "age_badge": age_badge,
                 "salary_str": salary_str, "work_style": work_style,
-                "overlap_pct": overlap_pct, "matched_skills": matched_skills
+                "overlap_pct": overlap_pct, "matched_skills": matched_skills,
+                "short_id": short_id
             })
 
     evaluated_matches.sort(key=lambda x: x["score"], reverse=True)
@@ -474,7 +502,7 @@ def run_job_pipeline(chat_id=None, top_n=5):
         send_telegram_card(
             job, item["score"], item["reason"], item["target_email"],
             item["age_badge"], item["salary_str"], item["work_style"],
-            item["overlap_pct"], item["matched_skills"]
+            item["overlap_pct"], item["matched_skills"], item["short_id"]
         )
         log_to_sheets_crm({
             "action": "add_row",
@@ -531,15 +559,14 @@ def telegram_webhook():
         callback_data = callback.get("data", "")
 
         if callback_data.startswith("approve:"):
-            parts = callback_data.split(":", 2)
-            company = parts[1] if len(parts) > 1 else "Company"
-            email = parts[2] if len(parts) > 2 else "operations@company.com"
-            job_desc = ""
-            for j in JOB_CACHE.values():
-                if j.get("employer_name") == company:
-                    job_desc = j.get("job_description", "")
-                    break
-            success, err_detail = create_gmail_draft(email, company, "Operations Role", job_desc)
+            short_id = callback_data.split(":", 1)[1]
+            job = JOB_CACHE.get(short_id, {})
+            company = job.get("employer_name", "Company")
+            job_title = job.get("job_title", "Operations Role")
+            email = resolve_target_email(company, job_title)
+            job_desc = job.get("job_description", "")
+
+            success, err_detail = create_gmail_draft(email, company, job_title, job_desc)
             msg = f"<b>Draft Created</b> for <code>{html.escape(email)}</code>!" if success else f"<b>Draft Failed:</b> <code>{html.escape(err_detail)}</code>"
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -548,8 +575,8 @@ def telegram_webhook():
             return jsonify({"status": "ok"}), 200
 
         elif callback_data.startswith("resume:"):
-            job_id = callback_data.split(":", 1)[1]
-            job = JOB_CACHE.get(job_id)
+            short_id = callback_data.split(":", 1)[1]
+            job = JOB_CACHE.get(short_id)
             if job:
                 cheat_sheet = generate_resume_cheat_sheet(job.get("job_description", ""))
                 msg = f"🎯 <b>Resume Tailoring Cheat Sheet</b> ({html.escape(job.get('employer_name', ''))}):\n\n{html.escape(cheat_sheet)}"
@@ -561,11 +588,20 @@ def telegram_webhook():
             )
             return jsonify({"status": "ok"}), 200
 
-        elif callback_data.startswith("apply_tc:"):
-            log_to_sheets_crm({"action": "apply_job", "row_index": 2})
+        elif callback_data.startswith("apply:"):
+            short_id = callback_data.split(":", 1)[1]
+            job = JOB_CACHE.get(short_id, {})
+            log_to_sheets_crm({"action": "apply_job", "company": job.get("employer_name", "")})
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": "📌 Moved to <b>Tetiana Warm</b> (Follow-up set to +5 days).", "parse_mode": "HTML"}
+                json={"chat_id": chat_id, "text": f"📌 Marked applied for <b>{html.escape(job.get('employer_name', 'Role'))}</b>.", "parse_mode": "HTML"}
+            )
+            return jsonify({"status": "ok"}), 200
+
+        elif callback_data.startswith("dead:"):
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": "❌ Marked role as dead.", "parse_mode": "HTML"}
             )
             return jsonify({"status": "ok"}), 200
 
@@ -610,3 +646,5 @@ def telegram_webhook():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
+```
