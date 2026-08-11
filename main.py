@@ -1,6 +1,3 @@
-The complete, updated `main.py` script integrates SQLite persistent button caching, 8-worker parallel Gemini AI evaluations, and corrected Google Sheet CRM column mappings:
-
-```python
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -705,5 +702,3 @@ def telegram_webhook():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
-
-```
