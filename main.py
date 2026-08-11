@@ -217,8 +217,8 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
         "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {"response_mime_type": response_mime}
     }
-    # Uses stable gemini-flash-lite-latest REST endpoint
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={GEMINI_API_KEY}"
+    # Configured specifically for Gemini 3.1 Flash Lite
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_API_KEY}"
     try:
         res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
