@@ -537,7 +537,7 @@ def telegram_webhook():
         chat_id = message.get("chat", {}).get("id")
 
         if text in ["/run", "/start"]:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "Pipeline scanning ~225 Metro Detroit roles..."})
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "Horny Bitch"})
             threading.Thread(target=run_job_pipeline).start()
             return jsonify({"status": "started"}), 200
 
