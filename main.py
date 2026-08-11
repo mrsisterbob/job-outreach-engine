@@ -92,6 +92,18 @@ def send_health_alert(error_msg):
         except Exception:
             pass
 
+def send_status_update(chat_id, text):
+    """Posts real-time pipeline telemetry updates to Telegram."""
+    if TELEGRAM_BOT_TOKEN and chat_id:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": f"⚙️ <b>Pipeline Telemetry:</b> {html.escape(text)}", "parse_mode": "HTML"},
+                timeout=5
+            )
+        except Exception:
+            pass
+
 def log_to_sheets_crm(payload, max_retries=3):
     if not CRM_WEBHOOK_URL:
         return False
@@ -205,7 +217,8 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
         "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {"response_mime_type": response_mime}
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # Uses stable gemini-flash-lite-latest REST endpoint
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={GEMINI_API_KEY}"
     try:
         res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
@@ -305,7 +318,6 @@ def passes_strict_filter(job):
     is_mi = (state == "MI") or "michigan" in city or any(c in city for c in valid_cities)
     is_remote = job.get("job_is_remote", False) or "remote" in description[:300] or "work from home" in description[:300]
     
-    # Location Gate: Must be in Michigan or Remote
     if not (is_mi or is_remote):
         return False
 
@@ -378,28 +390,26 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         timeout=10
     )
 
-def run_job_pipeline(top_n=5):
+def run_job_pipeline(chat_id=None, top_n=5):
     print(">>> Starting Job Search Pipeline...", flush=True)
+    if chat_id:
+        send_status_update(chat_id, "Fetching raw listings from JSearch across 5 query clusters...")
+
     seen_hashes = set()
     candidate_pool = []
     today_str = datetime.now().strftime("%Y-%m-%d")
     headers = {"x-api-key": API_KEY} if API_KEY else {}
+    raw_jobs_count = 0
 
     for query in TARGET_QUERIES:
-        for page in range(1, 3):  # Fetch pages 1 and 2
+        for page in range(1, 3):
             try:
-                print(f">>> Querying JSearch for: {query} (Page {page})", flush=True)
                 params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
                 res = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=20)
-                if res.status_code != 200:
-                    print(f"JSearch API Error {res.status_code}: {res.text[:100]}", flush=True)
-                    continue
-
-                jobs = res.json().get("data", [])
-                time.sleep(0.5)
-
-                for job in jobs:
-                    try:
+                if res.status_code == 200:
+                    jobs = res.json().get("data", [])
+                    raw_jobs_count += len(jobs)
+                    for job in jobs:
                         company = job.get("employer_name") or ""
                         title = job.get("job_title") or ""
                         job_hash = generate_dedup_hash(company, title)
@@ -408,37 +418,42 @@ def run_job_pipeline(top_n=5):
                         seen_hashes.add(job_hash)
 
                         posted_hours = parse_posted_hours(job.get("job_posted_at_datetime_utc"))
-                        if posted_hours > 720:  # Ignore > 30 days
+                        if posted_hours > 720:
                             continue
 
                         if passes_strict_filter(job):
-                            ai_pass, score, reason = evaluate_job_with_gemini(job)
-                            time.sleep(1.0)
-                            if ai_pass:
-                                job_id = str(job.get("job_id") or time.time())
-                                JOB_CACHE[job_id] = job
-                                target_email = resolve_target_email(company, title)
-                                age_badge = get_age_badge(posted_hours)
-                                salary_str = extract_salary(job)
-                                work_style = extract_work_style(job)
-                                overlap_pct, matched_skills = calculate_keyword_overlap(job.get("job_description"))
-
-                                candidate_pool.append({
-                                    "job": job, "score": score, "reason": reason,
-                                    "target_email": target_email, "age_badge": age_badge,
-                                    "salary_str": salary_str, "work_style": work_style,
-                                    "overlap_pct": overlap_pct, "matched_skills": matched_skills,
-                                    "posted_hours": posted_hours
-                                })
-                    except Exception as inner_e:
-                        print(f"Skipped single corrupted job entry: {inner_e}", flush=True)
-                        continue
+                            candidate_pool.append(job)
             except Exception as e:
-                send_health_alert(f"Error querying JSearch for '{query}': {e}")
+                print(f"Fetch Error: {e}", flush=True)
 
-    candidate_pool.sort(key=lambda x: x["score"], reverse=True)
-    top_matches = candidate_pool[:top_n]
-    print(f">>> Found {len(top_matches)} high-fit candidate matches.", flush=True)
+    if chat_id:
+        send_status_update(chat_id, f"Scanned {raw_jobs_count} total postings. {len(candidate_pool)} roles passed Stage 1 location/title filters. Running Gemini AI evaluation...")
+
+    evaluated_matches = []
+    for idx, job in enumerate(candidate_pool):
+        ai_pass, score, reason = evaluate_job_with_gemini(job)
+        time.sleep(1.0)
+        if ai_pass:
+            job_id = str(job.get("job_id") or time.time())
+            JOB_CACHE[job_id] = job
+            target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"))
+            age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
+            salary_str = extract_salary(job)
+            work_style = extract_work_style(job)
+            overlap_pct, matched_skills = calculate_keyword_overlap(job.get("job_description"))
+
+            evaluated_matches.append({
+                "job": job, "score": score, "reason": reason,
+                "target_email": target_email, "age_badge": age_badge,
+                "salary_str": salary_str, "work_style": work_style,
+                "overlap_pct": overlap_pct, "matched_skills": matched_skills
+            })
+
+    evaluated_matches.sort(key=lambda x: x["score"], reverse=True)
+    top_matches = evaluated_matches[:top_n]
+
+    if chat_id:
+        send_status_update(chat_id, f"AI Evaluation complete. Posting top {len(top_matches)} high-fit role cards below...")
 
     for item in top_matches:
         job = item["job"]
@@ -462,12 +477,8 @@ def run_job_pipeline(top_n=5):
             ]
         })
 
-    if not top_matches and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": "⚠️ Pipeline run complete: 0 matching roles found across targeted queries."},
-            timeout=5
-        )
+    if not top_matches and chat_id:
+        send_status_update(chat_id, "Pipeline run finished: 0 roles met the Gemini score threshold (70+) for this batch.")
 
     return len(top_matches)
 
@@ -552,9 +563,9 @@ def telegram_webhook():
         if text in ["/run", "/start"]:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": "🚀 Pipeline scanning ~225 Metro Detroit & Remote roles..."}
+                json={"chat_id": chat_id, "text": "🚀 Pipeline initialized. Scanning Metro Detroit & Remote roles..."}
             )
-            threading.Thread(target=run_job_pipeline).start()
+            threading.Thread(target=run_job_pipeline, args=(chat_id,)).start()
             return jsonify({"status": "started"}), 200
 
         elif text == "/sweep":
