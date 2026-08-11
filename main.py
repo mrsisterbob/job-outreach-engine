@@ -1,9 +1,14 @@
+The complete, updated `main.py` script integrates SQLite persistent button caching, 8-worker parallel Gemini AI evaluations, and corrected Google Sheet CRM column mappings:
+
+```python
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import html
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import urllib.parse
@@ -28,6 +33,43 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
+DB_PATH = "jobs_cache.db"
+
+def init_db():
+    """Initializes a local SQLite database for persistent button callback caching."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                short_id TEXT PRIMARY KEY,
+                job_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    conn.close()
+
+init_db()
+
+def save_job_to_cache(short_id, job_dict):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO jobs (short_id, job_json) VALUES (?, ?)",
+                (short_id, json.dumps(job_dict))
+            )
+    except Exception as e:
+        print(f"DB Save Error: {e}", flush=True)
+
+def get_job_from_cache(short_id):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT job_json FROM jobs WHERE short_id = ?", (short_id,))
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row[0])
+    except Exception as e:
+        print(f"DB Read Error: {e}", flush=True)
+    return {}
 
 # ==========================================
 # 2. FILTER RULES & SKILLS
@@ -76,8 +118,6 @@ Evaluate the job description and respond ONLY with a JSON object containing:
   "score": <integer between 1 and 100 representing fit signal>,
   "reason": "<1-sentence concise explanation of why this role fits or does not fit>"
 }"""
-
-JOB_CACHE = {}
 
 # ==========================================
 # 3. HELPER FUNCTIONS
@@ -397,6 +437,31 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     except Exception as e:
         print(f"Failed to post card to Telegram: {e}", flush=True)
 
+def process_single_candidate(job):
+    """Processes a single candidate job through Gemini evaluation and SQLite caching."""
+    ai_pass, score, reason = evaluate_job_with_gemini(job)
+    if ai_pass:
+        raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
+        short_id = generate_short_key(raw_id)
+        
+        # Save to SQLite DB for persistent button interaction
+        save_job_to_cache(short_id, job)
+
+        target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"))
+        age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
+        salary_str = extract_salary(job)
+        work_style = extract_work_style(job)
+        overlap_pct, matched_skills = calculate_keyword_overlap(job.get("job_description"))
+
+        return {
+            "job": job, "score": score, "reason": reason,
+            "target_email": target_email, "age_badge": age_badge,
+            "salary_str": salary_str, "work_style": work_style,
+            "overlap_pct": overlap_pct, "matched_skills": matched_skills,
+            "short_id": short_id
+        }
+    return None
+
 def run_job_pipeline(chat_id=None, top_n=5):
     print(">>> Starting Job Search Pipeline...", flush=True)
     if chat_id:
@@ -465,31 +530,13 @@ def run_job_pipeline(chat_id=None, top_n=5):
                     break
 
     if chat_id:
-        send_status_update(chat_id, f"Scanned {raw_jobs_count} total postings. {len(candidate_pool)} roles passed Stage 1 location/title filters. Running Gemini AI evaluation...")
+        send_status_update(chat_id, f"Scanned {raw_jobs_count} total postings. {len(candidate_pool)} roles passed Stage 1 location/title filters. Running parallel Gemini AI evaluation...")
 
-    evaluated_matches = []
-    for idx, job in enumerate(candidate_pool):
-        ai_pass, score, reason = evaluate_job_with_gemini(job)
-        time.sleep(1.0)
-        if ai_pass:
-            raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
-            short_id = generate_short_key(raw_id)
-            JOB_CACHE[short_id] = job
+    # Multi-threaded parallel evaluation with 8 workers (~20s execution time)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(process_single_candidate, candidate_pool))
 
-            target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"))
-            age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
-            salary_str = extract_salary(job)
-            work_style = extract_work_style(job)
-            overlap_pct, matched_skills = calculate_keyword_overlap(job.get("job_description"))
-
-            evaluated_matches.append({
-                "job": job, "score": score, "reason": reason,
-                "target_email": target_email, "age_badge": age_badge,
-                "salary_str": salary_str, "work_style": work_style,
-                "overlap_pct": overlap_pct, "matched_skills": matched_skills,
-                "short_id": short_id
-            })
-
+    evaluated_matches = [r for r in results if r is not None]
     evaluated_matches.sort(key=lambda x: x["score"], reverse=True)
     top_matches = evaluated_matches[:top_n]
 
@@ -507,14 +554,15 @@ def run_job_pipeline(chat_id=None, top_n=5):
             "action": "add_row",
             "target_code": "TC",
             "row_data": [
-                today_str,
-                job.get("employer_name"),
-                job.get("job_title"),
-                item["target_email"],
-                item["score"],
-                "Matched",
-                job.get("job_apply_link", ""),
-                f"{item['age_badge']} | {item['work_style']} | {item['reason']}"
+                today_str,                                                         # Col A: Date Added
+                job.get("employer_name"),                                          # Col B: Company
+                job.get("job_title"),                                              # Col C: Role
+                item["target_email"],                                              # Col D: Contact Email
+                item["score"],                                                     # Col E: Fit Score
+                "Matched",                                                         # Col F: Status
+                "",                                                                # Col G: Next Followup Date
+                job.get("job_apply_link", ""),                                     # Col H: Job Link
+                f"{item['age_badge']} | {item['work_style']} | {item['reason']}"   # Col I: Notes
             ]
         })
 
@@ -554,19 +602,31 @@ def telegram_webhook():
 
     if "callback_query" in data:
         callback = data["callback_query"]
+        callback_id = callback.get("id")
         chat_id = callback["message"]["chat"]["id"]
         callback_data = callback.get("data", "")
 
+        # Acknowledge button click to Telegram immediately
+        if TELEGRAM_BOT_TOKEN and callback_id:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                    json={"callback_query_id": callback_id, "text": "Processing request..."},
+                    timeout=3
+                )
+            except Exception:
+                pass
+
         if callback_data.startswith("approve:"):
             short_id = callback_data.split(":", 1)[1]
-            job = JOB_CACHE.get(short_id, {})
+            job = get_job_from_cache(short_id)
             company = job.get("employer_name", "Company")
             job_title = job.get("job_title", "Operations Role")
             email = resolve_target_email(company, job_title)
             job_desc = job.get("job_description", "")
 
             success, err_detail = create_gmail_draft(email, company, job_title, job_desc)
-            msg = f"<b>Draft Created</b> for <code>{html.escape(email)}</code>!" if success else f"<b>Draft Failed:</b> <code>{html.escape(err_detail)}</code>"
+            msg = f"⚡ <b>Draft Created</b> for <code>{html.escape(email)}</code>!" if success else f"⚠️ <b>Draft Failed:</b> <code>{html.escape(err_detail)}</code>"
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
@@ -575,7 +635,7 @@ def telegram_webhook():
 
         elif callback_data.startswith("resume:"):
             short_id = callback_data.split(":", 1)[1]
-            job = JOB_CACHE.get(short_id)
+            job = get_job_from_cache(short_id)
             if job:
                 cheat_sheet = generate_resume_cheat_sheet(job.get("job_description", ""))
                 msg = f"🎯 <b>Resume Tailoring Cheat Sheet</b> ({html.escape(job.get('employer_name', ''))}):\n\n{html.escape(cheat_sheet)}"
@@ -589,7 +649,7 @@ def telegram_webhook():
 
         elif callback_data.startswith("apply:"):
             short_id = callback_data.split(":", 1)[1]
-            job = JOB_CACHE.get(short_id, {})
+            job = get_job_from_cache(short_id)
             log_to_sheets_crm({"action": "apply_job", "company": job.get("employer_name", "")})
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -645,3 +705,5 @@ def telegram_webhook():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
+```
