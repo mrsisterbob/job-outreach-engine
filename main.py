@@ -1,4 +1,3 @@
-```python
 import base64
 import hashlib
 import html
