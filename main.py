@@ -1,6 +1,3 @@
-Here is the updated `main.py` refactored to interface with your 10-column Google Apps Script database (`Code.gs`), implementing native Python timestamp management, anti-fluff email generation with regex sanitization, dynamic priority decay math, mobile-first command routing, and dynamic SQLite filter management.
-
-```python
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
