@@ -874,6 +874,7 @@ def health_check():
     return "CRM & Job Pipeline Engine Active", 200
 
 @app.route("/telegram", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     try:
         data = request.get_json()
