@@ -814,6 +814,26 @@ ALIAS_MAP = {
     "q": "target_queries"
 }
 
+def safe_int(val, default=0):
+    """Safely converts filter values to integers without throwing exceptions."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+def safe_list(val):
+    """Safely parses filter list values from JSON or python lists."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return []
+
 def get_filter(key_name):
     """Retrieve JSON-decoded or raw scalar value for a given filter key from SQLite."""
     conn = get_db_connection()
@@ -861,16 +881,16 @@ def update_filter_param(raw_key, raw_val_str):
         # Scalar numeric handling (e.g., pay + 5000, min = 60000)
         clean_val = raw_val_str.strip()
         if clean_val.startswith("+"):
-            new_db_val = str(int(current_val) + int(clean_val[1:].strip()))
+            new_db_val = str(safe_int(current_val) + safe_int(clean_val[1:].strip()))
         elif clean_val.startswith("-"):
-            new_db_val = str(int(current_val) - int(clean_val[1:].strip()))
+            new_db_val = str(safe_int(current_val) - safe_int(clean_val[1:].strip()))
         else:
-            new_db_val = str(int(clean_val))
+            new_db_val = str(safe_int(clean_val))
 
     conn.execute("UPDATE search_filters SET value = ? WHERE key = ?", (new_db_val, key))
     conn.commit()
     conn.close()
-    return f"✅ Updated <code>{key}</code> to: <code>{new_db_val}</code>"
+    return f"⚙️ Filter <code>{key}</code> updated to <code>{new_db_val}</code>."
 
 def format_email_block(email_text):
     """Wraps anti-fluff email drafts in monospaced blocks for single-tap mobile copying."""
@@ -879,151 +899,164 @@ def format_email_block(email_text):
 
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
-    data = request.get_json()
-    if not data:
-        return jsonify({"status": "ignored"}), 200
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"status": "ignored"}), 200
 
-    # 1. Handle Interactive Inline Keyboard Callbacks
-    if "callback_query" in data:
-        cb = data["callback_query"]
-        chat_id = cb["message"]["chat"]["id"]
-        cb_data = cb.get("data", "")
+        # 1. Handle Interactive Inline Keyboard Callbacks
+        if "callback_query" in data:
+            cb = data["callback_query"]
+            chat_id = cb["message"]["chat"]["id"]
+            cb_data = cb.get("data", "")
 
-        if cb_data.startswith("adj_pay_"):
-            delta = cb_data.replace("adj_pay_", "")
-            res = update_filter_param("min_salary", delta)
-            send_telegram_message(chat_id, f"<b>Salary Floor Updated:</b>\n{res}")
-        elif cb_data == "add_city_novi":
-            res = update_filter_param("valid_cities", "+ novi")
-            send_telegram_message(chat_id, f"<b>Location Filter Updated:</b>\n{res}")
-        elif cb_data == "reset_filters":
-            init_db()
-            send_telegram_message(chat_id, "✅ <b>Search filters reset to default parameters.</b>")
+            if cb_data.startswith("adj_pay_"):
+                delta = cb_data.replace("adj_pay_", "")
+                res = update_filter_param("min_salary", delta)
+                send_telegram_message(chat_id, res)
+            elif cb_data == "add_city_novi":
+                res = update_filter_param("valid_cities", "+ novi")
+                send_telegram_message(chat_id, res)
+            elif cb_data == "reset_filters":
+                init_db()
+                send_telegram_message(chat_id, "✅ <b>Search filters reset to default parameters.</b>")
 
-        return jsonify({"status": "ok"}), 200
+            return jsonify({"status": "ok"}), 200
 
-    if "message" not in data:
-        return jsonify({"status": "ignored"}), 200
+        if "message" not in data:
+            return jsonify({"status": "ignored"}), 200
 
-    msg = data["message"]
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "").strip()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+        msg = data["message"]
+        chat_id = msg["chat"]["id"]
+        raw_text = msg.get("text", "").strip()
+        
+        # Strip optional bot handles (e.g. /search@MyBot -> /search)
+        text = re.sub(r"@\w+bot", "", raw_text, flags=re.IGNORECASE).strip()
+        today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # 2. Pre-filled /quick Monospaced Tap-to-Copy Template
-    if text == "/quick":
-        template_msg = (
-            "Tap the code block below to copy, adjust details, and send:\n\n"
-            "<code>/quick Jane Van Der Bilt @ Acme Corp 9 Spoke at event; interested in back-office systems</code>"
-        )
-        send_telegram_message(chat_id, template_msg)
-        return jsonify({"status": "ok"}), 200
-
-    # 3. Multi-Word Name Parser using @ Delimiter Regex
-    if text.startswith("/quick "):
-        raw_cmd = text[7:].strip()
-        match = re.match(r"^([^@]+)@([^\d]+)\s+(\d{1,2})\s+(.+)$", raw_cmd)
-        if match:
-            name = match.group(1).strip()
-            company = match.group(2).strip()
-            priority = int(match.group(3).strip())
-            note = match.group(4).strip()
-            next_followup = calculate_next_followup(priority)
-            
-            payload = {
-                "action": "quick_add",
-                "first_contact": today_str,
-                "last_contact": today_str,
-                "name": name,
-                "company": company,
-                "priority": priority,
-                "next_followup": next_followup,
-                "note": f"[{today_str}] {note}"
-            }
-            requests.post(APPS_SCRIPT_URL, json=payload)
-            
-            resp = (
-                f"✅ <b>Contact Created</b>\n"
-                f"<b>Name:</b> {name}\n"
-                f"<b>Company:</b> {company}\n"
-                f"<b>Priority:</b> {priority}\n"
-                f"<b>Next Follow-up:</b> {next_followup}"
+        # 2. Pre-filled /quick Monospaced Tap-to-Copy Template
+        if text == "/quick":
+            template_msg = (
+                "Tap the code block below to copy, adjust details, and send:\n\n"
+                "<code>/quick Jane Van Der Bilt @ Acme Corp 9 Spoke at event; interested in back-office systems</code>"
             )
-            send_telegram_message(chat_id, resp)
-        else:
-            err = "❌ <b>Syntax Error.</b> Use format:\n<code>/quick <Name> @<Company> <Priority 1-10> <Note></code>"
-            send_telegram_message(chat_id, err)
-        return jsonify({"status": "ok"}), 200
-
-    # 4. Single-Message Output Priority Batcher (/p 1 - 10)
-    if re.match(r"^/p\s+(\d+)$", text):
-        priority_lvl = int(re.match(r"^/p\s+(\d+)$", text).group(1))
-        resp = requests.get(f"{APPS_SCRIPT_URL}?action=get_priority&level={priority_lvl}").json()
-        contacts = resp.get("contacts", [])
-        
-        if not contacts:
-            send_telegram_message(chat_id, f"No active contacts at Priority Tier {priority_lvl}.")
+            send_telegram_message(chat_id, template_msg)
             return jsonify({"status": "ok"}), 200
-            
-        out_msg = f"<b>PRIORITY {priority_lvl} CONTACTS ({len(contacts)} Total)</b>\n\n"
-        for idx, c in enumerate(contacts, 1):
-            out_msg += f"{idx}. <b>{c.get('name')}</b> | {c.get('company')}\n"
-            out_msg += f"Last Contact: {c.get('last_contact')} | Next: {c.get('next_followup')}\n"
-            out_msg += f"Note: <i>{c.get('latest_note', 'No notes logged')}</i>\n\n"
-            
-        send_telegram_message(chat_id, out_msg)
-        return jsonify({"status": "ok"}), 200
 
-    # 5. /search Status Card + Tap-to-Copy Bubbles + Interactive Inline Buttons
-    if text == "/search":
-        min_sal = get_filter("min_salary")
-        exp_sal = get_filter("experience_salary_floor")
-        bans = get_filter("title_exclusions")
-        cities = get_filter("valid_cities")
-        
-        card_text = (
-            "⚙️ <b>ACTIVE SEARCH FILTER CONFIGURATION</b>\n\n"
-            f"<b>Base Salary Floor (min/pay):</b> ${int(min_sal):,}\n"
-            f"<b>3+ Yr Exp Floor (exp/floor):</b> ${int(exp_sal):,}\n"
-            f"<b>Banned Titles (ban):</b> {', '.join(bans[:4])}... ({len(bans)} total)\n"
-            f"<b>Target Cities (city/loc):</b> {', '.join(cities[:4])}... ({len(cities)} total)\n\n"
-            "<b>Tap-to-Copy Quick Adjustment Bubbles:</b>\n"
-            "<code>min = 60000</code>\n"
-            "<code>ban + sales</code>\n"
-            "<code>ban - manager</code>\n"
-            "<code>city + canton</code>"
-        )
-        
-        inline_keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "⬆️ Pay +$5k", "callback_data": "adj_pay_+5000"},
-                    {"text": "⬇️ Pay -$5k", "callback_data": "adj_pay_-5000"}
-                ],
-                [
-                    {"text": "📍 Add Novi", "callback_data": "add_city_novi"},
-                    {"text": "❌ Reset Filters", "callback_data": "reset_filters"}
+        # 3. Multi-Word Name Parser using @ Delimiter Regex
+        if text.startswith("/quick "):
+            raw_cmd = text[7:].strip()
+            match = re.match(r"^([^@]+)@([^\d]+)\s+(\d{1,2})\s+(.+)$", raw_cmd)
+            if match:
+                name = match.group(1).strip()
+                company = match.group(2).strip()
+                priority = safe_int(match.group(3).strip(), 5)
+                note = match.group(4).strip()
+                next_followup = calculate_next_followup(priority)
+                
+                payload = {
+                    "action": "quick_add",
+                    "first_contact": today_str,
+                    "last_contact": today_str,
+                    "name": name,
+                    "company": company,
+                    "priority": priority,
+                    "next_followup": next_followup,
+                    "note": f"[{today_str}] {note}"
+                }
+                requests.post(APPS_SCRIPT_URL, json=payload)
+                
+                resp = (
+                    f"✅ <b>Contact Created</b>\n"
+                    f"<b>Name:</b> {name}\n"
+                    f"<b>Company:</b> {company}\n"
+                    f"<b>Priority:</b> {priority}\n"
+                    f"<b>Next Follow-up:</b> {next_followup}"
+                )
+                send_telegram_message(chat_id, resp)
+            else:
+                err = "❌ <b>Syntax Error.</b> Use format:\n<code>/quick <Name> @<Company> <Priority 1-10> <Note></code>"
+                send_telegram_message(chat_id, err)
+            return jsonify({"status": "ok"}), 200
+
+        # 4. Single-Message Output Priority Batcher (/p 1 - 10)
+        if re.match(r"^/p\s+(\d+)$", text):
+            priority_lvl = int(re.match(r"^/p\s+(\d+)$", text).group(1))
+            resp = requests.get(f"{APPS_SCRIPT_URL}?action=get_priority&level={priority_lvl}").json()
+            contacts = resp.get("contacts", [])
+            
+            if not contacts:
+                send_telegram_message(chat_id, f"No active contacts at Priority Tier {priority_lvl}.")
+                return jsonify({"status": "ok"}), 200
+                
+            out_msg = f"<b>PRIORITY {priority_lvl} CONTACTS ({len(contacts)} Total)</b>\n\n"
+            for idx, c in enumerate(contacts, 1):
+                out_msg += f"{idx}. <b>{c.get('name')}</b> | {c.get('company')}\n"
+                out_msg += f"Last Contact: {c.get('last_contact')} | Next: {c.get('next_followup')}\n"
+                out_msg += f"Note: <i>{c.get('latest_note', 'No notes logged')}</i>\n\n"
+                
+            send_telegram_message(chat_id, out_msg)
+            return jsonify({"status": "ok"}), 200
+
+        # 5. /search Status Card + Tap-to-Copy Bubbles + Interactive Inline Buttons
+        if text == "/search":
+            min_sal = safe_int(get_filter("min_salary"), 50000)
+            exp_sal = safe_int(get_filter("experience_salary_floor"), 60000)
+            bans = safe_list(get_filter("title_exclusions"))
+            cities = safe_list(get_filter("valid_cities"))
+            
+            card_text = (
+                "🔍 <b>Current Dynamic Search Filters:</b>\n\n"
+                f"<b>Min Base Salary Floor:</b> ${min_sal:,}\n"
+                f"<b>Exp Salary Floor:</b> ${exp_sal:,}\n"
+                f"<b>Banned Terms ({len(bans)}):</b> {', '.join(bans[:4]) if bans else 'None'}...\n"
+                f"<b>Radius Cities ({len(cities)}):</b> {', '.join(cities[:5]) if cities else 'None'}...\n\n"
+                "<i>Swipe-reply key = value to update live (e.g. min_salary = 60000)</i>\n\n"
+                "<b>Tap-to-Copy Quick Adjustments:</b>\n"
+                "<code>min = 60000</code>\n"
+                "<code>ban + sales</code>\n"
+                "<code>ban - manager</code>\n"
+                "<code>city + canton</code>"
+            )
+            
+            inline_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "⬆️ Pay +$5k", "callback_data": "adj_pay_+5000"},
+                        {"text": "⬇️ Pay -$5k", "callback_data": "adj_pay_-5000"}
+                    ],
+                    [
+                        {"text": "📍 Add Novi", "callback_data": "add_city_novi"},
+                        {"text": "❌ Reset Filters", "callback_data": "reset_filters"}
+                    ]
                 ]
-            ]
-        }
-        
-        send_telegram_message(chat_id, card_text, reply_markup=inline_keyboard)
-        return jsonify({"status": "ok"}), 200
-
-    # 6. Swipe-Reply Key/Alias Mutation Parser (e.g., pay = 60000, ban + sales, city - canton)
-    if any(op in text for op in ["=", "+", "-"]):
-        match = re.match(r"^([a-zA-Z_]+)\s*(=|\+|-)\s*(.+)$", text)
-        if match:
-            raw_key = match.group(1).strip()
-            op = match.group(2).strip()
-            val_str = match.group(3).strip()
+            }
             
-            val_arg = f"{op} {val_str}" if op in ["+", "-"] else val_str
-            update_res = update_filter_param(raw_key, val_arg)
-            send_telegram_message(chat_id, update_res)
+            send_telegram_message(chat_id, card_text, reply_markup=inline_keyboard)
             return jsonify({"status": "ok"}), 200
 
-    return jsonify({"status": "ignored"}), 200
+        # 6. Swipe-Reply & Parameter Mutation Parser (e.g. /search min_salary = 50000, pay = 60000, ban + sales)
+        # Strip leading "/search " if user included it in command updates
+        cmd_body = re.sub(r"^/search\s*", "", text).strip()
+        
+        if any(op in cmd_body for op in ["=", "+", "-"]):
+            match = re.match(r"^([a-zA-Z_]+)\s*(=|\+|-)\s*(.+)$", cmd_body)
+            if match:
+                raw_key = match.group(1).strip()
+                op = match.group(2).strip()
+                val_str = match.group(3).strip()
+                
+                val_arg = f"{op} {val_str}" if op in ["+", "-"] else val_str
+                update_res = update_filter_param(raw_key, val_arg)
+                send_telegram_message(chat_id, update_res)
+                return jsonify({"status": "ok"}), 200
+
+        return jsonify({"status": "ignored"}), 200
+
+    except Exception as e:
+        # Prevent 500 crashes from killing Telegram webhook listener
+        print(f"Telegram Webhook Error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 200
 
 
 if __name__ == "__main__":
