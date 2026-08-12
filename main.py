@@ -797,272 +797,234 @@ def health_check():
     return "CRM & Job Pipeline Engine Active", 200
 
 
-@app.route('/webhook', methods=['POST'])
+# ==============================================================================
+# LINES 800+ : MOBILE COMMAND ROUTER, SEARCH FILTERS & INLINE KEYBOARDS
+# ==============================================================================
+
+ALIAS_MAP = {
+    "min": "min_salary",
+    "pay": "min_salary",
+    "exp": "experience_salary_floor",
+    "floor": "experience_salary_floor",
+    "ban": "title_exclusions",
+    "bans": "title_exclusions",
+    "city": "valid_cities",
+    "loc": "valid_cities",
+    "query": "target_queries",
+    "q": "target_queries"
+}
+
+def get_filter(key_name):
+    """Retrieve JSON-decoded or raw scalar value for a given filter key from SQLite."""
+    conn = get_db_connection()
+    res = conn.execute("SELECT value FROM search_filters WHERE key = ?", (key_name,)).fetchone()
+    conn.close()
+    if not res:
+        return None
+    val = res["value"]
+    try:
+        return json.loads(val)
+    except Exception:
+        return val
+
+def update_filter_param(raw_key, raw_val_str):
+    """Parses short aliases, scalar offsets (+/-), and array mutation operators (+ / -)."""
+    key = ALIAS_MAP.get(raw_key.lower().strip(), raw_key.lower().strip())
+    conn = get_db_connection()
+    current_val = get_filter(key)
+    
+    if current_val is None:
+        conn.close()
+        return f"❌ Unknown filter parameter: <code>{raw_key}</code>"
+
+    # Array parameter handling (e.g., ban + sales, city - canton)
+    if isinstance(current_val, list):
+        clean_val = raw_val_str.strip()
+        op = None
+        if clean_val.startswith("+"):
+            op = "add"
+            clean_val = clean_val[1:].strip()
+        elif clean_val.startswith("-"):
+            op = "remove"
+            clean_val = clean_val[1:].strip()
+
+        if op == "add":
+            if clean_val.lower() not in [x.lower() for x in current_val]:
+                current_val.append(clean_val)
+        elif op == "remove":
+            current_val = [x for x in current_val if x.lower() != clean_val.lower()]
+        else:
+            current_val = [x.strip() for x in clean_val.split(",")]
+
+        new_db_val = json.dumps(current_val)
+    else:
+        # Scalar numeric handling (e.g., pay + 5000, min = 60000)
+        clean_val = raw_val_str.strip()
+        if clean_val.startswith("+"):
+            new_db_val = str(int(current_val) + int(clean_val[1:].strip()))
+        elif clean_val.startswith("-"):
+            new_db_val = str(int(current_val) - int(clean_val[1:].strip()))
+        else:
+            new_db_val = str(int(clean_val))
+
+    conn.execute("UPDATE search_filters SET value = ? WHERE key = ?", (new_db_val, key))
+    conn.commit()
+    conn.close()
+    return f"✅ Updated <code>{key}</code> to: <code>{new_db_val}</code>"
+
+def format_email_block(email_text):
+    """Wraps anti-fluff email drafts in monospaced blocks for single-tap mobile copying."""
+    sanitized = sanitize_email_text(email_text)
+    return f"<code>{sanitized}</code>"
+
+@app.route("/telegram", methods=["POST"])
 def telegram_webhook():
-    global TOTAL_MESSAGES_SENT, TOTAL_INTERVIEWS_SET
     data = request.get_json()
     if not data:
         return jsonify({"status": "ignored"}), 200
 
-    # 1. HANDLE INLINE BUTTON CLICKS
+    # 1. Handle Interactive Inline Keyboard Callbacks
     if "callback_query" in data:
-        callback = data["callback_query"]
-        callback_id = callback.get("id")
-        chat_id = callback["message"]["chat"]["id"]
-        callback_data = callback.get("data", "")
+        cb = data["callback_query"]
+        chat_id = cb["message"]["chat"]["id"]
+        cb_data = cb.get("data", "")
 
-        if TELEGRAM_BOT_TOKEN and callback_id:
-            try:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "Processing..."}, timeout=3)
-            except Exception:
-                pass
+        if cb_data.startswith("adj_pay_"):
+            delta = cb_data.replace("adj_pay_", "")
+            res = update_filter_param("min_salary", delta)
+            send_telegram_message(chat_id, f"<b>Salary Floor Updated:</b>\n{res}")
+        elif cb_data == "add_city_novi":
+            res = update_filter_param("valid_cities", "+ novi")
+            send_telegram_message(chat_id, f"<b>Location Filter Updated:</b>\n{res}")
+        elif cb_data == "reset_filters":
+            init_db()
+            send_telegram_message(chat_id, "✅ <b>Search filters reset to default parameters.</b>")
 
-        if callback_data.startswith("approve:"):
-            short_id = callback_data.split(":", 1)[1]
-            job = get_job_from_cache(short_id)
-            company = job.get("employer_name", "Company")
-            job_title = job.get("job_title", "Operations Role")
-            email = resolve_target_email(company, job_title)
-            success, err = create_gmail_draft(email, company, job_title, is_warm=False)
-            status_msg = "<b>Gmail Draft Created!</b>" if success else f"⚠️ <b>Draft Failed:</b> <code>{html.escape(err)}</code>"
-            email_body = generate_cold_email(job_title, company)
-            msg_out = f"{status_msg}\n\n<b>To:</b> <code>{email}</code>\n<b>Body:</b>\n{email_body}"
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": msg_out, "parse_mode": "HTML"})
-            TOTAL_MESSAGES_SENT += 1
-            return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok"}), 200
 
-        elif callback_data.startswith("apply:"):
-            short_id = callback_data.split(":", 1)[1]
-            job = get_job_from_cache(short_id)
-            comp = job.get("employer_name", "")
-            add_company_cooldown(comp)
-            log_to_sheets_crm({"action": "apply_job", "company": comp})
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"✅ Marked applied for <b>{html.escape(comp)}</b>.", "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
+    if "message" not in data:
+        return jsonify({"status": "ignored"}), 200
 
-        elif callback_data.startswith("pivot:"):
-            short_id = callback_data.split(":", 1)[1]
-            job = get_job_from_cache(short_id)
-            comp = job.get("employer_name", "Firm")
-            apollo_url = build_apollo_url(comp)
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"🔄 <b>Pivot Lead for {html.escape(comp)}:</b>\n<a href='{apollo_url}'>Search New Operations Leadership on Apollo</a>", "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "").strip()
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-        elif callback_data.startswith("dead:"):
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "❌ Marked role as dead.", "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
+    # 2. Pre-filled /quick Monospaced Tap-to-Copy Template
+    if text == "/quick":
+        template_msg = (
+            "Tap the code block below to copy, adjust details, and send:\n\n"
+            "<code>/quick Jane Van Der Bilt @ Acme Corp 9 Spoke at event; interested in back-office systems</code>"
+        )
+        send_telegram_message(chat_id, template_msg)
+        return jsonify({"status": "ok"}), 200
 
-    # 2. HANDLE TEXT COMMANDS & SWIPE REPLIES
-    if "message" in data:
-        msg = data["message"]
-        text = msg.get("text", "").strip()
-        chat_id = msg.get("chat", {}).get("id")
-        cmd_clean = text.lower().strip()
-        today_str = datetime.now().strftime("%Y-%m-%d")
-
-        # Parse Swipe Thread Context if available
-        company = "Target Firm"
-        job_title = "Operations Role"
-        if "reply_to_message" in msg:
-            reply_text = msg.get("reply_to_message", {}).get("text", "")
-            lines = reply_text.split("\n")
-            job_title = lines[0].strip() if lines else "Operations Role"
-            for line in lines:
-                if "Company:" in line:
-                    company = line.replace("Company:", "").strip()
-                    break
-
-        # SHORTHAND COMMAND ROUTER
-        if cmd_clean.startswith("/t"):
-            parts = cmd_clean.split()
-            qty = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 2
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"⚡ Pulling {qty} job cards..."})
-            threading.Thread(target=run_job_pipeline, args=(chat_id, qty)).start()
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean.startswith("/c") or cmd_clean.startswith("/cw") or cmd_clean.startswith("/cc"):
-            parts = cmd_clean.split()
-            qty = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 2
-            target_tab = "CW" if "/cw" in cmd_clean else ("CC" if "/cc" in cmd_clean else "CW")
-            leads = fetch_networking_cards(target_tab, qty)
-            if not leads:
-                send_status_update(chat_id, f"No active contacts found in {target_tab} tab.")
-                return jsonify({"status": "ok"}), 200
-            for lead in leads:
-                comp = html.escape(str(lead.get("company") or "Target Firm"))
-                title = html.escape(str(lead.get("title") or "Executive"))
-                email = html.escape(str(lead.get("email") or "Unlisted"))
-                p_score = lead.get("priority") or 5
-                notes = html.escape(str(lead.get("notes") or ""))
-                card = (
-                    f"<b>{comp}</b> - {title}\n"
-                    f"<b>Contact:</b> <code>{email}</code> | <b>Priority:</b> {p_score}/10\n"
-                    f"<b>Notes:</b> {notes}\n\n"
-                    f"<b>Swipe Actions:</b>\n"
-                    f"  <code>draft</code> - Generate Draft\n"
-                    f"  <code>/f 14</code> - Set Followup\n"
-                    f"  <code>/p 8</code> - Set Priority\n"
-                    f"  <code>/n &lt;text&gt;</code> - Append Note"
-                )
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": card, "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean.startswith("/p "):
-            parts = cmd_clean.split()
-            target_p = parts[1] if len(parts) > 1 else "10"
+    # 3. Multi-Word Name Parser using @ Delimiter Regex
+    if text.startswith("/quick "):
+        raw_cmd = text[7:].strip()
+        match = re.match(r"^([^@]+)@([^\d]+)\s+(\d{1,2})\s+(.+)$", raw_cmd)
+        if match:
+            name = match.group(1).strip()
+            company = match.group(2).strip()
+            priority = int(match.group(3).strip())
+            note = match.group(4).strip()
+            next_followup = calculate_next_followup(priority)
             
-            # If in reply thread, update priority
-            if "reply_to_message" in msg:
-                next_f = (datetime.now() + timedelta(days=calculate_followup_interval(target_p))).strftime("%Y-%m-%d")
-                log_to_sheets_crm({
-                    "action": "update_lead",
-                    "company": company,
-                    "priority": target_p,
-                    "next_followup": next_f
-                })
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"✅ Priority updated to <b>{target_p}</b> for <b>{company}</b>. Next followup: {next_f}"})
-                return jsonify({"status": "ok"}), 200
-            
-            # Priority Search Query: Single Consolidated Message Block
-            res = requests.post(CRM_WEBHOOK_URL, json={"action": "get_followups", "priority": target_p}, timeout=10)
-            if res.status_code == 200:
-                leads = res.json().get("followups", [])
-                out_lines = [f"<b>PRIORITY {target_p} CONTACTS ({len(leads)} Total)</b>\n"]
-                for idx, l in enumerate(leads, 1):
-                    c = html.escape(str(l.get("company", "Firm")))
-                    title = html.escape(str(l.get("title", "Role")))
-                    email = html.escape(str(l.get("email", "N/A")))
-                    last_c = l.get("last_contact") or today_str
-                    nxt_f = l.get("next_followup") or today_str
-                    n = html.escape(str(l.get("notes", "No notes.")))
-                    out_lines.append(f"{idx}. <b>{c}</b> | {title}\n   <code>{email}</code> | Last: {last_c} | Next: {nxt_f}\n   Note: {n}\n")
-                send_telegram_chunked(chat_id, "\n".join(out_lines))
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean.startswith("/quick"):
-            name, comp, priority, note = parse_quick_command(text)
-            next_f = (datetime.now() + timedelta(days=calculate_followup_interval(priority))).strftime("%Y-%m-%d")
-            log_to_sheets_crm({
-                "action": "add_row",
-                "target_code": "CW",
-                "row_data": [
-                    today_str,                   # A: First Contact Date
-                    today_str,                   # B: Last Contact Date
-                    comp,                        # C: Company
-                    name,                        # D: Title/Contact Name
-                    f"{name.lower().replace(' ', '')}@{comp.lower().replace(' ', '')}.com", # E: Email
-                    priority,                    # F: Priority Score (1-10)
-                    "New Lead",                  # G: Status
-                    next_f,                      # H: Next Followup
-                    "Telegram /quick",           # I: Source
-                    f"[{today_str}] {note}"      # J: Timestamped Notes
-                ]
-            })
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"✅ Contact <b>{html.escape(name)}</b> @ <b>{html.escape(comp)}</b> added (Priority {priority}, Next: {next_f}).", "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean.startswith("/f "):
-            try:
-                days = int(cmd_clean.split()[1])
-                nxt_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-                log_to_sheets_crm({
-                    "action": "update_lead",
-                    "company": company,
-                    "last_contact": today_str,
-                    "next_followup": nxt_date
-                })
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"🗓️ Followup for <b>{html.escape(company)}</b> set to {nxt_date} ({days}d).", "parse_mode": "HTML"})
-            except Exception:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "⚠️ Invalid format. Use <code>/f 14</code>."})
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean.startswith("/n "):
-            note_text = text[3:].strip()
-            timestamped_note = f"[{today_str}] {note_text}"
-            log_to_sheets_crm({
-                "action": "append_note",
+            payload = {
+                "action": "quick_add",
+                "first_contact": today_str,
+                "last_contact": today_str,
+                "name": name,
                 "company": company,
-                "note": timestamped_note
-            })
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"📝 Appended note to <b>{html.escape(company)}</b>: <code>{html.escape(timestamped_note)}</code>", "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean == "/pivot":
-            apollo_url = build_apollo_url(company)
-            log_to_sheets_crm({"action": "move_row", "company": company, "target_tab": "Killed"})
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"🔄 Archived <b>{html.escape(company)}</b>. <a href='{apollo_url}'>Find new contacts on Apollo</a>", "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean == "/health":
-            health_msg = f"⚙️ <b>System Health Report:</b>\n\nDatabase: <code>ONLINE</code>\nCRM Connection: <code>ACTIVE</code>\nTimestamp Engine: <code>NATIVE ISO (UTC-4)</code>\nActive Mode: <code>100% Manual Pull</code>"
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": health_msg, "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean == "/efficiency":
-            ratio = f"{TOTAL_MESSAGES_SENT} Messages -> {TOTAL_INTERVIEWS_SET} Interviews"
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"📈 <b>Golden Ratio Analytics:</b>\n{ratio}", "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
-
-        elif cmd_clean.startswith("/search"):
-            # Swipe key = value updates
-            if "=" in text:
-                parts = text.replace("/search", "").split("=", 1)
-                k = parts[0].strip()
-                v_str = parts[1].strip()
-                try:
-                    v_val = json.loads(v_str)
-                except Exception:
-                    v_val = v_str
-                set_filter(k, v_val)
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"⚙️ Filter <code>{k}</code> updated to <code>{json.dumps(v_val)}</code>."})
-                return jsonify({"status": "ok"}), 200
+                "priority": priority,
+                "next_followup": next_followup,
+                "note": f"[{today_str}] {note}"
+            }
+            requests.post(APPS_SCRIPT_URL, json=payload)
             
-            # Display current search filters
-            min_sal = get_filter("min_salary", 50000)
-            cities = get_filter("valid_cities", [])
-            bans = get_filter("title_exclusions", [])
-            msg_out = (
-                f"🔍 <b>Current Dynamic Search Filters:</b>\n\n"
-                f"<b>Min Base Salary Floor:</b> ${min_sal:,.0f}\n"
-                f"<b>Radius Cities ({len(cities)}):</b> {', '.join(cities[:5])}...\n"
-                f"<b>Banned Terms:</b> {', '.join(bans[:5])}...\n\n"
-                f"<i>Swipe-reply key = value to update live (e.g. min_salary = 60000)</i>"
+            resp = (
+                f"✅ <b>Contact Created</b>\n"
+                f"<b>Name:</b> {name}\n"
+                f"<b>Company:</b> {company}\n"
+                f"<b>Priority:</b> {priority}\n"
+                f"<b>Next Follow-up:</b> {next_followup}"
             )
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": msg_out, "parse_mode": "HTML"})
-            return jsonify({"status": "ok"}), 200
+            send_telegram_message(chat_id, resp)
+        else:
+            err = "❌ <b>Syntax Error.</b> Use format:\n<code>/quick <Name> @<Company> <Priority 1-10> <Note></code>"
+            send_telegram_message(chat_id, err)
+        return jsonify({"status": "ok"}), 200
 
-        elif cmd_clean in ["draft", "/draft"]:
-            email_target = resolve_target_email(company, job_title)
-            success, err = create_gmail_draft(email_target, company, job_title, is_warm=False)
-            status = "<b>Gmail Draft Created!</b>" if success else f"⚠️ <b>Draft Failed:</b> <code>{html.escape(err)}</code>"
-            email_body = generate_cold_email(job_title, company)
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"{status}\n\nTo: <code>{email_target}</code>\nBody:\n{email_body}", "parse_mode": "HTML"})
-            TOTAL_MESSAGES_SENT += 1
+    # 4. Single-Message Output Priority Batcher (/p 1 - 10)
+    if re.match(r"^/p\s+(\d+)$", text):
+        priority_lvl = int(re.match(r"^/p\s+(\d+)$", text).group(1))
+        resp = requests.get(f"{APPS_SCRIPT_URL}?action=get_priority&level={priority_lvl}").json()
+        contacts = resp.get("contacts", [])
+        
+        if not contacts:
+            send_telegram_message(chat_id, f"No active contacts at Priority Tier {priority_lvl}.")
             return jsonify({"status": "ok"}), 200
+            
+        out_msg = f"<b>PRIORITY {priority_lvl} CONTACTS ({len(contacts)} Total)</b>\n\n"
+        for idx, c in enumerate(contacts, 1):
+            out_msg += f"{idx}. <b>{c.get('name')}</b> | {c.get('company')}\n"
+            out_msg += f"Last Contact: {c.get('last_contact')} | Next: {c.get('next_followup')}\n"
+            out_msg += f"Note: <i>{c.get('latest_note', 'No notes logged')}</i>\n\n"
+            
+        send_telegram_message(chat_id, out_msg)
+        return jsonify({"status": "ok"}), 200
 
-        elif cmd_clean in ["/conv", "/int", "/tw", "/cw", "/cc", "/tc", "/x"]:
-            if cmd_clean == "/conv":
-                log_to_sheets_crm({"action": "update_lead", "company": company, "status": "Good Conversation", "priority": 8})
-                msg_out = f"💬 Marked <b>{html.escape(company)}</b> as Good Conversation."
-            elif cmd_clean == "/int":
-                TOTAL_INTERVIEWS_SET += 1
-                log_to_sheets_crm({"action": "update_lead", "company": company, "status": "Interview Scheduled", "priority": 10})
-                msg_out = f"🎉 Marked <b>{html.escape(company)}</b> as Interview Scheduled!"
-            elif cmd_clean in ["/tw", "/cw"]:
-                log_to_sheets_crm({"action": "move_row", "company": company, "target_tab": "CW"})
-                msg_out = f"📁 Moved <b>{html.escape(company)}</b> to Warm tab."
-            elif cmd_clean in ["/cc", "/tc"]:
-                log_to_sheets_crm({"action": "move_row", "company": company, "target_tab": "CC"})
-                msg_out = f"📁 Moved <b>{html.escape(company)}</b> to Cold tab."
-            elif cmd_clean == "/x":
-                log_to_sheets_crm({"action": "move_row", "company": company, "target_tab": "Killed"})
-                msg_out = f"❌ Archived <b>{html.escape(company)}</b>."
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": msg_out, "parse_mode": "HTML"})
+    # 5. /search Status Card + Tap-to-Copy Bubbles + Interactive Inline Buttons
+    if text == "/search":
+        min_sal = get_filter("min_salary")
+        exp_sal = get_filter("experience_salary_floor")
+        bans = get_filter("title_exclusions")
+        cities = get_filter("valid_cities")
+        
+        card_text = (
+            "⚙️ <b>ACTIVE SEARCH FILTER CONFIGURATION</b>\n\n"
+            f"<b>Base Salary Floor (min/pay):</b> ${int(min_sal):,}\n"
+            f"<b>3+ Yr Exp Floor (exp/floor):</b> ${int(exp_sal):,}\n"
+            f"<b>Banned Titles (ban):</b> {', '.join(bans[:4])}... ({len(bans)} total)\n"
+            f"<b>Target Cities (city/loc):</b> {', '.join(cities[:4])}... ({len(cities)} total)\n\n"
+            "<b>Tap-to-Copy Quick Adjustment Bubbles:</b>\n"
+            "<code>min = 60000</code>\n"
+            "<code>ban + sales</code>\n"
+            "<code>ban - manager</code>\n"
+            "<code>city + canton</code>"
+        )
+        
+        inline_keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "⬆️ Pay +$5k", "callback_data": "adj_pay_+5000"},
+                    {"text": "⬇️ Pay -$5k", "callback_data": "adj_pay_-5000"}
+                ],
+                [
+                    {"text": "📍 Add Novi", "callback_data": "add_city_novi"},
+                    {"text": "❌ Reset Filters", "callback_data": "reset_filters"}
+                ]
+            ]
+        }
+        
+        send_telegram_message(chat_id, card_text, reply_markup=inline_keyboard)
+        return jsonify({"status": "ok"}), 200
+
+    # 6. Swipe-Reply Key/Alias Mutation Parser (e.g., pay = 60000, ban + sales, city - canton)
+    if any(op in text for op in ["=", "+", "-"]):
+        match = re.match(r"^([a-zA-Z_]+)\s*(=|\+|-)\s*(.+)$", text)
+        if match:
+            raw_key = match.group(1).strip()
+            op = match.group(2).strip()
+            val_str = match.group(3).strip()
+            
+            val_arg = f"{op} {val_str}" if op in ["+", "-"] else val_str
+            update_res = update_filter_param(raw_key, val_arg)
+            send_telegram_message(chat_id, update_res)
             return jsonify({"status": "ok"}), 200
 
     return jsonify({"status": "ignored"}), 200
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
