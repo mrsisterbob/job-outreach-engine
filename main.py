@@ -1041,29 +1041,18 @@ def telegram_webhook():
             exp_sal = safe_int(get_filter("experience_salary_floor"), 60000)
             bans = safe_list(get_filter("title_exclusions"))
             cities = safe_list(get_filter("valid_cities"))
+            kws = safe_list(get_filter("required_keywords"))
 
             card_text = (
-                "🔍 <b>Current Dynamic Search Filters:</b>\n\n"
-                f"<b>Min Base Salary Floor:</b> ${min_sal:,}\n"
-                f"<b>Exp Salary Floor:</b> ${exp_sal:,}\n"
-                f"<b>Banned Terms ({len(bans)}):</b> {', '.join(bans[:4]) if bans else 'None'}...\n"
-                f"<b>Radius Cities ({len(cities)}):</b> {', '.join(cities[:5]) if cities else 'None'}...\n\n"
-                "<b>💡 Filter Mutation Cheat Sheet:</b>\n"
-                "• <b>Salary:</b> <code>min = 60000</code> or <code>pay + 5000</code>\n"
-                "• <b>Exp Floor:</b> <code>exp = 65000</code> or <code>floor = 70000</code>\n"
-                "• <b>Bans:</b> <code>ban + sales</code> | <code>ban - manager</code>\n"
-                "• <b>Cities:</b> <code>city + canton</code> | <code>loc - novi</code>\n\n"
-                "<b>📱 Card Action Shortcuts (Swipe-Reply to Cards):</b>\n"
-                "• <code>draft</code> - Generate Gmail draft\n"
-                "• <code>/f 7</code> - Snooze followup (days)\n"
-                "• <code>/n note</code> - Append note to CRM\n"
-                "• <code>/cw</code> / <code>/cc</code> - Move to Warm / Cold\n"
-                "• <code>/pivot</code> - Pivot lead on Apollo\n"
-                "• <code>/x</code> - Mark Dead\n\n"
-                "<b>Tap-to-Copy Quick Adjustments:</b>\n"
-                "<code>min = 60000</code>\n"
+                "🔍 <b>Active Search Filters</b>\n"
+                f"• <b>Min Pay:</b> ${min_sal:,} | <b>Exp Floor:</b> ${exp_sal:,}\n"
+                f"• <b>Cities ({len(cities)}):</b> {', '.join(cities[:4]) if cities else 'All'}\n"
+                f"• <b>Banned ({len(bans)}):</b> {', '.join(bans[:3]) if bans else 'None'}\n"
+                f"• <b>Keywords ({len(kws)}):</b> {', '.join(kws[:3]) if kws else 'Any'}\n\n"
+                "<b>⚡ Tap-to-Copy Quick Adjustments</b>\n"
+                "<code>pay = 65000</code>\n"
+                "<code>kw + python</code>\n"
                 "<code>ban + sales</code>\n"
-                "<code>ban - manager</code>\n"
                 "<code>city + canton</code>"
             )
 
