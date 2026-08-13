@@ -19,7 +19,6 @@ app = Flask(__name__)
 # ==============================================================================
 # 1. ENVIRONMENT VARIABLES & DATABASE INITIALIZATION (WAL MODE)
 # ==============================================================================
-
 API_KEY = os.environ.get("OPENWEBNINJA_KEY") or os.environ.get("RAPIDAPI_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -134,14 +133,13 @@ def init_db():
             }
             for k, v in defaults.items():
                 conn.execute("INSERT INTO search_filters (key, value_json) VALUES (?, ?)", (k, json.dumps(v)))
-        conn.commit()
+            conn.commit()
 
 init_db()
 
 # ==============================================================================
 # 2. FILTER & DYNAMIC CONFIGURATION HELPERS
 # ==============================================================================
-
 def safe_int(val, default=0):
     try:
         return int(val)
@@ -178,7 +176,7 @@ def set_filter(key, val):
         with get_db_conn() as conn:
             conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(val)))
             conn.commit()
-            return True
+        return True
     except Exception as e:
         print(f"Filter Write Error ({key}): {e}", flush=True)
         return False
@@ -188,7 +186,6 @@ def update_filter_param(raw_key, raw_val_str):
     current_val = get_filter(key)
     if current_val is None:
         return f"❌ Unknown filter parameter: <code>{raw_key}</code>"
-    
     clean_val = raw_val_str.strip()
     if isinstance(current_val, list):
         op = None
@@ -198,7 +195,6 @@ def update_filter_param(raw_key, raw_val_str):
         elif clean_val.startswith("-"):
             op = "remove"
             clean_val = clean_val[1:].strip()
-            
         if op == "add":
             if clean_val.lower() not in [x.lower() for x in current_val]:
                 current_val.append(clean_val)
@@ -281,7 +277,6 @@ def is_company_on_cooldown(company_name):
 # ==============================================================================
 # 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE
 # ==============================================================================
-
 def calculate_followup_interval(priority_score):
     try:
         p = float(priority_score)
@@ -318,15 +313,13 @@ def format_email_block(email_text):
 # ==============================================================================
 # 4. HELPER FUNCTIONS & PIPELINE UTILITIES
 # ==============================================================================
-
-SYSTEM_PROMPT = """You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience).
-Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
+SYSTEM_PROMPT = """You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
 High Priority Skills: Python, SQL, Salesforce, Excel, Schwab SAC, Fidelity Wealthscape, DocuSign, Process Automation.
 Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles, retail bank tellers, CPA tracks, Senior/Lead/Manager roles.
 Evaluate the job description and respond ONLY with a JSON object containing:
 {
-  "score": <integer between 1 and 100 representing fit signal>,
-  "reason": "<1-sentence concise explanation of why this role fits or does not fit>"
+"score": <integer between 1 and 100 representing fit signal>,
+"reason": "<1-sentence concise explanation of why this role fits or does not fit>"
 }"""
 
 def send_health_alert(error_msg):
@@ -423,7 +416,6 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     title = str(job.get("job_title") or "").lower()
     company = str(job.get("employer_name") or "").lower()
     salary_str, max_sal = extract_salary(job)
-    
     tier1_ecosystem = get_filter("tier1_ecosystem", [])
     if any(k in desc or k in company for k in tier1_ecosystem):
         score += 10
@@ -473,7 +465,6 @@ def parse_quick_command(text_input):
             priority = safe_int(match.group(3).strip(), 5)
             note = match.group(4).strip()
             return name, company, priority, note
-        
         parts = clean.split("@", 1)
         name = parts[0].strip()
         rest = parts[1].strip().split()
@@ -510,7 +501,6 @@ def parse_quick_command(text_input):
 # ==============================================================================
 # 5. GEMINI REST API INTEGRATION (TRUNCATED PAYLOAD)
 # ==============================================================================
-
 def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"):
     if not GEMINI_API_KEY:
         return None
@@ -531,7 +521,6 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
 def evaluate_job_with_gemini(job):
     if not GEMINI_API_KEY:
         return True, 75, "Fallback pass (No Key)"
-    # Architectural Fix 5: Truncate job description to top 1,000 characters
     desc_truncated = str(job.get("job_description") or "")[:1000]
     prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{desc_truncated}"
     raw_text = call_gemini_api(prompt, SYSTEM_PROMPT)
@@ -551,7 +540,6 @@ def evaluate_job_with_gemini(job):
 # ==============================================================================
 # 6. STAGE 1 STRICT FILTER & SINGLE CANDIDATE EVALUATION
 # ==============================================================================
-
 def passes_strict_filter(job):
     title = str(job.get("job_title") or "").lower()
     description = str(job.get("job_description") or "").lower()
@@ -559,29 +547,24 @@ def passes_strict_filter(job):
     state = str(job.get("job_state") or "").upper()
     city = str(job.get("job_city") or "").lower()
     salary_str, max_sal = extract_salary(job)
-    
-    # 1. Company Cooldown Audit (14-day window)
+
     if is_company_on_cooldown(company):
         return False
-        
-    # 2. Base Salary Floor ($50K Hard Drop)
+    
     min_sal_floor = safe_int(get_filter("min_salary"), 50000)
     if max_sal > 0 and max_sal < min_sal_floor:
         return False
-        
-    # 3. Location & Commute (35-mile radius)
+
     valid_cities = get_filter("valid_cities", [])
     is_mi = (state == "MI") or "michigan" in city or any(c in city for c in valid_cities)
     is_remote = job.get("job_is_remote", False) or "remote" in description[:300] or "work from home" in description[:300]
     if not (is_mi or is_remote):
         return False
-        
-    # 4. Experience-to-Pay Audit
+
     exp_floor = safe_int(get_filter("experience_salary_floor"), 60000)
     if any(k in description for k in ["3+ years", "3-5 years", "4+ years"]) and (0 < max_sal < exp_floor):
         return False
-        
-    # 5. Exclusions & Hard Keyword Bans
+
     if any(term in title for term in get_filter("title_exclusions", [])):
         return False
     if any(comp in company for comp in get_filter("company_exclusions", [])):
@@ -590,7 +573,7 @@ def passes_strict_filter(job):
         return False
     if any(sen in title for sen in get_filter("seniority_exclusions", [])):
         return False
-        
+
     return True
 
 def process_single_candidate(job):
@@ -615,7 +598,6 @@ def process_single_candidate(job):
     # ==============================================================================
 # 7. GMAIL API DRAFTING & CRM LOGGING
 # ==============================================================================
-
 def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note=""):
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars:
@@ -632,21 +614,18 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         access_token = token_res.json().get("access_token")
         if not access_token:
             return False, "OAuth Token Refused"
-        
         if is_warm:
             body_content = generate_warm_email(custom_note)
             subject = f"Reconnecting - {company_name}"
         else:
             body_content = generate_cold_email(job_title, company_name)
             subject = f"Operations & Systems Alignment - {job_title} @ {company_name}"
-            
         message = EmailMessage()
         message["To"] = to_email
         message["From"] = GMAIL_USER
         message["Subject"] = subject
         body = f"Hi,\n\n{body_content}\n\nBest regards,\nKevin Miller"
         message.set_content(body)
-        
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
@@ -709,7 +688,6 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     apollo_url = html.escape(build_apollo_url(company), quote=True)
     linkedin_url = html.escape(build_linkedin_url(company), quote=True)
     matched_str = ", ".join(matched_skills[:4]).title() if matched_skills else "General Ops"
-    
     card_text = (
         f"<b>{title}</b>\n"
         f"<b>Company:</b> {company}\n"
@@ -729,7 +707,6 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"  <code>/cc</code> or <code>/tc</code> - Log Cold\n"
         f"  <code>/x</code> - Mark Dead"
     )
-    
     reply_markup = {
         "inline_keyboard": [
             [
@@ -742,7 +719,6 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
             ]
         ]
     }
-    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -759,13 +735,11 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
 # ==============================================================================
 # 8. PARALLEL PIPELINE EXECUTION (PARALLEL JSEARCH + EARLY-EXIT CIRCUIT BREAKER)
 # ==============================================================================
-
 def fetch_single_query_jobs(query_args):
     """Worker function for parallel JSearch API query execution."""
     query, api_url, headers = query_args
     params = {"query": query, "page": "1", "num_pages": "1", "date_posted": "month"}
     try:
-        # Architectural Fix 3: 10s request timeout
         res = requests.get(api_url, headers=headers, params=params, timeout=10)
         if res.status_code == 200:
             return res.json().get("data", [])
@@ -777,12 +751,10 @@ def run_job_pipeline(chat_id=None, top_n=2):
     print(">>> Starting Job Search Pipeline...", flush=True)
     if chat_id:
         send_status_update(chat_id, "Fetching raw listings from JSearch in parallel...")
-    
     seen_hashes = set()
     candidate_pool = []
     today_str = datetime.now().strftime("%Y-%m-%d")
     followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
-    
     rapidapi_key = os.environ.get("RAPIDAPI_KEY")
     openweb_key = os.environ.get("OPENWEBNINJA_KEY")
     if rapidapi_key:
@@ -791,11 +763,9 @@ def run_job_pipeline(chat_id=None, top_n=2):
     else:
         headers = {"x-api-key": openweb_key} if openweb_key else {}
         api_url = JSEARCH_URL
-
     target_queries = get_filter("target_queries", [])
     query_tasks = [(q, api_url, headers) for q in target_queries]
-
-    # Architectural Fix 2: Parallel JSearch query fetching via ThreadPoolExecutor
+    
     with ThreadPoolExecutor(max_workers=min(len(target_queries), 8) or 4) as executor:
         query_results = executor.map(fetch_single_query_jobs, query_tasks)
         for jobs in query_results:
@@ -809,8 +779,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 save_seen_job_db(job_hash)
                 if passes_strict_filter(job):
                     candidate_pool.append(job)
-
-    # Architectural Fix 4: Gemini Early-Exit Circuit Breaker (top_n Cap)
+                    
     top_matches = []
     for candidate in candidate_pool:
         if len(top_matches) >= top_n:
@@ -819,9 +788,8 @@ def run_job_pipeline(chat_id=None, top_n=2):
         result = process_single_candidate(candidate)
         if result:
             top_matches.append(result)
-
+            
     top_matches.sort(key=lambda x: x["score"], reverse=True)
-
     for item in top_matches:
         job = item["job"]
         send_telegram_card(
@@ -829,7 +797,6 @@ def run_job_pipeline(chat_id=None, top_n=2):
             item["age_badge"], item["salary_str"], item["work_style"],
             item["overlap_pct"], item["matched_skills"], item["short_id"]
         )
-        
         log_to_sheets_crm({
             "action": "add_row",
             "target_code": "TC",
@@ -846,13 +813,11 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 f"Matched via Pipeline | {item['reason']}"
             ]
         })
-        
     return len(top_matches)
 
 # ==============================================================================
 # 9. ASYNC WORKLOAD PROCESSOR & WEBHOOK CONTROLLER
 # ==============================================================================
-
 def process_webhook_payload_async(data):
     """Executes heavy workloads in background worker threads so HTTP return is instant."""
     try:
@@ -861,7 +826,6 @@ def process_webhook_payload_async(data):
             cb = data["callback_query"]
             chat_id = cb["message"]["chat"]["id"]
             cb_data = cb.get("data", "")
-            
             if cb_data.startswith("approve:"):
                 short_id = cb_data.split(":")[1]
                 job = get_job_from_cache(short_id)
@@ -970,8 +934,7 @@ def process_webhook_payload_async(data):
                 "action": "quick_add",
                 "first_contact": today_str,
                 "last_contact": today_str,
-                "name": name,
-                "company": company,
+                "name": name, "company": company,
                 "priority": priority,
                 "next_followup": next_followup,
                 "note": f"[{today_str}] {note}"
@@ -1050,10 +1013,12 @@ def process_webhook_payload_async(data):
             days = safe_int(text.split()[1], 7)
             send_telegram_message(chat_id, f"📅 Follow-up set in {days} days.")
             return
+
         if text.startswith("/n "):
             note_str = text[3:].strip()
             send_telegram_message(chat_id, f"📝 Appended note: <i>{html.escape(note_str)}</i>")
             return
+
         if text in ["/pivot", "/tw", "/cw", "/cc", "/tc", "/x"]:
             action_map = {
                 "/pivot": "Lead pivoted & Apollo link generated.",
@@ -1072,28 +1037,22 @@ def process_webhook_payload_async(data):
 # ==============================================================================
 # 10. FLASK SERVER & STACKED WEBHOOK ROUTER
 # ==============================================================================
-
 @app.route('/', methods=['GET'])
 def health_check():
     return "CRM & Job Pipeline Engine Active", 200
 
-# Architectural Fix 7: Stacked dual route decorators
 @app.route("/telegram", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     """
-    Architectural Fix 1: Instant non-blocking execution (<0.05s return).
+    Instant non-blocking execution (<0.05s return).
     Dispatches workload to background thread and returns HTTP 200 immediately.
     """
     try:
         data = request.get_json()
         if not data:
             return jsonify({"status": "ignored"}), 200
-
-        # Offload all processing to background thread immediately
         threading.Thread(target=process_webhook_payload_async, args=(data,)).start()
-        
-        # Line 1/2 Instant Return (<50ms response to Telegram)
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         print(f"Telegram Webhook Dispatch Error: {e}", flush=True)
