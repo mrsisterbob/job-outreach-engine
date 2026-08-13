@@ -17,8 +17,9 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. ENVIRONMENT VARIABLES & INITIALIZATION[cite: 1]
+# 1. ENVIRONMENT VARIABLES & DATABASE INITIALIZATION (WAL MODE)
 # ==============================================================================
+
 API_KEY = os.environ.get("OPENWEBNINJA_KEY") or os.environ.get("RAPIDAPI_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -35,7 +36,7 @@ DB_PATH = "jobs_cache.db"
 TOTAL_MESSAGES_SENT = 0
 TOTAL_INTERVIEWS_SET = 0
 
-# Mobile Short Key Alias Map[cite: 2]
+# Mobile Short Key Alias Map
 ALIAS_MAP = {
     "min": "min_salary",
     "pay": "min_salary",
@@ -46,12 +47,19 @@ ALIAS_MAP = {
     "city": "valid_cities",
     "loc": "valid_cities",
     "query": "target_queries",
-    "q": "target_queries"
+    "q": "target_queries",
+    "kw": "required_keywords"
 }
 
+def get_db_conn():
+    """Returns a SQLite connection with Write-Ahead Logging (WAL) enabled."""
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
 def init_db():
-    """Initializes local SQLite tables for jobs, deduplication, cooldowns, and dynamic search filters."""
-    with sqlite3.connect(DB_PATH) as conn:
+    """Initializes local SQLite tables with WAL mode enabled for multithreaded concurrency."""
+    with get_db_conn() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             short_id TEXT PRIMARY KEY,
@@ -74,7 +82,6 @@ def init_db():
             value_json TEXT
         )""")
         
-        # Seed dynamic filter defaults if empty[cite: 1, 2]
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
         if cursor.fetchone()[0] == 0:
@@ -114,6 +121,7 @@ def init_db():
                 "tier1_ecosystem": [
                     "downtown detroit", "inveniam", "rivian", "rocket", "quicken", "stockx", "venture"
                 ],
+                "required_keywords": [],
                 "target_queries": [
                     "Wealth Operations Detroit MI",
                     "Fintech Operations Michigan",
@@ -126,22 +134,21 @@ def init_db():
             }
             for k, v in defaults.items():
                 conn.execute("INSERT INTO search_filters (key, value_json) VALUES (?, ?)", (k, json.dumps(v)))
-            conn.commit()
+        conn.commit()
 
 init_db()
 
 # ==============================================================================
-# 2. FILTER & DYNAMIC CONFIGURATION HELPERS[cite: 1, 2]
+# 2. FILTER & DYNAMIC CONFIGURATION HELPERS
 # ==============================================================================
+
 def safe_int(val, default=0):
-    """Safely converts filter values to integers without throwing exceptions[cite: 1]."""
     try:
         return int(val)
     except (TypeError, ValueError):
         return default
 
 def safe_list(val):
-    """Safely parses filter list values from JSON or python lists[cite: 1]."""
     if isinstance(val, list):
         return val
     if isinstance(val, str):
@@ -155,9 +162,8 @@ def safe_list(val):
     return []
 
 def get_filter(key, default_val=None):
-    """Retrieve JSON-decoded value for a given filter key from SQLite[cite: 1, 2]."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT value_json FROM search_filters WHERE key = ?", (key,))
             row = cursor.fetchone()
@@ -168,9 +174,8 @@ def get_filter(key, default_val=None):
     return default_val
 
 def set_filter(key, val):
-    """Sets/replaces a filter key in SQLite[cite: 1]."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(val)))
             conn.commit()
             return True
@@ -179,15 +184,12 @@ def set_filter(key, val):
         return False
 
 def update_filter_param(raw_key, raw_val_str):
-    """Parses short aliases, scalar offsets (+/-), and array mutation operators (+/-)[cite: 1, 2]."""
     key = ALIAS_MAP.get(raw_key.lower().strip(), raw_key.lower().strip())
     current_val = get_filter(key)
     if current_val is None:
         return f"❌ Unknown filter parameter: <code>{raw_key}</code>"
-
-    clean_val = raw_val_str.strip()
     
-    # Array parameter handling (e.g., ban + sales, city - canton)[cite: 2]
+    clean_val = raw_val_str.strip()
     if isinstance(current_val, list):
         op = None
         if clean_val.startswith("+"):
@@ -196,7 +198,7 @@ def update_filter_param(raw_key, raw_val_str):
         elif clean_val.startswith("-"):
             op = "remove"
             clean_val = clean_val[1:].strip()
-
+            
         if op == "add":
             if clean_val.lower() not in [x.lower() for x in current_val]:
                 current_val.append(clean_val)
@@ -204,31 +206,29 @@ def update_filter_param(raw_key, raw_val_str):
             current_val = [x for x in current_val if x.lower() != clean_val.lower()]
         else:
             current_val = [x.strip() for x in clean_val.split(",") if x.strip()]
-        
         set_filter(key, current_val)
-        return f"⚡ Filter <code>{key}</code> updated to: <code>{json.dumps(current_val)}</code>"
+        return f"⚙️ Filter <code>{key}</code> updated to: <code>{json.dumps(current_val)}</code>"
     else:
-        # Scalar numeric handling (e.g., pay + 5000, min = 60000)[cite: 2]
         if clean_val.startswith("+"):
             new_val = safe_int(current_val) + safe_int(clean_val[1:].strip())
         elif clean_val.startswith("-"):
             new_val = safe_int(current_val) - safe_int(clean_val[1:].strip())
         else:
             new_val = safe_int(clean_val)
-            
         set_filter(key, new_val)
-        return f"⚡ Filter <code>{key}</code> updated to <code>{new_val:,}</code>."
+        return f"⚙️ Filter <code>{key}</code> updated to <code>{new_val:,}</code>."
 
 def save_job_to_cache(short_id, job_dict):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             conn.execute("INSERT OR REPLACE INTO jobs (short_id, job_json) VALUES (?, ?)", (short_id, json.dumps(job_dict)))
+            conn.commit()
     except Exception as e:
         print(f"DB Save Error: {e}", flush=True)
 
 def get_job_from_cache(short_id):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT job_json FROM jobs WHERE short_id = ?", (short_id,))
             row = cursor.fetchone()
@@ -240,7 +240,7 @@ def get_job_from_cache(short_id):
 
 def is_job_seen_db(job_hash):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT 1 FROM seen_jobs WHERE job_hash = ?", (job_hash,))
             return cursor.fetchone() is not None
@@ -249,8 +249,9 @@ def is_job_seen_db(job_hash):
 
 def save_seen_job_db(job_hash):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             conn.execute("INSERT OR IGNORE INTO seen_jobs (job_hash) VALUES (?)", (job_hash,))
+            conn.commit()
     except Exception as e:
         print(f"DB Seen Hash Error: {e}", flush=True)
 
@@ -259,8 +260,9 @@ def add_company_cooldown(company_name):
     if not clean:
         return
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             conn.execute("INSERT OR REPLACE INTO company_cooldown (company_clean, logged_at) VALUES (?, CURRENT_TIMESTAMP)", (clean,))
+            conn.commit()
     except Exception as e:
         print(f"DB Cooldown Save Error: {e}", flush=True)
 
@@ -269,7 +271,7 @@ def is_company_on_cooldown(company_name):
     if not clean:
         return False
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT logged_at FROM company_cooldown WHERE company_clean = ? AND logged_at >= datetime('now', '-14 days')", (clean,))
             return cursor.fetchone() is not None
@@ -277,10 +279,10 @@ def is_company_on_cooldown(company_name):
         return False
 
 # ==============================================================================
-# 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE[cite: 1, 2]
+# 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE
 # ==============================================================================
+
 def calculate_followup_interval(priority_score):
-    """Calculates follow-up gap dynamically: Interval = Max(3, Round(35 - (Priority * 3.2)))[cite: 1, 2]."""
     try:
         p = float(priority_score)
         return max(3, int(round(35.0 - (p * 3.2))))
@@ -288,46 +290,35 @@ def calculate_followup_interval(priority_score):
         return 14
 
 def sanitize_text(text):
-    """Post-generation sanitizer: strips em/en-dashes, hyphens, semicolons, colons, quotes,
-    parentheses, corporate buzzwords, and reduces 3-part lists (X, Y, and Z -> X and Y)[cite: 1, 2]."""
     if not text:
         return ""
-    # Strip prohibited punctuation: em-dash, en-dash, hyphens, ;, :, ", ', (, )[cite: 1, 2]
-    cleaned = re.sub(r'[\u2014\u2013\-;:"\'\(\)]', '', str(text))
-    
-    # Remove prohibited corporate buzzwords[cite: 1, 2]
+    cleaned = re.sub(r'[\u2014\u2013\-;:"\(\)]', "", str(text))
     buzzwords = ["leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm"]
     for bw in buzzwords:
-        cleaned = re.sub(rf'\b{bw}\b', '', cleaned, flags=re.IGNORECASE)
-        
-    # Simplify three-item lists (X, Y, and Z -> X and Y)[cite: 1, 2]
+        cleaned = re.sub(rf'\b{bw}\b', "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\b(\w+),\s*(\w+),\s*and\s*(\w+)\b', r'\1 and \2', cleaned)
-    
-    # Collapse extra whitespace
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
 def generate_cold_email(job_title, company_name, core_exp="wealth ops and process automation"):
-    """Carmen Cold (VP Outreach): Strict 2-Sentence Cap[cite: 1, 2]."""
     s1 = f"I saw the {job_title} role at {company_name} and wanted to highlight my background in {core_exp}."
     s2 = "Would you be open to a brief 5 minute call next week to discuss alignment?"
     return f"{sanitize_text(s1)} {sanitize_text(s2)}"
 
 def generate_warm_email(note_context=""):
-    """Carmen Warm (Network): Strict 3-Sentence Structure[cite: 1, 2]."""
     s1 = sanitize_text(note_context) if note_context else "I hope you have been doing well."
     s2 = "I am currently interning in wealth ops at Signal Advisors, a fast growing startup in downtown Detroit."
     s3 = "I am wondering what you have been up to lately, and would love to reconnect over coffee or a quick call if you have time."
     return f"{s1} {s2} {s3}"
 
 def format_email_block(email_text):
-    """Wraps email drafts in monospaced blocks for single-tap mobile copying[cite: 1, 2]."""
     sanitized = sanitize_text(email_text)
     return f"<code>{html.escape(sanitized)}</code>"
 
 # ==============================================================================
-# 4. HELPER FUNCTIONS & PIPELINE UTILITIES[cite: 1, 2]
+# 4. HELPER FUNCTIONS & PIPELINE UTILITIES
 # ==============================================================================
+
 SYSTEM_PROMPT = """You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience).
 Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
 High Priority Skills: Python, SQL, Salesforce, Excel, Schwab SAC, Fidelity Wealthscape, DocuSign, Process Automation.
@@ -340,7 +331,7 @@ Evaluate the job description and respond ONLY with a JSON object containing:
 
 def send_health_alert(error_msg):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        text = f"🚨 <b>Pipeline Operational Warning</b>\n<code>{html.escape(str(error_msg))}</code>"
+        text = f"⚠️ <b>Pipeline Operational Warning</b>\n<code>{html.escape(str(error_msg))}</code>"
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -360,44 +351,6 @@ def send_status_update(chat_id, text):
             )
         except Exception:
             pass
-
-def send_telegram_chunked(chat_id, full_text):
-    """Sends text blocks, splitting across Telegram's 4096 char limit with 0.5s safety delays[cite: 1]."""
-    if not (TELEGRAM_BOT_TOKEN and chat_id):
-        return
-    max_len = 4000
-    if len(full_text) <= max_len:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": full_text, "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=5
-        )
-    else:
-        chunks = [full_text[i:i + max_len] for i in range(0, len(full_text), max_len)]
-        for chunk in chunks:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True},
-                timeout=5
-            )
-            time.sleep(0.5)
-
-def log_to_sheets_crm(payload, max_retries=3):
-    """Interfaces with Google Apps Script 10-column database schema[cite: 1, 2]."""
-    if not CRM_WEBHOOK_URL:
-        return False
-    delay = 1.0
-    for attempt in range(max_retries):
-        try:
-            res = requests.post(CRM_WEBHOOK_URL, json=payload, timeout=10)
-            if res.status_code == 200:
-                return True
-        except Exception as e:
-            print(f"CRM Webhook Attempt {attempt+1} Failed: {e}", flush=True)
-        time.sleep(delay)
-        delay *= 2.0
-    send_health_alert(f"Failed to log payload to Google Sheets after {max_retries} attempts.")
-    return False
 
 def generate_dedup_hash(company, title):
     clean_company = str(company or "").lower().strip()
@@ -419,15 +372,15 @@ def parse_posted_hours(posted_utc_str):
 
 def get_age_badge(posted_hours):
     if posted_hours < 24:
-        return " [< 24h FRESH]"
+        return "🔥 [< 24h FRESH]"
     elif posted_hours < 72:
-        return " [1-3d RECENT]"
+        return "⚡ [1-3d RECENT]"
     elif posted_hours < 168:
-        return " [3-7d ACTIVE]"
+        return "🟢 [3-7d ACTIVE]"
     elif posted_hours < 336:
-        return " [7-14d AGING]"
+        return "🟡 [7-14d AGING]"
     else:
-        return " [14-30d STALE]"
+        return "🔴 [14-30d STALE]"
 
 def extract_salary(job):
     try:
@@ -484,24 +437,23 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
         score -= 15
     if "wealth" in desc and not any(k in desc for k in ["python", "sql", "automation", "systems"]):
         score -= 15
-        
     is_remote = job.get("job_is_remote", False) or "remote" in desc[:300] or "work from home" in desc[:300]
     if is_remote:
         score = min(score, 90)
     return max(1, min(100, score))
 
 def build_apollo_url(company_name):
-    clean_company = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or "")).strip()
+    clean_company = re.sub(r'[^a-zA-Z0-9\s]', "", str(company_name or "")).strip()
     encoded = urllib.parse.quote(f"{clean_company} Operations")
     return f"https://app.apollo.io/#/people?qKeywords={encoded}"
 
 def build_linkedin_url(company_name):
-    clean_company = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or "")).strip()
+    clean_company = re.sub(r'[^a-zA-Z0-9\s]', "", str(company_name or "")).strip()
     encoded = urllib.parse.quote(f'{clean_company} ("VP" OR "Director" OR "Manager") ("Operations" OR "Compliance")')
     return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
 
 def resolve_target_email(company_name, job_title=""):
-    clean_domain = re.sub(r'[^a-zA-Z0-9]', '', str(company_name or "")).lower() + ".com"
+    clean_domain = re.sub(r'[^a-zA-Z0-9]', "", str(company_name or "")).lower() + ".com"
     title_lower = str(job_title or "").lower()
     if "compliance" in title_lower:
         return f"compliance@{clean_domain}"
@@ -512,7 +464,6 @@ def resolve_target_email(company_name, job_title=""):
     return f"operations@{clean_domain}"
 
 def parse_quick_command(text_input):
-    """Refactored parsing using @ delimiter and integer scanning for multi-word contact names[cite: 1, 2]."""
     clean = text_input.replace("/quick", "").strip()
     if "@" in clean:
         match = re.match(r"^([^@]+)@([^\d]+)\s+(\d{1,2})\s+(.+)$", clean)
@@ -522,8 +473,7 @@ def parse_quick_command(text_input):
             priority = safe_int(match.group(3).strip(), 5)
             note = match.group(4).strip()
             return name, company, priority, note
-            
-        # Secondary fallback for @ split
+        
         parts = clean.split("@", 1)
         name = parts[0].strip()
         rest = parts[1].strip().split()
@@ -555,11 +505,12 @@ def parse_quick_command(text_input):
             company = " ".join(tokens[1:p_idx])
             note = " ".join(tokens[p_idx+1:])
             return name, company, priority, note
-    return clean, "Target Firm", 5, ""
+        return clean, "Target Firm", 5, ""
 
 # ==============================================================================
-# 5. GEMINI REST API INTEGRATION[cite: 1]
+# 5. GEMINI REST API INTEGRATION (TRUNCATED PAYLOAD)
 # ==============================================================================
+
 def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"):
     if not GEMINI_API_KEY:
         return None
@@ -580,11 +531,13 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
 def evaluate_job_with_gemini(job):
     if not GEMINI_API_KEY:
         return True, 75, "Fallback pass (No Key)"
-    prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{str(job.get('job_description') or '')[:2500]}"
+    # Architectural Fix 5: Truncate job description to top 1,000 characters
+    desc_truncated = str(job.get("job_description") or "")[:1000]
+    prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{desc_truncated}"
     raw_text = call_gemini_api(prompt, SYSTEM_PROMPT)
     if raw_text:
         try:
-            cleaned_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_text).strip()
+            cleaned_text = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
             res_data = json.loads(cleaned_text)
             raw_score = int(res_data.get("score", 0))
             reason = res_data.get("reason", "N/A")
@@ -596,81 +549,39 @@ def evaluate_job_with_gemini(job):
     return True, 70, "Fallback pass on API failure"
 
 # ==============================================================================
-# 6. GMAIL API DRAFTING[cite: 1, 2]
+# 6. STAGE 1 STRICT FILTER & SINGLE CANDIDATE EVALUATION
 # ==============================================================================
-def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note=""):
-    missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
-    if missing_vars:
-        return False, f"Missing Env Vars: {', '.join(missing_vars)}"
-    
-    token_url = "https://oauth2.googleapis.com/token"
-    token_data = {
-        "client_id": GMAIL_CLIENT_ID,
-        "client_secret": GMAIL_CLIENT_SECRET,
-        "refresh_token": GMAIL_REFRESH_TOKEN,
-        "grant_type": "refresh_token"
-    }
-    try:
-        token_res = requests.post(token_url, data=token_data, timeout=10)
-        access_token = token_res.json().get("access_token")
-        if not access_token:
-            return False, "OAuth Token Refused"
 
-        if is_warm:
-            body_content = generate_warm_email(custom_note)
-            subject = f"Reconnecting - {company_name}"
-        else:
-            body_content = generate_cold_email(job_title, company_name)
-            subject = f"Operations & Systems Alignment - {job_title} @ {company_name}"
-
-        message = EmailMessage()
-        message["To"] = to_email
-        message["From"] = GMAIL_USER
-        message["Subject"] = subject
-        body = f"Hi,\n\n{body_content}\n\nBest regards,\nKevin Miller"
-        message.set_content(body)
-
-        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-        draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
-        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-        res = requests.post(draft_url, headers=headers, json={"message": {"raw": raw_message}}, timeout=10)
-        return (True, "Success") if res.status_code in [200, 201] else (False, f"Gmail Error {res.status_code}")
-    except Exception as e:
-        return False, str(e)
-        # ==============================================================================
-# 6. STAGE 1 STRICT FILTER & PIPELINE EXECUTION
-# ==============================================================================
 def passes_strict_filter(job):
-    """Stage 1 rigid filter pipeline enforcing pay, distance, title & hard ban rules[cite: 1, 2]."""
     title = str(job.get("job_title") or "").lower()
     description = str(job.get("job_description") or "").lower()
     company = str(job.get("employer_name") or "").lower()
     state = str(job.get("job_state") or "").upper()
     city = str(job.get("job_city") or "").lower()
     salary_str, max_sal = extract_salary(job)
-
-    # 1. Company Cooldown Audit (14-day window)[cite: 1]
+    
+    # 1. Company Cooldown Audit (14-day window)
     if is_company_on_cooldown(company):
         return False
-
-    # 2. Base Salary Floor ($50K Hard Drop)[cite: 1, 2]
+        
+    # 2. Base Salary Floor ($50K Hard Drop)
     min_sal_floor = safe_int(get_filter("min_salary"), 50000)
     if max_sal > 0 and max_sal < min_sal_floor:
         return False
-
-    # 3. Location & Commute (35-mile Farmington/Detroit radius)[cite: 1, 2]
+        
+    # 3. Location & Commute (35-mile radius)
     valid_cities = get_filter("valid_cities", [])
     is_mi = (state == "MI") or "michigan" in city or any(c in city for c in valid_cities)
     is_remote = job.get("job_is_remote", False) or "remote" in description[:300] or "work from home" in description[:300]
     if not (is_mi or is_remote):
         return False
-
-    # 4. Experience-to-Pay Audit[cite: 1]
+        
+    # 4. Experience-to-Pay Audit
     exp_floor = safe_int(get_filter("experience_salary_floor"), 60000)
     if any(k in description for k in ["3+ years", "3-5 years", "4+ years"]) and (0 < max_sal < exp_floor):
         return False
-
-    # 5. Exclusions & Hard Keyword Bans[cite: 1, 2]
+        
+    # 5. Exclusions & Hard Keyword Bans
     if any(term in title for term in get_filter("title_exclusions", [])):
         return False
     if any(comp in company for comp in get_filter("company_exclusions", [])):
@@ -679,66 +590,8 @@ def passes_strict_filter(job):
         return False
     if any(sen in title for sen in get_filter("seniority_exclusions", [])):
         return False
-
+        
     return True
-
-def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id):
-    """Sends enriched job evaluation card with interactive action shortcuts to Telegram[cite: 1, 2]."""
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return
-
-    company = html.escape(str(job.get("employer_name") or "N/A"))
-    title = html.escape(str(job.get("job_title") or "N/A"))
-    apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
-    apollo_url = html.escape(build_apollo_url(company), quote=True)
-    linkedin_url = html.escape(build_linkedin_url(company), quote=True)
-    matched_str = ", ".join(matched_skills[:4]).title() if matched_skills else "General Ops"
-
-    card_text = (
-        f"<b>{title}</b>\n"
-        f"<b>Company:</b> {company}\n"
-        f"<b>Posting Recency:</b> {age_badge}\n"
-        f"<b>Work Style & Pay:</b> {work_style} | {salary_str}\n"
-        f"<b>Fit Score:</b> {score}/100 | <b>Skill Match:</b> {overlap_pct}%\n"
-        f"<b>Key Overlap:</b> <code>{html.escape(matched_str)}</code>\n"
-        f"<b>Default Target:</b> <code>{html.escape(target_email)}</code>\n\n"
-        f"<b>Fit Reason:</b> {html.escape(reason)}\n\n"
-        f"<a href='{apply_link}'>1. Apply Direct</a>\n"
-        f"<a href='{apollo_url}'>2. Open Leads in Apollo</a>\n"
-        f"<a href='{linkedin_url}'>3. Open Leadership on LinkedIn</a>\n\n"
-        f"<b>Mobile Swipe Shortcuts:</b>\n"
-        f" <code>draft</code> - Gmail Draft\n"
-        f" <code>/f &lt;days&gt;</code> - Snooze Followup\n"
-        f" <code>/tw</code> or <code>/cw</code> - Log Warm\n"
-        f" <code>/cc</code> or <code>/tc</code> - Log Cold\n"
-        f" <code>/x</code> - Mark Dead"
-    )
-
-    reply_markup = {
-        "inline_keyboard": [
-            [
-                {"text": "✉️ Draft Email", "callback_data": f"approve:{short_id}"},
-                {"text": "✅ Mark Applied", "callback_data": f"apply:{short_id}"}
-            ],
-            [
-                {"text": "🔄 Pivot VP Lead", "callback_data": f"pivot:{short_id}"},
-                {"text": "❌ Mark Dead", "callback_data": f"dead:{short_id}"}
-            ]
-        ]
-    }
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": card_text[:3990],
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-        "reply_markup": reply_markup
-    }
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Failed to post card to Telegram: {e}", flush=True)
 
 def process_single_candidate(job):
     ai_pass, score, reason = evaluate_job_with_gemini(job)
@@ -759,85 +612,66 @@ def process_single_candidate(job):
             "short_id": short_id
         }
     return None
+    # ==============================================================================
+# 7. GMAIL API DRAFTING & CRM LOGGING
+# ==============================================================================
 
-def run_job_pipeline(chat_id=None, top_n=2):
-    """Executes multi-query job fetch, candidate evaluation, and CRM logging[cite: 1, 2]."""
-    print(">>> Starting Job Search Pipeline...", flush=True)
-    if chat_id:
-        send_status_update(chat_id, "Fetching raw listings from JSearch...")
+def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note=""):
+    missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
+    if missing_vars:
+        return False, f"Missing Env Vars: {', '.join(missing_vars)}"
+    token_url = "https://oauth2.googleapis.com/token"
+    token_data = {
+        "client_id": GMAIL_CLIENT_ID,
+        "client_secret": GMAIL_CLIENT_SECRET,
+        "refresh_token": GMAIL_REFRESH_TOKEN,
+        "grant_type": "refresh_token"
+    }
+    try:
+        token_res = requests.post(token_url, data=token_data, timeout=10)
+        access_token = token_res.json().get("access_token")
+        if not access_token:
+            return False, "OAuth Token Refused"
+        
+        if is_warm:
+            body_content = generate_warm_email(custom_note)
+            subject = f"Reconnecting - {company_name}"
+        else:
+            body_content = generate_cold_email(job_title, company_name)
+            subject = f"Operations & Systems Alignment - {job_title} @ {company_name}"
+            
+        message = EmailMessage()
+        message["To"] = to_email
+        message["From"] = GMAIL_USER
+        message["Subject"] = subject
+        body = f"Hi,\n\n{body_content}\n\nBest regards,\nKevin Miller"
+        message.set_content(body)
+        
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        res = requests.post(draft_url, headers=headers, json={"message": {"raw": raw_message}}, timeout=10)
+        return (True, "Success") if res.status_code in [200, 201] else (False, f"Gmail Error {res.status_code}")
+    except Exception as e:
+        return False, str(e)
 
-    seen_hashes = set()
-    candidate_pool = []
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
-
-    rapidapi_key = os.environ.get("RAPIDAPI_KEY")
-    openweb_key = os.environ.get("OPENWEBNINJA_KEY")
-    if rapidapi_key:
-        headers = {"X-RapidAPI-Key": rapidapi_key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
-        api_url = "https://jsearch.p.rapidapi.com/search"
-    else:
-        headers = {"x-api-key": openweb_key} if openweb_key else {}
-        api_url = JSEARCH_URL
-
-    target_queries = get_filter("target_queries", [])
-    for query in target_queries:
+def log_to_sheets_crm(payload, max_retries=3):
+    if not CRM_WEBHOOK_URL:
+        return False
+    delay = 1.0
+    for attempt in range(max_retries):
         try:
-            params = {"query": query, "page": "1", "num_pages": "1", "date_posted": "month"}
-            res = requests.get(api_url, headers=headers, params=params, timeout=35)
+            res = requests.post(CRM_WEBHOOK_URL, json=payload, timeout=10)
             if res.status_code == 200:
-                jobs = res.json().get("data", [])
-                for job in jobs:
-                    company = job.get("employer_name") or ""
-                    title = job.get("job_title") or ""
-                    job_hash = generate_dedup_hash(company, title)
-                    if job_hash in seen_hashes or is_job_seen_db(job_hash):
-                        continue
-                    seen_hashes.add(job_hash)
-                    save_seen_job_db(job_hash)
-
-                    if passes_strict_filter(job):
-                        candidate_pool.append(job)
+                return True
         except Exception as e:
-            print(f"Fetch Exception ({query}): {e}", flush=True)
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(executor.map(process_single_candidate, candidate_pool))
-
-    evaluated_matches = [r for r in results if r is not None]
-    evaluated_matches.sort(key=lambda x: x["score"], reverse=True)
-    top_matches = evaluated_matches[:top_n]
-
-    for item in top_matches:
-        job = item["job"]
-        send_telegram_card(
-            job, item["score"], item["reason"], item["target_email"],
-            item["age_badge"], item["salary_str"], item["work_style"],
-            item["overlap_pct"], item["matched_skills"], item["short_id"]
-        )
-
-        # Log to Google Sheets CRM (10-column schema)[cite: 1, 2]
-        log_to_sheets_crm({
-            "action": "add_row",
-            "target_code": "TC",
-            "row_data": [
-                today_str,                              # A: First Contact Date
-                today_str,                              # B: Last Contact Date
-                job.get("employer_name"),              # C: Company
-                job.get("job_title"),                  # D: Title
-                item["target_email"],                  # E: Email
-                5,                                     # F: Priority Score (1-10)
-                "Matched",                             # G: Status
-                followup_date,                         # H: Next Followup
-                job.get("job_apply_link", ""),         # I: Apply Link
-                f"Matched via Pipeline | {item['reason']}" # J: Notes
-            ]
-        })
-
-    return len(top_matches)
+            print(f"CRM Webhook Attempt {attempt+1} Failed: {e}", flush=True)
+        time.sleep(delay)
+        delay *= 2.0
+    send_health_alert(f"Failed to log payload to Google Sheets after {max_retries} attempts.")
+    return False
 
 def fetch_networking_cards(target_code="CW", qty=2):
-    """Pulls cards from 10-column Google Apps Script schema[cite: 1, 2]."""
     if not CRM_WEBHOOK_URL:
         return []
     try:
@@ -866,29 +700,168 @@ def send_telegram_message(chat_id, text, reply_markup=None):
     except Exception as e:
         print(f"Telegram Post Error: {e}", flush=True)
 
-# ==============================================================================
-# 7. FLASK SERVER & MOBILE COMMAND WEBHOOK ROUTER[cite: 1, 2]
-# ==============================================================================
-@app.route('/', methods=['GET'])
-def health_check():
-    return "CRM & Job Pipeline Engine Active", 200
-
-@app.route("/telegram", methods=["POST"])
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
+def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    company = html.escape(str(job.get("employer_name") or "N/A"))
+    title = html.escape(str(job.get("job_title") or "N/A"))
+    apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
+    apollo_url = html.escape(build_apollo_url(company), quote=True)
+    linkedin_url = html.escape(build_linkedin_url(company), quote=True)
+    matched_str = ", ".join(matched_skills[:4]).title() if matched_skills else "General Ops"
+    
+    card_text = (
+        f"<b>{title}</b>\n"
+        f"<b>Company:</b> {company}\n"
+        f"<b>Posting Recency:</b> {age_badge}\n"
+        f"<b>Work Style & Pay:</b> {work_style} | {salary_str}\n"
+        f"<b>Fit Score:</b> {score}/100 | <b>Skill Match:</b> {overlap_pct}%\n"
+        f"<b>Key Overlap:</b> <code>{html.escape(matched_str)}</code>\n"
+        f"<b>Default Target:</b> <code>{html.escape(target_email)}</code>\n\n"
+        f"<b>Fit Reason:</b> {html.escape(reason)}\n\n"
+        f"<a href='{apply_link}'>1. Apply Direct</a>\n"
+        f"<a href='{apollo_url}'>2. Open Leads in Apollo</a>\n"
+        f"<a href='{linkedin_url}'>3. Open Leadership on LinkedIn</a>\n\n"
+        f"<b>Mobile Swipe Shortcuts:</b>\n"
+        f"  <code>draft</code> - Gmail Draft\n"
+        f"  <code>/f &lt;days&gt;</code> - Snooze Followup\n"
+        f"  <code>/tw</code> or <code>/cw</code> - Log Warm\n"
+        f"  <code>/cc</code> or <code>/tc</code> - Log Cold\n"
+        f"  <code>/x</code> - Mark Dead"
+    )
+    
+    reply_markup = {
+        "inline_keyboard": [
+            [
+                {"text": "✉️ Draft Email", "callback_data": f"approve:{short_id}"},
+                {"text": "✅ Mark Applied", "callback_data": f"apply:{short_id}"}
+            ],
+            [
+                {"text": "🔄 Pivot VP Lead", "callback_data": f"pivot:{short_id}"},
+                {"text": "❌ Mark Dead", "callback_data": f"dead:{short_id}"}
+            ]
+        ]
+    }
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": card_text[:3990],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": reply_markup
+    }
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"status": "ignored"}), 200
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Failed to post card to Telegram: {e}", flush=True)
 
-        # ----------------------------------------------------------------------
-        # 1. Interactive Inline Keyboard Callbacks[cite: 1, 2]
-        # ----------------------------------------------------------------------
+# ==============================================================================
+# 8. PARALLEL PIPELINE EXECUTION (PARALLEL JSEARCH + EARLY-EXIT CIRCUIT BREAKER)
+# ==============================================================================
+
+def fetch_single_query_jobs(query_args):
+    """Worker function for parallel JSearch API query execution."""
+    query, api_url, headers = query_args
+    params = {"query": query, "page": "1", "num_pages": "1", "date_posted": "month"}
+    try:
+        # Architectural Fix 3: 10s request timeout
+        res = requests.get(api_url, headers=headers, params=params, timeout=10)
+        if res.status_code == 200:
+            return res.json().get("data", [])
+    except Exception as e:
+        print(f"Fetch Exception ({query}): {e}", flush=True)
+    return []
+
+def run_job_pipeline(chat_id=None, top_n=2):
+    print(">>> Starting Job Search Pipeline...", flush=True)
+    if chat_id:
+        send_status_update(chat_id, "Fetching raw listings from JSearch in parallel...")
+    
+    seen_hashes = set()
+    candidate_pool = []
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
+    
+    rapidapi_key = os.environ.get("RAPIDAPI_KEY")
+    openweb_key = os.environ.get("OPENWEBNINJA_KEY")
+    if rapidapi_key:
+        headers = {"X-RapidAPI-Key": rapidapi_key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
+        api_url = "https://jsearch.p.rapidapi.com/search"
+    else:
+        headers = {"x-api-key": openweb_key} if openweb_key else {}
+        api_url = JSEARCH_URL
+
+    target_queries = get_filter("target_queries", [])
+    query_tasks = [(q, api_url, headers) for q in target_queries]
+
+    # Architectural Fix 2: Parallel JSearch query fetching via ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(len(target_queries), 8) or 4) as executor:
+        query_results = executor.map(fetch_single_query_jobs, query_tasks)
+        for jobs in query_results:
+            for job in jobs:
+                company = job.get("employer_name") or ""
+                title = job.get("job_title") or ""
+                job_hash = generate_dedup_hash(company, title)
+                if job_hash in seen_hashes or is_job_seen_db(job_hash):
+                    continue
+                seen_hashes.add(job_hash)
+                save_seen_job_db(job_hash)
+                if passes_strict_filter(job):
+                    candidate_pool.append(job)
+
+    # Architectural Fix 4: Gemini Early-Exit Circuit Breaker (top_n Cap)
+    top_matches = []
+    for candidate in candidate_pool:
+        if len(top_matches) >= top_n:
+            print(f"Early-exit circuit breaker triggered: reached top_{top_n} matches.", flush=True)
+            break
+        result = process_single_candidate(candidate)
+        if result:
+            top_matches.append(result)
+
+    top_matches.sort(key=lambda x: x["score"], reverse=True)
+
+    for item in top_matches:
+        job = item["job"]
+        send_telegram_card(
+            job, item["score"], item["reason"], item["target_email"],
+            item["age_badge"], item["salary_str"], item["work_style"],
+            item["overlap_pct"], item["matched_skills"], item["short_id"]
+        )
+        
+        log_to_sheets_crm({
+            "action": "add_row",
+            "target_code": "TC",
+            "row_data": [
+                today_str,
+                today_str,
+                job.get("employer_name"),
+                job.get("job_title"),
+                item["target_email"],
+                5,
+                "Matched",
+                followup_date,
+                job.get("job_apply_link", ""),
+                f"Matched via Pipeline | {item['reason']}"
+            ]
+        })
+        
+    return len(top_matches)
+
+# ==============================================================================
+# 9. ASYNC WORKLOAD PROCESSOR & WEBHOOK CONTROLLER
+# ==============================================================================
+
+def process_webhook_payload_async(data):
+    """Executes heavy workloads in background worker threads so HTTP return is instant."""
+    try:
+        # 1. Interactive Inline Keyboard Callbacks
         if "callback_query" in data:
             cb = data["callback_query"]
             chat_id = cb["message"]["chat"]["id"]
             cb_data = cb.get("data", "")
-
+            
             if cb_data.startswith("approve:"):
                 short_id = cb_data.split(":")[1]
                 job = get_job_from_cache(short_id)
@@ -897,9 +870,8 @@ def telegram_webhook():
                     ok, msg = create_gmail_draft(target, job.get("employer_name"), job.get("job_title"), is_warm=False)
                     send_telegram_message(chat_id, f"<b>Gmail Draft Status:</b> {msg}")
                 else:
-                    send_telegram_message(chat_id, "❌ Job cache expired.")
+                    send_telegram_message(chat_id, "⚠️ Job cache expired.")
             elif cb_data.startswith("apply:"):
-                short_id = cb_data.split(":")[1]
                 send_telegram_message(chat_id, "✅ Marked job as applied in CRM.")
             elif cb_data.startswith("pivot:"):
                 short_id = cb_data.split(":")[1]
@@ -907,7 +879,6 @@ def telegram_webhook():
                 comp = job.get("employer_name", "Target Firm") if job else "Target Firm"
                 send_telegram_message(chat_id, f"🔄 Lead pivoted for {comp}.\nApollo: {build_apollo_url(comp)}")
             elif cb_data.startswith("dead:"):
-                short_id = cb_data.split(":")[1]
                 send_telegram_message(chat_id, "❌ Job record archived to Dead.")
             elif cb_data.startswith("adj_pay_"):
                 delta = cb_data.replace("adj_pay_", "")
@@ -919,33 +890,27 @@ def telegram_webhook():
             elif cb_data == "reset_filters":
                 init_db()
                 send_telegram_message(chat_id, "<b>Search filters reset to default parameters.</b>")
-
-            return jsonify({"status": "ok"}), 200
+            return
 
         if "message" not in data:
-            return jsonify({"status": "ignored"}), 200
+            return
 
         msg = data["message"]
         chat_id = msg["chat"]["id"]
         raw_text = msg.get("text", "").strip()
-
-        # Strip optional bot handles (e.g. /search@MyBot -> /search)[cite: 1]
         text = re.sub(r"@\w+bot", "", raw_text, flags=re.IGNORECASE).strip()
         today_str = datetime.now().strftime("%Y-%m-%d")
 
-        # ----------------------------------------------------------------------
-        # 2. Shorthand Commands & Pull Triggers (/t, /c, /cw, /cc)[cite: 2]
-        # ----------------------------------------------------------------------
-        # /t [qty] -> Pull N job cards (Default: 2)[cite: 2]
+        # 2. Pipeline Run Trigger (/t [qty])
         if re.match(r"^/t(?:\s+(\d+))?$", text):
             m = re.match(r"^/t(?:\s+(\d+))?$", text)
             qty = safe_int(m.group(1), 2)
-            send_telegram_message(chat_id, f"⚡ Triggering Job Search Pipeline (Top {qty})...")
+            send_telegram_message(chat_id, f"🚀 Triggering Job Search Pipeline (Top {qty})...")
             count = run_job_pipeline(chat_id, top_n=qty)
-            send_telegram_message(chat_id, f"✅ Pipeline Completed. {count} cards dispatched.")
-            return jsonify({"status": "ok"}), 200
+            send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
+            return
 
-        # /c, /cw, /cc [qty] -> Networking Cards with Monospaced Draft Bubbles[cite: 2]
+        # 3. Networking Cards Pull Triggers (/c, /cw, /cc [qty])
         if re.match(r"^/(c|cw|cc)(?:\s+(\d+))?$", text):
             m = re.match(r"^/(c|cw|cc)(?:\s+(\d+))?$", text)
             cmd_type = m.group(1)
@@ -954,13 +919,11 @@ def telegram_webhook():
             cards = fetch_networking_cards(target_code, qty)
             if not cards:
                 send_telegram_message(chat_id, f"No active networking cards found for <code>/{cmd_type}</code>.")
-                return jsonify({"status": "ok"}), 200
-
+                return
             for c in cards:
                 is_warm = (cmd_type in ["c", "cw"])
                 draft_text = generate_warm_email(c.get("note", "")) if is_warm else generate_cold_email(c.get("title", "Operations Specialist"), c.get("company", "Target Firm"))
                 monospaced_draft = format_email_block(draft_text)
-                
                 card_msg = (
                     f"👤 <b>{c.get('name', 'Contact')}</b> | {c.get('company', 'Company')}\n"
                     f"<b>Priority Tier:</b> {c.get('priority', 5)}/10\n"
@@ -968,49 +931,41 @@ def telegram_webhook():
                     f"<b>Tap-to-Copy Email Draft:</b>\n{monospaced_draft}"
                 )
                 send_telegram_message(chat_id, card_msg)
-            return jsonify({"status": "ok"}), 200
+            return
 
-        # ----------------------------------------------------------------------
-        # 3. Single-Message Output Priority Batcher (/p 1-10)[cite: 2]
-        # ----------------------------------------------------------------------
+        # 4. Priority Batcher (/p 1-10)
         if re.match(r"^/p\s+(\d+)$", text):
             priority_lvl = safe_int(re.match(r"^/p\s+(\d+)$", text).group(1))
+            contacts = []
             if CRM_WEBHOOK_URL:
                 try:
                     resp = requests.get(f"{CRM_WEBHOOK_URL}?action=get_priority&level={priority_lvl}", timeout=10).json()
                     contacts = resp.get("contacts", [])
                 except Exception:
                     contacts = []
-            else:
-                contacts = []
-
             if not contacts:
                 send_telegram_message(chat_id, f"No active contacts found at Priority Tier {priority_lvl}.")
-                return jsonify({"status": "ok"}), 200
-
-            out_msg = f"<b>PRIORITY {priority_lvl} CONTACTS ({len(contacts)} Total)</b>\n\n"
+                return
+            out_msg = f"📌 <b>PRIORITY {priority_lvl} CONTACTS ({len(contacts)} Total)</b>\n\n"
             for idx, c in enumerate(contacts, 1):
                 out_msg += f"{idx}. <b>{c.get('name')}</b> | {c.get('company')}\n"
                 out_msg += f"   Last Contact: {c.get('last_contact')} | Next: {c.get('next_followup')}\n"
                 out_msg += f"   Note: <i>{c.get('latest_note', 'No notes logged')}</i>\n\n"
             send_telegram_message(chat_id, out_msg)
-            return jsonify({"status": "ok"}), 200
+            return
 
-        # ----------------------------------------------------------------------
-        # 4. Monospaced /quick Template & Multi-Word @ Name Parser[cite: 1, 2]
-        # ----------------------------------------------------------------------
+        # 5. Monospaced /quick Template & Quick Add Parser
         if text == "/quick":
             template_msg = (
                 "Tap the code block below to copy, adjust details, and send:\n\n"
                 "<code>/quick Jane Van Der Bilt @ Acme Corp 9 Spoke at event interested in back-office systems</code>"
             )
             send_telegram_message(chat_id, template_msg)
-            return jsonify({"status": "ok"}), 200
+            return
 
         if text.startswith("/quick "):
             name, company, priority, note = parse_quick_command(text)
             next_followup = (datetime.now() + timedelta(days=calculate_followup_interval(priority))).strftime("%Y-%m-%d")
-            
             payload = {
                 "action": "quick_add",
                 "first_contact": today_str,
@@ -1022,74 +977,63 @@ def telegram_webhook():
                 "note": f"[{today_str}] {note}"
             }
             log_to_sheets_crm(payload)
-            
             resp = (
-                f"👤 <b>Contact Created</b>\n"
+                f"✅ <b>Contact Created</b>\n"
                 f"<b>Name:</b> {name}\n"
                 f"<b>Company:</b> {company}\n"
                 f"<b>Priority:</b> {priority}\n"
                 f"<b>Next Follow-up:</b> {next_followup}"
             )
             send_telegram_message(chat_id, resp)
-            return jsonify({"status": "ok"}), 200
+            return
 
-        # ----------------------------------------------------------------------
-        # 5. Dynamic /search Card, Tap-to-Copy Bubbles & Inline Buttons[cite: 1, 2]
-        # ----------------------------------------------------------------------
+        # 6. Dynamic /search Filters Overview & Inline Adjustments
         if text == "/search":
             min_sal = safe_int(get_filter("min_salary"), 50000)
             exp_sal = safe_int(get_filter("experience_salary_floor"), 60000)
             bans = safe_list(get_filter("title_exclusions"))
             cities = safe_list(get_filter("valid_cities"))
             kws = safe_list(get_filter("required_keywords"))
-
             card_text = (
                 "🔍 <b>Active Search Filters</b>\n"
-                f"• <b>Min Pay:</b> ${min_sal:,} | <b>Exp Floor:</b> ${exp_sal:,}\n"
-                f"• <b>Cities ({len(cities)}):</b> {', '.join(cities[:4]) if cities else 'All'}\n"
-                f"• <b>Banned ({len(bans)}):</b> {', '.join(bans[:3]) if bans else 'None'}\n"
-                f"• <b>Keywords ({len(kws)}):</b> {', '.join(kws[:3]) if kws else 'Any'}\n\n"
-                "<b>⚡ Tap-to-Copy Quick Adjustments</b>\n"
+                f"💰 <b>Min Pay:</b> ${min_sal:,} | <b>Exp Floor:</b> ${exp_sal:,}\n"
+                f"📍 <b>Cities ({len(cities)}):</b> {', '.join(cities[:4]) if cities else 'All'}\n"
+                f"🚫 <b>Banned ({len(bans)}):</b> {', '.join(bans[:3]) if bans else 'None'}\n"
+                f"🔑 <b>Keywords ({len(kws)}):</b> {', '.join(kws[:3]) if kws else 'Any'}\n\n"
+                "<b>Tap-to-Copy Quick Adjustments</b>\n"
                 "<code>pay = 65000</code>\n"
                 "<code>kw + python</code>\n"
                 "<code>ban + sales</code>\n"
                 "<code>city + canton</code>"
             )
-
             inline_keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "💵 Pay +$5k", "callback_data": "adj_pay_+5000"},
-                        {"text": "📉 Pay -$5k", "callback_data": "adj_pay_-5000"}
+                        {"text": "➕ Pay +$5k", "callback_data": "adj_pay_+5000"},
+                        {"text": "➖ Pay -$5k", "callback_data": "adj_pay_-5000"}
                     ],
                     [
-                        {"text": "🏙️ Add Novi", "callback_data": "add_city_novi"},
-                        {"text": "❌ Reset Filters", "callback_data": "reset_filters"}
+                        {"text": "📍 Add Novi", "callback_data": "add_city_novi"},
+                        {"text": "🔄 Reset Filters", "callback_data": "reset_filters"}
                     ]
                 ]
             }
             send_telegram_message(chat_id, card_text, reply_markup=inline_keyboard)
-            return jsonify({"status": "ok"}), 200
+            return
 
-        # ----------------------------------------------------------------------
-        # 6. Telemetry & Utility Commands (/s, /health, /efficiency)[cite: 2]
-        # ----------------------------------------------------------------------
+        # 7. Telemetry & Utility Commands (/s, /health, /efficiency)
         if text == "/s":
             send_telegram_message(chat_id, "📊 <b>Overdue Status:</b> 0 overdue follow-ups across all tabs.")
-            return jsonify({"status": "ok"}), 200
-
+            return
         if text == "/health":
-            send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite persistent | Webhooks Active")
-            return jsonify({"status": "ok"}), 200
-
+            send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite WAL persistent | Webhooks Active")
+            return
         if text == "/efficiency":
             ratio = (TOTAL_INTERVIEWS_SET / TOTAL_MESSAGES_SENT * 100) if TOTAL_MESSAGES_SENT > 0 else 0.0
             send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({TOTAL_INTERVIEWS_SET} interviews / {TOTAL_MESSAGES_SENT} sent)")
-            return jsonify({"status": "ok"}), 200
+            return
 
-        # ----------------------------------------------------------------------
-        # 7. Swipe-Reply Parameter Mutation & Action Handlers[cite: 1, 2]
-        # ----------------------------------------------------------------------
+        # 8. Mobile Parameter Mutation & Inline Action Shortcuts
         cmd_body = re.sub(r"^/search\s*", "", text).strip()
         if any(op in cmd_body for op in ["=", "+", "-"]):
             match = re.match(r"^([a-zA-Z_]+)\s*(=|\+|-)\s*(.+)$", cmd_body)
@@ -1100,19 +1044,16 @@ def telegram_webhook():
                 val_arg = f"{op} {val_str}" if op in ["+", "-"] else val_str
                 update_res = update_filter_param(raw_key, val_arg)
                 send_telegram_message(chat_id, update_res)
-                return jsonify({"status": "ok"}), 200
+                return
 
-        # Inline Swipe Reply Actions: /f, /n, /pivot, /tw, /cw, /cc, /tc, /x[cite: 2]
         if text.startswith("/f "):
             days = safe_int(text.split()[1], 7)
-            send_telegram_message(chat_id, f"🗓️ Follow-up set in {days} days.")
-            return jsonify({"status": "ok"}), 200
-
+            send_telegram_message(chat_id, f"📅 Follow-up set in {days} days.")
+            return
         if text.startswith("/n "):
             note_str = text[3:].strip()
             send_telegram_message(chat_id, f"📝 Appended note: <i>{html.escape(note_str)}</i>")
-            return jsonify({"status": "ok"}), 200
-
+            return
         if text in ["/pivot", "/tw", "/cw", "/cc", "/tc", "/x"]:
             action_map = {
                 "/pivot": "Lead pivoted & Apollo link generated.",
@@ -1123,12 +1064,39 @@ def telegram_webhook():
                 "/x": "Archived lead to Died / Killed."
             }
             send_telegram_message(chat_id, f"⚡ Action Executed: {action_map[text]}")
-            return jsonify({"status": "ok"}), 200
-
-        return jsonify({"status": "ignored"}), 200
+            return
 
     except Exception as e:
-        print(f"Telegram Webhook Error: {e}", flush=True)
+        print(f"Async Webhook Processing Error: {e}", flush=True)
+
+# ==============================================================================
+# 10. FLASK SERVER & STACKED WEBHOOK ROUTER
+# ==============================================================================
+
+@app.route('/', methods=['GET'])
+def health_check():
+    return "CRM & Job Pipeline Engine Active", 200
+
+# Architectural Fix 7: Stacked dual route decorators
+@app.route("/telegram", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    """
+    Architectural Fix 1: Instant non-blocking execution (<0.05s return).
+    Dispatches workload to background thread and returns HTTP 200 immediately.
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"status": "ignored"}), 200
+
+        # Offload all processing to background thread immediately
+        threading.Thread(target=process_webhook_payload_async, args=(data,)).start()
+        
+        # Line 1/2 Instant Return (<50ms response to Telegram)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        print(f"Telegram Webhook Dispatch Error: {e}", flush=True)
         return jsonify({"status": "error", "message": str(e)}), 200
 
 if __name__ == "__main__":
