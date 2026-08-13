@@ -87,14 +87,29 @@ def init_db():
             value_json TEXT
         )""")
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_drafts (
+            to_email TEXT,
+            subject TEXT,
+            draft_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (to_email, subject)
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS sheet_row_map (
             sheet_uuid TEXT PRIMARY KEY,
             sheet_tab TEXT,
             sheet_row_index INTEGER,
             contact_name TEXT,
             contact_company TEXT,
+            telegram_message_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        # Migration guard: add column if table pre-dates this field
+        try:
+            conn.execute("ALTER TABLE sheet_row_map ADD COLUMN telegram_message_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_tg_msg ON sheet_row_map(telegram_message_id)")
         
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -281,33 +296,41 @@ def is_job_seen_db(job_hash):
         return False
 
 def save_seen_job_db(job_hash):
-    """Save seen job hash with thread-safe locking (30s timeout)."""
+    """Save seen job hash with thread-safe locking (30s timeout).
+    Prevents unhandled exceptions in thread pools.
+    """
     if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (seen_job)", flush=True)
-        return
+        print(f"DB Write Lock Timeout (seen_job: {job_hash})", flush=True)
+        return False
     try:
         with get_db_conn() as conn:
             conn.execute("INSERT OR IGNORE INTO seen_jobs (job_hash) VALUES (?)", (job_hash,))
             conn.commit()
+        return True
     except Exception as e:
-        print(f"DB Seen Hash Error: {e}", flush=True)
+        print(f"DB Seen Hash Error ({job_hash}): {e}", flush=True)
+        return False
     finally:
         DB_WRITE_LOCK.release()
 
 def add_company_cooldown(company_name):
-    """Add company cooldown with thread-safe locking (30s timeout)."""
+    """Add company cooldown with thread-safe locking (30s timeout).
+    Prevents unhandled exceptions in thread pools.
+    """
     clean = str(company_name or "").lower().strip()
     if not clean:
-        return
+        return False
     if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (cooldown)", flush=True)
-        return
+        print(f"DB Write Lock Timeout (cooldown: {clean})", flush=True)
+        return False
     try:
         with get_db_conn() as conn:
             conn.execute("INSERT OR REPLACE INTO company_cooldown (company_clean, logged_at) VALUES (?, CURRENT_TIMESTAMP)", (clean,))
             conn.commit()
+        return True
     except Exception as e:
-        print(f"DB Cooldown Save Error: {e}", flush=True)
+        print(f"DB Cooldown Save Error ({clean}): {e}", flush=True)
+        return False
     finally:
         DB_WRITE_LOCK.release()
 
@@ -323,6 +346,69 @@ def is_company_on_cooldown(company_name):
     except Exception:
         return False
 
+def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_name="", contact_company=""):
+    """Persist (telegram_message_id, sheet_uuid, sheet_tab) so swipe-replies can resolve the CRM row."""
+    if not telegram_message_id or not sheet_uuid:
+        return False
+    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
+        print(f"DB Write Lock Timeout (msg_map: {telegram_message_id})", flush=True)
+        return False
+    try:
+        with get_db_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO sheet_row_map 
+                (sheet_uuid, sheet_tab, contact_name, contact_company, telegram_message_id, created_at)
+                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sheet_row_map WHERE sheet_uuid = ?), CURRENT_TIMESTAMP))
+            """, (sheet_uuid, sheet_tab, contact_name, contact_company, telegram_message_id, sheet_uuid))
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"DB Message Mapping Save Error ({telegram_message_id}): {e}", flush=True)
+        return False
+    finally:
+        DB_WRITE_LOCK.release()
+
+def get_mapping_from_message_id(telegram_message_id):
+    """Resolve a replied-to Telegram message back to its CRM sheet_uuid/tab, or None if unmapped."""
+    if not telegram_message_id:
+        return None
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT sheet_uuid, sheet_tab, contact_name, contact_company FROM sheet_row_map WHERE telegram_message_id = ?",
+                (telegram_message_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return {"sheet_uuid": row[0], "sheet_tab": row[1], "contact_name": row[2], "contact_company": row[3]}
+            return None
+    except Exception as e:
+        print(f"DB Message Mapping Lookup Error ({telegram_message_id}): {e}", flush=True)
+        return None
+
+def build_crm_payload(action, sheet_uuid=None, **kwargs):
+    """Standardize outbound CRM payloads: every action includes rowOperationOrder DESC for bottom-to-top Apps Script loops."""
+    payload = {"action": action, "rowOperationOrder": "DESC"}
+    if sheet_uuid:
+        payload["sheet_uuid"] = sheet_uuid
+    payload.update(kwargs)
+    return payload
+
+def resolve_reply_mapping(msg, chat_id, command_label):
+    """For swipe-reply commands, resolve reply_to_message -> sheet_uuid mapping.
+    Sends a Telegram warning and returns None if reply context or mapping is missing.
+    """
+    reply_msg = msg.get("reply_to_message")
+    if not reply_msg:
+        send_telegram_message(chat_id, f"⚠️ <code>{html.escape(command_label)}</code> requires a reply context. Please reply to a job/contact card message.")
+        return None
+    mapping = get_mapping_from_message_id(reply_msg.get("message_id"))
+    if not mapping:
+        send_telegram_message(chat_id, "⚠️ No CRM record found for this card. Please retry with /t or /c to regenerate it.")
+        return None
+    return mapping
+
 # ==============================================================================
 # 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE
 # ==============================================================================
@@ -334,26 +420,40 @@ def calculate_followup_interval(priority_score):
         return 14
 
 def sanitize_text(text):
+    """Strip corporate fluff while preserving apostrophes, hyphens, and paragraph breaks."""
     if not text:
         return ""
-    cleaned = re.sub(r'[\u2014\u2013\-;:"\(\)]', "", str(text))
+    cleaned = str(text)
+    cleaned = re.sub(r'[\u2014\u2013]', "", cleaned)  # em-dash / en-dash only
+    cleaned = re.sub(r'[;:]', "", cleaned)
     buzzwords = ["leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm"]
     for bw in buzzwords:
         cleaned = re.sub(rf'\b{bw}\b', "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\b(\w+),\s*(\w+),\s*and\s*(\w+)\b', r'\1 and \2', cleaned)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)  # collapse horizontal whitespace only
+    cleaned = re.sub(r' *\n *', '\n', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)  # cap excess blank lines, keep \n\n breaks
+    return cleaned.strip()
+
+def enforce_sentence_limit(text, max_sentences):
+    """Truncate text to at most max_sentences sentences."""
+    sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
+    return ' '.join(sentences[:max_sentences])
 
 def generate_cold_email(job_title, company_name, core_exp="wealth ops and process automation"):
+    """Full cold email: greeting, strict 2-sentence body, sign-off as separate paragraphs."""
     s1 = f"I saw the {job_title} role at {company_name} and wanted to highlight my background in {core_exp}."
     s2 = "Would you be open to a brief 5 minute call next week to discuss alignment?"
-    return f"{sanitize_text(s1)} {sanitize_text(s2)}"
+    body = enforce_sentence_limit(f"{sanitize_text(s1)} {sanitize_text(s2)}", 2)
+    return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
 
 def generate_warm_email(note_context=""):
+    """Full warm email: greeting, strict 3-sentence body, sign-off as separate paragraphs."""
     s1 = sanitize_text(note_context) if note_context else "I hope you have been doing well."
     s2 = "I am currently interning in wealth ops at Signal Advisors, a fast growing startup in downtown Detroit."
     s3 = "I am wondering what you have been up to lately, and would love to reconnect over coffee or a quick call if you have time."
-    return f"{s1} {s2} {s3}"
+    body = enforce_sentence_limit(f"{s1} {s2} {s3}", 3)
+    return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
 
 def format_email_block(email_text):
     sanitized = sanitize_text(email_text)
@@ -493,16 +593,40 @@ def build_linkedin_url(company_name):
     encoded = urllib.parse.quote(f'{clean_company} ("VP" OR "Director" OR "Manager") ("Operations" OR "Compliance")')
     return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
 
-def resolve_target_email(company_name, job_title=""):
-    clean_domain = re.sub(r'[^a-zA-Z0-9]', "", str(company_name or "")).lower() + ".com"
+def extract_domain_from_website(url):
+    """Parse a root domain (no scheme/www/path) out of a company website URL, or None if unusable."""
+    if not url:
+        return None
+    url = str(url).strip()
+    if not url:
+        return None
+    if "://" not in url:
+        url = f"http://{url}"
+    try:
+        netloc = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return None
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc or None
+
+def resolve_target_email(company_name, job_title="", employer_website=None):
+    """Resolve target email. Prefers the real domain parsed from employer_website;
+    falls back to a cleaned company-name guess flagged with [⚠️ Fallback Email].
+    """
+    domain = extract_domain_from_website(employer_website)
+    is_fallback = domain is None
+    if is_fallback:
+        domain = re.sub(r'[^a-zA-Z0-9]', "", str(company_name or "")).lower() + ".com"
     title_lower = str(job_title or "").lower()
+    fallback_warning = " [⚠️ Fallback Email]" if is_fallback else ""
     if "compliance" in title_lower:
-        return f"compliance@{clean_domain}"
+        return f"compliance@{domain}{fallback_warning}"
     elif any(kw in title_lower for kw in ["wealth", "custody", "brokerage", "ria"]):
-        return f"wealthops@{clean_domain}"
+        return f"wealthops@{domain}{fallback_warning}"
     elif any(kw in title_lower for kw in ["systems", "automation", "revops"]):
-        return f"bizops@{clean_domain}"
-    return f"operations@{clean_domain}"
+        return f"bizops@{domain}{fallback_warning}"
+    return f"operations@{domain}{fallback_warning}"
 
 def parse_quick_command(text_input):
     """Strict regex parser for /quick command.
@@ -552,26 +676,38 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
     return None
 
 def evaluate_job_with_gemini(job):
-    """Evaluate job with Gemini. On failure/timeout, set score=0 and status 'Evaluation Pending'."""
+    """Evaluate job with Gemini. On failure/timeout, set score=0 and status 'Evaluation Pending'.
+    Thread-safe with timeout handling: DO NOT assign fake scores on failure.
+    """
     if not GEMINI_API_KEY:
         return True, 75, "Fallback pass (No Key)"
-    desc_truncated = str(job.get("job_description") or "")[:1000]
-    prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{desc_truncated}"
-    raw_text = call_gemini_api(prompt, SYSTEM_PROMPT)
-    if raw_text:
-        try:
-            cleaned_text = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
-            res_data = json.loads(cleaned_text)
-            raw_score = int(res_data.get("score", 0))
-            reason = res_data.get("reason", "N/A")
-            final_score = calculate_hybrid_score_modifier(job, raw_score)
-            return (final_score >= 65), final_score, reason
-        except Exception as e:
-            print(f"Gemini evaluation JSON parse failure: {e}", flush=True)
-            # On parse error, return 0 score with Evaluation Pending status
-            return False, 0, "Evaluation Pending"
-    # On API failure/timeout, set score to 0 and status to "Evaluation Pending" (do NOT assign fake scores)
-    return False, 0, "Evaluation Pending"
+    
+    try:
+        desc_truncated = str(job.get("job_description") or "")[:1000]
+        prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{desc_truncated}"
+        
+        # Call API with timeout handling
+        raw_text = call_gemini_api(prompt, SYSTEM_PROMPT)
+        
+        if raw_text:
+            try:
+                cleaned_text = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
+                res_data = json.loads(cleaned_text)
+                raw_score = int(res_data.get("score", 0))
+                reason = res_data.get("reason", "N/A")
+                final_score = calculate_hybrid_score_modifier(job, raw_score)
+                return (final_score >= 65), final_score, reason
+            except Exception as e:
+                print(f"Gemini evaluation JSON parse failure: {e}", flush=True)
+                # On parse error, return 0 score with Evaluation Pending status
+                return False, 0, "Evaluation Pending"
+        
+        # On API failure/timeout, set score to 0 and status to "Evaluation Pending" (NO fake scores)
+        return False, 0, "Evaluation Pending"
+    
+    except Exception as e:
+        print(f"Gemini evaluation exception: {e}", flush=True)
+        return False, 0, "Evaluation Pending"
 
 # ==============================================================================
 # 6. STAGE 1 STRICT FILTER & SINGLE CANDIDATE EVALUATION
@@ -617,8 +753,8 @@ def process_single_candidate(job):
     if ai_pass:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
         short_id = generate_short_key(raw_id)
-        save_job_to_cache(short_id, job)
-        target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"))
+        sheet_uuid = save_job_to_cache(short_id, job)
+        target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
         age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
         salary_str, _ = extract_salary(job)
         work_style = extract_work_style(job)
@@ -628,33 +764,72 @@ def process_single_candidate(job):
             "target_email": target_email, "age_badge": age_badge,
             "salary_str": salary_str, "work_style": work_style,
             "overlap_pct": overlap_pct, "matched_skills": matched_skills,
-            "short_id": short_id
+            "short_id": short_id, "sheet_uuid": sheet_uuid
         }
     return None
     # ==============================================================================
 # 7. GMAIL API DRAFTING & CRM LOGGING
 # ==============================================================================
-def check_existing_gmail_draft(to_email, company_name, job_title):
-    """Check if a Gmail draft already exists for this contact/role to prevent duplicates.
-    In production, this would query Gmail API drafts.
-    """
+def save_gmail_draft_record(to_email, subject, draft_id):
+    """Persist a created Gmail draft's identity for 24h dedup checks."""
+    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
+        print(f"DB Write Lock Timeout (gmail_draft: {to_email})", flush=True)
+        return False
     try:
-        # TODO: Query Gmail API for existing drafts with matching subject
-        # For now, return False (no existing draft)
+        with get_db_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO gmail_drafts (to_email, subject, draft_id, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (to_email, subject, draft_id)
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"DB Gmail Draft Save Error ({to_email}): {e}", flush=True)
         return False
-    except Exception:
-        return False
+    finally:
+        DB_WRITE_LOCK.release()
+
+def check_existing_gmail_draft(to_email, subject):
+    """Return existing draft metadata if (to_email, subject) was drafted in the last 24h, else None."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT draft_id, created_at FROM gmail_drafts WHERE to_email = ? AND subject = ? AND created_at >= datetime('now', '-1 day')",
+                (to_email, subject)
+            )
+            row = cursor.fetchone()
+            return {"draft_id": row[0], "created_at": row[1]} if row else None
+    except Exception as e:
+        print(f"DB Gmail Draft Lookup Error ({to_email}): {e}", flush=True)
+        return None
 
 def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note=""):
-    """Create Gmail draft with dedup check and token expiry handling."""
+    """Create Gmail draft with 24h dedup check and OAuth token expiry handling."""
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars:
         return False, f"Missing Env Vars: {', '.join(missing_vars)}"
-    
-    # Check for existing draft
-    if check_existing_gmail_draft(to_email, company_name, job_title):
-        return False, "Existing draft found for this contact"
-    
+
+    if is_warm:
+        body_content = generate_warm_email(custom_note)
+        subject = f"Reconnecting - {company_name}"
+    else:
+        body_content = generate_cold_email(job_title, company_name)
+        subject = f"Operations & Systems Alignment - {job_title} @ {company_name}"
+
+    existing = check_existing_gmail_draft(to_email, subject)
+    if existing:
+        if TELEGRAM_CHAT_ID:
+            send_telegram_message(
+                TELEGRAM_CHAT_ID,
+                f"ℹ️ <b>Draft Already Exists</b>\n"
+                f"<b>To:</b> <code>{html.escape(to_email)}</code>\n"
+                f"<b>Subject:</b> <code>{html.escape(subject)}</code>\n"
+                f"<b>Draft ID:</b> <code>{html.escape(str(existing['draft_id']))}</code>\n"
+                f"<b>Created:</b> {html.escape(str(existing['created_at']))}"
+            )
+        return False, "Draft already exists in Gmail"
+
     token_url = "https://oauth2.googleapis.com/token"
     token_data = {
         "client_id": GMAIL_CLIENT_ID,
@@ -665,40 +840,43 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     try:
         token_res = requests.post(token_url, data=token_data, timeout=10)
         token_json = token_res.json()
-        
-        # Check for token expiry errors
+
+        # Any OAuth failure (invalid_grant, revoked, etc.) needs an explicit re-auth alert
         if "error" in token_json:
-            error_code = token_json.get("error")
-            if "invalid_grant" in error_code or "revoked" in error_code:
-                # Send Telegram alert with OAuth link
-                oauth_link = f"https://accounts.google.com/o/oauth2/v2/auth?client_id={GMAIL_CLIENT_ID}&redirect_uri=http://localhost&scope=https://www.googleapis.com/auth/gmail.compose&response_type=code"
-                alert_msg = f"⚠️ <b>Gmail Token Expired</b>\nPlease re-authenticate:\n<a href='{html.escape(oauth_link, quote=True)}'>Authorize Gmail</a>"
-                if TELEGRAM_CHAT_ID:
-                    send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
-                return False, f"Gmail Token Expired: {error_code}"
-        
+            error_code = token_json.get("error", "unknown_error")
+            oauth_link = (
+                "https://accounts.google.com/o/oauth2/v2/auth?"
+                f"client_id={GMAIL_CLIENT_ID}&redirect_uri=http://localhost&"
+                "scope=https://www.googleapis.com/auth/gmail.compose&response_type=code&"
+                "access_type=offline&prompt=consent"
+            )
+            alert_msg = (
+                f"⚠️ <b>Gmail OAuth Failure ({html.escape(error_code)})</b>\n"
+                f"Please re-authorize production access:\n"
+                f"<a href='{html.escape(oauth_link, quote=True)}'>Authorize Gmail</a>"
+            )
+            if TELEGRAM_CHAT_ID:
+                send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
+            return False, f"Gmail OAuth Failure: {error_code}"
+
         access_token = token_json.get("access_token")
         if not access_token:
             return False, "OAuth Token Refused"
-        
-        if is_warm:
-            body_content = generate_warm_email(custom_note)
-            subject = f"Reconnecting - {company_name}"
-        else:
-            body_content = generate_cold_email(job_title, company_name)
-            subject = f"Operations & Systems Alignment - {job_title} @ {company_name}"
-        
+
         message = EmailMessage()
         message["To"] = to_email
         message["From"] = GMAIL_USER
         message["Subject"] = subject
-        body = f"Hi,\n\n{body_content}\n\nBest regards,\nKevin Miller"
-        message.set_content(body)
+        message.set_content(body_content)
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         res = requests.post(draft_url, headers=headers, json={"message": {"raw": raw_message}}, timeout=10)
-        return (True, "Success") if res.status_code in [200, 201] else (False, f"Gmail Error {res.status_code}")
+        if res.status_code in [200, 201]:
+            draft_id = res.json().get("id", "")
+            save_gmail_draft_record(to_email, subject, draft_id)
+            return True, "Success"
+        return False, f"Gmail Error {res.status_code}"
     except Exception as e:
         return False, str(e)
 
@@ -737,9 +915,11 @@ def fetch_networking_cards(target_code="CW", qty=2):
     return []
 
 def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=None):
-    """Send Telegram message. If callback_query_id provided, answer callback immediately (no spinner)."""
+    """Send Telegram message. If callback_query_id provided, answer callback immediately (no spinner).
+    Returns the sent message's telegram_message_id, or None on failure.
+    """
     if not (TELEGRAM_BOT_TOKEN and chat_id):
-        return
+        return None
     
     # Answer callback immediately to remove loading spinner
     if callback_query_id and TELEGRAM_BOT_TOKEN:
@@ -762,14 +942,19 @@ def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=No
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        requests.post(url, json=payload, timeout=5)
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code == 200:
+            return res.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Telegram Post Error: {e}", flush=True)
+    return None
 
-def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id):
-    """Send job card with buttons. Buttons auto-removed on first tap via answerCallbackQuery."""
+def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None):
+    """Send job card with buttons. Buttons auto-removed on first tap via answerCallbackQuery.
+    Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
+    """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return
+        return None
     company = html.escape(str(job.get("employer_name") or "N/A"))
     title = html.escape(str(job.get("job_title") or "N/A"))
     apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
@@ -817,9 +1002,15 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         "reply_markup": reply_markup
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            telegram_message_id = res.json().get("result", {}).get("message_id")
+            if telegram_message_id and sheet_uuid:
+                save_message_mapping(telegram_message_id, sheet_uuid, "Pipeline_Candidates", company, "")
+            return telegram_message_id
     except Exception as e:
         print(f"Failed to post card to Telegram: {e}", flush=True)
+    return None
 
 # ==============================================================================
 # 8. PARALLEL PIPELINE EXECUTION (PARALLEL JSEARCH + EARLY-EXIT CIRCUIT BREAKER)
@@ -837,13 +1028,20 @@ def fetch_single_query_jobs(query_args):
     return []
 
 def run_job_pipeline(chat_id=None, top_n=2):
+    """Job search pipeline with two-stage architecture:
+    Stage 1: Pre-filter candidates (strict filters)
+    Stage 2: Concurrent Gemini AI evaluation (ThreadPoolExecutor, max 10 candidates)
+    """
     print(">>> Starting Job Search Pipeline...", flush=True)
     if chat_id:
-        send_status_update(chat_id, "Fetching raw listings from JSearch in parallel...")
+        send_status_update(chat_id, "Stage 1: Fetching raw listings from JSearch in parallel...")
+    
     seen_hashes = set()
     candidate_pool = []
     today_str = datetime.now().strftime("%Y-%m-%d")
     followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
+    
+    # Stage 1: Parallel JSearch fetching + strict filtering
     rapidapi_key = os.environ.get("RAPIDAPI_KEY")
     openweb_key = os.environ.get("OPENWEBNINJA_KEY")
     if rapidapi_key:
@@ -852,6 +1050,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
     else:
         headers = {"x-api-key": openweb_key} if openweb_key else {}
         api_url = JSEARCH_URL
+    
     target_queries = get_filter("target_queries", [])
     query_tasks = [(q, api_url, headers) for q in target_queries]
     
@@ -868,28 +1067,46 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 save_seen_job_db(job_hash)
                 if passes_strict_filter(job):
                     candidate_pool.append(job)
-                    
+    
+    print(f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.", flush=True)
+    if chat_id:
+        send_status_update(chat_id, f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.\nStage 2: Running AI evaluations (max 10 candidates)...")
+    
+    # Stage 2: Cap at 10 candidates, concurrent Gemini evaluation with timeout handling
+    eval_candidates = candidate_pool[:10]
+    print(f"Stage 2: Evaluating {len(eval_candidates)} candidates with Gemini AI (max 10)...", flush=True)
+    
     top_matches = []
-    for candidate in candidate_pool:
-        if len(top_matches) >= top_n:
-            print(f"Early-exit circuit breaker triggered: reached top_{top_n} matches.", flush=True)
-            break
-        result = process_single_candidate(candidate)
-        if result:
-            top_matches.append(result)
-            
+    with ThreadPoolExecutor(max_workers=8) as eval_executor:
+        # Map candidate evaluation across thread pool
+        eval_futures = [eval_executor.submit(process_single_candidate, candidate) for candidate in eval_candidates]
+        
+        for future in eval_futures:
+            try:
+                result = future.result(timeout=20)  # 20s timeout per candidate
+                if result:
+                    top_matches.append(result)
+            except Exception as e:
+                print(f"Candidate evaluation failed (timeout or error): {e}", flush=True)
+                # On timeout/error: score=0, status='Evaluation Pending' is handled in evaluate_job_with_gemini
+    
+    # Sort by score descending
     top_matches.sort(key=lambda x: x["score"], reverse=True)
+    
+    # Dispatch results to Telegram and CRM
     for item in top_matches:
         job = item["job"]
         send_telegram_card(
             job, item["score"], item["reason"], item["target_email"],
             item["age_badge"], item["salary_str"], item["work_style"],
-            item["overlap_pct"], item["matched_skills"], item["short_id"]
+            item["overlap_pct"], item["matched_skills"], item["short_id"],
+            sheet_uuid=item.get("sheet_uuid")
         )
-        log_to_sheets_crm({
-            "action": "add_row",
-            "target_code": "TC",
-            "row_data": [
+        log_to_sheets_crm(build_crm_payload(
+            "add_row",
+            sheet_uuid=item.get("sheet_uuid"),
+            target_code="TC",
+            row_data=[
                 today_str,
                 today_str,
                 job.get("employer_name"),
@@ -901,7 +1118,12 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 job.get("job_apply_link", ""),
                 f"Matched via Pipeline | {item['reason']}"
             ]
-        })
+        ))
+    
+    print(f"Stage 2 Complete: {len(top_matches)} cards dispatched.", flush=True)
+    if chat_id:
+        send_status_update(chat_id, f"Pipeline Complete: {len(top_matches)} cards dispatched.")
+    
     return len(top_matches)
 
 # ==============================================================================
@@ -915,12 +1137,19 @@ def process_webhook_payload_async(data):
             cb = data["callback_query"]
             callback_query_id = cb.get("id")  # For answerCallbackQuery
             chat_id = cb["message"]["chat"]["id"]
-            cb_data = cb.get("data", "")
-            if cb_data.startswith("approve:"):
-                short_id = cb_data.split(":")[1]
+            cb_data = cb.get("data", "") or ""
+            cb_parts = cb_data.split(":")
+            cb_action = cb_parts[0] if cb_parts and cb_parts[0] else ""
+            cb_arg = cb_parts[1] if len(cb_parts) > 1 and cb_parts[1] else None
+
+            if cb_action == "approve":
+                if not cb_arg:
+                    send_telegram_message(chat_id, "⚠️ Malformed button data. Please re-run /t to regenerate cards.", callback_query_id=callback_query_id)
+                    return
+                short_id = cb_arg
                 job = get_job_from_cache(short_id)
                 if job:
-                    target = resolve_target_email(job.get("employer_name"), job.get("job_title"))
+                    target = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
                     comp = job.get("employer_name", "Target Firm")
                     title = job.get("job_title", "Operations Specialist")
                     
@@ -954,14 +1183,17 @@ def process_webhook_payload_async(data):
                 else:
                     send_telegram_message(chat_id, "⚠️ Job cache expired. Please re-run pipeline with /t.", callback_query_id=callback_query_id)
                 return
-            elif cb_data.startswith("apply:"):
+            elif cb_action == "apply":
                 send_telegram_message(chat_id, "✅ Marked job as applied in CRM.", callback_query_id=callback_query_id)
-            elif cb_data.startswith("pivot:"):
-                short_id = cb_data.split(":")[1]
+            elif cb_action == "pivot":
+                if not cb_arg:
+                    send_telegram_message(chat_id, "⚠️ Malformed button data. Please re-run /t to regenerate cards.", callback_query_id=callback_query_id)
+                    return
+                short_id = cb_arg
                 job = get_job_from_cache(short_id)
                 comp = job.get("employer_name", "Target Firm") if job else "Target Firm"
                 send_telegram_message(chat_id, f"🔄 Lead pivoted for {html.escape(comp)}.\nApollo: {html.escape(build_apollo_url(comp), quote=True)}", callback_query_id=callback_query_id)
-            elif cb_data.startswith("dead:"):
+            elif cb_action == "dead":
                 send_telegram_message(chat_id, "❌ Job record archived to Dead.", callback_query_id=callback_query_id)
             elif cb_data.startswith("adj_pay_"):
                 delta = cb_data.replace("adj_pay_", "")
@@ -973,6 +1205,8 @@ def process_webhook_payload_async(data):
             elif cb_data == "reset_filters":
                 init_db()
                 send_telegram_message(chat_id, "<b>Search filters reset to default parameters.</b>", callback_query_id=callback_query_id)
+            else:
+                send_telegram_message(chat_id, "⚠️ Unrecognized button action.", callback_query_id=callback_query_id)
             return
 
         if "message" not in data:
@@ -1013,7 +1247,10 @@ def process_webhook_payload_async(data):
                     f"<b>Last Note:</b> <i>{c.get('note', 'N/A')}</i>\n\n"
                     f"<b>Tap-to-Copy Email Draft:</b>\n{monospaced_draft}"
                 )
-                send_telegram_message(chat_id, card_msg)
+                sent_msg_id = send_telegram_message(chat_id, card_msg)
+                contact_sheet_uuid = c.get("sheet_uuid")
+                if sent_msg_id and contact_sheet_uuid:
+                    save_message_mapping(sent_msg_id, contact_sheet_uuid, target_code, c.get("name", ""), c.get("company", ""))
             return
 
         # 4. Priority Batcher (/p 1-10)
@@ -1052,19 +1289,19 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, "❌ Invalid /quick format. Use: <code>/quick Name@Company [Priority 1-10] [Note]</code>")
                 return
             name, company, priority, note = result
+            sheet_uuid = str(uuid.uuid4())
             next_followup = (datetime.now() + timedelta(days=calculate_followup_interval(priority))).strftime("%Y-%m-%d")
-            payload = {
-                "action": "quick_add",
-                "sheet_uuid": str(uuid.uuid4()),
-                "first_contact": today_str,
-                "last_contact": today_str,
-                "name": html.escape(name),
-                "company": html.escape(company),
-                "priority": priority,
-                "next_followup": next_followup,
-                "note": f"[{today_str}] {html.escape(note)}",
-                "rowOperationOrder": "DESC"
-            }
+            payload = build_crm_payload(
+                "quick_add",
+                sheet_uuid=sheet_uuid,
+                first_contact=today_str,
+                last_contact=today_str,
+                name=html.escape(name),
+                company=html.escape(company),
+                priority=priority,
+                next_followup=next_followup,
+                note=f"[{today_str}] {html.escape(note)}"
+            )
             log_to_sheets_crm(payload)
             resp = (
                 f"✅ <b>Contact Created</b>\n"
@@ -1073,7 +1310,8 @@ def process_webhook_payload_async(data):
                 f"<b>Priority:</b> {priority}/10\n"
                 f"<b>Next Follow-up:</b> {next_followup}"
             )
-            send_telegram_message(chat_id, resp)
+            sent_msg_id = send_telegram_message(chat_id, resp)
+            save_message_mapping(sent_msg_id, sheet_uuid, "Carmen Warm", name, company)
             return
 
         # 6. Dynamic /search Filters Overview & Inline Adjustments
@@ -1135,9 +1373,17 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, update_res)
                 return
 
-        if text.startswith("/f "):
-            days = safe_int(text.split()[1], 7)
-            send_telegram_message(chat_id, f"📅 Follow-up set in {days} days.")
+        # 9. Swipe-Reply CRM Actions (/f, /n, /pivot, /tw, /cw, /cc, /tc, /x) - require reply context
+        if text.startswith("/f ") or text == "/f":
+            mapping = resolve_reply_mapping(msg, chat_id, "/f")
+            if not mapping:
+                return
+            parts = text.split()
+            days = safe_int(parts[1], 7) if len(parts) > 1 else 7
+            next_followup = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+            log_to_sheets_crm(build_crm_payload("update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup))
+            label = html.escape(mapping.get("contact_company") or mapping.get("contact_name") or "record")
+            send_telegram_message(chat_id, f"📅 Follow-up for {label} snoozed to {next_followup}.")
             return
 
         if text.startswith("/n "):
@@ -1145,34 +1391,43 @@ def process_webhook_payload_async(data):
             if not note_str:
                 send_telegram_message(chat_id, "❌ Note cannot be empty.")
                 return
-            # Append note with timestamp to last viewed card (requires context from reply_to_message)
-            # For now, send confirmation with timestamp
+            mapping = resolve_reply_mapping(msg, chat_id, "/n")
+            if not mapping:
+                return
             timestamped_note = f"[{today_str}] {html.escape(note_str)}"
-            payload = {
-                "action": "append_note",
-                "note": timestamped_note,
-                "sheet_uuid": None  # Would be populated from context if available
-            }
-            # Calculate and update Follow-Up Decay (would use priority from context)
-            # Interval = max(3, round(35 - (Priority * 3.2)))
-            log_to_sheets_crm(payload)
-            send_telegram_message(chat_id, f"📝 Appended note: <i>{html.escape(note_str)}</i>\n<b>Note with timestamp:</b> <code>{timestamped_note}</code>")
+            log_to_sheets_crm(build_crm_payload("append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note))
+            send_telegram_message(chat_id, f"📝 Note logged: <code>{timestamped_note}</code>")
             return
 
         if text in ["/pivot", "/tw", "/cw", "/cc", "/tc", "/x"]:
-            # These commands require reply context (cannot be used standalone)
-            if "reply_to_message" not in msg:
-                send_telegram_message(chat_id, f"⚠️ <code>{html.escape(text)}</code> requires a reply context. Please reply to a contact card message.")
+            mapping = resolve_reply_mapping(msg, chat_id, text)
+            if not mapping:
                 return
-            action_map = {
-                "/pivot": "🔄 Lead pivoted & Apollo link generated.",
-                "/tw": "🔄 Moved lead to Warm Rolodex tab.",
-                "/cw": "🔄 Moved lead to Warm Rolodex tab.",
-                "/cc": "🔄 Logged lead to Cold VP Sprint tab.",
-                "/tc": "🔄 Logged lead to Cold VP Sprint tab.",
+            sheet_uuid = mapping["sheet_uuid"]
+
+            if text == "/pivot":
+                comp = mapping.get("contact_company") or "Target Firm"
+                send_telegram_message(chat_id, f"🔄 Lead pivoted for {html.escape(comp)}.\nApollo: {html.escape(build_apollo_url(comp), quote=True)}")
+                return
+
+            new_tab_map = {
+                "/tw": "Carmen Warm",
+                "/cw": "Carmen Warm",
+                "/cc": "Tetiana Cold",
+                "/tc": "Tetiana Cold",
+                "/x": "Died / Killed"
+            }
+            new_tab = new_tab_map[text]
+            log_to_sheets_crm(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+
+            confirm_map = {
+                "/tw": "🔄 Moved lead to Carmen Warm.",
+                "/cw": "🔄 Moved lead to Carmen Warm.",
+                "/cc": "🔄 Logged lead to Tetiana Cold.",
+                "/tc": "🔄 Logged lead to Tetiana Cold.",
                 "/x": "❌ Archived lead to Died / Killed."
             }
-            send_telegram_message(chat_id, f"⚡ Action Executed: {action_map[text]}")
+            send_telegram_message(chat_id, f"⚡ {confirm_map[text]}")
             return
 
     except Exception as e:
