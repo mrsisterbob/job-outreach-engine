@@ -831,10 +831,39 @@ def process_webhook_payload_async(data):
                 job = get_job_from_cache(short_id)
                 if job:
                     target = resolve_target_email(job.get("employer_name"), job.get("job_title"))
-                    ok, msg = create_gmail_draft(target, job.get("employer_name"), job.get("job_title"), is_warm=False)
-                    send_telegram_message(chat_id, f"<b>Gmail Draft Status:</b> {msg}")
+                    comp = job.get("employer_name", "Target Firm")
+                    title = job.get("job_title", "Operations Specialist")
+                    
+                    # 1. Create clean Gmail draft in background
+                    ok, msg = create_gmail_draft(
+                        to_email=target, 
+                        company_name=comp, 
+                        job_title=title, 
+                        is_warm=False
+                    )
+                    
+                    # 2. Build sanitized monospaced body for instant mobile tap-copy
+                    raw_email_text = generate_carmen_cold_email(title, comp)
+                    monospaced_body = format_email_block(raw_email_text)
+                    subject_line = f"Operations & Systems Alignment - {title} @ {comp}"
+
+                    if ok:
+                        status_hdr = "✉️ <b>Gmail Draft Created & Ready!</b>"
+                    else:
+                        status_hdr = f"⚠️ <b>Gmail API Alert ({msg})</b> - Manual Copy Below:"
+
+                    # Send rich Telegram message with autofilled tap-to-copy block
+                    card_response = (
+                        f"{status_hdr}\n\n"
+                        f"<b>To:</b> <code>{html.escape(target)}</code>\n"
+                        f"<b>Subject:</b> <code>{html.escape(subject_line)}</code>\n\n"
+                        f"<b>Tap-to-Copy Email Body:</b>\n"
+                        f"{monospaced_body}"
+                    )
+                    send_telegram_message(chat_id, card_response)
                 else:
-                    send_telegram_message(chat_id, "⚠️ Job cache expired.")
+                    send_telegram_message(chat_id, "⚠️ Job cache expired. Please re-run pipeline with /t.")
+                return
             elif cb_data.startswith("apply:"):
                 send_telegram_message(chat_id, "✅ Marked job as applied in CRM.")
             elif cb_data.startswith("pivot:"):
