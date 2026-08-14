@@ -5,3 +5,4 @@ google-auth
 dnspython
 flask
 gunicorn
+typst
