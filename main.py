@@ -4,6 +4,7 @@ import hashlib
 import html
 import json
 import os
+import queue
 import re
 import sqlite3
 import threading
@@ -32,13 +33,13 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 DB_PATH = "jobs_cache.db"
 
-# Analytics & Efficiency Trackers
-TOTAL_MESSAGES_SENT = 0
-TOTAL_INTERVIEWS_SET = 0
-
 # Database Write Lock (30s timeout)
 DB_WRITE_LOCK = threading.Lock()
 DB_WRITE_LOCK_TIMEOUT = 30  # seconds
+
+# Bounded webhook queue + fixed daemon worker pool (backpressure instead of unbounded threads)
+WEBHOOK_QUEUE = queue.Queue(maxsize=100)
+WEBHOOK_WORKER_COUNT = 4
 
 # Mobile Short Key Alias Map
 ALIAS_MAP = {
@@ -56,9 +57,10 @@ ALIAS_MAP = {
 }
 
 def get_db_conn():
-    """Returns a SQLite connection with Write-Ahead Logging (WAL) enabled."""
+    """Returns a SQLite connection with WAL mode + a busy_timeout to reduce lock contention."""
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
 def init_db():
@@ -93,6 +95,13 @@ def init_db():
             draft_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (to_email, subject)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            sheet_uuid TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS sheet_row_map (
@@ -333,6 +342,36 @@ def add_company_cooldown(company_name):
         return False
     finally:
         DB_WRITE_LOCK.release()
+
+def log_metric_event(event_type, sheet_uuid=None):
+    """Persist a pipeline metric event (e.g. message_sent, interview_set) to SQLite."""
+    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
+        print(f"DB Write Lock Timeout (metric: {event_type})", flush=True)
+        return False
+    try:
+        with get_db_conn() as conn:
+            conn.execute(
+                "INSERT INTO pipeline_metrics (event_type, sheet_uuid, timestamp) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (event_type, sheet_uuid)
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"DB Metric Log Error ({event_type}): {e}", flush=True)
+        return False
+    finally:
+        DB_WRITE_LOCK.release()
+
+def get_metric_count(event_type):
+    """Return the total persisted count of a given metric event_type."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM pipeline_metrics WHERE event_type = ?", (event_type,))
+            return cursor.fetchone()[0]
+    except Exception as e:
+        print(f"DB Metric Count Error ({event_type}): {e}", flush=True)
+        return 0
 
 def is_company_on_cooldown(company_name):
     clean = str(company_name or "").lower().strip()
@@ -944,6 +983,7 @@ def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=No
     try:
         res = requests.post(url, json=payload, timeout=5)
         if res.status_code == 200:
+            log_metric_event("message_sent")
             return res.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Telegram Post Error: {e}", flush=True)
@@ -1005,6 +1045,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         res = requests.post(url, json=payload, timeout=10)
         if res.status_code == 200:
             telegram_message_id = res.json().get("result", {}).get("message_id")
+            log_metric_event("message_sent", sheet_uuid)
             if telegram_message_id and sheet_uuid:
                 save_message_mapping(telegram_message_id, sheet_uuid, "Pipeline_Candidates", company, "")
             return telegram_message_id
@@ -1108,11 +1149,10 @@ def run_job_pipeline(chat_id=None, top_n=2):
             target_code="TC",
             row_data=[
                 today_str,
-                today_str,
                 job.get("employer_name"),
                 job.get("job_title"),
                 item["target_email"],
-                5,
+                item["score"],
                 "Matched",
                 followup_date,
                 job.get("job_apply_link", ""),
@@ -1296,11 +1336,11 @@ def process_webhook_payload_async(data):
                 sheet_uuid=sheet_uuid,
                 first_contact=today_str,
                 last_contact=today_str,
-                name=html.escape(name),
-                company=html.escape(company),
+                name=name,
+                company=company,
                 priority=priority,
                 next_followup=next_followup,
-                note=f"[{today_str}] {html.escape(note)}"
+                note=f"[{today_str}] {note}"
             )
             log_to_sheets_crm(payload)
             resp = (
@@ -1356,8 +1396,10 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite WAL persistent | Webhooks Active")
             return
         if text == "/efficiency":
-            ratio = (TOTAL_INTERVIEWS_SET / TOTAL_MESSAGES_SENT * 100) if TOTAL_MESSAGES_SENT > 0 else 0.0
-            send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({TOTAL_INTERVIEWS_SET} interviews / {TOTAL_MESSAGES_SENT} sent)")
+            messages_sent = get_metric_count("message_sent")
+            interviews_set = get_metric_count("interview_set")
+            ratio = (interviews_set / messages_sent * 100) if messages_sent > 0 else 0.0
+            send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({interviews_set} interviews / {messages_sent} sent)")
             return
 
         # 8. Mobile Parameter Mutation & Inline Action Shortcuts
@@ -1410,12 +1452,19 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, f"🔄 Lead pivoted for {html.escape(comp)}.\nApollo: {html.escape(build_apollo_url(comp), quote=True)}")
                 return
 
+            if text == "/x":
+                # Archive to the pipeline-appropriate tab: Carmen leads -> Killed, Tetiana leads -> Died
+                source_tab = mapping.get("sheet_tab") or ""
+                new_tab = "Killed" if source_tab in ("Carmen Warm", "Carmen Cold") else "Died"
+                log_to_sheets_crm(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+                send_telegram_message(chat_id, f"⚡ ❌ Archived lead to {new_tab}.")
+                return
+
             new_tab_map = {
                 "/tw": "Carmen Warm",
                 "/cw": "Carmen Warm",
                 "/cc": "Tetiana Cold",
-                "/tc": "Tetiana Cold",
-                "/x": "Died / Killed"
+                "/tc": "Tetiana Cold"
             }
             new_tab = new_tab_map[text]
             log_to_sheets_crm(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
@@ -1424,14 +1473,31 @@ def process_webhook_payload_async(data):
                 "/tw": "🔄 Moved lead to Carmen Warm.",
                 "/cw": "🔄 Moved lead to Carmen Warm.",
                 "/cc": "🔄 Logged lead to Tetiana Cold.",
-                "/tc": "🔄 Logged lead to Tetiana Cold.",
-                "/x": "❌ Archived lead to Died / Killed."
+                "/tc": "🔄 Logged lead to Tetiana Cold."
             }
             send_telegram_message(chat_id, f"⚡ {confirm_map[text]}")
             return
 
     except Exception as e:
         print(f"Async Webhook Processing Error: {e}", flush=True)
+
+def webhook_worker_loop():
+    """Daemon worker: pulls payloads off the bounded queue and processes them serially per-thread."""
+    while True:
+        data = WEBHOOK_QUEUE.get()
+        try:
+            process_webhook_payload_async(data)
+        except Exception as e:
+            print(f"Webhook Worker Error: {e}", flush=True)
+        finally:
+            WEBHOOK_QUEUE.task_done()
+
+def start_webhook_workers():
+    """Spin up a fixed pool of daemon threads instead of an unbounded thread-per-request model."""
+    for _ in range(WEBHOOK_WORKER_COUNT):
+        threading.Thread(target=webhook_worker_loop, daemon=True).start()
+
+start_webhook_workers()
 
 # ==============================================================================
 # 10. FLASK SERVER & STACKED WEBHOOK ROUTER
@@ -1458,13 +1524,25 @@ def health_check():
 def telegram_webhook():
     """
     Instant non-blocking execution (<0.05s return).
-    Dispatches workload to background thread and returns HTTP 200 immediately.
+    Validates Telegram's secret token header, then enqueues onto a bounded queue
+    processed by a fixed daemon worker pool instead of spawning a thread per request.
     """
+    webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+    if webhook_secret:
+        incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if incoming_secret != webhook_secret:
+            print("Telegram Webhook Rejected: invalid secret token", flush=True)
+            return jsonify({"status": "error", "message": "Unauthorized"}), 403
+
     try:
         data = request.get_json()
         if not data:
             return jsonify({"status": "ignored"}), 200
-        threading.Thread(target=process_webhook_payload_async, args=(data,)).start()
+        try:
+            WEBHOOK_QUEUE.put_nowait(data)
+        except queue.Full:
+            print("Webhook Queue Full: dropping payload", flush=True)
+            return jsonify({"status": "error", "message": "Server busy, queue full"}), 503
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         print(f"Telegram Webhook Dispatch Error: {e}", flush=True)
