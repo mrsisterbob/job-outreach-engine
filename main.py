@@ -1174,8 +1174,45 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     except Exception as e:
         return False, str(e), None
 
+def lookup_crm_sender_match(sender_raw):
+    """Extract sender email/domain and correlate against existing CRM records."""
+    email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender_raw or "")
+    sender_email = email_match.group(0).lower() if email_match else ""
+    if not sender_email:
+        return None
+
+    domain_part = sender_email.split("@")[-1].lower()
+    sender_domain = domain_part.split(".")[0]
+    generic_domains = {"gmail", "yahoo", "outlook", "hotmail", "icloud", "proton", "aol", "mail"}
+
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            if sender_domain not in generic_domains and len(sender_domain) > 2:
+                cursor.execute("""
+                    SELECT contact_name, contact_company, sheet_tab 
+                    FROM sheet_row_map 
+                    WHERE LOWER(contact_company) LIKE ? 
+                       OR sheet_uuid IN (SELECT sheet_uuid FROM jobs WHERE LOWER(job_json) LIKE ?)
+                    ORDER BY created_at DESC LIMIT 1
+                """, (f"%{sender_domain}%", f"%{sender_email}%"))
+            else:
+                cursor.execute("""
+                    SELECT contact_name, contact_company, sheet_tab 
+                    FROM sheet_row_map 
+                    WHERE sheet_uuid IN (SELECT sheet_uuid FROM jobs WHERE LOWER(job_json) LIKE ?)
+                    ORDER BY created_at DESC LIMIT 1
+                """, (f"%{sender_email}%",))
+
+            row = cursor.fetchone()
+            if row:
+                return {"name": row[0], "company": row[1], "tab": row[2]}
+    except Exception as e:
+        print(f"CRM Sender Lookup Error: {e}", flush=True)
+    return None
+
 def check_inbound_gmail_replies():
-    """Poll Gmail for unread inbound replies and alert Telegram with a direct thread link.
+    """Poll Gmail for unread inbound replies and alert Telegram with a direct thread link + CRM match.
     Removes the UNREAD label after alerting to prevent duplicate notifications on the next poll.
     """
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
@@ -1212,9 +1249,18 @@ def check_inbound_gmail_replies():
             thread_id = detail.get("threadId", msg_id)
             thread_link = html.escape(f"https://mail.google.com/mail/u/0/#inbox/{thread_id}", quote=True)
 
+            crm_match = lookup_crm_sender_match(sender)
+            crm_line = ""
+            if crm_match:
+                match_name = html.escape(str(crm_match.get("name") or "Unknown"))
+                match_company = html.escape(str(crm_match.get("company") or "Unknown"))
+                match_tab = html.escape(str(crm_match.get("tab") or "Unknown"))
+                crm_line = f"<b>CRM Match:</b> {match_name} @ {match_company} <i>({match_tab})</i>\n"
+
             alert_msg = (
                 f"📬 <b>New Gmail Reply!</b>\n\n"
                 f"<b>From:</b> {html.escape(sender)}\n"
+                f"{crm_line}"
                 f"<b>Subject:</b> {html.escape(subject)}\n"
                 f"<b>Preview:</b> <i>{html.escape(snippet)}</i>\n\n"
                 f"<a href='{thread_link}'>Open Thread in Gmail</a>"
@@ -1468,11 +1514,13 @@ def fetch_greenhouse_jobs(slug):
         jobs = []
         for p in postings:
             location = (p.get("location") or {}).get("name", "")
+            raw_desc = p.get("content", "") or ""
+            clean_desc = html.unescape(re.sub(r'<[^>]+>', ' ', raw_desc)).strip()
             jobs.append({
                 "job_id": f"gh_{slug}_{p.get('id')}",
                 "employer_name": slug.replace("-", " ").title(),
                 "job_title": p.get("title", ""),
-                "job_description": p.get("content", "") or "",
+                "job_description": clean_desc,
                 "job_apply_link": p.get("absolute_url", ""),
                 "job_city": location,
                 "job_state": "",
@@ -1517,16 +1565,45 @@ def fetch_lever_jobs(slug):
         print(f"Lever Fetch Exception ({slug}): {e}", flush=True)
         return []
 
+def fetch_ashby_jobs(slug):
+    """Pull unauthenticated postings from an Ashby job board for a company slug."""
+    try:
+        res = requests.get(f"https://api.ashbyhq.com/posting-api/job-board/{slug}", timeout=10)
+        if res.status_code != 200:
+            return []
+        postings = res.json().get("jobs", [])
+        jobs = []
+        for p in postings:
+            location = p.get("locationName", "")
+            raw_desc = p.get("descriptionHtml") or p.get("descriptionPlain") or ""
+            clean_desc = html.unescape(re.sub(r'<[^>]+>', ' ', raw_desc)).strip()
+            jobs.append({
+                "job_id": f"ashby_{slug}_{p.get('id')}",
+                "employer_name": slug.replace("-", " ").title(),
+                "job_title": p.get("title", ""),
+                "job_description": clean_desc,
+                "job_apply_link": p.get("jobUrl", ""),
+                "job_city": location,
+                "job_state": "",
+                "job_is_remote": p.get("isRemote", False) or "remote" in str(location).lower(),
+                "job_posted_at_datetime_utc": p.get("publishedAt", "")
+            })
+        return jobs
+    except Exception as e:
+        print(f"Ashby Fetch Exception ({slug}): {e}", flush=True)
+        return []
+
 def fetch_ats_jobs(company_slugs):
-    """Pull unauthenticated Greenhouse + Lever postings for a list of company slugs, in parallel."""
+    """Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in parallel."""
     if not company_slugs:
         return []
     all_jobs = []
-    with ThreadPoolExecutor(max_workers=min(len(company_slugs) * 2, 12) or 1) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(company_slugs) * 3, 18) or 1) as executor:
         futures = []
         for slug in company_slugs:
             futures.append(executor.submit(fetch_greenhouse_jobs, slug))
             futures.append(executor.submit(fetch_lever_jobs, slug))
+            futures.append(executor.submit(fetch_ashby_jobs, slug))
         for future in futures:
             try:
                 all_jobs.extend(future.result(timeout=15))
@@ -1644,7 +1721,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
         ))
         time.sleep(1.1)  # Telegram rate-limit pacing between outbound cards
 
-    # Dispatch Tier-2 (secondary qualified) matches as a single bundled digest, not individual cards
+    # Dispatch Tier-2 (secondary qualified) matches as bundled digests, chunked to stay under Telegram's payload limit
     if tier2_matches:
         digest_lines = []
         for item in tier2_matches:
@@ -1668,13 +1745,20 @@ def run_job_pipeline(chat_id=None, top_n=2):
                     f"Secondary Match via Pipeline | {item['reason']}"
                 ]
             ))
-        digest_ascii = "\n".join(digest_lines)
-        digest_msg = (
-            f"📋 <b>Secondary Match Leaderboard ({len(tier2_matches)} roles, score 65-79)</b>\n"
-            f"<pre>{html.escape(digest_ascii)}</pre>"
-        )
-        send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)
-        time.sleep(1.1)
+
+        # Max 20 roles/message to keep well under Telegram's 4,096 char payload limit
+        chunk_size = 20
+        line_chunks = [digest_lines[i:i + chunk_size] for i in range(0, len(digest_lines), chunk_size)]
+        total_chunks = len(line_chunks)
+        for idx, chunk in enumerate(line_chunks, 1):
+            digest_ascii = "\n".join(chunk)
+            page_label = f" (Page {idx}/{total_chunks})" if total_chunks > 1 else ""
+            digest_msg = (
+                f"📋 <b>Secondary Match Leaderboard ({len(tier2_matches)} roles, score 65-79){page_label}</b>\n"
+                f"<pre>{html.escape(digest_ascii)}</pre>"
+            )
+            send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)
+            time.sleep(1.1)
     
     print(f"Stage 2 Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.", flush=True)
     if chat_id:
