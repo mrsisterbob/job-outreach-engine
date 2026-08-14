@@ -44,6 +44,13 @@ const FIELD_ALIASES = {
   }
 };
 
+// Semantic column keys per schema (indices 0-8, excludes Sheet UUID at index 9) - used to
+// transpose rows across schemas without ever letting Company land in a Name column or vice versa
+const SCHEMA_FIELD_KEYS = {
+  JOBS:   ["date", "company", "title", "email", "score",    "status", "next_followup", "link", "notes"],
+  PEOPLE: ["date", "name",    "company", "email", "priority", "status", "next_followup", "link", "notes"]
+};
+
 const ALL_TABS = Object.keys(TAB_MAP);
 const UUID_COL = 10;    // Column J - the only field ever used to identify/move/delete a row
 const NOTES_COL = 9;
@@ -87,7 +94,7 @@ function doPost(e) {
     // 2. /quick Contact Creation (main.py: build_crm_payload("quick_add", ...))
     if (action === "quick_add") {
       const targetTab = payload.target_code === "TC" ? "Tetiana Cold" :
-                        payload.target_code === "CW" ? "Carmen Warm" : "Carmen Cold";
+                        payload.target_code === "CW" ? "Carmen Warm" : "Carmen Warm";
       const sheet = getOrCreateSheet(ss, targetTab);
       const rowData = [
         payload.last_contact || getTodayStr(),
@@ -119,13 +126,15 @@ function doPost(e) {
         return respondJSON({ status: "error", message: `No record found for sheet_uuid ${sheetUuid}` });
       }
       // Resolve ambiguous "kill" targets to the schema-correct archive tab: Died (JOBS) vs Killed (PEOPLE)
+      const sourceSchemaType = TAB_MAP[found.sheet.getName()] || "JOBS";
       if (newTab === "Died / Killed" || newTab === "Died/Killed" || newTab === "Dead") {
-        const sourceSchemaType = TAB_MAP[found.sheet.getName()] || "JOBS";
         newTab = sourceSchemaType === "PEOPLE" ? "Killed" : "Died";
       }
+      const targetSchemaType = TAB_MAP[newTab] || "JOBS";
       const rowValues = found.sheet.getRange(found.rowNum, 1, 1, found.sheet.getLastColumn()).getValues()[0];
+      const transposedValues = transposeRowValues(rowValues, sourceSchemaType, targetSchemaType);
       const targetSheet = getOrCreateSheet(ss, newTab);
-      targetSheet.appendRow(rowValues);
+      targetSheet.appendRow(transposedValues);
       found.sheet.deleteRow(found.rowNum);
       formatSheet(targetSheet);
       return respondJSON({ status: "success", message: `Moved record ${sheetUuid} to ${newTab}` });
@@ -144,6 +153,21 @@ function doPost(e) {
       }
       found.sheet.getRange(found.rowNum, FOLLOWUP_COL).setValue(nextFollowup);
       return respondJSON({ status: "success", message: `Follow-up snoozed to ${nextFollowup}` });
+    }
+
+    // 4b. Manual Apollo Email Override (/e, /email -> build_crm_payload("update_contact_email", ...))
+    if (action === "update_contact_email") {
+      const sheetUuid = payload.sheet_uuid;
+      const newEmail = payload.email;
+      if (!sheetUuid || !newEmail) {
+        return respondJSON({ status: "error", message: "update_contact_email requires sheet_uuid and email" });
+      }
+      const found = findRecordBySheetUuid(ss, sheetUuid);
+      if (!found) {
+        return respondJSON({ status: "error", message: `No record found for sheet_uuid ${sheetUuid}` });
+      }
+      found.sheet.getRange(found.rowNum, 4).setValue(newEmail); // Column D - Contact Email (JOBS + PEOPLE)
+      return respondJSON({ status: "success", message: "Email updated" });
     }
 
     // 5. Append Timestamped Note (/n -> build_crm_payload("append_note", ...))
@@ -174,6 +198,7 @@ function doPost(e) {
       if (!sheet) {
         return respondJSON({ status: "success", followups: [] });
       }
+      const schemaType = TAB_MAP[tabName] || "PEOPLE";
       const data = sheet.getDataRange().getValues();
       const results = [];
       for (let i = data.length - 1; i >= 1; i--) {
@@ -181,10 +206,17 @@ function doPost(e) {
         const contextPriority = (row[4] || "").toString();
         const prioMatch = contextPriority.match(/\d+/);
         const rowPriority = prioMatch ? parseInt(prioMatch[0], 10) : 5;
+
+        // JOBS tabs have no contact name (Col B = Company, Col C = Role); PEOPLE tabs have no job title
+        const name = schemaType === "JOBS" ? "" : row[1];
+        const company = schemaType === "JOBS" ? row[1] : row[2];
+        const title = schemaType === "JOBS" ? row[2] : "Operations Specialist";
+
         results.push({
           sheet_uuid: row[9] || "",
-          name: row[1],
-          company: row[2],
+          name: name,
+          company: company,
+          title: title,
           priority: rowPriority,
           note: row[8],
           next_followup: formatDate(row[6])
@@ -357,6 +389,33 @@ function normalizeRowData(rowInput, schemaType) {
   }
 
   return new Array(fieldCount).fill("");
+}
+
+// Transposes a full 10-column row (incl. Sheet UUID) from one schema to another using semantic
+// field keys, not raw index copy - prevents Company/Name column shifting on cross-tab moves.
+// Fields with no direct cross-schema equivalent (JOBS "title" / PEOPLE "name") are folded into Notes.
+function transposeRowValues(rowValues, sourceType, targetType) {
+  if (sourceType === targetType) return rowValues;
+
+  const sourceKeys = SCHEMA_FIELD_KEYS[sourceType];
+  const targetKeys = SCHEMA_FIELD_KEYS[targetType];
+  const sourceMap = {};
+  sourceKeys.forEach((key, idx) => { sourceMap[key] = rowValues[idx]; });
+
+  let extraNote = "";
+  if (targetType === "PEOPLE" && sourceMap["title"]) {
+    extraNote = `[Former Role: ${sourceMap["title"]}]`;
+  } else if (targetType === "JOBS" && sourceMap["name"]) {
+    extraNote = `[Contact: ${sourceMap["name"]}]`;
+  }
+
+  const out = targetKeys.map(key => (sourceMap[key] !== undefined ? sourceMap[key] : ""));
+  const notesIdx = targetKeys.indexOf("notes");
+  if (extraNote) {
+    out[notesIdx] = out[notesIdx] ? `${out[notesIdx]}\n${extraNote}` : extraNote;
+  }
+  out.push(rowValues[9]); // Sheet UUID (Column J) always preserved
+  return out;
 }
 
 function ensureTimestampedNote(note) {
