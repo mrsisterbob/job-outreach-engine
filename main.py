@@ -3063,13 +3063,111 @@ def health_check():
         elapsed_ms = (time.time() - start_time) * 1000
         return jsonify({"status": "error", "error": str(e), "elapsed_ms": round(elapsed_ms, 2)}), 500
 
+def _run_pipeline_and_notify(chat_id, qty):
+    """Background thread target for /t: runs the heavy pipeline off the request thread,
+    independent of the WEBHOOK_QUEUE worker pool, then posts the completion message.
+    """
+    try:
+        count = run_job_pipeline(chat_id, top_n=qty)
+        send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
+    except Exception as e:
+        logging.error(f"/t Background Pipeline Error: {e}")
+        send_telegram_message(chat_id, f"❌ Pipeline error: {html.escape(str(e)[:200])}")
+
+def handle_fast_path_command(chat_id, text, msg):
+    """Directly executes /t, /search, /health, /draft with a guaranteed synchronous requests.post
+    reply to the Telegram Bot API - bypasses the WEBHOOK_QUEUE worker pool entirely so these
+    core commands always produce a visible response. Returns True if the command was handled.
+    """
+    t_match = re.match(r"^/t(?:\s+(\d+))?$", text)
+    if t_match:
+        qty = safe_int(t_match.group(1), 2)
+        sent_id = send_telegram_message(chat_id, f"🚀 Triggering Job Search Pipeline (Top {qty})...")
+        logging.info(f"/t command handled directly (chat_id={chat_id}, qty={qty}, ack_message_id={sent_id})")
+        threading.Thread(target=_run_pipeline_and_notify, args=(chat_id, qty), daemon=True).start()
+        return True
+
+    if text == "/search":
+        min_sal = safe_int(get_filter("min_salary"), 50000)
+        exp_sal = safe_int(get_filter("experience_salary_floor"), 60000)
+        bans = safe_list(get_filter("title_exclusions"))
+        cities = safe_list(get_filter("valid_cities"))
+        kws = safe_list(get_filter("required_keywords"))
+        card_text = (
+            "🔍 <b>Active Search Filters</b>\n"
+            f"💰 <b>Min Pay:</b> ${min_sal:,} | <b>Exp Floor:</b> ${exp_sal:,}\n"
+            f"📍 <b>Cities ({len(cities)}):</b> {', '.join(cities[:4]) if cities else 'All'}\n"
+            f"🚫 <b>Banned ({len(bans)}):</b> {', '.join(bans[:3]) if bans else 'None'}\n"
+            f"🔑 <b>Keywords ({len(kws)}):</b> {', '.join(kws[:3]) if kws else 'Any'}\n\n"
+            "<b>Tap-to-Copy Quick Adjustments</b>\n"
+            "<code>pay = 65000</code>\n"
+            "<code>kw + python</code>\n"
+            "<code>ban + sales</code>\n"
+            "<code>city + canton</code>"
+        )
+        inline_keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "➕ Pay +$5k", "callback_data": "adj_pay_+5000"},
+                    {"text": "➖ Pay -$5k", "callback_data": "adj_pay_-5000"}
+                ],
+                [
+                    {"text": "📍 Add Novi", "callback_data": "add_city_novi"},
+                    {"text": "🔄 Reset Filters", "callback_data": "reset_filters"}
+                ]
+            ]
+        }
+        sent_id = send_telegram_message(chat_id, card_text, reply_markup=inline_keyboard)
+        logging.info(f"/search command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
+        return True
+
+    if text == "/health":
+        sent_id = send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite WAL persistent | Webhooks Active")
+        logging.info(f"/health command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
+        return True
+
+    if text == "/draft":
+        mapping = resolve_reply_mapping(msg, chat_id, "/draft")
+        if not mapping:
+            return True
+        job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+        comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+        title = job.get("job_title") or "Operations Specialist"
+        is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
+        target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
+        logging.info(f"/draft command handled directly: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
+        ok, gmail_msg, draft_id = create_gmail_draft(to_email=target, company_name=comp, job_title=title, is_warm=is_warm)
+        raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
+        monospaced_body = format_email_block(raw_email_text)
+        draft_link_line = ""
+        if draft_id:
+            draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
+            draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
+        if ok:
+            status_hdr = "✉️ <b>Gmail Draft Created & Ready!</b>"
+            log_daily_activity("drafts_staged")
+        else:
+            status_hdr = f"⚠️ <b>Gmail API Alert ({html.escape(gmail_msg)})</b> - Manual Copy Below:"
+        draft_msg = (
+            f"{status_hdr}\n"
+            f"{draft_link_line}"
+            f"<b>To:</b> <code>{html.escape(target)}</code>\n\n"
+            f"<b>Tap-to-Copy Email Body:</b>\n{monospaced_body}"
+        )
+        sent_id = send_telegram_message(chat_id, draft_msg)
+        logging.info(f"/draft command reply dispatched (chat_id={chat_id}, ack_message_id={sent_id})")
+        return True
+
+    return False
+
 @app.route("/telegram", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     """
     Instant non-blocking execution (<0.05s return).
-    Validates Telegram's secret token header, then enqueues onto a bounded queue
-    processed by a fixed daemon worker pool instead of spawning a thread per request.
+    Validates Telegram's secret token header. Core commands (/t, /search, /health, /draft) are
+    handled synchronously right here with a guaranteed requests.post reply, independent of the
+    background WEBHOOK_QUEUE worker pool. Everything else still enqueues for async processing.
     """
     webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     if webhook_secret:
@@ -3086,6 +3184,18 @@ def telegram_webhook():
 
         update_kind = "callback_query" if "callback_query" in data else ("message" if "message" in data else "unknown")
         logging.info(f"Telegram Webhook: received update_kind={update_kind}")
+
+        if update_kind == "message":
+            try:
+                msg = data["message"]
+                chat_id = msg["chat"]["id"]
+                raw_text = msg.get("text", "").strip()
+                text = re.sub(r"@\w+bot", "", raw_text, flags=re.IGNORECASE).strip()
+                logging.info(f"Telegram Webhook: parsed chat_id={chat_id} text='{text}'")
+                if handle_fast_path_command(chat_id, text, msg):
+                    return jsonify({"status": "ok"}), 200
+            except Exception as e:
+                logging.error(f"Telegram Webhook fast-path error: {e} - falling back to async queue")
 
         try:
             WEBHOOK_QUEUE.put_nowait(data)
