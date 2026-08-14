@@ -530,7 +530,9 @@ Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles
 Evaluate the job description and respond ONLY with a JSON object containing:
 {
 "score": <integer between 1 and 100 representing fit signal>,
-"reason": "<1-sentence concise explanation of why this role fits or does not fit>"
+"reason": "<1-sentence concise explanation of why this role fits or does not fit>",
+"linkedin_note": "<a personalized LinkedIn connection note tailored to this specific role and company, strictly under 300 characters, ideally under 280>",
+"ats_bullets": ["<high-impact quantified resume bullet #1 tailored to this job description's keywords and operations/systems focus>", "<high-impact quantified resume bullet #2>"]
 }"""
 
 def send_health_alert(error_msg):
@@ -655,6 +657,12 @@ def build_linkedin_url(company_name):
     encoded = urllib.parse.quote(f'{clean_company} ("VP" OR "Director" OR "Manager") ("Operations" OR "Compliance")')
     return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
 
+def build_hiring_manager_dork(company_name, job_title=""):
+    """Google dork to surface a company's Head/Director/VP of Operations or COO on LinkedIn."""
+    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    query = f'site:linkedin.com/in "{clean_comp}" ("Head of Operations" OR "Director of Operations" OR "Operations Manager" OR "VP of Operations" OR "COO")'
+    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+
 def extract_domain_from_website(url):
     """Parse a root domain (no scheme/www/path) out of a company website URL, or None if unusable."""
     if not url:
@@ -740,9 +748,10 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
 def evaluate_job_with_gemini(job):
     """Evaluate job with Gemini. On failure/timeout, set score=0 and status 'Evaluation Pending'.
     Thread-safe with timeout handling: DO NOT assign fake scores on failure.
+    Returns (pass_bool, score, reason, linkedin_note, ats_bullets).
     """
     if not GEMINI_API_KEY:
-        return True, 75, "Fallback pass (No Key)"
+        return True, 75, "Fallback pass (No Key)", "", []
     
     try:
         desc_truncated = str(job.get("job_description") or "")[:1000]
@@ -757,19 +766,24 @@ def evaluate_job_with_gemini(job):
                 res_data = json.loads(cleaned_text)
                 raw_score = int(res_data.get("score", 0))
                 reason = res_data.get("reason", "N/A")
+                linkedin_note = str(res_data.get("linkedin_note", "") or "")[:300]
+                ats_bullets = res_data.get("ats_bullets", [])
+                if not isinstance(ats_bullets, list):
+                    ats_bullets = []
+                ats_bullets = [str(b) for b in ats_bullets][:2]
                 final_score = calculate_hybrid_score_modifier(job, raw_score)
-                return (final_score >= 65), final_score, reason
+                return (final_score >= 65), final_score, reason, linkedin_note, ats_bullets
             except Exception as e:
                 print(f"Gemini evaluation JSON parse failure: {e}", flush=True)
                 # On parse error, return 0 score with Evaluation Pending status
-                return False, 0, "Evaluation Pending"
+                return False, 0, "Evaluation Pending", "", []
         
         # On API failure/timeout, set score to 0 and status to "Evaluation Pending" (NO fake scores)
-        return False, 0, "Evaluation Pending"
+        return False, 0, "Evaluation Pending", "", []
     
     except Exception as e:
         print(f"Gemini evaluation exception: {e}", flush=True)
-        return False, 0, "Evaluation Pending"
+        return False, 0, "Evaluation Pending", "", []
 
 # ==============================================================================
 # 6. STAGE 1 STRICT FILTER & SINGLE CANDIDATE EVALUATION
@@ -812,7 +826,7 @@ def passes_strict_filter(job):
 
 def process_single_candidate(job):
     log_metric_event("ai_screened")
-    ai_pass, score, reason = evaluate_job_with_gemini(job)
+    ai_pass, score, reason, linkedin_note, ats_bullets = evaluate_job_with_gemini(job)
     if ai_pass:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
         short_id = generate_short_key(raw_id)
@@ -824,6 +838,7 @@ def process_single_candidate(job):
         overlap_pct, matched_skills = calculate_keyword_overlap(job.get("job_description"))
         return {
             "job": job, "score": score, "reason": reason,
+            "linkedin_note": linkedin_note, "ats_bullets": ats_bullets,
             "target_email": target_email, "age_badge": age_badge,
             "salary_str": salary_str, "work_style": work_style,
             "overlap_pct": overlap_pct, "matched_skills": matched_skills,
@@ -1054,18 +1069,21 @@ def get_fit_score_indicator(score):
         return "🟡"
     return "🔴"
 
-def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None):
+def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None):
     """Send an executive-scannable job card with buttons. Buttons auto-removed on first tap via answerCallbackQuery.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
     """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return None
+    ats_bullets = ats_bullets or []
     company = html.escape(str(job.get("employer_name") or "N/A"))
     title = html.escape(str(job.get("job_title") or "N/A"))
     apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
     apollo_url = html.escape(build_apollo_url(company), quote=True)
     linkedin_url = html.escape(build_linkedin_url(company), quote=True)
+    dork_url = html.escape(build_hiring_manager_dork(company, job.get("job_title")), quote=True)
     matched_str = ", ".join(matched_skills[:4]).title() if matched_skills else "General Ops"
+    bullets_block = "\n".join(f"• {b}" for b in ats_bullets) if ats_bullets else "N/A"
     fit_dot = get_fit_score_indicator(score)
     card_text = (
         f"💼 <b>{title}</b>\n"
@@ -1079,8 +1097,11 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"🔗 <b>Quick Links:</b>\n"
         f"<a href='{apply_link}'>Direct Apply</a> | "
         f"<a href='{apollo_url}'>Apollo Operations Leads</a> | "
-        f"<a href='{linkedin_url}'>LinkedIn Leadership Search</a>\n\n"
+        f"<a href='{linkedin_url}'>LinkedIn Leadership Search</a> | "
+        f"<a href='{dork_url}'>🎯 Find Direct Hiring Manager (Google Dork)</a>\n\n"
         f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
+        f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note) if linkedin_note else 'N/A'}</code>\n\n"
+        f"📄 <b>Tailored ATS Resume Bullets:</b>\n<code>{html.escape(bullets_block)}</code>\n\n"
         f"⚡ <b>Swipe Actions:</b>\n"
         f"  <code>draft</code> Gmail Draft   <code>/f &lt;days&gt;</code> Snooze\n"
         f"  <code>/tw</code>/<code>/cw</code> Warm   <code>/cc</code>/<code>/tc</code> Cold   <code>/x</code> Dead"
@@ -1207,7 +1228,9 @@ def run_job_pipeline(chat_id=None, top_n=2):
             job, item["score"], item["reason"], item["target_email"],
             item["age_badge"], item["salary_str"], item["work_style"],
             item["overlap_pct"], item["matched_skills"], item["short_id"],
-            sheet_uuid=item.get("sheet_uuid")
+            sheet_uuid=item.get("sheet_uuid"),
+            linkedin_note=item.get("linkedin_note", ""),
+            ats_bullets=item.get("ats_bullets")
         )
         log_to_sheets_crm(build_crm_payload(
             "add_row",
