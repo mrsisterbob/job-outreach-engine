@@ -2,6 +2,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import html
+import io
 import json
 import os
 import queue
@@ -14,7 +15,8 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
+from resume_engine import compile_resume_pdf
 
 app = Flask(__name__)
 
@@ -2196,6 +2198,36 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, pitch_msg)
             return
 
+        if text in ["/cv", "/resume"]:
+            mapping = resolve_reply_mapping(msg, chat_id, text)
+            if not mapping:
+                return
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            if not job:
+                send_telegram_message(chat_id, "⚠️ Job data not found in cache. Please re-run /t.")
+                return
+
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            bullets = job.get("ats_bullets", [])
+            short_id = job.get("short_id") or generate_short_key(job.get("job_id"))
+
+            try:
+                pdf_bytes = compile_resume_pdf(comp, bullets)
+                clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
+                filename = f"Kevin_Miller_Resume_{clean_comp}.pdf"
+
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+                files = {"document": (filename, io.BytesIO(pdf_bytes), "application/pdf")}
+                caption_text = (
+                    f"📄 <b>Tailored Resume: {html.escape(comp)}</b>\n\n"
+                    f"🖥️ <b>Desktop Staging Link:</b>\n"
+                    f"<code>http://localhost:5000/stage/{short_id}</code>"
+                )
+                requests.post(url, data={"chat_id": chat_id, "caption": caption_text, "parse_mode": "HTML"}, files=files, timeout=10)
+            except Exception as e:
+                send_telegram_message(chat_id, f"❌ Resume Compilation Error: <code>{html.escape(str(e))}</code>")
+            return
+
         if text in ["/pivot", "/tw", "/cw", "/cc", "/tc", "/x"]:
             mapping = resolve_reply_mapping(msg, chat_id, text)
             if not mapping:
@@ -2305,6 +2337,62 @@ def telegram_webhook():
     except Exception as e:
         print(f"Telegram Webhook Dispatch Error: {e}", flush=True)
         return jsonify({"status": "error", "message": str(e)}), 200
+
+@app.route("/stage/<short_id>", methods=["GET"])
+def desktop_stage_view(short_id):
+    """Desktop review page showing tailored bullets, apply portal link, and PDF preview."""
+    job = get_job_from_cache(short_id)
+    if not job:
+        return "<h3>Job not found or cache expired.</h3>", 404
+
+    comp = job.get("employer_name", "Target Firm")
+    title = job.get("job_title", "Role")
+    apply_link = job.get("job_apply_link", "#")
+    bullets = job.get("ats_bullets", [])
+    bullets_html = "".join([f"<li>{html.escape(str(b))}</li>" for b in bullets])
+
+    html_page = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Resume Stage: {html.escape(comp)}</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 40px; background: #f8f9fa; color: #212529; }}
+            .card {{ background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); max-width: 750px; margin: auto; }}
+            h2 {{ color: #1B2A4A; margin-top: 0; }}
+            .btn {{ display: inline-block; padding: 10px 18px; margin-right: 10px; border-radius: 6px; text-decoration: none; font-weight: bold; }}
+            .btn-primary {{ background: #1B2A4A; color: white; }}
+            .btn-secondary {{ background: #e9ecef; color: #333; }}
+            ul {{ line-height: 1.6; }}
+            iframe {{ width: 100%; height: 500px; border: 1px solid #ddd; margin-top: 20px; border-radius: 4px; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>{html.escape(title)} @ {html.escape(comp)}</h2>
+            <p><b>Targeted ATS Bullets:</b></p>
+            <ul>{bullets_html}</ul>
+            <div style="margin-top: 20px;">
+                <a class="btn btn-primary" href="/stage/{short_id}/pdf" download="Kevin_Miller_Resume_{re.sub(r'[^a-zA-Z0-9]', '', comp)}.pdf">⬇️ Download Tailored PDF</a>
+                <a class="btn btn-secondary" href="{html.escape(apply_link)}" target="_blank">🔗 Open Application Portal</a>
+            </div>
+            <iframe src="/stage/{short_id}/pdf"></iframe>
+        </div>
+    </body>
+    </html>
+    """
+    return html_page, 200
+
+@app.route("/stage/<short_id>/pdf", methods=["GET"])
+def desktop_stage_pdf(short_id):
+    """Serves raw PDF bytes for browser preview and download."""
+    job = get_job_from_cache(short_id)
+    if not job:
+        return "Job cache expired", 404
+    comp = job.get("employer_name", "Target Firm")
+    bullets = job.get("ats_bullets", [])
+    pdf_bytes = compile_resume_pdf(comp, bullets)
+    return Response(pdf_bytes, mimetype="application/pdf")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
