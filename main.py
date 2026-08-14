@@ -873,6 +873,171 @@ def build_alumni_dork(company_name, school="Hope College"):
     query = f'site:linkedin.com/in "{clean_comp}" "{clean_school}"'
     return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
 
+def discover_ecosystem_network(target_entity: str) -> dict:
+    """Queries Gemini to discover ecosystem keywords and probable ATS board slugs for a target entity.
+    Returns a dict with canonical_name, ecosystem_keywords, and probable_ats_slugs.
+    """
+    if not target_entity or not GEMINI_API_KEY:
+        return {
+            "canonical_name": str(target_entity or "Unknown"),
+            "ecosystem_keywords": [],
+            "probable_ats_slugs": []
+        }
+
+    prompt = f"""Given the company or organization: "{html.escape(str(target_entity))}"
+
+Provide a JSON response ONLY with these exact keys:
+{{
+  "canonical_name": "official company name",
+  "ecosystem_keywords": ["keyword1", "parent_company", "subsidiary1", "brand_name", ...],
+  "probable_ats_slugs": ["slug1", "slug2", "slug3", ...]
+}}
+
+The ecosystem_keywords should include the company itself, parent companies, subsidiaries, portfolio brands, and related terms that could match job postings for this organization.
+The probable_ats_slugs should be plausible URL slugs for their job boards (e.g., "acme-corp", "acmecorp", "acme-careers", "jobs-acme").
+
+Respond with ONLY the JSON, no markdown formatting or extra text."""
+
+    raw_response = call_gemini_api(prompt)
+    if not raw_response:
+        logging.warning(f"Ecosystem discovery failed for {target_entity}: Gemini API unavailable")
+        return {
+            "canonical_name": str(target_entity),
+            "ecosystem_keywords": [str(target_entity)],
+            "probable_ats_slugs": []
+        }
+
+    try:
+        cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_response).strip()
+        data = json.loads(cleaned)
+        return {
+            "canonical_name": str(data.get("canonical_name", target_entity)),
+            "ecosystem_keywords": list(data.get("ecosystem_keywords", [str(target_entity)])),
+            "probable_ats_slugs": list(data.get("probable_ats_slugs", []))
+        }
+    except Exception as e:
+        logging.error(f"Ecosystem discovery JSON parse error ({target_entity}): {e}")
+        return {
+            "canonical_name": str(target_entity),
+            "ecosystem_keywords": [str(target_entity)],
+            "probable_ats_slugs": []
+        }
+
+def probe_ats_slug(slug: str) -> bool:
+    """Attempts a quick HEAD/GET to three major ATS board APIs to verify a slug is live.
+    Returns True if any endpoint returns HTTP 200 with content.
+    """
+    if not slug or not str(slug).strip():
+        return False
+    slug = str(slug).strip().lower()
+
+    endpoints = [
+        f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
+        f"https://api.lever.co/v0/postings/{slug}?mode=json",
+        f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
+    ]
+
+    for endpoint in endpoints:
+        try:
+            res = requests.get(endpoint, timeout=3)
+            if res.status_code == 200 and len(res.content) > 0:
+                logging.info(f"ATS slug verified: {slug} (endpoint: {endpoint})")
+                return True
+        except requests.exceptions.Timeout:
+            pass
+        except requests.exceptions.RequestException:
+            pass
+
+    return False
+
+def verify_live_slugs(candidate_slugs: list) -> list:
+    """Probes multiple ATS slugs in parallel (max_workers=8) and returns only the live ones."""
+    if not candidate_slugs:
+        return []
+
+    live_slugs = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(probe_ats_slug, slug): slug for slug in candidate_slugs}
+        for future in futures:
+            try:
+                is_live = future.result()
+                if is_live:
+                    live_slugs.append(futures[future])
+            except Exception as e:
+                logging.error(f"ATS slug probe error: {e}")
+
+    return live_slugs
+
+def expand_ecosystem_filter(target_entity: str) -> str:
+    """Orchestrates ecosystem discovery, ATS verification, and filter merge atomically.
+    Returns an HTML-formatted Telegram message reporting the results.
+    """
+    if not target_entity or not str(target_entity).strip():
+        return "⚠️ <b>Ecosystem Expansion Error:</b> No entity name provided."
+
+    target_entity = str(target_entity).strip()
+    logging.info(f"Ecosystem expansion triggered for: {target_entity}")
+
+    # Step 1: Discover ecosystem network
+    discovery = discover_ecosystem_network(target_entity)
+    canonical = discovery.get("canonical_name", target_entity)
+    new_keywords = discovery.get("ecosystem_keywords", [target_entity])
+    candidate_slugs = discovery.get("probable_ats_slugs", [])
+
+    logging.info(f"Discovered {len(new_keywords)} keywords and {len(candidate_slugs)} candidate ATS slugs for {canonical}")
+
+    # Step 2: Verify live ATS slugs
+    live_slugs = verify_live_slugs(candidate_slugs)
+    logging.info(f"Verified {len(live_slugs)} live ATS slugs for {canonical}")
+
+    # Step 3: Atomically merge into filters
+    added_keywords = []
+    added_slugs = []
+
+    try:
+        # Merge ecosystem keywords into tier1_ecosystem
+        current_keywords = get_filter("tier1_ecosystem") or []
+        for kw in new_keywords:
+            kw_lower = str(kw).lower().strip()
+            if kw_lower and not any(str(existing).lower() == kw_lower for existing in current_keywords):
+                current_keywords.append(kw)
+                added_keywords.append(kw)
+
+        if added_keywords:
+            set_filter("tier1_ecosystem", current_keywords)
+            logging.info(f"Added {len(added_keywords)} keywords to tier1_ecosystem: {added_keywords}")
+
+        # Merge live slugs into ats_company_slugs
+        current_slugs = get_filter("ats_company_slugs") or []
+        for slug in live_slugs:
+            slug_lower = str(slug).lower().strip()
+            if slug_lower and not any(str(existing).lower() == slug_lower for existing in current_slugs):
+                current_slugs.append(slug)
+                added_slugs.append(slug)
+
+        if added_slugs:
+            set_filter("ats_company_slugs", current_slugs)
+            logging.info(f"Added {len(added_slugs)} live ATS slugs: {added_slugs}")
+
+    except Exception as e:
+        logging.error(f"Ecosystem filter merge error: {e}")
+        return f"❌ <b>Ecosystem Expansion Error:</b> Failed to update filters. Check logs."
+
+    # Step 4: Format and return result
+    keywords_display = ", ".join(f"<code>{html.escape(str(k)[:30])}</code>" for k in added_keywords[:5]) if added_keywords else "None"
+    slugs_display = ", ".join(f"<code>{html.escape(str(s))}</code>" for s in added_slugs[:5]) if added_slugs else "None"
+
+    result_msg = (
+        f"✅ <b>Ecosystem Expanded: {html.escape(canonical)}</b>\n\n"
+        f"📌 <b>New Keywords Added:</b> {keywords_display}"
+        f"{f' (+{len(added_keywords)-5} more)' if len(added_keywords) > 5 else ''}\n"
+        f"🎯 <b>Live ATS Boards Found:</b> {slugs_display}"
+        f"{f' (+{len(added_slugs)-5} more)' if len(added_slugs) > 5 else ''}\n\n"
+        f"<i>Tier-1 ecosystem now has {len(current_keywords)} keywords | "
+        f"{len(current_slugs)} ATS board slugs active.</i>"
+    )
+    return result_msg
+
 def extract_domain_from_website(url):
     """Parse a root domain (no scheme/www/path) out of a company website URL, or None if unusable."""
     if not url:
@@ -2424,6 +2589,47 @@ def process_webhook_payload_async(data):
                 f"📊 <b>Lifetime Totals:</b> Staged: {lifetime['drafts_staged']} | Applied: {lifetime['applied_count']} | Notes: {lifetime['notes_logged']}"
             )
             send_telegram_message(chat_id, scorecard_msg)
+            return
+
+        # 7. Corporate Ecosystem Expansion (/ecosystem add <entity> | /ecosystem)
+        if text.startswith("/ecosystem add ") or text.startswith("/eco add "):
+            try:
+                # Handle both /ecosystem and /eco variants
+                if text.startswith("/eco add "):
+                    entity_name = text[8:].strip()
+                else:
+                    entity_name = text[14:].strip()
+
+                if not entity_name:
+                    send_telegram_message(chat_id, "⚠️ <b>Usage:</b> /ecosystem add <company_name>")
+                    return
+
+                result_msg = expand_ecosystem_filter(entity_name)
+                send_telegram_message(chat_id, result_msg)
+            except Exception as e:
+                logging.error(f"Ecosystem add command error: {e}")
+                send_telegram_message(chat_id, f"❌ <b>Ecosystem Error:</b> {html.escape(str(e)[:100])}")
+            return
+
+        if text == "/ecosystem":
+            try:
+                tier1_list = get_filter("tier1_ecosystem") or []
+                ats_list = get_filter("ats_company_slugs") or []
+
+                keywords_display = ", ".join(f"<code>{html.escape(str(k)[:25])}</code>" for k in tier1_list[:10]) if tier1_list else "No keywords"
+                slugs_display = ", ".join(f"<code>{html.escape(str(s))}</code>" for s in ats_list[:10]) if ats_list else "No active boards"
+
+                ecosystem_overview = (
+                    f"🌐 <b>Active Ecosystem Overview</b>\n\n"
+                    f"🏢 <b>Tier-1 Keywords ({len(tier1_list)}):</b>\n{keywords_display}"
+                    f"{f'<br/>... and {len(tier1_list)-10} more' if len(tier1_list) > 10 else ''}\n\n"
+                    f"🔗 <b>ATS Board Slugs ({len(ats_list)}):</b>\n{slugs_display}"
+                    f"{f'<br/>... and {len(ats_list)-10} more' if len(ats_list) > 10 else ''}"
+                )
+                send_telegram_message(chat_id, ecosystem_overview)
+            except Exception as e:
+                logging.error(f"Ecosystem overview command error: {e}")
+                send_telegram_message(chat_id, f"❌ <b>Ecosystem Overview Error:</b> {html.escape(str(e)[:100])}")
             return
 
         # 8. Mobile Parameter Mutation & Inline Action Shortcuts
