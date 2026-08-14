@@ -38,6 +38,25 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 DB_PATH = "jobs_cache.db"
 
+# Inbound Email Anti-Spam Gatekeeper: 10 pre-filter shield parameters (raw CSV/string env values,
+# parsed lazily in passes_email_prefilter() to avoid depending on helpers defined later in the file)
+EMAIL_ALLOW_DOMAINS = os.environ.get("EMAIL_ALLOW_DOMAINS", "")
+EMAIL_BLOCK_DOMAINS = os.environ.get("EMAIL_BLOCK_DOMAINS", "quora.com,anytimefitness.com")
+EMAIL_REQUIRED_KEYWORDS = os.environ.get("EMAIL_REQUIRED_KEYWORDS", "interview,schedule,offer,opportunity,reply")
+EMAIL_EXCLUDED_KEYWORDS = os.environ.get("EMAIL_EXCLUDED_KEYWORDS", "digest,unsubscribe,newsletter,promo,alert")
+EMAIL_SENDER_BLACKLIST = os.environ.get("EMAIL_SENDER_BLACKLIST", "no-reply@,noreply@")
+EMAIL_SUBJECT_REGEX_FILTER = os.environ.get("EMAIL_SUBJECT_REGEX_FILTER", "")
+try:
+    EMAIL_MAX_AGE_SECONDS = int(os.environ.get("EMAIL_MAX_AGE_SECONDS", "300"))
+except (TypeError, ValueError):
+    EMAIL_MAX_AGE_SECONDS = 300
+EMAIL_REQUIRE_DIRECT_REPLY = os.environ.get("EMAIL_REQUIRE_DIRECT_REPLY", "False").strip().lower() in ("1", "true", "yes")
+try:
+    EMAIL_MIN_BODY_LENGTH = int(os.environ.get("EMAIL_MIN_BODY_LENGTH", "50"))
+except (TypeError, ValueError):
+    EMAIL_MIN_BODY_LENGTH = 50
+EMAIL_LABEL_TARGET_INBOX = os.environ.get("EMAIL_LABEL_TARGET_INBOX", "INBOX")
+
 # Bounded webhook queue + fixed daemon worker pool (backpressure instead of unbounded threads)
 WEBHOOK_QUEUE = queue.Queue(maxsize=100)
 WEBHOOK_WORKER_COUNT = 4
@@ -155,7 +174,13 @@ def init_db():
             conn.execute("ALTER TABLE sheet_row_map ADD COLUMN telegram_message_id INTEGER")
         except sqlite3.OperationalError:
             pass
+        # Migration guard: contact_email powers the strict CRM whitelist gatekeeper for inbound mail
+        try:
+            conn.execute("ALTER TABLE sheet_row_map ADD COLUMN contact_email TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_tg_msg ON sheet_row_map(telegram_message_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_contact_email ON sheet_row_map(contact_email)")
         
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -597,18 +622,21 @@ def is_company_on_cooldown(company_name):
     except Exception:
         return False
 
-def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_name="", contact_company=""):
-    """Persist (telegram_message_id, sheet_uuid, sheet_tab) atomically so swipe-replies can resolve the CRM row."""
+def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_name="", contact_company="", contact_email=""):
+    """Persist (telegram_message_id, sheet_uuid, sheet_tab, contact_email) atomically so swipe-replies
+    can resolve the CRM row and inbound mail can be matched against the CRM whitelist.
+    """
     if not telegram_message_id or not sheet_uuid:
         return False
+    clean_email = str(contact_email or "").split(" [")[0].strip().lower()
     try:
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
                 INSERT OR REPLACE INTO sheet_row_map 
-                (sheet_uuid, sheet_tab, contact_name, contact_company, telegram_message_id, created_at)
-                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sheet_row_map WHERE sheet_uuid = ?), CURRENT_TIMESTAMP))
-            """, (sheet_uuid, sheet_tab, contact_name, contact_company, telegram_message_id, sheet_uuid))
+                (sheet_uuid, sheet_tab, contact_name, contact_company, telegram_message_id, contact_email, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sheet_row_map WHERE sheet_uuid = ?), CURRENT_TIMESTAMP))
+            """, (sheet_uuid, sheet_tab, contact_name, contact_company, telegram_message_id, clean_email, sheet_uuid))
             conn.commit()
         return True
     except Exception as e:
@@ -1494,41 +1522,62 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     except Exception as e:
         return False, str(e), None
 
-def lookup_crm_sender_match(sender_raw):
-    """Extract sender email/domain and correlate against existing CRM records."""
+def is_verified_crm_contact(sender_raw):
+    """Strict, exact-match CRM whitelist check for the inbound email anti-spam gatekeeper.
+    Checks the local SQLite cache (sheet_row_map.contact_email, jobs.job_json target_email) first,
+    then falls back to a live Google Sheets CRM lookup (find_contact_by_email) as the source of truth.
+    Returns {"name", "company", "tab", "sheet_uuid"} on an exact match, or None if the sender is unverified.
+    """
     email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender_raw or "")
-    sender_email = email_match.group(0).lower() if email_match else ""
+    sender_email = email_match.group(0).lower().strip() if email_match else ""
     if not sender_email:
         return None
-
-    domain_part = sender_email.split("@")[-1].lower()
-    sender_domain = domain_part.split(".")[0]
-    generic_domains = {"gmail", "yahoo", "outlook", "hotmail", "icloud", "proton", "aol", "mail"}
 
     try:
         with get_db_conn() as conn:
             cursor = conn.cursor()
-            if sender_domain not in generic_domains and len(sender_domain) > 2:
-                cursor.execute("""
-                    SELECT contact_name, contact_company, sheet_tab 
-                    FROM sheet_row_map 
-                    WHERE LOWER(contact_company) LIKE ? 
-                       OR sheet_uuid IN (SELECT sheet_uuid FROM jobs WHERE LOWER(job_json) LIKE ?)
-                    ORDER BY created_at DESC LIMIT 1
-                """, (f"%{sender_domain}%", f"%{sender_email}%"))
-            else:
-                cursor.execute("""
-                    SELECT contact_name, contact_company, sheet_tab 
-                    FROM sheet_row_map 
-                    WHERE sheet_uuid IN (SELECT sheet_uuid FROM jobs WHERE LOWER(job_json) LIKE ?)
-                    ORDER BY created_at DESC LIMIT 1
-                """, (f"%{sender_email}%",))
-
+            cursor.execute(
+                "SELECT contact_name, contact_company, sheet_tab, sheet_uuid FROM sheet_row_map WHERE LOWER(contact_email) = ? ORDER BY created_at DESC LIMIT 1",
+                (sender_email,)
+            )
             row = cursor.fetchone()
             if row:
-                return {"name": row[0], "company": row[1], "tab": row[2]}
+                return {"name": row[0], "company": row[1], "tab": row[2], "sheet_uuid": row[3]}
+
+            # Fallback: exact target_email match inside cached job_json blobs (auto-generated job outreach targets)
+            cursor.execute("SELECT sheet_uuid, job_json FROM jobs WHERE LOWER(job_json) LIKE ?", (f"%{sender_email}%",))
+            for sheet_uuid, job_json in cursor.fetchall():
+                try:
+                    job_dict = json.loads(job_json)
+                    cached_target = str(job_dict.get("target_email", "")).split(" [")[0].strip().lower()
+                    if cached_target == sender_email:
+                        return {
+                            "name": "",
+                            "company": job_dict.get("employer_name", "Unknown"),
+                            "tab": "Pipeline_Candidates",
+                            "sheet_uuid": sheet_uuid
+                        }
+                except (json.JSONDecodeError, TypeError):
+                    continue
     except Exception as e:
-        logging.error(f"CRM Sender Lookup Error: {e}")
+        logging.error(f"CRM Whitelist Local Lookup Error: {e}")
+
+    # Live authoritative check against the Google Sheets CRM (catches manual edits not yet cached locally)
+    if CRM_WEBHOOK_URL:
+        try:
+            res = requests.get(f"{CRM_WEBHOOK_URL}?action=find_contact_by_email&email={urllib.parse.quote(sender_email)}", timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("found"):
+                    return {
+                        "name": data.get("name", ""),
+                        "company": data.get("company", "Unknown"),
+                        "tab": data.get("sheet_tab", "Unknown"),
+                        "sheet_uuid": data.get("sheet_uuid", "")
+                    }
+        except Exception as e:
+            logging.error(f"CRM Whitelist Remote Lookup Error: {e}")
+
     return None
 
 def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
@@ -1555,9 +1604,74 @@ def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
 
     return "GENERAL", None
 
+def passes_email_prefilter(sender: str, subject: str, snippet: str, internal_date_ms=None, in_reply_to="", references=""):
+    """Zero-tolerance anti-spam pre-filter shield. Enforces the 10 EMAIL_* environment parameters
+    BEFORE any CRM whitelist check runs. Returns (passed: bool, rejection_reason: str).
+    """
+    email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender or "")
+    sender_email = email_match.group(0).lower().strip() if email_match else ""
+    sender_domain = sender_email.split("@")[-1] if sender_email else ""
+    subject_l = str(subject or "")
+    combined_text = f"{subject} {snippet}".lower()
+
+    # 1. Sender blacklist (substring match, e.g. "no-reply@", "noreply@")
+    blacklist = [s.strip().lower() for s in EMAIL_SENDER_BLACKLIST.split(",") if s.strip()]
+    if blacklist and any(b in sender_email for b in blacklist):
+        return False, f"sender blacklisted ({sender_email})"
+
+    # 2. Blocked domains
+    block_domains = [d.strip().lower() for d in EMAIL_BLOCK_DOMAINS.split(",") if d.strip()]
+    if sender_domain and block_domains and sender_domain in block_domains:
+        return False, f"domain blocked ({sender_domain})"
+
+    # 3. Allow-list domains (if configured, sender domain MUST be present)
+    allow_domains = [d.strip().lower() for d in EMAIL_ALLOW_DOMAINS.split(",") if d.strip()]
+    if allow_domains and sender_domain not in allow_domains:
+        return False, f"domain not in allow-list ({sender_domain})"
+
+    # 4. Excluded keywords (subject/body)
+    excluded_kws = [k.strip().lower() for k in EMAIL_EXCLUDED_KEYWORDS.split(",") if k.strip()]
+    if excluded_kws and any(kw in combined_text for kw in excluded_kws):
+        return False, "excluded keyword matched"
+
+    # 5. Required keywords (at least one must be present, if configured)
+    required_kws = [k.strip().lower() for k in EMAIL_REQUIRED_KEYWORDS.split(",") if k.strip()]
+    if required_kws and not any(kw in combined_text for kw in required_kws):
+        return False, "no required keyword present"
+
+    # 6. Subject regex filter
+    if EMAIL_SUBJECT_REGEX_FILTER:
+        try:
+            if not re.search(EMAIL_SUBJECT_REGEX_FILTER, subject_l, re.IGNORECASE):
+                return False, "subject regex mismatch"
+        except re.error as e:
+            logging.error(f"Invalid EMAIL_SUBJECT_REGEX_FILTER pattern: {e}")
+
+    # 7. Minimum body/snippet length
+    if len(str(snippet or "").strip()) < EMAIL_MIN_BODY_LENGTH:
+        return False, f"body too short (< {EMAIL_MIN_BODY_LENGTH} chars)"
+
+    # 8. Max message age (reject stale/backlog messages)
+    if internal_date_ms is not None:
+        try:
+            age_seconds = time.time() - (int(internal_date_ms) / 1000.0)
+            if age_seconds > EMAIL_MAX_AGE_SECONDS:
+                return False, f"message too old ({int(age_seconds)}s > {EMAIL_MAX_AGE_SECONDS}s)"
+        except (TypeError, ValueError):
+            pass
+
+    # 9. Require direct reply (In-Reply-To/References header or "Re:" subject prefix)
+    if EMAIL_REQUIRE_DIRECT_REPLY:
+        is_direct_reply = bool(in_reply_to) or bool(references) or subject_l.strip().lower().startswith("re:")
+        if not is_direct_reply:
+            return False, "not a direct reply"
+
+    return True, ""
+
 def check_inbound_gmail_replies():
-    """Poll Gmail for unread inbound replies and alert Telegram with a direct thread link + CRM match.
-    Removes the UNREAD label after alerting to prevent duplicate notifications on the next poll.
+    """Poll Gmail for unread inbound replies. Zero-tolerance anti-spam gatekeeper:
+    1) Runs the 10-parameter pre-filter shield, 2) Requires an exact CRM whitelist match.
+    Unverified/spam mail is silently dropped (label removed, no Telegram alert) - never surfaced.
     """
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars or not TELEGRAM_CHAT_ID:
@@ -1568,7 +1682,7 @@ def check_inbound_gmail_replies():
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
         list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
-        params = {"q": "is:unread -from:me label:INBOX", "maxResults": 10}
+        params = {"q": f"is:unread -from:me label:{EMAIL_LABEL_TARGET_INBOX}", "maxResults": 10}
         res = requests.get(list_url, headers=headers, params=params, timeout=10)
         if res.status_code != 200:
             logging.error(f"Gmail Poll List Error: {res.status_code}")
@@ -1581,7 +1695,7 @@ def check_inbound_gmail_replies():
     for msg_id in message_ids:
         try:
             detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
-            detail_params = {"format": "metadata", "metadataHeaders": ["From", "Subject"]}
+            detail_params = {"format": "metadata", "metadataHeaders": ["From", "Subject", "In-Reply-To", "References"]}
             detail_res = requests.get(detail_url, headers=headers, params=detail_params, timeout=10)
             if detail_res.status_code != 200:
                 continue
@@ -1589,17 +1703,32 @@ def check_inbound_gmail_replies():
             header_list = detail.get("payload", {}).get("headers", [])
             sender = next((h["value"] for h in header_list if h["name"] == "From"), "Unknown Sender")
             subject = next((h["value"] for h in header_list if h["name"] == "Subject"), "(No Subject)")
+            in_reply_to = next((h["value"] for h in header_list if h["name"] == "In-Reply-To"), "")
+            references = next((h["value"] for h in header_list if h["name"] == "References"), "")
             snippet = detail.get("snippet", "")
+            internal_date_ms = detail.get("internalDate")
             thread_id = detail.get("threadId", msg_id)
-            thread_link = html.escape(f"https://mail.google.com/mail/u/0/#inbox/{thread_id}", quote=True)
+            modify_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify"
 
-            crm_match = lookup_crm_sender_match(sender)
-            crm_line = ""
-            if crm_match:
-                match_name = html.escape(str(crm_match.get("name") or "Unknown"))
-                match_company = html.escape(str(crm_match.get("company") or "Unknown"))
-                match_tab = html.escape(str(crm_match.get("tab") or "Unknown"))
-                crm_line = f"<b>CRM Match:</b> {match_name} @ {match_company} <i>({match_tab})</i>\n"
+            # GATE 1: Pre-filter shield (10 EMAIL_* parameters)
+            passed, reject_reason = passes_email_prefilter(sender, subject, snippet, internal_date_ms, in_reply_to, references)
+            if not passed:
+                logging.info(f"Inbound email dropped (pre-filter: {reject_reason}) from {sender}")
+                requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+                continue
+
+            # GATE 2: Strict CRM whitelist - zero tolerance for unverified senders
+            crm_match = is_verified_crm_contact(sender)
+            if not crm_match:
+                logging.info(f"Inbound email dropped (unverified sender, not in CRM) from {sender}")
+                requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+                continue
+
+            thread_link = html.escape(f"https://mail.google.com/mail/u/0/#inbox/{thread_id}", quote=True)
+            match_name = html.escape(str(crm_match.get("name") or "Unknown"))
+            match_company = html.escape(str(crm_match.get("company") or "Unknown"))
+            match_tab = html.escape(str(crm_match.get("tab") or "Unknown"))
+            crm_line = f"<b>CRM Match:</b> {match_name} @ {match_company} <i>({match_tab})</i>\n"
 
             status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
             status_badges = {
@@ -1621,7 +1750,6 @@ def check_inbound_gmail_replies():
             )
             send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
 
-            modify_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify"
             requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
         except Exception as e:
             logging.error(f"Gmail Poll Message Processing Error ({msg_id}): {e}")
@@ -1919,7 +2047,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
             telegram_message_id = res.json().get("result", {}).get("message_id")
             log_metric_event("message_sent", sheet_uuid)
             if telegram_message_id and sheet_uuid:
-                save_message_mapping(telegram_message_id, sheet_uuid, "Pipeline_Candidates", company, "")
+                save_message_mapping(telegram_message_id, sheet_uuid, "Pipeline_Candidates", company, "", target_email)
             return telegram_message_id
     except Exception as e:
         logging.error(f"Failed to post card to Telegram: {e}")
@@ -2417,7 +2545,7 @@ def process_webhook_payload_async(data):
                 sent_msg_id = send_telegram_message(chat_id, card_msg)
                 contact_sheet_uuid = c.get("sheet_uuid")
                 if sent_msg_id and contact_sheet_uuid:
-                    save_message_mapping(sent_msg_id, contact_sheet_uuid, target_code, c.get("name", ""), c.get("company", ""))
+                    save_message_mapping(sent_msg_id, contact_sheet_uuid, target_code, c.get("name", ""), c.get("company", ""), c.get("email", ""))
             return
 
         # 4. Priority Batcher (/p 1-10)
