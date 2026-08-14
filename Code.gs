@@ -91,6 +91,39 @@ function doPost(e) {
       return respondJSON({ status: "success", message: "Row appended successfully", sheet_uuid: payload.sheet_uuid || "" });
     }
 
+    // 1b. Batch Job Pipeline Row Log (main.py: build_crm_payload("batch_add_rows", ...))
+    // Processes multiple Tier-1/Tier-2 pipeline matches under a single lock/execution
+    if (action === "batch_add_rows") {
+      const targetTab = payload.target_code === "CW" ? "Carmen Warm" : "Tetiana Cold";
+      const sheet = getOrCreateSheet(ss, targetTab);
+      const schemaType = TAB_MAP[targetTab] || "JOBS";
+      const rows = payload.rows || [];
+
+      if (rows.length > 0) {
+        const startRow = sheet.getLastRow() + 1;
+        const batchValues = [];
+
+        for (let i = 0; i < rows.length; i++) {
+          const item = rows[i];
+          const normalized = normalizeRowData(item.row_data, schemaType);
+          while (normalized.length < UUID_COL - 1) {
+            normalized.push("");
+          }
+          normalized[UUID_COL - 1] = item.sheet_uuid || "";
+          batchValues.push(normalized);
+        }
+
+        sheet.getRange(startRow, 1, batchValues.length, UUID_COL).setValues(batchValues);
+        formatSheet(sheet);
+      }
+
+      return respondJSON({
+        status: "success",
+        message: `Batch inserted ${rows.length} rows`,
+        count: rows.length
+      });
+    }
+
     // 2. /quick Contact Creation (main.py: build_crm_payload("quick_add", ...))
     if (action === "quick_add") {
       const targetTab = payload.target_code === "TC" ? "Tetiana Cold" :

@@ -9,9 +9,21 @@ import io
 import re
 import typst
 
+def escape_typst(text: str) -> str:
+    """
+    Escapes Typst markup reserved characters to prevent compilation syntax exceptions.
+    Order is critical: backslashes must be escaped before structural syntax symbols.
+    """
+    if not text:
+        return ""
+    clean = str(text).replace("\\", "\\\\")
+    for char in ["#", "$", "[", "]", "*", "_", "<", ">", "@"]:
+        clean = clean.replace(char, f"\\{char}")
+    return clean
+
 def render_typst_markup(company_name: str, dynamic_bullets: list) -> str:
-    """Builds Typst markup with verified baseline history and tailored role bullets."""
-    clean_company = company_name or "Target Operations"
+    """Builds Typst markup with verified baseline history, embedded metadata, and tailored role bullets."""
+    clean_company = escape_typst(company_name or "Target Operations")
 
     if not dynamic_bullets:
         bullet_lines = [
@@ -19,10 +31,20 @@ def render_typst_markup(company_name: str, dynamic_bullets: list) -> str:
             "  - Automated data extraction and operational compliance workflows using Python and structured API schemas."
         ]
     else:
-        bullet_lines = [f"  - {re.sub(r'^[•\-\*]\s*', '', str(b).strip())}" for b in dynamic_bullets[:2]]
+        bullet_lines = []
+        for b in dynamic_bullets[:2]:
+            clean_b = re.sub(r'^[•\-\*]\s*', '', str(b).strip())
+            bullet_lines.append(f"  - {escape_typst(clean_b)}")
     dynamic_bullets_block = "\n".join(bullet_lines)
 
     markup = f"""
+#set document(
+  title: "Kevin Miller - Resume - {clean_company}",
+  author: "Kevin Miller",
+  date: auto,
+  keywords: ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation")
+)
+
 #set page(paper: "us-letter", margin: (x: 0.55in, top: 0.45in, bottom: 0.45in))
 #set text(font: "Liberation Sans", size: 9.5pt)
 #set par(justify: false, leading: 0.52em)

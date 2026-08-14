@@ -114,6 +114,25 @@ def init_db():
             notes_logged INTEGER DEFAULT 0
         )""")
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS crm_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload_json TEXT NOT NULL,
+            status TEXT DEFAULT 'PENDING',
+            retry_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_attempt TIMESTAMP
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS system_alerts (
+            alert_key TEXT PRIMARY KEY,
+            last_sent TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS seen_content_hashes (
+            content_hash TEXT PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS sheet_row_map (
             sheet_uuid TEXT PRIMARY KEY,
             sheet_tab TEXT,
@@ -380,6 +399,33 @@ def save_seen_job_db(job_hash):
         return False
     finally:
         DB_WRITE_LOCK.release()
+
+def compute_description_simhash(text: str) -> str:
+    """Computes a normalized SimHash token on the core job description."""
+    clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(text or "")[:400].lower())
+    tokens = clean.split()
+    if not tokens:
+        return hashlib.md5(b"").hexdigest()
+    # Normalize 3-grams to catch reworded titles with identical bodies
+    shingles = [" ".join(tokens[i:i+3]) for i in range(max(1, len(tokens)-2))]
+    return hashlib.md5("".join(sorted(shingles)).encode()).hexdigest()
+
+def is_content_seen(content_hash: str) -> bool:
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM seen_content_hashes WHERE content_hash = ?", (content_hash,))
+            return cursor.fetchone() is not None
+    except Exception:
+        return False
+
+def save_content_hash(content_hash: str):
+    try:
+        with get_db_conn() as conn:
+            conn.execute("INSERT OR IGNORE INTO seen_content_hashes (content_hash) VALUES (?)", (content_hash,))
+            conn.commit()
+    except Exception:
+        pass
 
 def add_company_cooldown(company_name):
     """Add company cooldown with thread-safe locking (30s timeout).
@@ -1090,8 +1136,29 @@ def check_existing_gmail_draft(to_email, subject):
         print(f"DB Gmail Draft Lookup Error ({to_email}): {e}", flush=True)
         return None
 
+def should_send_alert(alert_key: str, cooldown_hours: int = 6) -> bool:
+    """Returns True if the alert has not been triggered within cooldown_hours (debounces repetitive alerts)."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT last_sent FROM system_alerts WHERE alert_key = ? AND last_sent >= datetime('now', ?)",
+                (alert_key, f"-{cooldown_hours} hours")
+            )
+            if cursor.fetchone():
+                return False
+            conn.execute(
+                "INSERT OR REPLACE INTO system_alerts (alert_key, last_sent) VALUES (?, CURRENT_TIMESTAMP)",
+                (alert_key,)
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        print(f"Alert Debounce Error: {e}", flush=True)
+        return True
+
 def get_gmail_access_token():
-    """Refresh a Gmail OAuth access token. Alerts Telegram and returns None on any failure."""
+    """Refresh a Gmail OAuth access token. Alerts Telegram (debounced) and returns None on any failure."""
     token_url = "https://oauth2.googleapis.com/token"
     token_data = {
         "client_id": GMAIL_CLIENT_ID,
@@ -1106,19 +1173,20 @@ def get_gmail_access_token():
         # Any OAuth failure (invalid_grant, revoked, etc.) needs an explicit re-auth alert
         if "error" in token_json:
             error_code = token_json.get("error", "unknown_error")
-            oauth_link = (
-                "https://accounts.google.com/o/oauth2/v2/auth?"
-                f"client_id={GMAIL_CLIENT_ID}&redirect_uri=http://localhost&"
-                "scope=https://www.googleapis.com/auth/gmail.compose&response_type=code&"
-                "access_type=offline&prompt=consent"
-            )
-            alert_msg = (
-                f"⚠️ <b>Gmail OAuth Failure ({html.escape(error_code)})</b>\n"
-                f"Please re-authorize production access:\n"
-                f"<a href='{html.escape(oauth_link, quote=True)}'>Authorize Gmail</a>"
-            )
-            if TELEGRAM_CHAT_ID:
-                send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
+            if should_send_alert(f"oauth_{error_code}", cooldown_hours=6):
+                oauth_link = (
+                    "https://accounts.google.com/o/oauth2/v2/auth?"
+                    f"client_id={GMAIL_CLIENT_ID}&redirect_uri=http://localhost&"
+                    "scope=https://www.googleapis.com/auth/gmail.compose&response_type=code&"
+                    "access_type=offline&prompt=consent"
+                )
+                alert_msg = (
+                    f"⚠️ <b>Gmail OAuth Failure ({html.escape(error_code)})</b>\n"
+                    f"Please re-authorize production access:\n"
+                    f"<a href='{html.escape(oauth_link, quote=True)}'>Authorize Gmail</a>"
+                )
+                if TELEGRAM_CHAT_ID:
+                    send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
             return None
         return token_json.get("access_token")
     except Exception as e:
@@ -1213,6 +1281,30 @@ def lookup_crm_sender_match(sender_raw):
         print(f"CRM Sender Lookup Error: {e}", flush=True)
     return None
 
+def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
+    """
+    Classifies ATS email into 'interview', 'rejection', or 'general'.
+    Returns (status_label, crm_action)
+    """
+    text = f"{subject} {snippet}".lower()
+
+    interview_patterns = [
+        r"invitation to interview", r"interview request", r"schedule a (?:call|time|screen|chat)",
+        r"selected for an interview", r"next steps with", r"speaking with our team",
+        r"move forward with your application"
+    ]
+    if any(re.search(p, text) for p in interview_patterns):
+        return "INTERVIEW_SET", "update_interview"
+
+    rejection_patterns = [
+        r"unfortunately", r"not moving forward", r"other candidates",
+        r"decided to pursue", r"position has been filled", r"impressed with your background, but"
+    ]
+    if any(re.search(p, text) for p in rejection_patterns):
+        return "REJECTION", "update_rejected"
+
+    return "GENERAL", None
+
 def check_inbound_gmail_replies():
     """Poll Gmail for unread inbound replies and alert Telegram with a direct thread link + CRM match.
     Removes the UNREAD label after alerting to prevent duplicate notifications on the next poll.
@@ -1259,8 +1351,18 @@ def check_inbound_gmail_replies():
                 match_tab = html.escape(str(crm_match.get("tab") or "Unknown"))
                 crm_line = f"<b>CRM Match:</b> {match_name} @ {match_company} <i>({match_tab})</i>\n"
 
+            status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
+            status_badges = {
+                "INTERVIEW_SET": "🎉 <b>Interview Signal Detected!</b>\n",
+                "REJECTION": "⚠️ <b>Rejection Detected</b>\n"
+            }
+            status_line = status_badges.get(status_label, "")
+            if status_label == "INTERVIEW_SET":
+                log_metric_event("interview_set")
+
             alert_msg = (
                 f"📬 <b>New Gmail Reply!</b>\n\n"
+                f"{status_line}"
                 f"<b>From:</b> {html.escape(sender)}\n"
                 f"{crm_line}"
                 f"<b>Subject:</b> {html.escape(subject)}\n"
@@ -1287,6 +1389,45 @@ def start_gmail_poller():
     """Spin up the inbound Gmail reply poller as a daemon thread."""
     threading.Thread(target=check_inbound_replies_loop, daemon=True).start()
 
+def morning_digest_loop():
+    """Dispatches a standup digest daily at 08:30 AM local time."""
+    while True:
+        now = datetime.now()
+        target_time = now.replace(hour=8, minute=30, second=0, microsecond=0)
+        if now >= target_time:
+            target_time += timedelta(days=1)
+
+        sleep_seconds = (target_time - now).total_seconds()
+        time.sleep(sleep_seconds)
+
+        try:
+            if TELEGRAM_CHAT_ID:
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                activity = get_daily_activity(today_str)
+                streak = calculate_active_day_streak()
+                cw_cards = fetch_networking_cards("CW", qty=10)
+                tc_cards = fetch_networking_cards("TC", qty=10)
+
+                overdue = [
+                    c for c in (cw_cards + tc_cards)
+                    if c.get("next_followup") and c.get("next_followup") <= today_str
+                ]
+
+                digest = (
+                    f"🌅 <b>Good Morning! Daily Outreach Brief ({today_str})</b>\n\n"
+                    f"🔥 <b>Active Streak:</b> {streak} Days\n"
+                    f"🎯 <b>Today's Staged Goal:</b> {activity['drafts_staged']} / 5\n"
+                    f"⚠️ <b>Overdue Actions:</b> {len(overdue)} contacts requiring follow-up\n\n"
+                    f"Run <code>/s</code> to review overdue contacts or <code>/t</code> to trigger the search pipeline."
+                )
+                send_telegram_message(TELEGRAM_CHAT_ID, digest)
+        except Exception as e:
+            print(f"Morning Digest Dispatch Error: {e}", flush=True)
+
+def start_morning_digest():
+    """Spin up the 8:30 AM daily standup digest as a daemon thread."""
+    threading.Thread(target=morning_digest_loop, daemon=True).start()
+
 def log_to_sheets_crm(payload, max_retries=3):
     """Log to Google Sheets CRM. Payload may include row UUID and note timestamp.
     Support apps script bottom-to-top search loops via rowOperationOrder: 'DESC'.
@@ -1309,9 +1450,63 @@ def log_to_sheets_crm(payload, max_retries=3):
     send_health_alert(f"Failed to log payload to Google Sheets after {max_retries} attempts.")
     return False
 
-def dispatch_crm_update_async(payload):
-    """Fire-and-forget CRM webhook POST on a daemon thread so Apps Script network latency never blocks Telegram UX."""
-    threading.Thread(target=log_to_sheets_crm, args=(payload,), daemon=True).start()
+def enqueue_crm_payload(payload):
+    """Enqueues an outbound Sheets write to local SQLite to ensure zero data loss (durable outbox pattern)."""
+    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
+        print("DB Write Lock Timeout (enqueue_crm_payload)", flush=True)
+        return False
+    try:
+        with get_db_conn() as conn:
+            conn.execute(
+                "INSERT INTO crm_outbox (payload_json, status) VALUES (?, 'PENDING')",
+                (json.dumps(payload),)
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"CRM Outbox Enqueue Error: {e}", flush=True)
+        return False
+    finally:
+        DB_WRITE_LOCK.release()
+
+def crm_outbox_worker_loop():
+    """Background daemon processing queued Sheets writes with exponential backoff."""
+    while True:
+        try:
+            with get_db_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, payload_json, retry_count 
+                    FROM crm_outbox 
+                    WHERE status = 'PENDING' AND retry_count < 10 
+                    ORDER BY id ASC LIMIT 5
+                """)
+                pending_jobs = cursor.fetchall()
+
+            for job_id, payload_str, retries in pending_jobs:
+                payload = json.loads(payload_str)
+                success = log_to_sheets_crm(payload, max_retries=1)
+
+                with get_db_conn() as conn:
+                    if success:
+                        conn.execute("DELETE FROM crm_outbox WHERE id = ?", (job_id,))
+                    else:
+                        conn.execute("""
+                            UPDATE crm_outbox 
+                            SET retry_count = retry_count + 1, 
+                                last_attempt = CURRENT_TIMESTAMP,
+                                status = CASE WHEN retry_count + 1 >= 10 THEN 'FAILED' ELSE 'PENDING' END
+                            WHERE id = ?
+                        """, (job_id,))
+                    conn.commit()
+                time.sleep(1.0)
+        except Exception as e:
+            print(f"CRM Outbox Worker Error: {e}", flush=True)
+        time.sleep(5)
+
+def start_crm_outbox_worker():
+    """Spin up the persistent CRM outbox worker as a daemon thread."""
+    threading.Thread(target=crm_outbox_worker_loop, daemon=True).start()
 
 def fetch_networking_cards(target_code="CW", qty=2):
     if not CRM_WEBHOOK_URL:
@@ -1636,6 +1831,13 @@ def run_job_pipeline(chat_id=None, top_n=2):
             return
         seen_hashes.add(job_hash)
         save_seen_job_db(job_hash)
+
+        # Fuzzy content dedup: catches identical postings cross-posted under reworded titles/companies
+        content_hash = compute_description_simhash(job.get("job_description"))
+        if is_content_seen(content_hash):
+            return
+        save_content_hash(content_hash)
+
         log_metric_event("listing_discovered")
         if passes_strict_filter(job):
             candidate_pool.append(job)
@@ -1695,6 +1897,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
     tier2_matches = [m for m in top_matches if 65 <= m["score"] < 80]
 
     # Dispatch Tier-1 matches as full interactive cards, paced to avoid Telegram 429s
+    batch_rows = []
     for item in tier1_matches:
         job = item["job"]
         send_telegram_card(
@@ -1705,11 +1908,9 @@ def run_job_pipeline(chat_id=None, top_n=2):
             linkedin_note=item.get("linkedin_note", ""),
             ats_bullets=item.get("ats_bullets")
         )
-        log_to_sheets_crm(build_crm_payload(
-            "add_row",
-            sheet_uuid=item.get("sheet_uuid"),
-            target_code="TC",
-            row_data=[
+        batch_rows.append({
+            "sheet_uuid": item.get("sheet_uuid"),
+            "row_data": [
                 today_str,
                 job.get("employer_name"),
                 job.get("job_title"),
@@ -1720,7 +1921,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 job.get("job_apply_link", ""),
                 f"Matched via Pipeline | {item['reason']}"
             ]
-        ))
+        })
         time.sleep(1.1)  # Telegram rate-limit pacing between outbound cards
 
     # Dispatch Tier-2 (secondary qualified) matches as bundled digests, chunked to stay under Telegram's payload limit
@@ -1731,11 +1932,9 @@ def run_job_pipeline(chat_id=None, top_n=2):
             comp = str(job.get("employer_name") or "N/A")[:28]
             title = str(job.get("job_title") or "N/A")[:40]
             digest_lines.append(f"{item['score']:>3}  {comp} - {title}")
-            log_to_sheets_crm(build_crm_payload(
-                "add_row",
-                sheet_uuid=item.get("sheet_uuid"),
-                target_code="TC",
-                row_data=[
+            batch_rows.append({
+                "sheet_uuid": item.get("sheet_uuid"),
+                "row_data": [
                     today_str,
                     job.get("employer_name"),
                     job.get("job_title"),
@@ -1746,7 +1945,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
                     job.get("job_apply_link", ""),
                     f"Secondary Match via Pipeline | {item['reason']}"
                 ]
-            ))
+            })
 
         # Max 20 roles/message to keep well under Telegram's 4,096 char payload limit
         chunk_size = 20
@@ -1761,6 +1960,10 @@ def run_job_pipeline(chat_id=None, top_n=2):
             )
             send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)
             time.sleep(1.1)
+
+    # Single batched CRM write for all Tier-1 + Tier-2 rows under one lock/execution in Code.gs
+    if batch_rows:
+        enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="TC", rows=batch_rows))
     
     print(f"Stage 2 Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.", flush=True)
     if chat_id:
@@ -1789,6 +1992,13 @@ def process_webhook_payload_async(data):
                     send_telegram_message(chat_id, "⚠️ Malformed button data. Please re-run /t to regenerate cards.", callback_query_id=callback_query_id)
                     return
                 short_id = cb_arg
+                message_id = cb["message"].get("message_id")
+                # Mutate the inline keyboard immediately to prevent a double-tap race from staging two drafts
+                edit_telegram_message(
+                    chat_id, message_id,
+                    cb["message"].get("text", ""),
+                    reply_markup={"inline_keyboard": [[{"text": "⏳ Staging Draft...", "callback_data": "noop"}]]}
+                )
                 job = get_job_from_cache(short_id)
                 if job:
                     target = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
@@ -1874,6 +2084,9 @@ def process_webhook_payload_async(data):
             elif cb_data == "reset_filters":
                 init_db()
                 send_telegram_message(chat_id, "<b>Search filters reset to default parameters.</b>", callback_query_id=callback_query_id)
+            elif cb_data == "noop":
+                # Placeholder button shown while a draft/action is staging - just clear the spinner
+                answer_callback_query(callback_query_id, "⏳ Already in progress...")
             else:
                 send_telegram_message(chat_id, "⚠️ Unrecognized button action.", callback_query_id=callback_query_id)
             return
@@ -2112,7 +2325,7 @@ def process_webhook_payload_async(data):
             label = html.escape(mapping.get("contact_company") or mapping.get("contact_name") or "record")
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"📅 Follow-up for {label} snoozed to {next_followup}.")
-            dispatch_crm_update_async(build_crm_payload("update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup))
+            enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup))
             return
 
         if text.startswith("/n "):
@@ -2126,7 +2339,7 @@ def process_webhook_payload_async(data):
             timestamped_note = f"[{today_str}] {html.escape(note_str)}"
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"📝 Note logged: <code>{timestamped_note}</code>")
-            dispatch_crm_update_async(build_crm_payload("append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note))
+            enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note))
             log_daily_activity("notes_logged")
             return
 
@@ -2162,7 +2375,7 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, confirm_msg)
             if ok:
                 log_daily_activity("drafts_staged")
-            dispatch_crm_update_async(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
+            enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
             return
 
         if text == "/prep":
@@ -2203,13 +2416,11 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
-            if not job:
-                send_telegram_message(chat_id, "⚠️ Job data not found in cache. Please re-run /t.")
-                return
 
-            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            # Fallback to the networking-record mapping (e.g. /quick contacts with no cached job) instead of blocking
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Company"
             bullets = job.get("ats_bullets", [])
-            short_id = job.get("short_id") or generate_short_key(job.get("job_id"))
+            short_id = job.get("short_id") or generate_short_key(job.get("job_id") or mapping["sheet_uuid"])
 
             try:
                 pdf_bytes = compile_resume_pdf(comp, bullets)
@@ -2245,7 +2456,7 @@ def process_webhook_payload_async(data):
                 new_tab = "Killed" if source_tab in ("Carmen Warm", "Carmen Cold") else "Died"
                 # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
                 send_telegram_message(chat_id, f"⚡ ❌ Archived lead to {new_tab}.")
-                dispatch_crm_update_async(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+                enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
                 return
 
             new_tab_map = {
@@ -2264,7 +2475,7 @@ def process_webhook_payload_async(data):
             }
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"⚡ {confirm_map[text]}")
-            dispatch_crm_update_async(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
     except Exception as e:
@@ -2288,6 +2499,8 @@ def start_webhook_workers():
 
 start_webhook_workers()
 start_gmail_poller()
+start_crm_outbox_worker()
+start_morning_digest()
 
 # ==============================================================================
 # 10. FLASK SERVER & STACKED WEBHOOK ROUTER
