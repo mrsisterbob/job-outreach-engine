@@ -250,6 +250,7 @@ function doPost(e) {
           name: name,
           company: company,
           title: title,
+          email: row[3] || "",
           priority: rowPriority,
           note: row[8],
           next_followup: formatDate(row[6])
@@ -360,7 +361,42 @@ function doGet(e) {
       return respondJSON({ status: "success", filters: filters });
     }
 
+    // 3. Strict CRM Whitelist Lookup (main.py inbound email anti-spam gatekeeper)
+    // Scans every schema-mapped tab's Contact Email column (index 3, shared by JOBS/PEOPLE schemas)
+    // for an exact case-insensitive match. Authoritative source of truth for the Sheets CRM.
+    if (action === "find_contact_by_email") {
+      const rawEmail = (e.parameter.email || "").toString().trim().toLowerCase();
+      if (!rawEmail) {
+        return respondJSON({ status: "success", found: false });
+      }
+
+      for (const tabName of ALL_TABS) {
+        const sheet = ss.getSheetByName(tabName);
+        if (!sheet) continue;
+        const schemaType = TAB_MAP[tabName] || "PEOPLE";
+        const data = sheet.getDataRange().getValues();
+        for (let i = data.length - 1; i >= 1; i--) {
+          const row = data[i];
+          const rowEmail = (row[3] || "").toString().trim().toLowerCase();
+          if (rowEmail && rowEmail === rawEmail) {
+            const name = schemaType === "JOBS" ? "" : row[1];
+            const company = schemaType === "JOBS" ? row[1] : row[2];
+            return respondJSON({
+              status: "success",
+              found: true,
+              sheet_uuid: row[9] || "",
+              sheet_tab: tabName,
+              name: name,
+              company: company
+            });
+          }
+        }
+      }
+      return respondJSON({ status: "success", found: false });
+    }
+
     return respondJSON({ status: "error", message: "Unsupported GET request" });
+
 
   } catch (err) {
     return respondJSON({ status: "error", message: err.toString() });
