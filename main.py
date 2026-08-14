@@ -53,7 +53,8 @@ ALIAS_MAP = {
     "loc": "valid_cities",
     "query": "target_queries",
     "q": "target_queries",
-    "kw": "required_keywords"
+    "kw": "required_keywords",
+    "ats": "ats_company_slugs"
 }
 
 def get_db_conn():
@@ -167,6 +168,7 @@ def init_db():
                     "downtown detroit", "inveniam", "rivian", "rocket", "quicken", "stockx", "venture"
                 ],
                 "required_keywords": [],
+                "ats_company_slugs": [],
                 "target_queries": [
                     "Wealth Operations Detroit MI",
                     "Fintech Operations Michigan",
@@ -1086,6 +1088,41 @@ def check_existing_gmail_draft(to_email, subject):
         print(f"DB Gmail Draft Lookup Error ({to_email}): {e}", flush=True)
         return None
 
+def get_gmail_access_token():
+    """Refresh a Gmail OAuth access token. Alerts Telegram and returns None on any failure."""
+    token_url = "https://oauth2.googleapis.com/token"
+    token_data = {
+        "client_id": GMAIL_CLIENT_ID,
+        "client_secret": GMAIL_CLIENT_SECRET,
+        "refresh_token": GMAIL_REFRESH_TOKEN,
+        "grant_type": "refresh_token"
+    }
+    try:
+        token_res = requests.post(token_url, data=token_data, timeout=10)
+        token_json = token_res.json()
+
+        # Any OAuth failure (invalid_grant, revoked, etc.) needs an explicit re-auth alert
+        if "error" in token_json:
+            error_code = token_json.get("error", "unknown_error")
+            oauth_link = (
+                "https://accounts.google.com/o/oauth2/v2/auth?"
+                f"client_id={GMAIL_CLIENT_ID}&redirect_uri=http://localhost&"
+                "scope=https://www.googleapis.com/auth/gmail.compose&response_type=code&"
+                "access_type=offline&prompt=consent"
+            )
+            alert_msg = (
+                f"⚠️ <b>Gmail OAuth Failure ({html.escape(error_code)})</b>\n"
+                f"Please re-authorize production access:\n"
+                f"<a href='{html.escape(oauth_link, quote=True)}'>Authorize Gmail</a>"
+            )
+            if TELEGRAM_CHAT_ID:
+                send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
+            return None
+        return token_json.get("access_token")
+    except Exception as e:
+        print(f"Gmail OAuth Token Refresh Exception: {e}", flush=True)
+        return None
+
 def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note=""):
     """Create Gmail draft with 24h dedup check and OAuth token expiry handling.
     Returns (success, message, draft_id) - draft_id is populated on success or when a duplicate is found.
@@ -1114,38 +1151,10 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
             )
         return False, "Draft already exists in Gmail", existing["draft_id"]
 
-    token_url = "https://oauth2.googleapis.com/token"
-    token_data = {
-        "client_id": GMAIL_CLIENT_ID,
-        "client_secret": GMAIL_CLIENT_SECRET,
-        "refresh_token": GMAIL_REFRESH_TOKEN,
-        "grant_type": "refresh_token"
-    }
     try:
-        token_res = requests.post(token_url, data=token_data, timeout=10)
-        token_json = token_res.json()
-
-        # Any OAuth failure (invalid_grant, revoked, etc.) needs an explicit re-auth alert
-        if "error" in token_json:
-            error_code = token_json.get("error", "unknown_error")
-            oauth_link = (
-                "https://accounts.google.com/o/oauth2/v2/auth?"
-                f"client_id={GMAIL_CLIENT_ID}&redirect_uri=http://localhost&"
-                "scope=https://www.googleapis.com/auth/gmail.compose&response_type=code&"
-                "access_type=offline&prompt=consent"
-            )
-            alert_msg = (
-                f"⚠️ <b>Gmail OAuth Failure ({html.escape(error_code)})</b>\n"
-                f"Please re-authorize production access:\n"
-                f"<a href='{html.escape(oauth_link, quote=True)}'>Authorize Gmail</a>"
-            )
-            if TELEGRAM_CHAT_ID:
-                send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
-            return False, f"Gmail OAuth Failure: {error_code}", None
-
-        access_token = token_json.get("access_token")
+        access_token = get_gmail_access_token()
         if not access_token:
-            return False, "OAuth Token Refused", None
+            return False, "OAuth Token Unavailable", None
 
         message = EmailMessage()
         message["To"] = to_email
@@ -1164,6 +1173,71 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         return False, f"Gmail Error {res.status_code}", None
     except Exception as e:
         return False, str(e), None
+
+def check_inbound_gmail_replies():
+    """Poll Gmail for unread inbound replies and alert Telegram with a direct thread link.
+    Removes the UNREAD label after alerting to prevent duplicate notifications on the next poll.
+    """
+    missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
+    if missing_vars or not TELEGRAM_CHAT_ID:
+        return
+    access_token = get_gmail_access_token()
+    if not access_token:
+        return
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+        params = {"q": "is:unread -from:me label:INBOX", "maxResults": 10}
+        res = requests.get(list_url, headers=headers, params=params, timeout=10)
+        if res.status_code != 200:
+            print(f"Gmail Poll List Error: {res.status_code}", flush=True)
+            return
+        message_ids = [m["id"] for m in res.json().get("messages", [])]
+    except Exception as e:
+        print(f"Gmail Poll List Exception: {e}", flush=True)
+        return
+
+    for msg_id in message_ids:
+        try:
+            detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
+            detail_params = {"format": "metadata", "metadataHeaders": ["From", "Subject"]}
+            detail_res = requests.get(detail_url, headers=headers, params=detail_params, timeout=10)
+            if detail_res.status_code != 200:
+                continue
+            detail = detail_res.json()
+            header_list = detail.get("payload", {}).get("headers", [])
+            sender = next((h["value"] for h in header_list if h["name"] == "From"), "Unknown Sender")
+            subject = next((h["value"] for h in header_list if h["name"] == "Subject"), "(No Subject)")
+            snippet = detail.get("snippet", "")
+            thread_id = detail.get("threadId", msg_id)
+            thread_link = html.escape(f"https://mail.google.com/mail/u/0/#inbox/{thread_id}", quote=True)
+
+            alert_msg = (
+                f"📬 <b>New Gmail Reply!</b>\n\n"
+                f"<b>From:</b> {html.escape(sender)}\n"
+                f"<b>Subject:</b> {html.escape(subject)}\n"
+                f"<b>Preview:</b> <i>{html.escape(snippet)}</i>\n\n"
+                f"<a href='{thread_link}'>Open Thread in Gmail</a>"
+            )
+            send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
+
+            modify_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify"
+            requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+        except Exception as e:
+            print(f"Gmail Poll Message Processing Error ({msg_id}): {e}", flush=True)
+
+def check_inbound_replies_loop():
+    """Daemon loop: poll Gmail for unread replies every 120 seconds."""
+    while True:
+        try:
+            check_inbound_gmail_replies()
+        except Exception as e:
+            print(f"Gmail Poller Loop Error: {e}", flush=True)
+        time.sleep(120)
+
+def start_gmail_poller():
+    """Spin up the inbound Gmail reply poller as a daemon thread."""
+    threading.Thread(target=check_inbound_replies_loop, daemon=True).start()
 
 def log_to_sheets_crm(payload, max_retries=3):
     """Log to Google Sheets CRM. Payload may include row UUID and note timestamp.
@@ -1262,6 +1336,11 @@ def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=No
         payload["reply_markup"] = reply_markup
     try:
         res = requests.post(url, json=payload, timeout=5)
+        if res.status_code == 429:
+            retry_after = res.json().get("parameters", {}).get("retry_after", 1)
+            print(f"Telegram 429 Rate Limit - retrying after {retry_after}s", flush=True)
+            time.sleep(retry_after)
+            res = requests.post(url, json=payload, timeout=5)
         if res.status_code == 200:
             log_metric_event("message_sent")
             return res.json().get("result", {}).get("message_id")
@@ -1337,6 +1416,11 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 429:
+            retry_after = res.json().get("parameters", {}).get("retry_after", 1)
+            print(f"Telegram 429 Rate Limit (card) - retrying after {retry_after}s", flush=True)
+            time.sleep(retry_after)
+            res = requests.post(url, json=payload, timeout=10)
         if res.status_code == 200:
             telegram_message_id = res.json().get("result", {}).get("message_id")
             log_metric_event("message_sent", sheet_uuid)
@@ -1351,32 +1435,133 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
 # 8. PARALLEL PIPELINE EXECUTION (PARALLEL JSEARCH + EARLY-EXIT CIRCUIT BREAKER)
 # ==============================================================================
 def fetch_single_query_jobs(query_args):
-    """Worker function for parallel JSearch API query execution."""
+    """Worker function for parallel JSearch API query execution.
+    Fetches up to 3 pages sequentially per query for 3x candidate volume; stops early on empty page or 429.
+    """
     query, api_url, headers = query_args
-    params = {"query": query, "page": "1", "num_pages": "1", "date_posted": "month"}
+    all_jobs = []
+    for page in range(1, 4):
+        params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
+        try:
+            res = requests.get(api_url, headers=headers, params=params, timeout=10)
+            if res.status_code == 429:
+                print(f"JSearch 429 Rate Limit on page {page} ({query}) - stopping pagination", flush=True)
+                break
+            if res.status_code != 200:
+                break
+            page_jobs = res.json().get("data", [])
+            if not page_jobs:
+                break  # no more results, stop paging early
+            all_jobs.extend(page_jobs)
+        except Exception as e:
+            print(f"Fetch Exception ({query} page {page}): {e}", flush=True)
+            break
+    return all_jobs
+
+def fetch_greenhouse_jobs(slug):
+    """Pull unauthenticated postings from a Greenhouse job board for a company slug."""
     try:
-        res = requests.get(api_url, headers=headers, params=params, timeout=10)
-        if res.status_code == 200:
-            return res.json().get("data", [])
+        res = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs", timeout=10)
+        if res.status_code != 200:
+            return []
+        postings = res.json().get("jobs", [])
+        jobs = []
+        for p in postings:
+            location = (p.get("location") or {}).get("name", "")
+            jobs.append({
+                "job_id": f"gh_{slug}_{p.get('id')}",
+                "employer_name": slug.replace("-", " ").title(),
+                "job_title": p.get("title", ""),
+                "job_description": p.get("content", "") or "",
+                "job_apply_link": p.get("absolute_url", ""),
+                "job_city": location,
+                "job_state": "",
+                "job_is_remote": "remote" in location.lower(),
+                "job_posted_at_datetime_utc": p.get("updated_at", "")
+            })
+        return jobs
     except Exception as e:
-        print(f"Fetch Exception ({query}): {e}", flush=True)
-    return []
+        print(f"Greenhouse Fetch Exception ({slug}): {e}", flush=True)
+        return []
+
+def fetch_lever_jobs(slug):
+    """Pull unauthenticated postings from a Lever job board for a company slug."""
+    try:
+        res = requests.get(f"https://api.lever.co/v0/postings/{slug}", params={"mode": "json"}, timeout=10)
+        if res.status_code != 200:
+            return []
+        postings = res.json()
+        jobs = []
+        for p in postings:
+            location = (p.get("categories") or {}).get("location", "")
+            created_ms = p.get("createdAt") or 0
+            posted_iso = ""
+            if created_ms:
+                try:
+                    posted_iso = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc).isoformat()
+                except Exception:
+                    posted_iso = ""
+            jobs.append({
+                "job_id": f"lever_{slug}_{p.get('id')}",
+                "employer_name": slug.replace("-", " ").title(),
+                "job_title": p.get("text", ""),
+                "job_description": p.get("descriptionPlain") or p.get("description") or "",
+                "job_apply_link": p.get("hostedUrl", ""),
+                "job_city": location,
+                "job_state": "",
+                "job_is_remote": "remote" in str(location).lower(),
+                "job_posted_at_datetime_utc": posted_iso
+            })
+        return jobs
+    except Exception as e:
+        print(f"Lever Fetch Exception ({slug}): {e}", flush=True)
+        return []
+
+def fetch_ats_jobs(company_slugs):
+    """Pull unauthenticated Greenhouse + Lever postings for a list of company slugs, in parallel."""
+    if not company_slugs:
+        return []
+    all_jobs = []
+    with ThreadPoolExecutor(max_workers=min(len(company_slugs) * 2, 12) or 1) as executor:
+        futures = []
+        for slug in company_slugs:
+            futures.append(executor.submit(fetch_greenhouse_jobs, slug))
+            futures.append(executor.submit(fetch_lever_jobs, slug))
+        for future in futures:
+            try:
+                all_jobs.extend(future.result(timeout=15))
+            except Exception as e:
+                print(f"ATS Fetch Future Error: {e}", flush=True)
+    return all_jobs
 
 def run_job_pipeline(chat_id=None, top_n=2):
     """Job search pipeline with two-stage architecture:
-    Stage 1: Pre-filter candidates (strict filters)
-    Stage 2: Concurrent Gemini AI evaluation (ThreadPoolExecutor, max 10 candidates)
+    Stage 1: Pre-filter candidates (JSearch multi-page + ATS direct-source, strict filters)
+    Stage 2: Concurrent Gemini AI evaluation (uncapped, ThreadPoolExecutor max_workers=20)
+    Tiered delivery: Tier-1 (score>=80, top 5) get full interactive cards; Tier-2 (65-79) get a bundled digest.
     """
     print(">>> Starting Job Search Pipeline...", flush=True)
     if chat_id:
-        send_status_update(chat_id, "Stage 1: Fetching raw listings from JSearch in parallel...")
+        send_status_update(chat_id, "Stage 1: Fetching raw listings from JSearch (3 pages/query) in parallel...")
     
     seen_hashes = set()
     candidate_pool = []
     today_str = datetime.now().strftime("%Y-%m-%d")
     followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
+
+    def _add_candidate(job):
+        company = job.get("employer_name") or ""
+        title = job.get("job_title") or ""
+        job_hash = generate_dedup_hash(company, title)
+        if job_hash in seen_hashes or is_job_seen_db(job_hash):
+            return
+        seen_hashes.add(job_hash)
+        save_seen_job_db(job_hash)
+        log_metric_event("listing_discovered")
+        if passes_strict_filter(job):
+            candidate_pool.append(job)
     
-    # Stage 1: Parallel JSearch fetching + strict filtering
+    # Stage 1: Parallel JSearch fetching (3 pages/query) + strict filtering
     rapidapi_key = os.environ.get("RAPIDAPI_KEY")
     openweb_key = os.environ.get("OPENWEBNINJA_KEY")
     if rapidapi_key:
@@ -1393,27 +1578,26 @@ def run_job_pipeline(chat_id=None, top_n=2):
         query_results = executor.map(fetch_single_query_jobs, query_tasks)
         for jobs in query_results:
             for job in jobs:
-                company = job.get("employer_name") or ""
-                title = job.get("job_title") or ""
-                job_hash = generate_dedup_hash(company, title)
-                if job_hash in seen_hashes or is_job_seen_db(job_hash):
-                    continue
-                seen_hashes.add(job_hash)
-                save_seen_job_db(job_hash)
-                log_metric_event("listing_discovered")
-                if passes_strict_filter(job):
-                    candidate_pool.append(job)
+                _add_candidate(job)
+
+    # Stage 1b: High-volume ATS direct-source expansion (unauthenticated Greenhouse/Lever boards)
+    ats_slugs = get_filter("ats_company_slugs", [])
+    if ats_slugs:
+        if chat_id:
+            send_status_update(chat_id, f"Stage 1b: Sourcing direct ATS postings from {len(ats_slugs)} companies...")
+        for job in fetch_ats_jobs(ats_slugs):
+            _add_candidate(job)
     
     print(f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.", flush=True)
     if chat_id:
-        send_status_update(chat_id, f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.\nStage 2: Running AI evaluations (max 10 candidates)...")
+        send_status_update(chat_id, f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.\nStage 2: Running AI evaluations (uncapped, Tier-1 capacity)...")
     
-    # Stage 2: Cap at 10 candidates, concurrent Gemini evaluation with timeout handling
-    eval_candidates = candidate_pool[:10]
-    print(f"Stage 2: Evaluating {len(eval_candidates)} candidates with Gemini AI (max 10)...", flush=True)
+    # Stage 2: Evaluate ALL strict-filtered candidates concurrently (uncapped Tier-1 capacity)
+    eval_candidates = candidate_pool
+    print(f"Stage 2: Evaluating {len(eval_candidates)} candidates with Gemini AI (uncapped)...", flush=True)
     
     top_matches = []
-    with ThreadPoolExecutor(max_workers=8) as eval_executor:
+    with ThreadPoolExecutor(max_workers=20) as eval_executor:
         # Map candidate evaluation across thread pool
         eval_futures = [eval_executor.submit(process_single_candidate, candidate) for candidate in eval_candidates]
         
@@ -1426,11 +1610,13 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 print(f"Candidate evaluation failed (timeout or error): {e}", flush=True)
                 # On timeout/error: score=0, status='Evaluation Pending' is handled in evaluate_job_with_gemini
     
-    # Sort by score descending
+    # Sort by score descending, then split into Tier-1 (full cards) and Tier-2 (bundled digest)
     top_matches.sort(key=lambda x: x["score"], reverse=True)
-    
-    # Dispatch results to Telegram and CRM
-    for item in top_matches:
+    tier1_matches = [m for m in top_matches if m["score"] >= 80][:5]
+    tier2_matches = [m for m in top_matches if 65 <= m["score"] < 80]
+
+    # Dispatch Tier-1 matches as full interactive cards, paced to avoid Telegram 429s
+    for item in tier1_matches:
         job = item["job"]
         send_telegram_card(
             job, item["score"], item["reason"], item["target_email"],
@@ -1456,12 +1642,45 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 f"Matched via Pipeline | {item['reason']}"
             ]
         ))
+        time.sleep(1.1)  # Telegram rate-limit pacing between outbound cards
+
+    # Dispatch Tier-2 (secondary qualified) matches as a single bundled digest, not individual cards
+    if tier2_matches:
+        digest_lines = []
+        for item in tier2_matches:
+            job = item["job"]
+            comp = str(job.get("employer_name") or "N/A")[:28]
+            title = str(job.get("job_title") or "N/A")[:40]
+            digest_lines.append(f"{item['score']:>3}  {comp} - {title}")
+            log_to_sheets_crm(build_crm_payload(
+                "add_row",
+                sheet_uuid=item.get("sheet_uuid"),
+                target_code="TC",
+                row_data=[
+                    today_str,
+                    job.get("employer_name"),
+                    job.get("job_title"),
+                    item["target_email"],
+                    item["score"],
+                    "Watchlist",
+                    followup_date,
+                    job.get("job_apply_link", ""),
+                    f"Secondary Match via Pipeline | {item['reason']}"
+                ]
+            ))
+        digest_ascii = "\n".join(digest_lines)
+        digest_msg = (
+            f"📋 <b>Secondary Match Leaderboard ({len(tier2_matches)} roles, score 65-79)</b>\n"
+            f"<pre>{html.escape(digest_ascii)}</pre>"
+        )
+        send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)
+        time.sleep(1.1)
     
-    print(f"Stage 2 Complete: {len(top_matches)} cards dispatched.", flush=True)
+    print(f"Stage 2 Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.", flush=True)
     if chat_id:
-        send_status_update(chat_id, f"Pipeline Complete: {len(top_matches)} cards dispatched.")
+        send_status_update(chat_id, f"Pipeline Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.")
     
-    return len(top_matches)
+    return len(tier1_matches) + len(tier2_matches)
 
 # ==============================================================================
 # 9. ASYNC WORKLOAD PROCESSOR & WEBHOOK CONTROLLER
@@ -1952,6 +2171,7 @@ def start_webhook_workers():
         threading.Thread(target=webhook_worker_loop, daemon=True).start()
 
 start_webhook_workers()
+start_gmail_poller()
 
 # ==============================================================================
 # 10. FLASK SERVER & STACKED WEBHOOK ROUTER
