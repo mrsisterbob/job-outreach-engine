@@ -104,6 +104,13 @@ def init_db():
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_activity (
+            date TEXT PRIMARY KEY,
+            drafts_staged INTEGER DEFAULT 0,
+            applied_count INTEGER DEFAULT 0,
+            notes_logged INTEGER DEFAULT 0
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS sheet_row_map (
             sheet_uuid TEXT PRIMARY KEY,
             sheet_tab TEXT,
@@ -307,6 +314,19 @@ def get_sheet_uuid_by_short_id(short_id):
         print(f"DB Read Error (sheet_uuid lookup): {e}", flush=True)
         return None
 
+def get_job_by_sheet_uuid(sheet_uuid):
+    """Resolve cached job JSON by sheet_uuid, for swipe-reply commands like /prep and /pitch."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT job_json FROM jobs WHERE sheet_uuid = ?", (sheet_uuid,))
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row[0])
+    except Exception as e:
+        print(f"DB Read Error (job by sheet_uuid): {e}", flush=True)
+    return {}
+
 def is_job_seen_db(job_hash):
     try:
         with get_db_conn() as conn:
@@ -384,6 +404,81 @@ def get_metric_count(event_type):
     except Exception as e:
         print(f"DB Metric Count Error ({event_type}): {e}", flush=True)
         return 0
+
+DAILY_ACTIVITY_COLUMNS = ("drafts_staged", "applied_count", "notes_logged")
+
+def log_daily_activity(activity_type):
+    """Increment today's daily_activity counter for a valid activity_type (drafts_staged/applied_count/notes_logged)."""
+    if activity_type not in DAILY_ACTIVITY_COLUMNS:
+        print(f"Invalid daily_activity type: {activity_type}", flush=True)
+        return False
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
+        print(f"DB Write Lock Timeout (daily_activity: {activity_type})", flush=True)
+        return False
+    try:
+        with get_db_conn() as conn:
+            conn.execute(
+                f"INSERT INTO daily_activity (date, {activity_type}) VALUES (?, 1) "
+                f"ON CONFLICT(date) DO UPDATE SET {activity_type} = {activity_type} + 1",
+                (today_str,)
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"DB Daily Activity Error ({activity_type}): {e}", flush=True)
+        return False
+    finally:
+        DB_WRITE_LOCK.release()
+
+def get_daily_activity(date_str):
+    """Return {drafts_staged, applied_count, notes_logged} for a given date, zeroed if no row exists."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT drafts_staged, applied_count, notes_logged FROM daily_activity WHERE date = ?",
+                (date_str,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return {"drafts_staged": row[0], "applied_count": row[1], "notes_logged": row[2]}
+    except Exception as e:
+        print(f"DB Daily Activity Read Error ({date_str}): {e}", flush=True)
+    return {"drafts_staged": 0, "applied_count": 0, "notes_logged": 0}
+
+def get_lifetime_activity_totals():
+    """Return lifetime SUM() totals across all daily_activity rows."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COALESCE(SUM(drafts_staged),0), COALESCE(SUM(applied_count),0), COALESCE(SUM(notes_logged),0) FROM daily_activity")
+            row = cursor.fetchone()
+            return {"drafts_staged": row[0], "applied_count": row[1], "notes_logged": row[2]}
+    except Exception as e:
+        print(f"DB Lifetime Activity Error: {e}", flush=True)
+        return {"drafts_staged": 0, "applied_count": 0, "notes_logged": 0}
+
+def calculate_active_day_streak():
+    """Count consecutive active days (any activity logged) ending today or yesterday."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT date FROM daily_activity WHERE (drafts_staged + applied_count + notes_logged) > 0 ORDER BY date DESC")
+            active_dates = {row[0] for row in cursor.fetchall()}
+    except Exception as e:
+        print(f"DB Streak Calc Error: {e}", flush=True)
+        return 0
+
+    cursor_date = datetime.now().date()
+    if cursor_date.strftime("%Y-%m-%d") not in active_dates:
+        cursor_date -= timedelta(days=1)  # allow the streak to still count if today has no activity yet
+
+    streak = 0
+    while cursor_date.strftime("%Y-%m-%d") in active_dates:
+        streak += 1
+        cursor_date -= timedelta(days=1)
+    return streak
 
 def render_ascii_funnel(stages):
     """Render an ASCII bar funnel from a list of (label, count) tuples, bar widths scaled to the largest count."""
@@ -516,6 +611,11 @@ def generate_warm_email(note_context=""):
     s3 = "I am wondering what you have been up to lately, and would love to reconnect over coffee or a quick call if you have time."
     body = enforce_sentence_limit(f"{s1} {s2} {s3}", 3)
     return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
+
+def generate_bump_email(contact_name=""):
+    """Short follow-up nudge for threads that went unanswered."""
+    name_str = f" {contact_name}" if contact_name else ""
+    return f"Hi{name_str},\n\nBumping this briefly to the top of your inbox in case it got buried. Would love to connect if you have 5 minutes this week to discuss alignment.\n\nBest regards,\nKevin Miller"
 
 def format_email_block(email_text):
     sanitized = sanitize_text(email_text)
@@ -784,6 +884,72 @@ def evaluate_job_with_gemini(job):
     except Exception as e:
         print(f"Gemini evaluation exception: {e}", flush=True)
         return False, 0, "Evaluation Pending", "", []
+
+def generate_interview_prep(company, job_title, job_description=""):
+    """3 talking points + 2 reverse questions tailored to a role; safe static fallback if Gemini is unavailable."""
+    fallback = {
+        "talking_points": [
+            f"My experience automating reporting workflows with Python and SQL directly maps to the operational efficiency {company or 'this team'} is likely optimizing for.",
+            f"In wealth ops, I've reconciled data across custodial platforms - the same rigor applies to {job_title or 'this role'}'s process ownership.",
+            "I like building lightweight automation that removes manual steps without adding fragile complexity."
+        ],
+        "reverse_questions": [
+            "What does a successful first 90 days look like for this role from an operations standpoint?",
+            "Where are the biggest manual bottlenecks the team is hoping this hire will help automate?"
+        ]
+    }
+    if not GEMINI_API_KEY:
+        return fallback
+    desc_truncated = str(job_description or "")[:800]
+    prompt = (
+        f"Job Title: {job_title or 'N/A'}\nCompany: {company or 'N/A'}\nDescription:\n{desc_truncated}\n\n"
+        "Generate interview prep for an early-career candidate whose background is Python, SQL, Salesforce, "
+        "process automation, and wealth operations. Respond ONLY with JSON: "
+        '{"talking_points": ["<3 items bridging Python/SQL/process automation/wealth ops experience to this role>"], '
+        '"reverse_questions": ["<2 high-leverage operational questions to ask the interviewer>"]}'
+    )
+    raw_text = call_gemini_api(prompt)
+    if raw_text:
+        try:
+            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
+            data = json.loads(cleaned)
+            talking_points = data.get("talking_points", [])
+            reverse_questions = data.get("reverse_questions", [])
+            if isinstance(talking_points, list) and isinstance(reverse_questions, list) and talking_points and reverse_questions:
+                return {
+                    "talking_points": [str(t) for t in talking_points][:3],
+                    "reverse_questions": [str(q) for q in reverse_questions][:2]
+                }
+        except Exception as e:
+            print(f"Interview prep parse failure: {e}", flush=True)
+    return fallback
+
+def generate_elevator_pitch(company, job_title):
+    """Tight 3-sentence elevator pitch tailored to a company/role; safe static fallback if Gemini is unavailable."""
+    fallback = (
+        f"Hi, I'm Kevin - I work in wealth ops and process automation, building Python and SQL tools that cut manual reconciliation time. "
+        f"I've been following {company or 'your team'} and think my background lines up well with {job_title or 'the operations work'} you're doing. "
+        "Would love to grab 15 minutes to see where I could help."
+    )
+    if not GEMINI_API_KEY:
+        return fallback
+    prompt = (
+        f"Company: {company or 'N/A'}\nRole: {job_title or 'N/A'}\n\n"
+        "Write a tight 3-sentence conversational 30-second elevator pitch for an early-career candidate with a "
+        "Python/SQL/Salesforce/process-automation/wealth-ops background, tailored to this company and role. "
+        'Respond ONLY with JSON: {"pitch": "<3-sentence pitch>"}'
+    )
+    raw_text = call_gemini_api(prompt)
+    if raw_text:
+        try:
+            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
+            data = json.loads(cleaned)
+            pitch = data.get("pitch", "")
+            if pitch:
+                return str(pitch)
+        except Exception as e:
+            print(f"Elevator pitch parse failure: {e}", flush=True)
+    return fallback
 
 # ==============================================================================
 # 6. STAGE 1 STRICT FILTER & SINGLE CANDIDATE EVALUATION
@@ -1297,6 +1463,7 @@ def process_webhook_payload_async(data):
 
                     if ok:
                         status_hdr = "✉️ <b>Gmail Draft Created & Ready!</b>"
+                        log_daily_activity("drafts_staged")
                     else:
                         status_hdr = f"⚠️ <b>Gmail API Alert ({html.escape(msg)})</b> - Manual Copy Below:"
 
@@ -1329,6 +1496,7 @@ def process_webhook_payload_async(data):
                 updated_text = f"{original_text}\n\n✅ <b>Applied - {today_str}</b>"
                 edit_telegram_message(chat_id, message_id, updated_text, reply_markup={"inline_keyboard": []})
                 log_metric_event("applied", get_sheet_uuid_by_short_id(cb_arg))
+                log_daily_activity("applied_count")
                 answer_callback_query(callback_query_id, "✅ Marked as Applied")
             elif cb_action == "pivot":
                 if not cb_arg:
@@ -1537,6 +1705,20 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, funnel_msg)
             return
 
+        if text in ["/streak", "/daily"]:
+            today_activity = get_daily_activity(datetime.now().strftime("%Y-%m-%d"))
+            lifetime = get_lifetime_activity_totals()
+            streak_days = calculate_active_day_streak()
+            goal_target = 5
+            scorecard_msg = (
+                "🏆 <b>Daily Outreach Scorecard</b>\n\n"
+                f"🎯 <b>Today's Goal:</b> {today_activity['drafts_staged']} / {goal_target} Staged Drafts\n"
+                f"🔥 <b>Current Streak:</b> {streak_days} Active Days\n"
+                f"📊 <b>Lifetime Totals:</b> Staged: {lifetime['drafts_staged']} | Applied: {lifetime['applied_count']} | Notes: {lifetime['notes_logged']}"
+            )
+            send_telegram_message(chat_id, scorecard_msg)
+            return
+
         # 8. Mobile Parameter Mutation & Inline Action Shortcuts
         cmd_body = re.sub(r"^/search\s*", "", text).strip()
         if any(op in cmd_body for op in ["=", "+", "-"]):
@@ -1573,7 +1755,41 @@ def process_webhook_payload_async(data):
                 return
             timestamped_note = f"[{today_str}] {html.escape(note_str)}"
             log_to_sheets_crm(build_crm_payload("append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note))
+            log_daily_activity("notes_logged")
             send_telegram_message(chat_id, f"📝 Note logged: <code>{timestamped_note}</code>")
+            return
+
+        if text == "/prep":
+            mapping = resolve_reply_mapping(msg, chat_id, "/prep")
+            if not mapping:
+                return
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            job_title = job.get("job_title") or "this role"
+            prep = generate_interview_prep(comp, job_title, job.get("job_description", ""))
+            talking_points_block = "\n".join(f"{i+1}. {tp}" for i, tp in enumerate(prep["talking_points"]))
+            reverse_questions_block = "\n".join(f"{i+1}. {q}" for i, q in enumerate(prep["reverse_questions"]))
+            prep_msg = (
+                f"🎓 <b>Interview Prep - {html.escape(comp)}</b>\n\n"
+                f"<b>💬 Talking Points:</b>\n{html.escape(talking_points_block)}\n\n"
+                f"<b>❓ Reverse Questions:</b>\n{html.escape(reverse_questions_block)}"
+            )
+            send_telegram_message(chat_id, prep_msg)
+            return
+
+        if text == "/pitch":
+            mapping = resolve_reply_mapping(msg, chat_id, "/pitch")
+            if not mapping:
+                return
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            job_title = job.get("job_title") or "this role"
+            pitch = generate_elevator_pitch(comp, job_title)
+            pitch_msg = (
+                f"🎤 <b>30-Second Elevator Pitch - {html.escape(comp)}</b>\n\n"
+                f"<code>{html.escape(pitch)}</code>"
+            )
+            send_telegram_message(chat_id, pitch_msg)
             return
 
         if text in ["/pivot", "/tw", "/cw", "/cc", "/tc", "/x"]:
