@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 import requests
 from flask import Flask, jsonify, request, Response
+from apscheduler.schedulers.background import BackgroundScheduler
 from resume_engine import compile_resume_pdf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1531,6 +1532,7 @@ def is_verified_crm_contact(sender_raw):
     email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender_raw or "")
     sender_email = email_match.group(0).lower().strip() if email_match else ""
     if not sender_email:
+        logging.info("[BLOCKED] CRM whitelist check: no parsable sender email address")
         return None
 
     try:
@@ -1542,7 +1544,9 @@ def is_verified_crm_contact(sender_raw):
             )
             row = cursor.fetchone()
             if row:
+                logging.info(f"CRM whitelist DB query: match found for {sender_email} in sheet_row_map ({row[2]})")
                 return {"name": row[0], "company": row[1], "tab": row[2], "sheet_uuid": row[3]}
+            logging.info(f"CRM whitelist DB query: no sheet_row_map match for {sender_email}, checking jobs cache")
 
             # Fallback: exact target_email match inside cached job_json blobs (auto-generated job outreach targets)
             cursor.execute("SELECT sheet_uuid, job_json FROM jobs WHERE LOWER(job_json) LIKE ?", (f"%{sender_email}%",))
@@ -1551,6 +1555,7 @@ def is_verified_crm_contact(sender_raw):
                     job_dict = json.loads(job_json)
                     cached_target = str(job_dict.get("target_email", "")).split(" [")[0].strip().lower()
                     if cached_target == sender_email:
+                        logging.info(f"CRM whitelist DB query: match found for {sender_email} in jobs cache")
                         return {
                             "name": "",
                             "company": job_dict.get("employer_name", "Unknown"),
@@ -1559,6 +1564,7 @@ def is_verified_crm_contact(sender_raw):
                         }
                 except (json.JSONDecodeError, TypeError):
                     continue
+            logging.info(f"CRM whitelist DB query: no local match for {sender_email}")
     except Exception as e:
         logging.error(f"CRM Whitelist Local Lookup Error: {e}")
 
@@ -1566,15 +1572,18 @@ def is_verified_crm_contact(sender_raw):
     if CRM_WEBHOOK_URL:
         try:
             res = requests.get(f"{CRM_WEBHOOK_URL}?action=find_contact_by_email&email={urllib.parse.quote(sender_email)}", timeout=10)
+            logging.info(f"CRM whitelist remote query response status: {res.status_code} (email={sender_email})")
             if res.status_code == 200:
                 data = res.json()
                 if data.get("found"):
+                    logging.info(f"CRM whitelist remote query: match found for {sender_email}")
                     return {
                         "name": data.get("name", ""),
                         "company": data.get("company", "Unknown"),
                         "tab": data.get("sheet_tab", "Unknown"),
                         "sheet_uuid": data.get("sheet_uuid", "")
                     }
+                logging.info(f"CRM whitelist remote query: no match found for {sender_email}")
         except Exception as e:
             logging.error(f"CRM Whitelist Remote Lookup Error: {e}")
 
@@ -1688,6 +1697,7 @@ def check_inbound_gmail_replies():
             logging.error(f"Gmail Poll List Error: {res.status_code}")
             return
         message_ids = [m["id"] for m in res.json().get("messages", [])]
+        logging.info(f"[POLL] Gmail list query returned {len(message_ids)} unread message(s) in label:{EMAIL_LABEL_TARGET_INBOX}")
     except Exception as e:
         logging.error(f"Gmail Poll List Exception: {e}")
         return
@@ -1713,16 +1723,18 @@ def check_inbound_gmail_replies():
             # GATE 1: Pre-filter shield (10 EMAIL_* parameters)
             passed, reject_reason = passes_email_prefilter(sender, subject, snippet, internal_date_ms, in_reply_to, references)
             if not passed:
-                logging.info(f"Inbound email dropped (pre-filter: {reject_reason}) from {sender}")
+                logging.info(f"[BLOCKED] Pre-filter rejected message from {sender} - reason: {reject_reason}")
                 requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
                 continue
 
             # GATE 2: Strict CRM whitelist - zero tolerance for unverified senders
             crm_match = is_verified_crm_contact(sender)
             if not crm_match:
-                logging.info(f"Inbound email dropped (unverified sender, not in CRM) from {sender}")
+                logging.info(f"[BLOCKED] Unverified sender (not found in SQLite/Sheets CRM): {sender}")
                 requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
                 continue
+
+            logging.info(f"[ALLOWED] Verified CRM sender {sender} matched to {crm_match.get('company')} ({crm_match.get('tab')})")
 
             thread_link = html.escape(f"https://mail.google.com/mail/u/0/#inbox/{thread_id}", quote=True)
             match_name = html.escape(str(crm_match.get("name") or "Unknown"))
@@ -1754,18 +1766,34 @@ def check_inbound_gmail_replies():
         except Exception as e:
             logging.error(f"Gmail Poll Message Processing Error ({msg_id}): {e}")
 
-def check_inbound_replies_loop():
-    """Daemon loop: poll Gmail for unread replies every 120 seconds."""
-    while True:
-        try:
-            check_inbound_gmail_replies()
-        except Exception as e:
-            logging.error(f"Gmail Poller Loop Error: {e}")
-        time.sleep(120)
+# Dedicated scheduler instance: Gmail polling runs strictly once every 15 minutes,
+# decoupled from Telegram webhook traffic (never triggered by incoming webhook pings).
+EMAIL_POLL_SCHEDULER = BackgroundScheduler(daemon=True)
+
+def scheduled_email_poll_job():
+    """APScheduler job target: fires exactly once every 15 minutes, independent of webhook load."""
+    logging.info("[POLL] 15-minute email poll cycle triggered")
+    try:
+        check_inbound_gmail_replies()
+    except Exception as e:
+        logging.error(f"[POLL] Gmail Poller Cycle Error: {e}")
+    logging.info("[POLL] 15-minute email poll cycle completed")
 
 def start_gmail_poller():
-    """Spin up the inbound Gmail reply poller as a daemon thread."""
-    threading.Thread(target=check_inbound_replies_loop, daemon=True).start()
+    """Register the Gmail reply poller on a strict 15-minute interval trigger (APScheduler),
+    replacing the old fixed-sleep thread loop. Ensures polling never runs on webhook requests.
+    """
+    EMAIL_POLL_SCHEDULER.add_job(
+        scheduled_email_poll_job,
+        trigger="interval",
+        minutes=15,
+        id="gmail_inbound_poll",
+        next_run_time=datetime.now(),  # fire once immediately on boot, then every 15 minutes
+        max_instances=1,
+        coalesce=True
+    )
+    EMAIL_POLL_SCHEDULER.start()
+    logging.info("[POLL] Gmail inbound poller scheduled: every 15 minutes")
 
 def morning_digest_loop():
     """Dispatches a standup digest daily at 08:30 AM local time."""
@@ -1953,14 +1981,18 @@ def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=No
         payload["reply_markup"] = reply_markup
     try:
         res = requests.post(url, json=payload, timeout=5)
+        logging.info(f"Telegram sendMessage response status: {res.status_code} (chat_id={chat_id})")
         if res.status_code == 429:
             retry_after = res.json().get("parameters", {}).get("retry_after", 1)
             logging.warning(f"Telegram 429 Rate Limit - retrying after {retry_after}s")
             time.sleep(retry_after)
             res = requests.post(url, json=payload, timeout=5)
+            logging.info(f"Telegram sendMessage retry response status: {res.status_code} (chat_id={chat_id})")
         if res.status_code == 200:
             log_metric_event("message_sent")
             return res.json().get("result", {}).get("message_id")
+        else:
+            logging.error(f"Telegram sendMessage failed: {res.status_code} {res.text[:200]}")
     except Exception as e:
         logging.error(f"Telegram Post Error: {e}")
     return None
@@ -2505,6 +2537,7 @@ def process_webhook_payload_async(data):
             return
 
         if "message" not in data:
+            logging.info("Webhook payload contained no callback_query or message key - ignored")
             return
 
         msg = data["message"]
@@ -2512,6 +2545,7 @@ def process_webhook_payload_async(data):
         raw_text = msg.get("text", "").strip()
         text = re.sub(r"@\w+bot", "", raw_text, flags=re.IGNORECASE).strip()
         today_str = datetime.now().strftime("%Y-%m-%d")
+        logging.info(f"Telegram command received: '{text}' (chat_id={chat_id})")
 
         # 2. Pipeline Run Trigger (/t [qty])
         if re.match(r"^/t(?:\s+(\d+))?$", text):
@@ -2802,6 +2836,37 @@ def process_webhook_payload_async(data):
             log_daily_activity("notes_logged")
             return
 
+        if text == "/draft":
+            mapping = resolve_reply_mapping(msg, chat_id, "/draft")
+            if not mapping:
+                return
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            title = job.get("job_title") or "Operations Specialist"
+            is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
+            target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
+            logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
+            ok, gmail_msg, draft_id = create_gmail_draft(to_email=target, company_name=comp, job_title=title, is_warm=is_warm)
+            raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
+            monospaced_body = format_email_block(raw_email_text)
+            draft_link_line = ""
+            if draft_id:
+                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
+                draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
+            if ok:
+                status_hdr = "✉️ <b>Gmail Draft Created & Ready!</b>"
+                log_daily_activity("drafts_staged")
+            else:
+                status_hdr = f"⚠️ <b>Gmail API Alert ({html.escape(gmail_msg)})</b> - Manual Copy Below:"
+            draft_msg = (
+                f"{status_hdr}\n"
+                f"{draft_link_line}"
+                f"<b>To:</b> <code>{html.escape(target)}</code>\n\n"
+                f"<b>Tap-to-Copy Email Body:</b>\n{monospaced_body}"
+            )
+            send_telegram_message(chat_id, draft_msg)
+            return
+
         if text.startswith("/e ") or text.startswith("/email "):
             raw_email = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
             email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
@@ -3014,9 +3079,14 @@ def telegram_webhook():
             return jsonify({"status": "error", "message": "Unauthorized"}), 403
 
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
+            logging.warning("Telegram Webhook: empty or non-JSON payload received - ignored")
             return jsonify({"status": "ignored"}), 200
+
+        update_kind = "callback_query" if "callback_query" in data else ("message" if "message" in data else "unknown")
+        logging.info(f"Telegram Webhook: received update_kind={update_kind}")
+
         try:
             WEBHOOK_QUEUE.put_nowait(data)
         except queue.Full:
