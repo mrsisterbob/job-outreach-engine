@@ -295,6 +295,18 @@ def get_job_from_cache(short_id):
         print(f"DB Read Error: {e}", flush=True)
     return {}
 
+def get_sheet_uuid_by_short_id(short_id):
+    """Resolve a cached job's sheet_uuid for metric attribution on later callback actions."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT sheet_uuid FROM jobs WHERE short_id = ?", (short_id,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+    except Exception as e:
+        print(f"DB Read Error (sheet_uuid lookup): {e}", flush=True)
+        return None
+
 def is_job_seen_db(job_hash):
     try:
         with get_db_conn() as conn:
@@ -372,6 +384,17 @@ def get_metric_count(event_type):
     except Exception as e:
         print(f"DB Metric Count Error ({event_type}): {e}", flush=True)
         return 0
+
+def render_ascii_funnel(stages):
+    """Render an ASCII bar funnel from a list of (label, count) tuples, bar widths scaled to the largest count."""
+    max_count = max((c for _, c in stages), default=0)
+    max_bar_width = 20
+    lines = []
+    for label, count in stages:
+        bar_len = int((count / max_count) * max_bar_width) if max_count > 0 else 0
+        bar = "█" * bar_len
+        lines.append(f"{label:<22} {bar} {count}")
+    return "\n".join(lines)
 
 def is_company_on_cooldown(company_name):
     clean = str(company_name or "").lower().strip()
@@ -788,6 +811,7 @@ def passes_strict_filter(job):
     return True
 
 def process_single_candidate(job):
+    log_metric_event("ai_screened")
     ai_pass, score, reason = evaluate_job_with_gemini(job)
     if ai_pass:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
@@ -844,10 +868,12 @@ def check_existing_gmail_draft(to_email, subject):
         return None
 
 def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note=""):
-    """Create Gmail draft with 24h dedup check and OAuth token expiry handling."""
+    """Create Gmail draft with 24h dedup check and OAuth token expiry handling.
+    Returns (success, message, draft_id) - draft_id is populated on success or when a duplicate is found.
+    """
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars:
-        return False, f"Missing Env Vars: {', '.join(missing_vars)}"
+        return False, f"Missing Env Vars: {', '.join(missing_vars)}", None
 
     if is_warm:
         body_content = generate_warm_email(custom_note)
@@ -867,7 +893,7 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
                 f"<b>Draft ID:</b> <code>{html.escape(str(existing['draft_id']))}</code>\n"
                 f"<b>Created:</b> {html.escape(str(existing['created_at']))}"
             )
-        return False, "Draft already exists in Gmail"
+        return False, "Draft already exists in Gmail", existing["draft_id"]
 
     token_url = "https://oauth2.googleapis.com/token"
     token_data = {
@@ -896,11 +922,11 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
             )
             if TELEGRAM_CHAT_ID:
                 send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
-            return False, f"Gmail OAuth Failure: {error_code}"
+            return False, f"Gmail OAuth Failure: {error_code}", None
 
         access_token = token_json.get("access_token")
         if not access_token:
-            return False, "OAuth Token Refused"
+            return False, "OAuth Token Refused", None
 
         message = EmailMessage()
         message["To"] = to_email
@@ -914,10 +940,11 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         if res.status_code in [200, 201]:
             draft_id = res.json().get("id", "")
             save_gmail_draft_record(to_email, subject, draft_id)
-            return True, "Success"
-        return False, f"Gmail Error {res.status_code}"
+            log_metric_event("gmail_draft_staged")
+            return True, "Success", draft_id
+        return False, f"Gmail Error {res.status_code}", None
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 def log_to_sheets_crm(payload, max_retries=3):
     """Log to Google Sheets CRM. Payload may include row UUID and note timestamp.
@@ -953,6 +980,43 @@ def fetch_networking_cards(target_code="CW", qty=2):
         print(f"Error fetching networking cards: {e}", flush=True)
     return []
 
+def answer_callback_query(callback_query_id, text=None, show_alert=False):
+    """Answer a callback query directly (clears the loading spinner) without sending a new chat message."""
+    if not (TELEGRAM_BOT_TOKEN and callback_query_id):
+        return
+    payload = {"callback_query_id": callback_query_id, "show_alert": show_alert}
+    if text:
+        payload["text"] = text
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            json=payload,
+            timeout=3
+        )
+    except Exception as e:
+        print(f"answerCallbackQuery error: {e}", flush=True)
+
+def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
+    """Edit an existing Telegram message in-place instead of sending a redundant new one."""
+    if not (TELEGRAM_BOT_TOKEN and chat_id and message_id):
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+        return res.status_code == 200
+    except Exception as e:
+        print(f"editMessageText error: {e}", flush=True)
+        return False
+
 def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=None):
     """Send Telegram message. If callback_query_id provided, answer callback immediately (no spinner).
     Returns the sent message's telegram_message_id, or None on failure.
@@ -961,15 +1025,8 @@ def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=No
         return None
     
     # Answer callback immediately to remove loading spinner
-    if callback_query_id and TELEGRAM_BOT_TOKEN:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                json={"callback_query_id": callback_query_id, "show_alert": False},
-                timeout=3
-            )
-        except Exception as e:
-            print(f"answerCallbackQuery error: {e}", flush=True)
+    if callback_query_id:
+        answer_callback_query(callback_query_id)
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -989,8 +1046,16 @@ def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=No
         print(f"Telegram Post Error: {e}", flush=True)
     return None
 
+def get_fit_score_indicator(score):
+    """Traffic-light emoji for Fit Score: green >=80, yellow >=65, red otherwise."""
+    if score >= 80:
+        return "🟢"
+    elif score >= 65:
+        return "🟡"
+    return "🔴"
+
 def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None):
-    """Send job card with buttons. Buttons auto-removed on first tap via answerCallbackQuery.
+    """Send an executive-scannable job card with buttons. Buttons auto-removed on first tap via answerCallbackQuery.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
     """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -1001,24 +1066,24 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     apollo_url = html.escape(build_apollo_url(company), quote=True)
     linkedin_url = html.escape(build_linkedin_url(company), quote=True)
     matched_str = ", ".join(matched_skills[:4]).title() if matched_skills else "General Ops"
+    fit_dot = get_fit_score_indicator(score)
     card_text = (
-        f"<b>{title}</b>\n"
-        f"<b>Company:</b> {company}\n"
-        f"<b>Posting Recency:</b> {age_badge}\n"
-        f"<b>Work Style & Pay:</b> {work_style} | {salary_str}\n"
-        f"<b>Fit Score:</b> {score}/100 | <b>Skill Match:</b> {overlap_pct}%\n"
-        f"<b>Key Overlap:</b> <code>{html.escape(matched_str)}</code>\n"
-        f"<b>Default Target:</b> <code>{html.escape(target_email)}</code>\n\n"
+        f"💼 <b>{title}</b>\n"
+        f"🏢 <b>{company}</b>\n"
+        f"────────────────────\n"
+        f"{fit_dot} <b>Fit Score:</b> {score}/100  |  <b>Skill Match:</b> {overlap_pct}%\n"
+        f"🕐 <b>Recency:</b> {age_badge}\n"
+        f"💰 <b>Pay &amp; Style:</b> {work_style} | {salary_str}\n\n"
+        f"🧩 <b>Matched Skills:</b> <code>{html.escape(matched_str)}</code>\n\n"
         f"<b>Fit Reason:</b> {html.escape(reason)}\n\n"
-        f"<a href='{apply_link}'>1. Apply Direct</a>\n"
-        f"<a href='{apollo_url}'>2. Open Leads in Apollo</a>\n"
-        f"<a href='{linkedin_url}'>3. Open Leadership on LinkedIn</a>\n\n"
-        f"<b>Mobile Swipe Shortcuts:</b>\n"
-        f"  <code>draft</code> - Gmail Draft\n"
-        f"  <code>/f &lt;days&gt;</code> - Snooze Followup\n"
-        f"  <code>/tw</code> or <code>/cw</code> - Log Warm\n"
-        f"  <code>/cc</code> or <code>/tc</code> - Log Cold\n"
-        f"  <code>/x</code> - Mark Dead"
+        f"🔗 <b>Quick Links:</b>\n"
+        f"<a href='{apply_link}'>Direct Apply</a> | "
+        f"<a href='{apollo_url}'>Apollo Operations Leads</a> | "
+        f"<a href='{linkedin_url}'>LinkedIn Leadership Search</a>\n\n"
+        f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
+        f"⚡ <b>Swipe Actions:</b>\n"
+        f"  <code>draft</code> Gmail Draft   <code>/f &lt;days&gt;</code> Snooze\n"
+        f"  <code>/tw</code>/<code>/cw</code> Warm   <code>/cc</code>/<code>/tc</code> Cold   <code>/x</code> Dead"
     )
     # Buttons are auto-removed on callback via answerCallbackQuery
     reply_markup = {
@@ -1106,6 +1171,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
                     continue
                 seen_hashes.add(job_hash)
                 save_seen_job_db(job_hash)
+                log_metric_event("listing_discovered")
                 if passes_strict_filter(job):
                     candidate_pool.append(job)
     
@@ -1194,7 +1260,7 @@ def process_webhook_payload_async(data):
                     title = job.get("job_title", "Operations Specialist")
                     
                     # 1. Create clean Gmail draft in background
-                    ok, msg = create_gmail_draft(
+                    ok, msg, draft_id = create_gmail_draft(
                         to_email=target, 
                         company_name=comp, 
                         job_title=title, 
@@ -1211,9 +1277,16 @@ def process_webhook_payload_async(data):
                     else:
                         status_hdr = f"⚠️ <b>Gmail API Alert ({html.escape(msg)})</b> - Manual Copy Below:"
 
+                    # Deep-link straight into the Gmail mobile web draft when we have an id
+                    draft_link_line = ""
+                    if draft_id:
+                        draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
+                        draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
+
                     # Send rich Telegram message with autofilled tap-to-copy block
                     card_response = (
-                        f"{status_hdr}\n\n"
+                        f"{status_hdr}\n"
+                        f"{draft_link_line}"
                         f"<b>To:</b> <code>{html.escape(target)}</code>\n"
                         f"<b>Subject:</b> <code>{html.escape(subject_line)}</code>\n\n"
                         f"<b>Tap-to-Copy Email Body:</b>\n"
@@ -1224,17 +1297,35 @@ def process_webhook_payload_async(data):
                     send_telegram_message(chat_id, "⚠️ Job cache expired. Please re-run pipeline with /t.", callback_query_id=callback_query_id)
                 return
             elif cb_action == "apply":
-                send_telegram_message(chat_id, "✅ Marked job as applied in CRM.", callback_query_id=callback_query_id)
+                if not cb_arg:
+                    answer_callback_query(callback_query_id, "⚠️ Malformed button data.", show_alert=True)
+                    return
+                message_id = cb["message"].get("message_id")
+                original_text = html.escape(cb["message"].get("text", ""))
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                updated_text = f"{original_text}\n\n✅ <b>Applied - {today_str}</b>"
+                edit_telegram_message(chat_id, message_id, updated_text, reply_markup={"inline_keyboard": []})
+                log_metric_event("applied", get_sheet_uuid_by_short_id(cb_arg))
+                answer_callback_query(callback_query_id, "✅ Marked as Applied")
             elif cb_action == "pivot":
                 if not cb_arg:
-                    send_telegram_message(chat_id, "⚠️ Malformed button data. Please re-run /t to regenerate cards.", callback_query_id=callback_query_id)
+                    answer_callback_query(callback_query_id, "⚠️ Malformed button data.", show_alert=True)
                     return
                 short_id = cb_arg
                 job = get_job_from_cache(short_id)
                 comp = job.get("employer_name", "Target Firm") if job else "Target Firm"
-                send_telegram_message(chat_id, f"🔄 Lead pivoted for {html.escape(comp)}.\nApollo: {html.escape(build_apollo_url(comp), quote=True)}", callback_query_id=callback_query_id)
+                message_id = cb["message"].get("message_id")
+                original_text = html.escape(cb["message"].get("text", ""))
+                apollo_url = html.escape(build_apollo_url(comp), quote=True)
+                updated_text = f"{original_text}\n\n🔄 <b>Pivoted</b> - <a href='{apollo_url}'>Apollo Leads</a>"
+                edit_telegram_message(chat_id, message_id, updated_text)
+                answer_callback_query(callback_query_id, f"🔄 Pivoted for {comp}")
             elif cb_action == "dead":
-                send_telegram_message(chat_id, "❌ Job record archived to Dead.", callback_query_id=callback_query_id)
+                message_id = cb["message"].get("message_id")
+                original_text = html.escape(cb["message"].get("text", ""))
+                updated_text = f"{original_text}\n\n❌ <b>Archived to Dead</b>"
+                edit_telegram_message(chat_id, message_id, updated_text, reply_markup={"inline_keyboard": []})
+                answer_callback_query(callback_query_id, "❌ Archived to Dead")
             elif cb_data.startswith("adj_pay_"):
                 delta = cb_data.replace("adj_pay_", "")
                 res = update_filter_param("min_salary", delta)
@@ -1400,6 +1491,27 @@ def process_webhook_payload_async(data):
             interviews_set = get_metric_count("interview_set")
             ratio = (interviews_set / messages_sent * 100) if messages_sent > 0 else 0.0
             send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({interviews_set} interviews / {messages_sent} sent)")
+            return
+        if text == "/funnel":
+            discovered = get_metric_count("listing_discovered")
+            screened = get_metric_count("ai_screened")
+            drafts_staged = get_metric_count("gmail_draft_staged")
+            applied = get_metric_count("applied")
+            interviews_set = get_metric_count("interview_set")
+            screen_rate = (interviews_set / screened * 100) if screened > 0 else 0.0
+
+            funnel_ascii = render_ascii_funnel([
+                ("Discovered Listings", discovered),
+                ("AI Screened", screened),
+                ("Gmail Drafts Staged", drafts_staged),
+                ("Applied Roles", applied)
+            ])
+            funnel_msg = (
+                "📊 <b>Pipeline Conversion Funnel</b>\n"
+                f"<pre>{html.escape(funnel_ascii)}</pre>\n"
+                f"🎯 <b>Screen / Interview Rate:</b> {screen_rate:.1f}% ({interviews_set} interviews / {screened} screened)"
+            )
+            send_telegram_message(chat_id, funnel_msg)
             return
 
         # 8. Mobile Parameter Mutation & Inline Action Shortcuts
