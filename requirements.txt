@@ -6,3 +6,4 @@ dnspython
 flask
 gunicorn
 typst
+apscheduler
