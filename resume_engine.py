@@ -20,7 +20,6 @@ def render_typst_markup(company_name: str, dynamic_bullets: list) -> str:
         ]
     else:
         bullet_lines = [f"  - {re.sub(r'^[•\-\*]\s*', '', str(b).strip())}" for b in dynamic_bullets[:2]]
-
     dynamic_bullets_block = "\n".join(bullet_lines)
 
     markup = f"""
