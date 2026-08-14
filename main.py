@@ -4,6 +4,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import os
 import queue
 import re
@@ -17,6 +18,8 @@ from email.message import EmailMessage
 import requests
 from flask import Flask, jsonify, request, Response
 from resume_engine import compile_resume_pdf
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 app = Flask(__name__)
 
@@ -34,10 +37,6 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 DB_PATH = "jobs_cache.db"
-
-# Database Write Lock (30s timeout)
-DB_WRITE_LOCK = threading.Lock()
-DB_WRITE_LOCK_TIMEOUT = 30  # seconds
 
 # Bounded webhook queue + fixed daemon worker pool (backpressure instead of unbounded threads)
 WEBHOOK_QUEUE = queue.Queue(maxsize=100)
@@ -60,9 +59,10 @@ ALIAS_MAP = {
 }
 
 def get_db_conn():
-    """Returns a SQLite connection with WAL mode + a busy_timeout to reduce lock contention."""
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.execute("PRAGMA journal_mode=WAL;")
+    """Returns a SQLite connection tuned for concurrent writers: WAL + NORMAL sync + busy_timeout."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
@@ -79,8 +79,16 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS seen_jobs (
             job_hash TEXT PRIMARY KEY,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            seen_count INTEGER DEFAULT 1
         )""")
+        # Migration guard: upgrade pre-existing seen_jobs tables missing the new tracking columns
+        for col_def in ["first_seen TIMESTAMP", "last_seen TIMESTAMP", "seen_count INTEGER DEFAULT 1"]:
+            try:
+                conn.execute(f"ALTER TABLE seen_jobs ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("""
         CREATE TABLE IF NOT EXISTS company_cooldown (
             company_clean TEXT PRIMARY KEY,
@@ -204,6 +212,26 @@ def init_db():
                 conn.execute("INSERT INTO search_filters (key, value_json) VALUES (?, ?)", (k, json.dumps(v)))
             conn.commit()
 
+    hydrate_filters_from_sheets()
+
+def hydrate_filters_from_sheets():
+    """On startup, pull load_system_config from Sheets so local filters reflect any manual spreadsheet edits."""
+    if not CRM_WEBHOOK_URL:
+        return
+    try:
+        res = requests.get(f"{CRM_WEBHOOK_URL}?action=load_system_config", timeout=10)
+        if res.status_code != 200:
+            return
+        remote_filters = res.json().get("filters", {})
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for key, val in remote_filters.items():
+                conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(val)))
+            conn.commit()
+        logging.info(f"Hydrated {len(remote_filters)} filters from Google Sheets System_Config")
+    except Exception as e:
+        logging.error(f"Filter Hydration Error: {e}")
+
 init_db()
 
 # ==============================================================================
@@ -237,16 +265,14 @@ def get_filter(key, default_val=None):
             if row:
                 return json.loads(row[0])
     except Exception as e:
-        print(f"Filter Read Error ({key}): {e}", flush=True)
+        logging.error(f"Filter Read Error ({key}): {e}")
     return default_val
 
 def set_filter(key, val):
-    """Set filter with thread-safe locking (30s timeout). Dual-write to System_Config sheet."""
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (filter {key})", flush=True)
-        return False
+    """Set filter atomically via BEGIN IMMEDIATE. Dual-write to System_Config sheet."""
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(val)))
             conn.commit()
         # Dual-write to Google Sheets System_Config tab
@@ -254,13 +280,11 @@ def set_filter(key, val):
             try:
                 requests.post(CRM_WEBHOOK_URL, json={"action": "update_system_config", "key": key, "value": val}, timeout=5)
             except Exception as e:
-                print(f"System_Config dual-write failed ({key}): {e}", flush=True)
+                logging.error(f"System_Config dual-write failed ({key}): {e}")
         return True
     except Exception as e:
-        print(f"Filter Write Error ({key}): {e}", flush=True)
+        logging.error(f"Filter Write Error ({key}): {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
 
 def update_filter_param(raw_key, raw_val_str):
     key = ALIAS_MAP.get(raw_key.lower().strip(), raw_key.lower().strip())
@@ -296,21 +320,17 @@ def update_filter_param(raw_key, raw_val_str):
         return f"⚙️ Filter <code>{key}</code> updated to <code>{new_val:,}</code>."
 
 def save_job_to_cache(short_id, job_dict, sheet_uuid=None):
-    """Save job to cache with thread-safe locking (30s timeout)."""
+    """Save job to cache atomically via BEGIN IMMEDIATE."""
     if sheet_uuid is None:
         sheet_uuid = str(uuid.uuid4())
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout ({short_id})", flush=True)
-        return sheet_uuid
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("INSERT OR REPLACE INTO jobs (short_id, sheet_uuid, job_json) VALUES (?, ?, ?)", 
                         (short_id, sheet_uuid, json.dumps(job_dict)))
             conn.commit()
     except Exception as e:
-        print(f"DB Save Error: {e}", flush=True)
-    finally:
-        DB_WRITE_LOCK.release()
+        logging.error(f"DB Save Error: {e}")
     return sheet_uuid
 
 def get_job_from_cache(short_id):
@@ -322,7 +342,7 @@ def get_job_from_cache(short_id):
             if row:
                 return json.loads(row[0])
     except Exception as e:
-        print(f"DB Read Error: {e}", flush=True)
+        logging.error(f"DB Read Error: {e}")
     return {}
 
 def get_sheet_uuid_by_short_id(short_id):
@@ -334,7 +354,7 @@ def get_sheet_uuid_by_short_id(short_id):
             row = cursor.fetchone()
             return row[0] if row else None
     except Exception as e:
-        print(f"DB Read Error (sheet_uuid lookup): {e}", flush=True)
+        logging.error(f"DB Read Error (sheet_uuid lookup): {e}")
         return None
 
 def get_job_by_sheet_uuid(sheet_uuid):
@@ -347,16 +367,14 @@ def get_job_by_sheet_uuid(sheet_uuid):
             if row:
                 return json.loads(row[0])
     except Exception as e:
-        print(f"DB Read Error (job by sheet_uuid): {e}", flush=True)
+        logging.error(f"DB Read Error (job by sheet_uuid): {e}")
     return {}
 
 def update_job_target_email(sheet_uuid, new_email):
     """Overwrite the cached job JSON's target_email field by sheet_uuid (used by the manual /e Apollo override)."""
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (job_email_update: {sheet_uuid})", flush=True)
-        return False
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             cursor = conn.cursor()
             cursor.execute("SELECT job_json FROM jobs WHERE sheet_uuid = ?", (sheet_uuid,))
             row = cursor.fetchone()
@@ -368,10 +386,8 @@ def update_job_target_email(sheet_uuid, new_email):
             conn.commit()
         return True
     except Exception as e:
-        print(f"DB Job Email Update Error ({sheet_uuid}): {e}", flush=True)
+        logging.error(f"DB Job Email Update Error ({sheet_uuid}): {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
 
 def is_job_seen_db(job_hash):
     try:
@@ -383,22 +399,41 @@ def is_job_seen_db(job_hash):
         return False
 
 def save_seen_job_db(job_hash):
-    """Save seen job hash with thread-safe locking (30s timeout).
-    Prevents unhandled exceptions in thread pools.
-    """
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (seen_job: {job_hash})", flush=True)
-        return False
+    """Upsert seen job hash atomically via BEGIN IMMEDIATE, tracking first/last seen + repost count."""
     try:
         with get_db_conn() as conn:
-            conn.execute("INSERT OR IGNORE INTO seen_jobs (job_hash) VALUES (?)", (job_hash,))
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                INSERT INTO seen_jobs (job_hash, first_seen, last_seen, seen_count)
+                VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                ON CONFLICT(job_hash) DO UPDATE SET
+                    last_seen = CURRENT_TIMESTAMP,
+                    seen_count = seen_count + 1
+            """, (job_hash,))
             conn.commit()
         return True
     except Exception as e:
-        print(f"DB Seen Hash Error ({job_hash}): {e}", flush=True)
+        logging.error(f"DB Seen Hash Error ({job_hash}): {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
+
+def get_ghost_listing_penalty(job_hash):
+    """Returns (score_penalty, badge) if a job hash has reposted >3 times across >45 days, else (0, "")."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT first_seen, seen_count FROM seen_jobs WHERE job_hash = ?", (job_hash,))
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return 0, ""
+            first_seen, seen_count = row
+            first_seen_dt = datetime.strptime(str(first_seen)[:19], "%Y-%m-%d %H:%M:%S")
+            days_active = (datetime.now() - first_seen_dt).days
+            if seen_count > 3 and days_active > 45:
+                return -15, " ⚠️ [REPOST / EVERGREEN]"
+            return 0, ""
+    except Exception as e:
+        logging.error(f"Ghost Listing Penalty Error ({job_hash}): {e}")
+        return 0, ""
 
 def compute_description_simhash(text: str) -> str:
     """Computes a normalized SimHash token on the core job description."""
@@ -428,33 +463,25 @@ def save_content_hash(content_hash: str):
         pass
 
 def add_company_cooldown(company_name):
-    """Add company cooldown with thread-safe locking (30s timeout).
-    Prevents unhandled exceptions in thread pools.
-    """
+    """Add company cooldown atomically via BEGIN IMMEDIATE."""
     clean = str(company_name or "").lower().strip()
     if not clean:
         return False
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (cooldown: {clean})", flush=True)
-        return False
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("INSERT OR REPLACE INTO company_cooldown (company_clean, logged_at) VALUES (?, CURRENT_TIMESTAMP)", (clean,))
             conn.commit()
         return True
     except Exception as e:
-        print(f"DB Cooldown Save Error ({clean}): {e}", flush=True)
+        logging.error(f"DB Cooldown Save Error ({clean}): {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
 
 def log_metric_event(event_type, sheet_uuid=None):
-    """Persist a pipeline metric event (e.g. message_sent, interview_set) to SQLite."""
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (metric: {event_type})", flush=True)
-        return False
+    """Persist a pipeline metric event (e.g. message_sent, interview_set) to SQLite atomically."""
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO pipeline_metrics (event_type, sheet_uuid, timestamp) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 (event_type, sheet_uuid)
@@ -462,10 +489,8 @@ def log_metric_event(event_type, sheet_uuid=None):
             conn.commit()
         return True
     except Exception as e:
-        print(f"DB Metric Log Error ({event_type}): {e}", flush=True)
+        logging.error(f"DB Metric Log Error ({event_type}): {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
 
 def get_metric_count(event_type):
     """Return the total persisted count of a given metric event_type."""
@@ -475,22 +500,20 @@ def get_metric_count(event_type):
             cursor.execute("SELECT COUNT(*) FROM pipeline_metrics WHERE event_type = ?", (event_type,))
             return cursor.fetchone()[0]
     except Exception as e:
-        print(f"DB Metric Count Error ({event_type}): {e}", flush=True)
+        logging.error(f"DB Metric Count Error ({event_type}): {e}")
         return 0
 
 DAILY_ACTIVITY_COLUMNS = ("drafts_staged", "applied_count", "notes_logged")
 
 def log_daily_activity(activity_type):
-    """Increment today's daily_activity counter for a valid activity_type (drafts_staged/applied_count/notes_logged)."""
+    """Increment today's daily_activity counter atomically for a valid activity_type."""
     if activity_type not in DAILY_ACTIVITY_COLUMNS:
-        print(f"Invalid daily_activity type: {activity_type}", flush=True)
+        logging.error(f"Invalid daily_activity type: {activity_type}")
         return False
     today_str = datetime.now().strftime("%Y-%m-%d")
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (daily_activity: {activity_type})", flush=True)
-        return False
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 f"INSERT INTO daily_activity (date, {activity_type}) VALUES (?, 1) "
                 f"ON CONFLICT(date) DO UPDATE SET {activity_type} = {activity_type} + 1",
@@ -499,10 +522,8 @@ def log_daily_activity(activity_type):
             conn.commit()
         return True
     except Exception as e:
-        print(f"DB Daily Activity Error ({activity_type}): {e}", flush=True)
+        logging.error(f"DB Daily Activity Error ({activity_type}): {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
 
 def get_daily_activity(date_str):
     """Return {drafts_staged, applied_count, notes_logged} for a given date, zeroed if no row exists."""
@@ -517,7 +538,7 @@ def get_daily_activity(date_str):
             if row:
                 return {"drafts_staged": row[0], "applied_count": row[1], "notes_logged": row[2]}
     except Exception as e:
-        print(f"DB Daily Activity Read Error ({date_str}): {e}", flush=True)
+        logging.error(f"DB Daily Activity Read Error ({date_str}): {e}")
     return {"drafts_staged": 0, "applied_count": 0, "notes_logged": 0}
 
 def get_lifetime_activity_totals():
@@ -529,7 +550,7 @@ def get_lifetime_activity_totals():
             row = cursor.fetchone()
             return {"drafts_staged": row[0], "applied_count": row[1], "notes_logged": row[2]}
     except Exception as e:
-        print(f"DB Lifetime Activity Error: {e}", flush=True)
+        logging.error(f"DB Lifetime Activity Error: {e}")
         return {"drafts_staged": 0, "applied_count": 0, "notes_logged": 0}
 
 def calculate_active_day_streak():
@@ -540,7 +561,7 @@ def calculate_active_day_streak():
             cursor.execute("SELECT date FROM daily_activity WHERE (drafts_staged + applied_count + notes_logged) > 0 ORDER BY date DESC")
             active_dates = {row[0] for row in cursor.fetchall()}
     except Exception as e:
-        print(f"DB Streak Calc Error: {e}", flush=True)
+        logging.error(f"DB Streak Calc Error: {e}")
         return 0
 
     cursor_date = datetime.now().date()
@@ -577,14 +598,12 @@ def is_company_on_cooldown(company_name):
         return False
 
 def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_name="", contact_company=""):
-    """Persist (telegram_message_id, sheet_uuid, sheet_tab) so swipe-replies can resolve the CRM row."""
+    """Persist (telegram_message_id, sheet_uuid, sheet_tab) atomically so swipe-replies can resolve the CRM row."""
     if not telegram_message_id or not sheet_uuid:
-        return False
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (msg_map: {telegram_message_id})", flush=True)
         return False
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
                 INSERT OR REPLACE INTO sheet_row_map 
                 (sheet_uuid, sheet_tab, contact_name, contact_company, telegram_message_id, created_at)
@@ -593,10 +612,8 @@ def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_
             conn.commit()
         return True
     except Exception as e:
-        print(f"DB Message Mapping Save Error ({telegram_message_id}): {e}", flush=True)
+        logging.error(f"DB Message Mapping Save Error ({telegram_message_id}): {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
 
 def get_mapping_from_message_id(telegram_message_id):
     """Resolve a replied-to Telegram message back to its CRM sheet_uuid/tab, or None if unmapped."""
@@ -614,8 +631,21 @@ def get_mapping_from_message_id(telegram_message_id):
                 return {"sheet_uuid": row[0], "sheet_tab": row[1], "contact_name": row[2], "contact_company": row[3]}
             return None
     except Exception as e:
-        print(f"DB Message Mapping Lookup Error ({telegram_message_id}): {e}", flush=True)
+        logging.error(f"DB Message Mapping Lookup Error ({telegram_message_id}): {e}")
         return None
+
+def get_contact_by_sheet_uuid(sheet_uuid):
+    """Resolve contact_name/contact_company from sheet_row_map for the auto-stage bump action."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT contact_name, contact_company FROM sheet_row_map WHERE sheet_uuid = ?", (sheet_uuid,))
+            row = cursor.fetchone()
+            if row:
+                return {"name": row[0], "company": row[1]}
+    except Exception as e:
+        logging.error(f"Contact Lookup Error ({sheet_uuid}): {e}")
+    return None
 
 def build_crm_payload(action, sheet_uuid=None, **kwargs):
     """Standardize outbound CRM payloads: every action includes rowOperationOrder DESC for bottom-to-top Apps Script loops."""
@@ -836,6 +866,13 @@ def build_hiring_manager_dork(company_name, job_title=""):
     query = f'site:linkedin.com/in "{clean_comp}" ("Head of Operations" OR "Director of Operations" OR "Operations Manager" OR "VP of Operations" OR "COO")'
     return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
 
+def build_alumni_dork(company_name, school="Hope College"):
+    """Google dork to surface shared-alma-mater employees at a target company on LinkedIn."""
+    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    clean_school = re.sub(r'[^a-zA-Z0-9\s]', '', str(school or '')).strip()
+    query = f'site:linkedin.com/in "{clean_comp}" "{clean_school}"'
+    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+
 def extract_domain_from_website(url):
     """Parse a root domain (no scheme/www/path) out of a company website URL, or None if unusable."""
     if not url:
@@ -908,8 +945,8 @@ def parse_quick_command(text_input):
 # ==============================================================================
 # 5. GEMINI REST API INTEGRATION (TRUNCATED PAYLOAD)
 # ==============================================================================
-def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"):
-    """Call Gemini API with resilience handling. Return None on failure/timeout."""
+def call_gemini_api(prompt, system_prompt=None, response_mime="application/json", max_retries=3):
+    """Call Gemini API with resilience handling: exponential backoff retry on 429/5xx. Return None on final failure."""
     if not GEMINI_API_KEY:
         return None
     full_prompt = f"{system_prompt}\n\n{prompt}".strip() if system_prompt else prompt
@@ -918,19 +955,30 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
         "generationConfig": {"response_mime_type": response_mime}
     }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_API_KEY}"
-    try:
-        res = requests.post(url, json=payload, timeout=15)
-        if res.status_code == 429:
-            # JSearch-like 429 error - halt and notify
-            send_health_alert("Gemini API Rate Limit (429) - halting evaluations temporarily")
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            res = requests.post(url, json=payload, timeout=15)
+            if res.status_code == 200:
+                return res.json()["candidates"][0]["content"]["parts"][0]["text"]
+            if res.status_code == 429 or res.status_code >= 500:
+                logging.warning(f"Gemini API {res.status_code} (attempt {attempt+1}/{max_retries}) - backing off {delay}s")
+                if attempt == max_retries - 1:
+                    send_health_alert(f"Gemini API {res.status_code} - halting evaluation after {max_retries} retries")
+                    return None
+                time.sleep(delay)
+                delay *= 2.0
+                continue
             return None
-        if res.status_code == 200:
-            return res.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except requests.exceptions.Timeout:
-        print(f"Gemini API Timeout", flush=True)
-        return None
-    except Exception as e:
-        print(f"Gemini API Exception: {e}", flush=True)
+        except requests.exceptions.Timeout:
+            logging.error(f"Gemini API Timeout (attempt {attempt+1}/{max_retries})")
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(delay)
+            delay *= 2.0
+        except Exception as e:
+            logging.error(f"Gemini API Exception: {e}")
+            return None
     return None
 
 def evaluate_job_with_gemini(job):
@@ -962,7 +1010,7 @@ def evaluate_job_with_gemini(job):
                 final_score = calculate_hybrid_score_modifier(job, raw_score)
                 return (final_score >= 65), final_score, reason, linkedin_note, ats_bullets
             except Exception as e:
-                print(f"Gemini evaluation JSON parse failure: {e}", flush=True)
+                logging.error(f"Gemini evaluation JSON parse failure: {e}")
                 # On parse error, return 0 score with Evaluation Pending status
                 return False, 0, "Evaluation Pending", "", []
         
@@ -970,7 +1018,7 @@ def evaluate_job_with_gemini(job):
         return False, 0, "Evaluation Pending", "", []
     
     except Exception as e:
-        print(f"Gemini evaluation exception: {e}", flush=True)
+        logging.error(f"Gemini evaluation exception: {e}")
         return False, 0, "Evaluation Pending", "", []
 
 def generate_interview_prep(company, job_title, job_description=""):
@@ -1009,7 +1057,7 @@ def generate_interview_prep(company, job_title, job_description=""):
                     "reverse_questions": [str(q) for q in reverse_questions][:2]
                 }
         except Exception as e:
-            print(f"Interview prep parse failure: {e}", flush=True)
+            logging.error(f"Interview prep parse failure: {e}")
     return fallback
 
 def generate_elevator_pitch(company, job_title):
@@ -1036,7 +1084,40 @@ def generate_elevator_pitch(company, job_title):
             if pitch:
                 return str(pitch)
         except Exception as e:
-            print(f"Elevator pitch parse failure: {e}", flush=True)
+            logging.error(f"Elevator pitch parse failure: {e}")
+    return fallback
+
+def generate_cover_letter(company, job_title, job_description=""):
+    """Tailored 3-paragraph plain-text cover letter; safe static fallback if Gemini is unavailable."""
+    fallback = (
+        f"Dear Hiring Manager,\n\n"
+        f"I'm writing to express my interest in the {job_title or 'operations'} role at {company or 'your organization'}. "
+        "My background in wealth operations, process automation, and reconciliation gives me a strong foundation for this kind of work, "
+        "and I've built Python and SQL tools that meaningfully cut down manual processing time in similar environments.\n\n"
+        f"I'm particularly drawn to {company or 'your team'} because of the operational rigor the role demands, and I believe my "
+        "combination of technical fluency and financial operations experience would let me contribute quickly.\n\n"
+        "I'd welcome the opportunity to discuss how I can support your team. Thank you for your consideration.\n\nBest regards,\nKevin Miller"
+    )
+    if not GEMINI_API_KEY:
+        return fallback
+    desc_truncated = str(job_description or "")[:800]
+    prompt = (
+        f"Company: {company or 'N/A'}\nRole: {job_title or 'N/A'}\nDescription:\n{desc_truncated}\n\n"
+        "Write a tailored 3-paragraph plain-text cover letter for an early-career candidate with a Python/SQL/Salesforce/"
+        "process-automation/wealth-ops background. Paragraph 1: intro + role interest. Paragraph 2: relevant experience "
+        "tied to this specific role. Paragraph 3: closing + call to action. No markdown formatting. "
+        'Respond ONLY with JSON: {"letter": "<full 3-paragraph plain-text letter>"}'
+    )
+    raw_text = call_gemini_api(prompt)
+    if raw_text:
+        try:
+            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
+            data = json.loads(cleaned)
+            letter = data.get("letter", "")
+            if letter:
+                return str(letter)
+        except Exception as e:
+            logging.error(f"Cover letter parse failure: {e}")
     return fallback
 
 # ==============================================================================
@@ -1090,6 +1171,14 @@ def process_single_candidate(job):
         salary_str, _ = extract_salary(job)
         work_style = extract_work_style(job)
         overlap_pct, matched_skills = calculate_keyword_overlap(job.get("job_description"))
+
+        # Ghost Listing Penalty: dock score + badge for reposted/evergreen listings (>3 sightings across >45 days)
+        job_hash = generate_dedup_hash(job.get("employer_name"), job.get("job_title"))
+        penalty, ghost_badge = get_ghost_listing_penalty(job_hash)
+        if penalty:
+            score = max(1, score + penalty)
+            age_badge = f"{age_badge}{ghost_badge}"
+
         return {
             "job": job, "score": score, "reason": reason,
             "linkedin_note": linkedin_note, "ats_bullets": ats_bullets,
@@ -1103,12 +1192,10 @@ def process_single_candidate(job):
 # 7. GMAIL API DRAFTING & CRM LOGGING
 # ==============================================================================
 def save_gmail_draft_record(to_email, subject, draft_id):
-    """Persist a created Gmail draft's identity for 24h dedup checks."""
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print(f"DB Write Lock Timeout (gmail_draft: {to_email})", flush=True)
-        return False
+    """Persist a created Gmail draft's identity atomically for 24h dedup checks."""
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT OR REPLACE INTO gmail_drafts (to_email, subject, draft_id, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
                 (to_email, subject, draft_id)
@@ -1116,10 +1203,8 @@ def save_gmail_draft_record(to_email, subject, draft_id):
             conn.commit()
         return True
     except Exception as e:
-        print(f"DB Gmail Draft Save Error ({to_email}): {e}", flush=True)
+        logging.error(f"DB Gmail Draft Save Error ({to_email}): {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
 
 def check_existing_gmail_draft(to_email, subject):
     """Return existing draft metadata if (to_email, subject) was drafted in the last 24h, else None."""
@@ -1133,7 +1218,7 @@ def check_existing_gmail_draft(to_email, subject):
             row = cursor.fetchone()
             return {"draft_id": row[0], "created_at": row[1]} if row else None
     except Exception as e:
-        print(f"DB Gmail Draft Lookup Error ({to_email}): {e}", flush=True)
+        logging.error(f"DB Gmail Draft Lookup Error ({to_email}): {e}")
         return None
 
 def should_send_alert(alert_key: str, cooldown_hours: int = 6) -> bool:
@@ -1154,7 +1239,7 @@ def should_send_alert(alert_key: str, cooldown_hours: int = 6) -> bool:
             conn.commit()
             return True
     except Exception as e:
-        print(f"Alert Debounce Error: {e}", flush=True)
+        logging.error(f"Alert Debounce Error: {e}")
         return True
 
 def get_gmail_access_token():
@@ -1190,7 +1275,7 @@ def get_gmail_access_token():
             return None
         return token_json.get("access_token")
     except Exception as e:
-        print(f"Gmail OAuth Token Refresh Exception: {e}", flush=True)
+        logging.error(f"Gmail OAuth Token Refresh Exception: {e}")
         return None
 
 def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note=""):
@@ -1278,7 +1363,7 @@ def lookup_crm_sender_match(sender_raw):
             if row:
                 return {"name": row[0], "company": row[1], "tab": row[2]}
     except Exception as e:
-        print(f"CRM Sender Lookup Error: {e}", flush=True)
+        logging.error(f"CRM Sender Lookup Error: {e}")
     return None
 
 def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
@@ -1321,11 +1406,11 @@ def check_inbound_gmail_replies():
         params = {"q": "is:unread -from:me label:INBOX", "maxResults": 10}
         res = requests.get(list_url, headers=headers, params=params, timeout=10)
         if res.status_code != 200:
-            print(f"Gmail Poll List Error: {res.status_code}", flush=True)
+            logging.error(f"Gmail Poll List Error: {res.status_code}")
             return
         message_ids = [m["id"] for m in res.json().get("messages", [])]
     except Exception as e:
-        print(f"Gmail Poll List Exception: {e}", flush=True)
+        logging.error(f"Gmail Poll List Exception: {e}")
         return
 
     for msg_id in message_ids:
@@ -1374,7 +1459,7 @@ def check_inbound_gmail_replies():
             modify_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify"
             requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
         except Exception as e:
-            print(f"Gmail Poll Message Processing Error ({msg_id}): {e}", flush=True)
+            logging.error(f"Gmail Poll Message Processing Error ({msg_id}): {e}")
 
 def check_inbound_replies_loop():
     """Daemon loop: poll Gmail for unread replies every 120 seconds."""
@@ -1382,7 +1467,7 @@ def check_inbound_replies_loop():
         try:
             check_inbound_gmail_replies()
         except Exception as e:
-            print(f"Gmail Poller Loop Error: {e}", flush=True)
+            logging.error(f"Gmail Poller Loop Error: {e}")
         time.sleep(120)
 
 def start_gmail_poller():
@@ -1422,7 +1507,7 @@ def morning_digest_loop():
                 )
                 send_telegram_message(TELEGRAM_CHAT_ID, digest)
         except Exception as e:
-            print(f"Morning Digest Dispatch Error: {e}", flush=True)
+            logging.error(f"Morning Digest Dispatch Error: {e}")
 
 def start_morning_digest():
     """Spin up the 8:30 AM daily standup digest as a daemon thread."""
@@ -1444,19 +1529,17 @@ def log_to_sheets_crm(payload, max_retries=3):
             if res.status_code == 200:
                 return True
         except Exception as e:
-            print(f"CRM Webhook Attempt {attempt+1} Failed: {e}", flush=True)
+            logging.error(f"CRM Webhook Attempt {attempt+1} Failed: {e}")
         time.sleep(delay)
         delay *= 2.0
     send_health_alert(f"Failed to log payload to Google Sheets after {max_retries} attempts.")
     return False
 
 def enqueue_crm_payload(payload):
-    """Enqueues an outbound Sheets write to local SQLite to ensure zero data loss (durable outbox pattern)."""
-    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
-        print("DB Write Lock Timeout (enqueue_crm_payload)", flush=True)
-        return False
+    """Enqueues an outbound Sheets write to local SQLite atomically (durable outbox pattern)."""
     try:
         with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO crm_outbox (payload_json, status) VALUES (?, 'PENDING')",
                 (json.dumps(payload),)
@@ -1464,10 +1547,8 @@ def enqueue_crm_payload(payload):
             conn.commit()
         return True
     except Exception as e:
-        print(f"CRM Outbox Enqueue Error: {e}", flush=True)
+        logging.error(f"CRM Outbox Enqueue Error: {e}")
         return False
-    finally:
-        DB_WRITE_LOCK.release()
 
 def crm_outbox_worker_loop():
     """Background daemon processing queued Sheets writes with exponential backoff."""
@@ -1501,7 +1582,7 @@ def crm_outbox_worker_loop():
                     conn.commit()
                 time.sleep(1.0)
         except Exception as e:
-            print(f"CRM Outbox Worker Error: {e}", flush=True)
+            logging.error(f"CRM Outbox Worker Error: {e}")
         time.sleep(5)
 
 def start_crm_outbox_worker():
@@ -1517,7 +1598,7 @@ def fetch_networking_cards(target_code="CW", qty=2):
             leads = res.json().get("followups", [])
             return leads[:qty]
     except Exception as e:
-        print(f"Error fetching networking cards: {e}", flush=True)
+        logging.error(f"Error fetching networking cards: {e}")
     return []
 
 def answer_callback_query(callback_query_id, text=None, show_alert=False):
@@ -1534,7 +1615,7 @@ def answer_callback_query(callback_query_id, text=None, show_alert=False):
             timeout=3
         )
     except Exception as e:
-        print(f"answerCallbackQuery error: {e}", flush=True)
+        logging.error(f"answerCallbackQuery error: {e}")
 
 def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
     """Edit an existing Telegram message in-place instead of sending a redundant new one."""
@@ -1554,7 +1635,7 @@ def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
         res = requests.post(url, json=payload, timeout=5)
         return res.status_code == 200
     except Exception as e:
-        print(f"editMessageText error: {e}", flush=True)
+        logging.error(f"editMessageText error: {e}")
         return False
 
 def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=None):
@@ -1581,14 +1662,14 @@ def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=No
         res = requests.post(url, json=payload, timeout=5)
         if res.status_code == 429:
             retry_after = res.json().get("parameters", {}).get("retry_after", 1)
-            print(f"Telegram 429 Rate Limit - retrying after {retry_after}s", flush=True)
+            logging.warning(f"Telegram 429 Rate Limit - retrying after {retry_after}s")
             time.sleep(retry_after)
             res = requests.post(url, json=payload, timeout=5)
         if res.status_code == 200:
             log_metric_event("message_sent")
             return res.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"Telegram Post Error: {e}", flush=True)
+        logging.error(f"Telegram Post Error: {e}")
     return None
 
 def get_fit_score_indicator(score):
@@ -1612,8 +1693,12 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     apollo_url = html.escape(build_apollo_url(company), quote=True)
     linkedin_url = html.escape(build_linkedin_url(company), quote=True)
     dork_url = html.escape(build_hiring_manager_dork(company, job.get("job_title")), quote=True)
-    matched_str = ", ".join(matched_skills[:4]).title() if matched_skills else "General Ops"
-    bullets_block = "\n".join(f"• {b}" for b in ats_bullets) if ats_bullets else "N/A"
+    alumni_url = html.escape(build_alumni_dork(company), quote=True)
+    # Truncate raw dynamic content BEFORE HTML-escaping/tag-wrapping so tags never get cut mid-string
+    reason_safe = str(reason or "")[:300]
+    matched_str = (", ".join(matched_skills[:4]).title() if matched_skills else "General Ops")[:150]
+    bullets_block = ("\n".join(f"• {b}" for b in ats_bullets) if ats_bullets else "N/A")[:500]
+    linkedin_note_safe = str(linkedin_note or "")[:300]
     fit_dot = get_fit_score_indicator(score)
     card_text = (
         f"💼 <b>{title}</b>\n"
@@ -1623,14 +1708,15 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"🕐 <b>Recency:</b> {age_badge}\n"
         f"💰 <b>Pay &amp; Style:</b> {work_style} | {salary_str}\n\n"
         f"🧩 <b>Matched Skills:</b> <code>{html.escape(matched_str)}</code>\n\n"
-        f"<b>Fit Reason:</b> {html.escape(reason)}\n\n"
+        f"<b>Fit Reason:</b> {html.escape(reason_safe)}\n\n"
         f"🔗 <b>Quick Links:</b>\n"
         f"<a href='{apply_link}'>Direct Apply</a> | "
         f"<a href='{apollo_url}'>Apollo Operations Leads</a> | "
         f"<a href='{linkedin_url}'>LinkedIn Leadership Search</a> | "
-        f"<a href='{dork_url}'>🎯 Find Direct Hiring Manager (Google Dork)</a>\n\n"
+        f"<a href='{dork_url}'>🎯 Find Direct Hiring Manager (Google Dork)</a> | "
+        f"<a href='{alumni_url}'>🎓 Alumni Connections</a>\n\n"
         f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
-        f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note) if linkedin_note else 'N/A'}</code>\n\n"
+        f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note_safe) if linkedin_note_safe else 'N/A'}</code>\n\n"
         f"📄 <b>Tailored ATS Resume Bullets:</b>\n<code>{html.escape(bullets_block)}</code>\n\n"
         f"⚡ <b>Swipe Actions:</b>\n"
         f"  <code>draft</code> Gmail Draft   <code>/f &lt;days&gt;</code> Snooze\n"
@@ -1661,7 +1747,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         res = requests.post(url, json=payload, timeout=10)
         if res.status_code == 429:
             retry_after = res.json().get("parameters", {}).get("retry_after", 1)
-            print(f"Telegram 429 Rate Limit (card) - retrying after {retry_after}s", flush=True)
+            logging.warning(f"Telegram 429 Rate Limit (card) - retrying after {retry_after}s")
             time.sleep(retry_after)
             res = requests.post(url, json=payload, timeout=10)
         if res.status_code == 200:
@@ -1671,7 +1757,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
                 save_message_mapping(telegram_message_id, sheet_uuid, "Pipeline_Candidates", company, "")
             return telegram_message_id
     except Exception as e:
-        print(f"Failed to post card to Telegram: {e}", flush=True)
+        logging.error(f"Failed to post card to Telegram: {e}")
     return None
 
 # ==============================================================================
@@ -1688,7 +1774,7 @@ def fetch_single_query_jobs(query_args):
         try:
             res = requests.get(api_url, headers=headers, params=params, timeout=10)
             if res.status_code == 429:
-                print(f"JSearch 429 Rate Limit on page {page} ({query}) - stopping pagination", flush=True)
+                logging.warning(f"JSearch 429 Rate Limit on page {page} ({query}) - stopping pagination")
                 break
             if res.status_code != 200:
                 break
@@ -1697,7 +1783,7 @@ def fetch_single_query_jobs(query_args):
                 break  # no more results, stop paging early
             all_jobs.extend(page_jobs)
         except Exception as e:
-            print(f"Fetch Exception ({query} page {page}): {e}", flush=True)
+            logging.error(f"Fetch Exception ({query} page {page}): {e}")
             break
     return all_jobs
 
@@ -1726,7 +1812,7 @@ def fetch_greenhouse_jobs(slug):
             })
         return jobs
     except Exception as e:
-        print(f"Greenhouse Fetch Exception ({slug}): {e}", flush=True)
+        logging.error(f"Greenhouse Fetch Exception ({slug}): {e}")
         return []
 
 def fetch_lever_jobs(slug):
@@ -1759,7 +1845,7 @@ def fetch_lever_jobs(slug):
             })
         return jobs
     except Exception as e:
-        print(f"Lever Fetch Exception ({slug}): {e}", flush=True)
+        logging.error(f"Lever Fetch Exception ({slug}): {e}")
         return []
 
 def fetch_ashby_jobs(slug):
@@ -1787,7 +1873,7 @@ def fetch_ashby_jobs(slug):
             })
         return jobs
     except Exception as e:
-        print(f"Ashby Fetch Exception ({slug}): {e}", flush=True)
+        logging.error(f"Ashby Fetch Exception ({slug}): {e}")
         return []
 
 def fetch_ats_jobs(company_slugs):
@@ -1805,7 +1891,7 @@ def fetch_ats_jobs(company_slugs):
             try:
                 all_jobs.extend(future.result(timeout=15))
             except Exception as e:
-                print(f"ATS Fetch Future Error: {e}", flush=True)
+                logging.error(f"ATS Fetch Future Error: {e}")
     return all_jobs
 
 def run_job_pipeline(chat_id=None, top_n=2):
@@ -1814,7 +1900,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
     Stage 2: Concurrent Gemini AI evaluation (uncapped, ThreadPoolExecutor max_workers=20)
     Tiered delivery: Tier-1 (score>=80, top 5) get full interactive cards; Tier-2 (65-79) get a bundled digest.
     """
-    print(">>> Starting Job Search Pipeline...", flush=True)
+    logging.info(">>> Starting Job Search Pipeline...")
     if chat_id:
         send_status_update(chat_id, "Stage 1: Fetching raw listings from JSearch (3 pages/query) in parallel...")
     
@@ -1869,16 +1955,16 @@ def run_job_pipeline(chat_id=None, top_n=2):
         for job in fetch_ats_jobs(ats_slugs):
             _add_candidate(job)
     
-    print(f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.", flush=True)
+    logging.info(f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.")
     if chat_id:
         send_status_update(chat_id, f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.\nStage 2: Running AI evaluations (uncapped, Tier-1 capacity)...")
     
     # Stage 2: Evaluate ALL strict-filtered candidates concurrently (uncapped Tier-1 capacity)
     eval_candidates = candidate_pool
-    print(f"Stage 2: Evaluating {len(eval_candidates)} candidates with Gemini AI (uncapped)...", flush=True)
+    logging.info(f"Stage 2: Evaluating {len(eval_candidates)} candidates with Gemini AI (uncapped)...")
     
     top_matches = []
-    with ThreadPoolExecutor(max_workers=20) as eval_executor:
+    with ThreadPoolExecutor(max_workers=4) as eval_executor:
         # Map candidate evaluation across thread pool
         eval_futures = [eval_executor.submit(process_single_candidate, candidate) for candidate in eval_candidates]
         
@@ -1888,7 +1974,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 if result:
                     top_matches.append(result)
             except Exception as e:
-                print(f"Candidate evaluation failed (timeout or error): {e}", flush=True)
+                logging.error(f"Candidate evaluation failed (timeout or error): {e}")
                 # On timeout/error: score=0, status='Evaluation Pending' is handled in evaluate_job_with_gemini
     
     # Sort by score descending, then split into Tier-1 (full cards) and Tier-2 (bundled digest)
@@ -1965,7 +2051,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
     if batch_rows:
         enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="TC", rows=batch_rows))
     
-    print(f"Stage 2 Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.", flush=True)
+    logging.info(f"Stage 2 Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.")
     if chat_id:
         send_status_update(chat_id, f"Pipeline Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.")
     
@@ -2074,6 +2160,40 @@ def process_webhook_payload_async(data):
                 updated_text = f"{original_text}\n\n❌ <b>Archived to Dead</b>"
                 edit_telegram_message(chat_id, message_id, updated_text, reply_markup={"inline_keyboard": []})
                 answer_callback_query(callback_query_id, "❌ Archived to Dead")
+            elif cb_action == "bump":
+                if not cb_arg:
+                    answer_callback_query(callback_query_id, "⚠️ Malformed button data.", show_alert=True)
+                    return
+                contact = get_contact_by_sheet_uuid(cb_arg)
+                if not contact:
+                    answer_callback_query(callback_query_id, "⚠️ Contact not found.", show_alert=True)
+                    return
+                contact_name = contact.get("name") or ""
+                contact_company = contact.get("company") or "Target Firm"
+                to_email = resolve_target_email(contact_company).split(" [")[0]  # strip fallback-warning suffix
+                bump_body = generate_bump_email(contact_name)
+                try:
+                    access_token = get_gmail_access_token()
+                    if access_token:
+                        message = EmailMessage()
+                        message["To"] = to_email
+                        message["From"] = GMAIL_USER
+                        message["Subject"] = f"Following Up - {contact_company}"
+                        message.set_content(bump_body)
+                        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+                        draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
+                        gmail_headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+                        res = requests.post(draft_url, headers=gmail_headers, json={"message": {"raw": raw_message}}, timeout=10)
+                        if res.status_code in [200, 201]:
+                            log_daily_activity("drafts_staged")
+                            answer_callback_query(callback_query_id, f"📨 Bump draft staged for {contact_name or contact_company}")
+                        else:
+                            answer_callback_query(callback_query_id, "⚠️ Gmail draft failed.", show_alert=True)
+                    else:
+                        answer_callback_query(callback_query_id, "⚠️ Gmail auth unavailable.", show_alert=True)
+                except Exception as e:
+                    logging.error(f"Bump Draft Error: {e}")
+                    answer_callback_query(callback_query_id, "❌ Error staging bump draft.", show_alert=True)
             elif cb_data.startswith("adj_pay_"):
                 delta = cb_data.replace("adj_pay_", "")
                 res = update_filter_param("min_salary", delta)
@@ -2250,11 +2370,16 @@ def process_webhook_payload_async(data):
                 return
 
             lines = [f"📊 <b>Overdue Pipeline:</b> {len(overdue)} contacts require immediate action.\n"]
+            bump_buttons = []
             for item in overdue[:3]:
                 comp = html.escape(str(item.get("company") or "N/A"))
                 name = html.escape(str(item.get("name") or "N/A"))
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
-            send_telegram_message(chat_id, "\n".join(lines))
+                if item["days_overdue"] >= 5 and item.get("sheet_uuid"):
+                    raw_label = str(item.get("name") or item.get("company") or "Contact")[:20]
+                    bump_buttons.append([{"text": f"📨 Bump {raw_label}", "callback_data": f"bump:{item['sheet_uuid']}"}])
+            reply_markup = {"inline_keyboard": bump_buttons} if bump_buttons else None
+            send_telegram_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
             return
         if text == "/health":
             send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite WAL persistent | Webhooks Active")
@@ -2411,8 +2536,25 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, pitch_msg)
             return
 
-        if text in ["/cv", "/resume"]:
-            mapping = resolve_reply_mapping(msg, chat_id, text)
+        if text == "/letter":
+            mapping = resolve_reply_mapping(msg, chat_id, "/letter")
+            if not mapping:
+                return
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            job_title = job.get("job_title") or "this role"
+            letter = generate_cover_letter(comp, job_title, job.get("job_description", ""))
+            letter_msg = (
+                f"✉️ <b>Cover Letter - {html.escape(comp)}</b>\n\n"
+                f"<code>{html.escape(letter)}</code>"
+            )
+            send_telegram_message(chat_id, letter_msg)
+            return
+
+        cv_match = re.match(r"^/(cv|resume)(?:\s+([ab]))?$", text, re.IGNORECASE)
+        if cv_match:
+            track = (cv_match.group(2) or "a").lower()
+            mapping = resolve_reply_mapping(msg, chat_id, cv_match.group(0).split()[0])
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
@@ -2423,16 +2565,16 @@ def process_webhook_payload_async(data):
             short_id = job.get("short_id") or generate_short_key(job.get("job_id") or mapping["sheet_uuid"])
 
             try:
-                pdf_bytes = compile_resume_pdf(comp, bullets)
+                pdf_bytes = compile_resume_pdf(comp, bullets, track=track)
                 clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
-                filename = f"Kevin_Miller_Resume_{clean_comp}.pdf"
+                filename = f"Kevin_Miller_Resume_{clean_comp}_Track{track.upper()}.pdf"
 
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
                 files = {"document": (filename, io.BytesIO(pdf_bytes), "application/pdf")}
                 caption_text = (
-                    f"📄 <b>Tailored Resume: {html.escape(comp)}</b>\n\n"
+                    f"📄 <b>Tailored Resume ({track.upper()}): {html.escape(comp)}</b>\n\n"
                     f"🖥️ <b>Desktop Staging Link:</b>\n"
-                    f"<code>http://localhost:5000/stage/{short_id}</code>"
+                    f"<code>http://localhost:5000/stage/{short_id}?track={track}</code>"
                 )
                 requests.post(url, data={"chat_id": chat_id, "caption": caption_text, "parse_mode": "HTML"}, files=files, timeout=10)
             except Exception as e:
@@ -2479,7 +2621,7 @@ def process_webhook_payload_async(data):
             return
 
     except Exception as e:
-        print(f"Async Webhook Processing Error: {e}", flush=True)
+        logging.error(f"Async Webhook Processing Error: {e}")
 
 def webhook_worker_loop():
     """Daemon worker: pulls payloads off the bounded queue and processes them serially per-thread."""
@@ -2488,7 +2630,7 @@ def webhook_worker_loop():
         try:
             process_webhook_payload_async(data)
         except Exception as e:
-            print(f"Webhook Worker Error: {e}", flush=True)
+            logging.error(f"Webhook Worker Error: {e}")
         finally:
             WEBHOOK_QUEUE.task_done()
 
@@ -2534,7 +2676,7 @@ def telegram_webhook():
     if webhook_secret:
         incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if incoming_secret != webhook_secret:
-            print("Telegram Webhook Rejected: invalid secret token", flush=True)
+            logging.warning("Telegram Webhook Rejected: invalid secret token")
             return jsonify({"status": "error", "message": "Unauthorized"}), 403
 
     try:
@@ -2544,11 +2686,11 @@ def telegram_webhook():
         try:
             WEBHOOK_QUEUE.put_nowait(data)
         except queue.Full:
-            print("Webhook Queue Full: dropping payload", flush=True)
+            logging.warning("Webhook Queue Full: dropping payload")
             return jsonify({"status": "error", "message": "Server busy, queue full"}), 503
         return jsonify({"status": "ok"}), 200
     except Exception as e:
-        print(f"Telegram Webhook Dispatch Error: {e}", flush=True)
+        logging.error(f"Telegram Webhook Dispatch Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 200
 
 @app.route("/stage/<short_id>", methods=["GET"])
@@ -2558,6 +2700,7 @@ def desktop_stage_view(short_id):
     if not job:
         return "<h3>Job not found or cache expired.</h3>", 404
 
+    track = request.args.get("track", "a")
     comp = job.get("employer_name", "Target Firm")
     title = job.get("job_title", "Role")
     apply_link = job.get("job_apply_link", "#")
@@ -2586,10 +2729,10 @@ def desktop_stage_view(short_id):
             <p><b>Targeted ATS Bullets:</b></p>
             <ul>{bullets_html}</ul>
             <div style="margin-top: 20px;">
-                <a class="btn btn-primary" href="/stage/{short_id}/pdf" download="Kevin_Miller_Resume_{re.sub(r'[^a-zA-Z0-9]', '', comp)}.pdf">⬇️ Download Tailored PDF</a>
+                <a class="btn btn-primary" href="/stage/{short_id}/pdf?track={track}" download="Kevin_Miller_Resume_{re.sub(r'[^a-zA-Z0-9]', '', comp)}.pdf">⬇️ Download Tailored PDF</a>
                 <a class="btn btn-secondary" href="{html.escape(apply_link)}" target="_blank">🔗 Open Application Portal</a>
             </div>
-            <iframe src="/stage/{short_id}/pdf"></iframe>
+            <iframe src="/stage/{short_id}/pdf?track={track}"></iframe>
         </div>
     </body>
     </html>
@@ -2602,10 +2745,60 @@ def desktop_stage_pdf(short_id):
     job = get_job_from_cache(short_id)
     if not job:
         return "Job cache expired", 404
+    track = request.args.get("track", "a")
     comp = job.get("employer_name", "Target Firm")
     bullets = job.get("ats_bullets", [])
-    pdf_bytes = compile_resume_pdf(comp, bullets)
+    pdf_bytes = compile_resume_pdf(comp, bullets, track=track)
     return Response(pdf_bytes, mimetype="application/pdf")
+
+@app.route("/ingest", methods=["POST"])
+def desktop_ingest():
+    """Secure endpoint for desktop bookmarklet ingestion of manual job links/text."""
+    ingest_secret = os.environ.get("INGEST_SECRET")
+    if ingest_secret:
+        incoming_secret = request.headers.get("X-Ingest-Secret") or request.args.get("secret")
+        if incoming_secret != ingest_secret:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 403
+
+    try:
+        data = request.get_json(silent=True) or {}
+        raw_text = str(data.get("text") or "").strip()
+        url = str(data.get("url") or "").strip()
+        title = str(data.get("title") or "").strip()
+        if not raw_text and not url:
+            return jsonify({"status": "error", "message": "No job text or URL provided"}), 400
+
+        job = {
+            "job_id": f"ingest_{hashlib.md5((url or raw_text).encode()).hexdigest()[:12]}",
+            "employer_name": data.get("company") or "Manual Ingest",
+            "job_title": title or "Manually Ingested Role",
+            "job_description": raw_text or title,
+            "job_apply_link": url,
+            "job_city": "",
+            "job_state": "",
+            "job_is_remote": False,
+            "job_posted_at_datetime_utc": datetime.now(timezone.utc).isoformat()
+        }
+
+        def _process_and_dispatch():
+            result = process_single_candidate(job)
+            if result:
+                send_telegram_card(
+                    result["job"], result["score"], result["reason"], result["target_email"],
+                    result["age_badge"], result["salary_str"], result["work_style"],
+                    result["overlap_pct"], result["matched_skills"], result["short_id"],
+                    sheet_uuid=result.get("sheet_uuid"),
+                    linkedin_note=result.get("linkedin_note", ""),
+                    ats_bullets=result.get("ats_bullets")
+                )
+            elif TELEGRAM_CHAT_ID:
+                send_telegram_message(TELEGRAM_CHAT_ID, f"⚠️ Ingested job did not pass AI screening: {html.escape(job['job_title'])}")
+
+        threading.Thread(target=_process_and_dispatch, daemon=True).start()
+        return jsonify({"status": "ok", "message": "Ingestion queued"}), 200
+    except Exception as e:
+        logging.error(f"Ingest Endpoint Error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
