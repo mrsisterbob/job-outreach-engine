@@ -327,6 +327,29 @@ def get_job_by_sheet_uuid(sheet_uuid):
         print(f"DB Read Error (job by sheet_uuid): {e}", flush=True)
     return {}
 
+def update_job_target_email(sheet_uuid, new_email):
+    """Overwrite the cached job JSON's target_email field by sheet_uuid (used by the manual /e Apollo override)."""
+    if not DB_WRITE_LOCK.acquire(timeout=DB_WRITE_LOCK_TIMEOUT):
+        print(f"DB Write Lock Timeout (job_email_update: {sheet_uuid})", flush=True)
+        return False
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT job_json FROM jobs WHERE sheet_uuid = ?", (sheet_uuid,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            job_dict = json.loads(row[0])
+            job_dict["target_email"] = new_email
+            conn.execute("UPDATE jobs SET job_json = ? WHERE sheet_uuid = ?", (json.dumps(job_dict), sheet_uuid))
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"DB Job Email Update Error ({sheet_uuid}): {e}", flush=True)
+        return False
+    finally:
+        DB_WRITE_LOCK.release()
+
 def is_job_seen_db(job_hash):
     try:
         with get_db_conn() as conn:
@@ -799,22 +822,37 @@ def resolve_target_email(company_name, job_title="", employer_website=None):
     return f"operations@{domain}{fallback_warning}"
 
 def parse_quick_command(text_input):
-    """Strict regex parser for /quick command.
-    Format: /quick Name@Company [Priority] [Note]
-    Regex: ^/quick\s+(?P<name>[^@]+)@(?P<company>[^\d@]+)\s*(?P<priority>\d+)?\s*(?P<note>.*?)$
+    """
+    Format: /quick Name @ Company [1-10] Note
+    Handles company names with numbers and special symbols safely (e.g. 3M, Web3 Labs, 1Password, 7-Eleven).
     """
     clean = text_input.replace("/quick", "").strip()
-    # Strict regex: name@company with optional priority and note
-    match = re.match(r"^(?P<name>[^@]+)@(?P<company>[^\d@]+)\s*(?P<priority>\d+)?\s*(?P<note>.*)$", clean)
-    if not match:
-        return None  # Invalid format
-    name = match.group('name').strip()
-    company = match.group('company').strip()
-    priority = safe_int(match.group('priority') or 5, 5)
-    note = match.group('note').strip()
-    # Validate: priority must be 1-10
-    if priority < 1 or priority > 10:
-        priority = 5
+    if "@" not in clean:
+        return None
+    name_part, rest = clean.split("@", 1)
+    name = name_part.strip()
+    rest = rest.strip()
+    if not name or not rest:
+        return None
+
+    # Extract priority if present as standalone integer
+    tokens = rest.split()
+    priority = 5
+    company_tokens = []
+    note_tokens = []
+    found_priority = False
+
+    for idx, token in enumerate(tokens):
+        if token.isdigit() and 1 <= int(token) <= 10 and not found_priority and idx > 0:
+            priority = int(token)
+            found_priority = True
+            note_tokens = tokens[idx + 1:]
+            break
+        else:
+            company_tokens.append(token)
+
+    company = " ".join(company_tokens).strip()
+    note = " ".join(note_tokens).strip() if found_priority else ""
     return name, company, priority, note
 
 # ==============================================================================
@@ -854,7 +892,7 @@ def evaluate_job_with_gemini(job):
         return True, 75, "Fallback pass (No Key)", "", []
     
     try:
-        desc_truncated = str(job.get("job_description") or "")[:1000]
+        desc_truncated = str(job.get("job_description") or "")[:4000]
         prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{desc_truncated}"
         
         # Call API with timeout handling
@@ -979,7 +1017,7 @@ def passes_strict_filter(job):
     if any(k in description for k in ["3+ years", "3-5 years", "4+ years"]) and (0 < max_sal < exp_floor):
         return False
 
-    if any(term in title for term in get_filter("title_exclusions", [])):
+    if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
         return False
     if any(comp in company for comp in get_filter("company_exclusions", [])):
         return False
@@ -1148,6 +1186,10 @@ def log_to_sheets_crm(payload, max_retries=3):
         delay *= 2.0
     send_health_alert(f"Failed to log payload to Google Sheets after {max_retries} attempts.")
     return False
+
+def dispatch_crm_update_async(payload):
+    """Fire-and-forget CRM webhook POST on a daemon thread so Apps Script network latency never blocks Telegram UX."""
+    threading.Thread(target=log_to_sheets_crm, args=(payload,), daemon=True).start()
 
 def fetch_networking_cards(target_code="CW", qty=2):
     if not CRM_WEBHOOK_URL:
@@ -1672,7 +1714,29 @@ def process_webhook_payload_async(data):
 
         # 7. Telemetry & Utility Commands (/s, /health, /efficiency)
         if text == "/s":
-            send_telegram_message(chat_id, "📊 <b>Overdue Status:</b> 0 overdue follow-ups across all tabs.")
+            cw_cards = fetch_networking_cards("CW", qty=5)
+            tc_cards = fetch_networking_cards("TC", qty=5)
+            today_date = datetime.now().date()
+            overdue = []
+            for c in (cw_cards + tc_cards):
+                try:
+                    nf_date = datetime.strptime(str(c.get("next_followup")), "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                if nf_date <= today_date:
+                    overdue.append({**c, "days_overdue": (today_date - nf_date).days})
+            overdue.sort(key=lambda x: x["days_overdue"], reverse=True)
+
+            if not overdue:
+                send_telegram_message(chat_id, "📊 <b>Overdue Pipeline:</b> 0 contacts require immediate action. All caught up!")
+                return
+
+            lines = [f"📊 <b>Overdue Pipeline:</b> {len(overdue)} contacts require immediate action.\n"]
+            for item in overdue[:3]:
+                comp = html.escape(str(item.get("company") or "N/A"))
+                name = html.escape(str(item.get("name") or "N/A"))
+                lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
+            send_telegram_message(chat_id, "\n".join(lines))
             return
         if text == "/health":
             send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite WAL persistent | Webhooks Active")
@@ -1732,7 +1796,7 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, update_res)
                 return
 
-        # 9. Swipe-Reply CRM Actions (/f, /n, /pivot, /tw, /cw, /cc, /tc, /x) - require reply context
+        # 9. Swipe-Reply CRM Actions (/f, /n, /pivot, /tw, /cw, /cc, /tc, /x, /e) - require reply context
         if text.startswith("/f ") or text == "/f":
             mapping = resolve_reply_mapping(msg, chat_id, "/f")
             if not mapping:
@@ -1740,9 +1804,10 @@ def process_webhook_payload_async(data):
             parts = text.split()
             days = safe_int(parts[1], 7) if len(parts) > 1 else 7
             next_followup = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-            log_to_sheets_crm(build_crm_payload("update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup))
             label = html.escape(mapping.get("contact_company") or mapping.get("contact_name") or "record")
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"📅 Follow-up for {label} snoozed to {next_followup}.")
+            dispatch_crm_update_async(build_crm_payload("update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup))
             return
 
         if text.startswith("/n "):
@@ -1754,9 +1819,45 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             timestamped_note = f"[{today_str}] {html.escape(note_str)}"
-            log_to_sheets_crm(build_crm_payload("append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note))
-            log_daily_activity("notes_logged")
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"📝 Note logged: <code>{timestamped_note}</code>")
+            dispatch_crm_update_async(build_crm_payload("append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note))
+            log_daily_activity("notes_logged")
+            return
+
+        if text.startswith("/e ") or text.startswith("/email "):
+            raw_email = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+            email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+            if not re.match(email_pattern, raw_email):
+                send_telegram_message(chat_id, "❌ Invalid email format. Use: <code>/e name@company.com</code>")
+                return
+            mapping = resolve_reply_mapping(msg, chat_id, "/e")
+            if not mapping:
+                return
+            new_email = raw_email
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            title = job.get("job_title") or "Operations Specialist"
+            is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
+            update_job_target_email(mapping["sheet_uuid"], new_email)
+
+            ok, gmail_msg, draft_id = create_gmail_draft(to_email=new_email, company_name=comp, job_title=title, is_warm=is_warm)
+            raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
+            monospaced_body = format_email_block(raw_email_text)
+            draft_link_line = ""
+            if draft_id:
+                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
+                draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
+            confirm_msg = (
+                f"🎯 <b>Apollo Email Locked:</b> <code>{html.escape(new_email)}</code>\n\n"
+                f"{draft_link_line}"
+                f"<b>Tap-to-Copy Email Body:</b>\n{monospaced_body}"
+            )
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            send_telegram_message(chat_id, confirm_msg)
+            if ok:
+                log_daily_activity("drafts_staged")
+            dispatch_crm_update_async(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
             return
 
         if text == "/prep":
@@ -1807,8 +1908,9 @@ def process_webhook_payload_async(data):
                 # Archive to the pipeline-appropriate tab: Carmen leads -> Killed, Tetiana leads -> Died
                 source_tab = mapping.get("sheet_tab") or ""
                 new_tab = "Killed" if source_tab in ("Carmen Warm", "Carmen Cold") else "Died"
-                log_to_sheets_crm(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+                # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
                 send_telegram_message(chat_id, f"⚡ ❌ Archived lead to {new_tab}.")
+                dispatch_crm_update_async(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
                 return
 
             new_tab_map = {
@@ -1818,7 +1920,6 @@ def process_webhook_payload_async(data):
                 "/tc": "Tetiana Cold"
             }
             new_tab = new_tab_map[text]
-            log_to_sheets_crm(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
 
             confirm_map = {
                 "/tw": "🔄 Moved lead to Carmen Warm.",
@@ -1826,7 +1927,9 @@ def process_webhook_payload_async(data):
                 "/cc": "🔄 Logged lead to Tetiana Cold.",
                 "/tc": "🔄 Logged lead to Tetiana Cold."
             }
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"⚡ {confirm_map[text]}")
+            dispatch_crm_update_async(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
     except Exception as e:
