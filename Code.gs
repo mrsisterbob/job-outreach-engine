@@ -1,6 +1,7 @@
 /**
  * PRODUCTION CRM & JOB SEARCH BACKEND
  * 10-Column Schemas (incl. Column J UUID key) | Lock Synchronization | Bottom-Up Deletion
+ * Auto-Formatting Engine: frozen/styled headers, zebra striping, hidden UUID column, conditional formatting
  */
 
 const SCHEMAS = {
@@ -17,11 +18,45 @@ const TAB_MAP = {
   "Killed": "PEOPLE"
 };
 
+// Named-object field aliasing for add_row (Column order = SCHEMAS[type], minus Sheet UUID)
+const FIELD_ALIASES = {
+  JOBS: {
+    "Date Added": ["date_added", "first_contact", "last_contact"],
+    "Company": ["company", "employer_name"],
+    "Role": ["role", "job_title", "title"],
+    "Contact Email": ["contact_email", "email", "target_email"],
+    "Fit Score": ["fit_score", "score"],
+    "Status": ["status"],
+    "Next Followup Date": ["next_followup", "next_followup_date"],
+    "Job Link": ["job_link", "job_apply_link", "link"],
+    "Notes": ["notes", "note", "reason"]
+  },
+  PEOPLE: {
+    "Last Contact Date": ["last_contact", "date_added", "first_contact"],
+    "Contact Name": ["name", "contact_name"],
+    "Company / Org": ["company", "company_org"],
+    "Contact Email": ["email", "contact_email"],
+    "Context / Priority": ["priority", "context"],
+    "Status": ["status"],
+    "Next Followup Date": ["next_followup", "next_followup_date"],
+    "LinkedIn / Source": ["source", "linkedin"],
+    "Notes": ["note", "notes"]
+  }
+};
+
 const ALL_TABS = Object.keys(TAB_MAP);
 const UUID_COL = 10;    // Column J - the only field ever used to identify/move/delete a row
 const NOTES_COL = 9;
 const FOLLOWUP_COL = 7;
 const LOCK_TIMEOUT_MS = 30000; // 30s concurrency lock, matches main.py's DB_WRITE_LOCK_TIMEOUT
+
+// Formatting constants
+const HEADER_BG = "#1B2A4A";
+const HEADER_FG = "#FFFFFF";
+const OVERDUE_BG = "#FCE8E6";
+const HIGH_FIT_BG = "#E6F4EA";
+const HEADER_ROW_HEIGHT = 35;
+const FORMAT_BUFFER_ROWS = 1000; // ensures banding/conditional formatting cover future appended rows
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -35,14 +70,17 @@ function doPost(e) {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
 
     // 1. Job Pipeline Row Log (main.py: build_crm_payload("add_row", ...))
+    // Accepts payload.row_data as either a structured array or a named object
     if (action === "add_row") {
       const targetTab = payload.target_code === "CW" ? "Carmen Warm" :
                         payload.target_code === "TC" ? "Tetiana Cold" : "Tetiana Cold";
       const sheet = getOrCreateSheet(ss, targetTab);
-      const rowData = payload.row_data || [];
-      sheet.appendRow(rowData);
-      // Column J always holds the UUIDv4 row key, independent of row_data length/content
-      sheet.getRange(sheet.getLastRow(), UUID_COL).setValue(payload.sheet_uuid || "");
+      const schemaType = TAB_MAP[targetTab] || "JOBS";
+      const rowData = normalizeRowData(payload.row_data, schemaType);
+      const newRow = sheet.getLastRow() + 1;
+      sheet.getRange(newRow, 1, 1, rowData.length).setValues([rowData]); // Columns A-I only
+      sheet.getRange(newRow, UUID_COL).setValue(payload.sheet_uuid || ""); // Column J reserved for UUID
+      formatSheet(sheet);
       return respondJSON({ status: "success", message: "Row appended successfully", sheet_uuid: payload.sheet_uuid || "" });
     }
 
@@ -62,15 +100,17 @@ function doPost(e) {
         payload.source || "Telegram /quick",
         payload.note || ""
       ];
-      sheet.appendRow(rowData);
-      sheet.getRange(sheet.getLastRow(), UUID_COL).setValue(payload.sheet_uuid || "");
+      const newRow = sheet.getLastRow() + 1;
+      sheet.getRange(newRow, 1, 1, rowData.length).setValues([rowData]); // Columns A-I only
+      sheet.getRange(newRow, UUID_COL).setValue(payload.sheet_uuid || ""); // Column J reserved for UUID
+      formatSheet(sheet);
       return respondJSON({ status: "success", message: "Contact created successfully", sheet_uuid: payload.sheet_uuid || "" });
     }
 
     // 3. Swipe-Reply Tab Move (/tw, /cw, /cc, /tc, /x -> build_crm_payload("update_status", ...))
     if (action === "update_status") {
       const sheetUuid = payload.sheet_uuid;
-      const newTab = payload.new_tab;
+      let newTab = payload.new_tab;
       if (!sheetUuid || !newTab) {
         return respondJSON({ status: "error", message: "update_status requires sheet_uuid and new_tab" });
       }
@@ -78,10 +118,16 @@ function doPost(e) {
       if (!found) {
         return respondJSON({ status: "error", message: `No record found for sheet_uuid ${sheetUuid}` });
       }
+      // Resolve ambiguous "kill" targets to the schema-correct archive tab: Died (JOBS) vs Killed (PEOPLE)
+      if (newTab === "Died / Killed" || newTab === "Died/Killed" || newTab === "Dead") {
+        const sourceSchemaType = TAB_MAP[found.sheet.getName()] || "JOBS";
+        newTab = sourceSchemaType === "PEOPLE" ? "Killed" : "Died";
+      }
       const rowValues = found.sheet.getRange(found.rowNum, 1, 1, found.sheet.getLastColumn()).getValues()[0];
       const targetSheet = getOrCreateSheet(ss, newTab);
       targetSheet.appendRow(rowValues);
       found.sheet.deleteRow(found.rowNum);
+      formatSheet(targetSheet);
       return respondJSON({ status: "success", message: `Moved record ${sheetUuid} to ${newTab}` });
     }
 
@@ -112,8 +158,8 @@ function doPost(e) {
         return respondJSON({ status: "error", message: `No record found for sheet_uuid ${sheetUuid}` });
       }
       const currentNote = found.sheet.getRange(found.rowNum, NOTES_COL).getValue();
-      // main.py already stamps the note with [YYYY-MM-DD] before sending - just append it
-      const updatedNote = currentNote ? `${currentNote}\n${newNote}` : newNote;
+      const stampedNote = ensureTimestampedNote(newNote);
+      const updatedNote = currentNote ? `${currentNote}\n${stampedNote}` : stampedNote;
       found.sheet.getRange(found.rowNum, NOTES_COL).setValue(updatedNote);
       return respondJSON({ status: "success", message: "Note appended" });
     }
@@ -285,13 +331,45 @@ function findRecordBySheetUuid(ss, sheetUuid) {
   return null;
 }
 
+// Normalizes add_row's payload.row_data (array OR named object) into a fixed-length
+// Column A-I array; Column J (Sheet UUID) is always set separately by the caller.
+function normalizeRowData(rowInput, schemaType) {
+  const schema = SCHEMAS[schemaType];
+  const fieldCount = schema.length - 1;
+
+  if (Array.isArray(rowInput)) {
+    const out = rowInput.slice(0, fieldCount);
+    while (out.length < fieldCount) out.push("");
+    return out;
+  }
+
+  if (rowInput && typeof rowInput === "object") {
+    const aliasMap = FIELD_ALIASES[schemaType];
+    return schema.slice(0, fieldCount).map(colName => {
+      const aliases = aliasMap[colName] || [];
+      for (const key of aliases) {
+        if (rowInput[key] !== undefined && rowInput[key] !== null && rowInput[key] !== "") {
+          return rowInput[key];
+        }
+      }
+      return "";
+    });
+  }
+
+  return new Array(fieldCount).fill("");
+}
+
+function ensureTimestampedNote(note) {
+  return /^\[\d{4}-\d{2}-\d{2}\]/.test(note) ? note : `[${getTodayStr()}] ${note}`;
+}
+
 function getOrCreateSheet(ss, name) {
   let sheet = ss.getSheetByName(name);
   if (!sheet) {
     sheet = ss.insertSheet(name);
     const schemaType = TAB_MAP[name] || "JOBS";
     sheet.appendRow(SCHEMAS[schemaType]);
-    sheet.getRange(1, 1, 1, SCHEMAS[schemaType].length).setFontWeight("bold");
+    formatSheet(sheet);
   }
   return sheet;
 }
@@ -304,6 +382,64 @@ function getSystemConfigSheet(ss) {
     sheet.getRange(1, 1, 1, 2).setFontWeight("bold");
   }
   return sheet;
+}
+
+// Beautification & Formatting Engine
+
+// Re-applies full styling to every CRM tab; safe to run repeatedly (bindings/rules are reset, not stacked)
+function formatAllSheets() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ALL_TABS.forEach(tabName => {
+    const sheet = ss.getSheetByName(tabName);
+    if (sheet) formatSheet(sheet);
+  });
+}
+
+// Applies frozen/styled header, body font, zebra striping, hidden UUID column, and conditional formatting
+function formatSheet(sheet) {
+  const schemaType = TAB_MAP[sheet.getName()];
+  if (!schemaType) return; // skip non-CRM tabs (e.g. System_Config)
+  const numCols = SCHEMAS[schemaType].length;
+  const maxRows = Math.max(sheet.getMaxRows(), FORMAT_BUFFER_ROWS);
+
+  const headerRange = sheet.getRange(1, 1, 1, numCols);
+  headerRange.setBackground(HEADER_BG)
+    .setFontColor(HEADER_FG)
+    .setFontWeight("bold")
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle");
+  sheet.setRowHeight(1, HEADER_ROW_HEIGHT);
+  sheet.setFrozenRows(1);
+
+  sheet.getRange(2, 1, maxRows - 1, numCols)
+    .setFontFamily("Arial")
+    .setFontSize(9)
+    .setVerticalAlignment("middle");
+
+  sheet.hideColumns(UUID_COL);
+
+  // Zebra striping (Light Grey) - clear existing bandings first to avoid duplicate-banding errors
+  sheet.getBandings().forEach(b => b.remove());
+  sheet.getRange(2, 1, maxRows - 1, numCols)
+    .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
+
+  applyConditionalFormatting(sheet, maxRows, numCols);
+}
+
+// Soft Red for overdue Next Followup Date (Col G), Soft Green for Fit Score >= 80 (Col E)
+function applyConditionalFormatting(sheet, maxRows, numCols) {
+  const range = sheet.getRange(2, 1, maxRows - 1, numCols);
+  const overdueRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied('=AND(ISDATE(G2), G2<TODAY(), G2<>"")')
+    .setBackground(OVERDUE_BG)
+    .setRanges([range])
+    .build();
+  const highFitRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied('=AND(ISNUMBER(E2), E2>=80)')
+    .setBackground(HIGH_FIT_BG)
+    .setRanges([range])
+    .build();
+  sheet.setConditionalFormatRules([overdueRule, highFitRule]);
 }
 
 function respondJSON(obj) {
