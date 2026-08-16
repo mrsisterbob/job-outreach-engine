@@ -2143,11 +2143,11 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
 # ==============================================================================
 def fetch_single_query_jobs(query_args):
     """Worker function for parallel JSearch API query execution.
-    Fetches up to 3 pages sequentially per query for 3x candidate volume; stops early on empty page or 429.
+    Fetches up to 5 pages sequentially per query (~400 raw listings/batch); stops early on empty page or 429.
     """
     query, api_url, headers = query_args
     all_jobs = []
-    for page in range(1, 4):
+    for page in range(1, 6):
         params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
         try:
             res = requests.get(api_url, headers=headers, params=params, timeout=10)
@@ -2280,14 +2280,17 @@ def run_job_pipeline(chat_id=None, top_n=2):
     """
     logging.info(">>> Starting Job Search Pipeline...")
     if chat_id:
-        send_status_update(chat_id, "Stage 1: Fetching raw listings from JSearch (3 pages/query) in parallel...")
-    
+        send_status_update(chat_id, "Stage 1: Fetching raw listings from JSearch (5 pages/query, ~400/batch) in parallel...")
+
     seen_hashes = set()
     candidate_pool = []
+    raw_discovered_count = 0
     today_str = datetime.now().strftime("%Y-%m-%d")
     followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
 
     def _add_candidate(job):
+        nonlocal raw_discovered_count
+        raw_discovered_count += 1
         company = job.get("employer_name") or ""
         title = job.get("job_title") or ""
         job_hash = generate_dedup_hash(company, title)
@@ -2306,7 +2309,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
         if passes_strict_filter(job):
             candidate_pool.append(job)
     
-    # Stage 1: Parallel JSearch fetching (3 pages/query) + strict filtering
+    # Stage 1: Parallel JSearch fetching (5 pages/query, ~400 listings/batch) + strict filtering
     rapidapi_key = os.environ.get("RAPIDAPI_KEY")
     openweb_key = os.environ.get("OPENWEBNINJA_KEY")
     if rapidapi_key:
@@ -2333,9 +2336,14 @@ def run_job_pipeline(chat_id=None, top_n=2):
         for job in fetch_ats_jobs(ats_slugs):
             _add_candidate(job)
     
-    logging.info(f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.")
+    logging.info(f"Stage 1 Complete: {raw_discovered_count} raw listings pulled, {len(candidate_pool)} candidates passed strict filter.")
     if chat_id:
-        send_status_update(chat_id, f"Stage 1 Complete: {len(candidate_pool)} candidates passed strict filter.\nStage 2: Running AI evaluations (uncapped, Tier-1 capacity)...")
+        send_status_update(
+            chat_id,
+            f"📊 <b>Batch Ingested:</b> {raw_discovered_count} raw listings pulled.\n"
+            f"🎯 <b>Filtered:</b> {len(candidate_pool)} passed strict criteria.\n"
+            f"🧠 <b>Stage 2:</b> Running Gemini AI scoring & Hope Alumni cross-referencing..."
+        )
     
     # Stage 2: Evaluate ALL strict-filtered candidates concurrently (uncapped Tier-1 capacity)
     eval_candidates = candidate_pool
@@ -2921,6 +2929,14 @@ def process_webhook_payload_async(data):
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"❌ Archived to {new_tab}.")
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+            return
+
+        # Muscle Memory Safety Net: catches old finger-memory taps of retired swipe commands
+        if text in ["/tw", "/cw", "/tc", "/cc", "/conv", "/int", "/pivot"]:
+            send_telegram_message(
+                chat_id,
+                f"⚠️ <code>{html.escape(text)}</code> has been retired. Use <code>/warm</code>, <code>/cold</code>, or <code>/apply</code> instead."
+            )
             return
 
         # 10. Catch-All Fallback: unrecognized slash commands get a formatted help menu instead of silence
