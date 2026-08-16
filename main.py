@@ -2570,12 +2570,12 @@ def process_webhook_payload_async(data):
             cards = fetch_networking_cards(target_code, qty)
             if not cards:
                 if loading_msg_id:
-                    edit_telegram_message(chat_id, loading_msg_id, "❌ <b>No active cards found or CRM timed out.</b>")
+                    edit_telegram_message(chat_id, loading_msg_id, "❌ <b>No active records found.</b>")
                 else:
                     send_telegram_message(chat_id, f"No active networking cards found for <code>/{cmd_type}</code>.")
                 return
             if loading_msg_id:
-                edit_telegram_message(chat_id, loading_msg_id, f"✅ <b>{len(cards)} card(s) found</b> - sending details below.")
+                edit_telegram_message(chat_id, loading_msg_id, "✅ <b>Data retrieved.</b>")
             for c in cards:
                 is_warm = (cmd_type in ["c", "cw"])
                 draft_text = generate_warm_email(c.get("note", "")) if is_warm else generate_cold_email(c.get("title", "Operations Specialist"), c.get("company", "Target Firm"))
@@ -2605,12 +2605,12 @@ def process_webhook_payload_async(data):
                     contacts = []
             if not contacts:
                 if loading_msg_id:
-                    edit_telegram_message(chat_id, loading_msg_id, "❌ <b>No active cards found or CRM timed out.</b>")
+                    edit_telegram_message(chat_id, loading_msg_id, "❌ <b>No active records found.</b>")
                 else:
                     send_telegram_message(chat_id, f"No active contacts found at Priority Tier {priority_lvl}.")
                 return
             if loading_msg_id:
-                edit_telegram_message(chat_id, loading_msg_id, f"✅ <b>{len(contacts)} contact(s) found</b> - compiling summary...")
+                edit_telegram_message(chat_id, loading_msg_id, "✅ <b>Data retrieved.</b>")
             out_msg = f"📌 <b>PRIORITY {priority_lvl} CONTACTS ({len(contacts)} Total)</b>\n\n"
             for idx, c in enumerate(contacts, 1):
                 out_msg += f"{idx}. <b>{c.get('name')}</b> | {c.get('company')}\n"
@@ -3010,17 +3010,20 @@ def process_webhook_payload_async(data):
             if text in ("/conv", "/int"):
                 source_tab = mapping.get("sheet_tab") or ""
                 conv_tab_map = {"Tetiana Cold": "Tetiana Warm", "Carmen Cold": "Carmen Warm"}
+                already_warm = source_tab in ("Tetiana Warm", "Carmen Warm")
                 new_tab = conv_tab_map.get(source_tab)
-                if not new_tab:
+                if not new_tab and not already_warm:
                     send_telegram_message(chat_id, f"⚠️ <code>{text}</code> requires a reply to a Tetiana Cold or Carmen Cold card (current tab: {html.escape(source_tab) or 'Unknown'}).")
                     return
                 label = html.escape(mapping.get("contact_company") or mapping.get("contact_name") or "record")
-                enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+                if new_tab:
+                    enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+                tab_suffix = f" - moved to {new_tab}" if new_tab else ""  # already warm: leave the tab as-is
                 if text == "/conv":
-                    send_telegram_message(chat_id, f"💬 Good conversation logged for {label} - moved to {new_tab}.")
+                    send_telegram_message(chat_id, f"💬 Good conversation logged for {label}{tab_suffix}.")
                 else:
                     interview_note = f"[{today_str}] [Interview Scheduled]"
-                    send_telegram_message(chat_id, f"🎉 Interview Scheduled for {label} - moved to {new_tab}.")
+                    send_telegram_message(chat_id, f"🎉 Interview Scheduled for {label}{tab_suffix}.")
                     log_metric_event("interview_set", sheet_uuid)
                     enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=sheet_uuid, note=interview_note))
                 return
@@ -3055,11 +3058,32 @@ def process_webhook_payload_async(data):
 
         # 10. Catch-All Fallback: unrecognized slash commands get a formatted help menu instead of silence
         if text.startswith("/"):
-            valid_commands = (
-                "/t, /c, /cw, /cc, /p, /quick, /search, /health, /efficiency, "
-                "/f, /n, /pivot, /draft, /conv, /int, /tw, /tc, /x"
+            send_telegram_message(
+                chat_id,
+                "⚠️ <b>Command Unrecognized</b>\n\n"
+                "<b>CORE COMMANDS:</b>\n"
+                "/t - Pull fresh job cards\n"
+                "/search - View or update live search filters\n"
+                "/quick - Create contact (Name @ Firm Priority Note)\n\n"
+                "<b>PULL CRM DATA:</b>\n"
+                "/c - Pull combined networking cards\n"
+                "/cw - Pull Warm Rolodex cards\n"
+                "/cc - Pull Cold VP Sprint cards\n"
+                "/p - Query priority tier contacts\n\n"
+                "<b>SWIPE-REPLY ACTIONS:</b>\n"
+                "/draft - Generate Gmail draft\n"
+                "/conv - Mark as Good Conversation\n"
+                "/int - Mark as Interview Scheduled\n"
+                "/tw - Move lead to Warm tab\n"
+                "/tc - Move lead to Cold tab\n"
+                "/x - Archive record to Killed tab\n"
+                "/f - Set followup gap in days\n"
+                "/n - Append timestamped note\n"
+                "/pivot - Archive lead and get new Apollo link\n\n"
+                "<b>TELEMETRY:</b>\n"
+                "/health - View system telemetry and status\n"
+                "/efficiency - View Input to Interview Golden Ratio"
             )
-            send_telegram_message(chat_id, f"⚠️ Command unrecognized.\n\n<b>Valid commands:</b>\n<code>{valid_commands}</code>")
             return
 
     except Exception as e:
