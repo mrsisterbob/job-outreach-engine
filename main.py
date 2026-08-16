@@ -694,6 +694,18 @@ def resolve_reply_mapping(msg, chat_id, command_label):
         return None
     return mapping
 
+def resolve_smart_target_tab(source_tab, direction):
+    """Smart auto-routing for /warm, /cold, /x: Carmen-family tabs stay in the Carmen pipeline;
+    Tetiana-family tabs (and "Pipeline_Candidates", the pre-CRM staging tab for fresh job cards)
+    stay in the Tetiana pipeline. direction is "warm", "cold", or "kill".
+    """
+    is_carmen = str(source_tab or "").startswith("Carmen")
+    if direction == "kill":
+        return "Killed" if is_carmen else "Died"
+    if direction == "warm":
+        return "Carmen Warm" if is_carmen else "Tetiana Warm"
+    return "Carmen Cold" if is_carmen else "Tetiana Cold"
+
 # ==============================================================================
 # 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE
 # ==============================================================================
@@ -1998,23 +2010,7 @@ def fetch_networking_cards(target_code="CW", qty=2):
         logging.error(f"Error fetching networking cards: {e}")
     return []
 
-def answer_callback_query(callback_query_id, text=None, show_alert=False):
-    """Answer a callback query directly (clears the loading spinner) without sending a new chat message."""
-    if not (TELEGRAM_BOT_TOKEN and callback_query_id):
-        return
-    payload = {"callback_query_id": callback_query_id, "show_alert": show_alert}
-    if text:
-        payload["text"] = text
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-            json=payload,
-            timeout=3
-        )
-    except Exception as e:
-        logging.error(f"answerCallbackQuery error: {e}")
-
-def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
+def edit_telegram_message(chat_id, message_id, text):
     """Edit an existing Telegram message in-place instead of sending a redundant new one."""
     if not (TELEGRAM_BOT_TOKEN and chat_id and message_id):
         return False
@@ -2026,8 +2022,6 @@ def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
     try:
         res = requests.post(url, json=payload, timeout=5)
         return res.status_code == 200
@@ -2035,17 +2029,13 @@ def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
         logging.error(f"editMessageText error: {e}")
         return False
 
-def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=None):
-    """Send Telegram message. If callback_query_id provided, answer callback immediately (no spinner).
+def send_telegram_message(chat_id, text):
+    """Send a plain-text Telegram message (no inline keyboards - pure text-based swipe-reply CLI).
     Returns the sent message's telegram_message_id, or None on failure.
     """
     if not (TELEGRAM_BOT_TOKEN and chat_id):
         return None
-    
-    # Answer callback immediately to remove loading spinner
-    if callback_query_id:
-        answer_callback_query(callback_query_id)
-    
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -2053,8 +2043,6 @@ def send_telegram_message(chat_id, text, reply_markup=None, callback_query_id=No
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
     try:
         res = requests.post(url, json=payload, timeout=5)
         logging.info(f"Telegram sendMessage response status: {res.status_code} (chat_id={chat_id})")
@@ -2082,7 +2070,7 @@ def get_fit_score_indicator(score):
     return "🔴"
 
 def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line=""):
-    """Send an executive-scannable job card with buttons. Buttons auto-removed on first tap via answerCallbackQuery.
+    """Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
     """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -2121,30 +2109,17 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
         f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note_safe) if linkedin_note_safe else 'N/A'}</code>\n\n"
         f"📄 <b>Tailored ATS Resume Bullets:</b>\n<code>{html.escape(bullets_block)}</code>\n\n"
-        f"⚡ <b>Swipe Actions:</b>\n"
-        f"  <code>draft</code> Gmail Draft   <code>/f &lt;days&gt;</code> Snooze\n"
-        f"  <code>/tw</code>/<code>/cw</code> Warm   <code>/cc</code>/<code>/tc</code> Cold   <code>/x</code> Dead"
+        f"⚡ <b>Swipe Actions (reply to this card):</b>\n"
+        f"  <code>/apply</code> Mark Applied   <code>/draft</code> Gmail Draft\n"
+        f"  <code>/warm</code> Move Warm   <code>/cold</code> Move Cold   <code>/x</code> Dead\n"
+        f"  <code>/f &lt;days&gt;</code> Snooze   <code>/n &lt;note&gt;</code> Log Note"
     )
-    # Buttons are auto-removed on callback via answerCallbackQuery
-    reply_markup = {
-        "inline_keyboard": [
-            [
-                {"text": "✉️ Draft Email", "callback_data": f"approve:{short_id}"},
-                {"text": "✅ Mark Applied", "callback_data": f"apply:{short_id}"}
-            ],
-            [
-                {"text": "🔄 Pivot VP Lead", "callback_data": f"pivot:{short_id}"},
-                {"text": "❌ Mark Dead", "callback_data": f"dead:{short_id}"}
-            ]
-        ]
-    }
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": card_text[:3990],
         "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-        "reply_markup": reply_markup
+        "disable_web_page_preview": True
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
@@ -2465,162 +2440,12 @@ def run_job_pipeline(chat_id=None, top_n=2):
 # 9. ASYNC WORKLOAD PROCESSOR & WEBHOOK CONTROLLER
 # ==============================================================================
 def process_webhook_payload_async(data):
-    """Executes heavy workloads in background worker threads so HTTP return is instant."""
+    """Executes heavy workloads in background worker threads so HTTP return is instant.
+    Pure text-based swipe-reply CLI - no inline keyboards/callback_query handling at all.
+    """
     try:
-        # 1. Interactive Inline Keyboard Callbacks - Execute answerCallbackQuery immediately
-        if "callback_query" in data:
-            cb = data["callback_query"]
-            callback_query_id = cb.get("id")  # For answerCallbackQuery
-            chat_id = cb["message"]["chat"]["id"]
-            cb_data = cb.get("data", "") or ""
-            cb_parts = cb_data.split(":")
-            cb_action = cb_parts[0] if cb_parts and cb_parts[0] else ""
-            cb_arg = cb_parts[1] if len(cb_parts) > 1 and cb_parts[1] else None
-
-            if cb_action == "approve":
-                if not cb_arg:
-                    send_telegram_message(chat_id, "⚠️ Malformed button data. Please re-run /t to regenerate cards.", callback_query_id=callback_query_id)
-                    return
-                short_id = cb_arg
-                message_id = cb["message"].get("message_id")
-                # Mutate the inline keyboard immediately to prevent a double-tap race from staging two drafts
-                edit_telegram_message(
-                    chat_id, message_id,
-                    cb["message"].get("text", ""),
-                    reply_markup={"inline_keyboard": [[{"text": "⏳ Staging Draft...", "callback_data": "noop"}]]}
-                )
-                job = get_job_from_cache(short_id)
-                if job:
-                    target = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
-                    comp = job.get("employer_name", "Target Firm")
-                    title = job.get("job_title", "Operations Specialist")
-                    
-                    # 1. Create clean Gmail draft in background
-                    ok, msg, draft_id = create_gmail_draft(
-                        to_email=target, 
-                        company_name=comp, 
-                        job_title=title, 
-                        is_warm=False
-                    )
-                    
-                    # 2. Build sanitized monospaced body for instant mobile tap-copy
-                    raw_email_text = generate_cold_email(title, comp)
-                    monospaced_body = format_email_block(raw_email_text)
-                    subject_line = f"Operations & Systems Alignment - {title} @ {comp}"
-
-                    if ok:
-                        status_hdr = "✉️ <b>Gmail Draft Created & Ready!</b>"
-                        log_daily_activity("drafts_staged")
-                    else:
-                        status_hdr = f"⚠️ <b>Gmail API Alert ({html.escape(msg)})</b> - Manual Copy Below:"
-
-                    # Deep-link straight into the Gmail mobile web draft when we have an id
-                    draft_link_line = ""
-                    if draft_id:
-                        draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
-                        draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
-
-                    # Send rich Telegram message with autofilled tap-to-copy block
-                    card_response = (
-                        f"{status_hdr}\n"
-                        f"{draft_link_line}"
-                        f"<b>To:</b> <code>{html.escape(target)}</code>\n"
-                        f"<b>Subject:</b> <code>{html.escape(subject_line)}</code>\n\n"
-                        f"<b>Tap-to-Copy Email Body:</b>\n"
-                        f"{monospaced_body}"
-                    )
-                    send_telegram_message(chat_id, card_response, callback_query_id=callback_query_id)
-                else:
-                    send_telegram_message(chat_id, "⚠️ Job cache expired. Please re-run pipeline with /t.", callback_query_id=callback_query_id)
-                return
-            elif cb_action == "apply":
-                if not cb_arg:
-                    answer_callback_query(callback_query_id, "⚠️ Malformed button data.", show_alert=True)
-                    return
-                message_id = cb["message"].get("message_id")
-                original_text = html.escape(cb["message"].get("text", ""))
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                updated_text = f"{original_text}\n\n✅ <b>Applied - {today_str}</b>"
-                edit_telegram_message(chat_id, message_id, updated_text, reply_markup={"inline_keyboard": []})
-                applied_sheet_uuid = get_sheet_uuid_by_short_id(cb_arg)
-                log_metric_event("applied", applied_sheet_uuid)
-                log_daily_activity("applied_count")
-                if applied_sheet_uuid:
-                    # Auto-route: Tetiana Cold (sourced) -> Tetiana Warm (applied/interviewing)
-                    enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=applied_sheet_uuid, new_tab="Tetiana Warm"))
-                answer_callback_query(callback_query_id, "✅ Marked as Applied")
-            elif cb_action == "pivot":
-                if not cb_arg:
-                    answer_callback_query(callback_query_id, "⚠️ Malformed button data.", show_alert=True)
-                    return
-                short_id = cb_arg
-                job = get_job_from_cache(short_id)
-                comp = job.get("employer_name", "Target Firm") if job else "Target Firm"
-                message_id = cb["message"].get("message_id")
-                original_text = html.escape(cb["message"].get("text", ""))
-                apollo_url = html.escape(build_apollo_url(comp), quote=True)
-                updated_text = f"{original_text}\n\n🔄 <b>Pivoted</b> - <a href='{apollo_url}'>Apollo Leads</a>"
-                edit_telegram_message(chat_id, message_id, updated_text)
-                answer_callback_query(callback_query_id, f"🔄 Pivoted for {comp}")
-            elif cb_action == "dead":
-                message_id = cb["message"].get("message_id")
-                original_text = html.escape(cb["message"].get("text", ""))
-                updated_text = f"{original_text}\n\n❌ <b>Archived to Dead</b>"
-                edit_telegram_message(chat_id, message_id, updated_text, reply_markup={"inline_keyboard": []})
-                answer_callback_query(callback_query_id, "❌ Archived to Dead")
-            elif cb_action == "bump":
-                if not cb_arg:
-                    answer_callback_query(callback_query_id, "⚠️ Malformed button data.", show_alert=True)
-                    return
-                contact = get_contact_by_sheet_uuid(cb_arg)
-                if not contact:
-                    answer_callback_query(callback_query_id, "⚠️ Contact not found.", show_alert=True)
-                    return
-                contact_name = contact.get("name") or ""
-                contact_company = contact.get("company") or "Target Firm"
-                to_email = resolve_target_email(contact_company).split(" [")[0]  # strip fallback-warning suffix
-                bump_body = generate_bump_email(contact_name)
-                try:
-                    access_token = get_gmail_access_token()
-                    if access_token:
-                        message = EmailMessage()
-                        message["To"] = to_email
-                        message["From"] = GMAIL_USER
-                        message["Subject"] = f"Following Up - {contact_company}"
-                        message.set_content(bump_body)
-                        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-                        draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
-                        gmail_headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-                        res = requests.post(draft_url, headers=gmail_headers, json={"message": {"raw": raw_message}}, timeout=10)
-                        if res.status_code in [200, 201]:
-                            log_daily_activity("drafts_staged")
-                            answer_callback_query(callback_query_id, f"📨 Bump draft staged for {contact_name or contact_company}")
-                        else:
-                            answer_callback_query(callback_query_id, "⚠️ Gmail draft failed.", show_alert=True)
-                    else:
-                        answer_callback_query(callback_query_id, "⚠️ Gmail auth unavailable.", show_alert=True)
-                except Exception as e:
-                    logging.error(f"Bump Draft Error: {e}")
-                    answer_callback_query(callback_query_id, "❌ Error staging bump draft.", show_alert=True)
-            elif cb_data.startswith("adj_pay_"):
-                delta = cb_data.replace("adj_pay_", "")
-                res = update_filter_param("min_salary", delta)
-                send_telegram_message(chat_id, res, callback_query_id=callback_query_id)
-            elif cb_data == "add_city_novi":
-                res = update_filter_param("valid_cities", "+ novi")
-                send_telegram_message(chat_id, res, callback_query_id=callback_query_id)
-            elif cb_data == "reset_filters":
-                init_db()
-                send_telegram_message(chat_id, "<b>Search filters reset to default parameters.</b>", callback_query_id=callback_query_id)
-            elif cb_data == "noop":
-                # Placeholder button shown while a draft/action is staging - just clear the spinner
-                answer_callback_query(callback_query_id, "⏳ Already in progress...")
-            else:
-                send_telegram_message(chat_id, "⚠️ Unrecognized button action.", callback_query_id=callback_query_id)
-            return
-
         if "message" not in data:
-            logging.info("Webhook payload contained no callback_query or message key - ignored")
+            logging.info("Webhook payload contained no message key - ignored")
             return
 
         msg = data["message"]
@@ -2757,19 +2582,7 @@ def process_webhook_payload_async(data):
                 "<code>ban + sales</code>\n"
                 "<code>city + canton</code>"
             )
-            inline_keyboard = {
-                "inline_keyboard": [
-                    [
-                        {"text": "➕ Pay +$5k", "callback_data": "adj_pay_+5000"},
-                        {"text": "➖ Pay -$5k", "callback_data": "adj_pay_-5000"}
-                    ],
-                    [
-                        {"text": "📍 Add Novi", "callback_data": "add_city_novi"},
-                        {"text": "🔄 Reset Filters", "callback_data": "reset_filters"}
-                    ]
-                ]
-            }
-            send_telegram_message(chat_id, card_text, reply_markup=inline_keyboard)
+            send_telegram_message(chat_id, card_text)
             return
 
         # 7. Telemetry & Utility Commands (/s, /health, /efficiency)
@@ -2792,16 +2605,11 @@ def process_webhook_payload_async(data):
                 return
 
             lines = [f"📊 <b>Overdue Pipeline:</b> {len(overdue)} contacts require immediate action.\n"]
-            bump_buttons = []
             for item in overdue[:3]:
                 comp = html.escape(str(item.get("company") or "N/A"))
                 name = html.escape(str(item.get("name") or "N/A"))
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
-                if item["days_overdue"] >= 5 and item.get("sheet_uuid"):
-                    raw_label = str(item.get("name") or item.get("company") or "Contact")[:20]
-                    bump_buttons.append([{"text": f"📨 Bump {raw_label}", "callback_data": f"bump:{item['sheet_uuid']}"}])
-            reply_markup = {"inline_keyboard": bump_buttons} if bump_buttons else None
-            send_telegram_message(chat_id, "\n".join(lines), reply_markup=reply_markup)
+            send_telegram_message(chat_id, "\n".join(lines))
             return
         if text == "/health":
             send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite WAL persistent | Webhooks Active")
@@ -2902,7 +2710,7 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, update_res)
                 return
 
-        # 9. Swipe-Reply CRM Actions (/f, /n, /pivot, /tw, /cw, /cc, /tc, /x, /e) - require reply context
+        # 9. Swipe-Reply CRM Actions (/f, /n, /apply, /warm, /cold, /x, /e) - require reply context
         if text.startswith("/f ") or text == "/f":
             mapping = resolve_reply_mapping(msg, chat_id, "/f")
             if not mapping:
@@ -2910,9 +2718,8 @@ def process_webhook_payload_async(data):
             parts = text.split()
             days = safe_int(parts[1], 7) if len(parts) > 1 else 7
             next_followup = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-            label = html.escape(mapping.get("contact_company") or mapping.get("contact_name") or "record")
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-            send_telegram_message(chat_id, f"📅 Follow-up for {label} snoozed to {next_followup}.")
+            send_telegram_message(chat_id, f"📅 Follow-up snoozed to {next_followup}.")
             enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup))
             return
 
@@ -2925,8 +2732,8 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             timestamped_note = f"[{today_str}] {html.escape(note_str)}"
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-            send_telegram_message(chat_id, f"📝 Note logged: <code>{timestamped_note}</code>")
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background - Code.gs auto-timestamps if this ever changes
+            send_telegram_message(chat_id, "📝 Note logged.")
             enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note))
             log_daily_activity("notes_logged")
             return
@@ -3075,63 +2882,44 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, f"❌ Resume Compilation Error: <code>{html.escape(str(e))}</code>")
             return
 
-        if text in ["/pivot", "/tw", "/cw", "/cc", "/tc", "/x", "/conv", "/int"]:
+        if text == "/apply":
+            mapping = resolve_reply_mapping(msg, chat_id, "/apply")
+            if not mapping:
+                return
+            sheet_uuid = mapping["sheet_uuid"]
+            applied_date = datetime.now().strftime("%Y-%m-%d")
+            reply_card = msg.get("reply_to_message") or {}
+            if reply_card.get("message_id"):
+                original_text = html.escape(reply_card.get("text", ""))
+                edit_telegram_message(chat_id, reply_card["message_id"], f"{original_text}\n\n✅ <b>Applied - {applied_date}</b>")
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            send_telegram_message(chat_id, f"✅ Applied - {applied_date}")
+            log_metric_event("applied", sheet_uuid)
+            log_daily_activity("applied_count")
+            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Tetiana Warm"))
+            return
+
+        if text in ("/warm", "/cold"):
             mapping = resolve_reply_mapping(msg, chat_id, text)
             if not mapping:
                 return
             sheet_uuid = mapping["sheet_uuid"]
-
-            if text == "/pivot":
-                comp = mapping.get("contact_company") or "Target Firm"
-                send_telegram_message(chat_id, f"🔄 Lead pivoted for {html.escape(comp)}.\nApollo: {html.escape(build_apollo_url(comp), quote=True)}")
-                return
-
-            if text in ("/conv", "/int"):
-                source_tab = mapping.get("sheet_tab") or ""
-                conv_tab_map = {"Tetiana Cold": "Tetiana Warm", "Carmen Cold": "Carmen Warm"}
-                already_warm = source_tab in ("Tetiana Warm", "Carmen Warm")
-                new_tab = conv_tab_map.get(source_tab)
-                if not new_tab and not already_warm:
-                    send_telegram_message(chat_id, f"⚠️ <code>{text}</code> requires a reply to a Tetiana Cold or Carmen Cold card (current tab: {html.escape(source_tab) or 'Unknown'}).")
-                    return
-                label = html.escape(mapping.get("contact_company") or mapping.get("contact_name") or "record")
-                if new_tab:
-                    enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
-                tab_suffix = f" - moved to {new_tab}" if new_tab else ""  # already warm: leave the tab as-is
-                if text == "/conv":
-                    send_telegram_message(chat_id, f"💬 Good conversation logged for {label}{tab_suffix}.")
-                else:
-                    interview_note = f"[{today_str}] [Interview Scheduled]"
-                    send_telegram_message(chat_id, f"🎉 Interview Scheduled for {label}{tab_suffix}.")
-                    log_metric_event("interview_set", sheet_uuid)
-                    enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=sheet_uuid, note=interview_note))
-                return
-
-            if text == "/x":
-                # Archive to the pipeline-appropriate tab: Carmen leads -> Killed, Tetiana leads -> Died
-                source_tab = mapping.get("sheet_tab") or ""
-                new_tab = "Killed" if source_tab in ("Carmen Warm", "Carmen Cold") else "Died"
-                # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-                send_telegram_message(chat_id, f"⚡ ❌ Archived lead to {new_tab}.")
-                enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
-                return
-
-            new_tab_map = {
-                "/tw": "Carmen Warm",
-                "/cw": "Carmen Warm",
-                "/cc": "Tetiana Cold",
-                "/tc": "Tetiana Cold"
-            }
-            new_tab = new_tab_map[text]
-
-            confirm_map = {
-                "/tw": "🔄 Moved lead to Carmen Warm.",
-                "/cw": "🔄 Moved lead to Carmen Warm.",
-                "/cc": "🔄 Logged lead to Tetiana Cold.",
-                "/tc": "🔄 Logged lead to Tetiana Cold."
-            }
+            direction = "warm" if text == "/warm" else "cold"
+            new_tab = resolve_smart_target_tab(mapping.get("sheet_tab"), direction)
+            confirm_text = "🔥 Moved to Warm" if direction == "warm" else "🧊 Moved to Cold"
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-            send_telegram_message(chat_id, f"⚡ {confirm_map[text]}")
+            send_telegram_message(chat_id, confirm_text)
+            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+            return
+
+        if text == "/x":
+            mapping = resolve_reply_mapping(msg, chat_id, "/x")
+            if not mapping:
+                return
+            sheet_uuid = mapping["sheet_uuid"]
+            new_tab = resolve_smart_target_tab(mapping.get("sheet_tab"), "kill")
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            send_telegram_message(chat_id, f"❌ Archived to {new_tab}.")
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
@@ -3149,16 +2937,14 @@ def process_webhook_payload_async(data):
                 "/cw - Pull Warm Rolodex cards\n"
                 "/cc - Pull Cold VP Sprint cards\n"
                 "/p - Query priority tier contacts\n\n"
-                "<b>SWIPE-REPLY ACTIONS:</b>\n"
-                "/draft - Generate Gmail draft\n"
-                "/conv - Mark as Good Conversation\n"
-                "/int - Mark as Interview Scheduled\n"
-                "/tw - Move lead to Warm tab\n"
-                "/tc - Move lead to Cold tab\n"
-                "/x - Archive record to Killed tab\n"
-                "/f - Set followup gap in days\n"
+                "<b>SWIPE-REPLY ACTIONS (reply to a card):</b>\n"
+                "/apply - Mark Applied & move to Tetiana Warm\n"
+                "/warm - Smart-route lead to its Warm tab\n"
+                "/cold - Smart-route lead to its Cold tab\n"
+                "/x - Archive lead to Died/Killed tab\n"
                 "/n - Append timestamped note\n"
-                "/pivot - Archive lead and get new Apollo link\n\n"
+                "/f - Snooze follow-up by [days]\n"
+                "/draft - Generate Gmail draft\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio"
@@ -3241,19 +3027,7 @@ def handle_fast_path_command(chat_id, text, msg):
             "<code>ban + sales</code>\n"
             "<code>city + canton</code>"
         )
-        inline_keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "➕ Pay +$5k", "callback_data": "adj_pay_+5000"},
-                    {"text": "➖ Pay -$5k", "callback_data": "adj_pay_-5000"}
-                ],
-                [
-                    {"text": "📍 Add Novi", "callback_data": "add_city_novi"},
-                    {"text": "🔄 Reset Filters", "callback_data": "reset_filters"}
-                ]
-            ]
-        }
-        sent_id = send_telegram_message(chat_id, card_text, reply_markup=inline_keyboard)
+        sent_id = send_telegram_message(chat_id, card_text)
         logging.info(f"/search command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
         return True
 
