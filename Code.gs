@@ -135,7 +135,7 @@ function doPost(e) {
         payload.company || "N/A",
         payload.email || "",
         payload.priority ? `Priority ${payload.priority}` : "Priority 5",
-        "Cold Lead",
+        payload.status || "Cold Lead", // e.g. "Warm Alum" from main.py's JIT Hope Alumni Discovery auto-log
         payload.next_followup || getFollowupStr(14),
         payload.source || "Telegram /quick",
         payload.note || ""
