@@ -236,9 +236,7 @@ function doPost(e) {
       const results = [];
       for (let i = data.length - 1; i >= 1; i--) {
         const row = data[i];
-        const contextPriority = (row[4] || "").toString();
-        const prioMatch = contextPriority.match(/\d+/);
-        const rowPriority = prioMatch ? parseInt(prioMatch[0], 10) : 5;
+        const rowPriority = mapPriorityValue(row[4]);
 
         // JOBS tabs have no contact name (Col B = Company, Col C = Role); PEOPLE tabs have no job title
         const name = schemaType === "JOBS" ? "" : row[1];
@@ -253,7 +251,7 @@ function doPost(e) {
           email: row[3] || "",
           priority: rowPriority,
           note: row[8],
-          next_followup: formatDate(row[6])
+          next_followup: formatFollowupDate(row[6])
         });
       }
       // Overdue Follow-Up Sort: Next Followup Date ASC, Priority DESC
@@ -316,9 +314,7 @@ function doGet(e) {
         const data = sheet.getDataRange().getValues();
         for (let i = 1; i < data.length; i++) {
           const row = data[i];
-          const contextPriority = (row[4] || "").toString();
-          const prioMatch = contextPriority.match(/\d+/);
-          const rowPriority = prioMatch ? parseInt(prioMatch[0], 10) : 5;
+          const rowPriority = mapPriorityValue(row[4]);
 
           if (rowPriority === priorityLevel) {
             results.push({
@@ -329,7 +325,7 @@ function doGet(e) {
               email: row[3],
               priority: rowPriority,
               status: row[5],
-              next_followup: formatDate(row[6]),
+              next_followup: formatFollowupDate(row[6]),
               source: row[7],
               latest_note: row[8]
             });
@@ -590,4 +586,34 @@ function formatDate(val) {
     return Utilities.formatDate(val, Session.getScriptTimeZone(), "yyyy-MM-dd");
   }
   return val || getTodayStr();
+}
+
+// Maps free-text priority values ("High"/"Medium"/"Low") or numeric 1-10 priority scales to a
+// sortable weight; defaults to 5 (Medium) for anything ambiguous instead of NaN'ing comparisons.
+function mapPriorityValue(rawValue) {
+  const str = (rawValue || "").toString().trim();
+  const lower = str.toLowerCase();
+  if (lower.includes("high")) return 8;
+  if (lower.includes("medium")) return 5;
+  if (lower.includes("low")) return 3;
+  const numMatch = str.match(/\d+/);
+  if (numMatch) {
+    const num = parseInt(numMatch[0], 10);
+    if (num >= 1 && num <= 2) return 8;
+    if (num >= 3 && num <= 6) return 5;
+    if (num >= 7 && num <= 10) return 3;
+  }
+  return 5;
+}
+
+// Next Followup Date (Col G) is often blank; coerce to a far-past fallback so `new Date(...)`
+// in the overdue sort never receives NaN from an empty string and crashes .sort().
+function formatFollowupDate(val) {
+  if (val instanceof Date) {
+    return Utilities.formatDate(val, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+  if (!val || val.toString().trim() === "") {
+    return "1970-01-01";
+  }
+  return val;
 }
