@@ -6,7 +6,6 @@ import io
 import json
 import logging
 import os
-import queue
 import re
 import sqlite3
 import threading
@@ -23,6 +22,7 @@ from resume_engine import compile_resume_pdf
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 app = Flask(__name__)
+APP_START_TIME = time.time()
 
 # ==============================================================================
 # 1. ENVIRONMENT VARIABLES & DATABASE INITIALIZATION (WAL MODE)
@@ -57,10 +57,6 @@ try:
 except (TypeError, ValueError):
     EMAIL_MIN_BODY_LENGTH = 50
 EMAIL_LABEL_TARGET_INBOX = os.environ.get("EMAIL_LABEL_TARGET_INBOX", "INBOX")
-
-# Bounded webhook queue + fixed daemon worker pool (backpressure instead of unbounded threads)
-WEBHOOK_QUEUE = queue.Queue(maxsize=100)
-WEBHOOK_WORKER_COUNT = 4
 
 # Mobile Short Key Alias Map
 ALIAS_MAP = {
@@ -690,11 +686,11 @@ def resolve_reply_mapping(msg, chat_id, command_label):
     """
     reply_msg = msg.get("reply_to_message")
     if not reply_msg:
-        send_telegram_message(chat_id, f"⚠️ <code>{html.escape(command_label)}</code> requires a reply context. Please reply to a job/contact card message.")
+        send_telegram_message(chat_id, "⚠️ <b>Context Missing:</b> Please swipe-reply directly to a job card or contact card to use this command.")
         return None
     mapping = get_mapping_from_message_id(reply_msg.get("message_id"))
     if not mapping:
-        send_telegram_message(chat_id, "⚠️ No CRM record found for this card. Please retry with /t or /c to regenerate it.")
+        send_telegram_message(chat_id, f"⚠️ <b>Record Not Found:</b> No CRM record is mapped to this card for <code>{html.escape(command_label)}</code>. Please retry with /t or /c to regenerate it.")
         return None
     return mapping
 
@@ -901,6 +897,60 @@ def build_alumni_dork(company_name, school="Hope College"):
     clean_school = re.sub(r'[^a-zA-Z0-9\s]', '', str(school or '')).strip()
     query = f'site:linkedin.com/in "{clean_comp}" "{clean_school}"'
     return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+
+def resolve_live_alumni_at_company(company_name, school="Hope College"):
+    """JIT alumni resolution: live-queries DuckDuckGo HTML search for a LinkedIn profile at
+    company_name sharing `school` as alma mater, instead of relying on a static spreadsheet.
+    Returns {"name", "company", "linkedin_url", "headline"} for the top matching profile, or None
+    on no-match/timeout/failure.
+    """
+    if not company_name:
+        return None
+    clean_company = re.sub(r'\b(inc|llc|corp|corporation|co|ltd|plc)\b\.?', '', str(company_name), flags=re.IGNORECASE)
+    clean_company = re.sub(r'[.,]', '', clean_company).strip()
+    if not clean_company:
+        return None
+
+    query = f'site:linkedin.com/in "{clean_company}" "{school}"'
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    try:
+        res = requests.get("https://html.duckduckgo.com/html/", params={"q": query}, headers=headers, timeout=8)
+        if res.status_code != 200:
+            return None
+        body = res.text
+
+        link_match = re.search(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', body, re.IGNORECASE | re.DOTALL)
+        if not link_match:
+            return None
+        raw_href, raw_title = link_match.groups()
+
+        # DuckDuckGo HTML wraps result links in a redirect: //duckduckgo.com/l/?uddg=<url-encoded-target>
+        linkedin_url = raw_href
+        if "uddg=" in raw_href:
+            parsed_qs = urllib.parse.parse_qs(urllib.parse.urlparse(raw_href).query)
+            linkedin_url = parsed_qs.get("uddg", [raw_href])[0]
+        if not linkedin_url.startswith("http"):
+            linkedin_url = f"https:{linkedin_url}"
+        if "linkedin.com/in/" not in linkedin_url:
+            return None
+
+        title_text = re.sub(r'<[^>]+>', '', raw_title).strip()
+        parsed_name = re.split(r' - | \| ', title_text)[0].strip() or "Alumnus Contact"
+
+        snippet_match = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', body, re.IGNORECASE | re.DOTALL)
+        snippet_text = re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip() if snippet_match else ""
+
+        return {
+            "name": parsed_name,
+            "company": company_name,
+            "linkedin_url": linkedin_url,
+            "headline": snippet_text[:200]
+        }
+    except Exception as e:
+        logging.warning(f"resolve_live_alumni_at_company failed for '{company_name}': {e}")
+        return None
 
 def discover_ecosystem_network(target_entity: str) -> dict:
     """Queries Gemini to discover ecosystem keywords and probable ATS board slugs for a target entity.
@@ -1373,13 +1423,39 @@ def process_single_candidate(job):
             score = max(1, score + penalty)
             age_badge = f"{age_badge}{ghost_badge}"
 
+        # JIT Hope College Alumni Resolution: live public-search lookup, score boost, auto-log Carmen Warm contact
+        alumni_line = ""
+        alum = resolve_live_alumni_at_company(job.get("employer_name"))
+        if alum:
+            score = min(100, score + 20)
+            alum_url_safe = html.escape(alum["linkedin_url"], quote=True)
+            alumni_line = f"🎓 <b>Hope Alum Connection:</b> <a href='{alum_url_safe}'>{html.escape(alum['name'])}</a> ({html.escape(alum['headline'])})\n"
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            alumni_payload = build_crm_payload(
+                "quick_add",
+                target_code="CW",
+                sheet_uuid=str(uuid.uuid4()),
+                first_contact=today_str,
+                last_contact=today_str,
+                name=alum["name"],
+                company=job.get("employer_name"),
+                priority=8,
+                status="Warm Alum",
+                next_followup=(datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d"),
+                source="JIT Hope Alumni Discovery",
+                note=f"[{today_str}] Auto-discovered via pipeline for {job.get('job_title')}. LinkedIn: {alum['linkedin_url']}"
+            )
+            enqueue_crm_payload(alumni_payload)
+            log_daily_activity("notes_logged")
+
         return {
             "job": job, "score": score, "reason": reason,
             "linkedin_note": linkedin_note, "ats_bullets": ats_bullets,
             "target_email": target_email, "age_badge": age_badge,
             "salary_str": salary_str, "work_style": work_style,
             "overlap_pct": overlap_pct, "matched_skills": matched_skills,
-            "short_id": short_id, "sheet_uuid": sheet_uuid
+            "short_id": short_id, "sheet_uuid": sheet_uuid,
+            "alumni_line": alumni_line
         }
     return None
     # ==============================================================================
@@ -2005,7 +2081,7 @@ def get_fit_score_indicator(score):
         return "🟡"
     return "🔴"
 
-def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None):
+def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line=""):
     """Send an executive-scannable job card with buttons. Buttons auto-removed on first tap via answerCallbackQuery.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
     """
@@ -2024,6 +2100,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     matched_str = (", ".join(matched_skills[:4]).title() if matched_skills else "General Ops")[:150]
     bullets_block = ("\n".join(f"• {b}" for b in ats_bullets) if ats_bullets else "N/A")[:500]
     linkedin_note_safe = str(linkedin_note or "")[:300]
+    alumni_line_safe = str(alumni_line or "")[:400]
     fit_dot = get_fit_score_indicator(score)
     card_text = (
         f"💼 <b>{title}</b>\n"
@@ -2031,7 +2108,8 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"────────────────────\n"
         f"{fit_dot} <b>Fit Score:</b> {score}/100  |  <b>Skill Match:</b> {overlap_pct}%\n"
         f"🕐 <b>Recency:</b> {age_badge}\n"
-        f"💰 <b>Pay &amp; Style:</b> {work_style} | {salary_str}\n\n"
+        f"💰 <b>Pay &amp; Style:</b> {work_style} | {salary_str}\n"
+        f"{alumni_line_safe}\n"
         f"🧩 <b>Matched Skills:</b> <code>{html.escape(matched_str)}</code>\n\n"
         f"<b>Fit Reason:</b> {html.escape(reason_safe)}\n\n"
         f"🔗 <b>Quick Links:</b>\n"
@@ -2317,7 +2395,8 @@ def run_job_pipeline(chat_id=None, top_n=2):
             item["overlap_pct"], item["matched_skills"], item["short_id"],
             sheet_uuid=item.get("sheet_uuid"),
             linkedin_note=item.get("linkedin_note", ""),
-            ats_bullets=item.get("ats_bullets")
+            ats_bullets=item.get("ats_bullets"),
+            alumni_line=item.get("alumni_line", "")
         )
         batch_rows.append({
             "sheet_uuid": item.get("sheet_uuid"),
@@ -3089,23 +3168,6 @@ def process_webhook_payload_async(data):
     except Exception as e:
         logging.error(f"Async Webhook Processing Error: {e}")
 
-def webhook_worker_loop():
-    """Daemon worker: pulls payloads off the bounded queue and processes them serially per-thread."""
-    while True:
-        data = WEBHOOK_QUEUE.get()
-        try:
-            process_webhook_payload_async(data)
-        except Exception as e:
-            logging.error(f"Webhook Worker Error: {e}")
-        finally:
-            WEBHOOK_QUEUE.task_done()
-
-def start_webhook_workers():
-    """Spin up a fixed pool of daemon threads instead of an unbounded thread-per-request model."""
-    for _ in range(WEBHOOK_WORKER_COUNT):
-        threading.Thread(target=webhook_worker_loop, daemon=True).start()
-
-start_webhook_workers()
 start_gmail_poller()
 start_crm_outbox_worker()
 start_morning_digest()
@@ -3132,7 +3194,7 @@ def health_check():
 
 def _run_pipeline_and_notify(chat_id, qty):
     """Background thread target for /t: runs the heavy pipeline off the request thread,
-    independent of the WEBHOOK_QUEUE worker pool, then posts the completion message.
+    in its own isolated daemon thread, then posts the completion message.
     """
     try:
         count = run_job_pipeline(chat_id, top_n=qty)
@@ -3142,14 +3204,21 @@ def _run_pipeline_and_notify(chat_id, qty):
         send_telegram_message(chat_id, f"❌ Pipeline error: {html.escape(str(e)[:200])}")
 
 def handle_fast_path_command(chat_id, text, msg):
-    """Directly executes /t, /search, /health, /draft with a guaranteed synchronous requests.post
-    reply to the Telegram Bot API - bypasses the WEBHOOK_QUEUE worker pool entirely so these
-    core commands always produce a visible response. Returns True if the command was handled.
+    """Directly executes /t, /search, /health, /efficiency, /streak, /daily, /draft with a guaranteed
+    synchronous requests.post reply to the Telegram Bot API - fires immediately instead of waiting on
+    a background thread so these core commands always produce a visible, instant response.
+    Returns True if the command was handled.
     """
     t_match = re.match(r"^/t(?:\s+(\d+))?$", text)
     if t_match:
         qty = safe_int(t_match.group(1), 2)
-        sent_id = send_telegram_message(chat_id, f"🚀 Triggering Job Search Pipeline (Top {qty})...")
+        target_queries = get_filter("target_queries", [])
+        ats_slugs = get_filter("ats_company_slugs", [])
+        sent_id = send_telegram_message(
+            chat_id,
+            f"🚀 <b>Triggering Job Search Pipeline (Top {qty})</b>\n"
+            f"🔍 Scanning {len(target_queries)} target rules & {len(ats_slugs)} ATS boards (with live Hope Alumni resolution)..."
+        )
         logging.info(f"/t command handled directly (chat_id={chat_id}, qty={qty}, ack_message_id={sent_id})")
         threading.Thread(target=_run_pipeline_and_notify, args=(chat_id, qty), daemon=True).start()
         return True
@@ -3189,8 +3258,46 @@ def handle_fast_path_command(chat_id, text, msg):
         return True
 
     if text == "/health":
-        sent_id = send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite WAL persistent | Webhooks Active")
+        db_check_start = time.time()
+        try:
+            with get_db_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode")
+                wal_mode = cursor.fetchone()[0]
+        except Exception as e:
+            wal_mode = f"error: {e}"
+        db_elapsed_ms = round((time.time() - db_check_start) * 1000, 2)
+        uptime_str = str(timedelta(seconds=int(time.time() - APP_START_TIME)))
+        sent_id = send_telegram_message(
+            chat_id,
+            f"🟢 <b>System Health:</b> Operational\n"
+            f"💾 <b>SQLite Mode:</b> {html.escape(str(wal_mode)).upper()} ({db_elapsed_ms}ms)\n"
+            f"⏱️ <b>Uptime:</b> {uptime_str}"
+        )
         logging.info(f"/health command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
+        return True
+
+    if text == "/efficiency":
+        messages_sent = get_metric_count("message_sent")
+        interviews_set = get_metric_count("interview_set")
+        ratio = (interviews_set / messages_sent * 100) if messages_sent > 0 else 0.0
+        sent_id = send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({interviews_set} interviews / {messages_sent} sent)")
+        logging.info(f"/efficiency command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
+        return True
+
+    if text in ("/streak", "/daily"):
+        today_activity = get_daily_activity(datetime.now().strftime("%Y-%m-%d"))
+        lifetime = get_lifetime_activity_totals()
+        streak_days = calculate_active_day_streak()
+        goal_target = 5
+        sent_id = send_telegram_message(
+            chat_id,
+            "🏆 <b>Daily Outreach Scorecard</b>\n\n"
+            f"🎯 <b>Today's Goal:</b> {today_activity['drafts_staged']} / {goal_target} Staged Drafts\n"
+            f"🔥 <b>Current Streak:</b> {streak_days} Active Days\n"
+            f"📊 <b>Lifetime Totals:</b> Staged: {lifetime['drafts_staged']} | Applied: {lifetime['applied_count']} | Notes: {lifetime['notes_logged']}"
+        )
+        logging.info(f"{text} command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
         return True
 
     if text == "/draft":
@@ -3232,9 +3339,10 @@ def handle_fast_path_command(chat_id, text, msg):
 def telegram_webhook():
     """
     Instant non-blocking execution (<0.05s return).
-    Validates Telegram's secret token header. Core commands (/t, /search, /health, /draft) are
-    handled synchronously right here with a guaranteed requests.post reply, independent of the
-    background WEBHOOK_QUEUE worker pool. Everything else still enqueues for async processing.
+    Validates Telegram's secret token header. Core commands (/t, /search, /health, /efficiency,
+    /streak, /daily, /draft) are handled synchronously right here with a guaranteed requests.post
+    reply. Everything else spawns an isolated daemon thread immediately (no bounded queue/worker
+    pool - unbounded thread-per-update, matching the rest of the app's fire-and-forget dispatch pattern).
     """
     webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     if webhook_secret:
@@ -3262,13 +3370,9 @@ def telegram_webhook():
                 if handle_fast_path_command(chat_id, text, msg):
                     return jsonify({"status": "ok"}), 200
             except Exception as e:
-                logging.error(f"Telegram Webhook fast-path error: {e} - falling back to async queue")
+                logging.error(f"Telegram Webhook fast-path error: {e} - falling back to async thread")
 
-        try:
-            WEBHOOK_QUEUE.put_nowait(data)
-        except queue.Full:
-            logging.warning("Webhook Queue Full: dropping payload")
-            return jsonify({"status": "error", "message": "Server busy, queue full"}), 503
+        threading.Thread(target=process_webhook_payload_async, args=(data,), daemon=True).start()
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logging.error(f"Telegram Webhook Dispatch Error: {e}")
