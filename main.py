@@ -17,7 +17,7 @@ from email.message import EmailMessage
 import requests
 from flask import Flask, jsonify, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
-from resume_engine import compile_resume_pdf
+from resume_engine import compile_resume_pdf, filter_ats_bullets
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -49,7 +49,9 @@ _FALLBACK_EVIDENCE_BANK = {
 
 def load_evidence_bank():
     """Loads the centralized fact bank (experience, skills, tone, banned words) used to ground
-    every AI-generated output. Falls back to a minimal stub on any read/parse failure.
+    every AI-generated output. Falls back to a minimal stub on any read/parse failure. Called
+    fresh on every use (no module-level cache) so manual JSON edits go live instantly, without a
+    Flask server restart.
     """
     try:
         with open(EVIDENCE_BANK_PATH, "r", encoding="utf-8") as f:
@@ -58,30 +60,33 @@ def load_evidence_bank():
         logging.error(f"Evidence Bank load failed, using fallback stub: {e}")
         return _FALLBACK_EVIDENCE_BANK
 
-EVIDENCE_BANK = load_evidence_bank()
-
-def build_evidence_context_block():
-    """Renders a compact, prompt-ready summary of the Evidence Bank for injection into every
-    Gemini prompt - the single source of truth for facts, tone, and forbidden language.
+def build_evidence_context_block(mode="eval"):
+    """Renders a compact, prompt-ready summary of the Evidence Bank for injection into Gemini
+    prompts. `mode` trims the token footprint per use case:
+      - "email"/"pitch": experience + technical_skills + voice_and_tone only.
+      - "eval" (default, the main job screener): the above PLUS banned_words, to strictly
+        govern the AI's output where enforcement matters most.
+    Always reloads the bank from disk (hot-reload, see load_evidence_bank()).
     """
-    identity = EVIDENCE_BANK.get("identity", {})
+    evidence_bank = load_evidence_bank()
+    identity = evidence_bank.get("identity", {})
     experience_lines = "\n".join(
         f"- {job.get('title')} at {job.get('company')} ({job.get('start')} - {job.get('end')})"
-        for job in EVIDENCE_BANK.get("experience", [])
+        for job in evidence_bank.get("experience", [])
     )
-    skills_line = ", ".join(EVIDENCE_BANK.get("technical_skills", []))
-    tone = EVIDENCE_BANK.get("voice_and_tone", {})
+    skills_line = ", ".join(evidence_bank.get("technical_skills", []))
+    tone = evidence_bank.get("voice_and_tone", {})
     tone_lines = "\n".join(f"- {g}" for g in tone.get("guidance", []))
-    banned_line = ", ".join(EVIDENCE_BANK.get("banned_words", []))
-    return (
+    block = (
         f"CANDIDATE: {identity.get('name', 'Kevin Miller')} ({identity.get('location', 'Detroit, MI')})\n"
         f"VERIFIED EXPERIENCE:\n{experience_lines}\n"
         f"VERIFIED TECHNICAL SKILLS: {skills_line}\n"
-        f"VOICE & TONE ({tone.get('tone', 'professional, grounded, low-pressure')}):\n{tone_lines}\n"
-        f"BANNED WORDS (never use): {banned_line}"
+        f"VOICE & TONE ({tone.get('tone', 'professional, grounded, low-pressure')}):\n{tone_lines}"
     )
-
-EVIDENCE_CONTEXT_BLOCK = build_evidence_context_block()
+    if mode == "eval":
+        banned_line = ", ".join(evidence_bank.get("banned_words", []))
+        block += f"\nBANNED WORDS (never use): {banned_line}"
+    return block
 
 # Inbound Email Anti-Spam Gatekeeper: 10 pre-filter shield parameters (raw CSV/string env values,
 # parsed lazily in passes_email_prefilter() to avoid depending on helpers defined later in the file)
@@ -762,14 +767,14 @@ def calculate_followup_interval(priority_score):
 
 def sanitize_text(text):
     """Strip corporate fluff/AI clichés while preserving apostrophes, hyphens, and paragraph breaks.
-    Buzzword list is sourced from evidence_bank.json's banned_words so it stays centrally maintained.
+    Buzzword list is hot-reloaded from evidence_bank.json's banned_words on every call.
     """
     if not text:
         return ""
     cleaned = str(text)
     cleaned = re.sub(r'[\u2014\u2013]', "", cleaned)  # em-dash / en-dash only
     cleaned = re.sub(r'[;:]', "", cleaned)
-    buzzwords = EVIDENCE_BANK.get("banned_words", []) or ["leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm"]
+    buzzwords = load_evidence_bank().get("banned_words", []) or ["leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm"]
     for bw in buzzwords:
         cleaned = re.sub(rf'\b{re.escape(bw)}\b', "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\b(\w+),\s*(\w+),\s*and\s*(\w+)\b', r'\1 and \2', cleaned)
@@ -785,9 +790,10 @@ def enforce_sentence_limit(text, max_sentences):
 
 def get_current_role_blurb():
     """Returns (core_exp_phrase, full_sentence) for the most recent Evidence Bank experience entry,
-    so outreach copy never drifts from the same facts the resume renders.
+    so outreach copy never drifts from the same facts the resume renders. Hot-reloads the bank on
+    every call.
     """
-    experience = EVIDENCE_BANK.get("experience", [])
+    experience = load_evidence_bank().get("experience", [])
     if not experience:
         return "wealth ops and process automation", "I am currently working in wealth operations and process automation."
     current = experience[0]
@@ -828,12 +834,17 @@ def format_email_block(email_text):
 # ==============================================================================
 # 4. HELPER FUNCTIONS & PIPELINE UTILITIES
 # ==============================================================================
-SYSTEM_PROMPT = f"""You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
+def build_system_prompt():
+    """Builds the Gemini job-screener system prompt fresh on every call so Evidence Bank edits
+    apply instantly (hot-reload, see build_evidence_context_block()/load_evidence_bank()).
+    """
+    evidence_block = build_evidence_context_block(mode="eval")
+    return f"""You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
 High Priority Skills: Python, SQL, Salesforce, Excel, Schwab SAC, Fidelity Wealthscape, DocuSign, Process Automation.
 Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles, retail bank tellers, CPA tracks, Senior/Lead/Manager roles.
 
 EVIDENCE BANK (the only source of truth for this candidate's real background):
-{EVIDENCE_CONTEXT_BLOCK}
+{evidence_block}
 
 NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. Never invent skills, employers, or experiences not listed there. Strictly follow the VOICE & TONE guidance above and avoid every word in BANNED WORDS. Output must sound like a direct, human communicator - short sentences, no corporate hype.
 
@@ -1320,7 +1331,7 @@ def evaluate_job_with_gemini(job):
         prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{desc_truncated}"
         
         # Call API with timeout handling
-        raw_text = call_gemini_api(prompt, SYSTEM_PROMPT)
+        raw_text = call_gemini_api(prompt, build_system_prompt())
         
         if raw_text:
             try:
@@ -1398,7 +1409,7 @@ def generate_elevator_pitch(company, job_title):
         return sanitize_text(fallback)
     prompt = (
         f"Company: {company or 'N/A'}\nRole: {job_title or 'N/A'}\n\n"
-        f"EVIDENCE BANK (only source of truth for this candidate - never invent facts outside it):\n{EVIDENCE_CONTEXT_BLOCK}\n\n"
+        f"EVIDENCE BANK (only source of truth for this candidate - never invent facts outside it):\n{build_evidence_context_block(mode='pitch')}\n\n"
         "Write a tight 3-sentence conversational 30-second elevator pitch for this candidate, tailored to this company "
         "and role, using ONLY the Evidence Bank above. Avoid all banned words. Sound like a direct human communicator. "
         'Respond ONLY with JSON: {"pitch": "<3-sentence pitch>"}'
@@ -3240,6 +3251,40 @@ def telegram_webhook():
         logging.error(f"Telegram Webhook Dispatch Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 200
 
+def format_ats_plaintext(job, track="a"):
+    """Builds a plain-text ATS-safe fallback block (identity/experience/education/bullets) for the
+    staging portal textarea. Experience/education are dynamically pulled from the hot-reloaded
+    Evidence Bank, and the achievement bullets go through resume_engine's filter_ats_bullets() so
+    this text can never drift from what the compiled Typst PDF actually renders.
+    """
+    evidence = load_evidence_bank()
+    identity = evidence.get("identity", {})
+    lines = [str(identity.get("name", "Kevin Miller"))]
+    contact_bits = [identity.get("email", ""), identity.get("phone", ""), identity.get("location", "")]
+    lines.append(" | ".join(b for b in contact_bits if b))
+    lines.append("")
+
+    lines.append("PROFESSIONAL EXPERIENCE")
+    for job_entry in evidence.get("experience", []):
+        lines.append(f"{job_entry.get('title', '')} | {job_entry.get('company', '')} ({job_entry.get('start', '')} - {job_entry.get('end', '')})")
+        for b in job_entry.get("bullets", []):
+            lines.append(f"- {b}")
+        lines.append("")
+
+    lines.append("EDUCATION")
+    for edu in evidence.get("education", []):
+        lines.append(f"{edu.get('school', '')} | {edu.get('degree', '')} ({edu.get('start', '')} - {edu.get('end', '')})")
+        for c in edu.get("credentials", []):
+            lines.append(f"- {c}")
+        lines.append("")
+
+    lines.append("TARGETED ACHIEVEMENTS")
+    validated_bullets = filter_ats_bullets(job.get("ats_bullets", []), track)
+    for b in validated_bullets:
+        lines.append(f"- {b}")
+
+    return "\n".join(lines).strip()
+
 @app.route("/stage/<short_id>", methods=["GET"])
 def desktop_stage_view(short_id):
     """Desktop review page showing tailored bullets, apply portal link, and PDF preview."""
@@ -3253,6 +3298,7 @@ def desktop_stage_view(short_id):
     apply_link = job.get("job_apply_link", "#")
     bullets = job.get("ats_bullets", [])
     bullets_html = "".join([f"<li>{html.escape(str(b))}</li>" for b in bullets])
+    ats_plaintext = format_ats_plaintext(job, track)
 
     html_page = f"""
     <!DOCTYPE html>
@@ -3268,6 +3314,7 @@ def desktop_stage_view(short_id):
             .btn-secondary {{ background: #e9ecef; color: #333; }}
             ul {{ line-height: 1.6; }}
             iframe {{ width: 100%; height: 500px; border: 1px solid #ddd; margin-top: 20px; border-radius: 4px; }}
+            textarea {{ box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; padding: 10px; margin-top: 8px; }}
         </style>
     </head>
     <body>
@@ -3280,7 +3327,22 @@ def desktop_stage_view(short_id):
                 <a class="btn btn-secondary" href="{html.escape(apply_link)}" target="_blank">🔗 Open Application Portal</a>
             </div>
             <iframe src="/stage/{short_id}/pdf?track={track}"></iframe>
+
+            <h3 style="margin-top: 24px;">Raw ATS Text (Workday / Taleo fallback)</h3>
+            <p style="color: #666; font-size: 0.9em;">Legacy ATS parsers sometimes fail to read the PDF - paste this plain-text version into application forms instead.</p>
+            <textarea id="ats-raw-text" rows="15" style="width: 100%; font-family: monospace;" readonly>{html.escape(ats_plaintext)}</textarea>
+            <div style="margin-top: 10px;">
+                <button class="btn btn-secondary" onclick="copyAtsText()" style="border: none; cursor: pointer;">📋 Copy ATS Text</button>
+            </div>
         </div>
+        <script>
+            function copyAtsText() {{
+                const textarea = document.getElementById('ats-raw-text');
+                textarea.select();
+                textarea.setSelectionRange(0, 99999);
+                navigator.clipboard.writeText(textarea.value);
+            }}
+        </script>
     </body>
     </html>
     """

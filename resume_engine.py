@@ -18,7 +18,7 @@ def escape_typst(text: str) -> str:
     Escapes Typst markup reserved characters to prevent compilation syntax exceptions.
     Order is critical: backslashes must be escaped before structural syntax symbols.
     """
-    if not text:
+    if text is None or text == "":
         return ""
     clean = str(text).replace("\\", "\\\\")
     for char in ["#", "$", "[", "]", "*", "_", "<", ">", "@"]:
@@ -39,15 +39,14 @@ _FALLBACK_EVIDENCE_BANK = {
 
 def load_evidence_bank() -> dict:
     """Loads the centralized fact bank from disk. Falls back to a minimal safe stub on any failure
-    so a missing/corrupt evidence_bank.json never crashes resume compilation.
+    so a missing/corrupt evidence_bank.json never crashes resume compilation. Called fresh on every
+    request (no module-level cache) so manual JSON edits apply instantly, with no server restart.
     """
     try:
         with open(EVIDENCE_BANK_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return _FALLBACK_EVIDENCE_BANK
-
-EVIDENCE_BANK = load_evidence_bank()
 
 RESUME_BULLETS_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_bullets_bank.json")
 
@@ -64,6 +63,7 @@ _FALLBACK_RESUME_BULLETS_BANK = {
 def load_resume_bullets_bank() -> dict:
     """Loads the pre-approved resume bullet pools from disk. Falls back to a minimal safe stub on
     any failure so a missing/corrupt resume_bullets_bank.json never crashes resume compilation.
+    Called fresh on every request (no module-level cache) - see load_evidence_bank().
     """
     try:
         with open(RESUME_BULLETS_BANK_PATH, "r", encoding="utf-8") as f:
@@ -71,13 +71,11 @@ def load_resume_bullets_bank() -> dict:
     except Exception:
         return _FALLBACK_RESUME_BULLETS_BANK
 
-RESUME_BULLETS_BANK = load_resume_bullets_bank()
-
 # Maps resume_engine.py's "a"/"b" track keys to resume_bullets_bank.json's descriptive pool names.
 TRACK_BULLET_POOL_KEYS = {"a": "track_a_wealth_ops", "b": "track_b_engineering"}
 
 # Persona framing only (subtitle/keywords/skills prose) - every skill named here must already
-# exist in EVIDENCE_BANK["technical_skills"]; factual content (jobs, dates, bullets) lives in the bank.
+# exist in evidence_bank.json's technical_skills; factual content (jobs, dates, bullets) lives in the bank.
 TRACKS = {
     "a": {
         "subtitle": "Financial Systems & Operations",
@@ -103,13 +101,15 @@ def filter_ats_bullets(dynamic_bullets: list, track: str = "a") -> list:
     pre-approved (per resume_bullets_bank.json) AND doesn't reference at least one known
     technical_skills term (i.e. it would otherwise be an unverifiable/hallucinated claim).
     Backfills with pre-approved bullets if Gemini's output was empty or fully rejected, so the
-    resume never renders fewer than 2 bullets.
+    resume never renders fewer than 2 bullets. Reloads both banks from disk on every call (hot-reload).
     """
+    evidence_bank = load_evidence_bank()
+    resume_bullets_bank = load_resume_bullets_bank()
     track_key = str(track or "a").lower()
     pool_key = TRACK_BULLET_POOL_KEYS.get(track_key, TRACK_BULLET_POOL_KEYS["a"])
-    approved_pool = RESUME_BULLETS_BANK.get(pool_key) or RESUME_BULLETS_BANK.get(TRACK_BULLET_POOL_KEYS["a"], [])
-    known_skills = [str(s).lower() for s in EVIDENCE_BANK.get("technical_skills", [])]
-    banned = [str(w).lower() for w in EVIDENCE_BANK.get("banned_words", [])]
+    approved_pool = resume_bullets_bank.get(pool_key) or resume_bullets_bank.get(TRACK_BULLET_POOL_KEYS["a"], [])
+    known_skills = [str(s).lower() for s in evidence_bank.get("technical_skills", [])]
+    banned = [str(w).lower() for w in evidence_bank.get("banned_words", [])]
     approved_lower = [str(b).strip().lower() for b in approved_pool]
 
     validated = []
@@ -167,9 +167,10 @@ def _render_education_block(evidence: dict) -> str:
 
 def render_typst_markup(company_name: str, dynamic_bullets: list, track: str = "a") -> str:
     """Builds Typst markup for the selected persona track, sourcing every factual claim
-    (experience, education, approved bullets) from the centralized Evidence Bank."""
+    (experience, education, approved bullets) from the centralized Evidence Bank (hot-reloaded
+    fresh on every call - see load_evidence_bank())."""
     track_data = TRACKS.get(str(track or "a").lower(), TRACKS["a"])
-    evidence = EVIDENCE_BANK
+    evidence = load_evidence_bank()
     identity = evidence.get("identity", {})
     clean_company = escape_typst(company_name or "Target Operations")
 
