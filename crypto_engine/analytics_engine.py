@@ -5,6 +5,7 @@ no API keys required. All outbound HTTP calls go through `_get`, decorated with 
 backoff for HTTP 429/5xx responses and connection-level failures.
 """
 import functools
+import json
 import logging
 import math
 import re
@@ -50,6 +51,25 @@ _DERIBIT_INSTRUMENT_RE = re.compile(r"^[A-Z]+-(\d{1,2}[A-Z]{3}\d{2})-(\d+(?:\.\d
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def get_tracked_alts() -> list[str]:
+    """Live/dynamic altcoin watchlist, hot-reloaded from system_config.tracked_alts on every
+    call (mutable via the /config CLI's 'alts + SUI' / 'alts - ADA' commands). Falls back to
+    the ALT_SYMBOLS default if the config value is missing or unparsable."""
+    raw = database.get_config("tracked_alts", json.dumps(ALT_SYMBOLS))
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and parsed:
+            return [str(s).upper() for s in parsed]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return list(ALT_SYMBOLS)
+
+
+def get_supported_pairs() -> set[str]:
+    """Dynamic counterpart to SUPPORTED_PAIRS, reflecting the live tracked_alts watchlist."""
+    return {f"{s}USDT" for s in MAJOR_SYMBOLS + get_tracked_alts()}
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +335,20 @@ def calculate_rvol(candles: list[dict], period: int = RVOL_PERIOD) -> dict:
 
 
 def calculate_risk_levels(entry_price: float, atr_14: float) -> tuple[float, float]:
-    stop_loss = entry_price - (SL_ATR_MULTIPLIER * atr_14)
-    take_profit = entry_price + (RISK_REWARD_RATIO * (entry_price - stop_loss))
+    """sl_atr_mult / tp_rr_ratio are read fresh from system_config on every call (hot-reload),
+    so a /config mutation takes effect on the very next signal without a restart."""
+    sl_mult = float(database.get_config("sl_atr_mult", str(SL_ATR_MULTIPLIER)))
+    rr_ratio = float(database.get_config("tp_rr_ratio", str(RISK_REWARD_RATIO)))
+    stop_loss = entry_price - (sl_mult * atr_14)
+    take_profit = entry_price + (rr_ratio * (entry_price - stop_loss))
     return stop_loss, take_profit
+
+
+def calculate_tp1_price(entry_price: float, stop_loss: float) -> float:
+    """TP1 (2-stage scale-out trigger) sits exactly 1R above entry, where R is THIS trade's own
+    actual stop distance (entry - stop_loss) rather than a hardcoded ATR multiple - this keeps
+    the scale-out mathematically correct even if sl_atr_mult is changed between trades."""
+    return entry_price + (entry_price - stop_loss)
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +412,10 @@ def evaluate_breakout_signal(symbol: str, asset_class: str, candles: list[dict],
     )
 
     rvol_ratio = rvol["rvol_ratio"]
-    volume_gate_passed = rvol_ratio >= RVOL_TRIGGER_THRESHOLD
-    volume_score = min(30.0, (rvol_ratio / RVOL_TRIGGER_THRESHOLD) * 15.0) if volume_gate_passed else 0.0
-    reasons.append(f"RVOL {rvol_ratio:.2f}x vs 200% gate ({'PASS' if volume_gate_passed else 'FAIL'})")
+    rvol_threshold = float(database.get_config("rvol_threshold", str(RVOL_TRIGGER_THRESHOLD)))
+    volume_gate_passed = rvol_ratio >= rvol_threshold
+    volume_score = min(30.0, (rvol_ratio / rvol_threshold) * 15.0) if volume_gate_passed else 0.0
+    reasons.append(f"RVOL {rvol_ratio:.2f}x vs {rvol_threshold * 100:.0f}% gate ({'PASS' if volume_gate_passed else 'FAIL'})")
 
     confidence_score = int(round(min(100.0, context_score + breakout_score + volume_score)))
     triggered = donchian_breached and volume_gate_passed and not halted
@@ -447,6 +479,46 @@ def _evaluate_alt(base_asset: str, interval_hours: int, btc_dominance_halted: bo
     return signal
 
 
+def reconcile_trade_tick(trade: dict, price: float) -> dict | None:
+    """Given one OPEN paper trade and a fresh price tick, decides + executes the correct action
+    (breakeven scale-out, full TP close, or SL close) via database.py's atomic ledger functions.
+    Returns an event dict describing what happened (for alert dispatch), or None if no action
+    was warranted at this price. Shared by both the REST reconciliation loop (main_2.py) and the
+    real-time WebSocket feed (ws_reconciler.py) so the exact-execution rules never diverge
+    between the two paths.
+    """
+    fee_pct = float(database.get_config("fee_slippage_pct", "0.13"))
+
+    if not trade["tp1_hit"]:
+        if price <= trade["stop_loss"]:
+            closed = database.close_paper_trade(trade["id"], price, "CLOSED_SL", fee_pct)
+            return {"type": "CLOSED_SL", "trade": closed} if closed else None
+
+        tp1_price = calculate_tp1_price(trade["entry_price"], trade["stop_loss"])
+        if price >= tp1_price:
+            close_qty = trade["initial_quantity"] * 0.5
+            updated = database.partial_close_tp1(trade["id"], close_qty, price, fee_pct)
+            if not updated:
+                return None
+            updated["tp1_exit_price"] = price
+            # Gap risk: a single tick/candle may have already blown through the final TP2 too.
+            if price >= updated["take_profit"]:
+                closed = database.close_paper_trade(updated["id"], price, "CLOSED_TP", fee_pct)
+                if closed:
+                    return {"type": "TP1_AND_TP2", "tp1_trade": updated, "trade": closed}
+            return {"type": "TP1", "trade": updated}
+        return None
+
+    # tp1 already hit - stop_loss now sits at breakeven (entry_price)
+    if price <= trade["stop_loss"]:
+        closed = database.close_paper_trade(trade["id"], price, "CLOSED_BE", fee_pct)
+        return {"type": "CLOSED_BE", "trade": closed} if closed else None
+    if price >= trade["take_profit"]:
+        closed = database.close_paper_trade(trade["id"], price, "CLOSED_TP", fee_pct)
+        return {"type": "CLOSED_TP", "trade": closed} if closed else None
+    return None
+
+
 def scan_all_symbols() -> list[dict]:
     """Runs one full scan cycle across BTC/ETH (gamma context) and the 7 tracked altcoins
     (OI/funding context), gated by a single BTC.D volatility check computed once per cycle.
@@ -468,12 +540,13 @@ def scan_all_symbols() -> list[dict]:
         logging.error(f"fetch_funding_intervals failed, defaulting all alts to 8h: {e}")
         funding_intervals = {}
 
+    tracked_alts = get_tracked_alts()
     results = []
-    with ThreadPoolExecutor(max_workers=len(MAJOR_SYMBOLS) + len(ALT_SYMBOLS)) as executor:
+    with ThreadPoolExecutor(max_workers=len(MAJOR_SYMBOLS) + len(tracked_alts)) as executor:
         futures = {}
         for currency in MAJOR_SYMBOLS:
             futures[executor.submit(_evaluate_major, currency)] = f"{currency}USDT"
-        for base_asset in ALT_SYMBOLS:
+        for base_asset in tracked_alts:
             interval_hours = funding_intervals.get(f"{base_asset}USDT", 8)
             futures[executor.submit(_evaluate_alt, base_asset, interval_hours, dominance_check.get("volatile", False))] = f"{base_asset}USDT"
 

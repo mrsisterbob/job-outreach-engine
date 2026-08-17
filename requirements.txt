@@ -7,3 +7,4 @@ flask
 gunicorn
 typst
 apscheduler
+websocket-client

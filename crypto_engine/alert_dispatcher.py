@@ -62,7 +62,8 @@ def format_signal_alert_card(signal: dict) -> str:
 def format_trade_closed_alert(trade: dict) -> str:
     symbol = html.escape(str(trade.get("symbol", "UNKNOWN")))
     status = str(trade.get("status", "CLOSED"))
-    outcome_emoji = "✅" if status == "CLOSED_TP" else ("🛑" if status == "CLOSED_SL" else "⚪")
+    emoji_map = {"CLOSED_TP": "\u2705", "CLOSED_SL": "\U0001F6D1", "CLOSED_BE": "\U0001F7E1", "CLOSED_MANUAL": "\u26AA"}
+    outcome_emoji = emoji_map.get(status, "\u26AA")
     lines = [
         f"{outcome_emoji} <b>PAPER TRADE CLOSED: {symbol}</b>",
         "",
@@ -70,6 +71,58 @@ def format_trade_closed_alert(trade: dict) -> str:
         f"<b>Entry:</b> {trade.get('entry_price', 0.0):.6g}",
         f"<b>Exit:</b> {trade.get('close_price', 0.0):.6g}",
         f"<b>PnL:</b> {trade.get('pnl_pct', 0.0):+.2f}% ({trade.get('pnl_usd', 0.0):+.2f} USD)",
+    ]
+    return "\n".join(lines)
+
+
+def format_tp1_scaleout_alert(trade: dict) -> str:
+    symbol = html.escape(str(trade.get("symbol", "UNKNOWN")))
+    lines = [
+        f"\U0001F3AF <b>Scale-Out &amp; Stop to Breakeven: {symbol}</b>",
+        "",
+        f"<b>Closed 50% @:</b> {trade.get('tp1_exit_price', 0.0):.6g}",
+        f"<b>Realized (this slice):</b> {trade.get('partial_pnl_usd', 0.0):+.2f} USD",
+        f"<b>Remaining Qty:</b> {trade.get('quantity', 0.0):.6g}",
+        f"<b>New Stop (Breakeven):</b> {trade.get('stop_loss', 0.0):.6g}",
+        f"<b>Final Target:</b> {trade.get('take_profit', 0.0):.6g}",
+    ]
+    return "\n".join(lines)
+
+
+def format_heat_cap_rejection(pair: str, requested_risk_pct: float, current_open_risk_pct: float, max_heat_pct: float) -> str:
+    symbol = html.escape(str(pair))
+    lines = [
+        "\U0001F6AB <b>Trade Rejected: Portfolio Heat Cap</b>",
+        "",
+        f"<b>Pair:</b> <code>{symbol}</code>",
+        f"<b>Requested Risk:</b> {requested_risk_pct:.2f}%",
+        f"<b>Current Open Risk:</b> {current_open_risk_pct:.2f}%",
+        f"<b>Max Portfolio Heat:</b> {max_heat_pct:.2f}%",
+        "",
+        f"Adding this trade would push total open risk to {(current_open_risk_pct + requested_risk_pct):.2f}%, exceeding the cap.",
+    ]
+    return "\n".join(lines)
+
+
+def format_config_card(params: dict) -> str:
+    display_order = [
+        ("risk_pct", "Risk % / Trade"),
+        ("max_portfolio_heat_pct", "Max Portfolio Heat %"),
+        ("rvol_threshold", "RVOL Trigger Threshold"),
+        ("sl_atr_mult", "Stop-Loss ATR Multiplier"),
+        ("tp_rr_ratio", "Take-Profit R:R Ratio"),
+        ("fee_slippage_pct", "Fee + Slippage %"),
+        ("tracked_alts", "Tracked Altcoins"),
+    ]
+    body_lines = [f"{label:<24} {html.escape(str(params.get(key, 'N/A')))}" for key, label in display_order]
+    lines = [
+        "\u2699\uFE0F <b>Active Engine Parameters</b>",
+        f"<pre>{chr(10).join(body_lines)}</pre>",
+        "",
+        "Tap to copy a mutation:",
+        "<code>risk = 1.5</code>",
+        "<code>alts + SUI</code>",
+        "<code>alts - ADA</code>",
     ]
     return "\n".join(lines)
 
@@ -120,3 +173,19 @@ def dispatch_signal_alert(signal: dict) -> bool:
 
 def dispatch_trade_closed_alert(trade: dict) -> bool:
     return send_telegram_message(format_trade_closed_alert(trade))
+
+
+def dispatch_reconcile_event(event: dict | None) -> None:
+    """Shared alert dispatch for reconciliation outcomes produced by
+    analytics_engine.reconcile_trade_tick() - used identically by the REST reconciliation loop
+    and the real-time WebSocket reconciler so both paths notify the user consistently."""
+    if not event:
+        return
+    event_type = event.get("type")
+    if event_type == "TP1":
+        send_telegram_message(format_tp1_scaleout_alert(event["trade"]))
+    elif event_type == "TP1_AND_TP2":
+        send_telegram_message(format_tp1_scaleout_alert(event["tp1_trade"]))
+        send_telegram_message(format_trade_closed_alert(event["trade"]))
+    else:
+        send_telegram_message(format_trade_closed_alert(event["trade"]))

@@ -55,9 +55,12 @@ CREATE TABLE IF NOT EXISTS paper_portfolio (
     side TEXT NOT NULL DEFAULT 'LONG',
     entry_price REAL NOT NULL,
     quantity REAL NOT NULL,
+    initial_quantity REAL,
     risk_pct REAL NOT NULL,
     stop_loss REAL NOT NULL,
     take_profit REAL NOT NULL,
+    tp1_hit INTEGER DEFAULT 0,
+    realized_pnl_usd REAL DEFAULT 0.0,
     status TEXT NOT NULL DEFAULT 'OPEN',
     signal_id INTEGER,
     opened_at TEXT NOT NULL,
@@ -111,15 +114,32 @@ def get_db_conn(immediate: bool = False):
 def init_db() -> None:
     with get_db_conn() as conn:
         conn.executescript(_SCHEMA_SQL)
+        # Migration guard: upgrade pre-existing paper_portfolio tables from before 2-stage scale-outs.
+        for ddl in (
+            "ALTER TABLE paper_portfolio ADD COLUMN tp1_hit INTEGER DEFAULT 0",
+            "ALTER TABLE paper_portfolio ADD COLUMN initial_quantity REAL",
+            "ALTER TABLE paper_portfolio ADD COLUMN realized_pnl_usd REAL DEFAULT 0.0",
+        ):
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         now = utcnow_iso()
-        conn.execute(
-            "INSERT OR IGNORE INTO system_config (key, value, updated_at) VALUES ('virtual_balance_usd', '10000', ?)",
-            (now,),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO system_config (key, value, updated_at) VALUES ('default_risk_pct', '2.0', ?)",
-            (now,),
-        )
+        defaults = {
+            "virtual_balance_usd": "10000",
+            "risk_pct": "2.0",
+            "max_portfolio_heat_pct": "6.0",
+            "rvol_threshold": "2.0",
+            "sl_atr_mult": "1.5",
+            "tp_rr_ratio": "3.0",
+            "fee_slippage_pct": "0.13",
+            "tracked_alts": json.dumps(["SOL", "BNB", "XRP", "ADA", "AVAX", "LINK", "DOT", "NEAR", "SUI"]),
+        }
+        for key, val in defaults.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO system_config (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, val, now),
+            )
     logging.info("Crypto engine database schema ready (WAL mode, busy_timeout=5000ms).")
 
 
@@ -207,10 +227,10 @@ def insert_paper_trade(
     with get_db_conn(immediate=True) as conn:
         cursor = conn.execute(
             """INSERT INTO paper_portfolio
-               (symbol, side, entry_price, quantity, risk_pct, stop_loss, take_profit,
-                status, signal_id, opened_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)""",
-            (symbol, side, entry_price, quantity, risk_pct, stop_loss, take_profit, signal_id, utcnow_iso()),
+               (symbol, side, entry_price, quantity, initial_quantity, risk_pct, stop_loss, take_profit,
+                status, signal_id, opened_at, tp1_hit, realized_pnl_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, 0, 0.0)""",
+            (symbol, side, entry_price, quantity, quantity, risk_pct, stop_loss, take_profit, signal_id, utcnow_iso()),
         )
         trade_id = cursor.lastrowid
     if signal_id:
@@ -226,33 +246,93 @@ def get_open_paper_trades() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def close_paper_trade(trade_id: int, close_price: float, status: str, pnl_pct: float, pnl_usd: float) -> bool:
-    """Closes a trade and compounds the realized PnL into virtual_balance_usd atomically
-    (same transaction), so position sizing on future trades reflects real performance.
-    Returns False (no-op) if the trade was already closed by a concurrent reconciliation pass.
+def _fee_haircut_pnl(entry_price: float, close_price: float, quantity: float, fee_slippage_pct: float) -> float:
+    """Round-trip fee/slippage haircut applied against both the entry and exit notional."""
+    fee_decimal = fee_slippage_pct / 100.0
+    gross_pnl = (close_price - entry_price) * quantity
+    return gross_pnl - (entry_price * quantity * fee_decimal) - (close_price * quantity * fee_decimal)
+
+
+def get_total_open_risk_pct() -> float:
+    """Sums risk_pct across OPEN trades that have not yet scaled out to breakeven (tp1_hit=0) -
+    a breakeven-stopped trade no longer contributes real downside risk to the portfolio heat cap.
     """
-    if status not in ("CLOSED_TP", "CLOSED_SL", "CLOSED_MANUAL"):
-        raise ValueError(f"Invalid close status '{status}'")
+    with get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(risk_pct), 0.0) AS total FROM paper_portfolio WHERE status = 'OPEN' AND tp1_hit = 0"
+        ).fetchone()
+    return row["total"] or 0.0
+
+
+def partial_close_tp1(trade_id: int, close_qty: float, close_price: float, fee_slippage_pct: float) -> dict | None:
+    """Scales 50% out at the TP1 (1R) level, moves the stop to breakeven (entry_price), and
+    compounds the realized slice into virtual_balance_usd atomically. Returns the updated trade
+    row (plus a 'partial_pnl_usd' key), or None if the trade is no longer eligible (already
+    closed / already scaled out) - guards against a race between the REST reconciliation loop
+    and the real-time WebSocket reconciler both acting on the same tick.
+    """
     now = utcnow_iso()
     with get_db_conn(immediate=True) as conn:
-        cursor = conn.execute(
-            """UPDATE paper_portfolio SET status = ?, close_price = ?, pnl_pct = ?, pnl_usd = ?, closed_at = ?
-               WHERE id = ? AND status = 'OPEN'""",
-            (status, close_price, pnl_pct, pnl_usd, now, trade_id),
-        )
-        if cursor.rowcount == 0:
-            return False
-        balance_row = conn.execute(
-            "SELECT value FROM system_config WHERE key = 'virtual_balance_usd'"
+        row = conn.execute(
+            "SELECT * FROM paper_portfolio WHERE id = ? AND status = 'OPEN' AND tp1_hit = 0", (trade_id,)
         ).fetchone()
+        if not row:
+            return None
+        trade = dict(row)
+        partial_pnl = _fee_haircut_pnl(trade["entry_price"], close_price, close_qty, fee_slippage_pct)
+        new_quantity = trade["quantity"] - close_qty
+        new_realized = trade["realized_pnl_usd"] + partial_pnl
+        conn.execute(
+            "UPDATE paper_portfolio SET quantity = ?, stop_loss = ?, tp1_hit = 1, realized_pnl_usd = ? WHERE id = ?",
+            (new_quantity, trade["entry_price"], new_realized, trade_id),
+        )
+        balance_row = conn.execute("SELECT value FROM system_config WHERE key = 'virtual_balance_usd'").fetchone()
         current_balance = float(balance_row["value"]) if balance_row else 10000.0
-        new_balance = current_balance + pnl_usd
+        new_balance = current_balance + partial_pnl
         conn.execute(
             """INSERT INTO system_config (key, value, updated_at) VALUES ('virtual_balance_usd', ?, ?)
                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
             (str(new_balance), now),
         )
-    return True
+        updated_row = conn.execute("SELECT * FROM paper_portfolio WHERE id = ?", (trade_id,)).fetchone()
+    return {**dict(updated_row), "partial_pnl_usd": partial_pnl}
+
+
+def close_paper_trade(trade_id: int, close_price: float, status: str, fee_slippage_pct: float) -> dict | None:
+    """Fully closes a trade: applies the fee/slippage haircut to whatever quantity currently
+    remains on the row (the other 50% if TP1 already scaled out), adds it to any already-realized
+    partial PnL, and compounds just the newly-closed slice into virtual_balance_usd atomically.
+    pnl_pct is computed against the trade's full original cost basis (initial_quantity *
+    entry_price) so a partial + final close always nets out to one coherent trade-level return.
+    Returns the closed trade row, or None if it was already closed by a concurrent reconciliation
+    pass (REST loop vs. real-time WS reconciler).
+    """
+    if status not in ("CLOSED_TP", "CLOSED_SL", "CLOSED_BE", "CLOSED_MANUAL"):
+        raise ValueError(f"Invalid close status '{status}'")
+    now = utcnow_iso()
+    with get_db_conn(immediate=True) as conn:
+        row = conn.execute("SELECT * FROM paper_portfolio WHERE id = ? AND status = 'OPEN'", (trade_id,)).fetchone()
+        if not row:
+            return None
+        trade = dict(row)
+        remaining_pnl = _fee_haircut_pnl(trade["entry_price"], close_price, trade["quantity"], fee_slippage_pct)
+        total_pnl_usd = trade["realized_pnl_usd"] + remaining_pnl
+        cost_basis = trade["entry_price"] * trade["initial_quantity"]
+        pnl_pct = (total_pnl_usd / cost_basis * 100.0) if cost_basis else 0.0
+        conn.execute(
+            """UPDATE paper_portfolio SET status = ?, close_price = ?, pnl_pct = ?, pnl_usd = ?, closed_at = ?
+               WHERE id = ?""",
+            (status, close_price, pnl_pct, total_pnl_usd, now, trade_id),
+        )
+        balance_row = conn.execute("SELECT value FROM system_config WHERE key = 'virtual_balance_usd'").fetchone()
+        current_balance = float(balance_row["value"]) if balance_row else 10000.0
+        new_balance = current_balance + remaining_pnl
+        conn.execute(
+            """INSERT INTO system_config (key, value, updated_at) VALUES ('virtual_balance_usd', ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+            (str(new_balance), now),
+        )
+    return {**trade, "status": status, "close_price": close_price, "pnl_pct": pnl_pct, "pnl_usd": total_pnl_usd}
 
 
 def get_closed_trade_stats() -> dict:
