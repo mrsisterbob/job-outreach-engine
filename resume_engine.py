@@ -3,9 +3,13 @@ resume_engine.py
 ================
 High-Performance In-Memory Resume Compiler for Kevin Miller.
 Translates structured profile data and Gemini ATS bullets into an ATS-compliant PDF via Typst (<30ms).
+All factual content (experience, education, skills, approved bullets) is sourced from evidence_bank.json
+so nothing here is ever invented independently of the centralized Evidence Bank.
 """
 
 import io
+import json
+import os
 import re
 import typst
 
@@ -21,52 +25,144 @@ def escape_typst(text: str) -> str:
         clean = clean.replace(char, f"\\{char}")
     return clean
 
-# Structured dual-persona profile data. Track A emphasizes wealth ops/custody/reconciliation;
-# Track B emphasizes Python/SQL/REST APIs/ETL/schema architecture. Job history is factual/shared,
-# only the subtitle, default highlight bullets, and skills section differ per track.
+EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
+
+# Minimal safe fallback if evidence_bank.json is ever missing/corrupt - keeps PDF compilation alive.
+_FALLBACK_EVIDENCE_BANK = {
+    "identity": {
+        "name": "Kevin Miller", "email": "kjmiller406@gmail.com", "phone": "248-709-6326",
+        "location": "Detroit, MI", "website": "montelattice.com", "linkedin": "linkedin.com/in/kevinmiller"
+    },
+    "experience": [], "education": [], "technical_skills": [],
+    "banned_words": [], "pre_approved_bullets": {"a": [], "b": []}, "evergreen_highlights": []
+}
+
+def load_evidence_bank() -> dict:
+    """Loads the centralized fact bank from disk. Falls back to a minimal safe stub on any failure
+    so a missing/corrupt evidence_bank.json never crashes resume compilation.
+    """
+    try:
+        with open(EVIDENCE_BANK_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return _FALLBACK_EVIDENCE_BANK
+
+EVIDENCE_BANK = load_evidence_bank()
+
+# Persona framing only (subtitle/keywords/skills prose) - every skill named here must already
+# exist in EVIDENCE_BANK["technical_skills"]; factual content (jobs, dates, bullets) lives in the bank.
 TRACKS = {
     "a": {
         "subtitle": "Financial Systems & Operations",
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
-        "default_bullets": [
-            "Reconciled high-volume data variances and mapped ownership structures to establish risk escalation logic.",
-            "Automated data extraction and operational compliance workflows using Python and structured API schemas."
-        ],
         "skills": [
             ("Operations & Data", "High-Volume Reconciliation, Variance Analysis, Audit Escalation, Power BI (ETL/Modeling), SQL, Advanced Excel."),
-            ("Systems & Tools", "HubSpot CRM, Schwab Advisor Center, REST APIs, JSON Intake, LLM Orchestration & Prompt Engineering.")
+            ("Systems & Tools", "HubSpot CRM, Schwab Advisor Center, REST APIs, JSON Schema Design, Fidelity Wealthscape.")
         ]
     },
     "b": {
         "subtitle": "Data & Systems Engineering",
         "keywords": ("Python", "SQL", "REST APIs", "ETL", "Schema Architecture", "Process Automation"),
-        "default_bullets": [
-            "Designed and scripted ETL pipelines and schema validation logic to automate high-volume data reconciliation.",
-            "Built REST API integrations and structured data intake schemas to replace manual compliance workflows."
-        ],
         "skills": [
-            ("Engineering & Data", "Python, SQL, REST API Integration, ETL Modeling & Schema Design, Process Scripting, Power BI."),
-            ("Systems & Tools", "HubSpot CRM API, Schwab Advisor Center, JSON Schema Intake, LLM Orchestration & Prompt Engineering.")
+            ("Engineering & Data", "Python, SQL, REST API Integration, ETL Modeling & Schema Design, Process Automation, Power BI."),
+            ("Systems & Tools", "HubSpot CRM, Schwab Advisor Center, Fidelity Wealthscape, SQLite (WAL mode), Flask, Telegram Bot API Webhooks.")
         ]
     }
 }
 
+def filter_ats_bullets(dynamic_bullets: list, track: str = "a") -> list:
+    """Grounds Gemini's ats_bullets against the Evidence Bank before they ever reach the PDF:
+    drops any bullet containing a banned buzzword, and drops any bullet that isn't itself
+    pre-approved AND doesn't reference at least one known technical_skills term (i.e. it would
+    otherwise be an unverifiable/hallucinated claim). Backfills with pre-approved bullets if
+    Gemini's output was empty or fully rejected, so the resume never renders fewer than 2 bullets.
+    """
+    track_key = str(track or "a").lower()
+    approved_pool = EVIDENCE_BANK.get("pre_approved_bullets", {}).get(track_key) \
+        or EVIDENCE_BANK.get("pre_approved_bullets", {}).get("a", [])
+    known_skills = [str(s).lower() for s in EVIDENCE_BANK.get("technical_skills", [])]
+    banned = [str(w).lower() for w in EVIDENCE_BANK.get("banned_words", [])]
+    approved_lower = [str(b).strip().lower() for b in approved_pool]
+
+    validated = []
+    for raw in (dynamic_bullets or [])[:2]:
+        clean = re.sub(r'^[•\-\*]\s*', '', str(raw).strip())
+        if not clean:
+            continue
+        lower = clean.lower()
+        if any(bw in lower for bw in banned):
+            continue  # hallucination-prone buzzword - drop outright, never patch/repair it
+        is_preapproved = lower in approved_lower
+        mentions_known_skill = any(skill in lower for skill in known_skills if skill)
+        if is_preapproved or mentions_known_skill:
+            validated.append(clean)
+
+    idx = 0
+    while len(validated) < 2 and idx < len(approved_pool):
+        candidate = approved_pool[idx]
+        if candidate not in validated:
+            validated.append(candidate)
+        idx += 1
+
+    return validated[:2]
+
+def _render_experience_block(evidence: dict) -> str:
+    """Renders the Professional Experience section entirely from Evidence Bank data - every
+    injected field is escape_typst()'d since none of this is a hardcoded literal anymore.
+    """
+    lines = ["== Professional Experience"]
+    for job in evidence.get("experience", []):
+        title = escape_typst(job.get("title", ""))
+        company = escape_typst(job.get("company", ""))
+        location = escape_typst(job.get("location", ""))
+        start = escape_typst(job.get("start", ""))
+        end = escape_typst(job.get("end", ""))
+        lines.append(f"*{title}* | {company} #h(1fr) {location} ({start} -- {end})")
+        for b in job.get("bullets", []):
+            lines.append(f"- {escape_typst(b)}")
+    return "\n".join(lines)
+
+def _render_education_block(evidence: dict) -> str:
+    """Renders the Education & Certifications section entirely from Evidence Bank data."""
+    lines = ["== Education & Certifications"]
+    for edu in evidence.get("education", []):
+        school = escape_typst(edu.get("school", ""))
+        degree = escape_typst(edu.get("degree", ""))
+        start = escape_typst(edu.get("start", ""))
+        end = escape_typst(edu.get("end", ""))
+        lines.append(f"*{school}* | {degree} #h(1fr) ({start} -- {end})")
+        creds = edu.get("credentials", [])
+        if creds:
+            cred_str = ", ".join(escape_typst(c) for c in creds)
+            lines.append(f"- *Licenses & Credentials:* {cred_str}")
+    return "\n".join(lines)
+
 def render_typst_markup(company_name: str, dynamic_bullets: list, track: str = "a") -> str:
-    """Builds Typst markup for the selected persona track with verified baseline history, embedded metadata, and tailored role bullets."""
+    """Builds Typst markup for the selected persona track, sourcing every factual claim
+    (experience, education, approved bullets) from the centralized Evidence Bank."""
     track_data = TRACKS.get(str(track or "a").lower(), TRACKS["a"])
+    evidence = EVIDENCE_BANK
+    identity = evidence.get("identity", {})
     clean_company = escape_typst(company_name or "Target Operations")
 
-    if not dynamic_bullets:
-        bullet_lines = [f"  - {b}" for b in track_data["default_bullets"]]
-    else:
-        bullet_lines = []
-        for b in dynamic_bullets[:2]:
-            clean_b = re.sub(r'^[•\-\*]\s*', '', str(b).strip())
-            bullet_lines.append(f"  - {escape_typst(clean_b)}")
-    dynamic_bullets_block = "\n".join(bullet_lines)
+    validated_bullets = filter_ats_bullets(dynamic_bullets, track)
+    dynamic_bullets_block = "\n".join(f"  - {escape_typst(b)}" for b in validated_bullets)
+    evergreen_block = "\n".join(
+        f"- *{escape_typst(h.get('label', ''))}:* {escape_typst(h.get('text', ''))}"
+        for h in evidence.get("evergreen_highlights", [])
+    )
 
+    experience_block = _render_experience_block(evidence)
+    education_block = _render_education_block(evidence)
     skills_block = "\n".join(f"- *{cat}:* {desc}" for cat, desc in track_data["skills"])
     keywords_tuple = ", ".join(f'"{kw}"' for kw in track_data["keywords"])
+
+    name = escape_typst(identity.get("name", "Kevin Miller"))
+    email = escape_typst(identity.get("email", ""))
+    phone = escape_typst(identity.get("phone", ""))
+    location = escape_typst(identity.get("location", ""))
+    website = escape_typst(identity.get("website", ""))
+    linkedin = identity.get("linkedin", "linkedin.com/in/kevinmiller")
 
     markup = f"""
 #set document(
@@ -81,35 +177,23 @@ def render_typst_markup(company_name: str, dynamic_bullets: list, track: str = "
 #set par(justify: false, leading: 0.52em)
 
 #align(center)[
-  #text(size: 15pt, weight: "bold")[Kevin Miller] \\
+  #text(size: 15pt, weight: "bold")[{name}] \\
   #text(size: 10pt, weight: "medium", fill: rgb("#1B2A4A"))[{track_data["subtitle"]}] \\
   #v(2pt)
-  kjmiller406\@gmail.com | 248-709-6326 | Detroit, MI | montelattice.com | [linkedin.com/in/kevinmiller](https://linkedin.com/in/kevinmiller)
+  {email} | {phone} | {location} | {website} | [{escape_typst(linkedin)}](https://{linkedin})
 ]
 
 #v(4pt)
 #line(length: 100%, stroke: 0.6pt + rgb("#CCCCCC"))
 #v(2pt)
 
-== Professional Experience
-*Compliance Lead* | 40 Acres App #h(1fr) Detroit, MI (04/2026 -- Present)
-- Architect regulatory infrastructure for blockchain-based real estate and real-world asset (RWA) tokenization.
-- Draft SEC Form D filings and Regulation Crowdfunding documentation for SEC and FinCEN compliance.
-- Design operational plumbing for digital asset ownership and institutional data validation.
-
-*Total Rewards Finance Intern* | ABC Technologies #h(1fr) Southfield, MI (05/2024 -- 08/2024)
-- Performed high-volume reconciliation of 500+ retirement accounts, validating ledger accuracy and resolving discrepancies.
-- Prepared and maintained supporting schedules for variance analysis and recurring internal audit reports.
-- Built and automated Excel models to streamline data intake workflows and cut manual processing cycles.
+{experience_block}
 
 == Targeted Systems & Project Highlights ({clean_company})
 {dynamic_bullets_block}
-- *Institutional Data Controls:* Reconciled \\$250k in ledger variances; automated AI extraction and compliance validation for legal workflows.
-- *Regulatory Translation:* Built operational onboarding workflows bridging legal compliance with structured due diligence.
+{evergreen_block}
 
-== Education & Certifications
-*Hope College* | B.A. Business (Finance), B.A. Political Science #h(1fr) (08/2022 -- 05/2026)
-- *Licenses & Credentials:* Series 65 Candidate, Securities Industry Essentials (SIE), Schwab Limited Power of Attorney (LPOA), Bloomberg Market Concepts (BMC).
+{education_block}
 
 == Technical Systems & Core Skills
 {skills_block}
@@ -120,3 +204,4 @@ def compile_resume_pdf(company_name: str, dynamic_bullets: list, track: str = "a
     """Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track."""
     markup = render_typst_markup(company_name, dynamic_bullets, track)
     return typst.compile(markup.encode("utf-8"))
+
