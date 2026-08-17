@@ -811,8 +811,8 @@ def generate_warm_email(note_context=""):
     """Full warm email: greeting, strict 3-sentence body, sign-off as separate paragraphs."""
     _, current_role_sentence = get_current_role_blurb()
     s1 = sanitize_text(note_context) if note_context else "I hope you have been doing well."
-    s2 = current_role_sentence
-    s3 = "I am wondering what you have been up to lately, and would love to reconnect over coffee or a quick call if you have time."
+    s2 = sanitize_text(current_role_sentence)
+    s3 = sanitize_text("I am wondering what you have been up to lately, and would love to reconnect over coffee or a quick call if you have time.")
     body = enforce_sentence_limit(f"{s1} {s2} {s3}", 3)
     return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
 
@@ -835,7 +835,7 @@ Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles
 EVIDENCE BANK (the only source of truth for this candidate's real background):
 {EVIDENCE_CONTEXT_BLOCK}
 
-NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. Never invent skills, employers, or experiences not listed there. Avoid all banned words. Output must sound like a direct, human communicator - short sentences, no corporate hype.
+NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. Never invent skills, employers, or experiences not listed there. Strictly follow the VOICE & TONE guidance above and avoid every word in BANNED WORDS. Output must sound like a direct, human communicator - short sentences, no corporate hype.
 
 Evaluate the job description and respond ONLY with a JSON object containing:
 {{

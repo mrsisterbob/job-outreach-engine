@@ -3,8 +3,8 @@ resume_engine.py
 ================
 High-Performance In-Memory Resume Compiler for Kevin Miller.
 Translates structured profile data and Gemini ATS bullets into an ATS-compliant PDF via Typst (<30ms).
-All factual content (experience, education, skills, approved bullets) is sourced from evidence_bank.json
-so nothing here is ever invented independently of the centralized Evidence Bank.
+Factual content (experience, education, skills) is sourced from evidence_bank.json and pre-approved
+resume bullet pools from resume_bullets_bank.json, so nothing here is ever invented independently.
 """
 
 import io
@@ -49,6 +49,33 @@ def load_evidence_bank() -> dict:
 
 EVIDENCE_BANK = load_evidence_bank()
 
+RESUME_BULLETS_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_bullets_bank.json")
+
+# Minimal safe fallback if resume_bullets_bank.json is ever missing/corrupt - keeps PDF compilation alive.
+_FALLBACK_RESUME_BULLETS_BANK = {
+    "track_a_wealth_ops": [
+        "Reconciled high-volume data variances and mapped ownership structures to establish risk escalation logic."
+    ],
+    "track_b_engineering": [
+        "Designed and scripted ETL pipelines and schema validation logic to automate high-volume data reconciliation."
+    ]
+}
+
+def load_resume_bullets_bank() -> dict:
+    """Loads the pre-approved resume bullet pools from disk. Falls back to a minimal safe stub on
+    any failure so a missing/corrupt resume_bullets_bank.json never crashes resume compilation.
+    """
+    try:
+        with open(RESUME_BULLETS_BANK_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return _FALLBACK_RESUME_BULLETS_BANK
+
+RESUME_BULLETS_BANK = load_resume_bullets_bank()
+
+# Maps resume_engine.py's "a"/"b" track keys to resume_bullets_bank.json's descriptive pool names.
+TRACK_BULLET_POOL_KEYS = {"a": "track_a_wealth_ops", "b": "track_b_engineering"}
+
 # Persona framing only (subtitle/keywords/skills prose) - every skill named here must already
 # exist in EVIDENCE_BANK["technical_skills"]; factual content (jobs, dates, bullets) lives in the bank.
 TRACKS = {
@@ -73,13 +100,14 @@ TRACKS = {
 def filter_ats_bullets(dynamic_bullets: list, track: str = "a") -> list:
     """Grounds Gemini's ats_bullets against the Evidence Bank before they ever reach the PDF:
     drops any bullet containing a banned buzzword, and drops any bullet that isn't itself
-    pre-approved AND doesn't reference at least one known technical_skills term (i.e. it would
-    otherwise be an unverifiable/hallucinated claim). Backfills with pre-approved bullets if
-    Gemini's output was empty or fully rejected, so the resume never renders fewer than 2 bullets.
+    pre-approved (per resume_bullets_bank.json) AND doesn't reference at least one known
+    technical_skills term (i.e. it would otherwise be an unverifiable/hallucinated claim).
+    Backfills with pre-approved bullets if Gemini's output was empty or fully rejected, so the
+    resume never renders fewer than 2 bullets.
     """
     track_key = str(track or "a").lower()
-    approved_pool = EVIDENCE_BANK.get("pre_approved_bullets", {}).get(track_key) \
-        or EVIDENCE_BANK.get("pre_approved_bullets", {}).get("a", [])
+    pool_key = TRACK_BULLET_POOL_KEYS.get(track_key, TRACK_BULLET_POOL_KEYS["a"])
+    approved_pool = RESUME_BULLETS_BANK.get(pool_key) or RESUME_BULLETS_BANK.get(TRACK_BULLET_POOL_KEYS["a"], [])
     known_skills = [str(s).lower() for s in EVIDENCE_BANK.get("technical_skills", [])]
     banned = [str(w).lower() for w in EVIDENCE_BANK.get("banned_words", [])]
     approved_lower = [str(b).strip().lower() for b in approved_pool]

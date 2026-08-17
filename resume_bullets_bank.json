@@ -1,0 +1,23 @@
+{
+  "track_a_wealth_ops": [
+    "Reconciled institutional wealth data across custodial platforms, resolving variances to maintain ledger accuracy for client accounts.",
+    "Drafted SEC Form D and Regulation Crowdfunding filings to support SEC and FinCEN compliance for a blockchain-based real estate tokenization platform.",
+    "Architected regulatory infrastructure for real-world asset (RWA) tokenization, translating legal requirements into operational data controls.",
+    "Analyzed corporate integration concepts and drafted deal structure breakdowns to support transaction evaluation.",
+    "Navigated Schwab Advisor Center (SAC) and Fidelity Wealthscape to service wealth management accounts and support operational workflows.",
+    "Performed variance analysis on institutional account data to identify and escalate discrepancies before they reached client-facing reporting.",
+    "Supported wealth operations workflows for a fast-growing Detroit-based startup, including account servicing and data intake.",
+    "Maintained HubSpot CRM records to track compliance documentation and client relationship data across active deals."
+  ],
+  "track_b_engineering": [
+    "Built an automated Python job search pipeline that scrapes, filters, and scores job listings against structured criteria.",
+    "Designed a custom Telegram CRM engine using Flask routing and webhook event handling to manage job and contact pipelines in real time.",
+    "Implemented SQLite with WAL (Write-Ahead Logging) mode enabled to support concurrent reads/writes without blocking pipeline threads.",
+    "Engineered ETL pipelines to normalize and load job listing data into a structured SQLite schema for downstream automation.",
+    "Integrated Google Apps Script with Google Sheets to synchronize CRM data schemas between the backend and spreadsheet-based tracking.",
+    "Automated data intake workflows using Python scripts to reduce manual entry across job search and CRM tracking systems.",
+    "Built REST API and Telegram webhook integrations to trigger real-time CRM updates from inbound messages and events.",
+    "Designed structured JSON schemas to standardize data intake and validation across the automation pipeline."
+  ]
+}
+
