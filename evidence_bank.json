@@ -1,0 +1,136 @@
+{
+  "identity": {
+    "name": "Kevin Miller",
+    "email": "kjmiller406@gmail.com",
+    "phone": "248-709-6326",
+    "location": "Detroit, MI",
+    "website": "montelattice.com",
+    "linkedin": "linkedin.com/in/kevinmiller"
+  },
+  "experience": [
+    {
+      "title": "Wealth Operations Intern",
+      "company": "Signal Advisors",
+      "location": "Detroit, MI",
+      "start": "06/2026",
+      "end": "Present",
+      "bullets": [
+        "Support wealth operations workflows for a fast-growing downtown Detroit startup, focused on data reconciliation and account servicing.",
+        "Automate recurring data intake and reporting tasks using Python to reduce manual processing time."
+      ]
+    },
+    {
+      "title": "Compliance Lead",
+      "company": "40 Acres App",
+      "location": "Detroit, MI",
+      "start": "04/2026",
+      "end": "Present",
+      "bullets": [
+        "Architect regulatory infrastructure for blockchain-based real estate and real-world asset (RWA) tokenization.",
+        "Draft SEC Form D filings and Regulation Crowdfunding documentation for SEC and FinCEN compliance.",
+        "Design operational plumbing for digital asset ownership and institutional data validation."
+      ]
+    },
+    {
+      "title": "Total Rewards Finance Intern",
+      "company": "ABC Technologies",
+      "location": "Southfield, MI",
+      "start": "05/2024",
+      "end": "08/2024",
+      "bullets": [
+        "Performed high-volume reconciliation of 500+ retirement accounts, validating ledger accuracy and resolving discrepancies.",
+        "Prepared and maintained supporting schedules for variance analysis and recurring internal audit reports.",
+        "Built and automated Excel models to streamline data intake workflows and cut manual processing cycles."
+      ]
+    }
+  ],
+  "education": [
+    {
+      "school": "Hope College",
+      "degree": "B.A. Business (Finance), B.A. Political Science",
+      "location": "Holland, MI",
+      "start": "08/2022",
+      "end": "05/2026",
+      "credentials": [
+        "Series 65 Candidate",
+        "Securities Industry Essentials (SIE)",
+        "Schwab Limited Power of Attorney (LPOA)",
+        "Bloomberg Market Concepts (BMC)"
+      ]
+    }
+  ],
+  "technical_skills": [
+    "Python",
+    "SQLite (WAL mode)",
+    "Flask",
+    "Telegram Bot API Webhooks",
+    "Schwab Advisor Center (SAC)",
+    "Fidelity Wealthscape",
+    "Salesforce",
+    "Advanced Excel",
+    "Power BI (ETL/Modeling)",
+    "REST APIs",
+    "JSON Schema Design",
+    "HubSpot CRM",
+    "DocuSign",
+    "SQL",
+    "Process Automation"
+  ],
+  "voice_and_tone": {
+    "tone": "Professional yet grounded, low-pressure, conversational",
+    "sentence_style": "Short, direct sentences. Avoid stacked subordinate clauses.",
+    "guidance": [
+      "Sound like a real person writing a quick note, not a marketing brochure.",
+      "State facts plainly - let the achievement carry the weight, not the adjective.",
+      "Keep outreach low-pressure: invite a conversation, never pressure or oversell.",
+      "Every sentence should carry real information - no filler, no hype."
+    ]
+  },
+  "banned_words": [
+    "leverage",
+    "leveraging",
+    "synergy",
+    "synergize",
+    "seamless",
+    "paradigm",
+    "passionate",
+    "spearheaded",
+    "results-driven",
+    "cutting-edge",
+    "hustle",
+    "dynamic",
+    "go-getter",
+    "rockstar",
+    "ninja",
+    "game-changer",
+    "value-add",
+    "circle back",
+    "touch base",
+    "best-in-class"
+  ],
+  "pre_approved_bullets": {
+    "a": [
+      "Reconciled high-volume data variances and mapped ownership structures to establish risk escalation logic.",
+      "Automated data extraction and operational compliance workflows using Python and structured API schemas.",
+      "Performed high-volume reconciliation of 500+ retirement accounts, validating ledger accuracy and resolving discrepancies.",
+      "Prepared supporting schedules for variance analysis and recurring internal audit reports.",
+      "Built and automated Excel models to streamline data intake workflows and cut manual processing cycles.",
+      "Drafted SEC Form D and Regulation Crowdfunding filings supporting SEC and FinCEN compliance requirements.",
+      "Designed operational controls for digital asset ownership and institutional data validation on a blockchain-based RWA platform.",
+      "Supported wealth operations data reconciliation and account servicing for a downtown Detroit fintech startup."
+    ],
+    "b": [
+      "Designed and scripted ETL pipelines and schema validation logic to automate high-volume data reconciliation.",
+      "Built REST API integrations and structured data intake schemas to replace manual compliance workflows.",
+      "Built a Flask-based automation backend with SQLite WAL-mode concurrency and Telegram webhook integration.",
+      "Automated AI-assisted data extraction and compliance validation workflows using Python and structured API schemas.",
+      "Engineered a durable outbox pattern with SQLite-backed retry queues for reliable webhook-driven CRM writes.",
+      "Built Power BI ETL models to support recurring variance analysis and audit reporting.",
+      "Integrated Salesforce and HubSpot CRM data pipelines with custom Python scripting to reduce manual data entry."
+    ]
+  },
+  "evergreen_highlights": [
+    { "label": "Institutional Data Controls", "text": "Reconciled $250k in ledger variances; automated AI extraction and compliance validation for legal workflows." },
+    { "label": "Regulatory Translation", "text": "Built operational onboarding workflows bridging legal compliance with structured due diligence." }
+  ]
+}

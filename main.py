@@ -38,6 +38,50 @@ GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 DB_PATH = "jobs_cache.db"
+EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
+
+# Minimal safe fallback if evidence_bank.json is ever missing/corrupt - keeps AI prompts alive.
+_FALLBACK_EVIDENCE_BANK = {
+    "identity": {"name": "Kevin Miller", "location": "Detroit, MI"},
+    "experience": [], "technical_skills": [], "banned_words": [],
+    "voice_and_tone": {"tone": "professional, grounded, low-pressure", "guidance": []}
+}
+
+def load_evidence_bank():
+    """Loads the centralized fact bank (experience, skills, tone, banned words) used to ground
+    every AI-generated output. Falls back to a minimal stub on any read/parse failure.
+    """
+    try:
+        with open(EVIDENCE_BANK_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Evidence Bank load failed, using fallback stub: {e}")
+        return _FALLBACK_EVIDENCE_BANK
+
+EVIDENCE_BANK = load_evidence_bank()
+
+def build_evidence_context_block():
+    """Renders a compact, prompt-ready summary of the Evidence Bank for injection into every
+    Gemini prompt - the single source of truth for facts, tone, and forbidden language.
+    """
+    identity = EVIDENCE_BANK.get("identity", {})
+    experience_lines = "\n".join(
+        f"- {job.get('title')} at {job.get('company')} ({job.get('start')} - {job.get('end')})"
+        for job in EVIDENCE_BANK.get("experience", [])
+    )
+    skills_line = ", ".join(EVIDENCE_BANK.get("technical_skills", []))
+    tone = EVIDENCE_BANK.get("voice_and_tone", {})
+    tone_lines = "\n".join(f"- {g}" for g in tone.get("guidance", []))
+    banned_line = ", ".join(EVIDENCE_BANK.get("banned_words", []))
+    return (
+        f"CANDIDATE: {identity.get('name', 'Kevin Miller')} ({identity.get('location', 'Detroit, MI')})\n"
+        f"VERIFIED EXPERIENCE:\n{experience_lines}\n"
+        f"VERIFIED TECHNICAL SKILLS: {skills_line}\n"
+        f"VOICE & TONE ({tone.get('tone', 'professional, grounded, low-pressure')}):\n{tone_lines}\n"
+        f"BANNED WORDS (never use): {banned_line}"
+    )
+
+EVIDENCE_CONTEXT_BLOCK = build_evidence_context_block()
 
 # Inbound Email Anti-Spam Gatekeeper: 10 pre-filter shield parameters (raw CSV/string env values,
 # parsed lazily in passes_email_prefilter() to avoid depending on helpers defined later in the file)
@@ -717,15 +761,17 @@ def calculate_followup_interval(priority_score):
         return 14
 
 def sanitize_text(text):
-    """Strip corporate fluff while preserving apostrophes, hyphens, and paragraph breaks."""
+    """Strip corporate fluff/AI clichés while preserving apostrophes, hyphens, and paragraph breaks.
+    Buzzword list is sourced from evidence_bank.json's banned_words so it stays centrally maintained.
+    """
     if not text:
         return ""
     cleaned = str(text)
     cleaned = re.sub(r'[\u2014\u2013]', "", cleaned)  # em-dash / en-dash only
     cleaned = re.sub(r'[;:]', "", cleaned)
-    buzzwords = ["leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm"]
+    buzzwords = EVIDENCE_BANK.get("banned_words", []) or ["leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm"]
     for bw in buzzwords:
-        cleaned = re.sub(rf'\b{bw}\b', "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(rf'\b{re.escape(bw)}\b', "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\b(\w+),\s*(\w+),\s*and\s*(\w+)\b', r'\1 and \2', cleaned)
     cleaned = re.sub(r'[ \t]+', ' ', cleaned)  # collapse horizontal whitespace only
     cleaned = re.sub(r' *\n *', '\n', cleaned)
@@ -737,8 +783,25 @@ def enforce_sentence_limit(text, max_sentences):
     sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
     return ' '.join(sentences[:max_sentences])
 
-def generate_cold_email(job_title, company_name, core_exp="wealth ops and process automation"):
+def get_current_role_blurb():
+    """Returns (core_exp_phrase, full_sentence) for the most recent Evidence Bank experience entry,
+    so outreach copy never drifts from the same facts the resume renders.
+    """
+    experience = EVIDENCE_BANK.get("experience", [])
+    if not experience:
+        return "wealth ops and process automation", "I am currently working in wealth operations and process automation."
+    current = experience[0]
+    title = current.get("title", "")
+    company = current.get("company", "")
+    location = current.get("location", "")
+    core_exp = f"{title.lower()} and process automation" if title else "wealth ops and process automation"
+    sentence = f"I am currently working as a {title} at {company}" + (f" in {location}" if location else "") + "."
+    return core_exp, sentence
+
+def generate_cold_email(job_title, company_name, core_exp=None):
     """Full cold email: greeting, strict 2-sentence body, sign-off as separate paragraphs."""
+    if not core_exp:
+        core_exp, _ = get_current_role_blurb()
     s1 = f"I saw the {job_title} role at {company_name} and wanted to highlight my background in {core_exp}."
     s2 = "Would you be open to a brief 5 minute call next week to discuss alignment?"
     body = enforce_sentence_limit(f"{sanitize_text(s1)} {sanitize_text(s2)}", 2)
@@ -746,8 +809,9 @@ def generate_cold_email(job_title, company_name, core_exp="wealth ops and proces
 
 def generate_warm_email(note_context=""):
     """Full warm email: greeting, strict 3-sentence body, sign-off as separate paragraphs."""
+    _, current_role_sentence = get_current_role_blurb()
     s1 = sanitize_text(note_context) if note_context else "I hope you have been doing well."
-    s2 = "I am currently interning in wealth ops at Signal Advisors, a fast growing startup in downtown Detroit."
+    s2 = current_role_sentence
     s3 = "I am wondering what you have been up to lately, and would love to reconnect over coffee or a quick call if you have time."
     body = enforce_sentence_limit(f"{s1} {s2} {s3}", 3)
     return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
@@ -764,16 +828,22 @@ def format_email_block(email_text):
 # ==============================================================================
 # 4. HELPER FUNCTIONS & PIPELINE UTILITIES
 # ==============================================================================
-SYSTEM_PROMPT = """You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
+SYSTEM_PROMPT = f"""You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
 High Priority Skills: Python, SQL, Salesforce, Excel, Schwab SAC, Fidelity Wealthscape, DocuSign, Process Automation.
 Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles, retail bank tellers, CPA tracks, Senior/Lead/Manager roles.
+
+EVIDENCE BANK (the only source of truth for this candidate's real background):
+{EVIDENCE_CONTEXT_BLOCK}
+
+NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. Never invent skills, employers, or experiences not listed there. Avoid all banned words. Output must sound like a direct, human communicator - short sentences, no corporate hype.
+
 Evaluate the job description and respond ONLY with a JSON object containing:
-{
+{{
 "score": <integer between 1 and 100 representing fit signal>,
 "reason": "<1-sentence concise explanation of why this role fits or does not fit>",
 "linkedin_note": "<a personalized LinkedIn connection note tailored to this specific role and company, strictly under 300 characters, ideally under 280>",
 "ats_bullets": ["<high-impact quantified resume bullet #1 tailored to this job description's keywords and operations/systems focus>", "<high-impact quantified resume bullet #2>"]
-}"""
+}}"""
 
 def send_health_alert(error_msg):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -1258,7 +1328,7 @@ def evaluate_job_with_gemini(job):
                 res_data = json.loads(cleaned_text)
                 raw_score = int(res_data.get("score", 0))
                 reason = res_data.get("reason", "N/A")
-                linkedin_note = str(res_data.get("linkedin_note", "") or "")[:300]
+                linkedin_note = sanitize_text(str(res_data.get("linkedin_note", "") or ""))[:300]
                 ats_bullets = res_data.get("ats_bullets", [])
                 if not isinstance(ats_bullets, list):
                     ats_bullets = []
@@ -1318,17 +1388,19 @@ def generate_interview_prep(company, job_title, job_description=""):
 
 def generate_elevator_pitch(company, job_title):
     """Tight 3-sentence elevator pitch tailored to a company/role; safe static fallback if Gemini is unavailable."""
+    core_exp, _ = get_current_role_blurb()
     fallback = (
-        f"Hi, I'm Kevin - I work in wealth ops and process automation, building Python and SQL tools that cut manual reconciliation time. "
+        f"Hi, I'm Kevin - I work in {core_exp}, building Python and SQL tools that cut manual reconciliation time. "
         f"I've been following {company or 'your team'} and think my background lines up well with {job_title or 'the operations work'} you're doing. "
         "Would love to grab 15 minutes to see where I could help."
     )
     if not GEMINI_API_KEY:
-        return fallback
+        return sanitize_text(fallback)
     prompt = (
         f"Company: {company or 'N/A'}\nRole: {job_title or 'N/A'}\n\n"
-        "Write a tight 3-sentence conversational 30-second elevator pitch for an early-career candidate with a "
-        "Python/SQL/Salesforce/process-automation/wealth-ops background, tailored to this company and role. "
+        f"EVIDENCE BANK (only source of truth for this candidate - never invent facts outside it):\n{EVIDENCE_CONTEXT_BLOCK}\n\n"
+        "Write a tight 3-sentence conversational 30-second elevator pitch for this candidate, tailored to this company "
+        "and role, using ONLY the Evidence Bank above. Avoid all banned words. Sound like a direct human communicator. "
         'Respond ONLY with JSON: {"pitch": "<3-sentence pitch>"}'
     )
     raw_text = call_gemini_api(prompt)
@@ -1338,7 +1410,7 @@ def generate_elevator_pitch(company, job_title):
             data = json.loads(cleaned)
             pitch = data.get("pitch", "")
             if pitch:
-                return str(pitch)
+                return sanitize_text(str(pitch))
         except Exception as e:
             logging.error(f"Elevator pitch parse failure: {e}")
     return fallback
