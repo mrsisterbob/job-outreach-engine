@@ -1121,6 +1121,12 @@ def build_hiring_manager_dork(company_name, job_title=""):
     query = f'site:linkedin.com/in "{clean_comp}" ("Head of Operations" OR "Director of Operations" OR "Operations Manager" OR "VP of Operations" OR "COO")'
     return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
 
+def build_recruiter_dork(company_name):
+    """Google dork targeting in-house talent acquisition for the company on LinkedIn."""
+    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    query = f'site:linkedin.com/in "{clean_comp}" ("Technical Recruiter" OR "Talent Acquisition" OR "Senior Recruiter" OR "Corporate Recruiter")'
+    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+
 def build_alumni_dork(company_name, school="Hope College"):
     """Google dork to surface shared-alma-mater employees at a target company on LinkedIn."""
     clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
@@ -2335,6 +2341,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     apollo_url = html.escape(build_apollo_url(company), quote=True)
     linkedin_url = html.escape(build_linkedin_url(company), quote=True)
     dork_url = html.escape(build_hiring_manager_dork(company, job.get("job_title")), quote=True)
+    recruiter_dork_url = html.escape(build_recruiter_dork(company), quote=True)
     alumni_url = html.escape(build_alumni_dork(company), quote=True)
     # Truncate raw dynamic content BEFORE HTML-escaping/tag-wrapping so tags never get cut mid-string
     reason_safe = str(reason or "")[:300]
@@ -2358,8 +2365,13 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"<a href='{apply_link}'>Direct Apply</a> | "
         f"<a href='{apollo_url}'>Apollo Operations Leads</a> | "
         f"<a href='{linkedin_url}'>LinkedIn Leadership Search</a> | "
-        f"<a href='{dork_url}'>🎯 Find Direct Hiring Manager (Google Dork)</a> | "
         f"<a href='{alumni_url}'>🎓 Alumni Connections</a>\n\n"
+        f"🎯 <b>Direct Decision Makers:</b>\n"
+        f"  👔 <a href='{dork_url}'>Search Director / VP of Ops (Hiring Manager)</a> |\n"
+        f"  🤝 <a href='{recruiter_dork_url}'>Search Senior In-House Recruiter</a>\n\n"
+        f"🧭 <b>Dual-Path Outreach Strategy:</b>\n"
+        f"  👔 <i>To Director/VP:</i> Lead with process automation, efficiency gains, and operational rigor.\n"
+        f"  🤝 <i>To Recruiter:</i> Confirm application submission, reference the specific role, request a brief phone screen.\n\n"
         f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
         f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note_safe) if linkedin_note_safe else 'N/A'}</code>\n\n"
         f"📄 <b>Tailored ATS Resume Bullets:</b>\n<code>{html.escape(bullets_block)}</code>\n\n"
