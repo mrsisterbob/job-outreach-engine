@@ -184,10 +184,12 @@ def compute_description_simhash(text: str) -> str:
     return hashlib.md5("".join(sorted(shingles)).encode()).hexdigest()
 
 
-def resolve_email_waterfall(full_name, company_name, domain_hint=None):
+def resolve_email_waterfall(full_name, company_name, domain_hint=None, on_provider_attempt=None):
     """Cascading email discovery for a named contact: Hunter.io -> Anymail Finder -> deterministic
     guess. Tries each configured provider in order and returns the first hit; falls back to a
     flagged best-guess address if neither provider is configured or finds a match.
+    on_provider_attempt(provider_name), if given, fires once per completed provider request
+    (whether or not it found an email) so the caller can track local monthly usage in its own DB.
     """
     domain = domain_hint or (re.sub(r'\s+', '', str(company_name or '').lower()) + ".com")
     parts = str(full_name or "").strip().split()
@@ -202,6 +204,8 @@ def resolve_email_waterfall(full_name, company_name, domain_hint=None):
                 params={"domain": domain, "first_name": first, "last_name": last, "api_key": hunter_key},
                 timeout=10
             )
+            if on_provider_attempt:
+                on_provider_attempt("hunter")
             email = res.json().get("data", {}).get("email")
             if email:
                 return email
@@ -217,6 +221,8 @@ def resolve_email_waterfall(full_name, company_name, domain_hint=None):
                 headers={"Authorization": f"Bearer {anymail_key}"},
                 timeout=10
             )
+            if on_provider_attempt:
+                on_provider_attempt("anymail")
             data = res.json()
             email = data.get("email") or (data.get("results") or {}).get("email")
             if email:
