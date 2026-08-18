@@ -227,6 +227,19 @@ def test_resolve_email_waterfall_uses_hunter_when_configured(monkeypatch):
     assert result == "jane@acmecorp.com"
 
 
+def test_resolve_email_waterfall_fires_on_provider_attempt_callback(monkeypatch):
+    monkeypatch.setenv("HUNTER_API_KEY", "test-key")
+
+    class FakeResponse:
+        def json(self):
+            return {"data": {"email": "jane@acmecorp.com"}}
+
+    monkeypatch.setattr(pu.requests, "get", lambda *a, **k: FakeResponse())
+    attempts = []
+    pu.resolve_email_waterfall("Jane Doe", "Acme Corp", on_provider_attempt=attempts.append)
+    assert attempts == ["hunter"]
+
+
 def test_resolve_email_waterfall_falls_through_to_anymail(monkeypatch):
     monkeypatch.setenv("HUNTER_API_KEY", "test-key")
     monkeypatch.setenv("ANYMAIL_API_KEY", "test-key-2")

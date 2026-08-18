@@ -348,6 +348,13 @@ def init_db():
             notes_logged INTEGER DEFAULT 0
         )""")
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_usage_counters (
+            month_key TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            call_count INTEGER DEFAULT 0,
+            PRIMARY KEY (month_key, provider)
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS crm_outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             payload_json TEXT NOT NULL,
@@ -784,6 +791,40 @@ def get_lifetime_activity_totals():
     except Exception as e:
         logging.error(f"DB Lifetime Activity Error: {e}")
         return {"drafts_staged": 0, "applied_count": 0, "notes_logged": 0}
+
+def increment_api_usage_counter(provider):
+    """Bump this calendar month's local call counter for a paid email-lookup provider
+    (e.g. "hunter", "anymail"). This is a local approximation for /health visibility only -
+    the provider's own dashboard is the authoritative quota source.
+    """
+    month_key = datetime.now().strftime("%Y-%m")
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO api_usage_counters (month_key, provider, call_count) VALUES (?, ?, 1) "
+                "ON CONFLICT(month_key, provider) DO UPDATE SET call_count = call_count + 1",
+                (month_key, provider)
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"DB API Usage Counter Error ({provider}): {e}")
+        return False
+
+def get_monthly_api_usage():
+    """Return {"hunter": n, "anymail": n} local call counts for the current calendar month."""
+    month_key = datetime.now().strftime("%Y-%m")
+    counts = {"hunter": 0, "anymail": 0}
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT provider, call_count FROM api_usage_counters WHERE month_key = ?", (month_key,))
+            for provider, call_count in cursor.fetchall():
+                counts[provider] = call_count
+    except Exception as e:
+        logging.error(f"DB API Usage Read Error: {e}")
+    return counts
 
 def calculate_active_day_streak():
     """Count consecutive active days (any activity logged) ending today or yesterday."""
@@ -3083,7 +3124,7 @@ def process_webhook_payload_async(data):
             domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
             if mapping.get("contact_name"):
                 # Named CRM contact (not a generic job-alert row) - resolve a real person's email via the waterfall
-                target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint)
+                target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint, on_provider_attempt=increment_api_usage_counter)
             else:
                 target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
@@ -3418,11 +3459,15 @@ def handle_fast_path_command(chat_id, text, msg):
             wal_mode = f"error: {e}"
         db_elapsed_ms = round((time.time() - db_check_start) * 1000, 2)
         uptime_str = str(timedelta(seconds=int(time.time() - APP_START_TIME)))
+        api_usage = get_monthly_api_usage()
+        month_label = datetime.now().strftime("%B %Y")
         sent_id = send_telegram_message(
             chat_id,
             f"🟢 <b>System Health:</b> Operational\n"
             f"💾 <b>SQLite Mode:</b> {html.escape(str(wal_mode)).upper()} ({db_elapsed_ms}ms)\n"
-            f"⏱️ <b>Uptime:</b> {uptime_str}"
+            f"⏱️ <b>Uptime:</b> {uptime_str}\n"
+            f"📇 <b>Email Waterfall Usage ({month_label}, local count):</b>\n"
+            f"  Hunter.io: {api_usage['hunter']} | Anymail Finder: {api_usage['anymail']}"
         )
         logging.info(f"/health command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
         return True
