@@ -250,6 +250,7 @@ function doPost(e) {
           title: title,
           email: row[3] || "",
           priority: rowPriority,
+          raw_priority: row[4] || "",
           note: row[8],
           next_followup: formatFollowupDate(row[6])
         });
