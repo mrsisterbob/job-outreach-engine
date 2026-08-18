@@ -747,6 +747,24 @@ def get_metric_count(event_type):
         logging.error(f"DB Metric Count Error ({event_type}): {e}")
         return 0
 
+def get_rolling_metric_counts(days=7):
+    """Return metric counts recorded during the trailing `days` window, including zero-count keys."""
+    event_types = ("listing_discovered", "ai_screened", "gmail_draft_staged", "applied", "interview_set")
+    counts = {event_type: 0 for event_type in event_types}
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT event_type, COUNT(*) FROM pipeline_metrics "
+                "WHERE timestamp >= datetime('now', ?) AND event_type IN (?, ?, ?, ?, ?) GROUP BY event_type",
+                (f"-{days} days", *event_types)
+            )
+            for event_type, count in cursor.fetchall():
+                counts[event_type] = count
+    except Exception as e:
+        logging.error(f"Rolling Metric Read Error ({days}d): {e}")
+    return counts
+
 DAILY_ACTIVITY_COLUMNS = ("drafts_staged", "applied_count", "notes_logged")
 
 def log_daily_activity(activity_type):
@@ -1864,7 +1882,7 @@ def get_gmail_access_token():
         logging.error(f"Gmail OAuth Token Refresh Exception: {e}")
         return None
 
-def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note=""):
+def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note="", custom_body=None, custom_subject=None):
     """Create Gmail draft with 24h dedup check and OAuth token expiry handling.
     Returns (success, message, draft_id) - draft_id is populated on success or when a duplicate is found.
     """
@@ -1872,7 +1890,10 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     if missing_vars:
         return False, f"Missing Env Vars: {', '.join(missing_vars)}", None
 
-    if is_warm:
+    if custom_body is not None:
+        body_content = custom_body
+        subject = custom_subject or f"Following up - {company_name}"
+    elif is_warm:
         body_content = generate_warm_email(custom_note)
         subject = f"Reconnecting - {company_name}"
     else:
@@ -2235,41 +2256,81 @@ def start_backup_scheduler():
     )
     logging.info("[BACKUP] Weekly SQLite backup scheduled: Sundays 03:00 local")
 
+def send_tuesday_pipeline_executive_hub(chat_id):
+    """Send Tuesday's weekly operations hub and all overdue records in Telegram-safe chunks."""
+    weekly = get_rolling_metric_counts(days=7)
+    golden_ratio = (weekly["interview_set"] / weekly["gmail_draft_staged"] * 100) if weekly["gmail_draft_staged"] else 0.0
+    api_usage = get_monthly_api_usage()
+    ats_count = len(safe_list(get_filter("ats_company_slugs", [])))
+    overdue = get_overdue_followups()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    hub = (
+        f"📈 <b>Tuesday Pipeline Executive &amp; Batch Hub ({today_str})</b>\n\n"
+        f"<b>Rolling 7-Day Pipeline:</b>\n"
+        f"• Discovered: {weekly['listing_discovered']} | AI Screened: {weekly['ai_screened']}\n"
+        f"• Drafted: {weekly['gmail_draft_staged']} | Applied: {weekly['applied']} | Interviews: {weekly['interview_set']}\n"
+        f"• <b>Golden Ratio:</b> {golden_ratio:.1f}% (interviews / staged drafts)\n\n"
+        f"<b>Coverage &amp; Enrichment:</b>\n"
+        f"• ATS boards: {ats_count}\n"
+        f"• Hunter.io: {api_usage['hunter']} | Anymail Finder: {api_usage['anymail']} (month-to-date local calls)\n\n"
+        f"⚠️ <b>Overdue:</b> {len(overdue)} records\n"
+        f"<code>/sendall</code> Draft bumps + set all eligible records to +14d\n"
+        f"<code>/snoozeall 7</code> Move all overdue follow-ups by N days"
+    )
+    send_telegram_message(chat_id, hub)
+    if not overdue:
+        return
+
+    lines = ["⚠️ <b>All Overdue Records (next follow-up ASC):</b>"]
+    for record in overdue:
+        tab = html.escape(record.get("sheet_tab") or "Unknown")
+        company = html.escape(str(record.get("company") or "N/A"))
+        name = html.escape(str(record.get("name") or ""))
+        due = html.escape(str(record.get("next_followup") or "N/A"))
+        lines.append(f"• <b>{company}</b>{f' - {name}' if name else ''} | {tab} | due {due}")
+
+    chunk = ""
+    for line in lines:
+        if chunk and len(chunk) + len(line) + 1 > 3900:
+            send_telegram_message(chat_id, chunk)
+            chunk = ""
+        chunk = f"{chunk}\n{line}".strip()
+    if chunk:
+        send_telegram_message(chat_id, chunk)
+
+def send_daily_standup(chat_id):
+    """Send the compact 08:30 standup used on every non-Tuesday morning."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    activity = get_daily_activity(today_str)
+    streak = calculate_active_day_streak()
+    overdue_count = len(get_overdue_followups())
+    digest = (
+        f"🌅 <b>Daily Standup ({today_str})</b>\n\n"
+        f"🔥 <b>Active Streak:</b> {streak} days\n"
+        f"🎯 <b>Today's Staged Goal:</b> {activity['drafts_staged']} / 5\n"
+        f"⚠️ <b>Overdue Actions:</b> {overdue_count}\n\n"
+        f"Run <code>/s</code> to review overdue contacts or <code>/t</code> to trigger the search pipeline."
+    )
+    health_warnings = check_system_health()
+    if health_warnings:
+        digest += "\n\n🚨 <b>Config Health Warnings:</b>\n" + "\n".join(f"• {html.escape(w)}" for w in health_warnings)
+    send_telegram_message(chat_id, digest)
+
 def morning_digest_loop():
-    """Dispatches a standup digest daily at 08:30 AM local time."""
+    """Dispatch Tuesday's executive hub or the compact daily standup at 08:30 local time."""
     while True:
         now = datetime.now()
         target_time = now.replace(hour=8, minute=30, second=0, microsecond=0)
         if now >= target_time:
             target_time += timedelta(days=1)
 
-        sleep_seconds = (target_time - now).total_seconds()
-        time.sleep(sleep_seconds)
-
+        time.sleep((target_time - now).total_seconds())
         try:
             if TELEGRAM_CHAT_ID:
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                activity = get_daily_activity(today_str)
-                streak = calculate_active_day_streak()
-                cw_cards = fetch_networking_cards("CW", qty=10)
-                tc_cards = fetch_networking_cards("TC", qty=10)
-
-                overdue = [
-                    c for c in (cw_cards + tc_cards)
-                    if c.get("next_followup") and c.get("next_followup") <= today_str
-                ]
-
-                digest = (
-                    f"🌅 <b>Good Morning! Daily Outreach Brief ({today_str})</b>\n\n"
-                    f"🔥 <b>Active Streak:</b> {streak} Days\n"
-                    f"🎯 <b>Today's Staged Goal:</b> {activity['drafts_staged']} / 5\n"
-                    f"⚠️ <b>Overdue Actions:</b> {len(overdue)} contacts requiring follow-up\n\n"
-                    f"Run <code>/s</code> to review overdue contacts or <code>/t</code> to trigger the search pipeline."
-                )
-                health_warnings = check_system_health()
-                if health_warnings:
-                    digest += "\n\n🚨 <b>Config Health Warnings:</b>\n" + "\n".join(f"• {html.escape(w)}" for w in health_warnings)
-                send_telegram_message(TELEGRAM_CHAT_ID, digest)
+                if datetime.now().weekday() == 1:  # Tuesday
+                    send_tuesday_pipeline_executive_hub(TELEGRAM_CHAT_ID)
+                else:
+                    send_daily_standup(TELEGRAM_CHAT_ID)
         except Exception as e:
             logging.error(f"Morning Digest Dispatch Error: {e}")
 
@@ -2378,10 +2439,56 @@ def fetch_networking_cards(target_code="CW", qty=2):
     try:
         if res.status_code == 200:
             leads = res.json().get("followups", [])
-            return leads[:qty]
+            return leads if qty is None else leads[:qty]
     except Exception as e:
         logging.error(f"Error fetching networking cards: {e}")
     return []
+
+def get_overdue_followups():
+    """Return every overdue Carmen Warm and Tetiana Cold record sorted by next_followup ASC."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    overdue = []
+    for target_code, tab_name in (("CW", "Carmen Warm"), ("TC", "Tetiana Cold")):
+        for record in fetch_networking_cards(target_code, qty=None):
+            next_followup = str(record.get("next_followup") or "")
+            if next_followup and next_followup <= today_str:
+                overdue.append({**record, "sheet_tab": tab_name})
+    return sorted(overdue, key=lambda record: str(record.get("next_followup") or ""))
+
+def process_overdue_batch(mode, snooze_days=7):
+    """Apply a batch follow-up action to every overdue record using the durable CRM outbox.
+    `sendall` drafts a personalized bump first and only advances rows whose draft was created or
+    already exists; `snoozeall` advances every overdue row without creating a draft.
+    """
+    overdue = get_overdue_followups()
+    next_followup = (datetime.now() + timedelta(days=snooze_days)).strftime("%Y-%m-%d")
+    result = {"total": len(overdue), "updated": 0, "drafted": 0, "skipped": 0}
+    for record in overdue:
+        if not record.get("sheet_uuid"):
+            result["skipped"] += 1
+            continue
+        if mode == "sendall":
+            email = str(record.get("email") or "").strip()
+            if not email or "[" in email:
+                result["skipped"] += 1
+                continue
+            draft_ok, draft_message, _ = create_gmail_draft(
+                to_email=email,
+                company_name=record.get("company") or "Target Firm",
+                job_title=record.get("title") or "Operations Specialist",
+                custom_body=generate_bump_email(record.get("name") or ""),
+                custom_subject=f"Following up - {record.get('company') or 'Target Firm'}"
+            )
+            if not draft_ok and draft_message != "Draft already exists in Gmail":
+                result["skipped"] += 1
+                continue
+            if draft_ok:
+                result["drafted"] += 1
+        if enqueue_crm_payload(build_crm_payload(
+            "update_snooze", sheet_uuid=record.get("sheet_uuid"), next_followup=next_followup
+        )):
+            result["updated"] += 1
+    return result, next_followup
 
 def edit_telegram_message(chat_id, message_id, text):
     """Edit an existing Telegram message in-place instead of sending a redundant new one."""
@@ -3448,6 +3555,9 @@ def process_webhook_payload_async(data):
                 "/prep - Interview talking points & reverse questions\n"
                 "/pitch - 30-second elevator pitch\n"
                 "/letter - Generate cover letter\n\n"
+                "<b>TUESDAY BATCH HUB:</b>\n"
+                "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
+                "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
@@ -3495,12 +3605,53 @@ def _run_pipeline_and_notify(chat_id, qty):
         logging.error(f"/t Background Pipeline Error: {e}")
         send_telegram_message(chat_id, f"❌ Pipeline error: {html.escape(str(e)[:200])}")
 
+def _run_overdue_batch_and_notify(chat_id, mode, snooze_days):
+    """Background target for the Tuesday batch-hub commands so webhook acknowledgement remains instant."""
+    try:
+        result, next_followup = process_overdue_batch(mode, snooze_days)
+        if mode == "sendall":
+            send_telegram_message(
+                chat_id,
+                f"✅ <b>Send-All Complete</b>\n"
+                f"• Overdue records found: {result['total']}\n"
+                f"• New bump drafts: {result['drafted']}\n"
+                f"• CRM follow-ups queued to {next_followup}: {result['updated']}\n"
+                f"• Skipped (missing/unverified email or draft failure): {result['skipped']}"
+            )
+        else:
+            send_telegram_message(
+                chat_id,
+                f"✅ <b>Snooze-All Complete</b>\n"
+                f"• Overdue records: {result['total']}\n"
+                f"• CRM follow-ups queued to {next_followup}: {result['updated']}"
+            )
+    except Exception as e:
+        logging.error(f"/{mode} batch error: {e}")
+        send_telegram_message(chat_id, f"❌ <b>Batch Error:</b> {html.escape(str(e)[:200])}")
+
 def handle_fast_path_command(chat_id, text, msg):
     """Directly executes /t, /search, /health, /efficiency, /streak, /daily, /draft with a guaranteed
     synchronous requests.post reply to the Telegram Bot API - fires immediately instead of waiting on
     a background thread so these core commands always produce a visible, instant response.
     Returns True if the command was handled.
     """
+    if text == "/sendall":
+        sent_id = send_telegram_message(chat_id, "⏳ <b>Send-All Started:</b> creating bump drafts and queueing +14-day follow-ups...")
+        logging.info(f"/sendall command acknowledged (chat_id={chat_id}, ack_message_id={sent_id})")
+        threading.Thread(target=_run_overdue_batch_and_notify, args=(chat_id, "sendall", 14), daemon=True).start()
+        return True
+
+    snooze_match = re.match(r"^/snoozeall(?:\s+(\d+))?$", text)
+    if snooze_match:
+        snooze_days = safe_int(snooze_match.group(1), 7)
+        if snooze_days < 1 or snooze_days > 365:
+            send_telegram_message(chat_id, "❌ <b>Usage:</b> <code>/snoozeall &lt;days 1-365&gt;</code>")
+            return True
+        sent_id = send_telegram_message(chat_id, f"⏳ <b>Snooze-All Started:</b> queueing overdue follow-ups to +{snooze_days} days...")
+        logging.info(f"/snoozeall command acknowledged (chat_id={chat_id}, days={snooze_days}, ack_message_id={sent_id})")
+        threading.Thread(target=_run_overdue_batch_and_notify, args=(chat_id, "snoozeall", snooze_days), daemon=True).start()
+        return True
+
     t_match = re.match(r"^/t(?:\s+(\d+))?$", text)
     if t_match:
         qty = safe_int(t_match.group(1), 2)
@@ -3592,7 +3743,11 @@ def handle_fast_path_command(chat_id, text, msg):
         comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
         title = job.get("job_title") or "Operations Specialist"
         is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
-        target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
+        domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
+        if mapping.get("contact_name"):
+            target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint, on_provider_attempt=increment_api_usage_counter)
+        else:
+            target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
         logging.info(f"/draft command handled directly: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
         ok, gmail_msg, draft_id = create_gmail_draft(to_email=target, company_name=comp, job_title=title, is_warm=is_warm)
         raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
