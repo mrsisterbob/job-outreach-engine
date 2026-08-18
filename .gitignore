@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local runtime state - never commit the live cache/backups or secrets
+jobs_cache.db
+jobs_cache.db-shm
+jobs_cache.db-wal
+backups/
+.env
+
+# Old CRM export snapshots referenced by manual test scripts
+Job_Outreach_CRM*.xlsx

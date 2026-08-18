@@ -8,3 +8,5 @@ gunicorn
 typst
 apscheduler
 websocket-client
+openpyxl
+pytest

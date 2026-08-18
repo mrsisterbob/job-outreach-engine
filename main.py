@@ -18,6 +18,13 @@ import requests
 from flask import Flask, jsonify, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 from resume_engine import compile_resume_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
+from pipeline_utils import (
+    build_apollo_url, build_linkedin_url, build_hiring_manager_dork, build_recruiter_dork,
+    build_alumni_dork, normalize_priority_value, calculate_followup_interval,
+    resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
+    generate_dedup_hash, generate_short_key, parse_posted_hours, get_age_badge,
+    extract_salary, extract_work_style, compute_description_simhash
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -32,6 +39,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL")
+CRM_SHARED_SECRET = os.environ.get("CRM_SHARED_SECRET")
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
@@ -39,6 +47,37 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 DB_PATH = "jobs_cache.db"
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
+
+def crm_get(params, timeout=10):
+    """GET against CRM_WEBHOOK_URL with the shared secret auto-attached. Returns a requests.Response
+    or None if CRM_WEBHOOK_URL is unset or the request raised. Centralizes CRM auth in one place -
+    defined early so startup-time callers (e.g. hydrate_filters_from_sheets via init_db()) can use it.
+    """
+    if not CRM_WEBHOOK_URL:
+        return None
+    merged_params = dict(params or {})
+    if CRM_SHARED_SECRET:
+        merged_params["secret"] = CRM_SHARED_SECRET
+    try:
+        return requests.get(CRM_WEBHOOK_URL, params=merged_params, timeout=timeout)
+    except Exception as e:
+        logging.error(f"CRM GET Error ({merged_params.get('action')}): {e}")
+        return None
+
+def crm_post(payload, timeout=10):
+    """POST against CRM_WEBHOOK_URL with the shared secret auto-attached. Returns a requests.Response
+    or None if CRM_WEBHOOK_URL is unset or the request raised. Centralizes CRM auth in one place.
+    """
+    if not CRM_WEBHOOK_URL:
+        return None
+    merged_payload = dict(payload or {})
+    if CRM_SHARED_SECRET:
+        merged_payload["secret"] = CRM_SHARED_SECRET
+    try:
+        return requests.post(CRM_WEBHOOK_URL, json=merged_payload, timeout=timeout)
+    except Exception as e:
+        logging.error(f"CRM POST Error ({merged_payload.get('action')}): {e}")
+        return None
 
 # Minimal safe fallback if evidence_bank.json is ever missing/corrupt - keeps AI prompts alive.
 _FALLBACK_EVIDENCE_BANK = {
@@ -417,12 +456,10 @@ def init_db():
 
 def hydrate_filters_from_sheets():
     """On startup, pull load_system_config from Sheets so local filters reflect any manual spreadsheet edits."""
-    if not CRM_WEBHOOK_URL:
+    res = crm_get({"action": "load_system_config"})
+    if not res or res.status_code != 200:
         return
     try:
-        res = requests.get(f"{CRM_WEBHOOK_URL}?action=load_system_config", timeout=10)
-        if res.status_code != 200:
-            return
         remote_filters = res.json().get("filters", {})
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -477,11 +514,10 @@ def set_filter(key, val):
             conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(val)))
             conn.commit()
         # Dual-write to Google Sheets System_Config tab
-        if CRM_WEBHOOK_URL:
-            try:
-                requests.post(CRM_WEBHOOK_URL, json={"action": "update_system_config", "key": key, "value": val}, timeout=5)
-            except Exception as e:
-                logging.error(f"System_Config dual-write failed ({key}): {e}")
+        try:
+            crm_post({"action": "update_system_config", "key": key, "value": val}, timeout=5)
+        except Exception as e:
+            logging.error(f"System_Config dual-write failed ({key}): {e}")
         return True
     except Exception as e:
         logging.error(f"Filter Write Error ({key}): {e}")
@@ -635,16 +671,6 @@ def get_ghost_listing_penalty(job_hash):
     except Exception as e:
         logging.error(f"Ghost Listing Penalty Error ({job_hash}): {e}")
         return 0, ""
-
-def compute_description_simhash(text: str) -> str:
-    """Computes a normalized SimHash token on the core job description."""
-    clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(text or "")[:400].lower())
-    tokens = clean.split()
-    if not tokens:
-        return hashlib.md5(b"").hexdigest()
-    # Normalize 3-grams to catch reworded titles with identical bodies
-    shingles = [" ".join(tokens[i:i+3]) for i in range(max(1, len(tokens)-2))]
-    return hashlib.md5("".join(sorted(shingles)).encode()).hexdigest()
 
 def is_content_seen(content_hash: str) -> bool:
     try:
@@ -873,49 +899,9 @@ def resolve_reply_mapping(msg, chat_id, command_label):
         return None
     return mapping
 
-def resolve_smart_target_tab(source_tab, direction):
-    """Smart auto-routing for /warm, /cold, /x: Carmen-family tabs stay in the Carmen pipeline;
-    Tetiana-family tabs (and "Pipeline_Candidates", the pre-CRM staging tab for fresh job cards)
-    stay in the Tetiana pipeline. direction is "warm", "cold", or "kill".
-    """
-    is_carmen = str(source_tab or "").startswith("Carmen")
-    if direction == "kill":
-        return "Killed" if is_carmen else "Died"
-    if direction == "warm":
-        return "Carmen Warm" if is_carmen else "Tetiana Warm"
-    return "Carmen Cold" if is_carmen else "Tetiana Cold"
-
 # ==============================================================================
 # 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE
 # ==============================================================================
-def calculate_followup_interval(priority_score):
-    try:
-        p = float(priority_score)
-        return max(3, int(round(35.0 - (p * 3.2))))
-    except Exception:
-        return 14
-
-def normalize_priority_value(raw_value):
-    """Normalize free-text ("High"/"Medium"/"Low") or numeric 1-10 priority values into an int 1-10
-    (10 = highest priority). Mirrors Code.gs's mapPriorityValue() but keeps a direct (non-inverted)
-    scale so it can drive the Dynamic Contact Quality Multiplier's score boost. Defaults to 5.
-    """
-    text = str(raw_value or "").strip()
-    lower = text.lower()
-    if "high" in lower:
-        return 9
-    if "medium" in lower:
-        return 5
-    if "low" in lower:
-        return 2
-    match = re.search(r'\d+', text)
-    if match:
-        try:
-            return max(1, min(10, int(match.group())))
-        except (ValueError, TypeError):
-            return 5
-    return 5
-
 _WARM_CRM_CACHE = {"data": {}, "fetched_at": 0.0}
 _WARM_CRM_CACHE_TTL_SECONDS = 300
 
@@ -927,10 +913,10 @@ def get_warm_crm_contacts():
     now = time.time()
     if now - _WARM_CRM_CACHE["fetched_at"] < _WARM_CRM_CACHE_TTL_SECONDS:
         return _WARM_CRM_CACHE["data"]
-    if not CRM_WEBHOOK_URL:
+    res = crm_post({"action": "get_followups", "tab": "CW"})
+    if not res:
         return _WARM_CRM_CACHE["data"]
     try:
-        res = requests.post(CRM_WEBHOOK_URL, json={"action": "get_followups", "tab": "CW"}, timeout=10)
         if res.status_code != 200:
             return _WARM_CRM_CACHE["data"]
         data = res.json()
@@ -972,11 +958,6 @@ def sanitize_text(text):
     cleaned = re.sub(r' *\n *', '\n', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)  # cap excess blank lines, keep \n\n breaks
     return cleaned.strip()
-
-def enforce_sentence_limit(text, max_sentences):
-    """Truncate text to at most max_sentences sentences."""
-    sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
-    return ' '.join(sentences[:max_sentences])
 
 def get_current_role_blurb():
     """Returns (core_exp_phrase, full_sentence) for the most recent Evidence Bank experience entry,
@@ -1076,64 +1057,6 @@ def send_status_update(chat_id, text):
         except Exception:
             pass
 
-def generate_dedup_hash(company, title):
-    clean_company = str(company or "").lower().strip()
-    clean_title = str(title or "").lower().strip()
-    return hashlib.md5(f"{clean_company}_{clean_title}".encode()).hexdigest()
-
-def generate_short_key(raw_id):
-    return hashlib.md5(str(raw_id or time.time()).encode()).hexdigest()[:12]
-
-def parse_posted_hours(posted_utc_str):
-    if not posted_utc_str:
-        return 48
-    try:
-        dt = datetime.fromisoformat(str(posted_utc_str).replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        return int((now - dt).total_seconds() / 3600)
-    except Exception:
-        return 48
-
-def get_age_badge(posted_hours):
-    if posted_hours < 24:
-        return "🔥 [< 24h FRESH]"
-    elif posted_hours < 72:
-        return "⚡ [1-3d RECENT]"
-    elif posted_hours < 168:
-        return "🟢 [3-7d ACTIVE]"
-    elif posted_hours < 336:
-        return "🟡 [7-14d AGING]"
-    else:
-        return "🔴 [14-30d STALE]"
-
-def extract_salary(job):
-    try:
-        min_sal = float(job.get("job_min_salary") or 0)
-        max_sal = float(job.get("job_max_salary") or 0)
-        curr = str(job.get("job_salary_currency") or "USD")
-        period = str(job.get("job_salary_period") or "year").lower()
-        if "hour" in period or period == "hr":
-            min_sal = min_sal * 2080
-            max_sal = max_sal * 2080
-            period = "year"
-        if min_sal and max_sal:
-            return f"${min_sal:,.0f} - ${max_sal:,.0f} {curr}/{period}", max_sal
-        elif min_sal or max_sal:
-            val = min_sal or max_sal
-            return f"${val:,.0f} {curr}/{period}", val
-    except Exception:
-        pass
-    return "Salary Unlisted", 0
-
-def extract_work_style(job):
-    desc = str(job.get("job_description") or "").lower()
-    is_remote = job.get("job_is_remote", False) or "remote" in desc[:300] or "work from home" in desc[:300]
-    if "hybrid" in desc:
-        return "Hybrid"
-    elif is_remote:
-        return "Remote"
-    return "On-Site / Unspecified"
-
 def calculate_keyword_overlap(job_desc):
     desc = str(job_desc or "").lower()
     core_skills = get_filter("core_skills", [])
@@ -1164,35 +1087,6 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     if is_remote:
         score = min(score, 90)
     return max(1, min(100, score))
-
-def build_apollo_url(company_name):
-    clean_company = re.sub(r'[^a-zA-Z0-9\s]', "", str(company_name or "")).strip()
-    encoded = urllib.parse.quote(f"{clean_company} Operations")
-    return f"https://app.apollo.io/#/people?qKeywords={encoded}"
-
-def build_linkedin_url(company_name):
-    clean_company = re.sub(r'[^a-zA-Z0-9\s]', "", str(company_name or "")).strip()
-    encoded = urllib.parse.quote(f'{clean_company} ("VP" OR "Director" OR "Manager") ("Operations" OR "Compliance")')
-    return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
-
-def build_hiring_manager_dork(company_name, job_title=""):
-    """Google dork to surface a company's Head/Director/VP of Operations or COO on LinkedIn."""
-    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
-    query = f'site:linkedin.com/in "{clean_comp}" ("Head of Operations" OR "Director of Operations" OR "Operations Manager" OR "VP of Operations" OR "COO")'
-    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
-
-def build_recruiter_dork(company_name):
-    """Google dork targeting in-house talent acquisition for the company on LinkedIn."""
-    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
-    query = f'site:linkedin.com/in "{clean_comp}" ("Technical Recruiter" OR "Talent Acquisition" OR "Senior Recruiter" OR "Corporate Recruiter")'
-    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
-
-def build_alumni_dork(company_name, school="Hope College"):
-    """Google dork to surface shared-alma-mater employees at a target company on LinkedIn."""
-    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
-    clean_school = re.sub(r'[^a-zA-Z0-9\s]', '', str(school or '')).strip()
-    query = f'site:linkedin.com/in "{clean_comp}" "{clean_school}"'
-    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
 
 def resolve_live_alumni_at_company(company_name, school="Hope College"):
     """JIT alumni resolution: live-queries DuckDuckGo HTML search for a LinkedIn profile at
@@ -1720,7 +1614,7 @@ def process_single_candidate(job):
     ai_pass, score, reason, track, bullet_indices, linkedin_template_id, outreach_template_id = evaluate_job_with_gemini(job)
     if ai_pass:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
-        short_id = generate_short_key(raw_id)
+        short_id = generate_short_key(raw_id, fallback=time.time())
         job_title = job.get("job_title") or "this role"
         company_name = job.get("employer_name") or "your team"
 
@@ -1989,9 +1883,9 @@ def is_verified_crm_contact(sender_raw):
         logging.error(f"CRM Whitelist Local Lookup Error: {e}")
 
     # Live authoritative check against the Google Sheets CRM (catches manual edits not yet cached locally)
-    if CRM_WEBHOOK_URL:
+    res = crm_get({"action": "find_contact_by_email", "email": sender_email})
+    if res:
         try:
-            res = requests.get(f"{CRM_WEBHOOK_URL}?action=find_contact_by_email&email={urllib.parse.quote(sender_email)}", timeout=10)
             logging.info(f"CRM whitelist remote query response status: {res.status_code} (email={sender_email})")
             if res.status_code == 200:
                 data = res.json()
@@ -2215,6 +2109,54 @@ def start_gmail_poller():
     EMAIL_POLL_SCHEDULER.start()
     logging.info("[POLL] Gmail inbound poller scheduled: every 15 minutes")
 
+BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+BACKUP_RETENTION_COUNT = 8  # ~2 months of weekly snapshots
+
+def backup_sqlite_db():
+    """Snapshot jobs_cache.db via the SQLite online backup API (safe under concurrent WAL writers)
+    into backups/, then prune down to the most recent BACKUP_RETENTION_COUNT snapshots.
+    This is the only durability net for years of pipeline/CRM-outbox history living in one local file.
+    """
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest_path = os.path.join(BACKUP_DIR, f"jobs_cache_{stamp}.db")
+        with get_db_conn() as src_conn, sqlite3.connect(dest_path) as dest_conn:
+            src_conn.backup(dest_conn)
+        logging.info(f"[BACKUP] SQLite snapshot written: {dest_path}")
+
+        snapshots = sorted(
+            (f for f in os.listdir(BACKUP_DIR) if f.startswith("jobs_cache_") and f.endswith(".db")),
+            reverse=True
+        )
+        for stale_file in snapshots[BACKUP_RETENTION_COUNT:]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, stale_file))
+            except OSError:
+                pass
+        return True
+    except Exception as e:
+        logging.error(f"[BACKUP] SQLite snapshot failed: {e}")
+        send_health_alert(f"Weekly SQLite backup failed: {e}")
+        return False
+
+def scheduled_backup_job():
+    logging.info("[BACKUP] Weekly SQLite backup cycle triggered")
+    backup_sqlite_db()
+
+def start_backup_scheduler():
+    """Register the weekly SQLite backup on the existing background scheduler (Sunday 3 AM local)."""
+    EMAIL_POLL_SCHEDULER.add_job(
+        scheduled_backup_job,
+        trigger="cron",
+        day_of_week="sun",
+        hour=3,
+        id="sqlite_weekly_backup",
+        max_instances=1,
+        coalesce=True
+    )
+    logging.info("[BACKUP] Weekly SQLite backup scheduled: Sundays 03:00 local")
+
 def morning_digest_loop():
     """Dispatches a standup digest daily at 08:30 AM local time."""
     while True:
@@ -2246,9 +2188,30 @@ def morning_digest_loop():
                     f"⚠️ <b>Overdue Actions:</b> {len(overdue)} contacts requiring follow-up\n\n"
                     f"Run <code>/s</code> to review overdue contacts or <code>/t</code> to trigger the search pipeline."
                 )
+                health_warnings = check_system_health()
+                if health_warnings:
+                    digest += "\n\n🚨 <b>Config Health Warnings:</b>\n" + "\n".join(f"• {html.escape(w)}" for w in health_warnings)
                 send_telegram_message(TELEGRAM_CHAT_ID, digest)
         except Exception as e:
             logging.error(f"Morning Digest Dispatch Error: {e}")
+
+def check_system_health():
+    """Returns human-readable warnings for missing critical config. Surfaced daily in the morning
+    digest so a lost env var (bad redeploy, expired secret) doesn't silently degrade the pipeline
+    for weeks before anyone notices - the single biggest risk for a years-long unattended system.
+    """
+    warnings = []
+    if not CRM_WEBHOOK_URL:
+        warnings.append("CRM_WEBHOOK_URL is unset - CRM sync is fully disabled.")
+    if not GEMINI_API_KEY:
+        warnings.append("GEMINI_API_KEY is unset - AI screening will fail every candidate.")
+    if not (os.environ.get("RAPIDAPI_KEY") or os.environ.get("OPENWEBNINJA_KEY")):
+        warnings.append("No JSearch API key set (RAPIDAPI_KEY/OPENWEBNINJA_KEY) - job sourcing is disabled.")
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        warnings.append("Telegram credentials missing - operator notifications are disabled.")
+    if not CRM_SHARED_SECRET:
+        warnings.append("CRM_SHARED_SECRET is unset - the CRM webhook is unauthenticated.")
+    return warnings
 
 def start_morning_digest():
     """Spin up the 8:30 AM daily standup digest as a daemon thread."""
@@ -2266,8 +2229,8 @@ def log_to_sheets_crm(payload, max_retries=3):
     delay = 1.0
     for attempt in range(max_retries):
         try:
-            res = requests.post(CRM_WEBHOOK_URL, json=payload, timeout=10)
-            if res.status_code == 200:
+            res = crm_post(payload)
+            if res and res.status_code == 200:
                 return True
         except Exception as e:
             logging.error(f"CRM Webhook Attempt {attempt+1} Failed: {e}")
@@ -2331,10 +2294,10 @@ def start_crm_outbox_worker():
     threading.Thread(target=crm_outbox_worker_loop, daemon=True).start()
 
 def fetch_networking_cards(target_code="CW", qty=2):
-    if not CRM_WEBHOOK_URL:
+    res = crm_post({"action": "get_followups", "tab": target_code})
+    if not res:
         return []
     try:
-        res = requests.post(CRM_WEBHOOK_URL, json={"action": "get_followups", "tab": target_code}, timeout=10)
         if res.status_code == 200:
             leads = res.json().get("followups", [])
             return leads[:qty]
@@ -2392,14 +2355,6 @@ def send_telegram_message(chat_id, text):
     except Exception as e:
         logging.error(f"Telegram Post Error: {e}")
     return None
-
-def get_fit_score_indicator(score):
-    """Traffic-light emoji for Fit Score: green >=80, yellow >=65, red otherwise."""
-    if score >= 80:
-        return "🟢"
-    elif score >= 65:
-        return "🟡"
-    return "🔴"
 
 def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line="", outreach_email=""):
     """Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only.
@@ -2677,6 +2632,12 @@ def run_job_pipeline(chat_id=None, top_n=2):
             _add_candidate(job)
     
     logging.info(f"Stage 1 Complete: {raw_discovered_count} raw listings pulled, {len(candidate_pool)} candidates passed strict filter.")
+    if raw_discovered_count == 0:
+        send_health_alert(
+            "JSearch/ATS sourcing returned 0 raw listings this run. Check RAPIDAPI_KEY/OPENWEBNINJA_KEY "
+            "validity and the target_queries filter - this usually means the API key expired or every "
+            "query is misconfigured, and it will silently produce zero candidates every run until fixed."
+        )
     if chat_id:
         send_status_update(
             chat_id,
@@ -2829,9 +2790,10 @@ def process_webhook_payload_async(data):
             priority_lvl = safe_int(re.match(r"^/p\s+(\d+)$", text).group(1))
             loading_msg_id = send_telegram_message(chat_id, "⏳ <i>Fetching CRM data...</i>")
             contacts = []
-            if CRM_WEBHOOK_URL:
+            resp_obj = crm_get({"action": "get_priority", "level": priority_lvl})
+            if resp_obj:
                 try:
-                    resp = requests.get(f"{CRM_WEBHOOK_URL}?action=get_priority&level={priority_lvl}", timeout=10).json()
+                    resp = resp_obj.json()
                     contacts = resp.get("contacts", [])
                 except Exception:
                     contacts = []
@@ -3192,7 +3154,7 @@ def process_webhook_payload_async(data):
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Company"
             track = requested_track or job.get("track") or "a"
             bullet_indices = job.get("bullet_indices")
-            short_id = job.get("short_id") or generate_short_key(job.get("job_id") or mapping["sheet_uuid"])
+            short_id = job.get("short_id") or generate_short_key(job.get("job_id") or mapping["sheet_uuid"], fallback=time.time())
 
             try:
                 pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
@@ -3318,6 +3280,7 @@ def process_webhook_payload_async(data):
 start_gmail_poller()
 start_crm_outbox_worker()
 start_morning_digest()
+start_backup_scheduler()
 
 # ==============================================================================
 # 10. FLASK SERVER & STACKED WEBHOOK ROUTER

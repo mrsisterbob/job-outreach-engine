@@ -65,6 +65,17 @@ const HIGH_FIT_BG = "#E6F4EA";
 const HEADER_ROW_HEIGHT = 35;
 const FORMAT_BUFFER_ROWS = 1000; // ensures banding/conditional formatting cover future appended rows
 
+// Shared-secret auth: set via Project Settings > Script Properties > CRM_SHARED_SECRET.
+// If unset, every request is allowed through (unauthenticated) - set this in production so the
+// webhook URL alone (which can leak via logs/history) isn't enough to read/write the CRM.
+function isRequestAuthorized(providedSecret) {
+  const expected = PropertiesService.getScriptProperties().getProperty("CRM_SHARED_SECRET");
+  if (!expected) {
+    return true;
+  }
+  return (providedSecret || "") === expected;
+}
+
 function doPost(e) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
@@ -73,6 +84,9 @@ function doPost(e) {
 
   try {
     const payload = JSON.parse(e.postData.contents);
+    if (!isRequestAuthorized(payload.secret)) {
+      return respondJSON({ status: "error", message: "Unauthorized" });
+    }
     const action = payload.action;
     const ss = SpreadsheetApp.getActiveSpreadsheet();
 
@@ -299,6 +313,9 @@ function doGet(e) {
   }
 
   try {
+    if (!isRequestAuthorized(e.parameter.secret)) {
+      return respondJSON({ status: "error", message: "Unauthorized" });
+    }
     const action = e.parameter.action;
     const ss = SpreadsheetApp.getActiveSpreadsheet();
 
