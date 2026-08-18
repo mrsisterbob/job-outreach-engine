@@ -118,7 +118,8 @@ def get_fit_score_indicator(score):
 
 
 def generate_dedup_hash(company, title):
-    clean_company = str(company or "").lower().strip()
+    """Legal-suffix-aware so 'Acme Corp' and 'Acme Corp Inc.' postings dedup as the same company."""
+    clean_company = _strip_legal_suffixes(company).lower()
     clean_title = str(title or "").lower().strip()
     return hashlib.md5(f"{clean_company}_{clean_title}".encode()).hexdigest()
 
@@ -242,4 +243,27 @@ def resolve_email_waterfall(full_name, company_name, domain_hint=None, on_provid
     if first and last:
         return f"{first.lower()}.{last.lower()}@{domain} [⚠️ Unverified]"
     return f"operations@{domain} [⚠️ Fallback]"
+
+
+def derive_job_source(job_id):
+    """Classify a job's origin from its job_id prefix for source-level outcome attribution.
+    Returns one of: greenhouse, lever, ashby, manual_ingest, jsearch (default, no known prefix).
+    """
+    job_id = str(job_id or "")
+    if job_id.startswith("gh_"):
+        return "greenhouse"
+    if job_id.startswith("lever_"):
+        return "lever"
+    if job_id.startswith("ashby_"):
+        return "ashby"
+    if job_id.startswith("ingest_"):
+        return "manual_ingest"
+    return "jsearch"
+
+
+def is_unverified_email(email_str):
+    """True if an email string carries an [\u26a0\ufe0f Unverified]/[\u26a0\ufe0f Fallback ...] tag from
+    resolve_email_waterfall() or resolve_target_email(), meaning it's a best-guess, not a confirmed hit.
+    """
+    return "[\u26a0\ufe0f" in str(email_str or "")
 

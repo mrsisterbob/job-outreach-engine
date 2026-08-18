@@ -23,7 +23,8 @@ from pipeline_utils import (
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
     resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
     generate_dedup_hash, generate_short_key, parse_posted_hours, get_age_badge,
-    extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall
+    extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall,
+    derive_job_source, is_unverified_email
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -369,6 +370,44 @@ def init_db():
             last_attempt TIMESTAMP
         )""")
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS application_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sheet_uuid TEXT NOT NULL,
+            company TEXT,
+            role TEXT,
+            source TEXT,
+            outreach_path TEXT,
+            status TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_application_outcomes_sheet_uuid ON application_outcomes(sheet_uuid)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_application_outcomes_status ON application_outcomes(status)")
+        # Migration guard: pipeline_metrics pre-dates the source-attribution column
+        try:
+            conn.execute("ALTER TABLE pipeline_metrics ADD COLUMN source TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS email_enrichment_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sheet_uuid TEXT,
+            provider TEXT NOT NULL,
+            returned_email TEXT,
+            confidence TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_identities (
+            normalized_name TEXT PRIMARY KEY,
+            display_name TEXT,
+            primary_domain TEXT,
+            aliases TEXT,
+            ats_slug TEXT,
+            crm_status TEXT,
+            applied_at TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS system_alerts (
             alert_key TEXT PRIMARY KEY,
             last_sent TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -708,7 +747,7 @@ def save_content_hash(content_hash: str):
 
 def add_company_cooldown(company_name):
     """Add company cooldown atomically via BEGIN IMMEDIATE."""
-    clean = str(company_name or "").lower().strip()
+    clean = normalize_company_for_match(company_name)
     if not clean:
         return False
     try:
@@ -721,14 +760,17 @@ def add_company_cooldown(company_name):
         logging.error(f"DB Cooldown Save Error ({clean}): {e}")
         return False
 
-def log_metric_event(event_type, sheet_uuid=None):
-    """Persist a pipeline metric event (e.g. message_sent, interview_set) to SQLite atomically."""
+def log_metric_event(event_type, sheet_uuid=None, source=None):
+    """Persist a pipeline metric event (e.g. message_sent, interview_set) to SQLite atomically.
+    `source` (jsearch/greenhouse/lever/ashby/manual_ingest) is optional, used for per-source
+    discovery/screening counts in /outcomes and the Tuesday hub.
+    """
     try:
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "INSERT INTO pipeline_metrics (event_type, sheet_uuid, timestamp) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                (event_type, sheet_uuid)
+                "INSERT INTO pipeline_metrics (event_type, sheet_uuid, source, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (event_type, sheet_uuid, source)
             )
             conn.commit()
         return True
@@ -746,6 +788,113 @@ def get_metric_count(event_type):
     except Exception as e:
         logging.error(f"DB Metric Count Error ({event_type}): {e}")
         return 0
+
+def record_application_outcome(sheet_uuid, status, company=None, role=None, source=None, outreach_path=None):
+    """Append an application_outcomes row (event-sourced, one row per transition) so /outcomes and
+    the Tuesday hub can compute evidence-based reply/interview rates and time-to-response, instead
+    of relying on gut-feel. status is one of: applied, interview, rejection, offer, withdrawn.
+    """
+    if not sheet_uuid:
+        return False
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO application_outcomes (sheet_uuid, company, role, source, outreach_path, status) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (sheet_uuid, company, role, source, outreach_path, status)
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Application Outcome Record Error ({sheet_uuid}, {status}): {e}")
+        return False
+
+def get_outcome_metrics():
+    """Aggregate application_outcomes into evidence-based conversion metrics:
+    per-source applied/interview counts + reply rate, per-outreach-path interview rate, and the
+    median days between an 'applied' row and its first subsequent response (interview/rejection/offer).
+    """
+    by_source = {}
+    by_path = {}
+    response_days = []
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT sheet_uuid, source, outreach_path, status, created_at FROM application_outcomes ORDER BY sheet_uuid, created_at ASC")
+            rows = cursor.fetchall()
+    except Exception as e:
+        logging.error(f"Outcome Metrics Read Error: {e}")
+        rows = []
+
+    applied_at_by_uuid = {}
+    for sheet_uuid, source, outreach_path, status, created_at in rows:
+        source = source or "unknown"
+        outreach_path = outreach_path or "unknown"
+        by_source.setdefault(source, {"applied": 0, "interview": 0})
+        by_path.setdefault(outreach_path, {"applied": 0, "interview": 0})
+        if status == "applied":
+            by_source[source]["applied"] += 1
+            by_path[outreach_path]["applied"] += 1
+            applied_at_by_uuid[sheet_uuid] = created_at
+        elif status == "interview":
+            by_source[source]["interview"] += 1
+            by_path[outreach_path]["interview"] += 1
+            applied_at = applied_at_by_uuid.get(sheet_uuid)
+            if applied_at:
+                try:
+                    delta = datetime.strptime(str(created_at)[:19], "%Y-%m-%d %H:%M:%S") - datetime.strptime(str(applied_at)[:19], "%Y-%m-%d %H:%M:%S")
+                    response_days.append(delta.total_seconds() / 86400.0)
+                except Exception:
+                    pass
+        elif status in ("rejection", "offer"):
+            applied_at = applied_at_by_uuid.get(sheet_uuid)
+            if applied_at:
+                try:
+                    delta = datetime.strptime(str(created_at)[:19], "%Y-%m-%d %H:%M:%S") - datetime.strptime(str(applied_at)[:19], "%Y-%m-%d %H:%M:%S")
+                    response_days.append(delta.total_seconds() / 86400.0)
+                except Exception:
+                    pass
+
+    for bucket in (by_source, by_path):
+        for stats in bucket.values():
+            stats["reply_rate"] = (stats["interview"] / stats["applied"] * 100) if stats["applied"] else 0.0
+
+    median_days = None
+    if response_days:
+        response_days.sort()
+        mid = len(response_days) // 2
+        median_days = response_days[mid] if len(response_days) % 2 else (response_days[mid - 1] + response_days[mid]) / 2
+
+    return {"by_source": by_source, "by_outreach_path": by_path, "median_days_to_response": median_days}
+
+def format_outcome_metrics_message():
+    """Render get_outcome_metrics() into an HTML Telegram message, shared by /outcomes and the Tuesday hub."""
+    metrics = get_outcome_metrics()
+    lines = ["📈 <b>Evidence-Based Outcomes</b>\n"]
+
+    if metrics["by_source"]:
+        lines.append("<b>By Source (applied → interview, reply rate):</b>")
+        for source, stats in sorted(metrics["by_source"].items()):
+            lines.append(f"• {html.escape(source)}: {stats['applied']} → {stats['interview']} ({stats['reply_rate']:.1f}%)")
+    else:
+        lines.append("<b>By Source:</b> No applications recorded yet.")
+
+    lines.append("")
+    if metrics["by_outreach_path"]:
+        lines.append("<b>By Outreach Path (applied → interview, rate):</b>")
+        for path, stats in sorted(metrics["by_outreach_path"].items()):
+            lines.append(f"• {html.escape(path)}: {stats['applied']} → {stats['interview']} ({stats['reply_rate']:.1f}%)")
+    else:
+        lines.append("<b>By Outreach Path:</b> No applications recorded yet.")
+
+    lines.append("")
+    if metrics["median_days_to_response"] is not None:
+        lines.append(f"⏱️ <b>Median Days to First Response:</b> {metrics['median_days_to_response']:.1f}")
+    else:
+        lines.append("⏱️ <b>Median Days to First Response:</b> Not enough data yet.")
+
+    return "\n".join(lines)
 
 def get_rolling_metric_counts(days=7):
     """Return metric counts recorded during the trailing `days` window, including zero-count keys."""
@@ -849,6 +998,23 @@ def get_monthly_api_usage():
         logging.error(f"DB API Usage Read Error: {e}")
     return counts
 
+def log_email_enrichment_attempt(sheet_uuid, provider, returned_email, confidence):
+    """Persist one resolve_email_waterfall() outcome (verified hit vs unverified fallback guess) so
+    contact quality can be audited later - never gates behavior on its own, see is_unverified_email().
+    """
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO email_enrichment_attempts (sheet_uuid, provider, returned_email, confidence) VALUES (?, ?, ?, ?)",
+                (sheet_uuid, provider, returned_email, confidence)
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Email Enrichment Attempt Log Error ({sheet_uuid}): {e}")
+        return False
+
 def get_query_start_page(query_text):
     """Return the next JSearch page offset to resume from for this exact query text, default 1."""
     try:
@@ -908,7 +1074,7 @@ def render_ascii_funnel(stages):
     return "\n".join(lines)
 
 def is_company_on_cooldown(company_name):
-    clean = str(company_name or "").lower().strip()
+    clean = normalize_company_for_match(company_name)
     if not clean:
         return False
     try:
@@ -1008,6 +1174,46 @@ def normalize_company_for_match(company_name):
     company = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', company, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', company).strip()
 
+def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applied=False):
+    """Merge newly-learned facts about a company into the canonical company_identities record,
+    keyed by normalize_company_for_match() so 'Acme Corp' and 'Acme Corp Inc.' share one row.
+    Never overwrites a field with an empty value - only adds/updates what's newly known.
+    """
+    normalized = normalize_company_for_match(company_name)
+    if not normalized:
+        return False
+    display_name = str(company_name or "").strip()
+    applied_at = datetime.now().strftime("%Y-%m-%d") if applied else None
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            cursor.execute("SELECT display_name, primary_domain, aliases, ats_slug, crm_status, applied_at FROM company_identities WHERE normalized_name = ?", (normalized,))
+            row = cursor.fetchone()
+            if row:
+                existing_display, existing_domain, existing_aliases, existing_slug, existing_status, existing_applied_at = row
+                aliases = set(filter(None, (existing_aliases or "").split("|")))
+                if display_name and display_name != existing_display:
+                    aliases.add(display_name)
+                merged_aliases = "|".join(sorted(aliases))
+                conn.execute(
+                    "UPDATE company_identities SET display_name = ?, aliases = ?, ats_slug = COALESCE(?, ats_slug), "
+                    "crm_status = COALESCE(?, crm_status), applied_at = COALESCE(?, applied_at), updated_at = CURRENT_TIMESTAMP "
+                    "WHERE normalized_name = ?",
+                    (existing_display or display_name, merged_aliases, ats_slug, crm_status, applied_at, normalized)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO company_identities (normalized_name, display_name, aliases, ats_slug, crm_status, applied_at) "
+                    "VALUES (?, ?, '', ?, ?, ?)",
+                    (normalized, display_name, ats_slug, crm_status, applied_at)
+                )
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Company Identity Upsert Error ({normalized}): {e}")
+        return False
+
 def get_applied_crm_companies():
     """Fetch Tetiana Warm companies as a short-lived suppression set for fresh job discovery."""
     now = time.time()
@@ -1058,7 +1264,7 @@ def get_warm_crm_contacts():
             company = str(row.get("company") or "").strip()
             if not company:
                 continue
-            contacts[company.lower()] = {
+            contacts[normalize_company_for_match(company)] = {
                 "name": row.get("name") or "Contact",
                 "raw_company": company,
                 "email": row.get("email", ""),
@@ -1747,7 +1953,7 @@ def passes_strict_filter(job):
     return True
 
 def process_single_candidate(job):
-    log_metric_event("ai_screened")
+    log_metric_event("ai_screened", source=derive_job_source(job.get("job_id")))
     ai_pass, score, reason, track, bullet_indices, linkedin_template_id, outreach_template_id = evaluate_job_with_gemini(job)
     if ai_pass:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
@@ -1810,7 +2016,7 @@ def process_single_candidate(job):
             log_daily_activity("notes_logged")
 
         # Dynamic Contact Quality Multiplier: warm CRM contacts scale the boost by priority rank (1-10 * 3, capped +30)
-        contact_info = get_warm_crm_contacts().get(str(job.get("employer_name") or "").strip().lower())
+        contact_info = get_warm_crm_contacts().get(normalize_company_for_match(job.get("employer_name")))
         if contact_info:
             priority_score = contact_info.get("priority_score", 5)
             score_boost = min(30, priority_score * 3)
@@ -2211,6 +2417,9 @@ def check_inbound_gmail_replies():
             status_line = status_badges.get(status_label, "")
             if status_label == "INTERVIEW_SET":
                 log_metric_event("interview_set")
+                record_application_outcome(crm_match.get("sheet_uuid"), "interview", company=crm_match.get("company"))
+            elif status_label == "REJECTION":
+                record_application_outcome(crm_match.get("sheet_uuid"), "rejection", company=crm_match.get("company"))
 
             alert_msg = (
                 f"📬 <b>New Gmail Reply!</b>\n\n"
@@ -2258,19 +2467,71 @@ def start_gmail_poller():
 
 BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
 BACKUP_RETENTION_COUNT = 8  # ~2 months of weekly snapshots
+BACKUP_CRITICAL_TABLES = ("jobs", "sheet_row_map", "crm_outbox", "application_outcomes", "pipeline_metrics")
+
+def verify_backup_snapshot(dest_path, min_expected_counts):
+    """Restore-verify a snapshot: PRAGMA integrity_check plus a row-count floor per critical table
+    (captured from the live DB immediately before the backup). Never raises - returns (ok, details).
+    """
+    details = {}
+    verify_conn = None
+    try:
+        verify_conn = sqlite3.connect(dest_path)
+        cursor = verify_conn.cursor()
+        cursor.execute("PRAGMA integrity_check")
+        integrity_result = cursor.fetchone()[0]
+        details["integrity_check"] = integrity_result
+        if integrity_result != "ok":
+            return False, details
+        for table in BACKUP_CRITICAL_TABLES:
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                backup_count = cursor.fetchone()[0]
+            except sqlite3.OperationalError:
+                backup_count = None
+            expected_min = min_expected_counts.get(table, 0)
+            details[table] = {"backup_count": backup_count, "expected_min": expected_min}
+            if backup_count is None or backup_count < expected_min:
+                return False, details
+        return True, details
+    except Exception as e:
+        details["error"] = str(e)
+        return False, details
+    finally:
+        if verify_conn:
+            verify_conn.close()
 
 def backup_sqlite_db():
     """Snapshot jobs_cache.db via the SQLite online backup API (safe under concurrent WAL writers)
-    into backups/, then prune down to the most recent BACKUP_RETENTION_COUNT snapshots.
-    This is the only durability net for years of pipeline/CRM-outbox history living in one local file.
+    into backups/, restore-verify it (integrity_check + row-count floor vs pre-backup counts), then
+    prune down to the most recent BACKUP_RETENTION_COUNT snapshots. Alerts Telegram if verification
+    fails - a backup that was never restore-tested is not a proven durability net.
     """
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         dest_path = os.path.join(BACKUP_DIR, f"jobs_cache_{stamp}.db")
-        with get_db_conn() as src_conn, sqlite3.connect(dest_path) as dest_conn:
+
+        pre_backup_counts = {}
+        with get_db_conn() as src_conn:
+            cursor = src_conn.cursor()
+            for table in BACKUP_CRITICAL_TABLES:
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                    pre_backup_counts[table] = cursor.fetchone()[0]
+                except sqlite3.OperationalError:
+                    pre_backup_counts[table] = 0
+            dest_conn = sqlite3.connect(dest_path)
             src_conn.backup(dest_conn)
+            dest_conn.close()
         logging.info(f"[BACKUP] SQLite snapshot written: {dest_path}")
+
+        verified, verify_details = verify_backup_snapshot(dest_path, pre_backup_counts)
+        if verified:
+            logging.info(f"[BACKUP] Restore verification passed: {dest_path}")
+        else:
+            logging.error(f"[BACKUP] Restore verification FAILED for {dest_path}: {verify_details}")
+            send_health_alert(f"Backup restore verification failed for {os.path.basename(dest_path)}: {verify_details}")
 
         snapshots = sorted(
             (f for f in os.listdir(BACKUP_DIR) if f.startswith("jobs_cache_") and f.endswith(".db")),
@@ -2281,7 +2542,7 @@ def backup_sqlite_db():
                 os.remove(os.path.join(BACKUP_DIR, stale_file))
             except OSError:
                 pass
-        return True
+        return verified
     except Exception as e:
         logging.error(f"[BACKUP] SQLite snapshot failed: {e}")
         send_health_alert(f"Weekly SQLite backup failed: {e}")
@@ -2326,6 +2587,7 @@ def send_tuesday_pipeline_executive_hub(chat_id):
         f"<code>/snoozeall 7</code> Move all overdue follow-ups by N days"
     )
     send_telegram_message(chat_id, hub)
+    send_telegram_message(chat_id, format_outcome_metrics_message())
     if not overdue:
         return
 
@@ -2817,10 +3079,12 @@ def fetch_ats_jobs(company_slugs):
                 logging.error(f"ATS Fetch Future Error: {e}")
     return all_jobs
 
-def expand_ecosystem_filter(company_name):
-    """Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its
+def auto_expand_ats_slug(company_name):
+    """Silent Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its
     name; if any board actually resolves, appends the slug to the ats_company_slugs filter so future
     /t runs source directly from it. Meant to run on a background daemon thread - silent on no match.
+    Distinct from expand_ecosystem_filter() (the Gemini-powered /ecosystem add command), which also
+    discovers keyword aliases and returns a Telegram report string - this one is fire-and-forget.
     """
     slug_guess = re.sub(r'[^a-z0-9]', '', str(company_name or '').lower())
     if not slug_guess:
@@ -2839,6 +3103,7 @@ def expand_ecosystem_filter(company_name):
             if res.status_code == 200 and res.json():
                 existing_slugs.append(slug_guess)
                 set_filter("ats_company_slugs", existing_slugs)
+                upsert_company_identity(company_name, ats_slug=slug_guess)
                 logging.info(f"[ATS EXPANSION] '{company_name}' resolved to '{slug_guess}' on {board_name} - added to ats_company_slugs")
                 return
         except Exception as e:
@@ -2878,7 +3143,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
             return
         save_content_hash(content_hash)
 
-        log_metric_event("listing_discovered")
+        log_metric_event("listing_discovered", source=derive_job_source(job.get("job_id")))
         if passes_strict_filter(job):
             candidate_pool.append(job)
     
@@ -3129,7 +3394,7 @@ def process_webhook_payload_async(data):
             )
             sent_msg_id = send_telegram_message(chat_id, resp)
             save_message_mapping(sent_msg_id, sheet_uuid, "Carmen Warm", name, company)
-            threading.Thread(target=expand_ecosystem_filter, args=(company,), daemon=True).start()
+            threading.Thread(target=auto_expand_ats_slug, args=(company,), daemon=True).start()
             return
 
         # 5b. Standalone /cold and /warm Quick-Add (distinct from the bare /cold, /warm swipe-reply
@@ -3168,7 +3433,7 @@ def process_webhook_payload_async(data):
             )
             sent_msg_id = send_telegram_message(chat_id, resp)
             save_message_mapping(sent_msg_id, sheet_uuid, target_tab, name, company)
-            threading.Thread(target=expand_ecosystem_filter, args=(company,), daemon=True).start()
+            threading.Thread(target=auto_expand_ats_slug, args=(company,), daemon=True).start()
             return
 
         # 6. Dynamic /search Filters Overview & Inline Adjustments
@@ -3248,6 +3513,10 @@ def process_webhook_payload_async(data):
                 f"🎯 <b>Screen / Interview Rate:</b> {screen_rate:.1f}% ({interviews_set} interviews / {screened} screened)"
             )
             send_telegram_message(chat_id, funnel_msg)
+            return
+
+        if text == "/outcomes":
+            send_telegram_message(chat_id, format_outcome_metrics_message())
             return
 
         if text in ["/streak", "/daily"]:
@@ -3358,6 +3627,16 @@ def process_webhook_payload_async(data):
             if mapping.get("contact_name"):
                 # Named CRM contact (not a generic job-alert row) - resolve a real person's email via the waterfall
                 target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint, on_provider_attempt=increment_api_usage_counter)
+                confidence = "unverified" if is_unverified_email(target) else "verified"
+                log_email_enrichment_attempt(mapping["sheet_uuid"], "waterfall", target, confidence)
+                if confidence == "unverified":
+                    send_telegram_message(
+                        chat_id,
+                        f"⚠️ <b>Unverified Contact Email - Draft Not Created</b>\n"
+                        f"<b>Best guess:</b> <code>{html.escape(target)}</code>\n\n"
+                        f"Reply <code>/e actual@email.com</code> to confirm the real address and create the draft."
+                    )
+                    return
             else:
                 target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
             track = job.get("track", "a")
@@ -3521,6 +3800,7 @@ def process_webhook_payload_async(data):
                 if normalized_company:
                     _APPLIED_CRM_CACHE["data"].add(normalized_company)
                 add_company_cooldown(company)
+                upsert_company_identity(company, crm_status="Tetiana Warm", applied=True)
             applied_date = datetime.now().strftime("%Y-%m-%d")
             reply_card = msg.get("reply_to_message") or {}
             if reply_card.get("message_id"):
@@ -3530,7 +3810,24 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, f"✅ Applied - {applied_date}")
             log_metric_event("applied", sheet_uuid)
             log_daily_activity("applied_count")
+            record_application_outcome(
+                sheet_uuid, "applied",
+                company=company, role=job.get("job_title"),
+                source=derive_job_source(job.get("job_id")),
+                outreach_path="warm" if mapping.get("contact_name") else "ats"
+            )
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Tetiana Warm"))
+            return
+
+        if text in ("/offer", "/withdraw"):
+            mapping = resolve_reply_mapping(msg, chat_id, text)
+            if not mapping:
+                return
+            sheet_uuid = mapping["sheet_uuid"]
+            status = "offer" if text == "/offer" else "withdrawn"
+            confirm_text = "🎉 <b>Offer Logged!</b>" if status == "offer" else "🚪 <b>Application Withdrawn.</b>"
+            send_telegram_message(chat_id, confirm_text)
+            record_application_outcome(sheet_uuid, status, company=mapping.get("contact_company"))
             return
 
         if text in ("/warm", "/cold"):
@@ -3545,7 +3842,7 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, confirm_text)
             # Auto-ATS Expansion: Carmen-family contacts (Cold or Warm) get monitored for future /t job runs
             if new_tab.startswith("Carmen") and mapping.get("contact_company"):
-                threading.Thread(target=expand_ecosystem_filter, args=(mapping["contact_company"],), daemon=True).start()
+                threading.Thread(target=auto_expand_ats_slug, args=(mapping["contact_company"],), daemon=True).start()
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
@@ -3612,6 +3909,8 @@ def process_webhook_payload_async(data):
                 "/p - Query priority tier contacts\n\n"
                 "<b>SWIPE-REPLY ACTIONS (reply to a card):</b>\n"
                 "/apply - Mark Applied & move to Tetiana Warm\n"
+                "/offer - Log an offer for this record\n"
+                "/withdraw - Log a withdrawn application\n"
                 "/warm - Smart-route lead to its Warm tab\n"
                 "/cold - Smart-route lead to its Cold tab\n"
                 "/x - Archive lead to Died/Killed tab\n"
@@ -3630,6 +3929,7 @@ def process_webhook_payload_async(data):
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
                 "/funnel - View pipeline conversion funnel\n"
+                "/outcomes - View evidence-based reply/interview rates by source & path\n"
                 "/streak, /daily - View daily outreach scorecard"
             )
             return
@@ -3814,6 +4114,16 @@ def handle_fast_path_command(chat_id, text, msg):
         domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
         if mapping.get("contact_name"):
             target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint, on_provider_attempt=increment_api_usage_counter)
+            confidence = "unverified" if is_unverified_email(target) else "verified"
+            log_email_enrichment_attempt(mapping["sheet_uuid"], "waterfall", target, confidence)
+            if confidence == "unverified":
+                send_telegram_message(
+                    chat_id,
+                    f"⚠️ <b>Unverified Contact Email - Draft Not Created</b>\n"
+                    f"<b>Best guess:</b> <code>{html.escape(target)}</code>\n\n"
+                    f"Reply <code>/e actual@email.com</code> to confirm the real address and create the draft."
+                )
+                return True
         else:
             target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
         track = job.get("track", "a")
