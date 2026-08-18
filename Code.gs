@@ -138,9 +138,10 @@ function doPost(e) {
       });
     }
 
-    // 2. /quick Contact Creation (main.py: build_crm_payload("quick_add", ...))
+    // 2. /quick, /cold, /warm Contact Creation (main.py: build_crm_payload("quick_add", ...))
     if (action === "quick_add") {
       const targetTab = payload.target_code === "TC" ? "Tetiana Cold" :
+                        payload.target_code === "CC" ? "Carmen Cold" :
                         payload.target_code === "CW" ? "Carmen Warm" : "Carmen Warm";
       const sheet = getOrCreateSheet(ss, targetTab);
       const rowData = [

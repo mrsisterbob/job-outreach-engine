@@ -29,16 +29,25 @@ def build_linkedin_url(company_name):
     return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
 
 
+def _strip_legal_suffixes(company_name):
+    """Strip common legal-entity suffixes (Inc, LLC, Corp, Holdings, etc.) and punctuation noise
+    so decision-maker dorks never search on a garbled/truncated company name.
+    """
+    clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    clean = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b', '', clean, flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', clean).strip()
+
+
 def build_hiring_manager_dork(company_name, job_title=""):
     """Google dork to surface a company's Head/Director/VP of Operations or COO on LinkedIn."""
-    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    clean_comp = _strip_legal_suffixes(company_name)
     query = f'site:linkedin.com/in "{clean_comp}" ("Head of Operations" OR "Director of Operations" OR "Operations Manager" OR "VP of Operations" OR "COO")'
     return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
 
 
 def build_recruiter_dork(company_name):
     """Google dork targeting in-house talent acquisition for the company on LinkedIn."""
-    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    clean_comp = _strip_legal_suffixes(company_name)
     query = f'site:linkedin.com/in "{clean_comp}" ("Technical Recruiter" OR "Talent Acquisition" OR "Senior Recruiter" OR "Corporate Recruiter")'
     return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
 
