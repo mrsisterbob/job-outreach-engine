@@ -1,0 +1,176 @@
+"""Pure, dependency-free pipeline helpers (no Flask/DB/network calls).
+
+Split out of main.py so the scoring/dedup/dork/formatting logic can be unit-tested in isolation
+and so main.py itself shrinks toward being just orchestration (routes, DB, CRM, Telegram, AI calls).
+"""
+import hashlib
+import re
+import urllib.parse
+from datetime import datetime, timezone
+
+
+def build_apollo_url(company_name):
+    clean_company = re.sub(r'[^a-zA-Z0-9\s]', "", str(company_name or "")).strip()
+    encoded = urllib.parse.quote(f"{clean_company} Operations")
+    return f"https://app.apollo.io/#/people?qKeywords={encoded}"
+
+
+def build_linkedin_url(company_name):
+    clean_company = re.sub(r'[^a-zA-Z0-9\s]', "", str(company_name or "")).strip()
+    encoded = urllib.parse.quote(f'{clean_company} ("VP" OR "Director" OR "Manager") ("Operations" OR "Compliance")')
+    return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
+
+
+def build_hiring_manager_dork(company_name, job_title=""):
+    """Google dork to surface a company's Head/Director/VP of Operations or COO on LinkedIn."""
+    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    query = f'site:linkedin.com/in "{clean_comp}" ("Head of Operations" OR "Director of Operations" OR "Operations Manager" OR "VP of Operations" OR "COO")'
+    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+
+
+def build_recruiter_dork(company_name):
+    """Google dork targeting in-house talent acquisition for the company on LinkedIn."""
+    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    query = f'site:linkedin.com/in "{clean_comp}" ("Technical Recruiter" OR "Talent Acquisition" OR "Senior Recruiter" OR "Corporate Recruiter")'
+    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+
+
+def build_alumni_dork(company_name, school="Hope College"):
+    """Google dork to surface shared-alma-mater employees at a target company on LinkedIn."""
+    clean_comp = re.sub(r'[^a-zA-Z0-9\s]', '', str(company_name or '')).strip()
+    clean_school = re.sub(r'[^a-zA-Z0-9\s]', '', str(school or '')).strip()
+    query = f'site:linkedin.com/in "{clean_comp}" "{clean_school}"'
+    return f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+
+
+def normalize_priority_value(raw_value):
+    """Normalize free-text ("High"/"Medium"/"Low") or numeric 1-10 priority values into an int 1-10
+    (10 = highest priority). Mirrors Code.gs's mapPriorityValue() but keeps a direct (non-inverted)
+    scale so it can drive the Dynamic Contact Quality Multiplier's score boost. Defaults to 5.
+    """
+    text = str(raw_value or "").strip()
+    lower = text.lower()
+    if "high" in lower:
+        return 9
+    if "medium" in lower:
+        return 5
+    if "low" in lower:
+        return 2
+    match = re.search(r'\d+', text)
+    if match:
+        try:
+            return max(1, min(10, int(match.group())))
+        except (ValueError, TypeError):
+            return 5
+    return 5
+
+
+def calculate_followup_interval(priority_score):
+    try:
+        p = float(priority_score)
+        return max(3, int(round(35.0 - (p * 3.2))))
+    except Exception:
+        return 14
+
+
+def resolve_smart_target_tab(source_tab, direction):
+    """Smart auto-routing for /warm, /cold, /x: Carmen-family tabs stay in the Carmen pipeline;
+    Tetiana-family tabs (and "Pipeline_Candidates", the pre-CRM staging tab for fresh job cards)
+    stay in the Tetiana pipeline. direction is "warm", "cold", or "kill".
+    """
+    is_carmen = str(source_tab or "").startswith("Carmen")
+    if direction == "kill":
+        return "Killed" if is_carmen else "Died"
+    if direction == "warm":
+        return "Carmen Warm" if is_carmen else "Tetiana Warm"
+    return "Carmen Cold" if is_carmen else "Tetiana Cold"
+
+
+def enforce_sentence_limit(text, max_sentences):
+    """Truncate text to at most max_sentences sentences."""
+    sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
+    return ' '.join(sentences[:max_sentences])
+
+
+def get_fit_score_indicator(score):
+    if score >= 80:
+        return "🟢"
+    elif score >= 65:
+        return "🟡"
+    return "🔴"
+
+
+def generate_dedup_hash(company, title):
+    clean_company = str(company or "").lower().strip()
+    clean_title = str(title or "").lower().strip()
+    return hashlib.md5(f"{clean_company}_{clean_title}".encode()).hexdigest()
+
+
+def generate_short_key(raw_id, fallback=None):
+    """fallback replaces time.time() as the entropy source when raw_id is falsy, keeping this pure."""
+    return hashlib.md5(str(raw_id or fallback or "0").encode()).hexdigest()[:12]
+
+
+def parse_posted_hours(posted_utc_str):
+    if not posted_utc_str:
+        return 48
+    try:
+        dt = datetime.fromisoformat(str(posted_utc_str).replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return int((now - dt).total_seconds() / 3600)
+    except Exception:
+        return 48
+
+
+def get_age_badge(posted_hours):
+    if posted_hours < 24:
+        return "🔥 [< 24h FRESH]"
+    elif posted_hours < 72:
+        return "⚡ [1-3d RECENT]"
+    elif posted_hours < 168:
+        return "🟢 [3-7d ACTIVE]"
+    elif posted_hours < 336:
+        return "🟡 [7-14d AGING]"
+    else:
+        return "🔴 [14-30d STALE]"
+
+
+def extract_salary(job):
+    try:
+        min_sal = float(job.get("job_min_salary") or 0)
+        max_sal = float(job.get("job_max_salary") or 0)
+        curr = str(job.get("job_salary_currency") or "USD")
+        period = str(job.get("job_salary_period") or "year").lower()
+        if "hour" in period or period == "hr":
+            min_sal = min_sal * 2080
+            max_sal = max_sal * 2080
+            period = "year"
+        if min_sal and max_sal:
+            return f"${min_sal:,.0f} - ${max_sal:,.0f} {curr}/{period}", max_sal
+        elif min_sal or max_sal:
+            val = min_sal or max_sal
+            return f"${val:,.0f} {curr}/{period}", val
+    except Exception:
+        pass
+    return "Salary Unlisted", 0
+
+
+def extract_work_style(job):
+    desc = str(job.get("job_description") or "").lower()
+    is_remote = job.get("job_is_remote", False) or "remote" in desc[:300] or "work from home" in desc[:300]
+    if "hybrid" in desc:
+        return "Hybrid"
+    elif is_remote:
+        return "Remote"
+    return "On-Site / Unspecified"
+
+
+def compute_description_simhash(text: str) -> str:
+    """Computes a normalized SimHash token on the core job description."""
+    clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(text or "")[:400].lower())
+    tokens = clean.split()
+    if not tokens:
+        return hashlib.md5(b"").hexdigest()
+    # Normalize 3-grams to catch reworded titles with identical bodies
+    shingles = [" ".join(tokens[i:i+3]) for i in range(max(1, len(tokens)-2))]
+    return hashlib.md5("".join(sorted(shingles)).encode()).hexdigest()
