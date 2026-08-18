@@ -1,0 +1,15 @@
+{
+  "cold_ops": [
+    "Hi {name},\n\nI saw the {job_title} role at {company} and wanted to highlight my background in wealth operations and process automation. Would you be open to a brief 5 minute call next week to discuss alignment?\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nLooks like you are hiring for the {job_title} role at {company}. Would it be helpful to discuss how my background in financial systems and reconciliation can support your team?\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nI noticed the {job_title} opening at {company}. I have automated recurring data intake and ledger reconciliation tasks in similar environments to cut manual processing time. Do you have time for a brief call this week?\n\nBest regards,\nKevin Miller"
+  ],
+  "warm_alumni": [
+    "Hi {name},\n\nAs a fellow Hope College business alum, I saw your work at {company} and wanted to reach out. I am currently working in wealth operations and would value learning more about your experience on the team over a quick call.\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nI hope you are doing well. I noticed your recent work at {company} and wanted to reconnect to see what you have been up to lately. Would love to catch up over coffee or a brief call if your schedule allows.\n\nBest regards,\nKevin Miller"
+  ],
+  "followup_bumps": [
+    "Hi {name},\n\nBumping this briefly to the top of your inbox in case it got buried. Would love to connect if you have 5 minutes this week to discuss alignment on the {job_title} role.\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nI reached out previously regarding the {job_title} role at {company}. I assume timing might be off right now, but let me know if exploring alignment is a priority in the coming quarters.\n\nBest regards,\nKevin Miller"
+  ]
+}

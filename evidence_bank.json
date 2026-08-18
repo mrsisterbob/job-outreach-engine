@@ -1,107 +1,81 @@
 {
   "identity": {
-    "name": "Kevin Jacob Miller",
+    "name": "Kevin Miller",
     "email": "kjmiller406@gmail.com",
     "phone": "248-709-6326",
-    "location": "Farmington / Detroit, MI",
+    "location": "Detroit, MI",
     "website": "montelattice.com",
     "linkedin": "linkedin.com/in/kevinmiller"
   },
   "experience": [
     {
-      "title": "Compliance Lead",
+      "company": "Signal Advisors",
+      "title": "Wealth Operations Specialist",
+      "location": "Detroit, MI",
+      "start": "06/2026",
+      "end": "Present",
+      "bullets": [
+        "Executed 300+ new financial account setups and tracked complete client onboarding lifecycles using Salesforce CRM while coordinating with 50+ advisors to resolve missing paperwork.",
+        "Navigated Fidelity and Schwab custodial platforms to reconcile account data across a 2.5 billion dollar AUM institutional portfolio spanning multiple state jurisdictions.",
+        "Engineered workflow audits in DocuSign to validate incoming Investment Advisory Agreements for 150+ advisors reducing manual packet verification time from 60 minutes to 20 minutes.",
+        "Redesigned ticket routing logic in Salesforce to segregate restricted account trading tickets from service requests eliminating 200+ invalid tickets from the service desk queue."
+      ]
+    },
+    {
       "company": "40 Acres App",
+      "title": "Compliance Lead",
       "location": "Detroit, MI",
       "start": "04/2026",
       "end": "Present",
       "bullets": [
-        "Architect regulatory infrastructure for blockchain-based real estate and real-world asset (RWA) tokenization.",
-        "Draft SEC Form D filings and Regulation Crowdfunding documentation for SEC and FinCEN compliance.",
-        "Design operational plumbing for digital asset ownership and institutional data validation."
+        "Architecting regulatory infrastructure for blockchain based real estate and the tokenization of real world assets.",
+        "Drafting SEC Form D filings and Regulation Crowdfunding documentation for SEC and FinCEN compliance.",
+        "Designing operational plumbing for digital asset ownership and institutional data validation."
       ]
     },
     {
-      "title": "Wealth Intern",
-      "company": "Signal Advisors",
-      "location": "Detroit, MI",
-      "start": "06/2026",
-      "end": "08/2026",
+      "company": "Northwestern Mutual",
+      "title": "Financial Planner",
+      "location": "Grand Rapids, MI",
+      "start": "05/2025",
+      "end": "08/2025",
       "bullets": [
-        "Supported wealth operations workflows for a fast-growing downtown Detroit startup, including data reconciliation and account servicing.",
-        "Automated recurring data intake and reporting tasks using Python to reduce manual processing time."
+        "Supported introductory client meetings and administrative workflow preparation within a regulated financial planning environment.",
+        "Applied suitability frameworks and regulatory constraints to support advisor operations."
       ]
     },
     {
-      "title": "Deal Structure Analyst",
-      "company": "Monetae",
-      "location": "",
-      "start": "Late 2025",
-      "end": "Late 2025",
+      "company": "ABC Technologies",
+      "title": "Total Rewards Finance Intern",
+      "location": "Southfield, MI",
+      "start": "05/2024",
+      "end": "08/2024",
       "bullets": [
-        "Analyzed corporate integration concepts and drafted deal structure breakdowns for prospective transactions.",
-        "Evaluated structural alternatives to support decision-making on deal formation and corporate integration."
+        "Performed high volume reconciliation of 500+ retirement accounts, validating ledger accuracy and resolving discrepancies.",
+        "Prepared and maintained supporting schedules for variance analysis and recurring internal reports.",
+        "Built and maintained Excel templates to streamline recurring data tasks and reduce manual processing time."
       ]
     }
   ],
   "education": [
     {
       "school": "Hope College",
-      "degree": "B.A. Business (Finance & Political Science Focus)",
+      "degree": "B.A. Business (Finance), B.A. Political Science",
       "location": "Holland, MI",
       "start": "08/2022",
       "end": "05/2026",
       "credentials": [
+        "Series 65 Candidate",
         "Securities Industry Essentials (SIE)",
-        "Michigan Life, Accident & Health Insurance Exam (In Progress)"
+        "Schwab Limited Power of Attorney"
       ]
     }
   ],
   "technical_skills": [
-    "Python",
-    "SQL",
-    "SQLite (WAL Mode)",
-    "Flask",
-    "Telegram Bot API Webhooks",
-    "Google Apps Script",
-    "Google Sheets (Schema Design)",
-    "Power BI",
-    "HubSpot CRM",
-    "SEC/FinCEN Regulatory Reporting",
-    "Schwab Advisor Center (SAC)",
-    "Fidelity Wealthscape",
-    "Salesforce",
-    "Advanced Excel"
+    "Python", "SQL", "Salesforce", "Power BI", "Excel", "HubSpot CRM", "Schwab Advisor Center", "Fidelity Wealthscape", "DocuSign", "Orion Eclipse", "Typst"
   ],
-  "voice_and_tone": {
-    "tone": "Direct, conversational, low-pressure, professional, and grounded. Sounds like a human writing a quick note. No corporate fluff.",
-    "sentence_style": "Short, direct sentences. Avoid stacked subordinate clauses.",
-    "guidance": [
-      "Sound like a real person writing a quick note, not a marketing brochure.",
-      "State facts plainly - let the achievement carry the weight, not the adjective.",
-      "Keep outreach low-pressure: invite a conversation, never pressure or oversell.",
-      "Every sentence should carry real information - no filler, no hype."
-    ]
-  },
   "banned_words": [
-    "leverage",
-    "leveraging",
-    "synergy",
-    "synergize",
-    "seamless",
-    "paradigm",
-    "passionate",
-    "spearheaded",
-    "results-driven",
-    "cutting-edge",
-    "hustle",
-    "relentless",
-    "dynamic",
-    "orchestrate",
-    "orchestrated"
-  ],
-  "evergreen_highlights": [
-    { "label": "Institutional Data Controls", "text": "Applied reconciliation and variance-analysis discipline to institutional wealth data and blockchain-based asset workflows." },
-    { "label": "Regulatory Translation", "text": "Bridged legal compliance requirements with structured technical workflows across SEC/FinCEN filings and RWA tokenization infrastructure." }
+    "leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm", "spearheaded", "utilizing", "dynamic", "robust"
   ]
 }
 

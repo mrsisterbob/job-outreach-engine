@@ -17,7 +17,7 @@ from email.message import EmailMessage
 import requests
 from flask import Flask, jsonify, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
-from resume_engine import compile_resume_pdf, filter_ats_bullets
+from resume_engine import compile_resume_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -87,6 +87,128 @@ def build_evidence_context_block(mode="eval"):
         banned_line = ", ".join(evidence_bank.get("banned_words", []))
         block += f"\nBANNED WORDS (never use): {banned_line}"
     return block
+
+# ==============================================================================
+# STRICT DETERMINISTIC TEMPLATE ENGINE (SDTE): local JSON template banks. Gemini never
+# authors outreach/LinkedIn prose - it only routes an integer template id, which Python then
+# interpolates deterministically via .format(). Editable live via the /edit Telegram command.
+# ==============================================================================
+TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+OUTREACH_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "outreach_templates.json")
+LINKEDIN_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "linkedin_templates.json")
+
+_FALLBACK_OUTREACH_TEMPLATES = {
+    "cold_ops": ["Hi {name},\n\nI saw the {job_title} role at {company} and wanted to reach out. Would you be open to a brief call?\n\nBest regards,\nKevin Miller"],
+    "warm_alumni": ["Hi {name},\n\nHope you have been doing well. Would love to reconnect.\n\nBest regards,\nKevin Miller"],
+    "followup_bumps": ["Hi {name},\n\nBumping this briefly to the top of your inbox.\n\nBest regards,\nKevin Miller"]
+}
+_FALLBACK_LINKEDIN_TEMPLATES = {
+    "linkedin_templates": ["Hi {name}. I saw the {job_title} opening at {company} and wanted to connect."]
+}
+
+def load_outreach_templates():
+    """Hot-reloads the cold/warm/bump email template bank from templates/outreach_templates.json.
+    Falls back to a minimal safe stub on any read/parse failure. Called fresh on every use so
+    /edit mutations go live instantly, without a Flask server restart.
+    """
+    try:
+        with open(OUTREACH_TEMPLATES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Outreach templates load failed, using fallback stub: {e}")
+        return _FALLBACK_OUTREACH_TEMPLATES
+
+def load_linkedin_templates():
+    """Hot-reloads the LinkedIn connection note template bank from templates/linkedin_templates.json.
+    Falls back to a minimal safe stub on any read/parse failure. See load_outreach_templates().
+    """
+    try:
+        with open(LINKEDIN_TEMPLATES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"LinkedIn templates load failed, using fallback stub: {e}")
+        return _FALLBACK_LINKEDIN_TEMPLATES
+
+def resolve_template_text(pool, idx, fallback_text=""):
+    """Bounds-checks an integer template index against a template pool, defaulting to index 0
+    (or a supplied fallback string) if the pool is empty or the index is missing/out-of-range.
+    """
+    if not isinstance(pool, list) or not pool:
+        return fallback_text
+    if not isinstance(idx, int) or idx < 0 or idx >= len(pool):
+        idx = 0
+    return pool[idx]
+
+def interpolate_template(template, name="there", company="", job_title=""):
+    """Deterministically fills {name}/{company}/{job_title} placeholders via str.format() - the
+    only place candidate-facing outreach/LinkedIn copy is ever assembled. Never calls Gemini."""
+    try:
+        return template.format(name=name or "there", company=company or "your team", job_title=job_title or "this role")
+    except Exception as e:
+        logging.error(f"Template interpolation failed: {e}")
+        return template
+
+RESUME_BULLETS_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_bullets_bank.json")
+
+EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|T[A-E])(\d+)$", re.IGNORECASE)
+
+def resolve_edit_target(id_str):
+    """Maps a /edit ID to (file_path, list_key, index):
+      L0-L5 -> templates/linkedin_templates.json[linkedin_templates]
+      C0-C2 -> templates/outreach_templates.json[cold_ops]
+      W0-W1 -> templates/outreach_templates.json[warm_alumni]
+      B0-B1 -> templates/outreach_templates.json[followup_bumps]
+      TA0-TA9 ... TE0-TE9 -> resume_bullets_bank.json[track_x_...]
+    Returns None if the ID prefix is unrecognized.
+    """
+    m = EDIT_ID_PATTERN.match(str(id_str or "").strip())
+    if not m:
+        return None
+    prefix, idx = m.group(1).upper(), int(m.group(2))
+    if prefix == "L":
+        return (LINKEDIN_TEMPLATES_PATH, "linkedin_templates", idx)
+    if prefix == "C":
+        return (OUTREACH_TEMPLATES_PATH, "cold_ops", idx)
+    if prefix == "W":
+        return (OUTREACH_TEMPLATES_PATH, "warm_alumni", idx)
+    if prefix == "B":
+        return (OUTREACH_TEMPLATES_PATH, "followup_bumps", idx)
+    if len(prefix) == 2 and prefix[0] == "T":
+        pool_key = TRACK_BULLET_POOL_KEYS.get(prefix[1].lower())
+        if pool_key:
+            return (RESUME_BULLETS_BANK_PATH, pool_key, idx)
+    return None
+
+def update_template_entry(file_path, list_key, idx, new_text):
+    """Atomically loads a template JSON bank, overwrites the string at (list_key, idx), and
+    writes it back to disk via a temp-file + os.replace swap (crash-safe, no partial writes on
+    disk). Returns (ok: bool, message: str) - message is a ready-to-send Telegram HTML string.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"❌ Failed to load template bank: {html.escape(str(e))}"
+
+    pool = data.get(list_key)
+    if not isinstance(pool, list):
+        return False, f"❌ Unknown template pool: <code>{html.escape(str(list_key))}</code>"
+    if idx < 0 or idx >= len(pool):
+        return False, f"❌ Index {idx} out of range for <code>{html.escape(str(list_key))}</code> (valid: 0-{len(pool) - 1})."
+
+    pool[idx] = new_text
+    try:
+        tmp_path = f"{file_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, file_path)
+    except Exception as e:
+        return False, f"❌ Failed to write template bank: {html.escape(str(e))}"
+
+    return True, (
+        f"✅ <b>Template Updated:</b> <code>{html.escape(str(list_key))}[{idx}]</code>\n\n"
+        f"<code>{html.escape(new_text)}</code>"
+    )
 
 # Inbound Email Anti-Spam Gatekeeper: 10 pre-filter shield parameters (raw CSV/string env values,
 # parsed lazily in passes_email_prefilter() to avoid depending on helpers defined later in the file)
@@ -837,23 +959,30 @@ def format_email_block(email_text):
 def build_system_prompt():
     """Builds the Gemini job-screener system prompt fresh on every call so Evidence Bank edits
     apply instantly (hot-reload, see build_evidence_context_block()/load_evidence_bank()).
+    Strict Deterministic Template Engine (SDTE): Gemini acts ONLY as a classifier/router - it
+    returns a score/reason plus integer routing keys (track, bullet_indices, linkedin_template_id,
+    outreach_template_id). It never authors resume bullets, email bodies, or LinkedIn notes
+    itself; all candidate-facing text is interpolated deterministically in Python from local
+    JSON template banks (see load_outreach_templates()/load_linkedin_templates()/resume_engine.filter_ats_bullets()).
     """
     evidence_block = build_evidence_context_block(mode="eval")
-    return f"""You are a strict technical job screener evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
+    return f"""You are a strict technical job screener and template router evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
 High Priority Skills: Python, SQL, Salesforce, Excel, Schwab SAC, Fidelity Wealthscape, DocuSign, Process Automation.
 Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles, retail bank tellers, CPA tracks, Senior/Lead/Manager roles.
 
 EVIDENCE BANK (the only source of truth for this candidate's real background):
 {evidence_block}
 
-NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. Never invent skills, employers, or experiences not listed there. Strictly follow the VOICE & TONE guidance above and avoid every word in BANNED WORDS. Output must sound like a direct, human communicator - short sentences, no corporate hype.
+NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. Never invent skills, employers, or experiences not listed there. You are STRICTLY a classifier/router - NEVER generate prose, sentences, resume bullets, email bodies, or LinkedIn notes yourself. Only return integer indices selecting from pre-approved local template banks; all actual text is interpolated deterministically in Python from those banks.
 
 Evaluate the job description and respond ONLY with a JSON object containing:
 {{
 "score": <integer between 1 and 100 representing fit signal>,
 "reason": "<1-sentence concise explanation of why this role fits or does not fit>",
-"linkedin_note": "<a personalized LinkedIn connection note tailored to this specific role and company, strictly under 300 characters, ideally under 280>",
-"ats_bullets": ["<high-impact quantified resume bullet #1 tailored to this job description's keywords and operations/systems focus>", "<high-impact quantified resume bullet #2>"]
+"track": "<one letter a|b|c|d|e selecting the resume bullet pool that best matches this role: a=wealth operations, b=data/systems engineering, c=risk & regulatory compliance, d=business intelligence & analytics, e=business operations & CRM systems>",
+"bullet_indices": [<int>, <int>, <int>],
+"linkedin_template_id": <integer 0-5 selecting a LinkedIn connection note template>,
+"outreach_template_id": <integer 0-2 selecting a cold outreach email template>
 }}"""
 
 def send_health_alert(error_msg):
@@ -1319,13 +1448,15 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
     return None
 
 def evaluate_job_with_gemini(job):
-    """Evaluate job with Gemini. On failure/timeout, set score=0 and status 'Evaluation Pending'.
-    Thread-safe with timeout handling: DO NOT assign fake scores on failure.
-    Returns (pass_bool, score, reason, linkedin_note, ats_bullets).
+    """Evaluate job with Gemini acting strictly as a classifier/router (Strict Deterministic
+    Template Engine). Gemini returns ONLY a score/reason plus integer routing keys - never
+    prose. On failure/timeout, set score=0 and status 'Evaluation Pending'. Thread-safe with
+    timeout handling: DO NOT assign fake scores on failure.
+    Returns (pass_bool, score, reason, track, bullet_indices, linkedin_template_id, outreach_template_id).
     """
     if not GEMINI_API_KEY:
-        return True, 75, "Fallback pass (No Key)", "", []
-    
+        return True, 75, "Fallback pass (No Key)", "a", [0, 1, 2], 0, 0
+
     try:
         desc_truncated = str(job.get("job_description") or "")[:4000]
         prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{desc_truncated}"
@@ -1339,24 +1470,36 @@ def evaluate_job_with_gemini(job):
                 res_data = json.loads(cleaned_text)
                 raw_score = int(res_data.get("score", 0))
                 reason = res_data.get("reason", "N/A")
-                linkedin_note = sanitize_text(str(res_data.get("linkedin_note", "") or ""))[:300]
-                ats_bullets = res_data.get("ats_bullets", [])
-                if not isinstance(ats_bullets, list):
-                    ats_bullets = []
-                ats_bullets = [str(b) for b in ats_bullets][:2]
+
+                track = str(res_data.get("track", "a") or "a").strip().lower()
+                if track not in ("a", "b", "c", "d", "e"):
+                    track = "a"
+
+                bullet_indices = res_data.get("bullet_indices", [0, 1, 2])
+                if not isinstance(bullet_indices, list) or not all(isinstance(i, int) for i in bullet_indices):
+                    bullet_indices = [0, 1, 2]
+
+                linkedin_template_id = res_data.get("linkedin_template_id", 0)
+                if not isinstance(linkedin_template_id, int):
+                    linkedin_template_id = 0
+
+                outreach_template_id = res_data.get("outreach_template_id", 0)
+                if not isinstance(outreach_template_id, int):
+                    outreach_template_id = 0
+
                 final_score = calculate_hybrid_score_modifier(job, raw_score)
-                return (final_score >= 65), final_score, reason, linkedin_note, ats_bullets
+                return (final_score >= 65), final_score, reason, track, bullet_indices, linkedin_template_id, outreach_template_id
             except Exception as e:
                 logging.error(f"Gemini evaluation JSON parse failure: {e}")
                 # On parse error, return 0 score with Evaluation Pending status
-                return False, 0, "Evaluation Pending", "", []
+                return False, 0, "Evaluation Pending", "a", [0, 1, 2], 0, 0
         
         # On API failure/timeout, set score to 0 and status to "Evaluation Pending" (NO fake scores)
-        return False, 0, "Evaluation Pending", "", []
+        return False, 0, "Evaluation Pending", "a", [0, 1, 2], 0, 0
     
     except Exception as e:
         logging.error(f"Gemini evaluation exception: {e}")
-        return False, 0, "Evaluation Pending", "", []
+        return False, 0, "Evaluation Pending", "a", [0, 1, 2], 0, 0
 
 def generate_interview_prep(company, job_title, job_description=""):
     """3 talking points + 2 reverse questions tailored to a role; safe static fallback if Gemini is unavailable."""
@@ -1500,10 +1643,28 @@ def passes_strict_filter(job):
 
 def process_single_candidate(job):
     log_metric_event("ai_screened")
-    ai_pass, score, reason, linkedin_note, ats_bullets = evaluate_job_with_gemini(job)
+    ai_pass, score, reason, track, bullet_indices, linkedin_template_id, outreach_template_id = evaluate_job_with_gemini(job)
     if ai_pass:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
         short_id = generate_short_key(raw_id)
+        job_title = job.get("job_title") or "this role"
+        company_name = job.get("employer_name") or "your team"
+
+        # Strict Deterministic Template Engine: Gemini only routed a track + integer indices -
+        # Python resolves/bounds-checks the actual bullet text and interpolates the actual
+        # LinkedIn/outreach copy from local JSON banks. Gemini never authors this text directly.
+        ats_bullets = filter_ats_bullets(track, bullet_indices)
+        linkedin_pool = load_linkedin_templates().get("linkedin_templates", [])
+        linkedin_template = resolve_template_text(linkedin_pool, linkedin_template_id)
+        linkedin_note = sanitize_text(interpolate_template(linkedin_template, name="there", company=company_name, job_title=job_title))[:300]
+        cold_pool = load_outreach_templates().get("cold_ops", [])
+        cold_template = resolve_template_text(cold_pool, outreach_template_id)
+        outreach_email = sanitize_text(interpolate_template(cold_template, name="there", company=company_name, job_title=job_title))
+
+        # Persist routing keys on the cached job so /cv, /stage, and ATS plaintext all resolve
+        # the exact same bullets later (bounds-checked again by resume_engine.filter_ats_bullets).
+        job["track"] = track
+        job["bullet_indices"] = bullet_indices
         sheet_uuid = save_job_to_cache(short_id, job)
         target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
         age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
@@ -1546,6 +1707,7 @@ def process_single_candidate(job):
         return {
             "job": job, "score": score, "reason": reason,
             "linkedin_note": linkedin_note, "ats_bullets": ats_bullets,
+            "outreach_email": outreach_email,
             "target_email": target_email, "age_badge": age_badge,
             "salary_str": salary_str, "work_style": work_style,
             "overlap_pct": overlap_pct, "matched_skills": matched_skills,
@@ -2152,7 +2314,7 @@ def get_fit_score_indicator(score):
         return "🟡"
     return "🔴"
 
-def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line=""):
+def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line="", outreach_email=""):
     """Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
     """
@@ -2172,6 +2334,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     bullets_block = ("\n".join(f"• {b}" for b in ats_bullets) if ats_bullets else "N/A")[:500]
     linkedin_note_safe = str(linkedin_note or "")[:300]
     alumni_line_safe = str(alumni_line or "")[:400]
+    outreach_email_safe = str(outreach_email or "")[:600]
     fit_dot = get_fit_score_indicator(score)
     card_text = (
         f"💼 <b>{title}</b>\n"
@@ -2192,6 +2355,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
         f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note_safe) if linkedin_note_safe else 'N/A'}</code>\n\n"
         f"📄 <b>Tailored ATS Resume Bullets:</b>\n<code>{html.escape(bullets_block)}</code>\n\n"
+        f"✉️ <b>Cold Outreach Draft (tap to copy):</b>\n<code>{html.escape(outreach_email_safe) if outreach_email_safe else 'N/A'}</code>\n\n"
         f"⚡ <b>Swipe Actions (reply to this card):</b>\n"
         f"  <code>/apply</code> Mark Applied   <code>/draft</code> Gmail Draft\n"
         f"  <code>/warm</code> Move Warm   <code>/cold</code> Move Cold   <code>/x</code> Dead\n"
@@ -2462,7 +2626,8 @@ def run_job_pipeline(chat_id=None, top_n=2):
             sheet_uuid=item.get("sheet_uuid"),
             linkedin_note=item.get("linkedin_note", ""),
             ats_bullets=item.get("ats_bullets"),
-            alumni_line=item.get("alumni_line", "")
+            alumni_line=item.get("alumni_line", ""),
+            outreach_email=item.get("outreach_email", "")
         )
         batch_rows.append({
             "sheet_uuid": item.get("sheet_uuid"),
@@ -2943,9 +3108,9 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, letter_msg)
             return
 
-        cv_match = re.match(r"^/(cv|resume)(?:\s+([ab]))?$", text, re.IGNORECASE)
+        cv_match = re.match(r"^/(cv|resume)(?:\s+([a-eA-E]))?$", text, re.IGNORECASE)
         if cv_match:
-            track = (cv_match.group(2) or "a").lower()
+            requested_track = (cv_match.group(2) or "").lower()
             mapping = resolve_reply_mapping(msg, chat_id, cv_match.group(0).split()[0])
             if not mapping:
                 return
@@ -2953,11 +3118,12 @@ def process_webhook_payload_async(data):
 
             # Fallback to the networking-record mapping (e.g. /quick contacts with no cached job) instead of blocking
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Company"
-            bullets = job.get("ats_bullets", [])
+            track = requested_track or job.get("track") or "a"
+            bullet_indices = job.get("bullet_indices")
             short_id = job.get("short_id") or generate_short_key(job.get("job_id") or mapping["sheet_uuid"])
 
             try:
-                pdf_bytes = compile_resume_pdf(comp, bullets, track=track)
+                pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
                 clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
                 filename = f"Kevin_Miller_Resume_{clean_comp}_Track{track.upper()}.pdf"
 
@@ -3014,6 +3180,29 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
+        # Deterministic Template Bank Editor (/edit ID New Text) - no reply context required
+        if text.startswith("/edit"):
+            body = text[5:].strip()
+            parts = body.split(None, 1)
+            if len(parts) < 2:
+                send_telegram_message(
+                    chat_id,
+                    "❌ <b>Usage:</b> <code>/edit ID New Text</code>\n"
+                    "IDs: <code>L0-L5</code> (LinkedIn), <code>C0-C2</code> (Cold), "
+                    "<code>W0-W1</code> (Warm), <code>B0-B1</code> (Bump), "
+                    "<code>TA0-TA9</code>...<code>TE0-TE9</code> (Resume Bullets)"
+                )
+                return
+            edit_id, new_text = parts[0], parts[1].strip()
+            target = resolve_edit_target(edit_id)
+            if not target:
+                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L5, C0-C2, W0-W1, B0-B1, TA0-TA9...TE0-TE9.")
+                return
+            file_path, list_key, idx = target
+            ok, result_msg = update_template_entry(file_path, list_key, idx, new_text)
+            send_telegram_message(chat_id, result_msg)
+            return
+
         # Muscle Memory Safety Net: catches old finger-memory taps of retired swipe commands
         if text in ["/tw", "/cw", "/tc", "/cc", "/conv", "/int", "/pivot"]:
             send_telegram_message(
@@ -3030,7 +3219,8 @@ def process_webhook_payload_async(data):
                 "<b>CORE COMMANDS:</b>\n"
                 "/t - Pull fresh job cards\n"
                 "/search - View or update live search filters\n"
-                "/quick - Create contact (Name @ Firm Priority Note)\n\n"
+                "/quick - Create contact (Name @ Firm Priority Note)\n"
+                "/edit - Edit a template (e.g. /edit L0 New note)\n\n"
                 "<b>PULL CRM DATA:</b>\n"
                 "/c - Pull combined networking cards\n"
                 "/cw - Pull Warm Rolodex cards\n"
@@ -3279,7 +3469,7 @@ def format_ats_plaintext(job, track="a"):
         lines.append("")
 
     lines.append("TARGETED ACHIEVEMENTS")
-    validated_bullets = filter_ats_bullets(job.get("ats_bullets", []), track)
+    validated_bullets = filter_ats_bullets(track, job.get("bullet_indices"))
     for b in validated_bullets:
         lines.append(f"- {b}")
 
@@ -3292,11 +3482,11 @@ def desktop_stage_view(short_id):
     if not job:
         return "<h3>Job not found or cache expired.</h3>", 404
 
-    track = request.args.get("track", "a")
+    track = request.args.get("track") or job.get("track") or "a"
     comp = job.get("employer_name", "Target Firm")
     title = job.get("job_title", "Role")
     apply_link = job.get("job_apply_link", "#")
-    bullets = job.get("ats_bullets", [])
+    bullets = filter_ats_bullets(track, job.get("bullet_indices"))
     bullets_html = "".join([f"<li>{html.escape(str(b))}</li>" for b in bullets])
     ats_plaintext = format_ats_plaintext(job, track)
 
@@ -3354,10 +3544,10 @@ def desktop_stage_pdf(short_id):
     job = get_job_from_cache(short_id)
     if not job:
         return "Job cache expired", 404
-    track = request.args.get("track", "a")
+    track = request.args.get("track") or job.get("track") or "a"
     comp = job.get("employer_name", "Target Firm")
-    bullets = job.get("ats_bullets", [])
-    pdf_bytes = compile_resume_pdf(comp, bullets, track=track)
+    bullet_indices = job.get("bullet_indices")
+    pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
     return Response(pdf_bytes, mimetype="application/pdf")
 
 @app.route("/ingest", methods=["POST"])
@@ -3398,7 +3588,8 @@ def desktop_ingest():
                     result["overlap_pct"], result["matched_skills"], result["short_id"],
                     sheet_uuid=result.get("sheet_uuid"),
                     linkedin_note=result.get("linkedin_note", ""),
-                    ats_bullets=result.get("ats_bullets")
+                    ats_bullets=result.get("ats_bullets"),
+                    outreach_email=result.get("outreach_email", "")
                 )
             elif TELEGRAM_CHAT_ID:
                 send_telegram_message(TELEGRAM_CHAT_ID, f"⚠️ Ingested job did not pass AI screening: {html.escape(job['job_title'])}")
