@@ -999,6 +999,42 @@ def resolve_reply_mapping(msg, chat_id, command_label):
 # ==============================================================================
 _WARM_CRM_CACHE = {"data": {}, "fetched_at": 0.0}
 _WARM_CRM_CACHE_TTL_SECONDS = 300
+_APPLIED_CRM_CACHE = {"data": set(), "fetched_at": 0.0}
+_APPLIED_CRM_CACHE_TTL_SECONDS = 300
+
+def normalize_company_for_match(company_name):
+    """Lowercase and strip legal suffixes so CRM and scraped company-name variants compare reliably."""
+    company = str(company_name or "").strip().lower()
+    company = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', company, flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', company).strip()
+
+def get_applied_crm_companies():
+    """Fetch Tetiana Warm companies as a short-lived suppression set for fresh job discovery."""
+    now = time.time()
+    if now - _APPLIED_CRM_CACHE["fetched_at"] < _APPLIED_CRM_CACHE_TTL_SECONDS:
+        return _APPLIED_CRM_CACHE["data"]
+    res = crm_post({"action": "get_followups", "tab": "TW"})
+    if not res:
+        return _APPLIED_CRM_CACHE["data"]
+    try:
+        if res.status_code != 200:
+            return _APPLIED_CRM_CACHE["data"]
+        data = res.json()
+        if data.get("status") != "success":
+            return _APPLIED_CRM_CACHE["data"]
+        applied_companies = set()
+        for row in data.get("followups", []):
+            raw_company = str(row.get("company") or "").strip().lower()
+            if raw_company:
+                applied_companies.add(raw_company)
+                normalized_company = normalize_company_for_match(raw_company)
+                if normalized_company:
+                    applied_companies.add(normalized_company)
+        _APPLIED_CRM_CACHE["data"] = applied_companies
+        _APPLIED_CRM_CACHE["fetched_at"] = now
+    except Exception as e:
+        logging.error(f"get_applied_crm_companies Error: {e}")
+    return _APPLIED_CRM_CACHE["data"]
 
 def get_warm_crm_contacts():
     """Fetch every Carmen Warm CRM contact keyed by lowercased company name, each tagged with a
@@ -1677,6 +1713,11 @@ def passes_strict_filter(job):
 
     if is_company_on_cooldown(company):
         return False
+    applied_companies = get_applied_crm_companies()
+    clean_company = normalize_company_for_match(company)
+    if company in applied_companies or clean_company in applied_companies:
+        logging.info(f"[EXCLUDED] {company} is already in Tetiana Warm (applied).")
+        return False
     
     min_sal_floor = safe_int(get_filter("min_salary"), 50000)
     if max_sal > 0 and max_sal < min_sal_floor:
@@ -1882,7 +1923,7 @@ def get_gmail_access_token():
         logging.error(f"Gmail OAuth Token Refresh Exception: {e}")
         return None
 
-def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note="", custom_body=None, custom_subject=None):
+def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note="", custom_body=None, custom_subject=None, pdf_bytes=None, pdf_filename="Kevin_Miller_Resume.pdf"):
     """Create Gmail draft with 24h dedup check and OAuth token expiry handling.
     Returns (success, message, draft_id) - draft_id is populated on success or when a duplicate is found.
     """
@@ -1923,6 +1964,13 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         message["From"] = GMAIL_USER
         message["Subject"] = subject
         message.set_content(body_content)
+        if pdf_bytes:
+            message.add_attachment(
+                pdf_bytes,
+                maintype="application",
+                subtype="pdf",
+                filename=pdf_filename
+            )
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
@@ -3312,8 +3360,20 @@ def process_webhook_payload_async(data):
                 target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint, on_provider_attempt=increment_api_usage_counter)
             else:
                 target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
+            track = job.get("track", "a")
+            bullet_indices = job.get("bullet_indices")
+            pdf_bytes = None
+            clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
+            pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
+            try:
+                pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
+            except Exception as e:
+                logging.error(f"/draft resume compilation failed for {comp}: {e}")
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
-            ok, gmail_msg, draft_id = create_gmail_draft(to_email=target, company_name=comp, job_title=title, is_warm=is_warm)
+            ok, gmail_msg, draft_id = create_gmail_draft(
+                to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
+                pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+            )
             raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
             monospaced_body = format_email_block(raw_email_text)
             draft_link_line = ""
@@ -3453,6 +3513,14 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             sheet_uuid = mapping["sheet_uuid"]
+            job = get_job_by_sheet_uuid(sheet_uuid)
+            company = mapping.get("contact_company") or job.get("employer_name")
+            if company:
+                _APPLIED_CRM_CACHE["data"].add(str(company).strip().lower())
+                normalized_company = normalize_company_for_match(company)
+                if normalized_company:
+                    _APPLIED_CRM_CACHE["data"].add(normalized_company)
+                add_company_cooldown(company)
             applied_date = datetime.now().strftime("%Y-%m-%d")
             reply_card = msg.get("reply_to_message") or {}
             if reply_card.get("message_id"):
@@ -3748,8 +3816,20 @@ def handle_fast_path_command(chat_id, text, msg):
             target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint, on_provider_attempt=increment_api_usage_counter)
         else:
             target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
+        track = job.get("track", "a")
+        bullet_indices = job.get("bullet_indices")
+        pdf_bytes = None
+        clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
+        pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
+        try:
+            pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
+        except Exception as e:
+            logging.error(f"/draft resume compilation failed for {comp}: {e}")
         logging.info(f"/draft command handled directly: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
-        ok, gmail_msg, draft_id = create_gmail_draft(to_email=target, company_name=comp, job_title=title, is_warm=is_warm)
+        ok, gmail_msg, draft_id = create_gmail_draft(
+            to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
+            pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+        )
         raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
         monospaced_body = format_email_block(raw_email_text)
         draft_link_line = ""
