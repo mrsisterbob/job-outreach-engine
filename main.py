@@ -895,6 +895,66 @@ def calculate_followup_interval(priority_score):
     except Exception:
         return 14
 
+def normalize_priority_value(raw_value):
+    """Normalize free-text ("High"/"Medium"/"Low") or numeric 1-10 priority values into an int 1-10
+    (10 = highest priority). Mirrors Code.gs's mapPriorityValue() but keeps a direct (non-inverted)
+    scale so it can drive the Dynamic Contact Quality Multiplier's score boost. Defaults to 5.
+    """
+    text = str(raw_value or "").strip()
+    lower = text.lower()
+    if "high" in lower:
+        return 9
+    if "medium" in lower:
+        return 5
+    if "low" in lower:
+        return 2
+    match = re.search(r'\d+', text)
+    if match:
+        try:
+            return max(1, min(10, int(match.group())))
+        except (ValueError, TypeError):
+            return 5
+    return 5
+
+_WARM_CRM_CACHE = {"data": {}, "fetched_at": 0.0}
+_WARM_CRM_CACHE_TTL_SECONDS = 300
+
+def get_warm_crm_contacts():
+    """Fetch every Carmen Warm CRM contact keyed by lowercased company name, each tagged with a
+    normalized 1-10 priority_score for the Dynamic Contact Quality Multiplier.
+    Cached in-process for a few minutes so parallel candidate evaluation doesn't hammer the CRM webhook.
+    """
+    now = time.time()
+    if now - _WARM_CRM_CACHE["fetched_at"] < _WARM_CRM_CACHE_TTL_SECONDS:
+        return _WARM_CRM_CACHE["data"]
+    if not CRM_WEBHOOK_URL:
+        return _WARM_CRM_CACHE["data"]
+    try:
+        res = requests.post(CRM_WEBHOOK_URL, json={"action": "get_followups", "tab": "CW"}, timeout=10)
+        if res.status_code != 200:
+            return _WARM_CRM_CACHE["data"]
+        data = res.json()
+        if data.get("status") != "success":
+            return _WARM_CRM_CACHE["data"]
+        contacts = {}
+        for row in data.get("followups", []):
+            company = str(row.get("company") or "").strip()
+            if not company:
+                continue
+            contacts[company.lower()] = {
+                "name": row.get("name") or "Contact",
+                "raw_company": company,
+                "email": row.get("email", ""),
+                "note": row.get("note") or "Active relationship",
+                "priority_score": normalize_priority_value(row.get("raw_priority", row.get("priority"))),
+                "sheet_uuid": row.get("sheet_uuid", "")
+            }
+        _WARM_CRM_CACHE["data"] = contacts
+        _WARM_CRM_CACHE["fetched_at"] = now
+    except Exception as e:
+        logging.error(f"get_warm_crm_contacts Error: {e}")
+    return _WARM_CRM_CACHE["data"]
+
 def sanitize_text(text):
     """Strip corporate fluff/AI clichés while preserving apostrophes, hyphens, and paragraph breaks.
     Buzzword list is hot-reloaded from evidence_bank.json's banned_words on every call.
@@ -1717,6 +1777,19 @@ def process_single_candidate(job):
             )
             enqueue_crm_payload(alumni_payload)
             log_daily_activity("notes_logged")
+
+        # Dynamic Contact Quality Multiplier: warm CRM contacts scale the boost by priority rank (1-10 * 3, capped +30)
+        contact_info = get_warm_crm_contacts().get(str(job.get("employer_name") or "").strip().lower())
+        if contact_info:
+            priority_score = contact_info.get("priority_score", 5)
+            score_boost = min(30, priority_score * 3)
+            score = min(100, score + score_boost)
+            alumni_line += (
+                f"🔥 <b>WARM REFERRAL AVAILABLE (+{score_boost} pts):</b> "
+                f"{html.escape(contact_info.get('name', 'Contact'))} "
+                f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10)</i>\n"
+                f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
+            )
 
         return {
             "job": job, "score": score, "reason": reason,
