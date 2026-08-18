@@ -46,7 +46,7 @@ GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
-DB_PATH = "jobs_cache.db"
+DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs_cache.db")  # override lets tests isolate their own SQLite file
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
 
 def crm_get(params, timeout=10):
@@ -2703,37 +2703,44 @@ def enqueue_crm_payload(payload):
         logging.error(f"CRM Outbox Enqueue Error: {e}")
         return False
 
+def process_crm_outbox_batch(inter_job_sleep=1.0):
+    """One outbox drain pass (<=5 pending rows): dispatch each to Sheets, delete on success or bump
+    retry_count/status on failure. Split out from crm_outbox_worker_loop so a single pass is unit-testable.
+    """
+    with get_db_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, payload_json, retry_count 
+            FROM crm_outbox 
+            WHERE status = 'PENDING' AND retry_count < 10 
+            ORDER BY id ASC LIMIT 5
+        """)
+        pending_jobs = cursor.fetchall()
+
+    for job_id, payload_str, retries in pending_jobs:
+        payload = json.loads(payload_str)
+        success = log_to_sheets_crm(payload, max_retries=1)
+
+        with get_db_conn() as conn:
+            if success:
+                conn.execute("DELETE FROM crm_outbox WHERE id = ?", (job_id,))
+            else:
+                conn.execute("""
+                    UPDATE crm_outbox 
+                    SET retry_count = retry_count + 1, 
+                        last_attempt = CURRENT_TIMESTAMP,
+                        status = CASE WHEN retry_count + 1 >= 10 THEN 'FAILED' ELSE 'PENDING' END
+                    WHERE id = ?
+                """, (job_id,))
+            conn.commit()
+        if inter_job_sleep:
+            time.sleep(inter_job_sleep)
+
 def crm_outbox_worker_loop():
     """Background daemon processing queued Sheets writes with exponential backoff."""
     while True:
         try:
-            with get_db_conn() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT id, payload_json, retry_count 
-                    FROM crm_outbox 
-                    WHERE status = 'PENDING' AND retry_count < 10 
-                    ORDER BY id ASC LIMIT 5
-                """)
-                pending_jobs = cursor.fetchall()
-
-            for job_id, payload_str, retries in pending_jobs:
-                payload = json.loads(payload_str)
-                success = log_to_sheets_crm(payload, max_retries=1)
-
-                with get_db_conn() as conn:
-                    if success:
-                        conn.execute("DELETE FROM crm_outbox WHERE id = ?", (job_id,))
-                    else:
-                        conn.execute("""
-                            UPDATE crm_outbox 
-                            SET retry_count = retry_count + 1, 
-                                last_attempt = CURRENT_TIMESTAMP,
-                                status = CASE WHEN retry_count + 1 >= 10 THEN 'FAILED' ELSE 'PENDING' END
-                            WHERE id = ?
-                        """, (job_id,))
-                    conn.commit()
-                time.sleep(1.0)
+            process_crm_outbox_batch()
         except Exception as e:
             logging.error(f"CRM Outbox Worker Error: {e}")
         time.sleep(5)
@@ -3937,10 +3944,11 @@ def process_webhook_payload_async(data):
     except Exception as e:
         logging.error(f"Async Webhook Processing Error: {e}")
 
-start_gmail_poller()
-start_crm_outbox_worker()
-start_morning_digest()
-start_backup_scheduler()
+if not os.environ.get("PYTEST_CURRENT_TEST"):  # keep background daemons out of the test process
+    start_gmail_poller()
+    start_crm_outbox_worker()
+    start_morning_digest()
+    start_backup_scheduler()
 
 # ==============================================================================
 # 10. FLASK SERVER & STACKED WEBHOOK ROUTER

@@ -139,6 +139,13 @@ def test_generate_dedup_hash_differs_for_different_jobs():
     assert a != b
 
 
+def test_generate_dedup_hash_is_legal_suffix_insensitive():
+    base = pu.generate_dedup_hash("Acme Corp", "Operations Manager")
+    for suffix in ["Inc.", "LLC", "Holdings", "Corp", "Corporation", "Ltd", "PLC", "Group"]:
+        assert pu.generate_dedup_hash(f"Acme {suffix}", "Operations Manager") == base
+    assert pu.generate_dedup_hash("Acme", "Operations Manager") == base
+
+
 def test_generate_short_key_deterministic_for_same_raw_id():
     assert pu.generate_short_key("job_123") == pu.generate_short_key("job_123")
     assert len(pu.generate_short_key("job_123")) == 12
@@ -266,4 +273,32 @@ def test_resolve_email_waterfall_falls_through_to_anymail(monkeypatch):
     monkeypatch.setattr(pu.requests, "post", lambda *a, **k: FakeAnymailResponse())
     result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp")
     assert result == "jane@acmecorp.com"
+
+
+# ---- Job source attribution ----
+
+def test_derive_job_source_recognizes_ats_prefixes():
+    assert pu.derive_job_source("gh_acme_123") == "greenhouse"
+    assert pu.derive_job_source("lever_acme_123") == "lever"
+    assert pu.derive_job_source("ashby_acme_123") == "ashby"
+    assert pu.derive_job_source("ingest_abc123") == "manual_ingest"
+
+
+def test_derive_job_source_defaults_to_jsearch():
+    assert pu.derive_job_source("some-random-jsearch-id") == "jsearch"
+    assert pu.derive_job_source(None) == "jsearch"
+    assert pu.derive_job_source("") == "jsearch"
+
+
+# ---- Email confidence gating ----
+
+def test_is_unverified_email_detects_warning_tags():
+    assert pu.is_unverified_email("jane.doe@acmecorp.com [⚠️ Unverified]") is True
+    assert pu.is_unverified_email("operations@acmecorp.com [⚠️ Fallback]") is True
+
+
+def test_is_unverified_email_false_for_clean_address():
+    assert pu.is_unverified_email("jane@acmecorp.com") is False
+    assert pu.is_unverified_email("") is False
+    assert pu.is_unverified_email(None) is False
 
