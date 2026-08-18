@@ -431,21 +431,26 @@ def init_db():
                 "required_keywords": [],
                 "ats_company_slugs": [],
                 "target_queries": [
-                    "Wealth Operations Detroit MI",
-                    "Fintech Operations Michigan",
-                    "Business Operations Analyst Detroit MI",
-                    "Custodial Operations Schwab Fidelity Michigan",
-                    "Financial Systems Process Automation Detroit MI",
-                    "Operations Specialist Detroit MI",
+                    "Wealth Operations Farmington MI",
+                    "Fintech Operations Farmington MI",
+                    "Business Operations Analyst Farmington MI",
+                    "Custodial Operations Schwab Fidelity Farmington MI",
+                    "Financial Systems Process Automation Farmington MI",
+                    "Operations Specialist Farmington MI",
                     "Financial Operations Analyst Remote",
-                    "Business Systems Analyst Detroit MI",
+                    "Business Systems Analyst Farmington MI",
                     "Risk Operations Analyst Remote",
-                    "Client Operations Associate Detroit MI",
-                    "Business Intelligence Analyst Detroit MI",
+                    "Client Operations Associate Farmington MI",
+                    "Business Intelligence Analyst Farmington MI",
                     "Trade Operations Analyst Remote",
-                    "Compliance Operations Specialist Michigan",
-                    "Financial Analyst Operations Detroit MI",
-                    "Treasury Operations Analyst Remote"
+                    "Compliance Operations Specialist Farmington MI",
+                    "Financial Analyst Operations Farmington MI",
+                    "Treasury Operations Analyst Remote",
+                    "Salesforce Administrator Farmington MI",
+                    "Client Success Operations Remote",
+                    "Data Operations Analyst Remote",
+                    "Process Improvement Analyst Farmington MI",
+                    "Onboarding Specialist Farmington MI"
                 ]
             }
             for k, v in defaults.items():
@@ -1577,7 +1582,6 @@ def passes_strict_filter(job):
     title = str(job.get("job_title") or "").lower()
     description = str(job.get("job_description") or "").lower()
     company = str(job.get("employer_name") or "").lower()
-    state = str(job.get("job_state") or "").upper()
     city = str(job.get("job_city") or "").lower()
     salary_str, max_sal = extract_salary(job)
 
@@ -1589,9 +1593,11 @@ def passes_strict_filter(job):
         return False
 
     valid_cities = get_filter("valid_cities", [])
-    is_mi = (state == "MI") or "michigan" in city or any(c in city for c in valid_cities)
+    # Metro-area allowlist only (~35mi of Farmington MI via radius_miles) - state=="MI" alone is NOT
+    # sufficient, since that would also admit Grand Rapids/Lansing/Traverse City etc. outside the radius.
+    is_in_metro_area = any(c in city for c in valid_cities)
     is_remote = job.get("job_is_remote", False) or "remote" in description[:300] or "work from home" in description[:300]
-    if not (is_mi or is_remote):
+    if not (is_in_metro_area or is_remote):
         return False
 
     exp_floor = safe_int(get_filter("experience_salary_floor"), 60000)
@@ -2439,11 +2445,18 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
 def fetch_single_query_jobs(query_args):
     """Worker function for parallel JSearch API query execution.
     Fetches up to 5 pages sequentially per query (~400 raw listings/batch); stops early on empty page or 429.
+    Non-"Remote" queries are radius-limited (radius_miles filter, anchored to the location text in the
+    query itself); "Remote" queries are capped to at most 1 result so nationwide remote postings don't
+    crowd out the local metro-area focus.
     """
     query, api_url, headers = query_args
+    is_remote_query = "remote" in query.lower()
+    radius_miles = safe_int(get_filter("radius_miles"), 35)
     all_jobs = []
     for page in range(1, 6):
         params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
+        if not is_remote_query and radius_miles:
+            params["radius"] = str(radius_miles)
         try:
             res = requests.get(api_url, headers=headers, params=params, timeout=10)
             if res.status_code == 429:
@@ -2458,6 +2471,8 @@ def fetch_single_query_jobs(query_args):
         except Exception as e:
             logging.error(f"Fetch Exception ({query} page {page}): {e}")
             break
+    if is_remote_query:
+        all_jobs = all_jobs[:1]
     return all_jobs
 
 def fetch_greenhouse_jobs(slug):
