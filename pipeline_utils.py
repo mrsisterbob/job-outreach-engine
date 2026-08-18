@@ -1,12 +1,20 @@
-"""Pure, dependency-free pipeline helpers (no Flask/DB/network calls).
+"""Pipeline helpers - mostly pure/dependency-free (no Flask/DB calls), unit-tested in isolation.
 
 Split out of main.py so the scoring/dedup/dork/formatting logic can be unit-tested in isolation
 and so main.py itself shrinks toward being just orchestration (routes, DB, CRM, Telegram, AI calls).
+
+Exception: resolve_email_waterfall() below does live network I/O (Hunter.io/Anymail Finder) - it
+lives here for architectural cohesion with the rest of the outreach-resolution helpers, but it is
+not covered by the no-network guarantee the rest of this module provides.
 """
 import hashlib
+import logging
+import os
 import re
 import urllib.parse
 from datetime import datetime, timezone
+
+import requests
 
 
 def build_apollo_url(company_name):
@@ -174,3 +182,49 @@ def compute_description_simhash(text: str) -> str:
     # Normalize 3-grams to catch reworded titles with identical bodies
     shingles = [" ".join(tokens[i:i+3]) for i in range(max(1, len(tokens)-2))]
     return hashlib.md5("".join(sorted(shingles)).encode()).hexdigest()
+
+
+def resolve_email_waterfall(full_name, company_name, domain_hint=None):
+    """Cascading email discovery for a named contact: Hunter.io -> Anymail Finder -> deterministic
+    guess. Tries each configured provider in order and returns the first hit; falls back to a
+    flagged best-guess address if neither provider is configured or finds a match.
+    """
+    domain = domain_hint or (re.sub(r'\s+', '', str(company_name or '').lower()) + ".com")
+    parts = str(full_name or "").strip().split()
+    first = parts[0] if parts else ""
+    last = parts[-1] if len(parts) > 1 else ""
+
+    hunter_key = os.environ.get("HUNTER_API_KEY")
+    if hunter_key:
+        try:
+            res = requests.get(
+                "https://api.hunter.io/v2/email-finder",
+                params={"domain": domain, "first_name": first, "last_name": last, "api_key": hunter_key},
+                timeout=10
+            )
+            email = res.json().get("data", {}).get("email")
+            if email:
+                return email
+        except Exception as e:
+            logging.error(f"Hunter.io email-finder failed ({domain}): {e}")
+
+    anymail_key = os.environ.get("ANYMAIL_API_KEY")
+    if anymail_key:
+        try:
+            res = requests.post(
+                "https://api.anymailfinder.com/v5.0/search/person.json",
+                json={"domain": domain, "first_name": first, "last_name": last},
+                headers={"Authorization": f"Bearer {anymail_key}"},
+                timeout=10
+            )
+            data = res.json()
+            email = data.get("email") or (data.get("results") or {}).get("email")
+            if email:
+                return email
+        except Exception as e:
+            logging.error(f"Anymail Finder search failed ({domain}): {e}")
+
+    if first and last:
+        return f"{first.lower()}.{last.lower()}@{domain} [⚠️ Unverified]"
+    return f"operations@{domain} [⚠️ Fallback]"
+

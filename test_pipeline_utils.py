@@ -190,3 +190,57 @@ def test_compute_description_simhash_stable_for_identical_text():
 
 def test_compute_description_simhash_empty_text_does_not_raise():
     assert pu.compute_description_simhash("") == pu.compute_description_simhash(None)
+
+
+# ---- Email waterfall (network calls mocked/disabled) ----
+
+def test_resolve_email_waterfall_falls_back_without_api_keys(monkeypatch):
+    monkeypatch.delenv("HUNTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANYMAIL_API_KEY", raising=False)
+    result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp")
+    assert result == "jane.doe@acmecorp.com [⚠️ Unverified]"
+
+
+def test_resolve_email_waterfall_uses_domain_hint_when_provided(monkeypatch):
+    monkeypatch.delenv("HUNTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANYMAIL_API_KEY", raising=False)
+    result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp", domain_hint="acme.io")
+    assert result == "jane.doe@acme.io [⚠️ Unverified]"
+
+
+def test_resolve_email_waterfall_single_name_uses_operations_fallback(monkeypatch):
+    monkeypatch.delenv("HUNTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANYMAIL_API_KEY", raising=False)
+    result = pu.resolve_email_waterfall("Cher", "Acme Corp")
+    assert result == "operations@acmecorp.com [⚠️ Fallback]"
+
+
+def test_resolve_email_waterfall_uses_hunter_when_configured(monkeypatch):
+    monkeypatch.setenv("HUNTER_API_KEY", "test-key")
+
+    class FakeResponse:
+        def json(self):
+            return {"data": {"email": "jane@acmecorp.com"}}
+
+    monkeypatch.setattr(pu.requests, "get", lambda *a, **k: FakeResponse())
+    result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp")
+    assert result == "jane@acmecorp.com"
+
+
+def test_resolve_email_waterfall_falls_through_to_anymail(monkeypatch):
+    monkeypatch.setenv("HUNTER_API_KEY", "test-key")
+    monkeypatch.setenv("ANYMAIL_API_KEY", "test-key-2")
+
+    class FakeHunterResponse:
+        def json(self):
+            return {"data": {}}  # no email found
+
+    class FakeAnymailResponse:
+        def json(self):
+            return {"results": {"email": "jane@acmecorp.com"}}
+
+    monkeypatch.setattr(pu.requests, "get", lambda *a, **k: FakeHunterResponse())
+    monkeypatch.setattr(pu.requests, "post", lambda *a, **k: FakeAnymailResponse())
+    result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp")
+    assert result == "jane@acmecorp.com"
+

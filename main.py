@@ -23,7 +23,7 @@ from pipeline_utils import (
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
     resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
     generate_dedup_hash, generate_short_key, parse_posted_hours, get_age_badge,
-    extract_salary, extract_work_style, compute_description_simhash
+    extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -2582,6 +2582,34 @@ def fetch_ats_jobs(company_slugs):
                 logging.error(f"ATS Fetch Future Error: {e}")
     return all_jobs
 
+def expand_ecosystem_filter(company_name):
+    """Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its
+    name; if any board actually resolves, appends the slug to the ats_company_slugs filter so future
+    /t runs source directly from it. Meant to run on a background daemon thread - silent on no match.
+    """
+    slug_guess = re.sub(r'[^a-z0-9]', '', str(company_name or '').lower())
+    if not slug_guess:
+        return
+    existing_slugs = safe_list(get_filter("ats_company_slugs", []))
+    if slug_guess in existing_slugs:
+        return  # already tracked
+    board_checks = (
+        ("greenhouse", f"https://boards-api.greenhouse.io/v1/boards/{slug_guess}/jobs"),
+        ("lever", f"https://api.lever.co/v0/postings/{slug_guess}?mode=json"),
+        ("ashby", f"https://api.ashbyhq.com/posting-api/job-board/{slug_guess}"),
+    )
+    for board_name, url in board_checks:
+        try:
+            res = requests.get(url, timeout=8)
+            if res.status_code == 200 and res.json():
+                existing_slugs.append(slug_guess)
+                set_filter("ats_company_slugs", existing_slugs)
+                logging.info(f"[ATS EXPANSION] '{company_name}' resolved to '{slug_guess}' on {board_name} - added to ats_company_slugs")
+                return
+        except Exception as e:
+            logging.error(f"[ATS EXPANSION] {board_name} check failed for '{slug_guess}': {e}")
+    logging.info(f"[ATS EXPANSION] No ATS board match found for '{company_name}' (guessed slug '{slug_guess}')")
+
 def run_job_pipeline(chat_id=None, top_n=2):
     """Job search pipeline with two-stage architecture:
     Stage 1: Pre-filter candidates (JSearch multi-page + ATS direct-source, strict filters)
@@ -2866,6 +2894,7 @@ def process_webhook_payload_async(data):
             )
             sent_msg_id = send_telegram_message(chat_id, resp)
             save_message_mapping(sent_msg_id, sheet_uuid, "Carmen Warm", name, company)
+            threading.Thread(target=expand_ecosystem_filter, args=(company,), daemon=True).start()
             return
 
         # 6. Dynamic /search Filters Overview & Inline Adjustments
@@ -3051,7 +3080,12 @@ def process_webhook_payload_async(data):
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
-            target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
+            domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
+            if mapping.get("contact_name"):
+                # Named CRM contact (not a generic job-alert row) - resolve a real person's email via the waterfall
+                target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint)
+            else:
+                target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
             ok, gmail_msg, draft_id = create_gmail_draft(to_email=target, company_name=comp, job_title=title, is_warm=is_warm)
             raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
@@ -3215,6 +3249,9 @@ def process_webhook_payload_async(data):
             confirm_text = "🔥 Moved to Warm" if direction == "warm" else "🧊 Moved to Cold"
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, confirm_text)
+            # Auto-ATS Expansion: Carmen-family contacts (Cold or Warm) get monitored for future /t job runs
+            if new_tab.startswith("Carmen") and mapping.get("contact_company"):
+                threading.Thread(target=expand_ecosystem_filter, args=(mapping["contact_company"],), daemon=True).start()
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
