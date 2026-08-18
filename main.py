@@ -398,7 +398,15 @@ def init_db():
                     "Custodial Operations Schwab Fidelity Michigan",
                     "Financial Systems Process Automation Detroit MI",
                     "Operations Specialist Detroit MI",
-                    "Financial Operations Analyst Remote"
+                    "Financial Operations Analyst Remote",
+                    "Business Systems Analyst Detroit MI",
+                    "Risk Operations Analyst Remote",
+                    "Client Operations Associate Detroit MI",
+                    "Business Intelligence Analyst Detroit MI",
+                    "Trade Operations Analyst Remote",
+                    "Compliance Operations Specialist Michigan",
+                    "Financial Analyst Operations Detroit MI",
+                    "Treasury Operations Analyst Remote"
                 ]
             }
             for k, v in defaults.items():
@@ -2610,12 +2618,12 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 logging.error(f"Candidate evaluation failed (timeout or error): {e}")
                 # On timeout/error: score=0, status='Evaluation Pending' is handled in evaluate_job_with_gemini
     
-    # Sort by score descending, then split into Tier-1 (full cards) and Tier-2 (bundled digest)
+    # Sort by score descending, then split into Tier-1 (cards + CRM) and Tier-2 (digest only, capped at 5)
     top_matches.sort(key=lambda x: x["score"], reverse=True)
     tier1_matches = [m for m in top_matches if m["score"] >= 80][:5]
-    tier2_matches = [m for m in top_matches if 65 <= m["score"] < 80]
+    tier2_matches = [m for m in top_matches if 65 <= m["score"] < 80][:5]
 
-    # Dispatch Tier-1 matches as full interactive cards, paced to avoid Telegram 429s
+    # Dispatch Tier-1 matches as full interactive cards & stage in CRM
     batch_rows = []
     for item in tier1_matches:
         job = item["job"]
@@ -2643,9 +2651,9 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 f"Matched via Pipeline | {item['reason']}"
             ]
         })
-        time.sleep(1.1)  # Telegram rate-limit pacing between outbound cards
+        time.sleep(1.1)
 
-    # Dispatch Tier-2 (secondary qualified) matches as bundled digests, chunked to stay under Telegram's payload limit
+    # Dispatch Tier-2 as leaderboard digest ONLY (do NOT add to batch_rows/CRM)
     if tier2_matches:
         digest_lines = []
         for item in tier2_matches:
@@ -2653,36 +2661,15 @@ def run_job_pipeline(chat_id=None, top_n=2):
             comp = str(job.get("employer_name") or "N/A")[:28]
             title = str(job.get("job_title") or "N/A")[:40]
             digest_lines.append(f"{item['score']:>3}  {comp} - {title}")
-            batch_rows.append({
-                "sheet_uuid": item.get("sheet_uuid"),
-                "row_data": [
-                    today_str,
-                    job.get("employer_name"),
-                    job.get("job_title"),
-                    item["target_email"],
-                    item["score"],
-                    "Watchlist",
-                    followup_date,
-                    job.get("job_apply_link", ""),
-                    f"Secondary Match via Pipeline | {item['reason']}"
-                ]
-            })
 
-        # Max 20 roles/message to keep well under Telegram's 4,096 char payload limit
-        chunk_size = 20
-        line_chunks = [digest_lines[i:i + chunk_size] for i in range(0, len(digest_lines), chunk_size)]
-        total_chunks = len(line_chunks)
-        for idx, chunk in enumerate(line_chunks, 1):
-            digest_ascii = "\n".join(chunk)
-            page_label = f" (Page {idx}/{total_chunks})" if total_chunks > 1 else ""
-            digest_msg = (
-                f"📋 <b>Secondary Match Leaderboard ({len(tier2_matches)} roles, score 65-79){page_label}</b>\n"
-                f"<pre>{html.escape(digest_ascii)}</pre>"
-            )
-            send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)
-            time.sleep(1.1)
+        digest_ascii = "\n".join(digest_lines)
+        digest_msg = (
+            f"📋 <b>Secondary Match Leaderboard (Top {len(tier2_matches)} roles, score 65-79)</b>\n"
+            f"<pre>{html.escape(digest_ascii)}</pre>"
+        )
+        send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)
 
-    # Single batched CRM write for all Tier-1 + Tier-2 rows under one lock/execution in Code.gs
+    # Write ONLY Tier-1 rows to CRM under a single execution lock
     if batch_rows:
         enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="TC", rows=batch_rows))
     
@@ -2724,7 +2711,7 @@ def process_webhook_payload_async(data):
         if re.match(r"^/(c|cw|cc)(?:\s+(\d+))?$", text):
             m = re.match(r"^/(c|cw|cc)(?:\s+(\d+))?$", text)
             cmd_type = m.group(1)
-            qty = safe_int(m.group(2), 2)
+            qty = safe_int(m.group(2), 5)
             target_code = "CW" if cmd_type in ["c", "cw"] else "TC"
             loading_msg_id = send_telegram_message(chat_id, "⏳ <i>Fetching CRM data...</i>")
             cards = fetch_networking_cards(target_code, qty)
