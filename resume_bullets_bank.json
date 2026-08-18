@@ -1,23 +1,64 @@
 {
   "track_a_wealth_ops": [
-    "Reconciled institutional wealth data across custodial platforms, resolving variances to maintain ledger accuracy for client accounts.",
-    "Drafted SEC Form D and Regulation Crowdfunding filings to support SEC and FinCEN compliance for a blockchain-based real estate tokenization platform.",
-    "Architected regulatory infrastructure for real-world asset (RWA) tokenization, translating legal requirements into operational data controls.",
-    "Analyzed corporate integration concepts and drafted deal structure breakdowns to support transaction evaluation.",
-    "Navigated Schwab Advisor Center (SAC) and Fidelity Wealthscape to service wealth management accounts and support operational workflows.",
-    "Performed variance analysis on institutional account data to identify and escalate discrepancies before they reached client-facing reporting.",
-    "Supported wealth operations workflows for a fast-growing Detroit-based startup, including account servicing and data intake.",
-    "Maintained HubSpot CRM records to track compliance documentation and client relationship data across active deals."
+    "Executed 300+ new financial account setups and tracked complete client onboarding lifecycles using Salesforce CRM while coordinating with 50+ advisors to resolve missing paperwork.",
+    "Navigated Fidelity and Schwab custodial platforms to reconcile account data across a 2.5 billion dollar AUM institutional portfolio spanning multiple state jurisdictions.",
+    "Engineered workflow audits in DocuSign to validate incoming Investment Advisory Agreements for 150+ advisors reducing manual packet verification time from 60 minutes to 20 minutes.",
+    "Expedited delayed custodial transfers to prevent 10 critical Service Level Agreement breaches and avoid associated client penalty payouts.",
+    "Processed cashiering distributions and remediated margin account errors across custodial platforms alongside internal banking operations.",
+    "Reconciled daily institutional asset positions across clearing custody feeds to resolve complex trade variances with zero service breaches.",
+    "Performed high volume reconciliation of 500+ retirement accounts to validate ledger accuracy and resolve historical discrepancies.",
+    "Applied suitability frameworks to support administrative workflows within a regulated financial planning environment.",
+    "Validated asset valuation data across CRM and billing engines to eliminate monthly invoicing errors.",
+    "Supervised daily cash distribution requests and custodian ledger reconciliations across active client portfolios."
   ],
   "track_b_engineering": [
-    "Built an automated Python job search pipeline that scrapes, filters, and scores job listings against structured criteria.",
-    "Designed a custom Telegram CRM engine using Flask routing and webhook event handling to manage job and contact pipelines in real time.",
-    "Implemented SQLite with WAL (Write-Ahead Logging) mode enabled to support concurrent reads/writes without blocking pipeline threads.",
-    "Engineered ETL pipelines to normalize and load job listing data into a structured SQLite schema for downstream automation.",
-    "Integrated Google Apps Script with Google Sheets to synchronize CRM data schemas between the backend and spreadsheet-based tracking.",
-    "Automated data intake workflows using Python scripts to reduce manual entry across job search and CRM tracking systems.",
-    "Built REST API and Telegram webhook integrations to trigger real-time CRM updates from inbound messages and events.",
-    "Designed structured JSON schemas to standardize data intake and validation across the automation pipeline."
+    "Redesigned ticket routing logic in Salesforce to segregate restricted account trading tickets from service requests eliminating 200+ invalid tickets from the service desk queue.",
+    "Executed a bulk data remediation project across internal databases to restore backend files for 1500+ legacy accounts established since company inception.",
+    "Tested integration pipelines bridging Salesforce with Eclipse trading platforms alongside software engineering teams to ensure system stability.",
+    "Developed automated Python pipelines using pandas to ingest and validate structured data feeds.",
+    "Architected lightweight Flask backend services with SQLite WAL mode to handle concurrent webhook operations under high load.",
+    "Designed strict JSON schema validation models to prevent malformed payload ingestion across asynchronous REST API endpoints.",
+    "Constructed bidirectional webhook synchronization workflows linking HubSpot CRM tables with relational SQLite databases.",
+    "Automated data extraction routines using Python orchestration cutting manual intake time by 15 hours weekly.",
+    "Deployed headless document compilation engines using Python to generate dynamic PDF reports in under 30 milliseconds.",
+    "Built dynamic reporting pipelines connecting REST APIs to internal database views for live operational telemetry."
+  ],
+  "track_c_risk_compliance": [
+    "Audited missing client paperwork via DocuSign for 150+ advisors enforcing strict regulatory compliance prior to trade execution.",
+    "Remediated compliance gaps across 1500+ legacy accounts by updating backend files to align with current regulatory standards.",
+    "Mitigated custodial risk by resolving margin account discrepancies and tracking paperwork exceptions across 600+ RIAs.",
+    "Architected regulatory compliance infrastructure and institutional data validation protocols for physical asset tokenization platforms.",
+    "Drafted SEC Form D filings and Regulation Crowdfunding documentation to ensure strict adherence to federal guidelines.",
+    "Translated complex sovereign regulations into standardized operational onboarding workflows for institutional investors.",
+    "Executed identity verification protocols and suitability reviews across massive wealth advisory pipelines.",
+    "Partnered with operational leadership to establish compliance audit checkpoints for institutional account opening lifecycles.",
+    "Designed internal operational controls to mitigate regulatory exposure and track disclosure deadlines across active portfolios.",
+    "Audited advisor commission allocations to maintain absolute compliance with internal RIA accounting controls."
+  ],
+  "track_d_business_intelligence": [
+    "Analyzed a 2.5 billion dollar AUM portfolio across various state jurisdictions to identify onboarding bottlenecks and track account setup speeds.",
+    "Monitored Salesforce service desk queues to identify routing anomalies resulting in the removal of 200+ miscategorized restricted account tickets.",
+    "Reconciled complex carrier funding promises and cashiering distributions within internal banking operations.",
+    "Designed interactive Power BI dashboards to analyze response patterns and track operational pipeline metrics.",
+    "Performed complex variance analysis on 500+ ledger accounts to prepare recurring internal financial reports.",
+    "Reconciled 250000 dollar variances across institutional data sets using SQL aggregations to identify core discrepancies.",
+    "Built automated data extraction workflows using Power BI to translate raw operational data into executive insights.",
+    "Engineered advanced Excel templates utilizing macros and pivot tables to streamline heavy financial reporting.",
+    "Extracted unstructured performance data via REST APIs to build relational database models for historical trend analysis.",
+    "Translated complex El Salvador Bitcoin laws into structured investor due diligence models bridging legal requirements with financial risk analysis."
+  ],
+  "track_e_bizops": [
+    "Optimized DocuSign and Salesforce paperwork workflows for 150+ advisors cutting manual packet verification time from 60 minutes to 20 minutes.",
+    "Redesigned ticketing workflows to distinguish trading desk exceptions from service requests clearing 200+ invalid tickets and preventing 10 critical service breaches.",
+    "Mapped complex wealth operations plumbing from initial paperwork submission in Salesforce through to execution in Orion Eclipse.",
+    "Deployed a custom outreach CRM in HubSpot utilizing structured workflow controls to manage a large operational pipeline.",
+    "Designed bidirectional data synchronization workflows to bridge external webhooks with internal CRM environments.",
+    "Mapped complex institutional ownership structures to automate data intake and reduce manual processing bottlenecks.",
+    "Engineered standardized escalation workflows for custodial account transfers cutting exception handling turnaround times by 25 percent.",
+    "Led operational planning for backcountry travel to support emergency search and rescue operations with strict risk management.",
+    "Automated routine data extraction and compliance validation tasks significantly reducing manual administrative overhead across the organization.",
+    "Built robust schema validation models to ensure data integrity during structured REST API intake processes."
   ]
 }
+
 

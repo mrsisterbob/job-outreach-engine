@@ -1,0 +1,10 @@
+{
+  "linkedin_templates": [
+    "Hi {name}. I saw the {job_title} opening at {company} and wanted to introduce myself. I work in wealth operations and would value connecting to follow your team and their work.",
+    "Hi {name}. I am a fellow Hope College business alum reaching out because I saw your work at {company}. I am currently focused on wealth operations and would value having you in my network.",
+    "Hi {name}. I am exploring operations roles and admire how {company} scales its platform. I focus on building better workflows and would love to keep up with your updates.",
+    "Hi {name}. Your team at {company} is doing interesting work. I spend my days managing data projects and operations. I am looking to expand my network with other professionals in this space.",
+    "Hi {name}. I came across your profile and noticed your role at {company}. I am currently navigating the operations space and always appreciate connecting with people doing good work.",
+    "Hi {name}. I noticed the {job_title} position at {company} and wanted to connect. My background is in business operations and data management. I would be glad to stay in touch."
+  ]
+}
