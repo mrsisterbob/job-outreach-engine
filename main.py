@@ -355,6 +355,11 @@ def init_db():
             PRIMARY KEY (month_key, provider)
         )""")
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS query_pagination (
+            query_text TEXT PRIMARY KEY,
+            last_page INTEGER DEFAULT 1
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS crm_outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             payload_json TEXT NOT NULL,
@@ -825,6 +830,32 @@ def get_monthly_api_usage():
     except Exception as e:
         logging.error(f"DB API Usage Read Error: {e}")
     return counts
+
+def get_query_start_page(query_text):
+    """Return the next JSearch page offset to resume from for this exact query text, default 1."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT last_page FROM query_pagination WHERE query_text = ?", (query_text,))
+            row = cursor.fetchone()
+            return row[0] if row else 1
+    except Exception as e:
+        logging.error(f"Query Pagination Read Error ({query_text}): {e}")
+        return 1
+
+def save_query_next_page(query_text, next_page):
+    """Persist the rolling page offset for this query so the next /t run resumes past this batch instead of re-fetching page 1."""
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO query_pagination (query_text, last_page) VALUES (?, ?) "
+                "ON CONFLICT(query_text) DO UPDATE SET last_page = excluded.last_page",
+                (query_text, next_page)
+            )
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Query Pagination Write Error ({query_text}): {e}")
 
 def calculate_active_day_streak():
     """Count consecutive active days (any activity logged) ending today or yesterday."""
@@ -1390,10 +1421,10 @@ def resolve_target_email(company_name, job_title="", employer_website=None):
 
 def parse_quick_command(text_input):
     """
-    Format: /quick Name @ Company [1-10] Note
+    Format: /quick Name @ Company [1-10] Note  (also reused by the /cold and /warm quick-add variants)
     Handles company names with numbers and special symbols safely (e.g. 3M, Web3 Labs, 1Password, 7-Eleven).
     """
-    clean = text_input.replace("/quick", "").strip()
+    clean = re.sub(r'^/\S+\s*', '', text_input.strip())
     if "@" not in clean:
         return None
     name_part, rest = clean.split("@", 1)
@@ -2485,16 +2516,20 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
 # ==============================================================================
 def fetch_single_query_jobs(query_args):
     """Worker function for parallel JSearch API query execution.
-    Fetches up to 5 pages sequentially per query (~400 raw listings/batch); stops early on empty page or 429.
-    Non-"Remote" queries are radius-limited (radius_miles filter, anchored to the location text in the
-    query itself); "Remote" queries are capped to at most 1 result so nationwide remote postings don't
-    crowd out the local metro-area focus.
+    Fetches a rolling 5-page window per query, resuming from this query's persisted query_pagination
+    offset (instead of always re-fetching page 1) and wrapping back to page 1 past page 20 - so every
+    /t run surfaces deeper/fresher listings instead of re-evaluating the same first page each time.
+    Stops early on empty page or 429. Non-"Remote" queries are radius-limited (radius_miles filter,
+    anchored to the location text in the query itself); "Remote" queries are capped to at most 1
+    result so nationwide remote postings don't crowd out the local metro-area focus.
     """
     query, api_url, headers = query_args
     is_remote_query = "remote" in query.lower()
     radius_miles = safe_int(get_filter("radius_miles"), 35)
+    start_page = get_query_start_page(query)
     all_jobs = []
-    for page in range(1, 6):
+    for offset in range(5):
+        page = start_page + offset
         params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
         if not is_remote_query and radius_miles:
             params["radius"] = str(radius_miles)
@@ -2514,6 +2549,10 @@ def fetch_single_query_jobs(query_args):
             break
     if is_remote_query:
         all_jobs = all_jobs[:1]
+    next_page = start_page + 5
+    if next_page > 20:
+        next_page = 1
+    save_query_next_page(query, next_page)
     return all_jobs
 
 def fetch_greenhouse_jobs(slug):
@@ -2938,6 +2977,45 @@ def process_webhook_payload_async(data):
             threading.Thread(target=expand_ecosystem_filter, args=(company,), daemon=True).start()
             return
 
+        # 5b. Standalone /cold and /warm Quick-Add (distinct from the bare /cold, /warm swipe-reply
+        # stage-move below - these always require trailing "Name @ Company" text, so they never collide)
+        if text.startswith("/cold ") or text.startswith("/warm "):
+            is_warm_quickadd = text.startswith("/warm ")
+            target_tab = "Carmen Warm" if is_warm_quickadd else "Carmen Cold"
+            cmd_token = "/warm" if is_warm_quickadd else "/cold"
+            result = parse_quick_command(text)
+            if result is None:
+                send_telegram_message(chat_id, f"❌ Invalid {cmd_token} format. Use: <code>{cmd_token} Name@Company [Priority 1-10] [Note]</code>")
+                return
+            name, company, priority, note = result
+            sheet_uuid = str(uuid.uuid4())
+            next_followup = (datetime.now() + timedelta(days=calculate_followup_interval(priority))).strftime("%Y-%m-%d")
+            payload = build_crm_payload(
+                "quick_add",
+                target_code="CW" if is_warm_quickadd else "CC",
+                sheet_uuid=sheet_uuid,
+                first_contact=today_str,
+                last_contact=today_str,
+                name=name,
+                company=company,
+                priority=priority,
+                status="Warm Lead" if is_warm_quickadd else "Cold Lead",
+                next_followup=next_followup,
+                note=f"[{today_str}] {note}"
+            )
+            log_to_sheets_crm(payload)
+            resp = (
+                f"✅ <b>Contact Created ({target_tab})</b>\n"
+                f"<b>Name:</b> {html.escape(name)}\n"
+                f"<b>Company:</b> {html.escape(company)}\n"
+                f"<b>Priority:</b> {priority}/10\n"
+                f"<b>Next Follow-up:</b> {next_followup}"
+            )
+            sent_msg_id = send_telegram_message(chat_id, resp)
+            save_message_mapping(sent_msg_id, sheet_uuid, target_tab, name, company)
+            threading.Thread(target=expand_ecosystem_filter, args=(company,), daemon=True).start()
+            return
+
         # 6. Dynamic /search Filters Overview & Inline Adjustments
         if text == "/search":
             min_sal = safe_int(get_filter("min_salary"), 50000)
@@ -3331,7 +3409,9 @@ def process_webhook_payload_async(data):
             return
 
         # Muscle Memory Safety Net: catches old finger-memory taps of retired swipe commands
-        if text in ["/tw", "/cw", "/tc", "/cc", "/conv", "/int", "/pivot"]:
+        # ("/cw"/"/cc" are NOT retired - they're live Networking Card pull triggers handled in
+        # section 3 above, which always matches first and returns before reaching this block)
+        if text in ["/tw", "/tc", "/conv", "/int", "/pivot"]:
             send_telegram_message(
                 chat_id,
                 f"⚠️ <code>{html.escape(text)}</code> has been retired. Use <code>/warm</code>, <code>/cold</code>, or <code>/apply</code> instead."
@@ -3347,7 +3427,9 @@ def process_webhook_payload_async(data):
                 "/t - Pull fresh job cards\n"
                 "/search - View or update live search filters\n"
                 "/quick - Create contact (Name @ Firm Priority Note)\n"
-                "/edit - Edit a template (e.g. /edit L0 New note)\n\n"
+                "/cold, /warm - Quick-add a Cold/Warm contact (Name @ Firm Priority Note)\n"
+                "/edit - Edit a template (e.g. /edit L0 New note)\n"
+                "/ecosystem, /eco add - View/expand tracked ATS boards\n\n"
                 "<b>PULL CRM DATA:</b>\n"
                 "/c - Pull combined networking cards\n"
                 "/cw - Pull Warm Rolodex cards\n"
@@ -3360,10 +3442,17 @@ def process_webhook_payload_async(data):
                 "/x - Archive lead to Died/Killed tab\n"
                 "/n - Append timestamped note\n"
                 "/f - Snooze follow-up by [days]\n"
-                "/draft - Generate Gmail draft\n\n"
+                "/e, /email - Override the target email & re-draft\n"
+                "/draft - Generate Gmail draft\n"
+                "/cv, /resume - Compile tailored resume PDF\n"
+                "/prep - Interview talking points & reverse questions\n"
+                "/pitch - 30-second elevator pitch\n"
+                "/letter - Generate cover letter\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
-                "/efficiency - View Input to Interview Golden Ratio"
+                "/efficiency - View Input to Interview Golden Ratio\n"
+                "/funnel - View pipeline conversion funnel\n"
+                "/streak, /daily - View daily outreach scorecard"
             )
             return
 

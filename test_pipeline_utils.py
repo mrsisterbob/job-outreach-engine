@@ -13,9 +13,19 @@ def test_build_hiring_manager_dork_encodes_company_and_targets_ops_titles():
     url = pu.build_hiring_manager_dork("Ann Arbor SPARK, Inc.")
     assert url.startswith("https://www.google.com/search?q=")
     decoded = urllib.parse.unquote(url.split("q=", 1)[1])
-    assert "Ann Arbor SPARK Inc" in decoded
+    assert "Ann Arbor SPARK" in decoded
     assert "VP of Operations" in decoded
     assert "site:linkedin.com/in" in decoded
+
+
+def test_dork_builders_strip_legal_entity_suffixes():
+    for suffix in ["Inc.", "LLC", "Holdings", "Corp", "Corporation", "Ltd", "PLC", "Group"]:
+        decoded_manager = urllib.parse.unquote(pu.build_hiring_manager_dork(f"Acme {suffix}"))
+        decoded_recruiter = urllib.parse.unquote(pu.build_recruiter_dork(f"Acme {suffix}"))
+        assert suffix.rstrip(".").lower() not in decoded_manager.split('"')[1].lower()
+        assert suffix.rstrip(".").lower() not in decoded_recruiter.split('"')[1].lower()
+        assert "Acme" in decoded_manager
+        assert "Acme" in decoded_recruiter
 
 
 def test_build_recruiter_dork_targets_talent_acquisition():
