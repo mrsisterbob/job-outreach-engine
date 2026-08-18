@@ -236,9 +236,11 @@ function doPost(e) {
       return respondJSON({ status: "success", message: "Note appended" });
     }
 
-    // 6. Networking Card Pull (/c, /cw, /cc -> {"action": "get_followups", "tab": target_code})
+    // 6. Networking Card Pull (/c, /cw, /cc, TW suppression -> {"action": "get_followups", "tab": target_code})
     if (action === "get_followups") {
-      const tabName = payload.tab === "CW" ? "Carmen Warm" : payload.tab === "TC" ? "Tetiana Cold" : null;
+      const tabName = payload.tab === "CW" ? "Carmen Warm" :
+                      payload.tab === "TC" ? "Tetiana Cold" :
+                      payload.tab === "TW" ? "Tetiana Warm" : null;
       if (!tabName) {
         return respondJSON({ status: "error", message: `Unknown target_code: ${payload.tab}` });
       }
