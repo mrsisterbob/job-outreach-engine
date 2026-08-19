@@ -1236,19 +1236,83 @@ def build_crm_payload(action, sheet_uuid=None, **kwargs):
     payload.update(kwargs)
     return payload
 
+def _parse_company_title_from_card_text(text):
+    """Extracts (company, title) from a dispatched job-card's Telegram text via its 💼/🏢 markers,
+    for stale swipe-reply recovery when the local sheet_row_map mapping has been lost/evicted.
+    Returns (None, None) if either marker is missing.
+    """
+    if not text:
+        return None, None
+    title_match = re.search(r'💼\s*<b>(.*?)</b>', text)
+    company_match = re.search(r'🏢\s*<b>(.*?)</b>', text)
+    if not (title_match and company_match):
+        return None, None
+    return html.unescape(company_match.group(1)).strip(), html.unescape(title_match.group(1)).strip()
+
+def _fuzzy_find_job_in_sheets(company, title):
+    """Searches Tetiana Cold then Clavicular via get_followups for a legal-suffix/case-insensitive
+    dedup-hash match on (company, title), returning (sheet_uuid, sheet_tab) or None.
+    """
+    target_hash = generate_dedup_hash(company, title)
+    for target_code, sheet_tab in (("TC", "Tetiana Cold"), ("CL", "Clavicular")):
+        for record in fetch_networking_cards(target_code, qty=None):
+            if generate_dedup_hash(record.get("company"), record.get("title")) == target_hash:
+                sheet_uuid = record.get("sheet_uuid")
+                if sheet_uuid:
+                    return sheet_uuid, sheet_tab
+    return None
+
+def _fuzzy_find_job_in_local_cache(company, title):
+    """Scans the local SQLite jobs cache for a dedup-hash match on (company, title), returning
+    sheet_uuid or None. Cheaper than the Sheets lookup - tried first in resolve_reply_mapping.
+    """
+    target_hash = generate_dedup_hash(company, title)
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT sheet_uuid, job_json FROM jobs")
+            for sheet_uuid, job_json in cursor.fetchall():
+                try:
+                    job_dict = json.loads(job_json)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if generate_dedup_hash(job_dict.get("employer_name"), job_dict.get("job_title")) == target_hash:
+                    return sheet_uuid
+    except Exception as e:
+        logging.error(f"Fuzzy Local Job Cache Lookup Error ({company}/{title}): {e}")
+    return None
+
 def resolve_reply_mapping(msg, chat_id, command_label):
     """For swipe-reply commands, resolve reply_to_message -> sheet_uuid mapping.
+    Falls back to fuzzy company/title recovery (local jobs cache, then Sheets Tetiana Cold /
+    Clavicular) when the local sheet_row_map entry was lost/evicted, re-persisting it on success
+    so future replies to the same card resolve instantly again.
     Sends a Telegram warning and returns None if reply context or mapping is missing.
     """
     reply_msg = msg.get("reply_to_message")
     if not reply_msg:
         send_telegram_message(chat_id, "⚠️ <b>Context Missing:</b> Please swipe-reply directly to a job card or contact card to use this command.")
         return None
-    mapping = get_mapping_from_message_id(reply_msg.get("message_id"))
-    if not mapping:
-        send_telegram_message(chat_id, f"⚠️ <b>Record Not Found:</b> No CRM record is mapped to this card for <code>{html.escape(command_label)}</code>. Please retry with /t or /c to regenerate it.")
-        return None
-    return mapping
+    reply_message_id = reply_msg.get("message_id")
+    mapping = get_mapping_from_message_id(reply_message_id)
+    if mapping:
+        return mapping
+
+    company, title = _parse_company_title_from_card_text(reply_msg.get("text", ""))
+    if company and title:
+        sheet_uuid = _fuzzy_find_job_in_local_cache(company, title)
+        sheet_tab = "Pipeline_Candidates"
+        if not sheet_uuid:
+            recovered = _fuzzy_find_job_in_sheets(company, title)
+            if recovered:
+                sheet_uuid, sheet_tab = recovered
+        if sheet_uuid:
+            save_message_mapping(reply_message_id, sheet_uuid, sheet_tab, "", company, "")
+            logging.info(f"[RECOVERY] Fuzzy-matched lost mapping for '{company}' / '{title}' -> {sheet_uuid} ({sheet_tab})")
+            return {"sheet_uuid": sheet_uuid, "sheet_tab": sheet_tab, "contact_name": "", "contact_company": company}
+
+    send_telegram_message(chat_id, f"⚠️ <b>Record Not Found:</b> No CRM record is mapped to this card for <code>{html.escape(command_label)}</code>. Please retry with /t or /c to regenerate it.")
+    return None
 
 # ==============================================================================
 # 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE
@@ -3870,7 +3934,7 @@ def process_webhook_payload_async(data):
                     )
                     return
             else:
-                target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
+                target = resolve_target_email(comp, title, job.get("employer_website"))
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
             pdf_bytes = None
@@ -4372,7 +4436,7 @@ def handle_fast_path_command(chat_id, text, msg):
                 )
                 return True
         else:
-            target = resolve_target_email(comp, title, job.get("employer_website")) if job else "Unknown"
+            target = resolve_target_email(comp, title, job.get("employer_website"))
         track = job.get("track", "a")
         bullet_indices = job.get("bullet_indices")
         pdf_bytes = None

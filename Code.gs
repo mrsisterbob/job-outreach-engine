@@ -242,7 +242,8 @@ function doPost(e) {
     if (action === "get_followups") {
       const tabName = payload.tab === "CW" ? "Carmen Warm" :
                       payload.tab === "TC" ? "Tetiana Cold" :
-                      payload.tab === "TW" ? "Tetiana Warm" : null;
+                      payload.tab === "TW" ? "Tetiana Warm" :
+                      payload.tab === "CL" ? "Clavicular" : null;
       if (!tabName) {
         return respondJSON({ status: "error", message: `Unknown target_code: ${payload.tab}` });
       }
