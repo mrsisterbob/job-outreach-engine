@@ -46,9 +46,9 @@ GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
-JSEARCH_TIMEOUT_SECONDS = 8
-JSEARCH_MAX_RETRIES = 2  # additional attempts beyond the first, on timeout/429/5xx
-JSEARCH_SEMAPHORE = threading.Semaphore(3)  # cap concurrent OpenWebNinja requests to avoid rate-limit timeouts
+JSEARCH_TIMEOUT_SECONDS = 12
+JSEARCH_MAX_RETRIES = 1  # additional attempts beyond the first, on timeout/429/5xx
+JSEARCH_SEMAPHORE = threading.Semaphore(4)  # cap concurrent OpenWebNinja requests to avoid rate-limit timeouts
 
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
@@ -63,7 +63,7 @@ def build_jsearch_request_config():
 DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs_cache.db")  # override lets tests isolate their own SQLite file
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
 
-def crm_get(params, timeout=4):
+def crm_get(params, timeout=10):
     """GET against CRM_WEBHOOK_URL with the shared secret auto-attached. Returns a requests.Response
     or None if CRM_WEBHOOK_URL is unset or the request raised. Centralizes CRM auth in one place -
     defined early so startup-time callers (e.g. hydrate_filters_from_sheets via init_db()) can use it.
@@ -79,7 +79,7 @@ def crm_get(params, timeout=4):
         logging.error(f"CRM GET Error ({merged_params.get('action')}): {e}")
         return None
 
-def crm_post(payload, timeout=4):
+def crm_post(payload, timeout=10):
     """POST against CRM_WEBHOOK_URL with the shared secret auto-attached. Returns a requests.Response
     or None if CRM_WEBHOOK_URL is unset or the request raised. Centralizes CRM auth in one place.
     """
@@ -506,20 +506,10 @@ def init_db():
                     "Custodial Operations Schwab Fidelity Farmington MI",
                     "Financial Systems Process Automation Farmington MI",
                     "Operations Specialist Farmington MI",
+                    "Salesforce Administrator Farmington MI",
                     "Financial Operations Analyst Remote",
                     "Business Systems Analyst Farmington MI",
-                    "Risk Operations Analyst Remote",
-                    "Client Operations Associate Farmington MI",
-                    "Business Intelligence Analyst Farmington MI",
-                    "Trade Operations Analyst Remote",
-                    "Compliance Operations Specialist Farmington MI",
-                    "Financial Analyst Operations Farmington MI",
-                    "Treasury Operations Analyst Remote",
-                    "Salesforce Administrator Farmington MI",
-                    "Client Success Operations Remote",
-                    "Data Operations Analyst Remote",
-                    "Process Improvement Analyst Farmington MI",
-                    "Onboarding Specialist Farmington MI"
+                    "Data Operations Analyst Remote"
                 ]
             }
             for k, v in defaults.items():
@@ -3018,12 +3008,8 @@ def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page):
             logging.warning(f"JSearch {res.status_code} on page {page} ({query}) - non-retryable")
             return [], True
         except requests.exceptions.Timeout:
-            if attempt == JSEARCH_MAX_RETRIES:
-                logging.error(f"JSearch timeout on page {page} ({query}) - retries exhausted")
-                return [], True
-            logging.warning(f"JSearch timeout on page {page} ({query}), attempt {attempt+1}/{JSEARCH_MAX_RETRIES+1} - retrying in {delay}s")
-            time.sleep(delay)
-            delay *= 2.0
+            logging.warning(f"JSearch timeout on page {page} ({query}) - skipping page")
+            return [], True
         except Exception as e:
             logging.error(f"JSearch fetch exception on page {page} ({query}): {e}")
             return [], True
@@ -3049,6 +3035,7 @@ def fetch_single_query_jobs(query_args):
         params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
         if not is_remote_query and radius_miles:
             params["radius"] = str(radius_miles)
+        time.sleep(0.3)  # stagger outbound requests to avoid slamming JSearch concurrently
         page_jobs, should_stop = _fetch_jsearch_page_with_retry(api_url, headers, params, query, page)
         if page_jobs:
             all_jobs.extend(page_jobs)
