@@ -57,6 +57,7 @@ def build_jsearch_request_config():
         return {"x-api-key": openweb_key}, JSEARCH_URL
     if rapidapi_key:
         return {"X-RapidAPI-Key": rapidapi_key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}, "https://jsearch.p.rapidapi.com/search"
+    logging.error("[CONFIG ERROR] No JSearch API key found in environment variables.")
     return {}, JSEARCH_URL
 DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs_cache.db")  # override lets tests isolate their own SQLite file
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
@@ -3000,6 +3001,7 @@ def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page):
     delay = 2.0
     for attempt in range(JSEARCH_MAX_RETRIES + 1):
         try:
+            logging.info(f"[JSEARCH OUTBOUND] Calling {api_url} with headers: {list(headers.keys())} for query: '{query}' page: {page}")
             res = requests.get(api_url, headers=headers, params=params, timeout=JSEARCH_TIMEOUT_SECONDS)
             if res.status_code == 200:
                 return res.json().get("data", []), False
