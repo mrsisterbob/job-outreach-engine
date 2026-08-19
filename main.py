@@ -2137,6 +2137,10 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     if missing_vars:
         return False, f"Missing Env Vars: {', '.join(missing_vars)}", None
 
+    # Strip bracketed confidence tags (e.g. "user@x.com [⚠️ Fallback Email]") before this ever
+    # reaches an SMTP header - the tag is a UI-only warning, never part of the real address.
+    clean_to_email = str(to_email or "").split(" [")[0].strip()
+
     if custom_body is not None:
         body_content = custom_body
         subject = custom_subject or f"Following up - {company_name}"
@@ -2147,13 +2151,13 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         body_content = generate_cold_email(job_title, company_name)
         subject = f"Operations & Systems Alignment - {job_title} @ {company_name}"
 
-    existing = check_existing_gmail_draft(to_email, subject)
+    existing = check_existing_gmail_draft(clean_to_email, subject)
     if existing:
         if TELEGRAM_CHAT_ID:
             send_telegram_message(
                 TELEGRAM_CHAT_ID,
                 f"ℹ️ <b>Draft Already Exists</b>\n"
-                f"<b>To:</b> <code>{html.escape(to_email)}</code>\n"
+                f"<b>To:</b> <code>{html.escape(clean_to_email)}</code>\n"
                 f"<b>Subject:</b> <code>{html.escape(subject)}</code>\n"
                 f"<b>Draft ID:</b> <code>{html.escape(str(existing['draft_id']))}</code>\n"
                 f"<b>Created:</b> {html.escape(str(existing['created_at']))}"
@@ -2166,7 +2170,7 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
             return False, "OAuth Token Unavailable", None
 
         message = EmailMessage()
-        message["To"] = to_email
+        message["To"] = clean_to_email
         message["From"] = GMAIL_USER
         message["Subject"] = subject
         message.set_content(body_content)
@@ -2183,7 +2187,7 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         res = requests.post(draft_url, headers=headers, json={"message": {"raw": raw_message}}, timeout=10)
         if res.status_code in [200, 201]:
             draft_id = res.json().get("id", "")
-            save_gmail_draft_record(to_email, subject, draft_id)
+            save_gmail_draft_record(clean_to_email, subject, draft_id)
             log_metric_event("gmail_draft_staged")
             return True, "Success", draft_id
         return False, f"Gmail Error {res.status_code}", None
@@ -3696,7 +3700,21 @@ def process_webhook_payload_async(data):
             is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
             update_job_target_email(mapping["sheet_uuid"], new_email)
 
-            ok, gmail_msg, draft_id = create_gmail_draft(to_email=new_email, company_name=comp, job_title=title, is_warm=is_warm)
+            # Compile the same tailored resume PDF /draft attaches, so /e never regresses to a bare-text draft
+            track = job.get("track", "a")
+            bullet_indices = job.get("bullet_indices")
+            pdf_bytes = None
+            clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
+            pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
+            try:
+                pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
+            except Exception as e:
+                logging.error(f"/e resume compilation failed for {comp}: {e}")
+
+            ok, gmail_msg, draft_id = create_gmail_draft(
+                to_email=new_email, company_name=comp, job_title=title, is_warm=is_warm,
+                pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+            )
             raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
             monospaced_body = format_email_block(raw_email_text)
             draft_link_line = ""
