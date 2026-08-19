@@ -1770,7 +1770,7 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
     delay = 1.0
     for attempt in range(max_retries):
         try:
-            res = requests.post(url, json=payload, timeout=15)
+            res = requests.post(url, json=payload, timeout=6)
             if res.status_code == 200:
                 return res.json()["candidates"][0]["content"]["parts"][0]["text"]
             if res.status_code == 429 or res.status_code >= 500:
@@ -1804,7 +1804,7 @@ def evaluate_job_with_gemini(job):
         return True, 75, "Fallback pass (No Key)", "a", [0, 1, 2], 0, 0
 
     try:
-        desc_truncated = str(job.get("job_description") or "")[:4000]
+        desc_truncated = str(job.get("job_description") or "")[:1800]
         prompt = f"Job Title: {job.get('job_title')}\nCompany: {job.get('employer_name')}\nDescription:\n{desc_truncated}"
         
         # Call API with timeout handling
@@ -3277,7 +3277,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
     logging.info(f"Stage 2: Evaluating {len(eval_candidates)} candidates with Gemini AI (uncapped)...")
     
     top_matches = []
-    with ThreadPoolExecutor(max_workers=10) as eval_executor:
+    with ThreadPoolExecutor(max_workers=8) as eval_executor:
         # Map candidate evaluation across thread pool
         eval_futures = [eval_executor.submit(process_single_candidate, candidate) for candidate in eval_candidates]
         
