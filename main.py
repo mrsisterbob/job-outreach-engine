@@ -46,7 +46,7 @@ GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
-JSEARCH_TIMEOUT_SECONDS = 20
+JSEARCH_TIMEOUT_SECONDS = 8
 JSEARCH_MAX_RETRIES = 2  # additional attempts beyond the first, on timeout/429/5xx
 
 def build_jsearch_request_config():
@@ -61,7 +61,7 @@ def build_jsearch_request_config():
 DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs_cache.db")  # override lets tests isolate their own SQLite file
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
 
-def crm_get(params, timeout=10):
+def crm_get(params, timeout=4):
     """GET against CRM_WEBHOOK_URL with the shared secret auto-attached. Returns a requests.Response
     or None if CRM_WEBHOOK_URL is unset or the request raised. Centralizes CRM auth in one place -
     defined early so startup-time callers (e.g. hydrate_filters_from_sheets via init_db()) can use it.
@@ -77,7 +77,7 @@ def crm_get(params, timeout=10):
         logging.error(f"CRM GET Error ({merged_params.get('action')}): {e}")
         return None
 
-def crm_post(payload, timeout=10):
+def crm_post(payload, timeout=4):
     """POST against CRM_WEBHOOK_URL with the shared secret auto-attached. Returns a requests.Response
     or None if CRM_WEBHOOK_URL is unset or the request raised. Centralizes CRM auth in one place.
     """
@@ -1455,7 +1455,7 @@ def resolve_live_alumni_at_company(company_name, school="Hope College"):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
     try:
-        res = requests.get("https://html.duckduckgo.com/html/", params={"q": query}, headers=headers, timeout=8)
+        res = requests.get("https://html.duckduckgo.com/html/", params={"q": query}, headers=headers, timeout=3)
         if res.status_code != 200:
             return None
         body = res.text
@@ -1487,6 +1487,8 @@ def resolve_live_alumni_at_company(company_name, school="Hope College"):
             "linkedin_url": linkedin_url,
             "headline": snippet_text[:200]
         }
+    except requests.exceptions.Timeout:
+        return None  # fast-fail: never retry a slow DuckDuckGo scrape
     except Exception as e:
         logging.warning(f"resolve_live_alumni_at_company failed for '{company_name}': {e}")
         return None
@@ -2989,7 +2991,7 @@ def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page):
 
 def fetch_single_query_jobs(query_args):
     """Worker function for parallel JSearch API query execution.
-    Fetches a rolling 5-page window per query, resuming from this query's persisted query_pagination
+    Fetches a rolling 3-page window per query, resuming from this query's persisted query_pagination
     offset (instead of always re-fetching page 1) and wrapping back to page 1 past page 20 - so every
     /t run surfaces deeper/fresher listings instead of re-evaluating the same first page each time.
     Stops early on empty page, 429, or exhausted retries (see _fetch_jsearch_page_with_retry).
@@ -3002,7 +3004,7 @@ def fetch_single_query_jobs(query_args):
     radius_miles = safe_int(get_filter("radius_miles"), 35)
     start_page = get_query_start_page(query)
     all_jobs = []
-    for offset in range(5):
+    for offset in range(3):
         page = start_page + offset
         params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
         if not is_remote_query and radius_miles:
@@ -3014,7 +3016,7 @@ def fetch_single_query_jobs(query_args):
             break  # no more results or retries exhausted, stop paging early
     if is_remote_query:
         all_jobs = all_jobs[:1]
-    next_page = start_page + 5
+    next_page = start_page + 3
     if next_page > 20:
         next_page = 1
     save_query_next_page(query, next_page)
@@ -3165,8 +3167,12 @@ def run_job_pipeline(chat_id=None, top_n=2):
     Tiered delivery: Tier-1 (score>=80, top 5) get full interactive cards; Tier-2 (65-79) get a bundled digest.
     """
     logging.info(">>> Starting Job Search Pipeline...")
+    # Pre-warm CRM caches synchronously so parallel Stage 2 evaluations never contend for the
+    # Google Apps Script lock on their first cache-miss call.
+    get_applied_crm_companies()
+    get_warm_crm_contacts()
     if chat_id:
-        send_status_update(chat_id, "Stage 1: Fetching raw listings from JSearch (5 pages/query, ~400/batch) in parallel...")
+        send_status_update(chat_id, "Stage 1: Fetching raw listings from JSearch (3 pages/query, ~240/batch) in parallel...")
 
     seen_hashes = set()
     candidate_pool = []
@@ -3235,7 +3241,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
     logging.info(f"Stage 2: Evaluating {len(eval_candidates)} candidates with Gemini AI (uncapped)...")
     
     top_matches = []
-    with ThreadPoolExecutor(max_workers=4) as eval_executor:
+    with ThreadPoolExecutor(max_workers=10) as eval_executor:
         # Map candidate evaluation across thread pool
         eval_futures = [eval_executor.submit(process_single_candidate, candidate) for candidate in eval_candidates]
         
