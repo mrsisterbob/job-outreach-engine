@@ -48,6 +48,7 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 JSEARCH_TIMEOUT_SECONDS = 8
 JSEARCH_MAX_RETRIES = 2  # additional attempts beyond the first, on timeout/429/5xx
+JSEARCH_SEMAPHORE = threading.Semaphore(3)  # cap concurrent OpenWebNinja requests to avoid rate-limit timeouts
 
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
@@ -3002,7 +3003,8 @@ def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page):
     for attempt in range(JSEARCH_MAX_RETRIES + 1):
         try:
             logging.info(f"[JSEARCH OUTBOUND] Calling {api_url} with headers: {list(headers.keys())} for query: '{query}' page: {page}")
-            res = requests.get(api_url, headers=headers, params=params, timeout=JSEARCH_TIMEOUT_SECONDS)
+            with JSEARCH_SEMAPHORE:
+                res = requests.get(api_url, headers=headers, params=params, timeout=JSEARCH_TIMEOUT_SECONDS)
             if res.status_code == 200:
                 return res.json().get("data", []), False
             if res.status_code == 429 or res.status_code >= 500:
