@@ -12,6 +12,7 @@ const SCHEMAS = {
 const TAB_MAP = {
   "Tetiana Cold": "JOBS",
   "Tetiana Warm": "JOBS",
+  "Clavicular": "JOBS",
   "Died": "JOBS",
   "Carmen Cold": "PEOPLE",
   "Carmen Warm": "PEOPLE",
@@ -108,7 +109,8 @@ function doPost(e) {
     // 1b. Batch Job Pipeline Row Log (main.py: build_crm_payload("batch_add_rows", ...))
     // Processes multiple Tier-1/Tier-2 pipeline matches under a single lock/execution
     if (action === "batch_add_rows") {
-      const targetTab = payload.target_code === "CW" ? "Carmen Warm" : "Tetiana Cold";
+      const targetTab = payload.target_code === "CW" ? "Carmen Warm" :
+                        payload.target_code === "CL" ? "Clavicular" : "Tetiana Cold";
       const sheet = getOrCreateSheet(ss, targetTab);
       const schemaType = TAB_MAP[targetTab] || "JOBS";
       const rows = payload.rows || [];
