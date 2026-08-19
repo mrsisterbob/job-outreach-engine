@@ -469,7 +469,9 @@ def init_db():
                     "sales", "account executive", "bdr", "sdr", "financial advisor", "financial planner",
                     "client relationship manager", "agent", "wholesaler", "producer", "insurance agent",
                     "teller", "branch", "personal banker", "loan officer", "mortgage", "cpa",
-                    "customer service representative", "call center", "door to door", "cold call"
+                    "customer service representative", "call center", "door to door", "cold call",
+                    "administrative", "receptionist", "office assistant", "logistics clerk",
+                    "patient intake", "intake coordinator", "front desk", "office coordinator"
                 ],
                 "company_exclusions": [
                     "cybercoders", "robert half", "kforce", "jobot", "actalent", "insight global"
@@ -479,7 +481,9 @@ def init_db():
                     "hunter mentality", "pipeline development", "uncapped earnings",
                     "cold outreach", "deal closing", "solution pitching",
                     "uncapped potential", "commission", "hustle", "grind", "door-to-door",
-                    "phone jockey", "call jockey", "cold calling"
+                    "phone jockey", "call jockey", "cold calling",
+                    "physical filing", "answering phones", "switchboard", "data entry clerk",
+                    "schedule travel arrangements", "clerical duties", "errands"
                 ],
                 "seniority_exclusions": [
                     "senior", " lead", " manager", "director", "vp", " executive", " principal", "head of"
@@ -519,6 +523,29 @@ def init_db():
             for k, v in defaults.items():
                 conn.execute("INSERT INTO search_filters (key, value_json) VALUES (?, ?)", (k, json.dumps(v)))
             conn.commit()
+
+        # Merge newly-added exclusion tokens into any pre-existing search_filters rows, so upgrades
+        # to an already-initialized local DB pick them up immediately without a manual table reset.
+        merge_tokens = {
+            "title_exclusions": [
+                "administrative", "receptionist", "office assistant", "logistics clerk",
+                "patient intake", "intake coordinator", "front desk", "office coordinator"
+            ],
+            "hard_ban_keywords": [
+                "physical filing", "answering phones", "switchboard", "data entry clerk",
+                "schedule travel arrangements", "clerical duties", "errands"
+            ]
+        }
+        for key, new_tokens in merge_tokens.items():
+            row = conn.execute("SELECT value_json FROM search_filters WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                conn.execute("INSERT INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(new_tokens)))
+                continue
+            existing = json.loads(row[0]) if row[0] else []
+            merged = existing + [t for t in new_tokens if t not in existing]
+            if merged != existing:
+                conn.execute("UPDATE search_filters SET value_json = ? WHERE key = ?", (json.dumps(merged), key))
+        conn.commit()
 
     hydrate_filters_from_sheets()
 
@@ -1963,6 +1990,15 @@ def passes_strict_filter(job):
         return False
     if any(sen in title for sen in get_filter("seniority_exclusions", [])):
         return False
+
+    # Gate wealth/finance roles: require at least one systems, automation, or tooling anchor
+    if any(term in title or term in description for term in ["wealth", "financial", "advisor", "branch", "banking"]):
+        core_systems_keywords = [
+            "python", "sql", "salesforce", "automation", "schwab", "fidelity",
+            "docusign", "reconciliation", "excel", "hubspot", "api", "etl"
+        ]
+        if not any(k in description for k in core_systems_keywords):
+            return False
 
     return True
 
