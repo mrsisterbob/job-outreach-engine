@@ -46,6 +46,18 @@ GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
+JSEARCH_TIMEOUT_SECONDS = 20
+JSEARCH_MAX_RETRIES = 2  # additional attempts beyond the first, on timeout/429/5xx
+
+def build_jsearch_request_config():
+    """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
+    openweb_key = os.environ.get("OPENWEBNINJA_KEY")
+    rapidapi_key = os.environ.get("RAPIDAPI_KEY")
+    if openweb_key:
+        return {"x-api-key": openweb_key}, JSEARCH_URL
+    if rapidapi_key:
+        return {"X-RapidAPI-Key": rapidapi_key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}, "https://jsearch.p.rapidapi.com/search"
+    return {}, JSEARCH_URL
 DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs_cache.db")  # override lets tests isolate their own SQLite file
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
 
@@ -2942,14 +2954,48 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
 # ==============================================================================
 # 8. PARALLEL PIPELINE EXECUTION (PARALLEL JSEARCH + EARLY-EXIT CIRCUIT BREAKER)
 # ==============================================================================
+def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page):
+    """GETs one JSearch page with exponential backoff on timeout/429/5xx.
+    Returns (jobs, stop_pagination) - stop_pagination is True once retries are exhausted or a
+    non-retryable status is hit, so one query's failure never raises past this function.
+    """
+    delay = 2.0
+    for attempt in range(JSEARCH_MAX_RETRIES + 1):
+        try:
+            res = requests.get(api_url, headers=headers, params=params, timeout=JSEARCH_TIMEOUT_SECONDS)
+            if res.status_code == 200:
+                return res.json().get("data", []), False
+            if res.status_code == 429 or res.status_code >= 500:
+                if attempt == JSEARCH_MAX_RETRIES:
+                    logging.error(f"JSearch {res.status_code} on page {page} ({query}) - retries exhausted")
+                    return [], True
+                logging.warning(f"JSearch {res.status_code} on page {page} ({query}), attempt {attempt+1}/{JSEARCH_MAX_RETRIES+1} - retrying in {delay}s")
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+            logging.warning(f"JSearch {res.status_code} on page {page} ({query}) - non-retryable")
+            return [], True
+        except requests.exceptions.Timeout:
+            if attempt == JSEARCH_MAX_RETRIES:
+                logging.error(f"JSearch timeout on page {page} ({query}) - retries exhausted")
+                return [], True
+            logging.warning(f"JSearch timeout on page {page} ({query}), attempt {attempt+1}/{JSEARCH_MAX_RETRIES+1} - retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2.0
+        except Exception as e:
+            logging.error(f"JSearch fetch exception on page {page} ({query}): {e}")
+            return [], True
+    return [], True
+
 def fetch_single_query_jobs(query_args):
     """Worker function for parallel JSearch API query execution.
     Fetches a rolling 5-page window per query, resuming from this query's persisted query_pagination
     offset (instead of always re-fetching page 1) and wrapping back to page 1 past page 20 - so every
     /t run surfaces deeper/fresher listings instead of re-evaluating the same first page each time.
-    Stops early on empty page or 429. Non-"Remote" queries are radius-limited (radius_miles filter,
-    anchored to the location text in the query itself); "Remote" queries are capped to at most 1
-    result so nationwide remote postings don't crowd out the local metro-area focus.
+    Stops early on empty page, 429, or exhausted retries (see _fetch_jsearch_page_with_retry).
+    Non-"Remote" queries are radius-limited (radius_miles filter, anchored to the location text in
+    the query itself); "Remote" queries are capped to at most 1 result so nationwide remote postings
+    don't crowd out the local metro-area focus.
     """
     query, api_url, headers = query_args
     is_remote_query = "remote" in query.lower()
@@ -2961,20 +3007,11 @@ def fetch_single_query_jobs(query_args):
         params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
         if not is_remote_query and radius_miles:
             params["radius"] = str(radius_miles)
-        try:
-            res = requests.get(api_url, headers=headers, params=params, timeout=10)
-            if res.status_code == 429:
-                logging.warning(f"JSearch 429 Rate Limit on page {page} ({query}) - stopping pagination")
-                break
-            if res.status_code != 200:
-                break
-            page_jobs = res.json().get("data", [])
-            if not page_jobs:
-                break  # no more results, stop paging early
+        page_jobs, should_stop = _fetch_jsearch_page_with_retry(api_url, headers, params, query, page)
+        if page_jobs:
             all_jobs.extend(page_jobs)
-        except Exception as e:
-            logging.error(f"Fetch Exception ({query} page {page}): {e}")
-            break
+        if should_stop or not page_jobs:
+            break  # no more results or retries exhausted, stop paging early
     if is_remote_query:
         all_jobs = all_jobs[:1]
     next_page = start_page + 5
@@ -3159,14 +3196,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
             candidate_pool.append(job)
     
     # Stage 1: Parallel JSearch fetching (5 pages/query, ~400 listings/batch) + strict filtering
-    rapidapi_key = os.environ.get("RAPIDAPI_KEY")
-    openweb_key = os.environ.get("OPENWEBNINJA_KEY")
-    if rapidapi_key:
-        headers = {"X-RapidAPI-Key": rapidapi_key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
-        api_url = "https://jsearch.p.rapidapi.com/search"
-    else:
-        headers = {"x-api-key": openweb_key} if openweb_key else {}
-        api_url = JSEARCH_URL
+    headers, api_url = build_jsearch_request_config()
     
     target_queries = get_filter("target_queries", [])
     query_tasks = [(q, api_url, headers) for q in target_queries]
