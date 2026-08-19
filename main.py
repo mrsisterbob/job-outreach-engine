@@ -1893,7 +1893,7 @@ def call_gemini_api(prompt, system_prompt=None, response_mime="application/json"
     delay = 1.0
     for attempt in range(max_retries):
         try:
-            res = requests.post(url, json=payload, timeout=6)
+            res = requests.post(url, json=payload, timeout=12)
             if res.status_code == 200:
                 return res.json()["candidates"][0]["content"]["parts"][0]["text"]
             if res.status_code == 429 or res.status_code >= 500:
@@ -3511,7 +3511,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
         
         for future in eval_futures:
             try:
-                result = future.result(timeout=20)  # 20s timeout per candidate
+                result = future.result(timeout=45)  # accommodate 3 Gemini attempts at 12s + backoff without outer preemption
                 if result:
                     top_matches.append(result)
             except Exception as e:
