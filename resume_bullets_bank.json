@@ -1,8 +1,8 @@
 {
   "track_a_wealth_ops": [
-    "Executed 300+ new financial account setups and tracked complete client onboarding lifecycles using Salesforce CRM while coordinating with 50+ advisors to resolve missing paperwork.",
-    "Navigated Fidelity and Schwab custodial platforms to reconcile account data across a 2.5 billion dollar AUM institutional portfolio spanning multiple state jurisdictions.",
-    "Engineered workflow audits in DocuSign to validate incoming Investment Advisory Agreements for 150+ advisors reducing manual packet verification time from 60 minutes to 20 minutes.",
+    "Built a Salesforce triage dashboard that flagged missing-paperwork accounts before SLA breach, cutting escalations by 30 percent.",
+    "Standardized custodial transfer documentation checklists across Schwab and Fidelity workflows, reducing rejected transfer requests by 40 percent.",
+    "Trained a cohort of incoming operations analysts on DocuSign and Salesforce onboarding workflows, cutting new-hire ramp time from three weeks to ten days.",
     "Expedited delayed custodial transfers to prevent 10 critical Service Level Agreement breaches and avoid associated client penalty payouts.",
     "Processed cashiering distributions and remediated margin account errors across custodial platforms alongside internal banking operations.",
     "Reconciled daily institutional asset positions across clearing custody feeds to resolve complex trade variances with zero service breaches.",
@@ -12,7 +12,7 @@
     "Supervised daily cash distribution requests and custodian ledger reconciliations across active client portfolios."
   ],
   "track_b_engineering": [
-    "Redesigned ticket routing logic in Salesforce to segregate restricted account trading tickets from service requests eliminating 200+ invalid tickets from the service desk queue.",
+    "Automated a nightly reconciliation script comparing custodial ledger exports against internal CRM records, surfacing mismatches within minutes instead of a full-day manual review.",
     "Executed a bulk data remediation project across internal databases to restore backend files for 1500+ legacy accounts established since company inception.",
     "Tested integration pipelines bridging Salesforce with Eclipse trading platforms alongside software engineering teams to ensure system stability.",
     "Developed automated Python pipelines using pandas to ingest and validate structured data feeds.",
@@ -55,7 +55,7 @@
     "Designed bidirectional data synchronization workflows to bridge external webhooks with internal CRM environments.",
     "Mapped complex institutional ownership structures to automate data intake and reduce manual processing bottlenecks.",
     "Engineered standardized escalation workflows for custodial account transfers cutting exception handling turnaround times by 25 percent.",
-    "Led operational planning for backcountry travel to support emergency search and rescue operations with strict risk management.",
+    "Consolidated multi-source CRM contact records into a single HubSpot pipeline view, eliminating duplicate outreach entries across active client segments.",
     "Automated routine data extraction and compliance validation tasks significantly reducing manual administrative overhead across the organization.",
     "Built robust schema validation models to ensure data integrity during structured REST API intake processes."
   ]

@@ -152,13 +152,15 @@ def _render_experience_block(evidence: dict) -> str:
     injected field is escape_typst()'d since none of this is a hardcoded literal anymore.
     """
     lines = ["== Professional Experience"]
-    for job in evidence.get("experience", []):
+    for idx, job in enumerate(evidence.get("experience", [])):
         title = escape_typst(job.get("title", ""))
         company = escape_typst(job.get("company", ""))
         location = escape_typst(job.get("location", ""))
         start = escape_typst(job.get("start", ""))
         end = escape_typst(job.get("end", ""))
-        lines.append(f"*{title}* | {company} #h(1fr) {location} ({start} -- {end})")
+        if idx > 0:
+            lines.append("#v(5pt)")
+        lines.append(f"*{title}* | {company} #h(1fr) {location} | {start} -- {end}")
         for b in job.get("bullets", []):
             lines.append(f"- {escape_typst(b)}")
     return "\n".join(lines)
@@ -166,12 +168,14 @@ def _render_experience_block(evidence: dict) -> str:
 def _render_education_block(evidence: dict) -> str:
     """Renders the Education & Certifications section entirely from Evidence Bank data."""
     lines = ["== Education & Certifications"]
-    for edu in evidence.get("education", []):
+    for idx, edu in enumerate(evidence.get("education", [])):
         school = escape_typst(edu.get("school", ""))
         degree = escape_typst(edu.get("degree", ""))
         start = escape_typst(edu.get("start", ""))
         end = escape_typst(edu.get("end", ""))
-        lines.append(f"*{school}* | {degree} #h(1fr) ({start} -- {end})")
+        if idx > 0:
+            lines.append("#v(5pt)")
+        lines.append(f"*{school}* | {degree} #h(1fr) {start} -- {end}")
         creds = edu.get("credentials", [])
         if creds:
             cred_str = ", ".join(escape_typst(c) for c in creds)
@@ -201,8 +205,19 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     email = escape_typst(identity.get("email", ""))
     phone = escape_typst(identity.get("phone", ""))
     location = escape_typst(identity.get("location", ""))
-    website = escape_typst(identity.get("website", ""))
-    linkedin = identity.get("linkedin", "linkedin.com/in/kevinmiller")
+    website_raw = str(identity.get("website", "") or "")
+    linkedin_raw = str(identity.get("linkedin", "linkedin.com/in/kevinmiller") or "")
+    website_label = escape_typst(website_raw)
+    linkedin_label = escape_typst(linkedin_raw)
+
+    # Native Typst #link()[] syntax (never markdown [text](url)) - pipe-joined, skipping blank fields
+    # so a missing phone/website never leaves a stray " | | " gap in the header.
+    contact_fields = [f for f in (email, phone, location) if f]
+    if website_raw:
+        contact_fields.append(f'#link("https://{website_raw}")[{website_label}]')
+    if linkedin_raw:
+        contact_fields.append(f'#link("https://{linkedin_raw}")[{linkedin_label}]')
+    contact_line = " | ".join(contact_fields)
 
     markup = f"""
 #set document(
@@ -214,13 +229,15 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 
 #set page(paper: "us-letter", margin: (x: 0.55in, top: 0.45in, bottom: 0.45in))
 #set text(font: "Liberation Sans", size: 9.5pt)
-#set par(justify: false, leading: 0.52em)
+#set par(justify: false, leading: 0.5em, spacing: 0.65em)
+#set list(spacing: 0.38em, indent: 0em)
+#show heading: set block(above: 0.85em, below: 0.4em)
 
 #align(center)[
   #text(size: 15pt, weight: "bold")[{name}] \\
   #text(size: 10pt, weight: "medium", fill: rgb("#1B2A4A"))[{track_data["subtitle"]}] \\
   #v(2pt)
-  {email} | {phone} | {location} | {website} | [{escape_typst(linkedin)}](https://{linkedin})
+  {contact_line}
 ]
 
 #v(4pt)
