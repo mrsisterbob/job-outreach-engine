@@ -15,10 +15,9 @@
       "start": "06/2026",
       "end": "Present",
       "bullets": [
-        "Executed 300+ new financial account setups and tracked complete client onboarding lifecycles using Salesforce CRM while coordinating with 50+ advisors to resolve missing paperwork.",
-        "Navigated Fidelity and Schwab custodial platforms to reconcile account data across a 2.5 billion dollar AUM institutional portfolio spanning multiple state jurisdictions.",
-        "Engineered workflow audits in DocuSign to validate incoming Investment Advisory Agreements for 150+ advisors reducing manual packet verification time from 60 minutes to 20 minutes.",
-        "Redesigned ticket routing logic in Salesforce to segregate restricted account trading tickets from service requests eliminating 200+ invalid tickets from the service desk queue."
+        "Created over 500 new client tickets and researched Schwab and Fidelity across accounts needing cash raises and distributions with the Service Team.",
+        "Found and presented to management an unknown conflict between restricted accounts amongst trading and service tickets.",
+        "Made an automated and autonomous DocuSign system to open documents and respond to follow up emails to advisors for missing documents based on python coded prompts."
       ]
     },
     {
@@ -57,17 +56,63 @@
       ]
     }
   ],
+  "other_experience": [
+    {
+      "title": "Residential Assistant",
+      "company": "Hope College",
+      "location": "Holland, MI",
+      "start": "08/2023",
+      "end": "01/2024",
+      "bullets": [
+        "Managed risky students and escalated health emergencies within dorms."
+      ]
+    },
+    {
+      "title": "Ranger",
+      "company": "Philmont Scout Ranch",
+      "location": "Cimarron, NM",
+      "start": "05/2023",
+      "end": "08/2023",
+      "bullets": [
+        "Trained over 95 participants in backcountry safety and protocols and supported emergency Search and Rescue operations with leadership."
+      ]
+    }
+  ],
   "education": [
     {
       "school": "Hope College",
       "degree": "B.A. Business (Finance), B.A. Political Science",
       "location": "Holland, MI",
       "start": "08/2022",
-      "end": "05/2026",
-      "credentials": [
-        "Series 65 Candidate",
-        "Securities Industry Essentials (SIE)",
-        "Schwab Limited Power of Attorney"
+      "end": "05/2026"
+    }
+  ],
+  "certificates": [
+    "Series 65 Candidate",
+    "Securities Industry Essentials (SIE)",
+    "Schwab Limited Power of Attorney",
+    "Bloomberg Market Concepts"
+  ],
+  "projects": [
+    {
+      "name": "Real World Asset Tokenization",
+      "category": "finance",
+      "location": "Detroit, MI",
+      "start": "07/2026",
+      "end": "08/2026",
+      "bullets": [
+        "Translated El Salvador's Bitcoin laws into plans for an apartment redevelopment project amongst private investors."
+      ]
+    },
+    {
+      "name": "Github Job Hunting and Trading Repositories",
+      "category": "systems",
+      "location": "Detroit, MI",
+      "start": "07/2026",
+      "end": "08/2026",
+      "bullets": [
+        "Built a personal Job Automation Repository that sources tailor-made postings and auto-updates a self-reinforcing CRM with messages in Telegram.",
+        "Built a Python Scripted Trading bot in Hyperliquid in Code.gs focusing on breakout trading and tracking Market Makers through Options."
       ]
     }
   ],

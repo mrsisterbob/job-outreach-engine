@@ -82,14 +82,16 @@ TRACKS = {
     "a": {
         "subtitle": "Financial Systems & Operations",
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
+        "summary": "Operations specialist with experience spanning custodial reconciliations, regulatory compliance, and CRM pipeline automation. Skilled in applying Python, SQL, and system integrations across Salesforce and HubSpot to remove manual bottlenecks, validate institutional data, and streamline complex financial workflows.",
         "skills": [
             ("Operations & Data", "High-Volume Reconciliation, Variance Analysis, Audit Escalation, Power BI (ETL/Modeling), SQL, Advanced Excel."),
-            ("Systems & Tools", "HubSpot CRM, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Salesforce.")
+            ("Systems & Tools", "Schwab Advisor Center, Fidelity Wealthscape, Salesforce, HubSpot CRM, DocuSign.")
         ]
     },
     "b": {
         "subtitle": "Data & Systems Engineering",
         "keywords": ("Python", "SQL", "REST APIs", "ETL", "Schema Architecture", "Process Automation"),
+        "summary": "Operations specialist with hands-on experience building Python and SQL tools that automate reconciliation, validate structured data feeds, and integrate REST APIs across CRM and custodial systems. Comfortable owning a problem from schema design through production deployment in fast-moving financial environments.",
         "skills": [
             ("Engineering & Data", "Python, SQL, REST API Integration, ETL Modeling & Schema Design, Process Automation, Power BI."),
             ("Systems & Tools", "HubSpot CRM, Salesforce, Schwab Advisor Center, Fidelity Wealthscape, Typst.")
@@ -98,6 +100,7 @@ TRACKS = {
     "c": {
         "subtitle": "Risk & Regulatory Compliance",
         "keywords": ("Regulatory Compliance", "SEC/FinCEN Filings", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
+        "summary": "Operations specialist with experience across SEC and FinCEN regulatory filings, custodial compliance audits, and DocuSign workflow validation for financial advisory teams. Focused on building controls that catch risk exposure early and keep institutional accounts audit-ready.",
         "skills": [
             ("Compliance & Risk", "SEC/FinCEN Regulatory Filings, RIA Compliance Audits, DocuSign Workflow Validation, Suitability Review, Risk Escalation Controls."),
             ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, Orion Eclipse, Excel.")
@@ -106,6 +109,7 @@ TRACKS = {
     "d": {
         "subtitle": "Business Intelligence & Analytics",
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
+        "summary": "Operations specialist with experience building Power BI dashboards, SQL-driven variance analysis, and Excel reporting models that turn raw operational data into decisions leadership can act on. Comfortable translating messy financial data sets into clear, repeatable reporting pipelines.",
         "skills": [
             ("Analytics & Reporting", "Power BI Dashboard Design, SQL Aggregation & Variance Analysis, Advanced Excel Modeling, Executive Reporting."),
             ("Systems & Tools", "Salesforce, HubSpot CRM, Schwab Advisor Center, Fidelity Wealthscape.")
@@ -114,6 +118,7 @@ TRACKS = {
     "e": {
         "subtitle": "Business Operations & CRM Systems",
         "keywords": ("Business Operations", "Salesforce", "HubSpot CRM", "Process Automation", "Ticket Routing", "Python"),
+        "summary": "Operations specialist with experience redesigning ticket routing, CRM workflows, and cross-team escalation processes across Salesforce and HubSpot. Focused on removing friction from day-to-day operations so teams spend less time on manual triage and more time on work that matters.",
         "skills": [
             ("Operations & Process", "Ticket Routing & Workflow Redesign, Process Automation, Cross-Team Coordination, Escalation Handling."),
             ("Systems & Tools", "Salesforce, HubSpot CRM, Python, DocuSign, Schwab Advisor Center.")
@@ -147,11 +152,13 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None) -> list:
     selected = [pool[i] for i in indices if not any(bw in str(pool[i]).lower() for bw in banned)]
     return selected or pool[:3]
 
-def _render_experience_block(evidence: dict) -> str:
+def _render_experience_block(evidence: dict, lead_bullet: str = None) -> str:
     """Renders the Professional Experience section entirely from Evidence Bank data - every
     injected field is escape_typst()'d since none of this is a hardcoded literal anymore.
+    `lead_bullet`, if given, is the dynamic track-routed top achievement bullet, prepended
+    ahead of the first job's master bullets so it leads the section.
     """
-    lines = ["== Professional Experience"]
+    lines = []
     for idx, job in enumerate(evidence.get("experience", [])):
         title = escape_typst(job.get("title", ""))
         company = escape_typst(job.get("company", ""))
@@ -159,34 +166,78 @@ def _render_experience_block(evidence: dict) -> str:
         start = escape_typst(job.get("start", ""))
         end = escape_typst(job.get("end", ""))
         if idx > 0:
-            lines.append("#v(5pt)")
+            lines.append("#v(3pt)")
         lines.append(f"*{title}* | {company} #h(1fr) {location} | {start} -- {end}")
+        if idx == 0 and lead_bullet:
+            lines.append(f"- {escape_typst(lead_bullet)}")
+        for b in job.get("bullets", []):
+            lines.append(f"- {escape_typst(b)}")
+    return "\n".join(lines)
+
+def _render_other_experience_block(evidence: dict) -> str:
+    """Renders the Other Experience section (non-financial leadership/service roles) from Evidence Bank data."""
+    lines = []
+    for idx, job in enumerate(evidence.get("other_experience", [])):
+        title = escape_typst(job.get("title", ""))
+        company = escape_typst(job.get("company", ""))
+        location = escape_typst(job.get("location", ""))
+        start = escape_typst(job.get("start", ""))
+        end = escape_typst(job.get("end", ""))
+        if idx > 0:
+            lines.append("#v(2pt)")
+        lines.append(f"*{company}*, _{title}_ #h(1fr) {location} | {start} -- {end}")
         for b in job.get("bullets", []):
             lines.append(f"- {escape_typst(b)}")
     return "\n".join(lines)
 
 def _render_education_block(evidence: dict) -> str:
-    """Renders the Education & Certifications section entirely from Evidence Bank data."""
-    lines = ["== Education & Certifications"]
+    """Renders the Education section entirely from Evidence Bank data."""
+    lines = []
     for idx, edu in enumerate(evidence.get("education", [])):
         school = escape_typst(edu.get("school", ""))
         degree = escape_typst(edu.get("degree", ""))
+        location = escape_typst(edu.get("location", ""))
         start = escape_typst(edu.get("start", ""))
         end = escape_typst(edu.get("end", ""))
         if idx > 0:
-            lines.append("#v(5pt)")
-        lines.append(f"*{school}* | {degree} #h(1fr) {start} -- {end}")
-        creds = edu.get("credentials", [])
-        if creds:
-            cred_str = ", ".join(escape_typst(c) for c in creds)
-            lines.append(f"- *Licenses & Credentials:* {cred_str}")
+            lines.append("#v(2pt)")
+        lines.append(f"*{degree}*, {school} #h(1fr) {location} | {start} -- {end}")
+    return "\n".join(lines)
+
+def _render_certificates_line(evidence: dict) -> str:
+    """Renders the Certificates & Licenses section as a single comma-joined line."""
+    return ", ".join(escape_typst(c) for c in evidence.get("certificates", []))
+
+def _render_projects_block(evidence: dict, track: str) -> str:
+    """Renders the Projects section. Dynamically leads with whichever project's category
+    (finance vs systems) matches the current track's lean - reuses the same track signal
+    Gemini already routes, so project prioritization needs no extra job-description parsing.
+    """
+    projects = list(evidence.get("projects", []))
+    preferred_category = "finance" if str(track or "a").lower() in ("a", "c") else "systems"
+    projects.sort(key=lambda p: 0 if p.get("category") == preferred_category else 1)
+
+    lines = []
+    for idx, proj in enumerate(projects):
+        name = escape_typst(proj.get("name", ""))
+        location = escape_typst(proj.get("location", ""))
+        start = escape_typst(proj.get("start", ""))
+        end = escape_typst(proj.get("end", ""))
+        if idx > 0:
+            lines.append("#v(2pt)")
+        lines.append(f"*{name}* #h(1fr) {location} | {start} -- {end}")
+        for b in proj.get("bullets", []):
+            lines.append(f"- {escape_typst(b)}")
     return "\n".join(lines)
 
 def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None) -> str:
-    """Builds single-column Typst markup for the selected persona track, sourcing every factual
-    claim (experience, education, bullets) from the centralized JSON banks (hot-reloaded fresh on
-    every call - see load_evidence_bank()/load_resume_bullets_bank()). Section order: Header ->
-    Subtitle -> Targeted Systems Highlights -> Experience -> Education -> Skills.
+    """Builds single-page Typst markup for the selected persona track, sourcing every factual
+    claim (experience, other experience, education, certificates, projects) from the centralized
+    JSON banks (hot-reloaded fresh on every call). Dynamic 30% customization is entirely
+    track-driven (a-e, already routed by Gemini as an SDTE integer/letter, never free text):
+    the header summary, the leading achievement bullet, project ordering, and skill emphasis
+    all key off the same `track` value, so no live job-description text is required at render
+    time - the resume still compiles correctly even from a bare "a" default with no cached job.
     """
     track_data = TRACKS.get(str(track or "a").lower(), TRACKS["a"])
     evidence = load_evidence_bank()
@@ -194,9 +245,10 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     clean_company = escape_typst(company_name or "Target Operations")
 
     selected_bullets = filter_ats_bullets(track, bullet_indices)
-    dynamic_bullets_block = "\n".join(f"- {escape_typst(b)}" for b in selected_bullets)
+    lead_bullet = selected_bullets[0] if selected_bullets else None
 
     keywords_tuple = ", ".join(f'"{kw}"' for kw in track_data["keywords"])
+    summary = escape_typst(track_data["summary"])
 
     name = escape_typst(identity.get("name", "Kevin Miller"))
     email = escape_typst(identity.get("email", ""))
@@ -205,7 +257,6 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     website_raw = str(identity.get("website", "") or "")
     linkedin_raw = str(identity.get("linkedin", "linkedin.com/in/kevinmiller") or "")
     website_label = escape_typst(website_raw)
-    linkedin_label = escape_typst(linkedin_raw)
 
     # Native Typst #link()[] syntax (never markdown [text](url)) - pipe-joined, skipping blank fields
     # so a missing phone/website never leaves a stray " | | " gap in the header.
@@ -213,8 +264,15 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     if website_raw:
         contact_fields.append(f'#link("https://{website_raw}")[{website_label}]')
     if linkedin_raw:
-        contact_fields.append(f'#link("https://{linkedin_raw}")[{linkedin_label}]')
-    contact_line = " | ".join(contact_fields)
+        contact_fields.append(f'#link("https://{linkedin_raw}")[LinkedIn]')
+    contact_line = " • ".join(contact_fields)
+
+    experience_block = _render_experience_block(evidence, lead_bullet=lead_bullet)
+    other_experience_block = _render_other_experience_block(evidence)
+    education_block = _render_education_block(evidence)
+    certificates_line = _render_certificates_line(evidence)
+    projects_block = _render_projects_block(evidence, track)
+    skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
 
     markup = f"""
 #set document(
@@ -224,72 +282,83 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
   keywords: ({keywords_tuple})
 )
 
-// Marcus Thorne spacing and typography
-#set page(paper: "us-letter", margin: (x: 0.6in, top: 0.5in, bottom: 0.5in))
-#set text(font: "Liberation Sans", size: 9pt, fill: rgb("#111827"))
-#set par(justify: false, leading: 0.5em, spacing: 0.6em)
-#set list(spacing: 0.4em, indent: 0em)
-#show heading: set block(above: 1em, below: 0.5em)
+// Marcus Thorne spacing and typography - tuned to fill the full 1-page canvas edge-to-edge
+#set page(paper: "us-letter", margin: (x: 0.6in, top: 0.45in, bottom: 0.45in))
+#set text(font: "Liberation Sans", size: 9.3pt, fill: rgb("#111827"))
+#set par(justify: false, leading: 0.5em, spacing: 0.58em)
+#set list(spacing: 0.38em, indent: 0em)
+#show heading: set block(above: 0.55em, below: 0.3em)
 
 // --- HEADER ---
-#text(size: 18pt, weight: "bold", fill: rgb("#000000"))[Kevin Miller] \\
-#text(size: 9.5pt, weight: "medium", fill: rgb("#4B5563"))[Financial Systems & Operations] \\
-#v(-2pt)
-#text(size: 8.5pt, fill: rgb("#6B7280"))[kjmiller406\\@gmail.com • 248-709-6326 • Detroit, MI • montelattice.com • linkedin.com/in/kevinmiller]
+#align(center)[
+  #text(size: 18pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
+  #text(size: 10pt, weight: "medium", fill: rgb("#4B5563"))[{escape_typst(track_data["subtitle"])}] \\
+  #v(3pt)
+  #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
+]
 
-#v(2pt)
-#line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))
-#v(1pt)
+#v(5pt)
+#line(length: 100%, stroke: 0.7pt + rgb("#CCCCCC"))
+#v(3pt)
 
 // --- SUMMARY ---
-#text(size: 8pt, weight: "bold", tracking: 1pt, fill: rgb("#374151"))[SUMMARY]
-#v(1pt)
-Operations specialist with experience spanning custodial reconciliations, regulatory compliance, and CRM pipeline automation. Proven track record of leveraging Python, SQL, and system integrations (Salesforce, HubSpot) to eliminate manual bottlenecks, validate institutional data, and streamline complex financial workflows.
-
+#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
 #v(2pt)
-#line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))
-#v(1pt)
+{summary}
 
-// --- EXPERIENCE ---
-#text(size: 8pt, weight: "bold", tracking: 1pt, fill: rgb("#374151"))[EXPERIENCE]
+#v(5pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
+#v(3pt)
 
-*Wealth Operations* | Signal Advisors #h(1fr) Detroit, MI | 05/2026 -- Present
-{dynamic_bullets_block}
-
-*Compliance Lead* | 40 Acres App #h(1fr) Detroit, MI | 04/2026 -- Present
-- Architecting regulatory infrastructure for blockchain-based real estate and the tokenization of real-world assets.
-- Drafting SEC Form D filings and Regulation Crowdfunding documentation for SEC and FinCEN compliance.
-- Designing operational plumbing for digital asset ownership and institutional data validation.
-
-*Total Rewards Finance Intern* | ABC Technologies #h(1fr) Southfield, MI | 05/2024 -- 08/2024
-- Performed high-volume reconciliation of 500+ retirement accounts, validating ledger accuracy and resolving discrepancies.
-- Prepared and maintained supporting schedules for variance analysis and recurring internal reports.
-- Built and maintained Excel templates to streamline recurring data tasks and reduce manual processing time.
-
+// --- PROFESSIONAL EXPERIENCE ---
+#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[PROFESSIONAL EXPERIENCE]
 #v(2pt)
-#line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))
-#v(1pt)
+{experience_block}
+
+#v(5pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
+#v(3pt)
+
+// --- OTHER EXPERIENCE ---
+#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[OTHER EXPERIENCE]
+#v(2pt)
+{other_experience_block}
+
+#v(5pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
+#v(3pt)
+
+// --- EDUCATION ---
+#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[EDUCATION]
+#v(2pt)
+{education_block}
+
+#v(5pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
+#v(3pt)
+
+// --- CERTIFICATES & LICENSES ---
+#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[CERTIFICATES & LICENSES]
+#v(2pt)
+{certificates_line}
+
+#v(5pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
+#v(3pt)
 
 // --- PROJECTS ---
-#text(size: 8pt, weight: "bold", tracking: 1pt, fill: rgb("#374151"))[PROJECTS & ARCHITECTURE]
-
-*Institutional Data Controls & Outreach Engine*
-- Built a custom Flask-based outreach CRM in HubSpot connected to SQLite databases to manage a high-volume pipeline, utilizing Power BI to analyze response patterns.
-- Reconciled \\$250,000 variances and mapped ownership structures to establish risk escalation logic for operational failures.
-- Automated AI data extraction and compliance validation for legal documents through prompt engineering and LLM orchestration.
-
+#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[PROJECTS]
 #v(2pt)
-#line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))
-#v(1pt)
+{projects_block}
 
-// --- EDUCATION & SKILLS ---
-#text(size: 8pt, weight: "bold", tracking: 1pt, fill: rgb("#374151"))[EDUCATION & CORE SKILLS]
+#v(5pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
+#v(3pt)
 
-*Bachelor of Arts in Business (Finance)* | Hope College #h(1fr) 2022 -- 2026
-- *Licenses & Credentials:* Series 65 Candidate, Securities Industry Essentials (SIE), Schwab Limited Power of Attorney.
-
-*Technical Proficiencies:* Python, SQL (joins, aggregations), Power BI (ETL, data modeling), Advanced Excel, REST APIs, JSON data intake.
-*Systems & Controls:* HubSpot CRM, Salesforce, Schwab Advisor Center, Fidelity Wealthscape, Reconciliation workflows.
+// --- SKILLS & SYSTEMS ---
+#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SKILLS & SYSTEMS]
+#v(2pt)
+{skills_lines}
 """
     return markup.strip()
 
