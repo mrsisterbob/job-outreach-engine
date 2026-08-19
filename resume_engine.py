@@ -196,9 +196,6 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     selected_bullets = filter_ats_bullets(track, bullet_indices)
     dynamic_bullets_block = "\n".join(f"- {escape_typst(b)}" for b in selected_bullets)
 
-    experience_block = _render_experience_block(evidence)
-    education_block = _render_education_block(evidence)
-    skills_block = "\n".join(f"- *{cat}:* {desc}" for cat, desc in track_data["skills"])
     keywords_tuple = ", ".join(f'"{kw}"' for kw in track_data["keywords"])
 
     name = escape_typst(identity.get("name", "Kevin Miller"))
@@ -221,38 +218,78 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 
     markup = f"""
 #set document(
-  title: "Kevin Miller - Resume - {clean_company}",
+  title: "Kevin Miller - Resume - " + clean_company,
   author: "Kevin Miller",
   date: auto,
   keywords: ({keywords_tuple})
 )
 
-#set page(paper: "us-letter", margin: (x: 0.55in, top: 0.45in, bottom: 0.45in))
-#set text(font: "Liberation Sans", size: 9.5pt)
-#set par(justify: false, leading: 0.5em, spacing: 0.65em)
-#set list(spacing: 0.38em, indent: 0em)
-#show heading: set block(above: 0.85em, below: 0.4em)
+// Marcus Thorne spacing and typography
+#set page(paper: "us-letter", margin: (x: 0.6in, top: 0.5in, bottom: 0.5in))
+#set text(font: "Liberation Sans", size: 9pt, fill: rgb("#111827"))
+#set par(justify: false, leading: 0.5em, spacing: 0.6em)
+#set list(spacing: 0.4em, indent: 0em)
+#show heading: set block(above: 1em, below: 0.5em)
 
-#align(center)[
-  #text(size: 15pt, weight: "bold")[{name}] \\
-  #text(size: 10pt, weight: "medium", fill: rgb("#1B2A4A"))[{track_data["subtitle"]}] \\
-  #v(2pt)
-  {contact_line}
-]
+// --- HEADER ---
+#text(size: 18pt, weight: "bold", fill: rgb("#000000"))[Kevin Miller] \\
+#text(size: 9.5pt, weight: "medium", fill: rgb("#4B5563"))[Financial Systems & Operations] \\
+#v(-2pt)
+#text(size: 8.5pt, fill: rgb("#6B7280"))[kjmiller406@gmail.com • 248-709-6326 • Detroit, MI • montelattice.com • linkedin.com/in/kevinmiller]
 
-#v(4pt)
-#line(length: 100%, stroke: 0.6pt + rgb("#CCCCCC"))
 #v(2pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))
+#v(1pt)
 
-== Targeted Systems & Project Highlights ({clean_company})
+// --- SUMMARY ---
+#text(size: 8pt, weight: "bold", tracking: 1pt, fill: rgb("#374151"))[SUMMARY]
+#v(1pt)
+Operations specialist with experience spanning custodial reconciliations, regulatory compliance, and CRM pipeline automation. Proven track record of leveraging Python, SQL, and system integrations (Salesforce, HubSpot) to eliminate manual bottlenecks, validate institutional data, and streamline complex financial workflows.
+
+#v(2pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))
+#v(1pt)
+
+// --- EXPERIENCE ---
+#text(size: 8pt, weight: "bold", tracking: 1pt, fill: rgb("#374151"))[EXPERIENCE]
+
+*Wealth Operations* | Signal Advisors #h(1fr) Detroit, MI | 05/2026 -- Present
 {dynamic_bullets_block}
 
-{experience_block}
+*Compliance Lead* | 40 Acres App #h(1fr) Detroit, MI | 04/2026 -- Present
+- Architecting regulatory infrastructure for blockchain-based real estate and the tokenization of real-world assets.
+- Drafting SEC Form D filings and Regulation Crowdfunding documentation for SEC and FinCEN compliance.
+- Designing operational plumbing for digital asset ownership and institutional data validation.
 
-{education_block}
+*Total Rewards Finance Intern* | ABC Technologies #h(1fr) Southfield, MI | 05/2024 -- 08/2024
+- Performed high-volume reconciliation of 500+ retirement accounts, validating ledger accuracy and resolving discrepancies.
+- Prepared and maintained supporting schedules for variance analysis and recurring internal reports.
+- Built and maintained Excel templates to streamline recurring data tasks and reduce manual processing time.
 
-== Technical Systems & Core Skills
-{skills_block}
+#v(2pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))
+#v(1pt)
+
+// --- PROJECTS ---
+#text(size: 8pt, weight: "bold", tracking: 1pt, fill: rgb("#374151"))[PROJECTS & ARCHITECTURE]
+
+*Institutional Data Controls & Outreach Engine*
+- Built a custom Flask-based outreach CRM in HubSpot connected to SQLite databases to manage a high-volume pipeline, utilizing Power BI to analyze response patterns.
+- Reconciled \\$250,000 variances and mapped ownership structures to establish risk escalation logic for operational failures.
+- Automated AI data extraction and compliance validation for legal documents through prompt engineering and LLM orchestration.
+
+#v(2pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))
+#v(1pt)
+
+// --- EDUCATION & SKILLS ---
+#text(size: 8pt, weight: "bold", tracking: 1pt, fill: rgb("#374151"))[EDUCATION & CORE SKILLS]
+
+*Bachelor of Arts in Business (Finance)* | Hope College #h(1fr) 2022 -- 2026
+- *Licenses & Credentials:* Series 65 Candidate, Securities Industry Essentials (SIE), Schwab Limited Power of Attorney.
+
+*Technical Proficiencies:* Python, SQL (joins, aggregations), Power BI (ETL, data modeling), Advanced Excel, REST APIs, JSON data intake.
+*Systems & Controls:* HubSpot CRM, Salesforce, Schwab Advisor Center, Fidelity Wealthscape, Reconciliation workflows.
 """
     return markup.strip()
 
