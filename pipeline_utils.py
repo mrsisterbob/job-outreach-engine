@@ -92,8 +92,9 @@ def calculate_followup_interval(priority_score):
 
 def resolve_smart_target_tab(source_tab, direction):
     """Smart auto-routing for /warm, /cold, /x: Carmen-family tabs stay in the Carmen pipeline;
-    Tetiana-family tabs (and "Pipeline_Candidates", the pre-CRM staging tab for fresh job cards)
-    stay in the Tetiana pipeline. direction is "warm", "cold", or "kill".
+    Tetiana-family tabs, "Clavicular" (warm-referral ATS matches), and "Pipeline_Candidates" (the
+    pre-CRM staging tab for fresh job cards) all route through the Tetiana pipeline. direction is
+    "warm", "cold", or "kill" (e.g. Clavicular + "kill" -> "Died").
     """
     is_carmen = str(source_tab or "").startswith("Carmen")
     if direction == "kill":

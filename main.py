@@ -2129,18 +2129,38 @@ def process_single_candidate(job):
             enqueue_crm_payload(alumni_payload)
             log_daily_activity("notes_logged")
 
-        # Dynamic Contact Quality Multiplier: warm CRM contacts scale the boost by priority rank (1-10 * 3, capped +30)
+        # Dynamic Contact Quality Multiplier / Clavicular Routing: warm CRM contacts boost score.
+        # ATS-sourced pulls (gh_/lever_/ashby_) at a Carmen Warm company route through the stricter
+        # Clavicular pathway (flat +30, gated at raw score >= 70) instead of the priority multiplier.
         contact_info = get_warm_crm_contacts().get(normalize_company_for_match(job.get("employer_name")))
+        is_clavicular = False
+        contact_name = ""
+        contact_note = ""
         if contact_info:
-            priority_score = contact_info.get("priority_score", 5)
-            score_boost = min(30, priority_score * 3)
-            score = min(100, score + score_boost)
-            alumni_line += (
-                f"🔥 <b>WARM REFERRAL AVAILABLE (+{score_boost} pts):</b> "
-                f"{html.escape(contact_info.get('name', 'Contact'))} "
-                f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10)</i>\n"
-                f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
-            )
+            is_ats_sourced = str(job.get("job_id") or "").startswith(("gh_", "lever_", "ashby_"))
+            if is_ats_sourced:
+                if score >= 70:
+                    score = min(100, score + 30)
+                    is_clavicular = True
+                    contact_name = contact_info.get("name", "Contact")
+                    contact_note = contact_info.get("note", "Active relationship")
+                    alumni_line += (
+                        f"🎯 <b>CLAVICULAR WARM REFERRAL (+30 pts):</b> "
+                        f"{html.escape(contact_name)} "
+                        f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))})</i>\n"
+                        f"📝 <b>Note:</b> {html.escape(contact_note)}\n"
+                    )
+                # raw score < 70: ATS + warm match does not qualify for any boost or Clavicular routing
+            else:
+                priority_score = contact_info.get("priority_score", 5)
+                score_boost = min(30, priority_score * 3)
+                score = min(100, score + score_boost)
+                alumni_line += (
+                    f"🔥 <b>WARM REFERRAL AVAILABLE (+{score_boost} pts):</b> "
+                    f"{html.escape(contact_info.get('name', 'Contact'))} "
+                    f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10)</i>\n"
+                    f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
+                )
 
         return {
             "job": job, "score": score, "reason": reason,
@@ -2150,7 +2170,10 @@ def process_single_candidate(job):
             "salary_str": salary_str, "work_style": work_style,
             "overlap_pct": overlap_pct, "matched_skills": matched_skills,
             "short_id": short_id, "sheet_uuid": sheet_uuid,
-            "alumni_line": alumni_line
+            "alumni_line": alumni_line,
+            "is_clavicular": is_clavicular,
+            "contact_name": contact_name,
+            "contact_note": contact_note
         }
     return None
     # ==============================================================================
@@ -2976,7 +2999,7 @@ def send_telegram_message(chat_id, text):
         logging.error(f"Telegram Post Error: {e}")
     return None
 
-def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line="", outreach_email=""):
+def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line="", outreach_email="", sheet_tab="Pipeline_Candidates"):
     """Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
     """
@@ -3047,7 +3070,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
             telegram_message_id = res.json().get("result", {}).get("message_id")
             log_metric_event("message_sent", sheet_uuid)
             if telegram_message_id and sheet_uuid:
-                save_message_mapping(telegram_message_id, sheet_uuid, "Pipeline_Candidates", company, "", target_email)
+                save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab, company, "", target_email)
             return telegram_message_id
     except Exception as e:
         logging.error(f"Failed to post card to Telegram: {e}")
@@ -3259,6 +3282,36 @@ def auto_expand_ats_slug(company_name):
             logging.error(f"[ATS EXPANSION] {board_name} check failed for '{slug_guess}': {e}")
     logging.info(f"[ATS EXPANSION] No ATS board match found for '{company_name}' (guessed slug '{slug_guess}')")
 
+def resolve_warm_company_ats_slugs():
+    """Resolves an ATS board slug for every unique Carmen Warm CRM company: prefers the
+    already-verified company_identities.ats_slug, else synchronously probes Greenhouse/Lever/Ashby
+    via auto_expand_ats_slug(). Stage 1b sources ONLY from this warm-network list, never the
+    untracked general ats_company_slugs enterprise board filter.
+    """
+    warm_companies = {c.get("raw_company") for c in get_warm_crm_contacts().values() if c.get("raw_company")}
+    slugs = []
+    for company in warm_companies:
+        normalized = normalize_company_for_match(company)
+        try:
+            with get_db_conn() as conn:
+                row = conn.execute("SELECT ats_slug FROM company_identities WHERE normalized_name = ?", (normalized,)).fetchone()
+        except Exception as e:
+            logging.error(f"Warm Company Identity Lookup Error ({company}): {e}")
+            row = None
+        if row and row[0]:
+            slugs.append(row[0])
+            continue
+        auto_expand_ats_slug(company)  # synchronous probe + company_identities upsert on success
+        try:
+            with get_db_conn() as conn:
+                row = conn.execute("SELECT ats_slug FROM company_identities WHERE normalized_name = ?", (normalized,)).fetchone()
+        except Exception as e:
+            logging.error(f"Warm Company Identity Re-Lookup Error ({company}): {e}")
+            row = None
+        if row and row[0]:
+            slugs.append(row[0])
+    return list(dict.fromkeys(slugs))  # de-dup while preserving discovery order
+
 def run_job_pipeline(chat_id=None, top_n=2):
     """Job search pipeline with two-stage architecture:
     Stage 1: Pre-filter candidates (JSearch multi-page + ATS direct-source, strict filters)
@@ -3334,12 +3387,13 @@ def run_job_pipeline(chat_id=None, top_n=2):
             for job in jobs:
                 _add_candidate(job)
 
-    # Stage 1b: High-volume ATS direct-source expansion (unauthenticated Greenhouse/Lever boards)
-    ats_slugs = get_filter("ats_company_slugs", [])
-    if ats_slugs:
+    # Stage 1b: ATS direct-source expansion strictly scoped to Carmen Warm network companies -
+    # untracked general enterprise boards (ats_company_slugs) are intentionally never sourced here.
+    warm_ats_slugs = resolve_warm_company_ats_slugs()
+    if warm_ats_slugs:
         if chat_id:
-            send_status_update(chat_id, f"Stage 1b: Sourcing direct ATS postings from {len(ats_slugs)} companies...")
-        for job in fetch_ats_jobs(ats_slugs):
+            send_status_update(chat_id, f"Stage 1b: Sourcing direct ATS postings from {len(warm_ats_slugs)} Carmen Warm companies...")
+        for job in fetch_ats_jobs(warm_ats_slugs):
             _add_candidate(job)
     
     logging.info(f"Stage 1 Complete: {raw_discovered_count} raw listings pulled, {len(candidate_pool)} candidates passed strict filter.")
@@ -3380,10 +3434,12 @@ def run_job_pipeline(chat_id=None, top_n=2):
     tier1_matches = [m for m in top_matches if m["score"] >= 80][:5]
     tier2_matches = [m for m in top_matches if 65 <= m["score"] < 80][:5]
 
-    # Dispatch Tier-1 matches as full interactive cards & stage in CRM
-    batch_rows = []
+    # Dispatch Tier-1 matches as full interactive cards & stage in CRM, routed by Clavicular flag
+    clavicular_rows = []
+    standard_rows = []
     for item in tier1_matches:
         job = item["job"]
+        is_clavicular = item.get("is_clavicular", False)
         send_telegram_card(
             job, item["score"], item["reason"], item["target_email"],
             item["age_badge"], item["salary_str"], item["work_style"],
@@ -3392,9 +3448,14 @@ def run_job_pipeline(chat_id=None, top_n=2):
             linkedin_note=item.get("linkedin_note", ""),
             ats_bullets=item.get("ats_bullets"),
             alumni_line=item.get("alumni_line", ""),
-            outreach_email=item.get("outreach_email", "")
+            outreach_email=item.get("outreach_email", ""),
+            sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates"
         )
-        batch_rows.append({
+        note = (
+            f"Warm Referral Matched: {item.get('contact_name', 'Contact')} | {item['reason']}"
+            if is_clavicular else f"Matched via Pipeline | {item['reason']}"
+        )
+        row = {
             "sheet_uuid": item.get("sheet_uuid"),
             "row_data": [
                 today_str,
@@ -3405,9 +3466,10 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 "Matched",
                 followup_date,
                 job.get("job_apply_link", ""),
-                f"Matched via Pipeline | {item['reason']}"
+                note
             ]
-        })
+        }
+        (clavicular_rows if is_clavicular else standard_rows).append(row)
         time.sleep(1.1)
 
     # Dispatch Tier-2 as leaderboard digest ONLY (do NOT add to batch_rows/CRM)
@@ -3426,9 +3488,11 @@ def run_job_pipeline(chat_id=None, top_n=2):
         )
         send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)
 
-    # Write ONLY Tier-1 rows to CRM under a single execution lock
-    if batch_rows:
-        enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="TC", rows=batch_rows))
+    # Write Tier-1 rows to CRM under separate execution locks per destination tab
+    if clavicular_rows:
+        enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows))
+    if standard_rows:
+        enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="TC", rows=standard_rows))
     
     logging.info(f"Stage 2 Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.")
     if chat_id:
