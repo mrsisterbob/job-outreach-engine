@@ -218,7 +218,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 
     markup = f"""
 #set document(
-  title: "Kevin Miller - Resume - " + clean_company,
+  title: "Kevin Miller - Resume - {clean_company}",
   author: "Kevin Miller",
   date: auto,
   keywords: ({keywords_tuple})
@@ -235,7 +235,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 #text(size: 18pt, weight: "bold", fill: rgb("#000000"))[Kevin Miller] \\
 #text(size: 9.5pt, weight: "medium", fill: rgb("#4B5563"))[Financial Systems & Operations] \\
 #v(-2pt)
-#text(size: 8.5pt, fill: rgb("#6B7280"))[kjmiller406@gmail.com • 248-709-6326 • Detroit, MI • montelattice.com • linkedin.com/in/kevinmiller]
+#text(size: 8.5pt, fill: rgb("#6B7280"))[kjmiller406\\@gmail.com • 248-709-6326 • Detroit, MI • montelattice.com • linkedin.com/in/kevinmiller]
 
 #v(2pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#D1D5DB"))

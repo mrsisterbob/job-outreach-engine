@@ -2382,6 +2382,9 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
                 subtype="pdf",
                 filename=pdf_filename
             )
+            logging.info(f"Gmail draft attachment: '{pdf_filename}' attached ({len(pdf_bytes)} bytes) for {clean_to_email}")
+        else:
+            logging.info(f"Gmail draft attachment: no pdf_bytes provided - draft for {clean_to_email} will be text-only")
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
@@ -2394,6 +2397,28 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         return False, f"Gmail Error {res.status_code}", None
     except Exception as e:
         return False, str(e), None
+
+def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label):
+    """Compiles the tailored resume PDF with a fallback retry (track 'a', bullet_indices [0,1,2])
+    if the first attempt raises or returns empty bytes. Sends a Telegram warning on final failure
+    so a broken attachment is never silent. Returns pdf_bytes, or None if both attempts failed.
+    """
+    try:
+        pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
+        if pdf_bytes:
+            return pdf_bytes
+        raise ValueError("compile_resume_pdf returned empty bytes")
+    except Exception as e:
+        logging.error(f"{command_label} resume compilation failed for {comp} (track={track}): {e} - retrying with fallback track 'a'")
+        try:
+            pdf_bytes = compile_resume_pdf(comp, track="a", bullet_indices=[0, 1, 2])
+            if pdf_bytes:
+                return pdf_bytes
+            raise ValueError("fallback compile_resume_pdf returned empty bytes")
+        except Exception as e:
+            logging.error(f"{command_label} fallback resume compilation failed for {comp}: {e}")
+            send_telegram_message(chat_id, f"⚠️ Resume compilation warning: {e}")
+            return None
 
 def is_verified_crm_contact(sender_raw):
     """Strict, exact-match CRM whitelist check for the inbound email anti-spam gatekeeper.
@@ -3937,13 +3962,9 @@ def process_webhook_payload_async(data):
                 target = resolve_target_email(comp, title, job.get("employer_website"))
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
-            pdf_bytes = None
             clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
             pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
-            try:
-                pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
-            except Exception as e:
-                logging.error(f"/draft resume compilation failed for {comp}: {e}")
+            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft")
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
             ok, gmail_msg, draft_id = create_gmail_draft(
                 to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
@@ -3988,13 +4009,9 @@ def process_webhook_payload_async(data):
             # Compile the same tailored resume PDF /draft attaches, so /e never regresses to a bare-text draft
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
-            pdf_bytes = None
             clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
             pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
-            try:
-                pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
-            except Exception as e:
-                logging.error(f"/e resume compilation failed for {comp}: {e}")
+            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/e")
 
             ok, gmail_msg, draft_id = create_gmail_draft(
                 to_email=new_email, company_name=comp, job_title=title, is_warm=is_warm,
@@ -4439,13 +4456,9 @@ def handle_fast_path_command(chat_id, text, msg):
             target = resolve_target_email(comp, title, job.get("employer_website"))
         track = job.get("track", "a")
         bullet_indices = job.get("bullet_indices")
-        pdf_bytes = None
         clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
         pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
-        try:
-            pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
-        except Exception as e:
-            logging.error(f"/draft resume compilation failed for {comp}: {e}")
+        pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft")
         logging.info(f"/draft command handled directly: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
         ok, gmail_msg, draft_id = create_gmail_draft(
             to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
