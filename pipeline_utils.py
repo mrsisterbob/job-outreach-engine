@@ -3,9 +3,9 @@
 Split out of main.py so the scoring/dedup/dork/formatting logic can be unit-tested in isolation
 and so main.py itself shrinks toward being just orchestration (routes, DB, CRM, Telegram, AI calls).
 
-Exception: resolve_email_waterfall() below does live network I/O (Hunter.io/Anymail Finder) - it
-lives here for architectural cohesion with the rest of the outreach-resolution helpers, but it is
-not covered by the no-network guarantee the rest of this module provides.
+Exception: resolve_email_waterfall() below does live network I/O (Hunter.io/Prospeo/GetProspect) -
+it lives here for architectural cohesion with the rest of the outreach-resolution helpers, but it
+is not covered by the no-network guarantee the rest of this module provides.
 """
 import hashlib
 import logging
@@ -196,9 +196,10 @@ def compute_description_simhash(text: str) -> str:
 
 
 def resolve_email_waterfall(full_name, company_name, domain_hint=None, on_provider_attempt=None):
-    """Cascading email discovery for a named contact: Hunter.io -> Anymail Finder -> deterministic
-    guess. Tries each configured provider in order and returns the first hit; falls back to a
-    flagged best-guess address if neither provider is configured or finds a match.
+    """Cascading email discovery for a named contact: Hunter.io -> Prospeo -> GetProspect ->
+    deterministic guess. Tries each configured provider in order and returns the first hit
+    immediately (early-exit, no downstream providers are called once a match is found); falls
+    back to a flagged best-guess address if no provider is configured or none finds a match.
     on_provider_attempt(provider_name), if given, fires once per completed provider request
     (whether or not it found an email) so the caller can track local monthly usage in its own DB.
     """
@@ -223,23 +224,38 @@ def resolve_email_waterfall(full_name, company_name, domain_hint=None, on_provid
         except Exception as e:
             logging.error(f"Hunter.io email-finder failed ({domain}): {e}")
 
-    anymail_key = os.environ.get("ANYMAIL_API_KEY")
-    if anymail_key:
+    prospeo_key = os.environ.get("PROSPEO_API_KEY")
+    if prospeo_key:
         try:
             res = requests.post(
-                "https://api.anymailfinder.com/v5.0/search/person.json",
-                json={"domain": domain, "first_name": first, "last_name": last},
-                headers={"Authorization": f"Bearer {anymail_key}"},
+                "https://api.prospeo.io/email-finder",
+                json={"first_name": first, "last_name": last, "company": domain},
+                headers={"X-KEY": prospeo_key},
                 timeout=10
             )
             if on_provider_attempt:
-                on_provider_attempt("anymail")
-            data = res.json()
-            email = data.get("email") or (data.get("results") or {}).get("email")
+                on_provider_attempt("prospeo")
+            email = (res.json().get("response") or {}).get("email")
             if email:
                 return email
         except Exception as e:
-            logging.error(f"Anymail Finder search failed ({domain}): {e}")
+            logging.error(f"Prospeo email-finder failed ({domain}): {e}")
+
+    getprospect_key = os.environ.get("GETPROSPECT_API_KEY")
+    if getprospect_key:
+        try:
+            res = requests.get(
+                "https://api.getprospect.com/public/v1/email/find",
+                params={"apikey": getprospect_key, "domain": domain, "first_name": first, "last_name": last},
+                timeout=10
+            )
+            if on_provider_attempt:
+                on_provider_attempt("getprospect")
+            email = res.json().get("email")
+            if email:
+                return email
+        except Exception as e:
+            logging.error(f"GetProspect email-finder failed ({domain}): {e}")
 
     if first and last:
         return f"{first.lower()}.{last.lower()}@{domain} [⚠️ Unverified]"

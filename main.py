@@ -1057,8 +1057,8 @@ def get_lifetime_activity_totals():
 
 def increment_api_usage_counter(provider):
     """Bump this calendar month's local call counter for a paid email-lookup provider
-    (e.g. "hunter", "anymail"). This is a local approximation for /health visibility only -
-    the provider's own dashboard is the authoritative quota source.
+    (e.g. "hunter", "prospeo", "getprospect"). This is a local approximation for /health
+    visibility only - the provider's own dashboard is the authoritative quota source.
     """
     month_key = datetime.now().strftime("%Y-%m")
     try:
@@ -1076,9 +1076,11 @@ def increment_api_usage_counter(provider):
         return False
 
 def get_monthly_api_usage():
-    """Return {"hunter": n, "anymail": n} local call counts for the current calendar month."""
+    """Return {"hunter": n, "prospeo": n, "getprospect": n} local call counts for the current
+    calendar month.
+    """
     month_key = datetime.now().strftime("%Y-%m")
-    counts = {"hunter": 0, "anymail": 0}
+    counts = {"hunter": 0, "prospeo": 0, "getprospect": 0}
     try:
         with get_db_conn() as conn:
             cursor = conn.cursor()
@@ -2801,7 +2803,7 @@ def send_tuesday_pipeline_executive_hub(chat_id):
         f"• <b>Golden Ratio:</b> {golden_ratio:.1f}% (interviews / staged drafts)\n\n"
         f"<b>Coverage &amp; Enrichment:</b>\n"
         f"• ATS boards: {ats_count}\n"
-        f"• Hunter.io: {api_usage['hunter']} | Anymail Finder: {api_usage['anymail']} (month-to-date local calls)\n\n"
+        f"• Hunter.io: {api_usage['hunter']} | Prospeo: {api_usage['prospeo']} | GetProspect: {api_usage['getprospect']} (month-to-date local calls)\n\n"
         f"⚠️ <b>Overdue:</b> {len(overdue)} records\n"
         f"<code>/sendall</code> Draft bumps + set all eligible records to +14d\n"
         f"<code>/snoozeall 7</code> Move all overdue follow-ups by N days"
@@ -4446,7 +4448,7 @@ def handle_fast_path_command(chat_id, text, msg):
             f"💾 <b>SQLite Mode:</b> {html.escape(str(wal_mode)).upper()} ({db_elapsed_ms}ms)\n"
             f"⏱️ <b>Uptime:</b> {uptime_str}\n"
             f"📇 <b>Email Waterfall Usage ({month_label}, local count):</b>\n"
-            f"  Hunter.io: {api_usage['hunter']} | Anymail Finder: {api_usage['anymail']}"
+            f"  Hunter.io: {api_usage['hunter']} | Prospeo: {api_usage['prospeo']} | GetProspect: {api_usage['getprospect']}"
         )
         logging.info(f"/health command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
         return True
