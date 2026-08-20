@@ -1252,6 +1252,19 @@ def _parse_company_title_from_card_text(text):
         return None, None
     return html.unescape(company_match.group(1)).strip(), html.unescape(title_match.group(1)).strip()
 
+def _parse_sheet_uuid_from_card_text(text):
+    """Extracts (sheet_uuid, sheet_tab) embedded directly in a dispatched card's own 🆔 marker.
+    Unlike sheet_row_map, this survives SQLite wipes from container restarts/redeploys since the
+    durable copy lives in the Telegram message itself, not the ephemeral local DB.
+    Returns (None, None) if the marker is missing.
+    """
+    if not text:
+        return None, None
+    match = re.search(r'🆔\s*<code>([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})</code>(?:\s*·\s*<code>([^<]*)</code>)?', text)
+    if not match:
+        return None, None
+    return match.group(1), html.unescape((match.group(2) or "Pipeline_Candidates").strip())
+
 def _fuzzy_find_job_in_sheets(company, title):
     """Searches Tetiana Cold then Clavicular via get_followups for a legal-suffix/case-insensitive
     dedup-hash match on (company, title), returning (sheet_uuid, sheet_tab) or None.
@@ -1287,9 +1300,12 @@ def _fuzzy_find_job_in_local_cache(company, title):
 
 def resolve_reply_mapping(msg, chat_id, command_label):
     """For swipe-reply commands, resolve reply_to_message -> sheet_uuid mapping.
-    Falls back to fuzzy company/title recovery (local jobs cache, then Sheets Tetiana Cold /
-    Clavicular) when the local sheet_row_map entry was lost/evicted, re-persisting it on success
-    so future replies to the same card resolve instantly again.
+    Recovery order: 1) local sheet_row_map (fast path), 2) the sheet_uuid embedded directly in
+    the card's own 🆔 marker - survives sheet_row_map being wiped by a container restart/redeploy
+    since it never depended on local SQLite in the first place, 3) fuzzy company/title recovery
+    (local jobs cache, then Sheets Tetiana Cold / Clavicular) for older cards sent before the 🆔
+    marker existed. Any successful recovery re-persists the mapping so future replies to the same
+    card resolve instantly again.
     Sends a Telegram warning and returns None if reply context or mapping is missing.
     """
     reply_msg = msg.get("reply_to_message")
@@ -1301,7 +1317,14 @@ def resolve_reply_mapping(msg, chat_id, command_label):
     if mapping:
         return mapping
 
-    company, title = _parse_company_title_from_card_text(reply_msg.get("text", ""))
+    card_text = reply_msg.get("text", "")
+    sheet_uuid, sheet_tab = _parse_sheet_uuid_from_card_text(card_text)
+    if sheet_uuid:
+        save_message_mapping(reply_message_id, sheet_uuid, sheet_tab)
+        logging.info(f"[RECOVERY] Recovered sheet_uuid={sheet_uuid} directly from card's 🆔 marker (message_id={reply_message_id})")
+        return {"sheet_uuid": sheet_uuid, "sheet_tab": sheet_tab, "contact_name": "", "contact_company": ""}
+
+    company, title = _parse_company_title_from_card_text(card_text)
     if company and title:
         sheet_uuid = _fuzzy_find_job_in_local_cache(company, title)
         sheet_tab = "Pipeline_Candidates"
@@ -3113,6 +3136,7 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     card_text = (
         f"💼 <b>{title}</b>\n"
         f"🏢 <b>{company}</b>\n"
+        f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code>\n"
         f"────────────────────\n"
         f"{fit_dot} <b>Fit Score:</b> {score}/100  |  <b>Skill Match:</b> {overlap_pct}%\n"
         f"🕐 <b>Recency:</b> {age_badge}\n"
@@ -3637,14 +3661,15 @@ def process_webhook_payload_async(data):
                 is_warm = (cmd_type in ["c", "cw"])
                 draft_text = generate_warm_email(c.get("note", "")) if is_warm else generate_cold_email(c.get("title", "Operations Specialist"), c.get("company", "Target Firm"))
                 monospaced_draft = format_email_block(draft_text)
+                contact_sheet_uuid = c.get("sheet_uuid", "")
                 card_msg = (
                     f"👤 <b>{c.get('name', 'Contact')}</b> | {c.get('company', 'Company')}\n"
+                    f"🆔 <code>{html.escape(str(contact_sheet_uuid))}</code> · <code>{html.escape(target_code)}</code>\n"
                     f"<b>Priority Tier:</b> {c.get('priority', 5)}/10\n"
                     f"<b>Last Note:</b> <i>{c.get('note', 'N/A')}</i>\n\n"
                     f"<b>Tap-to-Copy Email Draft:</b>\n{monospaced_draft}"
                 )
                 sent_msg_id = send_telegram_message(chat_id, card_msg)
-                contact_sheet_uuid = c.get("sheet_uuid")
                 if sent_msg_id and contact_sheet_uuid:
                     save_message_mapping(sent_msg_id, contact_sheet_uuid, target_code, c.get("name", ""), c.get("company", ""), c.get("email", ""))
             return
@@ -3708,6 +3733,7 @@ def process_webhook_payload_async(data):
             log_to_sheets_crm(payload)
             resp = (
                 f"✅ <b>Contact Created</b>\n"
+                f"🆔 <code>{html.escape(sheet_uuid)}</code> · <code>Carmen Warm</code>\n"
                 f"<b>Name:</b> {html.escape(name)}\n"
                 f"<b>Company:</b> {html.escape(company)}\n"
                 f"<b>Priority:</b> {priority}/10\n"
@@ -3747,6 +3773,7 @@ def process_webhook_payload_async(data):
             log_to_sheets_crm(payload)
             resp = (
                 f"✅ <b>Contact Created ({target_tab})</b>\n"
+                f"🆔 <code>{html.escape(sheet_uuid)}</code> · <code>{html.escape(target_tab)}</code>\n"
                 f"<b>Name:</b> {html.escape(name)}\n"
                 f"<b>Company:</b> {html.escape(company)}\n"
                 f"<b>Priority:</b> {priority}/10\n"
