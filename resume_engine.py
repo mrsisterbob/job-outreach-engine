@@ -171,7 +171,7 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode:
         isinstance(bullet_indices, list) and len(bullet_indices) > 0
         and all(isinstance(i, int) and 0 <= i < len(pool) for i in bullet_indices)
     )
-    indices = bullet_indices if is_valid else [0, 1, 2]
+    indices = bullet_indices if is_valid else [0, 1, 2, 3]
     indices = [i for i in indices if 0 <= i < len(pool)]
 
     forbidden = TRACK_TONE_CONSTRAINTS.get((track_key, tone_key), [])
@@ -187,7 +187,7 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode:
             indices = [0]
 
     selected = [pool[i] for i in indices if not any(bw in str(pool[i]).lower() for bw in banned)]
-    return selected or pool[:3]
+    return selected or pool[:4]
 
 def _render_experience_block(evidence: dict, dynamic_bullets: list = None) -> str:
     """Renders the Professional Experience section entirely from Evidence Bank data - every
@@ -204,7 +204,7 @@ def _render_experience_block(evidence: dict, dynamic_bullets: list = None) -> st
         start = escape_typst(job.get("start", ""))
         end = escape_typst(job.get("end", ""))
         if idx > 0:
-            lines.append("#v(3pt)")
+            lines.append("#v(7pt)")
         lines.append(f"*{title}* | {company} #h(1fr) {location} | {start} -- {end}")
         bullets = dynamic_bullets if (idx == 0 and dynamic_bullets) else job.get("bullets", [])
         for b in bullets:
@@ -287,55 +287,55 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
   keywords: ({keywords_tuple})
 )
 
-// Marcus Thorne spacing and typography - tuned to fill the full 1-page canvas edge-to-edge
-#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.5in, bottom: 0.5in))
-#set text(font: "Liberation Sans", size: 9.6pt, fill: rgb("#111827"))
-#set par(justify: false, leading: 0.5em, spacing: 0.58em)
-#set list(spacing: 0.38em, indent: 0em)
-#show heading: set block(above: 0.55em, below: 0.3em)
+// Tuned 1-Page Layout Spacing
+#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.52in, bottom: 0.52in))
+#set text(font: "Liberation Sans", size: 10pt, fill: rgb("#111827"))
+#set par(justify: false, leading: 0.56em, spacing: 0.62em)
+#set list(spacing: 0.48em, indent: 0em)
+#show heading: set block(above: 0.6em, below: 0.3em)
 
 // --- HEADER ---
 #align(center)[
-  #text(size: 18pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
-  #text(size: 10pt, weight: "medium", fill: rgb("#4B5563"))[{escape_typst(track_data["subtitle"])}] \\
+  #text(size: 18.5pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
+  #text(size: 10.2pt, weight: "medium", fill: rgb("#4B5563"))[{escape_typst(track_data["subtitle"])}] \\
   #v(3pt)
   #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
 ]
 
-#v(5pt)
+#v(7pt)
 #line(length: 100%, stroke: 0.7pt + rgb("#CCCCCC"))
-#v(3pt)
+#v(4pt)
 
 // --- SUMMARY ---
-#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
-#v(2pt)
+#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
+#v(2.5pt)
 {summary}
 
-#v(5pt)
+#v(7pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
+#v(4pt)
 
 // --- PROFESSIONAL EXPERIENCE ---
-#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[PROFESSIONAL EXPERIENCE]
-#v(2pt)
+#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[PROFESSIONAL EXPERIENCE]
+#v(2.5pt)
 {experience_block}
 
-#v(5pt)
+#v(7pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
+#v(4pt)
 
 // --- EDUCATION & CREDENTIALS ---
-#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[EDUCATION & CREDENTIALS]
-#v(2pt)
+#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[EDUCATION & CREDENTIALS]
+#v(2.5pt)
 {education_credentials_block}
 
-#v(5pt)
+#v(7pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
+#v(4pt)
 
 // --- SKILLS & SYSTEMS ---
-#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SKILLS & SYSTEMS]
-#v(2pt)
+#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SKILLS & SYSTEMS]
+#v(2.5pt)
 {skills_lines}
 """
     return markup.strip()

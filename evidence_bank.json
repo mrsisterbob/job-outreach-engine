@@ -15,21 +15,21 @@
       "start": "06/2026",
       "end": "Present",
       "bullets": [
-        "Identified a workflow collision in Salesforce between restricted trading desk accounts and service queues; presented root-cause analysis to leadership that corrected the underlying ticket misrouting.",
-        "Audited onboarding paperwork for 500+ accounts, checking advisory agreements and risk profiles to stay SEC-compliant.",
-        "Handled urgent advisor service requests within 1 to 2 hour SLA windows to meet custodial deadlines across Schwab Advisor Center and Fidelity Wealthscape.",
-        "Audited and cleaned 1,500+ legacy account files in internal databases to ensure required legal agreements were on record."
+        "Identified a workflow collision in Salesforce between restricted trading desk accounts and service queues; presented root-cause analysis to leadership that corrected ticket misrouting and prevented 10 SLA breaches.",
+        "Audited onboarding paperwork for 500+ accounts, verifying advisory agreements and client risk profiles to enforce SEC compliance standards.",
+        "Handled urgent advisor service escalations within 1 to 2 hour SLA windows across Schwab Advisor Center and Fidelity Wealthscape.",
+        "Audited and cleaned 1,500+ legacy account files in internal databases to ensure data parity with custodial compliance rules."
       ]
     },
     {
-      "company": "40 Acres App",
+      "company": "40 Acres",
       "title": "Compliance Lead",
       "location": "Detroit, MI",
       "start": "04/2026",
       "end": "05/2026",
       "bullets": [
         "Drafted SEC Form D and Regulation Crowdfunding filings for digital asset and private real estate offerings.",
-        "Set up compliance checkpoints and suitability reviews for incoming platform investors.",
+        "Set up compliance intake checkpoints and suitability reviews for incoming platform investors.",
         "Reviewed property documentation and title records to ensure custodial data parity across active offerings."
       ]
     },
@@ -67,7 +67,7 @@
     }
   ],
   "certificates": [
-    "Series 65 Candidate",
+    "Series 65 (Expected Q4 2026)",
     "Securities Industry Essentials (SIE)",
     "Schwab Limited Power of Attorney",
     "Bloomberg Market Concepts"
