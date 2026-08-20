@@ -194,11 +194,12 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode:
     selected = [pool[i] for i in indices if not any(bw in str(pool[i]).lower() for bw in banned)]
     return selected or pool[:3]
 
-def _render_experience_block(evidence: dict, lead_bullet: str = None) -> str:
+def _render_experience_block(evidence: dict, dynamic_bullets: list = None) -> str:
     """Renders the Professional Experience section entirely from Evidence Bank data - every
     injected field is escape_typst()'d since none of this is a hardcoded literal anymore.
-    `lead_bullet`, if given, is the dynamic track-routed top achievement bullet, prepended
-    ahead of the first job's master bullets so it leads the section.
+    `dynamic_bullets`, if given, entirely replaces the first job's (Signal Advisors) static
+    bullets instead of stacking on top of them, so the track-routed bullets lead the section
+    without duplicating the static ones.
     """
     lines = []
     for idx, job in enumerate(evidence.get("experience", [])):
@@ -210,9 +211,8 @@ def _render_experience_block(evidence: dict, lead_bullet: str = None) -> str:
         if idx > 0:
             lines.append("#v(3pt)")
         lines.append(f"*{title}* | {company} #h(1fr) {location} | {start} -- {end}")
-        if idx == 0 and lead_bullet:
-            lines.append(f"- {escape_typst(lead_bullet)}")
-        for b in job.get("bullets", []):
+        bullets = dynamic_bullets if (idx == 0 and dynamic_bullets) else job.get("bullets", [])
+        for b in bullets:
             lines.append(f"- {escape_typst(b)}")
     return "\n".join(lines)
 
@@ -259,7 +259,6 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     clean_company = escape_typst(company_name or "Target Operations")
 
     selected_bullets = filter_ats_bullets(track, bullet_indices, tone_key)
-    lead_bullet = selected_bullets[0] if selected_bullets else None
 
     keywords_tuple = ", ".join(f'"{kw}"' for kw in track_data["keywords"])
     summary = escape_typst(apply_tone_filter(track_data["summary"], tone_key))
@@ -281,7 +280,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
         contact_fields.append(f'#link("https://{linkedin_raw}")[LinkedIn]')
     contact_line = " • ".join(contact_fields)
 
-    experience_block = _render_experience_block(evidence, lead_bullet=lead_bullet)
+    experience_block = _render_experience_block(evidence, dynamic_bullets=selected_bullets)
     education_credentials_block = _render_education_credentials_block(evidence)
     tone_skills = list(track_data["skills"]) + [TONE_SKILL_ADDENDUM[tone_key]]
     skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in tone_skills)
