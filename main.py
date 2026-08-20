@@ -1515,11 +1515,14 @@ EVIDENCE BANK (the only source of truth for this candidate's real background):
 
 NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. Never invent skills, employers, or experiences not listed there. You are STRICTLY a classifier/router - NEVER generate prose, sentences, resume bullets, email bodies, or LinkedIn notes yourself. Only return integer indices selecting from pre-approved local template banks; all actual text is interpolated deterministically in Python from those banks.
 
+Determine the target firm's conservatism level. If the company is a traditional bank, broker-dealer, legacy RIA, or insurance carrier, set "tone_mode" to "conservative". If the company is a fintech, crypto platform, tokenization startup, or software vendor, set "tone_mode" to "tech". When "tone_mode" is "conservative", DO NOT select bullet indices referencing crypto, Bitcoin, or Web3.
+
 Evaluate the job description and respond ONLY with a JSON object containing:
 {{
 "score": <integer between 1 and 100 representing fit signal>,
 "reason": "<1-sentence concise explanation of why this role fits or does not fit>",
 "track": "<one letter a|b|c|d|e selecting the resume bullet pool that best matches this role: a=wealth operations, b=data/systems engineering, c=risk & regulatory compliance, d=business intelligence & analytics, e=business operations & CRM systems>",
+"tone_mode": "<'conservative' or 'tech' - conservative for traditional banks/broker-dealers/legacy RIAs/insurance carriers, tech for fintech/crypto/tokenization startups/software vendors>",
 "bullet_indices": [<int>, <int>, <int>],
 "linkedin_template_id": <integer 0-9 selecting a LinkedIn connection note template>,
 "outreach_template_id": <integer 0-5 selecting a cold outreach email template>
@@ -1921,10 +1924,10 @@ def evaluate_job_with_gemini(job):
     Template Engine). Gemini returns ONLY a score/reason plus integer routing keys - never
     prose. On failure/timeout, set score=0 and status 'Evaluation Pending'. Thread-safe with
     timeout handling: DO NOT assign fake scores on failure.
-    Returns (pass_bool, score, reason, track, bullet_indices, linkedin_template_id, outreach_template_id).
+    Returns (pass_bool, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id).
     """
     if not GEMINI_API_KEY:
-        return True, 75, "Fallback pass (No Key)", "a", [0, 1, 2], 0, 0
+        return True, 75, "Fallback pass (No Key)", "a", "conservative", [0, 1, 2], 0, 0
 
     try:
         desc_truncated = str(job.get("job_description") or "")[:1800]
@@ -1944,6 +1947,12 @@ def evaluate_job_with_gemini(job):
                 if track not in ("a", "b", "c", "d", "e"):
                     track = "a"
 
+                # Company Conservatism & Culture Filter: defaults to the safer "conservative" tone
+                # on any missing/invalid value so crypto/Web3 language never leaks unintentionally.
+                tone_mode = str(res_data.get("tone_mode", "conservative") or "conservative").strip().lower()
+                if tone_mode not in ("conservative", "tech"):
+                    tone_mode = "conservative"
+
                 bullet_indices = res_data.get("bullet_indices", [0, 1, 2])
                 if not isinstance(bullet_indices, list) or not all(isinstance(i, int) for i in bullet_indices):
                     bullet_indices = [0, 1, 2]
@@ -1957,18 +1966,18 @@ def evaluate_job_with_gemini(job):
                     outreach_template_id = 0
 
                 final_score = calculate_hybrid_score_modifier(job, raw_score)
-                return (final_score >= 65), final_score, reason, track, bullet_indices, linkedin_template_id, outreach_template_id
+                return (final_score >= 65), final_score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id
             except Exception as e:
                 logging.error(f"Gemini evaluation JSON parse failure: {e}")
                 # On parse error, return 0 score with Evaluation Pending status
-                return False, 0, "Evaluation Pending", "a", [0, 1, 2], 0, 0
+                return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0
         
         # On API failure/timeout, set score to 0 and status to "Evaluation Pending" (NO fake scores)
-        return False, 0, "Evaluation Pending", "a", [0, 1, 2], 0, 0
+        return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0
     
     except Exception as e:
         logging.error(f"Gemini evaluation exception: {e}")
-        return False, 0, "Evaluation Pending", "a", [0, 1, 2], 0, 0
+        return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0
 
 def generate_interview_prep(company, job_title, job_description=""):
     """3 talking points + 2 reverse questions tailored to a role; safe static fallback if Gemini is unavailable."""
@@ -2127,7 +2136,7 @@ def passes_strict_filter(job):
 
 def process_single_candidate(job):
     log_metric_event("ai_screened", source=derive_job_source(job.get("job_id")))
-    ai_pass, score, reason, track, bullet_indices, linkedin_template_id, outreach_template_id = evaluate_job_with_gemini(job)
+    ai_pass, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id = evaluate_job_with_gemini(job)
     if ai_pass:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
         short_id = generate_short_key(raw_id, fallback=time.time())
@@ -2149,6 +2158,7 @@ def process_single_candidate(job):
         # the exact same bullets later (bounds-checked again by resume_engine.filter_ats_bullets).
         job["track"] = track
         job["bullet_indices"] = bullet_indices
+        job["tone_mode"] = tone_mode
         sheet_uuid = save_job_to_cache(short_id, job)
         target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
         age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
@@ -2229,7 +2239,7 @@ def process_single_candidate(job):
         return {
             "job": job, "score": score, "reason": reason,
             "linkedin_note": linkedin_note, "ats_bullets": ats_bullets,
-            "outreach_email": outreach_email,
+            "outreach_email": outreach_email, "tone_mode": tone_mode,
             "target_email": target_email, "age_badge": age_badge,
             "salary_str": salary_str, "work_style": work_style,
             "overlap_pct": overlap_pct, "matched_skills": matched_skills,
@@ -2398,20 +2408,20 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     except Exception as e:
         return False, str(e), None
 
-def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label):
+def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label, tone_mode="conservative"):
     """Compiles the tailored resume PDF with a fallback retry (track 'a', bullet_indices [0,1,2])
     if the first attempt raises or returns empty bytes. Sends a Telegram warning on final failure
     so a broken attachment is never silent. Returns pdf_bytes, or None if both attempts failed.
     """
     try:
-        pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
+        pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
         if pdf_bytes:
             return pdf_bytes
         raise ValueError("compile_resume_pdf returned empty bytes")
     except Exception as e:
         logging.error(f"{command_label} resume compilation failed for {comp} (track={track}): {e} - retrying with fallback track 'a'")
         try:
-            pdf_bytes = compile_resume_pdf(comp, track="a", bullet_indices=[0, 1, 2])
+            pdf_bytes = compile_resume_pdf(comp, track="a", bullet_indices=[0, 1, 2], tone_mode=tone_mode)
             if pdf_bytes:
                 return pdf_bytes
             raise ValueError("fallback compile_resume_pdf returned empty bytes")
@@ -3541,8 +3551,8 @@ def run_job_pipeline(chat_id=None, top_n=2):
             sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates"
         )
         note = (
-            f"Warm Referral Matched: {item.get('contact_name', 'Contact')} | {item['reason']}"
-            if is_clavicular else f"Matched via Pipeline | {item['reason']}"
+            f"Warm Referral Matched: {item.get('contact_name', 'Contact')} | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
+            if is_clavicular else f"Matched via Pipeline | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
         )
         row = {
             "sheet_uuid": item.get("sheet_uuid"),
@@ -3962,9 +3972,10 @@ def process_webhook_payload_async(data):
                 target = resolve_target_email(comp, title, job.get("employer_website"))
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
+            tone_mode = job.get("tone_mode", "conservative")
             clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
             pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
-            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft")
+            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft", tone_mode=tone_mode)
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
             ok, gmail_msg, draft_id = create_gmail_draft(
                 to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
@@ -4009,9 +4020,10 @@ def process_webhook_payload_async(data):
             # Compile the same tailored resume PDF /draft attaches, so /e never regresses to a bare-text draft
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
+            tone_mode = job.get("tone_mode", "conservative")
             clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
             pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
-            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/e")
+            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/e", tone_mode=tone_mode)
 
             ok, gmail_msg, draft_id = create_gmail_draft(
                 to_email=new_email, company_name=comp, job_title=title, is_warm=is_warm,
@@ -4095,10 +4107,11 @@ def process_webhook_payload_async(data):
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Company"
             track = requested_track or job.get("track") or "a"
             bullet_indices = job.get("bullet_indices")
+            tone_mode = job.get("tone_mode", "conservative")
             short_id = job.get("short_id") or generate_short_key(job.get("job_id") or mapping["sheet_uuid"], fallback=time.time())
 
             try:
-                pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
+                pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
                 clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
                 filename = f"Kevin_Miller_Resume_{clean_comp}_Track{track.upper()}.pdf"
 
@@ -4456,9 +4469,10 @@ def handle_fast_path_command(chat_id, text, msg):
             target = resolve_target_email(comp, title, job.get("employer_website"))
         track = job.get("track", "a")
         bullet_indices = job.get("bullet_indices")
+        tone_mode = job.get("tone_mode", "conservative")
         clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
         pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
-        pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft")
+        pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft", tone_mode=tone_mode)
         logging.info(f"/draft command handled directly: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
         ok, gmail_msg, draft_id = create_gmail_draft(
             to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
@@ -4637,7 +4651,8 @@ def desktop_stage_pdf(short_id):
     track = request.args.get("track") or job.get("track") or "a"
     comp = job.get("employer_name", "Target Firm")
     bullet_indices = job.get("bullet_indices")
-    pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices)
+    tone_mode = job.get("tone_mode", "conservative")
+    pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
     return Response(pdf_bytes, mimetype="application/pdf")
 
 @app.route("/ingest", methods=["POST"])
