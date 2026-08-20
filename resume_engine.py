@@ -12,7 +12,25 @@ import io
 import json
 import logging
 import os
+import re
 import typst
+
+# Company Conservatism & Culture Filter: crypto/Web3 language Gemini might otherwise route into
+# a conservative-tone resume (RIAs, banks, custodians) gets scrubbed to institutional-safe phrasing.
+_CRYPTO_TERMS_PATTERN = re.compile(r"\b(bitcoin|crypto(?:currency)?|tokeniz\w*|web3|blockchain|trading bots?)\b", re.IGNORECASE)
+
+TONE_SKILL_ADDENDUM = {
+    "conservative": ("Compliance & Data Integrity", "Custodial Systems, Data Reconciliation, SEC Compliance."),
+    "tech": ("Modern Engineering & Automation", "Asset Tokenization, API Integration, Flask, Process Automation."),
+}
+
+def apply_tone_filter(text: str, tone_mode: str) -> str:
+    """Scrubs crypto/Web3 keywords to institutional-safe phrasing when tone_mode is 'conservative';
+    passes text through unchanged for 'tech' (or any other) tone_mode.
+    """
+    if str(tone_mode or "").lower() != "conservative" or not text:
+        return text
+    return _CRYPTO_TERMS_PATTERN.sub("custodial systems", text)
 
 def escape_typst(text: str) -> str:
     """
@@ -195,7 +213,7 @@ def _render_education_credentials_block(evidence: dict) -> str:
         lines.append(f"*Certificates & Licenses:* {certificates_line}")
     return "\n".join(lines)
 
-def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None) -> str:
+def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> str:
     """Builds single-page Typst markup for the selected persona track, sourcing every factual
     claim (experience, education, certificates) from the centralized JSON banks (hot-reloaded
     fresh on every call), assembled into 4 sections: Summary, Professional Experience,
@@ -204,8 +222,14 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     the header summary, the leading achievement bullet, and skill emphasis all key off the
     same `track` value, so no live job-description text is required at render time - the
     resume still compiles correctly even from a bare "a" default with no cached job.
+    `tone_mode` ("conservative" | "tech") is the Company Conservatism & Culture Filter: it scrubs
+    crypto/Web3 language from the summary for conservative firms (RIAs, banks, custodians) and
+    appends tone-appropriate chips to the Skills & Systems line.
     """
     track_data = TRACKS.get(str(track or "a").lower(), TRACKS["a"])
+    tone_key = str(tone_mode or "conservative").lower()
+    if tone_key not in TONE_SKILL_ADDENDUM:
+        tone_key = "conservative"
     evidence = load_evidence_bank()
     identity = evidence.get("identity", {})
     clean_company = escape_typst(company_name or "Target Operations")
@@ -214,7 +238,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     lead_bullet = selected_bullets[0] if selected_bullets else None
 
     keywords_tuple = ", ".join(f'"{kw}"' for kw in track_data["keywords"])
-    summary = escape_typst(track_data["summary"])
+    summary = escape_typst(apply_tone_filter(track_data["summary"], tone_key))
 
     name = escape_typst(identity.get("name", "Kevin Miller"))
     email = escape_typst(identity.get("email", ""))
@@ -235,7 +259,8 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 
     experience_block = _render_experience_block(evidence, lead_bullet=lead_bullet)
     education_credentials_block = _render_education_credentials_block(evidence)
-    skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
+    tone_skills = list(track_data["skills"]) + [TONE_SKILL_ADDENDUM[tone_key]]
+    skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in tone_skills)
 
     markup = f"""
 #set document(
@@ -298,8 +323,8 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 """
     return markup.strip()
 
-def compile_resume_pdf(company_name: str, track: str = "a", bullet_indices: list = None) -> bytes:
+def compile_resume_pdf(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> bytes:
     """Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track."""
-    markup = render_typst_markup(company_name, track, bullet_indices)
+    markup = render_typst_markup(company_name, track, bullet_indices, tone_mode)
     return typst.compile(markup.encode("utf-8"))
 
