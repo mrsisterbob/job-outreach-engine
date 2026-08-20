@@ -3129,7 +3129,8 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"⚡ <b>Swipe Actions (reply to this card):</b>\n"
         f"  <code>/apply</code> Mark Applied   <code>/draft</code> Gmail Draft\n"
         f"  <code>/warm</code> Move Warm   <code>/cold</code> Move Cold   <code>/x</code> Dead\n"
-        f"  <code>/f &lt;days&gt;</code> Snooze   <code>/n &lt;note&gt;</code> Log Note"
+        f"  <code>/f &lt;days&gt;</code> Snooze   <code>/n &lt;note&gt;</code> Log Note\n"
+        f"  <code>/e &lt;email&gt;</code> Lock Apollo Email   <code>/eh</code> API Lookup"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -3981,6 +3982,54 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, draft_msg)
             return
 
+        if text == "/eh" or text.startswith("/eh "):
+            custom_name = text[len("/eh"):].strip()
+            mapping = resolve_reply_mapping(msg, chat_id, "/eh")
+            if not mapping:
+                return
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            title = job.get("job_title") or "Operations Specialist"
+            is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
+            domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
+            contact_name = custom_name or "Operations Lead"
+
+            target = resolve_email_waterfall(contact_name, comp, domain_hint=domain_hint, on_provider_attempt=increment_api_usage_counter)
+            confidence = "unverified" if is_unverified_email(target) else "verified"
+            log_email_enrichment_attempt(mapping["sheet_uuid"], "waterfall", target, confidence)
+            update_job_target_email(mapping["sheet_uuid"], target)
+            enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=target))
+
+            # Compile the same tailored resume PDF /draft and /e attach, so /eh never regresses to a bare-text draft
+            track = job.get("track", "a")
+            bullet_indices = job.get("bullet_indices")
+            tone_mode = job.get("tone_mode", "conservative")
+            clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
+            pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
+            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/eh", tone_mode=tone_mode)
+
+            ok, gmail_msg, draft_id = create_gmail_draft(
+                to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
+                pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+            )
+            raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
+            monospaced_body = format_email_block(raw_email_text)
+            draft_link_line = ""
+            if draft_id:
+                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
+                draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
+            confidence_badge = "⚠️ Unverified guess" if confidence == "unverified" else "✅ Verified"
+            confirm_msg = (
+                f"🔍 <b>API Lookup Resolved ({confidence_badge}):</b> <code>{html.escape(target)}</code>\n\n"
+                f"{draft_link_line}"
+                f"<b>Tap-to-Copy Email Body:</b>\n{monospaced_body}"
+            )
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            send_telegram_message(chat_id, confirm_msg)
+            if ok:
+                log_daily_activity("drafts_staged")
+            return
+
         if text.startswith("/e ") or text.startswith("/email "):
             raw_email = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
             email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
@@ -4236,7 +4285,8 @@ def process_webhook_payload_async(data):
                 "/x - Archive lead to Died/Killed tab\n"
                 "/n - Append timestamped note\n"
                 "/f - Snooze follow-up by [days]\n"
-                "/e, /email - Override the target email & re-draft\n"
+                "/e <email> - Lock Apollo email override & re-draft\n"
+                "/eh [Name] - On-demand API email lookup & re-draft\n"
                 "/draft - Generate Gmail draft\n"
                 "/cv, /resume - Compile tailored resume PDF\n"
                 "/prep - Interview talking points & reverse questions\n"
