@@ -1,8 +1,11 @@
 {
   "cold_ops": [
-    "Hi {name},\n\nI saw the {job_title} role at {company} and wanted to highlight my background in wealth operations and process automation. Would you be open to a brief 5 minute call next week to discuss alignment?\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nLooks like you are hiring for the {job_title} role at {company}. Would it be helpful to discuss how my background in financial systems and reconciliation can support your team?\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nI noticed the {job_title} opening at {company}. I have automated recurring data intake and ledger reconciliation tasks in similar environments to cut manual processing time. Do you have time for a brief call this week?\n\nBest regards,\nKevin Miller"
+    "Hi {name},\n\nI saw the {job_title} role at {company} and wanted to highlight my work in wealth operations and process automation. Would you be open to a brief five minute call next week to discuss alignment?\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nI saw that {company} is hiring for a {job_title}. My experience centers on automating reporting workflows and data reconciliation with Python and SQL. Would you be open to a brief chat about where my background might help your team?\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nI came across the {job_title} opening on your team at {company}. I focus on removing manual data bottlenecks and cleaning up operational queues across Salesforce and internal databases. Do you have five minutes for a quick call next week?\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nI saw the {job_title} posting at {company} and wanted to reach out directly. My background is in technical operations, systems reconciliation, and data integrity. I would welcome the chance to connect briefly if you have a few minutes next week.\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nI noticed the {job_title} role at {company}. I have practical experience building automated Python pipelines and managing CRM exception workflows to cut processing lag. Would you be open to a brief chat to discuss how I could contribute?\n\nBest regards,\nKevin Miller",
+    "Hi {name},\n\nI saw that {company} is looking for a {job_title}. Having built data pipelines and automated compliance checks across complex records, I am interested in how your team manages operational scale. Would you be open to a quick call next week?\n\nBest regards,\nKevin Miller"
   ],
   "warm_alumni": [
     "Hi {name},\n\nAs a fellow Hope College business alum, I saw your work at {company} and wanted to reach out. I am currently working in wealth operations and would value learning more about your experience on the team over a quick call.\n\nBest regards,\nKevin Miller",
