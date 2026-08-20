@@ -18,6 +18,7 @@ import requests
 from flask import Flask, jsonify, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 from resume_engine import compile_resume_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
+from response_schema import GeminiJobScreenerResponse
 from pipeline_utils import (
     build_apollo_url, build_linkedin_url, build_hiring_manager_dork, build_recruiter_dork,
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
@@ -1939,37 +1940,16 @@ def evaluate_job_with_gemini(job):
         if raw_text:
             try:
                 cleaned_text = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
-                res_data = json.loads(cleaned_text)
-                raw_score = int(res_data.get("score", 0))
-                reason = res_data.get("reason", "N/A")
+                validated = GeminiJobScreenerResponse.model_validate_json(cleaned_text)
 
-                track = str(res_data.get("track", "a") or "a").strip().lower()
-                if track not in ("a", "b", "c", "d", "e"):
-                    track = "a"
-
-                # Company Conservatism & Culture Filter: defaults to the safer "conservative" tone
-                # on any missing/invalid value so crypto/Web3 language never leaks unintentionally.
-                tone_mode = str(res_data.get("tone_mode", "conservative") or "conservative").strip().lower()
-                if tone_mode not in ("conservative", "tech"):
-                    tone_mode = "conservative"
-
-                bullet_indices = res_data.get("bullet_indices", [0, 1, 2])
-                if not isinstance(bullet_indices, list) or not all(isinstance(i, int) for i in bullet_indices):
-                    bullet_indices = [0, 1, 2]
-
-                linkedin_template_id = res_data.get("linkedin_template_id", 0)
-                if not isinstance(linkedin_template_id, int):
-                    linkedin_template_id = 0
-
-                outreach_template_id = res_data.get("outreach_template_id", 0)
-                if not isinstance(outreach_template_id, int):
-                    outreach_template_id = 0
-
-                final_score = calculate_hybrid_score_modifier(job, raw_score)
-                return (final_score >= 65), final_score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id
+                final_score = calculate_hybrid_score_modifier(job, validated.score)
+                return (
+                    (final_score >= 65), final_score, validated.reason, validated.track, validated.tone_mode,
+                    validated.bullet_indices, validated.linkedin_template_id, validated.outreach_template_id
+                )
             except Exception as e:
-                logging.error(f"Gemini evaluation JSON parse failure: {e}")
-                # On parse error, return 0 score with Evaluation Pending status
+                logging.error(f"Gemini evaluation JSON parse/validation failure: {e}")
+                # On parse/validation error, return 0 score with Evaluation Pending status
                 return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0
         
         # On API failure/timeout, set score to 0 and status to "Evaluation Pending" (NO fake scores)
@@ -2146,7 +2126,7 @@ def process_single_candidate(job):
         # Strict Deterministic Template Engine: Gemini only routed a track + integer indices -
         # Python resolves/bounds-checks the actual bullet text and interpolates the actual
         # LinkedIn/outreach copy from local JSON banks. Gemini never authors this text directly.
-        ats_bullets = filter_ats_bullets(track, bullet_indices)
+        ats_bullets = filter_ats_bullets(track, bullet_indices, tone_mode)
         linkedin_pool = load_linkedin_templates().get("linkedin_templates", [])
         linkedin_template = resolve_template_text(linkedin_pool, linkedin_template_id)
         linkedin_note = sanitize_text(interpolate_template(linkedin_template, name="there", company=company_name, job_title=job_title))[:300]
@@ -4573,7 +4553,7 @@ def format_ats_plaintext(job, track="a"):
         lines.append("")
 
     lines.append("TARGETED ACHIEVEMENTS")
-    validated_bullets = filter_ats_bullets(track, job.get("bullet_indices"))
+    validated_bullets = filter_ats_bullets(track, job.get("bullet_indices"), job.get("tone_mode", "conservative"))
     for b in validated_bullets:
         lines.append(f"- {b}")
 
@@ -4590,7 +4570,7 @@ def desktop_stage_view(short_id):
     comp = job.get("employer_name", "Target Firm")
     title = job.get("job_title", "Role")
     apply_link = job.get("job_apply_link", "#")
-    bullets = filter_ats_bullets(track, job.get("bullet_indices"))
+    bullets = filter_ats_bullets(track, job.get("bullet_indices"), job.get("tone_mode", "conservative"))
     bullets_html = "".join([f"<li>{html.escape(str(b))}</li>" for b in bullets])
     ats_plaintext = format_ats_plaintext(job, track)
 
