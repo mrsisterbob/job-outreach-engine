@@ -213,21 +213,24 @@ def test_compute_description_simhash_empty_text_does_not_raise():
 
 def test_resolve_email_waterfall_falls_back_without_api_keys(monkeypatch):
     monkeypatch.delenv("HUNTER_API_KEY", raising=False)
-    monkeypatch.delenv("ANYMAIL_API_KEY", raising=False)
+    monkeypatch.delenv("PROSPEO_API_KEY", raising=False)
+    monkeypatch.delenv("GETPROSPECT_API_KEY", raising=False)
     result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp")
     assert result == "jane.doe@acmecorp.com [⚠️ Unverified]"
 
 
 def test_resolve_email_waterfall_uses_domain_hint_when_provided(monkeypatch):
     monkeypatch.delenv("HUNTER_API_KEY", raising=False)
-    monkeypatch.delenv("ANYMAIL_API_KEY", raising=False)
+    monkeypatch.delenv("PROSPEO_API_KEY", raising=False)
+    monkeypatch.delenv("GETPROSPECT_API_KEY", raising=False)
     result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp", domain_hint="acme.io")
     assert result == "jane.doe@acme.io [⚠️ Unverified]"
 
 
 def test_resolve_email_waterfall_single_name_uses_operations_fallback(monkeypatch):
     monkeypatch.delenv("HUNTER_API_KEY", raising=False)
-    monkeypatch.delenv("ANYMAIL_API_KEY", raising=False)
+    monkeypatch.delenv("PROSPEO_API_KEY", raising=False)
+    monkeypatch.delenv("GETPROSPECT_API_KEY", raising=False)
     result = pu.resolve_email_waterfall("Cher", "Acme Corp")
     assert result == "operations@acmecorp.com [⚠️ Fallback]"
 
@@ -257,20 +260,47 @@ def test_resolve_email_waterfall_fires_on_provider_attempt_callback(monkeypatch)
     assert attempts == ["hunter"]
 
 
-def test_resolve_email_waterfall_falls_through_to_anymail(monkeypatch):
+def test_resolve_email_waterfall_falls_through_to_prospeo(monkeypatch):
     monkeypatch.setenv("HUNTER_API_KEY", "test-key")
-    monkeypatch.setenv("ANYMAIL_API_KEY", "test-key-2")
+    monkeypatch.setenv("PROSPEO_API_KEY", "test-key-2")
+    monkeypatch.delenv("GETPROSPECT_API_KEY", raising=False)
 
     class FakeHunterResponse:
         def json(self):
             return {"data": {}}  # no email found
 
-    class FakeAnymailResponse:
+    class FakeProspeoResponse:
         def json(self):
-            return {"results": {"email": "jane@acmecorp.com"}}
+            return {"response": {"email": "jane@acmecorp.com"}}
 
     monkeypatch.setattr(pu.requests, "get", lambda *a, **k: FakeHunterResponse())
-    monkeypatch.setattr(pu.requests, "post", lambda *a, **k: FakeAnymailResponse())
+    monkeypatch.setattr(pu.requests, "post", lambda *a, **k: FakeProspeoResponse())
+    result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp")
+    assert result == "jane@acmecorp.com"
+
+
+def test_resolve_email_waterfall_falls_through_to_getprospect(monkeypatch):
+    monkeypatch.setenv("HUNTER_API_KEY", "test-key")
+    monkeypatch.setenv("PROSPEO_API_KEY", "test-key-2")
+    monkeypatch.setenv("GETPROSPECT_API_KEY", "test-key-3")
+
+    class FakeHunterResponse:
+        def json(self):
+            return {"data": {}}  # no email found
+
+    class FakeProspeoResponse:
+        def json(self):
+            return {"response": {}}  # no email found
+
+    class FakeGetProspectResponse:
+        def json(self):
+            return {"email": "jane@acmecorp.com"}
+
+    def fake_get(url, *a, **k):
+        return FakeGetProspectResponse() if "getprospect" in url else FakeHunterResponse()
+
+    monkeypatch.setattr(pu.requests, "get", fake_get)
+    monkeypatch.setattr(pu.requests, "post", lambda *a, **k: FakeProspeoResponse())
     result = pu.resolve_email_waterfall("Jane Doe", "Acme Corp")
     assert result == "jane@acmecorp.com"
 
