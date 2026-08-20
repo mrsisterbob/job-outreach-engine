@@ -327,12 +327,6 @@ def init_db():
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             seen_count INTEGER DEFAULT 1
         )""")
-        # Migration guard: upgrade pre-existing seen_jobs tables missing the new tracking columns
-        for col_def in ["first_seen TIMESTAMP", "last_seen TIMESTAMP", "seen_count INTEGER DEFAULT 1"]:
-            try:
-                conn.execute(f"ALTER TABLE seen_jobs ADD COLUMN {col_def}")
-            except sqlite3.OperationalError:
-                pass
         conn.execute("""
         CREATE TABLE IF NOT EXISTS company_cooldown (
             company_clean TEXT PRIMARY KEY,
@@ -356,6 +350,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_type TEXT NOT NULL,
             sheet_uuid TEXT,
+            source TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.execute("""
@@ -399,11 +394,6 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_application_outcomes_sheet_uuid ON application_outcomes(sheet_uuid)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_application_outcomes_status ON application_outcomes(status)")
-        # Migration guard: pipeline_metrics pre-dates the source-attribution column
-        try:
-            conn.execute("ALTER TABLE pipeline_metrics ADD COLUMN source TEXT")
-        except sqlite3.OperationalError:
-            pass
         conn.execute("""
         CREATE TABLE IF NOT EXISTS email_enrichment_attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -442,18 +432,9 @@ def init_db():
             contact_name TEXT,
             contact_company TEXT,
             telegram_message_id INTEGER,
+            contact_email TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
-        # Migration guard: add column if table pre-dates this field
-        try:
-            conn.execute("ALTER TABLE sheet_row_map ADD COLUMN telegram_message_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
-        # Migration guard: contact_email powers the strict CRM whitelist gatekeeper for inbound mail
-        try:
-            conn.execute("ALTER TABLE sheet_row_map ADD COLUMN contact_email TEXT")
-        except sqlite3.OperationalError:
-            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_tg_msg ON sheet_row_map(telegram_message_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_contact_email ON sheet_row_map(contact_email)")
         
@@ -3632,11 +3613,33 @@ def process_webhook_payload_async(data):
         today_str = datetime.now().strftime("%Y-%m-%d")
         logging.info(f"Telegram command received: '{text}' (chat_id={chat_id})")
 
+        # 1b. Tuesday Batch Hub Commands (/sendall, /snoozeall)
+        if text == "/sendall":
+            send_telegram_message(chat_id, "⏳ <b>Send-All Started:</b> creating bump drafts and queueing +14-day follow-ups...")
+            threading.Thread(target=_run_overdue_batch_and_notify, args=(chat_id, "sendall", 14), daemon=True).start()
+            return
+
+        snooze_match = re.match(r"^/snoozeall(?:\s+(\d+))?$", text)
+        if snooze_match:
+            snooze_days = safe_int(snooze_match.group(1), 7)
+            if snooze_days < 1 or snooze_days > 365:
+                send_telegram_message(chat_id, "❌ <b>Usage:</b> <code>/snoozeall &lt;days 1-365&gt;</code>")
+                return
+            send_telegram_message(chat_id, f"⏳ <b>Snooze-All Started:</b> queueing overdue follow-ups to +{snooze_days} days...")
+            threading.Thread(target=_run_overdue_batch_and_notify, args=(chat_id, "snoozeall", snooze_days), daemon=True).start()
+            return
+
         # 2. Pipeline Run Trigger (/t [qty])
         if re.match(r"^/t(?:\s+(\d+))?$", text):
             m = re.match(r"^/t(?:\s+(\d+))?$", text)
             qty = safe_int(m.group(1), 2)
-            send_telegram_message(chat_id, f"🚀 Triggering Job Search Pipeline (Top {qty})...")
+            target_queries = get_filter("target_queries", [])
+            ats_slugs = get_filter("ats_company_slugs", [])
+            send_telegram_message(
+                chat_id,
+                f"🚀 <b>Triggering Job Search Pipeline (Top {qty})</b>\n"
+                f"🔍 Scanning {len(target_queries)} target rules & {len(ats_slugs)} ATS boards (with live Hope Alumni resolution)..."
+            )
             count = run_job_pipeline(chat_id, top_n=qty)
             send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
             return
@@ -3833,7 +3836,26 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, "\n".join(lines))
             return
         if text == "/health":
-            send_telegram_message(chat_id, "🟢 <b>System Health:</b> Operational | SQLite WAL persistent | Webhooks Active")
+            db_check_start = time.time()
+            try:
+                with get_db_conn() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("PRAGMA journal_mode")
+                    wal_mode = cursor.fetchone()[0]
+            except Exception as e:
+                wal_mode = f"error: {e}"
+            db_elapsed_ms = round((time.time() - db_check_start) * 1000, 2)
+            uptime_str = str(timedelta(seconds=int(time.time() - APP_START_TIME)))
+            api_usage = get_monthly_api_usage()
+            month_label = datetime.now().strftime("%B %Y")
+            send_telegram_message(
+                chat_id,
+                f"🟢 <b>System Health:</b> Operational\n"
+                f"💾 <b>SQLite Mode:</b> {html.escape(str(wal_mode)).upper()} ({db_elapsed_ms}ms)\n"
+                f"⏱️ <b>Uptime:</b> {uptime_str}\n"
+                f"📇 <b>Email Waterfall Usage ({month_label}, local count):</b>\n"
+                f"  Hunter.io: {api_usage['hunter']} | Prospeo: {api_usage['prospeo']} | GetProspect: {api_usage['getprospect']}"
+            )
             return
         if text == "/efficiency":
             messages_sent = get_metric_count("message_sent")
@@ -4404,178 +4426,13 @@ def _run_overdue_batch_and_notify(chat_id, mode, snooze_days):
         logging.error(f"/{mode} batch error: {e}")
         send_telegram_message(chat_id, f"❌ <b>Batch Error:</b> {html.escape(str(e)[:200])}")
 
-def handle_fast_path_command(chat_id, text, msg):
-    """Directly executes /t, /search, /health, /efficiency, /streak, /daily, /draft with a guaranteed
-    synchronous requests.post reply to the Telegram Bot API - fires immediately instead of waiting on
-    a background thread so these core commands always produce a visible, instant response.
-    Returns True if the command was handled.
-    """
-    if text == "/sendall":
-        sent_id = send_telegram_message(chat_id, "⏳ <b>Send-All Started:</b> creating bump drafts and queueing +14-day follow-ups...")
-        logging.info(f"/sendall command acknowledged (chat_id={chat_id}, ack_message_id={sent_id})")
-        threading.Thread(target=_run_overdue_batch_and_notify, args=(chat_id, "sendall", 14), daemon=True).start()
-        return True
-
-    snooze_match = re.match(r"^/snoozeall(?:\s+(\d+))?$", text)
-    if snooze_match:
-        snooze_days = safe_int(snooze_match.group(1), 7)
-        if snooze_days < 1 or snooze_days > 365:
-            send_telegram_message(chat_id, "❌ <b>Usage:</b> <code>/snoozeall &lt;days 1-365&gt;</code>")
-            return True
-        sent_id = send_telegram_message(chat_id, f"⏳ <b>Snooze-All Started:</b> queueing overdue follow-ups to +{snooze_days} days...")
-        logging.info(f"/snoozeall command acknowledged (chat_id={chat_id}, days={snooze_days}, ack_message_id={sent_id})")
-        threading.Thread(target=_run_overdue_batch_and_notify, args=(chat_id, "snoozeall", snooze_days), daemon=True).start()
-        return True
-
-    t_match = re.match(r"^/t(?:\s+(\d+))?$", text)
-    if t_match:
-        qty = safe_int(t_match.group(1), 2)
-        target_queries = get_filter("target_queries", [])
-        ats_slugs = get_filter("ats_company_slugs", [])
-        sent_id = send_telegram_message(
-            chat_id,
-            f"🚀 <b>Triggering Job Search Pipeline (Top {qty})</b>\n"
-            f"🔍 Scanning {len(target_queries)} target rules & {len(ats_slugs)} ATS boards (with live Hope Alumni resolution)..."
-        )
-        logging.info(f"/t command handled directly (chat_id={chat_id}, qty={qty}, ack_message_id={sent_id})")
-        threading.Thread(target=_run_pipeline_and_notify, args=(chat_id, qty), daemon=True).start()
-        return True
-
-    if text == "/search":
-        min_sal = safe_int(get_filter("min_salary"), 50000)
-        exp_sal = safe_int(get_filter("experience_salary_floor"), 60000)
-        bans = safe_list(get_filter("title_exclusions"))
-        cities = safe_list(get_filter("valid_cities"))
-        kws = safe_list(get_filter("required_keywords"))
-        card_text = (
-            "🔍 <b>Active Search Filters</b>\n"
-            f"💰 <b>Min Pay:</b> ${min_sal:,} | <b>Exp Floor:</b> ${exp_sal:,}\n"
-            f"📍 <b>Cities ({len(cities)}):</b> {', '.join(cities[:4]) if cities else 'All'}\n"
-            f"🚫 <b>Banned ({len(bans)}):</b> {', '.join(bans[:3]) if bans else 'None'}\n"
-            f"🔑 <b>Keywords ({len(kws)}):</b> {', '.join(kws[:3]) if kws else 'Any'}\n\n"
-            "<b>Tap-to-Copy Quick Adjustments</b>\n"
-            "<code>pay = 65000</code>\n"
-            "<code>kw + python</code>\n"
-            "<code>ban + sales</code>\n"
-            "<code>city + canton</code>"
-        )
-        sent_id = send_telegram_message(chat_id, card_text)
-        logging.info(f"/search command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
-        return True
-
-    if text == "/health":
-        db_check_start = time.time()
-        try:
-            with get_db_conn() as conn:
-                cursor = conn.cursor()
-                cursor.execute("PRAGMA journal_mode")
-                wal_mode = cursor.fetchone()[0]
-        except Exception as e:
-            wal_mode = f"error: {e}"
-        db_elapsed_ms = round((time.time() - db_check_start) * 1000, 2)
-        uptime_str = str(timedelta(seconds=int(time.time() - APP_START_TIME)))
-        api_usage = get_monthly_api_usage()
-        month_label = datetime.now().strftime("%B %Y")
-        sent_id = send_telegram_message(
-            chat_id,
-            f"🟢 <b>System Health:</b> Operational\n"
-            f"💾 <b>SQLite Mode:</b> {html.escape(str(wal_mode)).upper()} ({db_elapsed_ms}ms)\n"
-            f"⏱️ <b>Uptime:</b> {uptime_str}\n"
-            f"📇 <b>Email Waterfall Usage ({month_label}, local count):</b>\n"
-            f"  Hunter.io: {api_usage['hunter']} | Prospeo: {api_usage['prospeo']} | GetProspect: {api_usage['getprospect']}"
-        )
-        logging.info(f"/health command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
-        return True
-
-    if text == "/efficiency":
-        messages_sent = get_metric_count("message_sent")
-        interviews_set = get_metric_count("interview_set")
-        ratio = (interviews_set / messages_sent * 100) if messages_sent > 0 else 0.0
-        sent_id = send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({interviews_set} interviews / {messages_sent} sent)")
-        logging.info(f"/efficiency command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
-        return True
-
-    if text in ("/streak", "/daily"):
-        today_activity = get_daily_activity(datetime.now().strftime("%Y-%m-%d"))
-        lifetime = get_lifetime_activity_totals()
-        streak_days = calculate_active_day_streak()
-        goal_target = 5
-        sent_id = send_telegram_message(
-            chat_id,
-            "🏆 <b>Daily Outreach Scorecard</b>\n\n"
-            f"🎯 <b>Today's Goal:</b> {today_activity['drafts_staged']} / {goal_target} Staged Drafts\n"
-            f"🔥 <b>Current Streak:</b> {streak_days} Active Days\n"
-            f"📊 <b>Lifetime Totals:</b> Staged: {lifetime['drafts_staged']} | Applied: {lifetime['applied_count']} | Notes: {lifetime['notes_logged']}"
-        )
-        logging.info(f"{text} command handled directly (chat_id={chat_id}, ack_message_id={sent_id})")
-        return True
-
-    if text == "/draft":
-        mapping = resolve_reply_mapping(msg, chat_id, "/draft")
-        if not mapping:
-            return True
-        job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
-        comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
-        title = job.get("job_title") or "Operations Specialist"
-        is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
-        domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
-        if mapping.get("contact_name"):
-            target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint, on_provider_attempt=increment_api_usage_counter)
-            confidence = "unverified" if is_unverified_email(target) else "verified"
-            log_email_enrichment_attempt(mapping["sheet_uuid"], "waterfall", target, confidence)
-            if confidence == "unverified":
-                send_telegram_message(
-                    chat_id,
-                    f"⚠️ <b>Unverified Contact Email - Draft Not Created</b>\n"
-                    f"<b>Best guess:</b> <code>{html.escape(target)}</code>\n\n"
-                    f"Reply <code>/e actual@email.com</code> to confirm the real address and create the draft."
-                )
-                return True
-        else:
-            target = resolve_target_email(comp, title, job.get("employer_website"))
-        track = job.get("track", "a")
-        bullet_indices = job.get("bullet_indices")
-        tone_mode = job.get("tone_mode", "conservative")
-        clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
-        pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
-        pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft", tone_mode=tone_mode)
-        logging.info(f"/draft command handled directly: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
-        ok, gmail_msg, draft_id = create_gmail_draft(
-            to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
-            pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
-        )
-        raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
-        monospaced_body = format_email_block(raw_email_text)
-        draft_link_line = ""
-        if draft_id:
-            draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
-            draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
-        if ok:
-            status_hdr = "✉️ <b>Gmail Draft Created & Ready!</b>"
-            log_daily_activity("drafts_staged")
-        else:
-            status_hdr = f"⚠️ <b>Gmail API Alert ({html.escape(gmail_msg)})</b> - Manual Copy Below:"
-        draft_msg = (
-            f"{status_hdr}\n"
-            f"{draft_link_line}"
-            f"<b>To:</b> <code>{html.escape(target)}</code>\n\n"
-            f"<b>Tap-to-Copy Email Body:</b>\n{monospaced_body}"
-        )
-        sent_id = send_telegram_message(chat_id, draft_msg)
-        logging.info(f"/draft command reply dispatched (chat_id={chat_id}, ack_message_id={sent_id})")
-        return True
-
-    return False
-
 @app.route("/telegram", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     """
-    Instant non-blocking execution (<0.05s return).
-    Validates Telegram's secret token header. Core commands (/t, /search, /health, /efficiency,
-    /streak, /daily, /draft) are handled synchronously right here with a guaranteed requests.post
-    reply. Everything else spawns an isolated daemon thread immediately (no bounded queue/worker
-    pool - unbounded thread-per-update, matching the rest of the app's fire-and-forget dispatch pattern).
+    Instant non-blocking execution (<0.05s return). Validates Telegram's secret token header,
+    then spawns an isolated daemon thread immediately (no bounded queue/worker pool - unbounded
+    thread-per-update). process_webhook_payload_async() is the single source of truth for every command.
     """
     webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     if webhook_secret:
@@ -4592,18 +4449,6 @@ def telegram_webhook():
 
         update_kind = "callback_query" if "callback_query" in data else ("message" if "message" in data else "unknown")
         logging.info(f"Telegram Webhook: received update_kind={update_kind}")
-
-        if update_kind == "message":
-            try:
-                msg = data["message"]
-                chat_id = msg["chat"]["id"]
-                raw_text = msg.get("text", "").strip()
-                text = re.sub(r"@\w+bot", "", raw_text, flags=re.IGNORECASE).strip()
-                logging.info(f"Telegram Webhook: parsed chat_id={chat_id} text='{text}'")
-                if handle_fast_path_command(chat_id, text, msg):
-                    return jsonify({"status": "ok"}), 200
-            except Exception as e:
-                logging.error(f"Telegram Webhook fast-path error: {e} - falling back to async thread")
 
         threading.Thread(target=process_webhook_payload_async, args=(data,), daemon=True).start()
         return jsonify({"status": "ok"}), 200
