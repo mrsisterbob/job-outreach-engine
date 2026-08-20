@@ -15,10 +15,10 @@
       "start": "06/2026",
       "end": "Present",
       "bullets": [
-        "Created over 500 new client tickets and researched Schwab and Fidelity across accounts needing cash raises and distributions with the Service Team.",
         "Identified a workflow collision in Salesforce between restricted trading desk accounts and service queues; presented root-cause analysis to leadership that corrected the underlying ticket misrouting.",
-        "Managed high-velocity operational tickets across Schwab Advisor Center and Fidelity Wealthscape under strict 1-to-2 hour SLA response windows.",
-        "Audited and updated backend records for 1,500+ legacy accounts in internal databases to ensure data parity with custodial compliance standards."
+        "Audited onboarding paperwork for 500+ accounts, checking advisory agreements and risk profiles to stay SEC-compliant.",
+        "Handled urgent advisor service requests within 1 to 2 hour SLA windows to meet custodial deadlines across Schwab Advisor Center and Fidelity Wealthscape.",
+        "Audited and cleaned 1,500+ legacy account files in internal databases to ensure required legal agreements were on record."
       ]
     },
     {
@@ -26,22 +26,22 @@
       "title": "Compliance Lead",
       "location": "Detroit, MI",
       "start": "04/2026",
-      "end": "Present",
+      "end": "05/2026",
       "bullets": [
-        "Architecting regulatory infrastructure for blockchain based real estate and the tokenization of real world assets.",
-        "Drafting SEC Form D filings and Regulation Crowdfunding documentation for SEC and FinCEN compliance.",
-        "Designing operational plumbing for digital asset ownership and institutional data validation."
+        "Drafted SEC Form D and Regulation Crowdfunding filings for digital asset and private real estate offerings.",
+        "Set up compliance checkpoints and suitability reviews for incoming platform investors.",
+        "Reviewed property documentation and title records to ensure custodial data parity across active offerings."
       ]
     },
     {
       "company": "Northwestern Mutual",
-      "title": "Financial Planner",
+      "title": "Financial Planning Intern",
       "location": "Grand Rapids, MI",
       "start": "05/2025",
       "end": "08/2025",
       "bullets": [
-        "Supported introductory client meetings and administrative workflow preparation within a regulated financial planning environment.",
-        "Applied suitability frameworks and regulatory constraints to support advisor operations."
+        "Supported introductory wealth planning reviews and prepared client onboarding documentation under RIA suitability guidelines.",
+        "Verified client financial profiles and prepared account transfer paperwork prior to advisor meetings."
       ]
     },
     {
@@ -51,10 +51,9 @@
       "start": "05/2024",
       "end": "08/2024",
       "bullets": [
-        "Performed high volume reconciliation of 500+ retirement accounts, validating ledger accuracy and resolving discrepancies.",
-        "Built structured audit checklists to cross-reference multi-plant payroll data, catching and correcting recurring 401(k) deduction errors before they compounded.",
-        "Prepared and maintained supporting schedules for variance analysis and recurring internal reports.",
-        "Built and maintained Excel templates to streamline recurring data tasks and reduce manual processing time."
+        "Reconciled employee 401(k) and healthcare deduction variances across 500+ accounts in bSwift and Excel.",
+        "Built structured audit checklists to cross-reference multi-plant payroll data, catching recurring 401(k) deduction errors across 70+ manufacturing facilities.",
+        "Prepared and maintained supporting schedules for variance analysis and recurring internal financial reports."
       ]
     }
   ],

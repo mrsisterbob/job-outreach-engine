@@ -19,11 +19,6 @@ import typst
 # a conservative-tone resume (RIAs, banks, custodians) gets scrubbed to institutional-safe phrasing.
 _CRYPTO_TERMS_PATTERN = re.compile(r"\b(bitcoin|crypto(?:currency)?|tokeniz\w*|web3|blockchain|trading bots?)\b", re.IGNORECASE)
 
-TONE_SKILL_ADDENDUM = {
-    "conservative": ("Compliance & Data Integrity", "Custodial Systems, Data Reconciliation, SEC Compliance."),
-    "tech": ("Modern Engineering & Automation", "Asset Tokenization, API Integration, Flask, Process Automation."),
-}
-
 def apply_tone_filter(text: str, tone_mode: str) -> str:
     """Scrubs crypto/Web3 keywords to institutional-safe phrasing when tone_mode is 'conservative';
     passes text through unchanged for 'tech' (or any other) tone_mode.
@@ -107,46 +102,46 @@ TRACKS = {
     "a": {
         "subtitle": "Financial Systems & Operations",
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
-        "summary": "Operations specialist with experience spanning custodial reconciliations, regulatory compliance, and CRM pipeline automation. Skilled in applying Python, SQL, and system integrations across Salesforce and HubSpot to remove manual bottlenecks, validate institutional data, and streamline complex financial workflows.",
+        "summary": "Operations specialist managing custodial reconciliations, advisor service escalations, and CRM automation across Schwab Advisor Center, Fidelity Wealthscape, and Salesforce. Focused on removing manual bottlenecks, resolving ledger variances, and maintaining SEC compliance.",
         "skills": [
-            ("Operations & Data", "High-Volume Reconciliation, Variance Analysis, Audit Escalation, Power BI (ETL/Modeling), SQL, Advanced Excel."),
-            ("Systems & Tools", "Schwab Advisor Center, Fidelity Wealthscape, Salesforce, HubSpot CRM, DocuSign.")
+            ("Core Operations", "Custodial Reconciliations, Variance Analysis, RIA Compliance Audits, Process Automation."),
+            ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Python, SQL, Excel.")
         ]
     },
     "b": {
         "subtitle": "Data & Systems Engineering",
         "keywords": ("Python", "SQL", "REST APIs", "ETL", "Schema Architecture", "Process Automation"),
-        "summary": "Operations specialist with hands-on experience building Python and SQL tools that automate reconciliation, validate structured data feeds, and integrate REST APIs across CRM and custodial systems. Comfortable owning a problem from schema design through production deployment in fast-moving financial environments.",
+        "summary": "Systems operator building Python scripts, SQL queries, and webhook pipelines that automate account reconciliation, validate JSON payloads, and sync CRM databases with custodial feeds. Experienced deploying lightweight tools that eliminate operational bottlenecks.",
         "skills": [
-            ("Engineering & Data", "Python, SQL, REST API Integration, ETL Modeling & Schema Design, Process Automation, Power BI."),
-            ("Systems & Tools", "HubSpot CRM, Salesforce, Schwab Advisor Center, Fidelity Wealthscape, Typst.")
+            ("Engineering & Data", "Python, SQL, REST APIs, Webhook Integrations, SQLite WAL, Data Reconciliation."),
+            ("Platforms & Stack", "Salesforce, HubSpot CRM, Flask, Typst, Schwab Advisor Center, Fidelity Wealthscape.")
         ]
     },
     "c": {
         "subtitle": "Risk & Regulatory Compliance",
         "keywords": ("Regulatory Compliance", "SEC/FinCEN Filings", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
-        "summary": "Operations specialist with experience across SEC and FinCEN regulatory filings, custodial compliance audits, and DocuSign workflow validation for financial advisory teams. Focused on building controls that catch risk exposure early and keep institutional accounts audit-ready.",
+        "summary": "Compliance and operations specialist with direct experience preparing SEC Form D filings, auditing legacy account files for regulatory compliance, and managing custodial ticket queues. Experienced building intake checkpoints that catch risk exposure early.",
         "skills": [
-            ("Compliance & Risk", "SEC/FinCEN Regulatory Filings, RIA Compliance Audits, DocuSign Workflow Validation, Suitability Review, Risk Escalation Controls."),
-            ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, Orion Eclipse, Excel.")
+            ("Compliance & Risk", "SEC / FinCEN Filings, Suitability Reviews, Custodial Exception Audits, Form D."),
+            ("Systems & Controls", "Salesforce Queue Routing, DocuSign API, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
         ]
     },
     "d": {
         "subtitle": "Business Intelligence & Analytics",
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
-        "summary": "Operations specialist with experience building Power BI dashboards, SQL-driven variance analysis, and Excel reporting models that turn raw operational data into decisions leadership can act on. Comfortable translating messy financial data sets into clear, repeatable reporting pipelines.",
+        "summary": "Analytics operator building SQL variance models, Power BI dashboards, and Excel reporting pipelines to reconcile multi-source financial feeds and track team SLA metrics. Experienced turning messy operational records into clean executive visibility.",
         "skills": [
-            ("Analytics & Reporting", "Power BI Dashboard Design, SQL Aggregation & Variance Analysis, Advanced Excel Modeling, Executive Reporting."),
-            ("Systems & Tools", "Salesforce, HubSpot CRM, Schwab Advisor Center, Fidelity Wealthscape.")
+            ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Advanced Excel Modeling."),
+            ("Systems & Data", "Salesforce Reports, bSwift, Schwab Advisor Center, Fidelity Wealthscape, Python (pandas).")
         ]
     },
     "e": {
         "subtitle": "Business Operations & CRM Systems",
         "keywords": ("Business Operations", "Salesforce", "HubSpot CRM", "Process Automation", "Ticket Routing", "Python"),
-        "summary": "Operations specialist with experience redesigning ticket routing, CRM workflows, and cross-team escalation processes across Salesforce and HubSpot. Focused on removing friction from day-to-day operations so teams spend less time on manual triage and more time on work that matters.",
+        "summary": "Operations specialist focused on resolving ticket queue collisions, standardizing custodial transfer escalation paths, and automating advisor onboarding workflows across Salesforce and HubSpot CRM. Focused on eliminating friction from day-to-day operations.",
         "skills": [
-            ("Operations & Process", "Ticket Routing & Workflow Redesign, Process Automation, Cross-Team Coordination, Escalation Handling."),
-            ("Systems & Tools", "Salesforce, HubSpot CRM, Python, DocuSign, Schwab Advisor Center.")
+            ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management, Process Design."),
+            ("Systems & Tools", "Salesforce, HubSpot CRM, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Python.")
         ]
     }
 }
@@ -247,12 +242,12 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     same `track` value, so no live job-description text is required at render time - the
     resume still compiles correctly even from a bare "a" default with no cached job.
     `tone_mode` ("conservative" | "tech") is the Company Conservatism & Culture Filter: it scrubs
-    crypto/Web3 language from the summary for conservative firms (RIAs, banks, custodians) and
-    appends tone-appropriate chips to the Skills & Systems line.
+    crypto/Web3 language from the summary for conservative firms (RIAs, banks, custodians). The
+    Skills & Systems footer always renders the track's own 2-line category blocks unchanged.
     """
     track_data = TRACKS.get(str(track or "a").lower(), TRACKS["a"])
     tone_key = str(tone_mode or "conservative").lower()
-    if tone_key not in TONE_SKILL_ADDENDUM:
+    if tone_key not in ("conservative", "tech"):
         tone_key = "conservative"
     evidence = load_evidence_bank()
     identity = evidence.get("identity", {})
@@ -282,8 +277,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 
     experience_block = _render_experience_block(evidence, dynamic_bullets=selected_bullets)
     education_credentials_block = _render_education_credentials_block(evidence)
-    tone_skills = list(track_data["skills"]) + [TONE_SKILL_ADDENDUM[tone_key]]
-    skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in tone_skills)
+    skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
 
     markup = f"""
 #set document(
