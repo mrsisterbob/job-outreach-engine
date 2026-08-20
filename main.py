@@ -1454,18 +1454,22 @@ def sanitize_text(text):
     return cleaned.strip()
 
 def get_current_role_blurb():
-    """Returns (core_exp_phrase, full_sentence) for the most recent Evidence Bank experience entry,
-    so outreach copy never drifts from the same facts the resume renders. Hot-reloads the bank on
-    every call.
+    """Returns (core_exp_phrase, full_sentence) cleaned of job-title suffixes
+    so sentences like 'background in wealth operations' read naturally.
     """
     experience = load_evidence_bank().get("experience", [])
     if not experience:
-        return "wealth ops and process automation", "I am currently working in wealth operations and process automation."
+        return "wealth operations and process automation", "I am currently working in wealth operations and process automation."
     current = experience[0]
     title = current.get("title", "")
     company = current.get("company", "")
     location = current.get("location", "")
-    core_exp = f"{title.lower()} and process automation" if title else "wealth ops and process automation"
+
+    # Strip trailing role nouns (Specialist, Intern, Lead, Analyst, Manager)
+    clean_domain = re.sub(r'\b(specialist|intern|lead|analyst|manager|associate|coordinator)\b', '', title, flags=re.IGNORECASE).strip().lower()
+    clean_domain = re.sub(r'\s+', ' ', clean_domain)
+
+    core_exp = f"{clean_domain} and process automation" if clean_domain else "wealth operations and process automation"
     sentence = f"I am currently working as a {title} at {company}" + (f" in {location}" if location else "") + "."
     return core_exp, sentence
 
@@ -1473,8 +1477,11 @@ def generate_cold_email(job_title, company_name, core_exp=None):
     """Full cold email: greeting, strict 2-sentence body, sign-off as separate paragraphs."""
     if not core_exp:
         core_exp, _ = get_current_role_blurb()
-    s1 = f"I saw the {job_title} role at {company_name} and wanted to highlight my background in {core_exp}."
-    s2 = "Would you be open to a brief 5 minute call next week to discuss alignment?"
+    clean_company = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', str(company_name or ''), flags=re.IGNORECASE).strip().rstrip(',')
+    clean_company = re.sub(r'\s+', ' ', clean_company).strip() or (company_name or "your team")
+
+    s1 = f"I saw the {job_title} role at {clean_company} and wanted to highlight my background in {core_exp}."
+    s2 = "Would you be open to a brief 5-minute call next week to discuss alignment?"
     body = enforce_sentence_limit(f"{sanitize_text(s1)} {sanitize_text(s2)}", 2)
     return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
 
