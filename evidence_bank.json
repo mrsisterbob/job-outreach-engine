@@ -17,7 +17,6 @@
       "bullets": [
         "Created over 500 new client tickets and researched Schwab and Fidelity across accounts needing cash raises and distributions with the Service Team.",
         "Identified a workflow collision in Salesforce between restricted trading desk accounts and service queues; presented root-cause analysis to leadership that corrected the underlying ticket misrouting.",
-        "Made an automated and autonomous DocuSign system to open documents and respond to follow up emails to advisors for missing documents based on python coded prompts.",
         "Managed high-velocity operational tickets across Schwab Advisor Center and Fidelity Wealthscape under strict 1-to-2 hour SLA response windows.",
         "Audited and updated backend records for 1,500+ legacy accounts in internal databases to ensure data parity with custodial compliance standards."
       ]
@@ -59,28 +58,6 @@
       ]
     }
   ],
-  "other_experience": [
-    {
-      "title": "Residential Assistant",
-      "company": "Hope College",
-      "location": "Holland, MI",
-      "start": "08/2023",
-      "end": "01/2024",
-      "bullets": [
-        "Managed risky students and escalated health emergencies within dorms."
-      ]
-    },
-    {
-      "title": "Ranger",
-      "company": "Philmont Scout Ranch",
-      "location": "Cimarron, NM",
-      "start": "05/2023",
-      "end": "08/2023",
-      "bullets": [
-        "Trained over 95 participants in backcountry safety and protocols and supported emergency Search and Rescue operations with leadership."
-      ]
-    }
-  ],
   "education": [
     {
       "school": "Hope College",
@@ -97,16 +74,6 @@
     "Bloomberg Market Concepts"
   ],
   "projects": [
-    {
-      "name": "Real World Asset Tokenization",
-      "category": "finance",
-      "location": "Detroit, MI",
-      "start": "07/2026",
-      "end": "08/2026",
-      "bullets": [
-        "Translated El Salvador's Bitcoin laws into plans for an apartment redevelopment project amongst private investors."
-      ]
-    },
     {
       "name": "Job Outreach & CRM Automation Engine",
       "category": "systems",
