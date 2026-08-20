@@ -9,4 +9,5 @@ typst
 apscheduler
 websocket-client
 openpyxl
+pydantic
 pytest

@@ -94,6 +94,13 @@ TRACK_BULLET_POOL_KEYS = {
     "e": "track_e_bizops",
 }
 
+# Indices within specific (track, tone_mode) pairs that contain Web3/crypto/tokenization
+# references - excluded whenever tone_mode is "conservative", regardless of what Gemini routed.
+TRACK_TONE_CONSTRAINTS = {
+    ("c", "conservative"): [2],  # e.g., Form D digital asset/tokenization bullet
+}
+_SAFE_FALLBACK_INDICES = [0, 1, 3]
+
 # Persona framing only (subtitle/keywords/skills prose) - every skill named here must already
 # exist in evidence_bank.json's technical_skills; factual content (jobs, dates, bullets) lives in the bank.
 TRACKS = {
@@ -144,7 +151,7 @@ TRACKS = {
     }
 }
 
-def filter_ats_bullets(track: str = "a", bullet_indices: list = None) -> list:
+def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> list:
     """Resolves the actual bullet strings for a track + list of pool indices. Gemini only ever
     routes a track letter and integer indices (Strict Deterministic Template Engine) - it never
     authors bullet text itself, so there is nothing to "validate" beyond bounds-checking.
@@ -152,10 +159,15 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None) -> list:
     out-of-range index. Still screens against evidence_bank.json's banned_words as a
     defense-in-depth guard in case a manual /edit mutation ever introduces one. Reloads both
     banks from disk on every call (hot-reload).
+    `tone_mode` applies the Company Conservatism & Culture Filter at bullet-selection time: any
+    index flagged in TRACK_TONE_CONSTRAINTS for (track, tone_mode) is dropped and backfilled from
+    _SAFE_FALLBACK_INDICES, so a conservative-tone resume never surfaces a Web3/crypto bullet even
+    if Gemini's routed indices included one.
     """
     evidence_bank = load_evidence_bank()
     resume_bullets_bank = load_resume_bullets_bank()
     track_key = str(track or "a").lower()
+    tone_key = str(tone_mode or "conservative").lower()
     pool_key = TRACK_BULLET_POOL_KEYS.get(track_key, TRACK_BULLET_POOL_KEYS["a"])
     pool = resume_bullets_bank.get(pool_key) or resume_bullets_bank.get(TRACK_BULLET_POOL_KEYS["a"], [])
     banned = [str(w).lower() for w in evidence_bank.get("banned_words", [])]
@@ -166,6 +178,18 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None) -> list:
     )
     indices = bullet_indices if is_valid else [0, 1, 2]
     indices = [i for i in indices if 0 <= i < len(pool)]
+
+    forbidden = TRACK_TONE_CONSTRAINTS.get((track_key, tone_key), [])
+    if forbidden and any(i in forbidden for i in indices):
+        original_len = len(indices)
+        indices = [i for i in indices if i not in forbidden]
+        for fallback_i in _SAFE_FALLBACK_INDICES:
+            if len(indices) >= original_len:
+                break
+            if fallback_i not in indices and fallback_i not in forbidden and 0 <= fallback_i < len(pool):
+                indices.append(fallback_i)
+        if not indices:
+            indices = [0]
 
     selected = [pool[i] for i in indices if not any(bw in str(pool[i]).lower() for bw in banned)]
     return selected or pool[:3]
@@ -234,7 +258,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     identity = evidence.get("identity", {})
     clean_company = escape_typst(company_name or "Target Operations")
 
-    selected_bullets = filter_ats_bullets(track, bullet_indices)
+    selected_bullets = filter_ats_bullets(track, bullet_indices, tone_key)
     lead_bullet = selected_bullets[0] if selected_bullets else None
 
     keywords_tuple = ", ".join(f'"{kw}"' for kw in track_data["keywords"])
