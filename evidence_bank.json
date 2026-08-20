@@ -16,8 +16,10 @@
       "end": "Present",
       "bullets": [
         "Created over 500 new client tickets and researched Schwab and Fidelity across accounts needing cash raises and distributions with the Service Team.",
-        "Found and presented to management an unknown conflict between restricted accounts amongst trading and service tickets.",
-        "Made an automated and autonomous DocuSign system to open documents and respond to follow up emails to advisors for missing documents based on python coded prompts."
+        "Identified a workflow collision in Salesforce between restricted trading desk accounts and service queues; presented root-cause analysis to leadership that corrected the underlying ticket misrouting.",
+        "Made an automated and autonomous DocuSign system to open documents and respond to follow up emails to advisors for missing documents based on python coded prompts.",
+        "Managed high-velocity operational tickets across Schwab Advisor Center and Fidelity Wealthscape under strict 1-to-2 hour SLA response windows.",
+        "Audited and updated backend records for 1,500+ legacy accounts in internal databases to ensure data parity with custodial compliance standards."
       ]
     },
     {
@@ -51,6 +53,7 @@
       "end": "08/2024",
       "bullets": [
         "Performed high volume reconciliation of 500+ retirement accounts, validating ledger accuracy and resolving discrepancies.",
+        "Built structured audit checklists to cross-reference multi-plant payroll data, catching and correcting recurring 401(k) deduction errors before they compounded.",
         "Prepared and maintained supporting schedules for variance analysis and recurring internal reports.",
         "Built and maintained Excel templates to streamline recurring data tasks and reduce manual processing time."
       ]
@@ -105,19 +108,29 @@
       ]
     },
     {
-      "name": "Github Job Hunting and Trading Repositories",
+      "name": "Job Outreach & CRM Automation Engine",
       "category": "systems",
       "location": "Detroit, MI",
       "start": "07/2026",
       "end": "08/2026",
       "bullets": [
-        "Built a personal Job Automation Repository that sources tailor-made postings and auto-updates a self-reinforcing CRM with messages in Telegram.",
-        "Built a Python Scripted Trading bot in Hyperliquid in Code.gs focusing on breakout trading and tracking Market Makers through Options."
+        "Built a Flask and SQLite (WAL mode) backend that sources tailor-made postings and auto-updates a self-reinforcing CRM, syncing replies over Telegram webhooks.",
+        "Wired a headless Typst compiler into the pipeline to generate tailored PDF resumes on demand."
+      ]
+    },
+    {
+      "name": "Hyperliquid Trading Bot",
+      "category": "systems",
+      "location": "Detroit, MI",
+      "start": "07/2026",
+      "end": "08/2026",
+      "bullets": [
+        "Built a Python scripted trading bot in Hyperliquid in Code.gs focusing on breakout trading and tracking Market Makers through Options."
       ]
     }
   ],
   "technical_skills": [
-    "Python", "SQL", "Salesforce", "Power BI", "Excel", "HubSpot CRM", "Schwab Advisor Center", "Fidelity Wealthscape", "DocuSign", "Orion Eclipse", "Typst"
+    "Python", "SQL", "Salesforce", "Power BI", "Excel", "HubSpot CRM", "Schwab Advisor Center", "Fidelity Wealthscape", "DocuSign", "Orion Eclipse", "Typst", "Flask", "SQLite"
   ],
   "banned_words": [
     "leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm", "spearheaded", "utilizing", "dynamic", "robust"

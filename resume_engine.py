@@ -174,24 +174,10 @@ def _render_experience_block(evidence: dict, lead_bullet: str = None) -> str:
             lines.append(f"- {escape_typst(b)}")
     return "\n".join(lines)
 
-def _render_other_experience_block(evidence: dict) -> str:
-    """Renders the Other Experience section (non-financial leadership/service roles) from Evidence Bank data."""
-    lines = []
-    for idx, job in enumerate(evidence.get("other_experience", [])):
-        title = escape_typst(job.get("title", ""))
-        company = escape_typst(job.get("company", ""))
-        location = escape_typst(job.get("location", ""))
-        start = escape_typst(job.get("start", ""))
-        end = escape_typst(job.get("end", ""))
-        if idx > 0:
-            lines.append("#v(2pt)")
-        lines.append(f"*{company}*, _{title}_ #h(1fr) {location} | {start} -- {end}")
-        for b in job.get("bullets", []):
-            lines.append(f"- {escape_typst(b)}")
-    return "\n".join(lines)
-
-def _render_education_block(evidence: dict) -> str:
-    """Renders the Education section entirely from Evidence Bank data."""
+def _render_education_credentials_block(evidence: dict) -> str:
+    """Renders the combined Education & Credentials section - degrees from evidence_bank's
+    `education` list followed by a single comma-joined line of `certificates`.
+    """
     lines = []
     for idx, edu in enumerate(evidence.get("education", [])):
         school = escape_typst(edu.get("school", ""))
@@ -202,42 +188,22 @@ def _render_education_block(evidence: dict) -> str:
         if idx > 0:
             lines.append("#v(2pt)")
         lines.append(f"*{degree}*, {school} #h(1fr) {location} | {start} -- {end}")
-    return "\n".join(lines)
 
-def _render_certificates_line(evidence: dict) -> str:
-    """Renders the Certificates & Licenses section as a single comma-joined line."""
-    return ", ".join(escape_typst(c) for c in evidence.get("certificates", []))
-
-def _render_projects_block(evidence: dict, track: str) -> str:
-    """Renders the Projects section. Dynamically leads with whichever project's category
-    (finance vs systems) matches the current track's lean - reuses the same track signal
-    Gemini already routes, so project prioritization needs no extra job-description parsing.
-    """
-    projects = list(evidence.get("projects", []))
-    preferred_category = "finance" if str(track or "a").lower() in ("a", "c") else "systems"
-    projects.sort(key=lambda p: 0 if p.get("category") == preferred_category else 1)
-
-    lines = []
-    for idx, proj in enumerate(projects):
-        name = escape_typst(proj.get("name", ""))
-        location = escape_typst(proj.get("location", ""))
-        start = escape_typst(proj.get("start", ""))
-        end = escape_typst(proj.get("end", ""))
-        if idx > 0:
-            lines.append("#v(2pt)")
-        lines.append(f"*{name}* #h(1fr) {location} | {start} -- {end}")
-        for b in proj.get("bullets", []):
-            lines.append(f"- {escape_typst(b)}")
+    certificates_line = ", ".join(escape_typst(c) for c in evidence.get("certificates", []))
+    if certificates_line:
+        lines.append("#v(3pt)")
+        lines.append(f"*Certificates & Licenses:* {certificates_line}")
     return "\n".join(lines)
 
 def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None) -> str:
     """Builds single-page Typst markup for the selected persona track, sourcing every factual
-    claim (experience, other experience, education, certificates, projects) from the centralized
-    JSON banks (hot-reloaded fresh on every call). Dynamic 30% customization is entirely
+    claim (experience, education, certificates) from the centralized JSON banks (hot-reloaded
+    fresh on every call), assembled into 4 sections: Summary, Professional Experience,
+    Education & Credentials, Skills & Systems. Dynamic 30% customization is entirely
     track-driven (a-e, already routed by Gemini as an SDTE integer/letter, never free text):
-    the header summary, the leading achievement bullet, project ordering, and skill emphasis
-    all key off the same `track` value, so no live job-description text is required at render
-    time - the resume still compiles correctly even from a bare "a" default with no cached job.
+    the header summary, the leading achievement bullet, and skill emphasis all key off the
+    same `track` value, so no live job-description text is required at render time - the
+    resume still compiles correctly even from a bare "a" default with no cached job.
     """
     track_data = TRACKS.get(str(track or "a").lower(), TRACKS["a"])
     evidence = load_evidence_bank()
@@ -268,10 +234,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     contact_line = " • ".join(contact_fields)
 
     experience_block = _render_experience_block(evidence, lead_bullet=lead_bullet)
-    other_experience_block = _render_other_experience_block(evidence)
-    education_block = _render_education_block(evidence)
-    certificates_line = _render_certificates_line(evidence)
-    projects_block = _render_projects_block(evidence, track)
+    education_credentials_block = _render_education_credentials_block(evidence)
     skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
 
     markup = f"""
@@ -283,8 +246,8 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 )
 
 // Marcus Thorne spacing and typography - tuned to fill the full 1-page canvas edge-to-edge
-#set page(paper: "us-letter", margin: (x: 0.6in, top: 0.45in, bottom: 0.45in))
-#set text(font: "Liberation Sans", size: 9.3pt, fill: rgb("#111827"))
+#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.5in, bottom: 0.5in))
+#set text(font: "Liberation Sans", size: 9.6pt, fill: rgb("#111827"))
 #set par(justify: false, leading: 0.5em, spacing: 0.58em)
 #set list(spacing: 0.38em, indent: 0em)
 #show heading: set block(above: 0.55em, below: 0.3em)
@@ -319,37 +282,10 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
 #v(3pt)
 
-// --- OTHER EXPERIENCE ---
-#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[OTHER EXPERIENCE]
+// --- EDUCATION & CREDENTIALS ---
+#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[EDUCATION & CREDENTIALS]
 #v(2pt)
-{other_experience_block}
-
-#v(5pt)
-#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
-
-// --- EDUCATION ---
-#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[EDUCATION]
-#v(2pt)
-{education_block}
-
-#v(5pt)
-#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
-
-// --- CERTIFICATES & LICENSES ---
-#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[CERTIFICATES & LICENSES]
-#v(2pt)
-{certificates_line}
-
-#v(5pt)
-#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
-
-// --- PROJECTS ---
-#text(size: 8.3pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[PROJECTS]
-#v(2pt)
-{projects_block}
+{education_credentials_block}
 
 #v(5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
