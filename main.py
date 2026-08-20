@@ -210,8 +210,8 @@ EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|T[A-E])(\d+)$", re.IGNORECASE)
 
 def resolve_edit_target(id_str):
     """Maps a /edit ID to (file_path, list_key, index):
-      L0-L5 -> templates/linkedin_templates.json[linkedin_templates]
-      C0-C2 -> templates/outreach_templates.json[cold_ops]
+      L0-L9 -> templates/linkedin_templates.json[linkedin_templates]
+      C0-C5 -> templates/outreach_templates.json[cold_ops]
       W0-W1 -> templates/outreach_templates.json[warm_alumni]
       B0-B1 -> templates/outreach_templates.json[followup_bumps]
       TA0-TA9 ... TE0-TE9 -> resume_bullets_bank.json[track_x_...]
@@ -1521,8 +1521,8 @@ Evaluate the job description and respond ONLY with a JSON object containing:
 "reason": "<1-sentence concise explanation of why this role fits or does not fit>",
 "track": "<one letter a|b|c|d|e selecting the resume bullet pool that best matches this role: a=wealth operations, b=data/systems engineering, c=risk & regulatory compliance, d=business intelligence & analytics, e=business operations & CRM systems>",
 "bullet_indices": [<int>, <int>, <int>],
-"linkedin_template_id": <integer 0-5 selecting a LinkedIn connection note template>,
-"outreach_template_id": <integer 0-2 selecting a cold outreach email template>
+"linkedin_template_id": <integer 0-9 selecting a LinkedIn connection note template>,
+"outreach_template_id": <integer 0-5 selecting a cold outreach email template>
 }}"""
 
 def send_health_alert(error_msg):
