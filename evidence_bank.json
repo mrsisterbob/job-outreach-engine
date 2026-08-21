@@ -15,10 +15,10 @@
       "start": "06/2026",
       "end": "Present",
       "bullets": [
-        "Identified a workflow collision in Salesforce between restricted trading desk accounts and service queues; presented root-cause analysis to leadership that corrected ticket misrouting and prevented 10 SLA breaches.",
-        "Audited onboarding paperwork for 500+ accounts, verifying advisory agreements and client risk profiles to enforce SEC compliance standards.",
-        "Handled urgent advisor service escalations within 1 to 2 hour SLA windows across Schwab Advisor Center and Fidelity Wealthscape.",
-        "Audited and cleaned 1,500+ legacy account files in internal databases to ensure data parity with custodial compliance rules."
+        "Audited onboarding paperwork for 500+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
+        "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
+        "Managed Salesforce ticketing queues and engaged directly with custodians to resolve urgent advisor requests within 1 to 2 hour SLAs.",
+        "Fixed margin errors and cash distribution mismatches across clearing feeds with zero service breaches."
       ]
     },
     {
@@ -40,8 +40,9 @@
       "start": "05/2025",
       "end": "08/2025",
       "bullets": [
-        "Supported introductory wealth planning reviews and prepared client onboarding documentation under RIA suitability guidelines.",
-        "Verified client financial profiles and prepared account transfer paperwork prior to advisor meetings."
+        "Learned the client sales and acquisition process, preparing financial planning proposals and leading 15+ prospecting reviews under RIA suitability guidelines.",
+        "Engaged with institutional custodians to verify prospective client financial profiles and expedite account transfer paperwork.",
+        "Tracked onboarding paperwork exceptions across prospective client files to resolve documentation hold-ups with partner firms."
       ]
     },
     {
@@ -74,27 +75,25 @@
   ],
   "projects": [
     {
-      "name": "Automated Job Search & Custom Telegram CRM Engine",
+      "name": "Automated Job Pipeline & Custom Telegram CRM",
       "category": "systems",
       "location": "Detroit, MI",
       "start": "07/2026",
       "end": "08/2026",
       "bullets": [
-        "Built an automated job sourcing and application CRM in Python and Flask, using SQLite in WAL mode with thread-safe connection pooling to handle concurrent Telegram webhook updates.",
-        "Integrated Gemini REST API for deterministic template routing, evaluating postings against a local evidence bank and piping custom Typst PDF resume compilations in sub-second execution.",
-        "Engineered a two-way synchronization engine to Google Sheets via Apps Script webhooks, featuring an outbox transaction buffer and a 15-minute Gmail polling shield."
+        "Built a Python and Flask backend with SQLite to track job applications and sync live status updates over Telegram webhooks.",
+        "Integrated Gemini API to screen job postings against a resume bank and compile tailored 1-page PDF resumes on demand using Typst."
       ]
     },
     {
-      "name": "Digital Asset Infrastructure & Algorithmic Trading Systems",
+      "name": "Digital Asset Compliance & Algorithmic Trading Systems",
       "category": "systems",
       "location": "Detroit, MI",
       "start": "04/2026",
       "end": "08/2026",
       "bullets": [
-        "Architected regulatory compliance models and SEC Form D / Regulation Crowdfunding frameworks to structure private real estate offerings into digital custodial ledgers.",
-        "Built Python algorithmic trading scripts connecting to decentralized exchange APIs (Hyperliquid), executing breakout momentum models and tracking market-maker liquidity spreads.",
-        "Designed schema validation models in Python to verify incoming transaction payloads, reconcile ledger balances, and prevent execution conflicts across live data feeds."
+        "Structured SEC Form D and Regulation Crowdfunding compliance workflows to tokenize private real estate offerings into digital ledgers.",
+        "Wrote Python scripts connecting to decentralized exchange APIs (Hyperliquid) to execute automated breakout strategies and track market maker data."
       ]
     }
   ],
