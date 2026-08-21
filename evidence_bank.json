@@ -73,6 +73,11 @@
     "Schwab Limited Power of Attorney",
     "Bloomberg Market Concepts"
   ],
+  "activities": [
+    "Secretary, Student Political Organization",
+    "Member, Economic Club of Grand Rapids",
+    "Varsity Cross Country & Track (2 years)"
+  ],
   "projects": [
     {
       "name": "Automated Job Pipeline & Custom Telegram CRM",
@@ -86,14 +91,14 @@
       ]
     },
     {
-      "name": "Digital Asset Compliance & Algorithmic Trading Systems",
+      "name": "Digital Asset Compliance & Automated Execution Systems",
       "category": "systems",
       "location": "Detroit, MI",
       "start": "04/2026",
       "end": "08/2026",
       "bullets": [
-        "Structured SEC Form D and Regulation Crowdfunding compliance workflows to tokenize private real estate offerings into digital ledgers.",
-        "Wrote Python scripts connecting to decentralized exchange APIs (Hyperliquid) to execute automated breakout strategies and track market maker data."
+        "Drafted SEC Form D and Regulation Crowdfunding compliance workflows to structure private real estate offerings into digital ledgers.",
+        "Built Python execution scripts connecting to decentralized exchange APIs (Hyperliquid) to track market maker spreads and automate order routing."
       ]
     }
   ],
