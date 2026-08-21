@@ -86,13 +86,13 @@
       ]
     },
     {
-      "name": "Asset Tokenization & Automated Trading Infrastructure",
+      "name": "Digital Asset Infrastructure & Algorithmic Trading Systems",
       "category": "systems",
       "location": "Detroit, MI",
       "start": "04/2026",
       "end": "08/2026",
       "bullets": [
-        "Architected regulatory compliance models and SEC Form D / Regulation Crowdfunding frameworks to structure real-world real estate assets into digital custodial ledgers.",
+        "Architected regulatory compliance models and SEC Form D / Regulation Crowdfunding frameworks to structure private real estate offerings into digital custodial ledgers.",
         "Built Python algorithmic trading scripts connecting to decentralized exchange APIs (Hyperliquid), executing breakout momentum models and tracking market-maker liquidity spreads.",
         "Designed schema validation models in Python to verify incoming transaction payloads, reconcile ledger balances, and prevent execution conflicts across live data feeds."
       ]

@@ -300,7 +300,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     experience_block = _render_experience_block(evidence, dynamic_bullets=selected_bullets)
     projects_block = _render_projects_block(evidence, tone_mode=tone_key)
     education_credentials_block = _render_education_credentials_block(evidence)
-    skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
+    skills_lines = " \\\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
 
     markup = f"""
 #set document(
@@ -311,17 +311,17 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 )
 
 // Tuned 1-Page Layout Spacing
-#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.44in, bottom: 0.44in))
-#set text(font: "Liberation Sans", size: 9.6pt, fill: rgb("#111827"))
-#set par(justify: false, leading: 0.50em, spacing: 0.50em)
-#set list(spacing: 0.38em, indent: 0em)
-#show heading: set block(above: 0.45em, below: 0.20em)
+#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.42in, bottom: 0.42in))
+#set text(font: "Liberation Sans", size: 9.5pt, fill: rgb("#111827"))
+#set par(justify: false, leading: 0.48em, spacing: 0.48em)
+#set list(spacing: 0.36em, indent: 0em)
+#show heading: set block(above: 0.40em, below: 0.18em)
 
 // --- HEADER ---
 #align(center)[
   #text(size: 18pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
   #text(size: 10pt, weight: "medium", fill: rgb("#4B5563"))[{escape_typst(track_data["subtitle"])}] \\
-  #v(2.5pt)
+  #v(2pt)
   #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
 ]
 
