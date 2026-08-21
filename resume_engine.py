@@ -311,11 +311,11 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 )
 
 // Tuned 1-Page Layout Spacing
-#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.45in, bottom: 0.45in))
-#set text(font: "Liberation Sans", size: 9.7pt, fill: rgb("#111827"))
-#set par(justify: false, leading: 0.52em, spacing: 0.52em)
-#set list(spacing: 0.42em, indent: 0em)
-#show heading: set block(above: 0.5em, below: 0.25em)
+#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.44in, bottom: 0.44in))
+#set text(font: "Liberation Sans", size: 9.6pt, fill: rgb("#111827"))
+#set par(justify: false, leading: 0.50em, spacing: 0.50em)
+#set list(spacing: 0.38em, indent: 0em)
+#show heading: set block(above: 0.45em, below: 0.20em)
 
 // --- HEADER ---
 #align(center)[
@@ -325,45 +325,45 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
   #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
 ]
 
-#v(5pt)
+#v(4.5pt)
 #line(length: 100%, stroke: 0.7pt + rgb("#CCCCCC"))
-#v(3pt)
+#v(2.5pt)
 
 // --- SUMMARY ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
 #v(2pt)
 {summary}
 
-#v(5pt)
+#v(4.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
+#v(2.5pt)
 
 // --- PROFESSIONAL EXPERIENCE ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[PROFESSIONAL EXPERIENCE]
 #v(2pt)
 {experience_block}
 
-#v(5pt)
+#v(4.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
+#v(2.5pt)
 
 // --- TECHNICAL PROJECTS ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[TECHNICAL PROJECTS]
 #v(2pt)
 {projects_block}
 
-#v(5pt)
+#v(4.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
+#v(2.5pt)
 
 // --- EDUCATION & CREDENTIALS ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[EDUCATION & CREDENTIALS]
 #v(2pt)
 {education_credentials_block}
 
-#v(5pt)
+#v(4.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(3pt)
+#v(2.5pt)
 
 // --- SKILLS & SYSTEMS ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SKILLS & SYSTEMS]
