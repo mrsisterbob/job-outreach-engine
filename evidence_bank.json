@@ -80,19 +80,21 @@
       "start": "07/2026",
       "end": "08/2026",
       "bullets": [
-        "Built a Flask and SQLite (WAL mode) backend that sources tailor-made postings and auto-updates a self-reinforcing CRM, syncing replies over Telegram webhooks.",
-        "Wired a headless Typst compiler into the pipeline to generate tailored, ATS-compliant PDF resumes on demand."
+        "Built an automated job sourcing and application CRM in Python and Flask, using SQLite in WAL mode with thread-safe connection pooling to handle concurrent Telegram webhook updates.",
+        "Integrated Gemini REST API for deterministic template routing, evaluating postings against a local evidence bank and piping custom Typst PDF resume compilations in sub-second execution.",
+        "Engineered a two-way synchronization engine to Google Sheets via Apps Script webhooks, featuring an outbox transaction buffer and a 15-minute Gmail polling shield."
       ]
     },
     {
-      "name": "Real World Asset Tokenization & Trading Infrastructure",
+      "name": "Asset Tokenization & Automated Trading Infrastructure",
       "category": "systems",
       "location": "Detroit, MI",
       "start": "04/2026",
       "end": "08/2026",
       "bullets": [
-        "Designed proposals for blockchain-based real estate tokenization and evaluated legal compliance structures under SEC Form D and Regulation Crowdfunding.",
-        "Scripted automated breakout trading engines and market maker tracking models in Python connecting to decentralized exchange APIs."
+        "Architected regulatory compliance models and SEC Form D / Regulation Crowdfunding frameworks to structure real-world real estate assets into digital custodial ledgers.",
+        "Built Python algorithmic trading scripts connecting to decentralized exchange APIs (Hyperliquid), executing breakout momentum models and tracking market-maker liquidity spreads.",
+        "Designed schema validation models in Python to verify incoming transaction payloads, reconcile ledger balances, and prevent execution conflicts across live data feeds."
       ]
     }
   ],
