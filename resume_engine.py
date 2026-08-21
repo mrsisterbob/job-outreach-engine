@@ -204,7 +204,7 @@ def _render_experience_block(evidence: dict, dynamic_bullets: list = None) -> st
         start = escape_typst(job.get("start", ""))
         end = escape_typst(job.get("end", ""))
         if idx > 0:
-            lines.append("#v(5pt)")
+            lines.append("#v(6.5pt)")
         lines.append(f"*{title}* | {company} #h(1fr) {location} | {start} -- {end}")
         bullets = dynamic_bullets if (idx == 0 and dynamic_bullets) else job.get("bullets", [])
         for b in bullets:
@@ -223,12 +223,12 @@ def _render_education_credentials_block(evidence: dict) -> str:
         start = escape_typst(edu.get("start", ""))
         end = escape_typst(edu.get("end", ""))
         if idx > 0:
-            lines.append("#v(2pt)")
+            lines.append("#v(4.0pt)")
         lines.append(f"*{degree}*, {school} #h(1fr) {location} | {start} -- {end}")
 
     certificates_line = ", ".join(escape_typst(c) for c in evidence.get("certificates", []))
     if certificates_line:
-        lines.append("#v(3pt)")
+        lines.append("#v(4.0pt)")
         lines.append(f"*Certificates & Licenses:* {certificates_line}")
     return "\n".join(lines)
 
@@ -247,7 +247,7 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative") -> s
         end = escape_typst(proj.get("end", ""))
         bullets = proj.get("bullets", [])
         if idx > 0:
-            lines.append("#v(4pt)")
+            lines.append("#v(6.0pt)")
         lines.append(f"*{name}* #h(1fr) {location} | {start} -- {end}")
         for b in bullets:
             clean_b = apply_tone_filter(b, tone_key)
@@ -311,11 +311,11 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 )
 
 // Tuned 1-Page Layout Spacing
-#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.42in, bottom: 0.42in))
+#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.44in, bottom: 0.44in))
 #set text(font: "Liberation Sans", size: 9.5pt, fill: rgb("#111827"))
-#set par(justify: false, leading: 0.48em, spacing: 0.48em)
-#set list(spacing: 0.36em, indent: 0em)
-#show heading: set block(above: 0.40em, below: 0.18em)
+#set par(justify: false, leading: 0.57em, spacing: 0.57em)
+#set list(spacing: 0.50em, indent: 0em)
+#show heading: set block(above: 0.50em, below: 0.22em)
 
 // --- HEADER ---
 #align(center)[
@@ -325,45 +325,45 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
   #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
 ]
 
-#v(4.5pt)
+#v(6.5pt)
 #line(length: 100%, stroke: 0.7pt + rgb("#CCCCCC"))
-#v(2.5pt)
+#v(3.8pt)
 
 // --- SUMMARY ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
 #v(2pt)
 {summary}
 
-#v(4.5pt)
+#v(6.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(2.5pt)
+#v(3.8pt)
 
 // --- PROFESSIONAL EXPERIENCE ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[PROFESSIONAL EXPERIENCE]
 #v(2pt)
 {experience_block}
 
-#v(4.5pt)
+#v(6.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(2.5pt)
+#v(3.8pt)
 
 // --- TECHNICAL PROJECTS ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[TECHNICAL PROJECTS]
 #v(2pt)
 {projects_block}
 
-#v(4.5pt)
+#v(6.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(2.5pt)
+#v(3.8pt)
 
 // --- EDUCATION & CREDENTIALS ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[EDUCATION & CREDENTIALS]
 #v(2pt)
 {education_credentials_block}
 
-#v(4.5pt)
+#v(6.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(2.5pt)
+#v(3.8pt)
 
 // --- SKILLS & SYSTEMS ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SKILLS & SYSTEMS]
