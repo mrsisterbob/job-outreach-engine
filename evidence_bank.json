@@ -74,24 +74,25 @@
   ],
   "projects": [
     {
-      "name": "Job Outreach & CRM Automation Engine",
+      "name": "Automated Job Search & Custom Telegram CRM Engine",
       "category": "systems",
       "location": "Detroit, MI",
       "start": "07/2026",
       "end": "08/2026",
       "bullets": [
         "Built a Flask and SQLite (WAL mode) backend that sources tailor-made postings and auto-updates a self-reinforcing CRM, syncing replies over Telegram webhooks.",
-        "Wired a headless Typst compiler into the pipeline to generate tailored PDF resumes on demand."
+        "Wired a headless Typst compiler into the pipeline to generate tailored, ATS-compliant PDF resumes on demand."
       ]
     },
     {
-      "name": "Hyperliquid Trading Bot",
+      "name": "Real World Asset Tokenization & Trading Infrastructure",
       "category": "systems",
       "location": "Detroit, MI",
-      "start": "07/2026",
+      "start": "04/2026",
       "end": "08/2026",
       "bullets": [
-        "Built a Python scripted trading bot in Hyperliquid in Code.gs focusing on breakout trading and tracking Market Makers through Options."
+        "Designed proposals for blockchain-based real estate tokenization and evaluated legal compliance structures under SEC Form D and Regulation Crowdfunding.",
+        "Scripted automated breakout trading engines and market maker tracking models in Python connecting to decentralized exchange APIs."
       ]
     }
   ],

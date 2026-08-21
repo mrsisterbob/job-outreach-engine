@@ -102,7 +102,7 @@ TRACKS = {
     "a": {
         "subtitle": "Financial Systems & Operations",
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
-        "summary": "Operations specialist managing custodial reconciliations, advisor service escalations, and CRM automation across Schwab Advisor Center, Fidelity Wealthscape, and Salesforce. Focused on removing manual bottlenecks, resolving ledger variances, and maintaining SEC compliance.",
+        "summary": "I reconcile custodial accounts and automate onboarding paperwork using Python and Salesforce.",
         "skills": [
             ("Core Operations", "Custodial Reconciliations, Variance Analysis, RIA Compliance Audits, Process Automation."),
             ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Python, SQL, Excel.")
@@ -111,7 +111,7 @@ TRACKS = {
     "b": {
         "subtitle": "Data & Systems Engineering",
         "keywords": ("Python", "SQL", "REST APIs", "ETL", "Schema Architecture", "Process Automation"),
-        "summary": "Systems operator building Python scripts, SQL queries, and webhook pipelines that automate account reconciliation, validate JSON payloads, and sync CRM databases with custodial feeds. Experienced deploying lightweight tools that eliminate operational bottlenecks.",
+        "summary": "I build lightweight Python scripts and database tools to automate manual back-office tasks.",
         "skills": [
             ("Engineering & Data", "Python, SQL, REST APIs, Webhook Integrations, SQLite WAL, Data Reconciliation."),
             ("Platforms & Stack", "Salesforce, HubSpot CRM, Flask, Typst, Schwab Advisor Center, Fidelity Wealthscape.")
@@ -120,7 +120,7 @@ TRACKS = {
     "c": {
         "subtitle": "Risk & Regulatory Compliance",
         "keywords": ("Regulatory Compliance", "SEC/FinCEN Filings", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
-        "summary": "Compliance and operations specialist with direct experience preparing SEC Form D filings, auditing legacy account files for regulatory compliance, and managing custodial ticket queues. Experienced building intake checkpoints that catch risk exposure early.",
+        "summary": "I audit client onboarding files and draft SEC filings to catch compliance risks early.",
         "skills": [
             ("Compliance & Risk", "SEC / FinCEN Filings, Suitability Reviews, Custodial Exception Audits, Form D."),
             ("Systems & Controls", "Salesforce Queue Routing, DocuSign API, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
@@ -129,7 +129,7 @@ TRACKS = {
     "d": {
         "subtitle": "Business Intelligence & Analytics",
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
-        "summary": "Analytics operator building SQL variance models, Power BI dashboards, and Excel reporting pipelines to reconcile multi-source financial feeds and track team SLA metrics. Experienced turning messy operational records into clean executive visibility.",
+        "summary": "I build SQL queries and Power BI dashboards to reconcile complex financial data.",
         "skills": [
             ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Advanced Excel Modeling."),
             ("Systems & Data", "Salesforce Reports, bSwift, Schwab Advisor Center, Fidelity Wealthscape, Python (pandas).")
@@ -138,7 +138,7 @@ TRACKS = {
     "e": {
         "subtitle": "Business Operations & CRM Systems",
         "keywords": ("Business Operations", "Salesforce", "HubSpot CRM", "Process Automation", "Ticket Routing", "Python"),
-        "summary": "Operations specialist focused on resolving ticket queue collisions, standardizing custodial transfer escalation paths, and automating advisor onboarding workflows across Salesforce and HubSpot CRM. Focused on eliminating friction from day-to-day operations.",
+        "summary": "I design Salesforce ticket queues and DocuSign workflows to cut operational response times.",
         "skills": [
             ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management, Process Design."),
             ("Systems & Tools", "Salesforce, HubSpot CRM, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Python.")
@@ -204,7 +204,7 @@ def _render_experience_block(evidence: dict, dynamic_bullets: list = None) -> st
         start = escape_typst(job.get("start", ""))
         end = escape_typst(job.get("end", ""))
         if idx > 0:
-            lines.append("#v(10pt)")
+            lines.append("#v(5pt)")
         lines.append(f"*{title}* | {company} #h(1fr) {location} | {start} -- {end}")
         bullets = dynamic_bullets if (idx == 0 and dynamic_bullets) else job.get("bullets", [])
         for b in bullets:
@@ -230,6 +230,28 @@ def _render_education_credentials_block(evidence: dict) -> str:
     if certificates_line:
         lines.append("#v(3pt)")
         lines.append(f"*Certificates & Licenses:* {certificates_line}")
+    return "\n".join(lines)
+
+def _render_projects_block(evidence: dict, tone_mode: str = "conservative") -> str:
+    """Renders the Technical Projects section - name/location/dates header line per project,
+    followed by its bullets. `tone_mode` scrubs crypto/Web3 phrasing for conservative firms,
+    same as the summary and dynamic experience bullets.
+    """
+    lines = []
+    tone_key = str(tone_mode or "conservative").lower()
+    projects = evidence.get("projects", [])
+    for idx, proj in enumerate(projects):
+        name = escape_typst(apply_tone_filter(proj.get("name", ""), tone_key))
+        location = escape_typst(proj.get("location", ""))
+        start = escape_typst(proj.get("start", ""))
+        end = escape_typst(proj.get("end", ""))
+        bullets = proj.get("bullets", [])
+        if idx > 0:
+            lines.append("#v(4pt)")
+        lines.append(f"*{name}* #h(1fr) {location} | {start} -- {end}")
+        for b in bullets:
+            clean_b = apply_tone_filter(b, tone_key)
+            lines.append(f"- {escape_typst(clean_b)}")
     return "\n".join(lines)
 
 def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> str:
@@ -276,6 +298,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     contact_line = " • ".join(contact_fields)
 
     experience_block = _render_experience_block(evidence, dynamic_bullets=selected_bullets)
+    projects_block = _render_projects_block(evidence, tone_mode=tone_key)
     education_credentials_block = _render_education_credentials_block(evidence)
     skills_lines = "\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
 
@@ -288,54 +311,63 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 )
 
 // Tuned 1-Page Layout Spacing
-#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.52in, bottom: 0.52in))
-#set text(font: "Liberation Sans", size: 10.3pt, fill: rgb("#111827"))
-#set par(justify: false, leading: 0.65em, spacing: 0.65em)
-#set list(spacing: 0.68em, indent: 0em)
-#show heading: set block(above: 0.6em, below: 0.3em)
+#set page(paper: "us-letter", margin: (x: 0.65in, top: 0.45in, bottom: 0.45in))
+#set text(font: "Liberation Sans", size: 9.7pt, fill: rgb("#111827"))
+#set par(justify: false, leading: 0.52em, spacing: 0.52em)
+#set list(spacing: 0.42em, indent: 0em)
+#show heading: set block(above: 0.5em, below: 0.25em)
 
 // --- HEADER ---
 #align(center)[
-  #text(size: 18.5pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
-  #text(size: 10.2pt, weight: "medium", fill: rgb("#4B5563"))[{escape_typst(track_data["subtitle"])}] \\
-  #v(3pt)
+  #text(size: 18pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
+  #text(size: 10pt, weight: "medium", fill: rgb("#4B5563"))[{escape_typst(track_data["subtitle"])}] \\
+  #v(2.5pt)
   #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
 ]
 
-#v(10pt)
+#v(5pt)
 #line(length: 100%, stroke: 0.7pt + rgb("#CCCCCC"))
-#v(6pt)
+#v(3pt)
 
 // --- SUMMARY ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
-#v(2.5pt)
+#v(2pt)
 {summary}
 
-#v(10pt)
+#v(5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(6pt)
+#v(3pt)
 
 // --- PROFESSIONAL EXPERIENCE ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[PROFESSIONAL EXPERIENCE]
-#v(2.5pt)
+#v(2pt)
 {experience_block}
 
-#v(10pt)
+#v(5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(6pt)
+#v(3pt)
+
+// --- TECHNICAL PROJECTS ---
+#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[TECHNICAL PROJECTS]
+#v(2pt)
+{projects_block}
+
+#v(5pt)
+#line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
+#v(3pt)
 
 // --- EDUCATION & CREDENTIALS ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[EDUCATION & CREDENTIALS]
-#v(2.5pt)
+#v(2pt)
 {education_credentials_block}
 
-#v(10pt)
+#v(5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
-#v(6pt)
+#v(3pt)
 
 // --- SKILLS & SYSTEMS ---
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SKILLS & SYSTEMS]
-#v(2.5pt)
+#v(2pt)
 {skills_lines}
 """
     return markup.strip()
