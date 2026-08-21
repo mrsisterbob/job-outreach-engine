@@ -91,14 +91,14 @@
       ]
     },
     {
-      "name": "Digital Asset Compliance & Automated Execution Systems",
+      "name": "Crypto Breakout Alert and Real Time Paper Trading Engine",
       "category": "systems",
       "location": "Detroit, MI",
       "start": "04/2026",
       "end": "08/2026",
       "bullets": [
-        "Drafted SEC Form D and Regulation Crowdfunding compliance workflows to structure private real estate offerings into digital ledgers.",
-        "Built Python execution scripts connecting to decentralized exchange APIs (Hyperliquid) to track market maker spreads and automate order routing."
+        "Built a concurrent Python backend utilizing SQLite in WAL mode with explicit write locks to process live exchange data and manage virtual portfolios.",
+        "Engineered a real time WebSocket reconciliation feed and historical backtester for automated breakout detection and trade execution."
       ]
     }
   ],
