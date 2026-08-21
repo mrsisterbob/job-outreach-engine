@@ -104,7 +104,7 @@ TRACKS = {
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
         "summary": "I reconcile custodial accounts and automate onboarding paperwork using Python and Salesforce.",
         "skills": [
-            ("Core Operations", "Custodial Reconciliations, Variance Analysis, RIA Compliance Audits, Process Automation."),
+            ("Core Operations", "Custodial Cashiering & Reconciliations, Ticketing Queue Management, RIA Audits, Automation."),
             ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Python, SQL, Excel.")
         ]
     },
@@ -122,7 +122,7 @@ TRACKS = {
         "keywords": ("Regulatory Compliance", "SEC/FinCEN Filings", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
         "summary": "I audit client onboarding files and draft SEC filings to catch compliance risks early.",
         "skills": [
-            ("Compliance & Risk", "SEC / FinCEN Filings, Suitability Reviews, Custodial Exception Audits, Form D."),
+            ("Compliance & Risk", "SEC & FinCEN Filings, Suitability Reviews, Custodial Exception Audits, Form D."),
             ("Systems & Controls", "Salesforce Queue Routing, DocuSign API, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
         ]
     },
@@ -312,10 +312,10 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 
 // Tuned 1-Page Layout Spacing
 #set page(paper: "us-letter", margin: (x: 0.65in, top: 0.44in, bottom: 0.44in))
-#set text(font: "Liberation Sans", size: 9.5pt, fill: rgb("#111827"))
-#set par(justify: false, leading: 0.57em, spacing: 0.57em)
-#set list(spacing: 0.50em, indent: 0em)
-#show heading: set block(above: 0.50em, below: 0.22em)
+#set text(font: "Liberation Sans", size: 9.6pt, fill: rgb("#111827"))
+#set par(justify: false, leading: 0.55em, spacing: 0.55em)
+#set list(spacing: 0.48em, indent: 0em)
+#show heading: set block(above: 0.48em, below: 0.20em)
 
 // --- HEADER ---
 #align(center)[
