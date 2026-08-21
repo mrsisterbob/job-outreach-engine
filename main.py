@@ -1223,12 +1223,13 @@ def build_crm_payload(action, sheet_uuid=None, **kwargs):
 def _parse_company_title_from_card_text(text):
     """Extracts (company, title) from a dispatched job-card's Telegram text via its 💼/🏢 markers,
     for stale swipe-reply recovery when the local sheet_row_map mapping has been lost/evicted.
+    Tags are optional since mobile/desktop Telegram clients strip <b>/<code> from reply-to text.
     Returns (None, None) if either marker is missing.
     """
     if not text:
         return None, None
-    title_match = re.search(r'💼\s*<b>(.*?)</b>', text)
-    company_match = re.search(r'🏢\s*<b>(.*?)</b>', text)
+    title_match = re.search(r'💼\s*(?:<b>)?(.*?)(?:</b>)?(?:\n|$)', text)
+    company_match = re.search(r'🏢\s*(?:<b>)?(.*?)(?:</b>)?(?:\n|$)', text)
     if not (title_match and company_match):
         return None, None
     return html.unescape(company_match.group(1)).strip(), html.unescape(title_match.group(1)).strip()
@@ -1236,12 +1237,13 @@ def _parse_company_title_from_card_text(text):
 def _parse_sheet_uuid_from_card_text(text):
     """Extracts (sheet_uuid, sheet_tab) embedded directly in a dispatched card's own 🆔 marker.
     Unlike sheet_row_map, this survives SQLite wipes from container restarts/redeploys since the
-    durable copy lives in the Telegram message itself, not the ephemeral local DB.
+    durable copy lives in the Telegram message itself, not the ephemeral local DB. Tags are optional
+    since mobile/desktop Telegram clients strip <code> from reply-to text.
     Returns (None, None) if the marker is missing.
     """
     if not text:
         return None, None
-    match = re.search(r'🆔\s*<code>([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})</code>(?:\s*·\s*<code>([^<]*)</code>)?', text)
+    match = re.search(r'🆔\s*(?:<code>)?([0-9a-fA-F\-]{36})(?:</code>)?(?:\s*·\s*(?:<code>)?([^<\n]*)(?:</code>)?)?', text)
     if not match:
         return None, None
     return match.group(1), html.unescape((match.group(2) or "Pipeline_Candidates").strip())
@@ -1423,6 +1425,12 @@ def get_warm_crm_contacts():
         contacts = {}
         for row in data.get("followups", []):
             company = str(row.get("company") or "").strip()
+            raw_name = str(row.get("name") or "").strip()
+            # Fallback: infer company from the trailing token of the contact name when Column C is blank
+            if not company and raw_name and not raw_name.lower().startswith("http"):
+                name_parts = raw_name.split()
+                if len(name_parts) >= 2:
+                    company = name_parts[-1]
             if not company:
                 continue
             contacts[normalize_company_for_match(company)] = {
@@ -1584,10 +1592,12 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
         score += 10
     if max_sal >= 60000:
         score += 5
-    if any(k in desc for k in ["fintech", "payments", "autotech", "automotive", "saas", "bizops"]):
+    if any(k in desc for k in ["fintech", "payments", "autotech", "saas", "tokenization", "digital assets", "web3", "trading bot"]):
+        score += 15
+    if any(k in desc for k in ["schwab", "fidelity", "docusign", "orion", "salesforce", "python", "sql", "etl"]):
         score += 10
-    if any(k in desc for k in ["python", "sql", "salesforce", "automation", "api"]):
-        score += 5
+    if any(k in desc for k in ["high call volume", "outbound calling", "phone queue", "call center", "inbound calls", "dialer"]):
+        score -= 20
     if any(k in title for k in ["data entry", "admin coordinator", "administrative assistant"]) and max_sal < 60000:
         score -= 15
     if "wealth" in desc and not any(k in desc for k in ["python", "sql", "automation", "systems"]):
@@ -1605,7 +1615,7 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     return max(1, min(100, score))
 
 def resolve_live_alumni_at_company(company_name, school="Hope College"):
-    """JIT alumni resolution: live-queries DuckDuckGo HTML search for a LinkedIn profile at
+    """JIT alumni resolution: live-queries DuckDuckGo HTML search for a LinkedIn profile ath
     company_name sharing `school` as alma mater, instead of relying on a static spreadsheet.
     Returns {"name", "company", "linkedin_url", "headline"} for the top matching profile, or None
     on no-match/timeout/failure.
