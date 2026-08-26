@@ -1,5 +1,10 @@
 # job-outreach-engine
 
+<!-- AUTO-STATS:START -->
+![Lines of source](https://img.shields.io/badge/source-5985_lines-c9a24b)
+![Tests](https://img.shields.io/badge/tests-54-4a8a5c)
+<!-- AUTO-STATS:END -->
+
 An AI-assisted job search pipeline: sources listings from multiple job boards, screens/tailors
 outreach with Gemini against a strict evidence bank (no hallucinated experience), logs everything
 to a Google Sheets CRM, and runs entirely through a swipe-reply Telegram bot. Designed to be run
