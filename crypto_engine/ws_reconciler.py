@@ -16,6 +16,7 @@ import websocket
 
 import alert_dispatcher
 import analytics_engine
+import circuit_breaker
 import database
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
@@ -70,6 +71,8 @@ def _on_message(ws, message: str) -> None:
             continue
         try:
             event = analytics_engine.reconcile_trade_tick(trade, price)
+            if event:
+                circuit_breaker.update_peak_balance()
             alert_dispatcher.dispatch_reconcile_event(event)
         except Exception as e:
             logging.error(f"ws_reconciler: failed to reconcile trade #{trade.get('id')} ({trade['symbol']}) @ {price}: {e}")

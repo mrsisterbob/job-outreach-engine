@@ -22,6 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import database
 import analytics_engine
 import alert_dispatcher
+import circuit_breaker
 import ws_reconciler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -132,6 +133,9 @@ def _process_scan_results(signals: list[dict], notify: bool) -> list[dict]:
 
 
 def scan_cycle_job() -> None:
+    if circuit_breaker.is_tripped():
+        logging.info("scan_cycle_job: circuit breaker tripped, skipping scan.")
+        return
     try:
         signals = analytics_engine.scan_all_symbols()
     except Exception as e:
@@ -144,23 +148,32 @@ def reconcile_paper_trades_job() -> None:
     """REST-based reconciliation backstop (5-min cadence). The real-time WebSocket reconciler
     (ws_reconciler.py) handles sub-second SL/TP/scale-out detection on the same shared decision
     logic (analytics_engine.reconcile_trade_tick); this loop exists purely in case the WS
-    connection drops or misses a tick."""
+    connection drops or misses a tick.
+
+    Runs (and checks the circuit breaker) regardless of whether it's currently tripped - a
+    tripped breaker blocks NEW entries and alerts, but existing open trades must keep being
+    reconciled against their own stop-loss/take-profit unchanged."""
     try:
         open_trades = database.get_open_paper_trades()
-        if not open_trades:
-            return
-        prices = {}
-        for symbol in {t["symbol"] for t in open_trades}:
-            try:
-                prices[symbol] = analytics_engine.fetch_current_price(symbol)
-            except Exception as e:
-                logging.error(f"reconcile_paper_trades_job: price fetch failed for {symbol}: {e}")
-        for trade in open_trades:
-            price = prices.get(trade["symbol"])
-            if price is None:
-                continue
-            event = analytics_engine.reconcile_trade_tick(trade, price)
-            alert_dispatcher.dispatch_reconcile_event(event)
+        if open_trades:
+            prices = {}
+            for symbol in {t["symbol"] for t in open_trades}:
+                try:
+                    prices[symbol] = analytics_engine.fetch_current_price(symbol)
+                except Exception as e:
+                    logging.error(f"reconcile_paper_trades_job: price fetch failed for {symbol}: {e}")
+            for trade in open_trades:
+                price = prices.get(trade["symbol"])
+                if price is None:
+                    continue
+                event = analytics_engine.reconcile_trade_tick(trade, price)
+                if event:
+                    circuit_breaker.update_peak_balance()
+                alert_dispatcher.dispatch_reconcile_event(event)
+
+        breach = circuit_breaker.check_and_latch()
+        if breach:
+            alert_dispatcher.send_telegram_message(alert_dispatcher.format_circuit_breaker_tripped_alert(breach))
     except Exception as e:
         logging.error(f"reconcile_paper_trades_job failed: {e}", exc_info=True)
 
@@ -246,6 +259,13 @@ def _cmd_config(chat_id: str) -> None:
 
 
 def _cmd_paper_buy(text: str, chat_id: str) -> None:
+    if circuit_breaker.is_tripped():
+        alert_dispatcher.send_telegram_message(
+            "🛑 Circuit breaker is active - new entries are blocked. Send <code>/status</code> "
+            "to review, or <code>/resume</code> once you've decided to continue.",
+            chat_id=chat_id,
+        )
+        return
     match = PAPER_BUY_RE.match(text)
     if not match:
         alert_dispatcher.send_telegram_message("⚠️ Invalid format. Usage: <code>/paper_buy BTCUSDT 2%</code>", chat_id=chat_id)
@@ -307,6 +327,28 @@ def _cmd_paper_buy(text: str, chat_id: str) -> None:
         alert_dispatcher.send_telegram_message(f"⚠️ Failed to open paper trade: {html.escape(str(e))}", chat_id=chat_id)
 
 
+def _cmd_status(chat_id: str) -> None:
+    alert_dispatcher.send_telegram_message(
+        alert_dispatcher.format_circuit_breaker_status_card(circuit_breaker.status()), chat_id=chat_id,
+    )
+
+
+def _cmd_halt(chat_id: str) -> None:
+    circuit_breaker.halt_manual()
+    alert_dispatcher.send_telegram_message(
+        "🛑 Manually halted. New signal alerts and paper-trade entries are blocked until <code>/resume</code>.",
+        chat_id=chat_id,
+    )
+
+
+def _cmd_resume(chat_id: str) -> None:
+    circuit_breaker.reset()
+    alert_dispatcher.send_telegram_message(
+        "✅ Circuit breaker reset. Peak balance re-anchored to current balance - drawdown is now tracked fresh from here.",
+        chat_id=chat_id,
+    )
+
+
 def _handle_command(text: str, chat_id: str) -> None:
     try:
         if text == "/scan":
@@ -315,6 +357,12 @@ def _handle_command(text: str, chat_id: str) -> None:
             _cmd_portfolio(chat_id)
         elif text == "/config":
             _cmd_config(chat_id)
+        elif text == "/status":
+            _cmd_status(chat_id)
+        elif text == "/halt":
+            _cmd_halt(chat_id)
+        elif text == "/resume":
+            _cmd_resume(chat_id)
         elif text.lower().startswith("/paper_buy"):
             _cmd_paper_buy(text, chat_id)
         elif not text.startswith("/") and (m := CONFIG_MUTATION_RE.match(text)):
@@ -323,7 +371,7 @@ def _handle_command(text: str, chat_id: str) -> None:
         else:
             alert_dispatcher.send_telegram_message(
                 "Unknown command. Available: /scan, /portfolio, /paper_buy <PAIR> [size%], /config, "
-                "or a parameter mutation like <code>risk = 1.5</code>.",
+                "/status, /halt, /resume, or a parameter mutation like <code>risk = 1.5</code>.",
                 chat_id=chat_id,
             )
     except Exception as e:
