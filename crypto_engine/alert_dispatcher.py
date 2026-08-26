@@ -167,6 +167,36 @@ def format_portfolio_summary_card(summary: dict) -> str:
     return "\n".join(lines)
 
 
+def format_circuit_breaker_tripped_alert(event: dict) -> str:
+    lines = [
+        "\U0001F6D1 <b>CIRCUIT BREAKER TRIPPED</b>",
+        "",
+        f"<b>Drawdown:</b> {event.get('drawdown_pct', 0.0):.2f}%",
+        f"<b>Threshold:</b> {event.get('threshold_pct', 0.0):.2f}%",
+        "",
+        "New signal alerts and paper-trade entries are now HALTED. Existing open trades still "
+        "run their own stop-loss/take-profit unchanged.",
+        "",
+        "Review what happened before resuming. Send <code>/resume</code> to clear the halt "
+        "once you've decided to continue.",
+    ]
+    return "\n".join(lines)
+
+
+def format_circuit_breaker_status_card(status: dict) -> str:
+    state = "\U0001F6D1 HALTED" if status["tripped"] else "✅ ACTIVE"
+    lines = [
+        f"⚙️ <b>Circuit Breaker: {state}</b>",
+        "",
+        f"<b>Current Drawdown:</b> {status['drawdown_pct']:.2f}%",
+        f"<b>Threshold:</b> {status['max_drawdown_pct']:.2f}%",
+        f"<b>Peak Balance:</b> {status['peak_balance_usd']:.2f} USD",
+        f"<b>Current Balance:</b> {status['current_balance_usd']:.2f} USD",
+        f"<b>Manual Halt:</b> {'Yes' if status['manual_halt'] else 'No'}",
+    ]
+    return "\n".join(lines)
+
+
 def dispatch_signal_alert(signal: dict) -> bool:
     return send_telegram_message(format_signal_alert_card(signal))
 
