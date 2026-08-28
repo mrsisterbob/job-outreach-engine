@@ -3436,12 +3436,14 @@ def resolve_warm_company_ats_slugs():
             slugs.append(row[0])
     return list(dict.fromkeys(slugs))  # de-dup while preserving discovery order
 
-def run_job_pipeline(chat_id=None, top_n=2):
+def run_job_pipeline(chat_id=None, top_n=2, sort="score"):
     """Job search pipeline with two-stage architecture:
     Stage 1: Pre-filter candidates (JSearch multi-page + ATS direct-source, strict filters)
     Stage 2: Concurrent Gemini AI evaluation (uncapped, ThreadPoolExecutor max_workers=20)
     Tiered delivery: Tier-1 (score>=tier1_cutoff, default 85) get full interactive cards; Tier-2
     (65..tier1_cutoff-1) get a bundled digest. tier1_cutoff and the Tier-1 size are filter-tunable.
+    sort="score" (default, /t) ranks Tier-1 by fit score; sort="recent" (/tr) ranks the same
+    score>=cutoff pool by posting recency (freshest first).
     """
     logging.info(">>> Starting Job Search Pipeline...")
     # Pre-warm CRM caches synchronously so parallel Stage 2 evaluations never contend for the
@@ -3559,7 +3561,10 @@ def run_job_pipeline(chat_id=None, top_n=2):
     tier1_cutoff = safe_int(get_filter("tier1_cutoff"), 85)
     tier1_size = max(1, min(safe_int(top_n, 5) or 5, 8))
     top_matches.sort(key=lambda x: x["score"], reverse=True)
-    tier1_matches = [m for m in top_matches if m["score"] >= tier1_cutoff][:tier1_size]
+    eligible = [m for m in top_matches if m["score"] >= tier1_cutoff]
+    if sort == "recent":
+        eligible.sort(key=lambda m: parse_posted_hours(m["job"].get("job_posted_at_datetime_utc")))
+    tier1_matches = eligible[:tier1_size]
     tier2_matches = [m for m in top_matches if 65 <= m["score"] < tier1_cutoff][:5]
 
     # Dispatch Tier-1 matches as full interactive cards & stage in CRM, routed by Clavicular flag
@@ -3683,19 +3688,24 @@ def process_webhook_payload_async(data):
             threading.Thread(target=_run_overdue_batch_and_notify, args=(chat_id, "snoozeall", snooze_days), daemon=True).start()
             return
 
-        # 2. Pipeline Run Trigger (/t [qty])
-        if re.match(r"^/t(?:\s+(\d+))?$", text):
-            m = re.match(r"^/t(?:\s+(\d+))?$", text)
-            qty = safe_int(m.group(1), 2)
+        # 2. Pipeline Run Trigger — /t [qty] (score-sorted, the default key) and /tr [qty] (freshest first)
+        _t_match = re.match(r"^/(t|tr)(?:\s+(\d+))?$", text)
+        if _t_match:
+            sort_mode = "recent" if _t_match.group(1) == "tr" else "score"
+            qty = safe_int(_t_match.group(2), 2)
             target_queries = get_filter("target_queries", [])
             ats_slugs = get_filter("ats_company_slugs", [])
+            label = "freshest first" if sort_mode == "recent" else f"Top {qty} by fit"
             send_telegram_message(
                 chat_id,
-                f"🚀 <b>Triggering Job Search Pipeline (Top {qty})</b>\n"
+                f"🚀 <b>Triggering Job Search Pipeline ({label})</b>\n"
                 f"🔍 Scanning {len(target_queries)} target rules & {len(ats_slugs)} ATS boards (with live Hope Alumni resolution)..."
             )
-            count = run_job_pipeline(chat_id, top_n=qty)
-            send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
+            # Run off the webhook thread so Telegram acknowledgement is instant; the wrapper
+            # posts the completion message itself.
+            threading.Thread(
+                target=_run_pipeline_and_notify, args=(chat_id, qty, sort_mode), daemon=True
+            ).start()
             return
 
         # 3. Networking Cards Pull Triggers (/c, /cw, /cc [qty])
@@ -4419,7 +4429,8 @@ def process_webhook_payload_async(data):
                 chat_id,
                 "⚠️ <b>Command Unrecognized</b>\n\n"
                 "<b>CORE COMMANDS:</b>\n"
-                "/t - Pull fresh job cards\n"
+                "/t [n] - Pull fresh job cards (best fit first)\n"
+                "/tr [n] - Same pipeline, freshest postings first\n"
                 "/search - View or update live search filters\n"
                 "/quick - Create contact (Name @ Firm Priority Note)\n"
                 "/cold, /warm - Quick-add a Cold/Warm contact (Name @ Firm Priority Note)\n"
@@ -4488,12 +4499,12 @@ def health_check():
         elapsed_ms = (time.time() - start_time) * 1000
         return jsonify({"status": "error", "error": str(e), "elapsed_ms": round(elapsed_ms, 2)}), 500
 
-def _run_pipeline_and_notify(chat_id, qty):
-    """Background thread target for /t: runs the heavy pipeline off the request thread,
-    in its own isolated daemon thread, then posts the completion message.
+def _run_pipeline_and_notify(chat_id, qty, sort="score"):
+    """Background thread target for /t and /tr: runs the heavy pipeline off the request
+    thread, in its own isolated daemon thread, then posts the completion message.
     """
     try:
-        count = run_job_pipeline(chat_id, top_n=qty)
+        count = run_job_pipeline(chat_id, top_n=qty, sort=sort)
         send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
     except Exception as e:
         logging.error(f"/t Background Pipeline Error: {e}")
