@@ -4443,36 +4443,47 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, f"❌ Resume Compilation Error: <code>{html.escape(str(e))}</code>")
             return
 
-        if text == "/apply":
-            mapping = resolve_reply_mapping(msg, chat_id, "/apply")
+        if text in ("/apply", "/applyt", "/applyc"):
+            mapping = resolve_reply_mapping(msg, chat_id, text)
             if not mapping:
                 return
             sheet_uuid = mapping["sheet_uuid"]
             job = get_job_by_sheet_uuid(sheet_uuid)
             company = mapping.get("contact_company") or job.get("employer_name")
+            # Route by record type: a person card (Carmen family, or an explicit /applyc) lands in
+            # Carmen Warm; a job card (or explicit /applyt) lands in Tetiana Warm. Bare /apply
+            # infers from the card's source tab / whether it carries a contact name.
+            src_tab = str(mapping.get("sheet_tab") or "")
+            if text == "/applyc":
+                is_person = True
+            elif text == "/applyt":
+                is_person = False
+            else:  # bare /apply: infer from the card
+                is_person = src_tab.startswith("Carmen") or (bool(mapping.get("contact_name")) and not job)
+            target_tab = "Carmen Warm" if is_person else "Tetiana Warm"
             if company:
                 _APPLIED_CRM_CACHE["data"].add(str(company).strip().lower())
                 normalized_company = normalize_company_for_match(company)
                 if normalized_company:
                     _APPLIED_CRM_CACHE["data"].add(normalized_company)
                 add_company_cooldown(company)
-                upsert_company_identity(company, crm_status="Tetiana Warm", applied=True)
+                upsert_company_identity(company, crm_status=target_tab, applied=True)
             applied_date = datetime.now().strftime("%Y-%m-%d")
             reply_card = msg.get("reply_to_message") or {}
             if reply_card.get("message_id"):
                 original_text = html.escape(reply_card.get("text", ""))
                 edit_telegram_message(chat_id, reply_card["message_id"], f"{original_text}\n\n✅ <b>Applied - {applied_date}</b>")
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-            send_telegram_message(chat_id, f"✅ Applied - {applied_date}")
+            send_telegram_message(chat_id, f"✅ Applied - {applied_date} → {target_tab}")
             log_metric_event("applied", sheet_uuid)
             log_daily_activity("applied_count")
             record_application_outcome(
                 sheet_uuid, "applied",
                 company=company, role=job.get("job_title"),
                 source=derive_job_source(job.get("job_id")),
-                outreach_path="warm" if mapping.get("contact_name") else "ats"
+                outreach_path="warm" if (is_person or mapping.get("contact_name")) else "ats"
             )
-            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Tetiana Warm"))
+            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=target_tab))
             return
 
         if text in ("/offer", "/withdraw"):
@@ -4593,7 +4604,8 @@ def process_webhook_payload_async(data):
                 "/cc - Pull Cold VP Sprint cards\n"
                 "/p - Query priority tier contacts\n\n"
                 "<b>SWIPE-REPLY ACTIONS (reply to a card — slash optional for the short ones):</b>\n"
-                "done / applied  (or /apply) - Mark Applied & move to Tetiana Warm\n"
+                "done / applied  (or /apply) - Mark Applied; job card -> Tetiana Warm, person card -> Carmen Warm\n"
+                "/applyt , /applyc - Force the job (Tetiana) or contact (Carmen) Warm tab\n"
                 "w  (or /warm) - Smart-route lead to its Warm tab\n"
                 "c  (or /cold) - Smart-route lead to its Cold tab\n"
                 "x  (or /x) - Archive lead to Died/Killed tab\n"
