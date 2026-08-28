@@ -118,6 +118,53 @@ def get_fit_score_indicator(score):
     return "🔴"
 
 
+# Defaults for role_orientation_delta(); overridable from the search_filters DB
+# (tech_role_terms / csa_role_terms) so the operator can retune from Telegram /search.
+DEFAULT_TECH_ROLE_TERMS = [
+    "python", "sql", "etl", "api", "automation", "data pipeline", "backend",
+    "scripting", "data engineer", "software", "developer", "analytics engineer",
+    "integration", "rest", "webhook",
+]
+DEFAULT_CSA_ROLE_TERMS = [
+    "client service associate", "client services associate", "wealth operations specialist",
+    "financial advisor", "branch", "teller", "relationship manager", "client associate",
+    "registered client", "service associate",
+]
+
+
+def role_orientation_delta(title, description, tech_terms=None, csa_terms=None,
+                           tech_title_bonus=10, tech_desc_bonus=5, csa_penalty=12):
+    """Ranking-layer score nudge (not a gate): reward roles that clearly lean
+    technical/automation, dampen pure client-service / wealth-ops roles that carry
+    no systems anchor. Returns a signed int.
+
+    - any tech term in the TITLE      -> +tech_title_bonus
+    - else any tech term in the DESC  -> +tech_desc_bonus
+    - a CSA/wealth-ops term in the TITLE and NO tech term anywhere -> -csa_penalty
+    - otherwise 0
+
+    passes_strict_filter() already *excludes* wealth/finance titles that lack a
+    systems keyword; this only re-ranks what survives, so CSA roles still surface
+    (operator's "fine as a fallback") but sit below technical matches.
+    """
+    t = str(title or "").lower()
+    d = str(description or "").lower()
+    tech = [str(x).lower() for x in (tech_terms if tech_terms is not None else DEFAULT_TECH_ROLE_TERMS)]
+    csa = [str(x).lower() for x in (csa_terms if csa_terms is not None else DEFAULT_CSA_ROLE_TERMS)]
+
+    tech_in_title = any(term in t for term in tech)
+    tech_in_desc = any(term in d for term in tech)
+    csa_in_title = any(term in t for term in csa)
+
+    if tech_in_title:
+        return int(tech_title_bonus)
+    if csa_in_title and not tech_in_desc:
+        return -int(csa_penalty)
+    if tech_in_desc:
+        return int(tech_desc_bonus)
+    return 0
+
+
 def generate_dedup_hash(company, title):
     """Legal-suffix-aware so 'Acme Corp' and 'Acme Corp Inc.' postings dedup as the same company."""
     clean_company = _strip_legal_suffixes(company).lower()

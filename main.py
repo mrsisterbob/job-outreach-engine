@@ -25,7 +25,7 @@ from pipeline_utils import (
     resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
     generate_dedup_hash, generate_short_key, parse_posted_hours, get_age_badge,
     extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall,
-    derive_job_source, is_unverified_email
+    derive_job_source, is_unverified_email, role_orientation_delta
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1581,37 +1581,64 @@ def calculate_keyword_overlap(job_desc):
     return overlap_pct, matches
 
 def calculate_hybrid_score_modifier(job, base_ai_score):
+    """Rule-based adjustment on top of Gemini's raw fit score.
+
+    Signals are accumulated into one bonus pool and one penalty pool, each clamped
+    (max_rule_bonus / max_rule_penalty) so a role can't stack its way to the ceiling
+    from keyword matches alone - the point is to spread scores, not saturate them.
+    A separate technical-vs-CSA orientation nudge (role_orientation_delta, tunable
+    via tech_role_terms / csa_role_terms / *_bonus / csa_role_penalty filters) then
+    re-ranks what survives passes_strict_filter().
+    """
     score = base_ai_score
     desc = str(job.get("job_description") or "").lower()
     title = str(job.get("job_title") or "").lower()
     company = str(job.get("employer_name") or "").lower()
     city = str(job.get("job_city") or "").lower()
     salary_str, max_sal = extract_salary(job)
+
+    bonus = 0
     tier1_ecosystem = get_filter("tier1_ecosystem", [])
     if any(k in desc or k in company for k in tier1_ecosystem):
-        score += 10
+        bonus += 6
     if max_sal >= 60000:
-        score += 5
+        bonus += 3
     if any(k in desc for k in ["fintech", "payments", "autotech", "saas", "tokenization", "digital assets", "web3", "trading bot"]):
-        score += 15
+        bonus += 8
     if any(k in desc for k in ["schwab", "fidelity", "docusign", "orion", "salesforce", "python", "sql", "etl"]):
-        score += 10
-    if any(k in desc for k in ["high call volume", "outbound calling", "phone queue", "call center", "inbound calls", "dialer"]):
-        score -= 20
-    if any(k in title for k in ["data entry", "admin coordinator", "administrative assistant"]) and max_sal < 60000:
-        score -= 15
-    if "wealth" in desc and not any(k in desc for k in ["python", "sql", "automation", "systems"]):
-        score -= 15
-    is_remote = job.get("job_is_remote", False) or "remote" in desc[:300] or "work from home" in desc[:300]
+        bonus += 6
+    bonus = min(bonus, safe_int(get_filter("max_rule_bonus"), 15))
 
+    penalty = 0
+    if any(k in desc for k in ["high call volume", "outbound calling", "phone queue", "call center", "inbound calls", "dialer"]):
+        penalty += 20
+    if any(k in title for k in ["data entry", "admin coordinator", "administrative assistant"]) and max_sal < 60000:
+        penalty += 15
+    if "wealth" in desc and not any(k in desc for k in ["python", "sql", "automation", "systems"]):
+        penalty += 15
+
+    is_remote = job.get("job_is_remote", False) or "remote" in desc[:300] or "work from home" in desc[:300]
     non_mi_hubs = ["chicago", "new york", "austin", "boston", "dallas", "atlanta", "denver", "seattle", "san francisco", "charlotte", "nyc"]
     valid_cities = get_filter("valid_cities", [])
-    # Only penalize on-site/hybrid out-of-state hub roles; remote roles are governed by the 90-point cap
+    # Only penalize on-site/hybrid out-of-state hub roles; remote roles are governed by the remote cap
     if not is_remote and any(hub in city or hub in desc[:300] for hub in non_mi_hubs) and not any(c in city for c in valid_cities):
-        score -= 15
+        penalty += 15
+    penalty = min(penalty, safe_int(get_filter("max_rule_penalty"), 25))
+
+    # Technical-vs-CSA orientation nudge (ranking layer, not a gate)
+    orientation = role_orientation_delta(
+        title, desc,
+        tech_terms=get_filter("tech_role_terms", None),
+        csa_terms=get_filter("csa_role_terms", None),
+        tech_title_bonus=safe_int(get_filter("tech_role_bonus"), 10),
+        tech_desc_bonus=safe_int(get_filter("tech_role_desc_bonus"), 5),
+        csa_penalty=safe_int(get_filter("csa_role_penalty"), 12),
+    )
+
+    score = score + bonus - penalty + orientation
 
     if is_remote:
-        score = min(score, 90)
+        score = min(score, safe_int(get_filter("remote_score_cap"), 90))
     return max(1, min(100, score))
 
 def resolve_live_alumni_at_company(company_name, school="Hope College"):
@@ -2185,10 +2212,11 @@ def process_single_candidate(job):
             age_badge = f"{age_badge}{ghost_badge}"
 
         # JIT Hope College Alumni Resolution: live public-search lookup, score boost, auto-log Carmen Warm contact
+        alumni_bonus = safe_int(get_filter("alumni_bonus"), 12)
         alumni_line = ""
         alum = resolve_live_alumni_at_company(job.get("employer_name"))
         if alum:
-            score = min(100, score + 20)
+            score = min(100, score + alumni_bonus)
             alum_url_safe = html.escape(alum["linkedin_url"], quote=True)
             alumni_line = f"🎓 <b>Hope Alum Connection:</b> <a href='{alum_url_safe}'>{html.escape(alum['name'])}</a> ({html.escape(alum['headline'])})\n"
             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -2211,7 +2239,10 @@ def process_single_candidate(job):
 
         # Dynamic Contact Quality Multiplier / Clavicular Routing: warm CRM contacts boost score.
         # ATS-sourced pulls (gh_/lever_/ashby_) at a Carmen Warm company route through the stricter
-        # Clavicular pathway (flat +30, gated at raw score >= 70) instead of the priority multiplier.
+        # Clavicular pathway (flat clavicular_bonus, gated at raw score >= 70) instead of the
+        # priority multiplier. All boost sizes are filter-tunable.
+        clavicular_bonus = safe_int(get_filter("clavicular_bonus"), 20)
+        warm_bonus_cap = safe_int(get_filter("warm_bonus_cap"), 18)
         contact_info = get_warm_crm_contacts().get(normalize_company_for_match(job.get("employer_name")))
         is_clavicular = False
         contact_name = ""
@@ -2220,12 +2251,12 @@ def process_single_candidate(job):
             is_ats_sourced = str(job.get("job_id") or "").startswith(("gh_", "lever_", "ashby_"))
             if is_ats_sourced:
                 if score >= 70:
-                    score = min(100, score + 30)
+                    score = min(100, score + clavicular_bonus)
                     is_clavicular = True
                     contact_name = contact_info.get("name", "Contact")
                     contact_note = contact_info.get("note", "Active relationship")
                     alumni_line += (
-                        f"🎯 <b>CLAVICULAR WARM REFERRAL (+30 pts):</b> "
+                        f"🎯 <b>CLAVICULAR WARM REFERRAL (+{clavicular_bonus} pts):</b> "
                         f"{html.escape(contact_name)} "
                         f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))})</i>\n"
                         f"📝 <b>Note:</b> {html.escape(contact_note)}\n"
@@ -2233,7 +2264,7 @@ def process_single_candidate(job):
                 # raw score < 70: ATS + warm match does not qualify for any boost or Clavicular routing
             else:
                 priority_score = contact_info.get("priority_score", 5)
-                score_boost = min(30, priority_score * 3)
+                score_boost = min(warm_bonus_cap, priority_score * 2)
                 score = min(100, score + score_boost)
                 alumni_line += (
                     f"🔥 <b>WARM REFERRAL AVAILABLE (+{score_boost} pts):</b> "
@@ -2241,6 +2272,10 @@ def process_single_candidate(job):
                     f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10)</i>\n"
                     f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
                 )
+
+        # Reserve a true 100 for genuinely exceptional matches so near-ties stay separable
+        # after all boosts. score_ceiling is filter-tunable (default 97).
+        score = min(score, safe_int(get_filter("score_ceiling"), 97))
 
         return {
             "job": job, "score": score, "reason": reason,
@@ -3405,7 +3440,8 @@ def run_job_pipeline(chat_id=None, top_n=2):
     """Job search pipeline with two-stage architecture:
     Stage 1: Pre-filter candidates (JSearch multi-page + ATS direct-source, strict filters)
     Stage 2: Concurrent Gemini AI evaluation (uncapped, ThreadPoolExecutor max_workers=20)
-    Tiered delivery: Tier-1 (score>=80, top 5) get full interactive cards; Tier-2 (65-79) get a bundled digest.
+    Tiered delivery: Tier-1 (score>=tier1_cutoff, default 85) get full interactive cards; Tier-2
+    (65..tier1_cutoff-1) get a bundled digest. tier1_cutoff and the Tier-1 size are filter-tunable.
     """
     logging.info(">>> Starting Job Search Pipeline...")
     # Pre-warm CRM caches synchronously so parallel Stage 2 evaluations never contend for the
@@ -3518,10 +3554,13 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 logging.error(f"Candidate evaluation failed (timeout or error): {e}")
                 # On timeout/error: score=0, status='Evaluation Pending' is handled in evaluate_job_with_gemini
     
-    # Sort by score descending, then split into Tier-1 (cards + CRM) and Tier-2 (digest only, capped at 5)
+    # Sort by score descending, then split into Tier-1 (cards + CRM) and Tier-2 (digest only, capped at 5).
+    # tier1_cutoff is filter-tunable (default 85, up from 80) now that scores spread instead of pegging.
+    tier1_cutoff = safe_int(get_filter("tier1_cutoff"), 85)
+    tier1_size = max(1, min(safe_int(top_n, 5) or 5, 8))
     top_matches.sort(key=lambda x: x["score"], reverse=True)
-    tier1_matches = [m for m in top_matches if m["score"] >= 80][:5]
-    tier2_matches = [m for m in top_matches if 65 <= m["score"] < 80][:5]
+    tier1_matches = [m for m in top_matches if m["score"] >= tier1_cutoff][:tier1_size]
+    tier2_matches = [m for m in top_matches if 65 <= m["score"] < tier1_cutoff][:5]
 
     # Dispatch Tier-1 matches as full interactive cards & stage in CRM, routed by Clavicular flag
     clavicular_rows = []
@@ -3572,7 +3611,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
 
         digest_ascii = "\n".join(digest_lines)
         digest_msg = (
-            f"📋 <b>Secondary Match Leaderboard (Top {len(tier2_matches)} roles, score 65-79)</b>\n"
+            f"📋 <b>Secondary Match Leaderboard (Top {len(tier2_matches)} roles, score 65-{tier1_cutoff - 1})</b>\n"
             f"<pre>{html.escape(digest_ascii)}</pre>"
         )
         send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)

@@ -125,6 +125,39 @@ def test_get_fit_score_indicator_thresholds():
     assert pu.get_fit_score_indicator(64) == "🔴"
 
 
+# ---- Role orientation (technical bias) ----
+
+def test_role_orientation_rewards_technical_title():
+    assert pu.role_orientation_delta("Automation Analyst (Python)", "some desc") == 10
+
+
+def test_role_orientation_rewards_technical_description_only():
+    assert pu.role_orientation_delta("Operations Analyst", "build ETL pipelines in SQL") == 5
+
+
+def test_role_orientation_dampens_pure_csa_title_with_no_tech():
+    assert pu.role_orientation_delta(
+        "Client Service Associate", "greet clients, schedule reviews, manage the branch calendar"
+    ) == -12
+
+
+def test_role_orientation_csa_title_with_tech_in_desc_is_not_penalized():
+    # a CSA-titled role that actually mentions automation should not be dampened
+    assert pu.role_orientation_delta(
+        "Wealth Operations Specialist", "automate reconciliation with python and sql"
+    ) == 5
+
+
+def test_role_orientation_neutral_role_is_zero():
+    assert pu.role_orientation_delta("Office Coordinator", "answer phones, order supplies") == 0
+
+
+def test_role_orientation_respects_custom_weights():
+    assert pu.role_orientation_delta(
+        "Data Engineer", "x", tech_title_bonus=6
+    ) == 6
+
+
 # ---- Dedup / short key hashing ----
 
 def test_generate_dedup_hash_is_case_and_whitespace_insensitive():
