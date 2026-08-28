@@ -1497,24 +1497,24 @@ def generate_cold_email(job_title, company_name, core_exp=None):
     clean_company = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', str(company_name or ''), flags=re.IGNORECASE).strip().rstrip(',')
     clean_company = re.sub(r'\s+', ' ', clean_company).strip() or (company_name or "your team")
 
-    s1 = f"I saw the {job_title} role at {clean_company} and wanted to highlight my background in {core_exp}."
-    s2 = "Would you be open to a brief 5-minute call next week to discuss alignment?"
+    s1 = f"I saw the {job_title} role at {clean_company} and my background is in {core_exp}."
+    s2 = "Would you have five minutes next week for a quick call about whether it's a fit?"
     body = enforce_sentence_limit(f"{sanitize_text(s1)} {sanitize_text(s2)}", 2)
-    return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
+    return f"Hi,\n\n{body}\n\nBest,\nKevin Miller"
 
 def generate_warm_email(note_context=""):
     """Full warm email: greeting, strict 3-sentence body, sign-off as separate paragraphs."""
     _, current_role_sentence = get_current_role_blurb()
     s1 = sanitize_text(note_context) if note_context else "I hope you have been doing well."
     s2 = sanitize_text(current_role_sentence)
-    s3 = sanitize_text("I am wondering what you have been up to lately, and would love to reconnect over coffee or a quick call if you have time.")
+    s3 = sanitize_text("I'd like to hear what you've been working on, and would be glad to reconnect over coffee or a call if you have time.")
     body = enforce_sentence_limit(f"{s1} {s2} {s3}", 3)
-    return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
+    return f"Hi,\n\n{body}\n\nBest,\nKevin Miller"
 
 def generate_bump_email(contact_name=""):
     """Short follow-up nudge for threads that went unanswered."""
     name_str = f" {contact_name}" if contact_name else ""
-    return f"Hi{name_str},\n\nBumping this briefly to the top of your inbox in case it got buried. Would love to connect if you have 5 minutes this week to discuss alignment.\n\nBest regards,\nKevin Miller"
+    return f"Hi{name_str},\n\nBumping this in case it got buried. Still glad to connect for five minutes this week if the timing works.\n\nBest,\nKevin Miller"
 
 def format_email_block(email_text):
     sanitized = sanitize_text(email_text)
@@ -4521,7 +4521,7 @@ def process_webhook_payload_async(data):
                 send_telegram_message(
                     chat_id,
                     "❌ <b>Usage:</b> <code>/edit ID New Text</code>\n"
-                    "IDs: <code>L0-L5</code> (LinkedIn), <code>C0-C2</code> (Cold), "
+                    "IDs: <code>L0-L9</code> (LinkedIn), <code>C0-C5</code> (Cold), "
                     "<code>W0-W1</code> (Warm), <code>B0-B1</code> (Bump), "
                     "<code>TA0-TA9</code>...<code>TE0-TE9</code> (Resume Bullets)"
                 )
@@ -4529,7 +4529,7 @@ def process_webhook_payload_async(data):
             edit_id, new_text = parts[0], parts[1].strip()
             target = resolve_edit_target(edit_id)
             if not target:
-                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L5, C0-C2, W0-W1, B0-B1, TA0-TA9...TE0-TE9.")
+                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L9, C0-C5, W0-W1, B0-B1, TA0-TA9...TE0-TE9.")
                 return
             file_path, list_key, idx = target
             ok, result_msg = update_template_entry(file_path, list_key, idx, new_text)

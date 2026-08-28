@@ -1,14 +1,14 @@
 {
   "linkedin_templates": [
-    "Hi {name}. I saw the {job_title} opening at {company} and wanted to connect.",
-    "Hi {name}. I came across your profile while looking at the {job_title} role at {company}. I would love to connect and follow your work.",
-    "Hi {name}. I noticed {company} is growing the operations team for the {job_title} position. I would appreciate connecting here.",
-    "Hi {name}. I saw the {job_title} opening at {company}. Given my background in process automation and data reconciliation, I wanted to reach out and connect.",
-    "Hi {name}. I like what {company} is building. I saw the {job_title} posting and wanted to connect directly with operations leaders at the firm.",
-    "Hi {name}. I recently applied for the {job_title} role at {company}. I would love to connect and keep in touch.",
-    "Hi {name}. I work across Python, SQL, and operations systems, and I noticed the {job_title} role at {company}. I wanted to reach out and connect.",
-    "Hi {name}. I saw the {job_title} opening on your team at {company} and wanted to put a face to the name. I look forward to connecting.",
-    "Hi {name}. I follow operational innovation in Metro Detroit and noticed the opening at {company} for {job_title}. I would love to connect.",
-    "Hi {name}. I am reaching out regarding the {job_title} role at {company}. My background centers on back office automation and CRM systems, and I would value connecting."
+    "Hi {name}, I saw the {job_title} opening at {company} and wanted to connect.",
+    "Hi {name}, I came across your profile while looking at the {job_title} role at {company}. Would like to connect and follow your work.",
+    "Hi {name}, I saw {company} is growing the team for the {job_title} spot. Would appreciate connecting here.",
+    "Hi {name}, I saw the {job_title} opening at {company}. My background is Python, SQL, and operations work, so I wanted to reach out and connect.",
+    "Hi {name}, I like what {company} is building. Saw the {job_title} posting and wanted to connect with people on the operations side.",
+    "Hi {name}, I recently applied for the {job_title} role at {company}. Would like to connect and keep in touch.",
+    "Hi {name}, I work across Python, SQL, and back-office systems, and I noticed the {job_title} role at {company}. Wanted to reach out and connect.",
+    "Hi {name}, I saw the {job_title} opening on your team at {company} and wanted to put a name to the application. Looking forward to connecting.",
+    "Hi {name}, I follow operations work in the Detroit area and noticed the {job_title} opening at {company}. Would like to connect.",
+    "Hi {name}, I'm reaching out about the {job_title} role at {company}. My background is back-office automation and CRM systems, and I'd value connecting."
   ]
 }

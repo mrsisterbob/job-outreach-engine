@@ -1,18 +1,18 @@
 {
   "cold_ops": [
-    "Hi {name},\n\nI saw the {job_title} role at {company} and wanted to highlight my work in wealth operations and process automation. Would you be open to a brief five minute call next week to discuss alignment?\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nI saw that {company} is hiring for a {job_title}. My experience centers on automating reporting workflows and data reconciliation with Python and SQL. Would you be open to a brief chat about where my background might help your team?\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nI came across the {job_title} opening on your team at {company}. I focus on removing manual data bottlenecks and cleaning up operational queues across Salesforce and internal databases. Do you have five minutes for a quick call next week?\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nI saw the {job_title} posting at {company} and wanted to reach out directly. My background is in technical operations, systems reconciliation, and data integrity. I would welcome the chance to connect briefly if you have a few minutes next week.\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nI noticed the {job_title} role at {company}. I have practical experience building automated Python pipelines and managing CRM exception workflows to cut processing lag. Would you be open to a brief chat to discuss how I could contribute?\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nI saw that {company} is looking for a {job_title}. Having built data pipelines and automated compliance checks across complex records, I am interested in how your team manages operational scale. Would you be open to a quick call next week?\n\nBest regards,\nKevin Miller"
+    "Hi {name},\n\nI saw the {job_title} opening at {company}. I work in wealth operations and write Python and SQL to cut down manual reporting and reconciliation. Would you have five minutes next week to talk about whether my background is a fit?\n\nBest,\nKevin Miller",
+    "Hi {name},\n\nI came across the {job_title} role at {company}. Most of my day is reconciling data across custodial platforms and automating the parts that used to be done by hand. Happy to send a resume or hop on a quick call if that's useful.\n\nBest,\nKevin Miller",
+    "Hi {name},\n\nI noticed {company} is hiring for a {job_title}. I've spent the last two years cleaning up operational queues in Salesforce and internal databases and building small scripts to keep them clean. Would you be open to a short call next week?\n\nBest,\nKevin Miller",
+    "Hi {name},\n\nI wanted to reach out directly about the {job_title} posting at {company}. My work is in back-office operations, systems reconciliation, and data checks. If there's a few minutes on your calendar next week I'd appreciate the chance to talk.\n\nBest,\nKevin Miller",
+    "Hi {name},\n\nI saw the {job_title} role at {company}. I've built Python pipelines and Salesforce exception workflows that shaved real time off month-end. I'd be glad to walk through how that might apply to your team.\n\nBest,\nKevin Miller",
+    "Hi {name},\n\nI saw that {company} is looking for a {job_title}. I've built data pipelines and automated compliance checks across a few thousand client records, and I'm interested in how your team handles that work. Would a quick call next week work?\n\nBest,\nKevin Miller"
   ],
   "warm_alumni": [
-    "Hi {name},\n\nAs a fellow Hope College business alum, I saw your work at {company} and wanted to reach out. I am currently working in wealth operations and would value learning more about your experience on the team over a quick call.\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nI hope you are doing well. I noticed your recent work at {company} and wanted to reconnect to see what you have been up to lately. Would love to catch up over coffee or a brief call if your schedule allows.\n\nBest regards,\nKevin Miller"
+    "Hi {name},\n\nI'm a fellow Hope College business grad. I saw your work at {company} and wanted to reach out. I'm in wealth operations right now and would value hearing about your experience on the team over a short call.\n\nBest,\nKevin Miller",
+    "Hi {name},\n\nHope you're doing well. I saw your recent work at {company} and wanted to reconnect and hear what you've been up to. Would be glad to catch up over coffee or a quick call if your schedule allows.\n\nBest,\nKevin Miller"
   ],
   "followup_bumps": [
-    "Hi {name},\n\nBumping this briefly to the top of your inbox in case it got buried. Would love to connect if you have 5 minutes this week to discuss alignment on the {job_title} role.\n\nBest regards,\nKevin Miller",
-    "Hi {name},\n\nI reached out previously regarding the {job_title} role at {company}. I assume timing might be off right now, but let me know if exploring alignment is a priority in the coming quarters.\n\nBest regards,\nKevin Miller"
+    "Hi {name},\n\nBumping this in case it got buried. Still glad to connect for five minutes this week about the {job_title} role if the timing works.\n\nBest,\nKevin Miller",
+    "Hi {name},\n\nI reached out a while back about the {job_title} role at {company}. Timing might not be right now, but let me know if it becomes a priority down the line.\n\nBest,\nKevin Miller"
   ]
 }

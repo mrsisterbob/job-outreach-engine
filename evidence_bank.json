@@ -106,7 +106,9 @@
     "Python", "SQL", "Salesforce", "Power BI", "Excel", "HubSpot CRM", "Schwab Advisor Center", "Fidelity Wealthscape", "DocuSign", "Orion Eclipse", "Typst", "Flask", "SQLite"
   ],
   "banned_words": [
-    "leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm", "spearheaded", "utilizing", "dynamic", "robust"
+    "leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm", "spearheaded",
+    "spearhead", "utilizing", "dynamic", "robust", "alignment", "operational rigor", "streamline",
+    "streamlined", "impactful", "results-driven", "detail-oriented", "operational scale"
   ]
 }
 
