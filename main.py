@@ -2157,11 +2157,14 @@ def process_single_candidate(job):
         cold_template = resolve_template_text(cold_pool, outreach_template_id)
         outreach_email = sanitize_text(interpolate_template(cold_template, name="there", company=company_name, job_title=job_title))
 
-        # Persist routing keys on the cached job so /cv, /stage, and ATS plaintext all resolve
-        # the exact same bullets later (bounds-checked again by resume_engine.filter_ats_bullets).
+        # Persist routing keys on the cached job so /cv, /stage, /msg, and ATS plaintext all resolve
+        # the exact same bullets/copy later (bounds-checked again by resume_engine.filter_ats_bullets
+        # and resolve_template_text).
         job["track"] = track
         job["bullet_indices"] = bullet_indices
         job["tone_mode"] = tone_mode
+        job["linkedin_template_id"] = linkedin_template_id
+        job["outreach_template_id"] = outreach_template_id
         sheet_uuid = save_job_to_cache(short_id, job)
         target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
         age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
@@ -3111,19 +3114,15 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     company = html.escape(str(job.get("employer_name") or "N/A"))
     title = html.escape(str(job.get("job_title") or "N/A"))
     apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
-    apollo_url = html.escape(build_apollo_url(company), quote=True)
-    linkedin_url = html.escape(build_linkedin_url(company), quote=True)
-    dork_url = html.escape(build_hiring_manager_dork(company, job.get("job_title")), quote=True)
-    recruiter_dork_url = html.escape(build_recruiter_dork(company), quote=True)
-    alumni_url = html.escape(build_alumni_dork(company), quote=True)
     # Truncate raw dynamic content BEFORE HTML-escaping/tag-wrapping so tags never get cut mid-string
     reason_safe = str(reason or "")[:300]
     matched_str = (", ".join(matched_skills[:4]).title() if matched_skills else "General Ops")[:150]
-    bullets_block = ("\n".join(f"• {b}" for b in ats_bullets) if ats_bullets else "N/A")[:500]
-    linkedin_note_safe = str(linkedin_note or "")[:300]
     alumni_line_safe = str(alumni_line or "")[:400]
-    outreach_email_safe = str(outreach_email or "")[:600]
     fit_dot = get_fit_score_indicator(score)
+    # Signal-only card. The LinkedIn note, cold-outreach draft, ATS bullets, and decision-maker
+    # dork links used to be inlined here - they now live behind a swipe-reply to keep the card
+    # scannable: /msg -> LinkedIn note + cold email + lead-search links, /cv -> tailored resume PDF.
+    alumni_block = f"{alumni_line_safe}\n" if alumni_line_safe else ""
     card_text = (
         f"💼 <b>{title}</b>\n"
         f"🏢 <b>{company}</b>\n"
@@ -3132,29 +3131,15 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"{fit_dot} <b>Fit Score:</b> {score}/100  |  <b>Skill Match:</b> {overlap_pct}%\n"
         f"🕐 <b>Recency:</b> {age_badge}\n"
         f"💰 <b>Pay &amp; Style:</b> {work_style} | {salary_str}\n"
-        f"{alumni_line_safe}\n"
+        f"{alumni_block}"
         f"🧩 <b>Matched Skills:</b> <code>{html.escape(matched_str)}</code>\n\n"
         f"<b>Fit Reason:</b> {html.escape(reason_safe)}\n\n"
-        f"🔗 <b>Quick Links:</b>\n"
-        f"<a href='{apply_link}'>Direct Apply</a> | "
-        f"<a href='{apollo_url}'>Apollo Operations Leads</a> | "
-        f"<a href='{linkedin_url}'>LinkedIn Leadership Search</a> | "
-        f"<a href='{alumni_url}'>🎓 Alumni Connections</a>\n\n"
-        f"🎯 <b>Direct Decision Makers:</b>\n"
-        f"  👔 <a href='{dork_url}'>Search Director / VP of Ops (Hiring Manager)</a> |\n"
-        f"  🤝 <a href='{recruiter_dork_url}'>Search Senior In-House Recruiter</a>\n\n"
-        f"🧭 <b>Dual-Path Outreach Strategy:</b>\n"
-        f"  👔 <i>To Director/VP:</i> Lead with process automation, efficiency gains, and operational rigor.\n"
-        f"  🤝 <i>To Recruiter:</i> Confirm application submission, reference the specific role, request a brief phone screen.\n\n"
-        f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
-        f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note_safe) if linkedin_note_safe else 'N/A'}</code>\n\n"
-        f"📄 <b>Tailored ATS Resume Bullets:</b>\n<code>{html.escape(bullets_block)}</code>\n\n"
-        f"✉️ <b>Cold Outreach Draft (tap to copy):</b>\n<code>{html.escape(outreach_email_safe) if outreach_email_safe else 'N/A'}</code>\n\n"
-        f"⚡ <b>Swipe Actions (reply to this card):</b>\n"
-        f"  <code>/apply</code> Mark Applied   <code>/draft</code> Gmail Draft\n"
-        f"  <code>/warm</code> Move Warm   <code>/cold</code> Move Cold   <code>/x</code> Dead\n"
-        f"  <code>/f &lt;days&gt;</code> Snooze   <code>/n &lt;note&gt;</code> Log Note\n"
-        f"  <code>/e &lt;email&gt;</code> Lock Apollo Email   <code>/eh</code> API Lookup"
+        f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n"
+        f"<a href='{apply_link}'>Direct Apply</a>\n\n"
+        f"⚡ <b>Reply to this card:</b>\n"
+        f"  <code>done</code> Applied   <code>/draft</code> Gmail Draft   <code>/msg</code> Outreach Copy\n"
+        f"  <code>w</code> Warm   <code>c</code> Cold   <code>x</code> Dead   <code>/cv</code> Résumé PDF\n"
+        f"  <code>/f &lt;days&gt;</code> Snooze   <code>/n &lt;note&gt;</code> Note   <code>e &lt;email&gt;</code> Lock Email"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -3995,6 +3980,48 @@ def process_webhook_payload_async(data):
             log_daily_activity("notes_logged")
             return
 
+        if text == "/msg":
+            # Read-only: rebuild the outreach copy that used to be inlined on the card
+            # (LinkedIn connect note + cold-outreach draft + decision-maker lead-search links).
+            # No CRM write, no Gmail draft - that stays /draft.
+            mapping = resolve_reply_mapping(msg, chat_id, "/msg")
+            if not mapping:
+                return
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
+            title = job.get("job_title") or "Operations Specialist"
+            is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
+            contact_name = mapping.get("contact_name") or ""
+
+            li_pool = load_linkedin_templates().get("linkedin_templates", [])
+            li_tmpl = resolve_template_text(li_pool, job.get("linkedin_template_id", 0))
+            linkedin_note = sanitize_text(interpolate_template(
+                li_tmpl, name=contact_name or "there", company=comp, job_title=title))[:300]
+
+            raw_email_text = generate_warm_email(contact_name) if is_warm else generate_cold_email(title, comp)
+            cold_block = format_email_block(raw_email_text)
+
+            comp_esc = html.escape(str(comp))
+            apollo_url = html.escape(build_apollo_url(comp), quote=True)
+            linkedin_url = html.escape(build_linkedin_url(comp), quote=True)
+            dork_url = html.escape(build_hiring_manager_dork(comp, title), quote=True)
+            recruiter_dork_url = html.escape(build_recruiter_dork(comp), quote=True)
+            alumni_url = html.escape(build_alumni_dork(comp), quote=True)
+
+            msg_out = (
+                f"✉️ <b>Outreach Copy — {comp_esc}</b>\n\n"
+                f"🤝 <b>LinkedIn Connect Note (&lt;300):</b>\n<code>{html.escape(linkedin_note) if linkedin_note else 'N/A'}</code>\n\n"
+                f"📧 <b>Cold Outreach Draft (tap to copy):</b>\n{cold_block}\n\n"
+                f"🔎 <b>Lead-Search Links:</b>\n"
+                f"<a href='{apollo_url}'>Apollo</a> | "
+                f"<a href='{linkedin_url}'>LinkedIn Leadership</a> | "
+                f"<a href='{dork_url}'>Hiring Manager</a> | "
+                f"<a href='{recruiter_dork_url}'>In-House Recruiter</a> | "
+                f"<a href='{alumni_url}'>🎓 Alumni</a>"
+            )
+            send_telegram_message(chat_id, msg_out)
+            return
+
         if text == "/draft":
             mapping = resolve_reply_mapping(msg, chat_id, "/draft")
             if not mapping:
@@ -4344,18 +4371,19 @@ def process_webhook_payload_async(data):
                 "/cw - Pull Warm Rolodex cards\n"
                 "/cc - Pull Cold VP Sprint cards\n"
                 "/p - Query priority tier contacts\n\n"
-                "<b>SWIPE-REPLY ACTIONS (reply to a card):</b>\n"
-                "/apply - Mark Applied & move to Tetiana Warm\n"
+                "<b>SWIPE-REPLY ACTIONS (reply to a card — slash optional for the short ones):</b>\n"
+                "done / applied  (or /apply) - Mark Applied & move to Tetiana Warm\n"
+                "w  (or /warm) - Smart-route lead to its Warm tab\n"
+                "c  (or /cold) - Smart-route lead to its Cold tab\n"
+                "x  (or /x) - Archive lead to Died/Killed tab\n"
+                "e <email>  (or /e <email>) - Lock email override & re-draft\n"
                 "/offer - Log an offer for this record\n"
                 "/withdraw - Log a withdrawn application\n"
-                "/warm - Smart-route lead to its Warm tab\n"
-                "/cold - Smart-route lead to its Cold tab\n"
-                "/x - Archive lead to Died/Killed tab\n"
                 "/n - Append timestamped note\n"
                 "/f - Snooze follow-up by [days]\n"
-                "/e <email> - Lock Apollo email override & re-draft\n"
                 "/eh [Name] - On-demand API email lookup & re-draft\n"
                 "/draft - Generate Gmail draft\n"
+                "/msg - Show LinkedIn note + cold email + lead-search links\n"
                 "/cv, /resume - Compile tailored resume PDF\n"
                 "/prep - Interview talking points & reverse questions\n"
                 "/pitch - 30-second elevator pitch\n"
