@@ -437,7 +437,12 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_tg_msg ON sheet_row_map(telegram_message_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_contact_email ON sheet_row_map(contact_email)")
-        
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS warm_jsearch_checks (
+            normalized_name TEXT PRIMARY KEY,
+            last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
         if cursor.fetchone()[0] == 0:
@@ -2248,20 +2253,23 @@ def process_single_candidate(job):
         contact_name = ""
         contact_note = ""
         if contact_info:
-            is_ats_sourced = str(job.get("job_id") or "").startswith(("gh_", "lever_", "ashby_"))
-            if is_ats_sourced:
+            # ATS-sourced (gh_/lever_/ashby_) OR the Stage 1c JSearch warm-company fallback
+            # (warmjsearch_) both route through the stricter Clavicular pathway.
+            is_ats_sourced = str(job.get("job_id") or "").startswith(("gh_", "lever_", "ashby_", "warmjsearch_"))
+            if is_ats_sourced or job.get("warm_company_sourced"):
                 if score >= 70:
                     score = min(100, score + clavicular_bonus)
                     is_clavicular = True
                     contact_name = contact_info.get("name", "Contact")
                     contact_note = contact_info.get("note", "Active relationship")
+                    src_tag = "JSEARCH WARM COMPANY" if job.get("warm_company_sourced") else "CLAVICULAR WARM REFERRAL"
                     alumni_line += (
-                        f"🎯 <b>CLAVICULAR WARM REFERRAL (+{clavicular_bonus} pts):</b> "
+                        f"🎯 <b>{src_tag} (+{clavicular_bonus} pts):</b> "
                         f"{html.escape(contact_name)} "
                         f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))})</i>\n"
                         f"📝 <b>Note:</b> {html.escape(contact_note)}\n"
                     )
-                # raw score < 70: ATS + warm match does not qualify for any boost or Clavicular routing
+                # raw score < 70: warm match does not qualify for any boost or Clavicular routing
             else:
                 priority_score = contact_info.get("priority_score", 5)
                 score_boost = min(warm_bonus_cap, priority_score * 2)
@@ -3406,14 +3414,19 @@ def auto_expand_ats_slug(company_name):
             logging.error(f"[ATS EXPANSION] {board_name} check failed for '{slug_guess}': {e}")
     logging.info(f"[ATS EXPANSION] No ATS board match found for '{company_name}' (guessed slug '{slug_guess}')")
 
-def resolve_warm_company_ats_slugs():
+def resolve_warm_company_ats_slugs(return_uncovered=False):
     """Resolves an ATS board slug for every unique Carmen Warm CRM company: prefers the
     already-verified company_identities.ats_slug, else synchronously probes Greenhouse/Lever/Ashby
     via auto_expand_ats_slug(). Stage 1b sources ONLY from this warm-network list, never the
     untracked general ats_company_slugs enterprise board filter.
+
+    If return_uncovered=True, returns (slugs, uncovered_companies) where uncovered_companies is
+    the list of raw warm-company names for which NO ATS board resolved (Ford, GM, Rocket, etc.) -
+    those are the candidates for the paid JSearch company-query fallback (Stage 1c).
     """
     warm_companies = {c.get("raw_company") for c in get_warm_crm_contacts().values() if c.get("raw_company")}
     slugs = []
+    uncovered = []
     for company in warm_companies:
         normalized = normalize_company_for_match(company)
         try:
@@ -3434,7 +3447,79 @@ def resolve_warm_company_ats_slugs():
             row = None
         if row and row[0]:
             slugs.append(row[0])
-    return list(dict.fromkeys(slugs))  # de-dup while preserving discovery order
+        else:
+            uncovered.append(company)
+    slugs = list(dict.fromkeys(slugs))  # de-dup while preserving discovery order
+    if return_uncovered:
+        return slugs, list(dict.fromkeys(uncovered))
+    return slugs
+
+
+def _warm_jsearch_check_fresh(company_name, ttl_hours):
+    """True if this warm company had a JSearch company-query within the last ttl_hours."""
+    normalized = normalize_company_for_match(company_name)
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute(
+                "SELECT last_checked FROM warm_jsearch_checks WHERE normalized_name = ?", (normalized,)
+            ).fetchone()
+        if not row or not row[0]:
+            return False
+        last = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00").split(".")[0])
+        return (datetime.now() - last.replace(tzinfo=None)) < timedelta(hours=ttl_hours)
+    except Exception as e:
+        logging.error(f"warm_jsearch_checks read error ({normalized}): {e}")
+        return False
+
+
+def _mark_warm_jsearch_checked(company_name):
+    normalized = normalize_company_for_match(company_name)
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR REPLACE INTO warm_jsearch_checks (normalized_name, last_checked) VALUES (?, CURRENT_TIMESTAMP)",
+                (normalized,),
+            )
+            conn.commit()
+    except Exception as e:
+        logging.error(f"warm_jsearch_checks write error ({normalized}): {e}")
+
+
+def fetch_warm_company_jobs_via_jsearch(company_name):
+    """Stage 1c fallback: one JSearch query scoped to a warm company that has NO resolvable
+    Greenhouse/Lever/Ashby board (Ford, GM, Rocket, Blue Cross, hospital systems...). Aggregators
+    do index Workday/Taleo/enterprise postings, so this is the only programmatic path to them.
+    Results are post-filtered to an exact normalized-employer-name match plus Metro-Detroit/remote
+    geo so fuzzy aggregator matches (staffing reposts, same-name-different-company) don't leak in.
+    Every returned job is tagged warm_company_sourced=True and job_id 'warmjsearch_<slug>_<n>'.
+    """
+    headers, api_url = build_jsearch_request_config()
+    if not headers:
+        return []
+    role_hint = str(get_filter("jsearch_role_hint", "") or "").strip()
+    query = f'"{company_name}" {role_hint}'.strip()
+    params = {"query": query, "page": "1", "num_pages": "1", "date_posted": "month"}
+    raw_jobs, _ = _fetch_jsearch_page_with_retry(api_url, headers, params, query, 1)
+    if not raw_jobs:
+        return []
+
+    target_norm = normalize_company_for_match(company_name)
+    valid_cities = [str(c).lower() for c in get_filter("valid_cities", [])]
+    slug = re.sub(r'[^a-z0-9]', '', str(company_name or '').lower()) or "co"
+    out = []
+    for i, r in enumerate(raw_jobs):
+        if normalize_company_for_match(r.get("employer_name")) != target_norm:
+            continue
+        city = str(r.get("job_city") or "").lower()
+        is_remote = r.get("job_is_remote", False) or "remote" in str(r.get("job_description") or "")[:300].lower()
+        if not (is_remote or any(vc in city for vc in valid_cities)):
+            continue
+        r["job_id"] = f"warmjsearch_{slug}_{i}"
+        r["warm_company_sourced"] = True
+        out.append(r)
+    logging.info(f"[STAGE 1C] JSearch warm-company query '{company_name}': {len(raw_jobs)} raw -> {len(out)} kept")
+    return out
 
 def run_job_pipeline(chat_id=None, top_n=2, sort="score"):
     """Job search pipeline with two-stage architecture:
@@ -3516,12 +3601,36 @@ def run_job_pipeline(chat_id=None, top_n=2, sort="score"):
 
     # Stage 1b: ATS direct-source expansion strictly scoped to Carmen Warm network companies -
     # untracked general enterprise boards (ats_company_slugs) are intentionally never sourced here.
-    warm_ats_slugs = resolve_warm_company_ats_slugs()
+    warm_ats_slugs, warm_uncovered = resolve_warm_company_ats_slugs(return_uncovered=True)
     if warm_ats_slugs:
         if chat_id:
             send_status_update(chat_id, f"Stage 1b: Sourcing direct ATS postings from {len(warm_ats_slugs)} Carmen Warm companies...")
         for job in fetch_ats_jobs(warm_ats_slugs):
             _add_candidate(job)
+
+    # Stage 1c: paid JSearch company-query FALLBACK for warm companies with no ATS board
+    # (Ford, GM, Rocket...). Gated hard: fires only for uncovered companies, only when the
+    # per-company cache is stale, and capped per run on a persisted round-robin pointer so
+    # steady-state cost is a handful of calls/day.
+    if warm_uncovered:
+        cap = safe_int(get_filter("warm_jsearch_cap"), 5)
+        ttl_h = safe_int(get_filter("warm_jsearch_ttl_h"), 24)
+        ptr = safe_int(get_filter("warm_jsearch_pointer"), 0) % max(len(warm_uncovered), 1)
+        rotated = warm_uncovered[ptr:] + warm_uncovered[:ptr]
+        picked, checked = 0, 0
+        for company in rotated:
+            if picked >= cap:
+                break
+            if _warm_jsearch_check_fresh(company, ttl_h):
+                continue
+            picked += 1
+            for job in fetch_warm_company_jobs_via_jsearch(company):
+                _add_candidate(job)
+            _mark_warm_jsearch_checked(company)
+            checked += 1
+        set_filter("warm_jsearch_pointer", (ptr + max(checked, 1)) % max(len(warm_uncovered), 1))
+        if checked and chat_id:
+            send_status_update(chat_id, f"Stage 1c: JSearch company-query fallback ran for {checked} board-less warm companies.")
     
     logging.info(f"Stage 1 Complete: {raw_discovered_count} raw listings pulled, {len(candidate_pool)} candidates passed strict filter.")
     if raw_discovered_count == 0:
@@ -3573,6 +3682,20 @@ def run_job_pipeline(chat_id=None, top_n=2, sort="score"):
     for item in tier1_matches:
         job = item["job"]
         is_clavicular = item.get("is_clavicular", False)
+        # Distinct high-priority push for a warm-company match so it isn't buried in the batch;
+        # it also gets force-filed to the Clavicular tab (via is_clavicular below).
+        if is_clavicular or job.get("warm_company_sourced"):
+            is_clavicular = True
+            src = "JSearch fallback" if job.get("warm_company_sourced") else "warm-network ATS board"
+            send_telegram_message(
+                TELEGRAM_CHAT_ID,
+                f"🎯 <b>WARM COMPANY MATCH</b> — {html.escape(str(job.get('employer_name') or 'Company'))}\n"
+                f"{html.escape(str(job.get('job_title') or 'Role'))}\n"
+                f"Warm contact: {html.escape(str(item.get('contact_name') or 'Contact'))}\n"
+                f"Fit {item['score']}/100 · via {src} · filed to Clavicular\n"
+                f"↳ full card below — reply <code>/msg</code> for outreach copy"
+            )
+            time.sleep(0.5)
         send_telegram_card(
             job, item["score"], item["reason"], item["target_email"],
             item["age_badge"], item["salary_str"], item["work_style"],
@@ -4413,6 +4536,33 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, result_msg)
             return
 
+        # Manual ATS slug override: rescue warm companies whose real Greenhouse/Lever/Ashby slug
+        # isn't the squashed legal name (e.g. "fordmotorcompany" -> "ford", "stripeinc" -> "stripe").
+        if text.startswith("/setslug"):
+            parts = text[len("/setslug"):].strip().rsplit(None, 1)
+            if len(parts) != 2 or not parts[0].strip():
+                send_telegram_message(
+                    chat_id,
+                    "❌ <b>Usage:</b> <code>/setslug &lt;Company Name&gt; &lt;board-slug&gt;</code>\n"
+                    "e.g. <code>/setslug Ford Motor Company ford</code>"
+                )
+                return
+            company_in, slug_in = parts[0].strip(), re.sub(r'[^a-z0-9-]', '', parts[1].strip().lower())
+            if not slug_in:
+                send_telegram_message(chat_id, "❌ Slug must be alphanumeric (dashes allowed).")
+                return
+            upsert_company_identity(company_in, ats_slug=slug_in)
+            existing = safe_list(get_filter("ats_company_slugs", []))
+            if slug_in not in existing:
+                existing.append(slug_in)
+                set_filter("ats_company_slugs", existing)
+            send_telegram_message(
+                chat_id,
+                f"✅ <b>Slug set:</b> <code>{html.escape(company_in)}</code> → <code>{html.escape(slug_in)}</code>\n"
+                f"Next <code>/t</code> run will source that board directly."
+            )
+            return
+
         # Muscle Memory Safety Net: catches old finger-memory taps of retired swipe commands
         # ("/cw"/"/cc" are NOT retired - they're live Networking Card pull triggers handled in
         # section 3 above, which always matches first and returns before reaching this block)
@@ -4435,6 +4585,7 @@ def process_webhook_payload_async(data):
                 "/quick - Create contact (Name @ Firm Priority Note)\n"
                 "/cold, /warm - Quick-add a Cold/Warm contact (Name @ Firm Priority Note)\n"
                 "/edit - Edit a template (e.g. /edit L0 New note)\n"
+                "/setslug <Company> <slug> - Pin a company's ATS board slug\n"
                 "/ecosystem, /eco add - View/expand tracked ATS boards\n\n"
                 "<b>PULL CRM DATA:</b>\n"
                 "/c - Pull combined networking cards\n"
