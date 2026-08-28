@@ -3606,6 +3606,26 @@ def process_webhook_payload_async(data):
         raw_text = msg.get("text", "").strip()
         text = re.sub(r"@\w+bot", "", raw_text, flags=re.IGNORECASE).strip()
         today_str = datetime.now().strftime("%Y-%m-%d")
+
+        # Bare-word swipe aliases: when this message is a reply to a card, let plain words stand
+        # in for the common swipe commands so the operator never has to type a leading slash.
+        # Exact single-token match only, so "warm"/"cold" here never collide with the
+        # "/warm Name @ Company" quick-add (which always carries trailing text and its slash).
+        if msg.get("reply_to_message"):
+            _bare = text.strip().lower()
+            _bare_alias = {
+                "done": "/apply", "applied": "/apply", "apply": "/apply",
+                "w": "/warm", "warm": "/warm",
+                "c": "/cold", "cold": "/cold",
+                "x": "/x", "dead": "/x", "kill": "/x",
+            }
+            if _bare in _bare_alias:
+                text = _bare_alias[_bare]
+            else:
+                _em = re.match(r"^e\s+(\S+@\S+\.\S+)$", _bare)   # "e Foo@Bar.com" -> "/e Foo@Bar.com"
+                if _em:
+                    text = "/e " + text.strip().split(None, 1)[1].strip()
+
         logging.info(f"Telegram command received: '{text}' (chat_id={chat_id})")
 
         # 1b. Tuesday Batch Hub Commands (/sendall, /snoozeall)
