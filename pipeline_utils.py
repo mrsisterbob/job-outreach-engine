@@ -125,6 +125,27 @@ def generate_dedup_hash(company, title):
     return hashlib.md5(f"{clean_company}_{clean_title}".encode()).hexdigest()
 
 
+# Filler / legal-entity tokens dropped from both halves of a dedup key so "AAA, Inc." / "aaa"
+# and "The Blue Chip Co." / "Blue Chip" collapse to the same key.
+_DEDUP_STOP_TOKENS = {"inc", "llc", "corp", "co", "ltd", "the"}
+
+
+def normalize_dedup_key(company, role):
+    """Canonical key for spotting a JOBS row logged twice (same Company + Role). Lowercases,
+    replaces punctuation with spaces, collapses internal whitespace, and drops the filler tokens
+    in _DEDUP_STOP_TOKENS from each half. Returns "<company>|<role>"; empty/None inputs yield "|".
+
+    Mirrored by Code.gs's normalizeDedupKey() - keep the two in sync (used by dedupeJobsTabs and
+    the in-append dedup guard).
+    """
+    def _clean(part):
+        spaced = re.sub(r'[^a-z0-9\s]', ' ', str(part or "").lower())
+        tokens = [t for t in spaced.split() if t and t not in _DEDUP_STOP_TOKENS]
+        return " ".join(tokens)
+
+    return f"{_clean(company)}|{_clean(role)}"
+
+
 def generate_short_key(raw_id, fallback=None):
     """fallback replaces time.time() as the entropy source when raw_id is falsy, keeping this pure."""
     return hashlib.md5(str(raw_id or fallback or "0").encode()).hexdigest()[:12]
