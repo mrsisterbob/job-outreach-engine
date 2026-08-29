@@ -72,6 +72,22 @@ function statusRank(value) {
   return -1;
 }
 
+// Maps any free-text / pre-migration Status string to its nearest canonical value, or null
+// when nothing matches (the caller then logs UNMAPPED or buckets it as the earliest stage).
+// Rules are applied in canonical order, first match wins. Shared by migrateStatusVocabulary()
+// (item 5) and the funnel_stats endpoint (item 6) so both bucket legacy data the same way.
+function canonicalizeStatus(raw) {
+  const s = (raw == null ? "" : raw.toString()).trim().toLowerCase();
+  if (s === "" || /match|sourc|lead|prospect|candidate|pending|queue|identif|backlog|to review/.test(s)) return "Matched";
+  if (/appl|sent/.test(s)) return "Applied";
+  if (/repl|respond/.test(s)) return "Replied";
+  if (/screen/.test(s)) return "Screening";
+  if (/interview/.test(s)) return "Interviewing";
+  if (/offer/.test(s)) return "Offer";
+  if (/reject|declin|pass|no thanks/.test(s)) return "Rejected";
+  return null;
+}
+
 // Filler / legal-entity tokens dropped from both halves of a dedup key. MUST stay in sync with
 // pipeline_utils._DEDUP_STOP_TOKENS on the Python side.
 const DEDUP_STOP_TOKENS = { inc: 1, llc: 1, corp: 1, co: 1, ltd: 1, the: 1 };
@@ -611,6 +627,58 @@ function dedupeJobsTabs(dryRun) {
 
     Logger.log("dedupeJobsTabs(dryRun=%s): %s duplicate row(s) %s.",
                dryRun, totalDropped, dryRun ? "would be deleted" : "deleted");
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// One-time migration callable from the Apps Script editor. Rewrites every JOBS tab's Status
+// column to the canonical vocabulary via canonicalizeStatus(). dryRun (default true) logs every
+// intended "<old>" -> "<new>" change and every UNMAPPED value without writing; dryRun=false
+// writes each tab's column in one setValues() and logs a per-tab count. PEOPLE tabs untouched.
+function migrateStatusVocabulary(dryRun) {
+  if (dryRun === undefined) dryRun = true;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    Logger.log("migrateStatusVocabulary: could not acquire script lock - aborting, nothing changed.");
+    return;
+  }
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const jobsTabs = ALL_TABS.filter(name => TAB_MAP[name] === "JOBS");
+    let totalChanged = 0;
+    let totalUnmapped = 0;
+
+    jobsTabs.forEach(tabName => {
+      const sheet = ss.getSheetByName(tabName);
+      if (!sheet || sheet.getLastRow() < 2) return;
+      const n = sheet.getLastRow() - 1;
+      const statusCells = sheet.getRange(2, STATUS_COL, n, 1).getValues();
+      let tabChanged = 0;
+
+      for (let i = 0; i < statusCells.length; i++) {
+        const current = (statusCells[i][0] == null ? "" : statusCells[i][0]).toString();
+        const canon = canonicalizeStatus(current);
+        if (canon === null) {
+          totalUnmapped++;
+          Logger.log('UNMAPPED: "%s" (%s, row %s)', current, tabName, i + 2);
+          continue;
+        }
+        if (canon === current) continue; // already canonical
+        tabChanged++;
+        totalChanged++;
+        Logger.log('[%s] row %s: "%s" -> "%s"', tabName, i + 2, current, canon);
+        if (!dryRun) statusCells[i][0] = canon;
+      }
+
+      if (!dryRun && tabChanged > 0) {
+        sheet.getRange(2, STATUS_COL, n, 1).setValues(statusCells);
+        Logger.log("[%s] wrote %s Status change(s).", tabName, tabChanged);
+      }
+    });
+
+    Logger.log("migrateStatusVocabulary(dryRun=%s): %s change(s) %s, %s UNMAPPED.",
+               dryRun, totalChanged, dryRun ? "pending" : "written", totalUnmapped);
   } finally {
     lock.releaseLock();
   }
