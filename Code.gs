@@ -248,6 +248,23 @@ function doPost(e) {
       return respondJSON({ status: "success", message: `Moved record ${sheetUuid} to ${newTab}` });
     }
 
+    // 3b. Status-field write, no tab move (/apply, /replied, /interview ->
+    //     build_crm_payload("set_status", sheet_uuid=..., status=...)). Writes Column F only;
+    //     the row stays in whatever tab it already lives in.
+    if (action === "set_status") {
+      const sheetUuid = payload.sheet_uuid;
+      const newStatus = payload.status;
+      if (!sheetUuid || !newStatus) {
+        return respondJSON({ status: "error", message: "set_status requires sheet_uuid and status" });
+      }
+      const found = findRecordBySheetUuid(ss, sheetUuid);
+      if (!found) {
+        return respondJSON({ status: "error", message: `No record found for sheet_uuid ${sheetUuid}` });
+      }
+      found.sheet.getRange(found.rowNum, STATUS_COL).setValue(newStatus);
+      return respondJSON({ status: "success", message: `Status set to ${newStatus} for ${sheetUuid}` });
+    }
+
     // 4. Snooze Follow-up (/f -> build_crm_payload("update_snooze", ...))
     if (action === "update_snooze") {
       const sheetUuid = payload.sheet_uuid;

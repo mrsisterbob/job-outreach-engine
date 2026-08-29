@@ -178,6 +178,23 @@ def test_normalize_dedup_key_distinguishes_different_roles_same_company():
     assert pu.normalize_dedup_key("Aptiv", "Ops Analyst") != pu.normalize_dedup_key("Aptiv", "Data Analyst")
 
 
+def test_status_rank_every_canonical_value_is_ordered():
+    assert [pu.status_rank(v) for v in pu.STATUS_VOCAB] == list(range(len(pu.STATUS_VOCAB)))
+    assert pu.status_rank("Matched") == 0
+    assert pu.status_rank("Rejected") == len(pu.STATUS_VOCAB) - 1
+
+
+def test_status_rank_is_case_insensitive_and_trims_whitespace():
+    assert pu.status_rank("  interviewing  ") == pu.STATUS_VOCAB.index("Interviewing")
+    assert pu.status_rank("ApPlIeD") == pu.STATUS_VOCAB.index("Applied")
+
+
+def test_status_rank_unknown_and_none_return_minus_one():
+    assert pu.status_rank("Ghosted") == -1
+    assert pu.status_rank("") == -1
+    assert pu.status_rank(None) == -1
+
+
 def test_generate_short_key_deterministic_for_same_raw_id():
     assert pu.generate_short_key("job_123") == pu.generate_short_key("job_123")
     assert len(pu.generate_short_key("job_123")) == 12
