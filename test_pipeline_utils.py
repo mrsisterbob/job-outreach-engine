@@ -146,6 +146,55 @@ def test_generate_dedup_hash_is_legal_suffix_insensitive():
     assert pu.generate_dedup_hash("Acme", "Operations Manager") == base
 
 
+def test_normalize_dedup_key_is_case_insensitive():
+    assert pu.normalize_dedup_key("Aptiv", "Ops Analyst") == pu.normalize_dedup_key("APTIV", "ops ANALYST")
+
+
+def test_normalize_dedup_key_strips_punctuation():
+    assert pu.normalize_dedup_key("AAA, Inc.", "Operations - Manager") == \
+           pu.normalize_dedup_key("AAA Inc", "Operations Manager")
+
+
+def test_normalize_dedup_key_drops_common_suffixes_and_filler():
+    base = pu.normalize_dedup_key("Blue Chip", "Analyst")
+    assert pu.normalize_dedup_key("The Blue Chip Co", "Analyst") == base
+    assert pu.normalize_dedup_key("Blue Chip LLC", "Analyst") == base
+    assert pu.normalize_dedup_key("Blue Chip Corp.", "Analyst") == base
+
+
+def test_normalize_dedup_key_collapses_internal_whitespace():
+    assert pu.normalize_dedup_key("  Aptiv   PLC ", "  Senior   Ops  Analyst ") == \
+           pu.normalize_dedup_key("Aptiv PLC", "Senior Ops Analyst")
+
+
+def test_normalize_dedup_key_handles_empty_and_none():
+    assert pu.normalize_dedup_key("", "") == "|"
+    assert pu.normalize_dedup_key(None, None) == "|"
+    assert pu.normalize_dedup_key("Aptiv", None) == "aptiv|"
+    assert pu.normalize_dedup_key(None, "Analyst") == "|analyst"
+
+
+def test_normalize_dedup_key_distinguishes_different_roles_same_company():
+    assert pu.normalize_dedup_key("Aptiv", "Ops Analyst") != pu.normalize_dedup_key("Aptiv", "Data Analyst")
+
+
+def test_status_rank_every_canonical_value_is_ordered():
+    assert [pu.status_rank(v) for v in pu.STATUS_VOCAB] == list(range(len(pu.STATUS_VOCAB)))
+    assert pu.status_rank("Matched") == 0
+    assert pu.status_rank("Rejected") == len(pu.STATUS_VOCAB) - 1
+
+
+def test_status_rank_is_case_insensitive_and_trims_whitespace():
+    assert pu.status_rank("  interviewing  ") == pu.STATUS_VOCAB.index("Interviewing")
+    assert pu.status_rank("ApPlIeD") == pu.STATUS_VOCAB.index("Applied")
+
+
+def test_status_rank_unknown_and_none_return_minus_one():
+    assert pu.status_rank("Ghosted") == -1
+    assert pu.status_rank("") == -1
+    assert pu.status_rank(None) == -1
+
+
 def test_generate_short_key_deterministic_for_same_raw_id():
     assert pu.generate_short_key("job_123") == pu.generate_short_key("job_123")
     assert len(pu.generate_short_key("job_123")) == 12

@@ -3035,7 +3035,7 @@ def process_overdue_batch(mode, snooze_days=7):
             draft_ok, draft_message, _ = create_gmail_draft(
                 to_email=email,
                 company_name=record.get("company") or "Target Firm",
-                job_title=record.get("title") or "Operations Specialist",
+                job_title=record.get("title") or "",
                 custom_body=generate_bump_email(record.get("name") or ""),
                 custom_subject=f"Following up - {record.get('company') or 'Target Firm'}"
             )
@@ -3672,7 +3672,7 @@ def process_webhook_payload_async(data):
                 edit_telegram_message(chat_id, loading_msg_id, "✅ <b>Data retrieved.</b>")
             for c in cards:
                 is_warm = (cmd_type in ["c", "cw"])
-                draft_text = generate_warm_email(c.get("note", "")) if is_warm else generate_cold_email(c.get("title", "Operations Specialist"), c.get("company", "Target Firm"))
+                draft_text = generate_warm_email(c.get("note", "")) if is_warm else generate_cold_email(c.get("title") or "", c.get("company", "Target Firm"))
                 monospaced_draft = format_email_block(draft_text)
                 contact_sheet_uuid = c.get("sheet_uuid", "")
                 card_msg = (
@@ -3874,25 +3874,40 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({interviews_set} interviews / {messages_sent} sent)")
             return
         if text == "/funnel":
-            discovered = get_metric_count("listing_discovered")
-            screened = get_metric_count("ai_screened")
-            drafts_staged = get_metric_count("gmail_draft_staged")
-            applied = get_metric_count("applied")
-            interviews_set = get_metric_count("interview_set")
-            screen_rate = (interviews_set / screened * 100) if screened > 0 else 0.0
+            res = crm_get({"action": "funnel_stats"})
+            payload = {}
+            if res is not None:
+                try:
+                    payload = res.json()
+                except Exception:
+                    payload = {}
+            if not payload or payload.get("status") != "success":
+                send_telegram_message(chat_id, "⚠️ <b>Funnel unavailable:</b> couldn't read the CRM funnel endpoint.")
+                return
 
-            funnel_ascii = render_ascii_funnel([
-                ("Discovered Listings", discovered),
-                ("AI Screened", screened),
-                ("Gmail Drafts Staged", drafts_staged),
-                ("Applied Roles", applied)
-            ])
-            funnel_msg = (
-                "📊 <b>Pipeline Conversion Funnel</b>\n"
-                f"<pre>{html.escape(funnel_ascii)}</pre>\n"
-                f"🎯 <b>Screen / Interview Rate:</b> {screen_rate:.1f}% ({interviews_set} interviews / {screened} screened)"
-            )
-            send_telegram_message(chat_id, funnel_msg)
+            def _fmt_buckets(b):
+                b = b or {}
+                return (
+                    f"Matched {b.get('Matched', 0)} | Applied {b.get('Applied', 0)} | Replied {b.get('Replied', 0)}\n"
+                    f"Screening {b.get('Screening', 0)} | Interviewing {b.get('Interviewing', 0)} | "
+                    f"Offer {b.get('Offer', 0)} | Rejected {b.get('Rejected', 0)}"
+                )
+
+            rates = payload.get("rates", {})
+            _pct = lambda key: f"{float(rates.get(key) or 0):.1f}"
+            funnel_lines = [
+                "📊 <b>CRM Pipeline Funnel</b>\n",
+                "<b>OVERALL</b>",
+                _fmt_buckets(payload.get("overall", {})),
+                (f"<b>Rates:</b> Matched→Applied {_pct('matched_to_applied')}% · "
+                 f"Applied→Replied {_pct('applied_to_reply')}% · "
+                 f"Replied→Interviewing {_pct('reply_to_interview')}% · "
+                 f"Interviewing→Offer {_pct('interview_to_offer')}%"),
+            ]
+            for persona, buckets in (payload.get("by_persona") or {}).items():
+                funnel_lines.append(f"\n<b>{html.escape(str(persona)).upper()}</b>")
+                funnel_lines.append(_fmt_buckets(buckets))
+            send_telegram_message(chat_id, "\n".join(funnel_lines))
             return
 
         if text == "/outcomes":
@@ -4253,7 +4268,8 @@ def process_webhook_payload_async(data):
                 source=derive_job_source(job.get("job_id")),
                 outreach_path="warm" if mapping.get("contact_name") else "ats"
             )
-            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Tetiana Warm"))
+            # Canonical Status write on the row in place - no tab move (see set_status in Code.gs).
+            enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status="Applied"))
             return
 
         if text in ("/offer", "/withdraw"):
@@ -4292,6 +4308,29 @@ def process_webhook_payload_async(data):
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"❌ Archived to {new_tab}.")
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+            return
+
+        # Canonical Status advance by short_id (no reply context): /replied <id>, /interview <id>.
+        # Resolves the short_id to a sheet_uuid the same way callbacks do (get_sheet_uuid_by_short_id)
+        # and writes only the Status field - never a tab move.
+        status_cmd_match = re.match(r"^/(replied|interview)(?:\s+(\S+))?$", text)
+        if status_cmd_match:
+            cmd, short_id = status_cmd_match.group(1), (status_cmd_match.group(2) or "").strip()
+            new_status = "Replied" if cmd == "replied" else "Interviewing"
+            if not short_id:
+                send_telegram_message(chat_id, f"⚠️ <b>Usage:</b> <code>/{cmd} &lt;short_id&gt;</code>")
+                return
+            sheet_uuid = get_sheet_uuid_by_short_id(short_id)
+            if not sheet_uuid:
+                send_telegram_message(
+                    chat_id,
+                    f"⚠️ <b>Record Not Found:</b> No CRM record is mapped to <code>{html.escape(short_id)}</code> "
+                    f"for <code>/{cmd}</code>. Please retry with /t or /c to regenerate it."
+                )
+                return
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            send_telegram_message(chat_id, f"✅ {new_status} - {datetime.now().strftime('%Y-%m-%d')}")
+            enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status=new_status))
             return
 
         # Deterministic Template Bank Editor (/edit ID New Text) - no reply context required
@@ -4345,7 +4384,9 @@ def process_webhook_payload_async(data):
                 "/cc - Pull Cold VP Sprint cards\n"
                 "/p - Query priority tier contacts\n\n"
                 "<b>SWIPE-REPLY ACTIONS (reply to a card):</b>\n"
-                "/apply - Mark Applied & move to Tetiana Warm\n"
+                "/apply - Mark Applied (Status only, no tab move)\n"
+                "/replied &lt;id&gt; - Set Status to Replied\n"
+                "/interview &lt;id&gt; - Set Status to Interviewing\n"
                 "/offer - Log an offer for this record\n"
                 "/withdraw - Log a withdrawn application\n"
                 "/warm - Smart-route lead to its Warm tab\n"
