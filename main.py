@@ -3035,7 +3035,7 @@ def process_overdue_batch(mode, snooze_days=7):
             draft_ok, draft_message, _ = create_gmail_draft(
                 to_email=email,
                 company_name=record.get("company") or "Target Firm",
-                job_title=record.get("title") or "Operations Specialist",
+                job_title=record.get("title") or "",
                 custom_body=generate_bump_email(record.get("name") or ""),
                 custom_subject=f"Following up - {record.get('company') or 'Target Firm'}"
             )
@@ -3672,7 +3672,7 @@ def process_webhook_payload_async(data):
                 edit_telegram_message(chat_id, loading_msg_id, "✅ <b>Data retrieved.</b>")
             for c in cards:
                 is_warm = (cmd_type in ["c", "cw"])
-                draft_text = generate_warm_email(c.get("note", "")) if is_warm else generate_cold_email(c.get("title", "Operations Specialist"), c.get("company", "Target Firm"))
+                draft_text = generate_warm_email(c.get("note", "")) if is_warm else generate_cold_email(c.get("title") or "", c.get("company", "Target Firm"))
                 monospaced_draft = format_email_block(draft_text)
                 contact_sheet_uuid = c.get("sheet_uuid", "")
                 card_msg = (
