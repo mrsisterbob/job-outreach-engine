@@ -319,7 +319,8 @@ function doPost(e) {
         // JOBS tabs have no contact name (Col B = Company, Col C = Role); PEOPLE tabs have no job title
         const name = schemaType === "JOBS" ? "" : row[1];
         const company = schemaType === "JOBS" ? row[1] : row[2];
-        const title = schemaType === "JOBS" ? row[2] : "Operations Specialist";
+        // JOBS: the real role from Column C, "" when blank/missing (never a stubbed title).
+        const title = schemaType === "JOBS" ? (row[2] || "") : "Operations Specialist";
 
         results.push({
           sheet_uuid: row[9] || "",
