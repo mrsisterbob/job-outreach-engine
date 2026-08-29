@@ -4253,7 +4253,8 @@ def process_webhook_payload_async(data):
                 source=derive_job_source(job.get("job_id")),
                 outreach_path="warm" if mapping.get("contact_name") else "ats"
             )
-            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Tetiana Warm"))
+            # Canonical Status write on the row in place - no tab move (see set_status in Code.gs).
+            enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status="Applied"))
             return
 
         if text in ("/offer", "/withdraw"):
@@ -4292,6 +4293,29 @@ def process_webhook_payload_async(data):
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"❌ Archived to {new_tab}.")
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+            return
+
+        # Canonical Status advance by short_id (no reply context): /replied <id>, /interview <id>.
+        # Resolves the short_id to a sheet_uuid the same way callbacks do (get_sheet_uuid_by_short_id)
+        # and writes only the Status field - never a tab move.
+        status_cmd_match = re.match(r"^/(replied|interview)(?:\s+(\S+))?$", text)
+        if status_cmd_match:
+            cmd, short_id = status_cmd_match.group(1), (status_cmd_match.group(2) or "").strip()
+            new_status = "Replied" if cmd == "replied" else "Interviewing"
+            if not short_id:
+                send_telegram_message(chat_id, f"⚠️ <b>Usage:</b> <code>/{cmd} &lt;short_id&gt;</code>")
+                return
+            sheet_uuid = get_sheet_uuid_by_short_id(short_id)
+            if not sheet_uuid:
+                send_telegram_message(
+                    chat_id,
+                    f"⚠️ <b>Record Not Found:</b> No CRM record is mapped to <code>{html.escape(short_id)}</code> "
+                    f"for <code>/{cmd}</code>. Please retry with /t or /c to regenerate it."
+                )
+                return
+            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            send_telegram_message(chat_id, f"✅ {new_status} - {datetime.now().strftime('%Y-%m-%d')}")
+            enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status=new_status))
             return
 
         # Deterministic Template Bank Editor (/edit ID New Text) - no reply context required
@@ -4345,7 +4369,9 @@ def process_webhook_payload_async(data):
                 "/cc - Pull Cold VP Sprint cards\n"
                 "/p - Query priority tier contacts\n\n"
                 "<b>SWIPE-REPLY ACTIONS (reply to a card):</b>\n"
-                "/apply - Mark Applied & move to Tetiana Warm\n"
+                "/apply - Mark Applied (Status only, no tab move)\n"
+                "/replied &lt;id&gt; - Set Status to Replied\n"
+                "/interview &lt;id&gt; - Set Status to Interviewing\n"
                 "/offer - Log an offer for this record\n"
                 "/withdraw - Log a withdrawn application\n"
                 "/warm - Smart-route lead to its Warm tab\n"

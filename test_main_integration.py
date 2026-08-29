@@ -214,3 +214,66 @@ def test_create_gmail_draft_attaches_pdf_with_correct_filename(monkeypatch):
     assert attachments[0].get_filename() == "Kevin_Miller_Resume_Acme_TrackA.pdf"
     assert attachments[0].get_content_type() == "application/pdf"
     assert attachments[0].get_payload(decode=True) == b"%PDF-1.4 fake pdf bytes"
+
+
+# ---- Canonical Status writes: /apply, /replied, /interview (Status field only, no tab move) ----
+
+def _dispatch(text, reply_to_message=None):
+    msg = {"chat": {"id": 1}, "text": text}
+    if reply_to_message is not None:
+        msg["reply_to_message"] = reply_to_message
+    m.process_webhook_payload_async({"message": msg})
+
+
+def test_apply_swipe_writes_status_applied_and_never_moves_tabs(monkeypatch):
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-apply", "sheet_tab": "Tetiana Cold", "contact_name": "", "contact_company": "Acme Corp"})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {"job_title": "Ops Analyst", "job_id": "gh_x"})
+    for name in ("send_telegram_message", "edit_telegram_message", "log_metric_event",
+                 "log_daily_activity", "record_application_outcome", "add_company_cooldown",
+                 "upsert_company_identity"):
+        monkeypatch.setattr(m, name, lambda *a, **k: None)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    _dispatch("/apply")
+
+    assert len(enqueued) == 1
+    assert enqueued[0]["action"] == "set_status"
+    assert enqueued[0]["status"] == "Applied"
+    assert enqueued[0]["sheet_uuid"] == "uuid-apply"
+    assert "new_tab" not in enqueued[0]  # Status write only - no tab move
+
+
+@pytest.mark.parametrize("command,short_id,expected_status", [
+    ("/replied", "abc123", "Replied"),
+    ("/interview", "abc123", "Interviewing"),
+])
+def test_status_short_id_commands_build_set_status_payload(monkeypatch, command, short_id, expected_status):
+    monkeypatch.setattr(m, "get_sheet_uuid_by_short_id",
+                        lambda sid: "uuid-target" if sid == short_id else None)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    _dispatch(f"{command} {short_id}")
+
+    assert enqueued == [{
+        "action": "set_status", "rowOperationOrder": "DESC",
+        "sheet_uuid": "uuid-target", "status": expected_status,
+    }]
+    assert any(expected_status in line for line in sent)
+
+
+def test_status_short_id_command_unknown_id_reports_not_found_and_enqueues_nothing(monkeypatch):
+    monkeypatch.setattr(m, "get_sheet_uuid_by_short_id", lambda sid: None)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    _dispatch("/replied bogus-id")
+
+    assert enqueued == []
+    assert any("Record Not Found" in line for line in sent)

@@ -146,6 +146,22 @@ def normalize_dedup_key(company, role):
     return f"{_clean(company)}|{_clean(role)}"
 
 
+# Canonical Status vocabulary, ordered from earliest pipeline stage to latest. This is the
+# single source of truth for Status ordering; Code.gs mirrors it as STATUS_VOCAB / statusRank().
+STATUS_VOCAB = ["Matched", "Applied", "Replied", "Screening", "Interviewing", "Offer", "Rejected"]
+
+
+def status_rank(value):
+    """0-based ordinal of `value` within STATUS_VOCAB (case-insensitive, surrounding whitespace
+    tolerated); -1 for anything unrecognized (blank, None, typo, pre-migration free text).
+    """
+    needle = str(value or "").strip().lower()
+    for idx, canonical in enumerate(STATUS_VOCAB):
+        if canonical.lower() == needle:
+            return idx
+    return -1
+
+
 def generate_short_key(raw_id, fallback=None):
     """fallback replaces time.time() as the entropy source when raw_id is falsy, keeping this pure."""
     return hashlib.md5(str(raw_id or fallback or "0").encode()).hexdigest()[:12]
