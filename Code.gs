@@ -735,6 +735,19 @@ function formatSheet(sheet) {
   sheet.getRange(2, 1, maxRows - 1, numCols)
     .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
 
+  // JOBS tabs only: canonical Status dropdown on Column F (rows 2..maxRows). allowInvalid(true)
+  // keeps pre-migration values from erroring; any prior validation on the range is cleared first.
+  // PEOPLE tabs keep their free-text Status column untouched.
+  if (schemaType === "JOBS") {
+    const statusRange = sheet.getRange(2, STATUS_COL, maxRows - 1, 1);
+    statusRange.clearDataValidations();
+    const statusRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(STATUS_VOCAB, true)
+      .setAllowInvalid(true)
+      .build();
+    statusRange.setDataValidation(statusRule);
+  }
+
   applyConditionalFormatting(sheet, maxRows, numCols);
 }
 
