@@ -3874,25 +3874,40 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({interviews_set} interviews / {messages_sent} sent)")
             return
         if text == "/funnel":
-            discovered = get_metric_count("listing_discovered")
-            screened = get_metric_count("ai_screened")
-            drafts_staged = get_metric_count("gmail_draft_staged")
-            applied = get_metric_count("applied")
-            interviews_set = get_metric_count("interview_set")
-            screen_rate = (interviews_set / screened * 100) if screened > 0 else 0.0
+            res = crm_get({"action": "funnel_stats"})
+            payload = {}
+            if res is not None:
+                try:
+                    payload = res.json()
+                except Exception:
+                    payload = {}
+            if not payload or payload.get("status") != "success":
+                send_telegram_message(chat_id, "⚠️ <b>Funnel unavailable:</b> couldn't read the CRM funnel endpoint.")
+                return
 
-            funnel_ascii = render_ascii_funnel([
-                ("Discovered Listings", discovered),
-                ("AI Screened", screened),
-                ("Gmail Drafts Staged", drafts_staged),
-                ("Applied Roles", applied)
-            ])
-            funnel_msg = (
-                "📊 <b>Pipeline Conversion Funnel</b>\n"
-                f"<pre>{html.escape(funnel_ascii)}</pre>\n"
-                f"🎯 <b>Screen / Interview Rate:</b> {screen_rate:.1f}% ({interviews_set} interviews / {screened} screened)"
-            )
-            send_telegram_message(chat_id, funnel_msg)
+            def _fmt_buckets(b):
+                b = b or {}
+                return (
+                    f"Matched {b.get('Matched', 0)} | Applied {b.get('Applied', 0)} | Replied {b.get('Replied', 0)}\n"
+                    f"Screening {b.get('Screening', 0)} | Interviewing {b.get('Interviewing', 0)} | "
+                    f"Offer {b.get('Offer', 0)} | Rejected {b.get('Rejected', 0)}"
+                )
+
+            rates = payload.get("rates", {})
+            _pct = lambda key: f"{float(rates.get(key) or 0):.1f}"
+            funnel_lines = [
+                "📊 <b>CRM Pipeline Funnel</b>\n",
+                "<b>OVERALL</b>",
+                _fmt_buckets(payload.get("overall", {})),
+                (f"<b>Rates:</b> Matched→Applied {_pct('matched_to_applied')}% · "
+                 f"Applied→Replied {_pct('applied_to_reply')}% · "
+                 f"Replied→Interviewing {_pct('reply_to_interview')}% · "
+                 f"Interviewing→Offer {_pct('interview_to_offer')}%"),
+            ]
+            for persona, buckets in (payload.get("by_persona") or {}).items():
+                funnel_lines.append(f"\n<b>{html.escape(str(persona)).upper()}</b>")
+                funnel_lines.append(_fmt_buckets(buckets))
+            send_telegram_message(chat_id, "\n".join(funnel_lines))
             return
 
         if text == "/outcomes":
