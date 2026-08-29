@@ -277,3 +277,66 @@ def test_status_short_id_command_unknown_id_reports_not_found_and_enqueues_nothi
 
     assert enqueued == []
     assert any("Record Not Found" in line for line in sent)
+
+
+# ---- /funnel Telegram command (reads the funnel_stats GET action) ----
+
+_FUNNEL_OK = {
+    "status": "success",
+    "overall": {"Matched": 12, "Applied": 8, "Replied": 4, "Screening": 2,
+                "Interviewing": 3, "Offer": 1, "Rejected": 5},
+    "by_persona": {
+        "Tetiana": {"Matched": 10, "Applied": 6, "Replied": 3, "Screening": 1,
+                    "Interviewing": 2, "Offer": 1, "Rejected": 4},
+        "Clavicular": {"Matched": 2, "Applied": 2, "Replied": 1, "Screening": 1,
+                       "Interviewing": 1, "Offer": 0, "Rejected": 1},
+    },
+    "rates": {"matched_to_applied": 66.7, "applied_to_reply": 50.0,
+              "reply_to_interview": 75.0, "interview_to_offer": 33.3},
+}
+
+
+class _FakeResp:
+    def __init__(self, body):
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def test_funnel_command_calls_funnel_stats_and_renders_personas(monkeypatch):
+    calls = []
+    monkeypatch.setattr(m, "crm_get", lambda params, *a, **k: calls.append(params) or _FakeResp(_FUNNEL_OK))
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+
+    _dispatch("/funnel")
+
+    assert calls == [{"action": "funnel_stats"}]
+    assert len(sent) == 1
+    body = sent[0]
+    assert "OVERALL" in body and "TETIANA" in body and "CLAVICULAR" in body
+    assert "Matched 12" in body and "Interviewing 3" in body and "Rejected 5" in body
+    assert "66.7%" in body and "33.3%" in body
+
+
+def test_funnel_command_handles_webhook_unreachable(monkeypatch):
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: None)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+
+    _dispatch("/funnel")
+
+    assert len(sent) == 1
+    assert "unavailable" in sent[0].lower()
+
+
+def test_funnel_command_handles_error_status_response(monkeypatch):
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _FakeResp({"status": "error", "message": "Unauthorized"}))
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+
+    _dispatch("/funnel")
+
+    assert len(sent) == 1
+    assert "unavailable" in sent[0].lower()
