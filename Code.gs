@@ -507,6 +507,53 @@ function doGet(e) {
       return respondJSON({ status: "success", found: false });
     }
 
+    // 4. Pipeline funnel (read-only): Status-bucket counts overall and per persona, plus the
+    //    4 key conversion rates. Legacy Status text is bucketed via the same canonicalizeStatus()
+    //    the migration (item 5) uses, so pre-migration data still buckets sanely. Touches no data.
+    if (action === "funnel_stats") {
+      const emptyBuckets = () => {
+        const b = {};
+        STATUS_VOCAB.forEach(k => { b[k] = 0; });
+        return b;
+      };
+      const personaFor = tabName => {
+        if (tabName === "Tetiana Cold" || tabName === "Tetiana Warm") return "Tetiana";
+        if (tabName === "Clavicular") return "Clavicular";
+        return null; // Died archive / anything else - no persona, excluded from the funnel
+      };
+
+      const overall = emptyBuckets();
+      const byPersona = {};
+      ALL_TABS.forEach(tabName => {
+        if (TAB_MAP[tabName] !== "JOBS") return;
+        const persona = personaFor(tabName);
+        if (!persona) return;
+        if (!byPersona[persona]) byPersona[persona] = emptyBuckets();
+        const sheet = ss.getSheetByName(tabName);
+        if (!sheet || sheet.getLastRow() < 2) return;
+        const statuses = sheet.getRange(2, STATUS_COL, sheet.getLastRow() - 1, 1).getValues();
+        for (let i = 0; i < statuses.length; i++) {
+          const canon = canonicalizeStatus(statuses[i][0]) || "Matched";
+          overall[canon]++;
+          byPersona[persona][canon]++;
+        }
+      });
+
+      const rate = (num, denom) => (denom > 0 ? Math.round((num / denom) * 1000) / 10 : 0.0);
+
+      return respondJSON({
+        status: "success",
+        overall: overall,
+        by_persona: byPersona,
+        rates: {
+          matched_to_applied: rate(overall.Applied, overall.Matched),
+          applied_to_reply: rate(overall.Replied, overall.Applied),
+          reply_to_interview: rate(overall.Interviewing, overall.Replied),
+          interview_to_offer: rate(overall.Offer, overall.Interviewing)
+        }
+      });
+    }
+
     return respondJSON({ status: "error", message: "Unsupported GET request" });
 
 
