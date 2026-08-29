@@ -56,6 +56,36 @@ const ALL_TABS = Object.keys(TAB_MAP);
 const UUID_COL = 10;    // Column J - the only field ever used to identify/move/delete a row
 const NOTES_COL = 9;
 const FOLLOWUP_COL = 7;
+const STATUS_COL = 6;   // Column F - Status (shared JOBS/PEOPLE schema position)
+
+// Canonical Status vocabulary, ordered least- to most-advanced. Mirrors
+// pipeline_utils.STATUS_VOCAB / status_rank() on the Python side. statusRank() returns the
+// 0-based ordinal (or -1 for anything unrecognized) and is used to pick the surviving row
+// when deduping and to bucket rows for funnel_stats.
+const STATUS_VOCAB = ["Matched", "Applied", "Replied", "Screening", "Interviewing", "Offer", "Rejected"];
+
+function statusRank(value) {
+  const needle = (value || "").toString().trim().toLowerCase();
+  for (let i = 0; i < STATUS_VOCAB.length; i++) {
+    if (STATUS_VOCAB[i].toLowerCase() === needle) return i;
+  }
+  return -1;
+}
+
+// Filler / legal-entity tokens dropped from both halves of a dedup key. MUST stay in sync with
+// pipeline_utils._DEDUP_STOP_TOKENS on the Python side.
+const DEDUP_STOP_TOKENS = { inc: 1, llc: 1, corp: 1, co: 1, ltd: 1, the: 1 };
+
+// Canonical key for spotting a JOBS row logged twice (same Company + Role). Lowercases,
+// replaces punctuation with spaces, collapses whitespace, drops filler tokens. Returns
+// "<company>|<role>"; empty inputs yield "|". Mirrors pipeline_utils.normalize_dedup_key().
+function normalizeDedupKey(company, role) {
+  function clean(part) {
+    const spaced = (part == null ? "" : part.toString()).toLowerCase().replace(/[^a-z0-9\s]/g, " ");
+    return spaced.split(/\s+/).filter(t => t && !DEDUP_STOP_TOKENS[t]).join(" ");
+  }
+  return clean(company) + "|" + clean(role);
+}
 const LOCK_TIMEOUT_MS = 30000; // 30s concurrency lock, matches main.py's DB_WRITE_LOCK_TIMEOUT
 
 // Formatting constants
@@ -99,6 +129,17 @@ function doPost(e) {
       const sheet = getOrCreateSheet(ss, targetTab);
       const schemaType = TAB_MAP[targetTab] || "JOBS";
       const rowData = normalizeRowData(payload.row_data, schemaType);
+
+      // In-append dedup guard (JOBS only): if a non-terminal row with the same normalized
+      // Company+Role already exists in this tab, don't append a second one - hand back the
+      // existing UUID so the caller's mapping still resolves.
+      if (schemaType === "JOBS") {
+        const existingUuid = findLiveJobsDuplicate(sheet, rowData[1], rowData[2]);
+        if (existingUuid !== null) {
+          return respondJSON({ status: "success", message: "duplicate suppressed", sheet_uuid: existingUuid });
+        }
+      }
+
       const newRow = sheet.getLastRow() + 1;
       sheet.getRange(newRow, 1, 1, rowData.length).setValues([rowData]); // Columns A-I only
       sheet.getRange(newRow, UUID_COL).setValue(payload.sheet_uuid || ""); // Column J reserved for UUID
@@ -115,28 +156,45 @@ function doPost(e) {
       const schemaType = TAB_MAP[targetTab] || "JOBS";
       const rows = payload.rows || [];
 
-      if (rows.length > 0) {
-        const startRow = sheet.getLastRow() + 1;
-        const batchValues = [];
-
-        for (let i = 0; i < rows.length; i++) {
-          const item = rows[i];
-          const normalized = normalizeRowData(item.row_data, schemaType);
-          while (normalized.length < UUID_COL - 1) {
-            normalized.push("");
-          }
-          normalized[UUID_COL - 1] = item.sheet_uuid || "";
-          batchValues.push(normalized);
+      // In-append dedup guard (JOBS only): seed the set of live Company+Role keys already in
+      // the tab, then skip any batch row that collides with it or with an earlier row in this
+      // same batch. Terminal rows (Rejected / the Died tab) never count as a live duplicate.
+      const liveKeys = {};
+      if (schemaType === "JOBS" && sheet.getName() !== "Died" && sheet.getLastRow() >= 2) {
+        const existing = sheet.getRange(2, 1, sheet.getLastRow() - 1, SCHEMAS.JOBS.length).getValues();
+        for (let e = 0; e < existing.length; e++) {
+          if (statusRank(existing[e][STATUS_COL - 1]) === statusRank("Rejected")) continue;
+          liveKeys[normalizeDedupKey(existing[e][1], existing[e][2])] = true;
         }
+      }
 
+      let suppressed = 0;
+      const batchValues = [];
+      for (let i = 0; i < rows.length; i++) {
+        const item = rows[i];
+        const normalized = normalizeRowData(item.row_data, schemaType);
+        if (schemaType === "JOBS") {
+          const key = normalizeDedupKey(normalized[1], normalized[2]);
+          if (key !== "|" && liveKeys[key]) { suppressed++; continue; }
+          if (key !== "|") liveKeys[key] = true;
+        }
+        while (normalized.length < UUID_COL - 1) {
+          normalized.push("");
+        }
+        normalized[UUID_COL - 1] = item.sheet_uuid || "";
+        batchValues.push(normalized);
+      }
+
+      if (batchValues.length > 0) {
+        const startRow = sheet.getLastRow() + 1;
         sheet.getRange(startRow, 1, batchValues.length, UUID_COL).setValues(batchValues);
         formatSheet(sheet);
       }
 
       return respondJSON({
         status: "success",
-        message: `Batch inserted ${rows.length} rows`,
-        count: rows.length
+        message: `Batch inserted ${batchValues.length} rows` + (suppressed ? ` (${suppressed} duplicate(s) suppressed)` : ""),
+        count: batchValues.length
       });
     }
 
@@ -450,6 +508,94 @@ function findRecordBySheetUuid(ss, sheetUuid) {
     }
   }
   return null;
+}
+
+// Returns the Sheet UUID (possibly "") of an existing non-terminal JOBS row in `sheet` whose
+// normalized Company+Role matches (company, role), or null when there is no live duplicate.
+// "Non-terminal" = Status is not Rejected and the sheet is not the Died archive. Scans
+// bottom-to-top so in-flight matches survive concurrent deletions elsewhere.
+function findLiveJobsDuplicate(sheet, company, role) {
+  if (sheet.getName() === "Died") return null;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+  const targetKey = normalizeDedupKey(company, role);
+  if (targetKey === "|") return null;
+  const data = sheet.getRange(2, 1, lastRow - 1, SCHEMAS.JOBS.length).getValues();
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (statusRank(data[i][STATUS_COL - 1]) === statusRank("Rejected")) continue;
+    if (normalizeDedupKey(data[i][1], data[i][2]) === targetKey) {
+      return data[i][UUID_COL - 1] || "";
+    }
+  }
+  return null;
+}
+
+// One-time cleanup callable from the Apps Script editor. Collapses duplicate JOBS rows (same
+// normalized Company+Role) in every JOBS tab down to the single most-advanced row: winner =
+// highest statusRank, then highest Fit Score, then earliest Date Added, then lowest row
+// number. dryRun (default true) only logs; dryRun=false deletes the losers bottom-up under the
+// script lock, then re-formats the tab. PEOPLE tabs are never touched.
+function dedupeJobsTabs(dryRun) {
+  if (dryRun === undefined) dryRun = true;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    Logger.log("dedupeJobsTabs: could not acquire script lock - aborting, nothing changed.");
+    return;
+  }
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const jobsTabs = ALL_TABS.filter(name => TAB_MAP[name] === "JOBS");
+    let totalDropped = 0;
+
+    jobsTabs.forEach(tabName => {
+      const sheet = ss.getSheetByName(tabName);
+      if (!sheet || sheet.getLastRow() < 3) return; // need >=2 data rows for a duplicate
+
+      const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, SCHEMAS.JOBS.length).getValues();
+      const groups = {};
+      values.forEach((row, idx) => {
+        const key = normalizeDedupKey(row[1], row[2]);
+        if (key === "|") return; // blank Company+Role - leave alone
+        (groups[key] = groups[key] || []).push({
+          rowNum: idx + 2,
+          uuid: row[UUID_COL - 1] || "",
+          rank: statusRank(row[STATUS_COL - 1]),
+          fit: parseFloat(row[4]) || 0,
+          dateAdded: (row[0] || "").toString()
+        });
+      });
+
+      const loserRows = [];
+      Object.keys(groups).forEach(key => {
+        const rows = groups[key];
+        if (rows.length < 2) return;
+        const sorted = rows.slice().sort((a, b) => {
+          if (b.rank !== a.rank) return b.rank - a.rank;                 // most-advanced Status
+          if (b.fit !== a.fit) return b.fit - a.fit;                    // highest Fit Score
+          if (a.dateAdded !== b.dateAdded) return a.dateAdded < b.dateAdded ? -1 : 1; // earliest
+          return a.rowNum - b.rowNum;                                   // lowest row number
+        });
+        const keeper = sorted[0];
+        const losers = sorted.slice(1);
+        losers.forEach(l => loserRows.push(l.rowNum));
+        totalDropped += losers.length;
+        Logger.log("[%s] key='%s' KEEP uuid=%s (row %s) | DROP %s",
+                   tabName, key, keeper.uuid || "(none)", keeper.rowNum,
+                   losers.map(l => (l.uuid || "(none)") + "@row" + l.rowNum).join(", "));
+      });
+
+      if (!dryRun && loserRows.length > 0) {
+        loserRows.sort((a, b) => b - a).forEach(rowNum => sheet.deleteRow(rowNum)); // bottom-up
+        formatSheet(sheet);
+        Logger.log("[%s] deleted %s duplicate row(s).", tabName, loserRows.length);
+      }
+    });
+
+    Logger.log("dedupeJobsTabs(dryRun=%s): %s duplicate row(s) %s.",
+               dryRun, totalDropped, dryRun ? "would be deleted" : "deleted");
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // Normalizes add_row's payload.row_data (array OR named object) into a fixed-length
