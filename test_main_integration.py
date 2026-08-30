@@ -11,6 +11,7 @@ import os
 import sqlite3
 import tempfile
 import uuid
+from datetime import date
 from email import message_from_bytes
 
 import pytest
@@ -26,7 +27,8 @@ import main as m  # noqa: E402  (must import after JOBS_DB_PATH is set)
 def clean_tables():
     """Truncate the tables under test before every test so cases don't bleed into each other."""
     with m.get_db_conn() as conn:
-        for table in ("crm_outbox", "sheet_row_map", "company_cooldown", "company_identities", "jobs"):
+        for table in ("crm_outbox", "sheet_row_map", "company_cooldown", "company_identities",
+                      "jobs", "followup_sequencer_log"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
     yield
@@ -173,6 +175,110 @@ def test_process_overdue_batch_sendall_drafts_for_valid_email(monkeypatch):
     monkeypatch.setattr(m, "create_gmail_draft", lambda **kwargs: (True, "Success", "draft1"))
     result, _ = m.process_overdue_batch("sendall", snooze_days=14)
     assert result == {"total": 1, "updated": 1, "drafted": 1, "skipped": 0}
+
+
+# ---- Nightly follow-up sequencer (run_followup_sequencer) ----
+
+_SEQ_TODAY = date(2026, 6, 1)
+
+# Applied 4d ago -> follow-up #1 ; Applied 16d ago -> bury ; Interviewing 10d ago -> stale ;
+# two Matched rows for the "top 3" section ; one future-dated Applied row that must be left alone.
+_SEQ_RECORDS = {
+    "TC": [
+        {"sheet_uuid": "seq-fu1", "company": "Acme", "title": "Ops Analyst", "name": "",
+         "status": "Applied", "date_added": "2026-05-28", "next_followup": "1970-01-01", "raw_priority": "70"},
+        {"sheet_uuid": "seq-bury", "company": "Beta", "title": "Ops Lead", "name": "",
+         "status": "Applied", "date_added": "2026-05-16", "next_followup": "1970-01-01", "raw_priority": "60"},
+        {"sheet_uuid": "seq-future", "company": "Gamma", "title": "Analyst", "name": "",
+         "status": "Applied", "date_added": "2026-05-01", "next_followup": "2026-06-30", "raw_priority": "55"},
+    ],
+    "TW": [
+        {"sheet_uuid": "seq-stale", "company": "Delta", "title": "Ops Manager", "name": "",
+         "status": "Interviewing", "date_added": "2026-05-22", "next_followup": "1970-01-01", "raw_priority": "80"},
+    ],
+    "CL": [
+        {"sheet_uuid": "seq-m1", "company": "Epsilon", "title": "Ops Coord", "name": "",
+         "status": "Matched", "date_added": "2026-05-30", "next_followup": "1970-01-01", "raw_priority": "88"},
+        {"sheet_uuid": "seq-m2", "company": "Zeta", "title": "Ops Spec", "name": "",
+         "status": "Matched", "date_added": "2026-05-30", "next_followup": "1970-01-01", "raw_priority": "72"},
+    ],
+}
+
+
+def _mock_sequencer_crm(monkeypatch):
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(r) for r in _SEQ_RECORDS.get(code, [])])
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    return enqueued
+
+
+def test_sequencer_queues_followup_1_with_window_snooze(monkeypatch):
+    enqueued = _mock_sequencer_crm(monkeypatch)
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    ready = result["followups_ready"]
+    assert [r["sheet_uuid"] for r in ready] == ["seq-fu1"]
+    assert ready[0]["attempt"] == 1
+    assert ready[0]["draft_text"] and "{" not in ready[0]["draft_text"]  # interpolated, not raw template
+
+    snoozes = [p for p in enqueued if p["action"] == "update_snooze" and p["sheet_uuid"] == "seq-fu1"]
+    assert len(snoozes) == 1
+    # anchor (Date Added 2026-05-28) + FOLLOWUP_2_DAYS -> the next window boundary
+    assert snoozes[0]["next_followup"] == "2026-06-06"
+    # the future-dated Applied row is never touched
+    assert all(p["sheet_uuid"] != "seq-future" for p in enqueued)
+
+
+def test_sequencer_bury_ghosted_writes_reason_note_then_died_move(monkeypatch):
+    enqueued = _mock_sequencer_crm(monkeypatch)
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert [r["sheet_uuid"] for r in result["buried"]] == ["seq-bury"]
+    bury_payloads = [p for p in enqueued if p["sheet_uuid"] == "seq-bury"]
+    actions = [p["action"] for p in bury_payloads]
+    assert actions == ["append_note", "update_status"]  # note first, then the tab move
+    assert "ghosted" in bury_payloads[0]["note"]
+    assert bury_payloads[1]["new_tab"] == "Died"
+
+
+def test_sequencer_stale_nudge_and_top_matched_do_not_write(monkeypatch):
+    enqueued = _mock_sequencer_crm(monkeypatch)
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert [r["sheet_uuid"] for r in result["going_cold"]] == ["seq-stale"]
+    assert result["going_cold"][0]["days"] == 10
+    assert all(p["sheet_uuid"] != "seq-stale" for p in enqueued)
+
+    # Top matched: highest Fit Score first, capped at 3, no writes.
+    assert [r["sheet_uuid"] for r in result["top_matched"]] == ["seq-m1", "seq-m2"]
+    assert result["top_matched"][0]["fit_score"] == 88.0
+    assert all(p["sheet_uuid"] not in ("seq-m1", "seq-m2") for p in enqueued)
+    assert result["counts"] == {"followups_ready": 1, "going_cold": 1, "buried": 1, "top_matched": 2}
+
+
+def test_sequencer_is_idempotent_across_two_consecutive_runs(monkeypatch):
+    enqueued = _mock_sequencer_crm(monkeypatch)
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+    after_first = list(enqueued)
+    assert after_first, "first run should enqueue writes"
+
+    m.run_followup_sequencer(today=_SEQ_TODAY)  # same data, same day
+    assert enqueued == after_first  # nothing new queued or buried
+
+    with m.get_db_conn() as conn:
+        logged = {row[0] for row in conn.execute("SELECT sheet_uuid FROM followup_sequencer_log")}
+    assert logged == {"seq-fu1", "seq-bury"}
+
+
+def test_sequencer_dry_run_performs_zero_writes(monkeypatch):
+    enqueued = _mock_sequencer_crm(monkeypatch)
+    result = m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True)
+
+    assert result["counts"] == {"followups_ready": 1, "going_cold": 1, "buried": 1, "top_matched": 2}
+    assert enqueued == []
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
 
 
 # ---- /draft Gmail MIME attachment correctness ----

@@ -363,6 +363,8 @@ function doPost(e) {
           email: row[3] || "",
           priority: rowPriority,
           raw_priority: row[4] || "",
+          status: row[5] || "",          // Column F, verbatim - the follow-up sequencer buckets it
+          date_added: formatDate(row[0]), // Column A - the sequencer's stable +4/+9/+16 anchor
           note: row[8],
           next_followup: formatFollowupDate(row[6])
         });
