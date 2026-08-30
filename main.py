@@ -4201,6 +4201,13 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, "\n".join(funnel_lines))
             return
 
+        if text == "/queue":
+            # On-demand, read-only preview of the nightly follow-up sequencer: no writes,
+            # no burying, no snooze advancement (run_followup_sequencer(dry_run=True)).
+            result = run_followup_sequencer(dry_run=True)
+            send_telegram_message(chat_id, render_followup_needs_card(result, on_demand=True))
+            return
+
         if text == "/outcomes":
             send_telegram_message(chat_id, format_outcome_metrics_message())
             return
@@ -4699,6 +4706,7 @@ def process_webhook_payload_async(data):
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
                 "/funnel - View pipeline conversion funnel\n"
+                "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
                 "/streak, /daily - View daily outreach scorecard"
             )

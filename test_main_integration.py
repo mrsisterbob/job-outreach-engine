@@ -313,6 +313,22 @@ def test_needs_card_on_demand_is_labelled_read_only():
     assert "Queue Preview" in card and "read-only" in card
 
 
+# ---- /queue command (read-only sequencer preview) ----
+
+def test_queue_command_previews_without_any_writes(monkeypatch):
+    enqueued = _mock_sequencer_crm(monkeypatch)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+
+    _dispatch("/queue")
+
+    assert len(sent) == 1
+    assert "Queue Preview" in sent[0] and "read-only" in sent[0]
+    assert enqueued == []
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
+
+
 # ---- /draft Gmail MIME attachment correctness ----
 
 def test_create_gmail_draft_attaches_pdf_with_correct_filename(monkeypatch):
