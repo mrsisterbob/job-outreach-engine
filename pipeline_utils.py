@@ -162,6 +162,101 @@ def status_rank(value):
     return -1
 
 
+# ==============================================================================
+# FOLLOW-UP SEQUENCER POLICY (pure, deterministic, no I/O)
+#
+# Decides the single thing that should happen to a JOBS row today from four inputs
+# that already exist on the row - Status (Col F), Date Added (Col A), Next Followup
+# Date (Col G) - plus today's date. No schema change: nothing new is stored.
+# ==============================================================================
+
+# Tunable follow-up cadence, in days. See the Item 5 block below for the rationale.
+FOLLOWUP_1_DAYS = 4       # Applied + no reply -> follow-up #1 becomes due
+FOLLOWUP_2_DAYS = 9       # Applied + no reply -> follow-up #2 becomes due
+FOLLOWUP_BURY_DAYS = 16   # Applied + no reply -> auto-bury as ghosted
+STALE_HOT_DAYS = 5        # Replied/Screening/Interviewing untouched longer than this -> stale_nudge
+
+# Every value followup_action() can return.
+FOLLOWUP_ACTIONS = ("none", "send_followup_1", "send_followup_2", "bury_ghosted", "stale_nudge")
+
+# Code.gs's get_followups read path emits this for a blank Next Followup Date cell
+# (see formatFollowupDate); treat it as "unset", not as a real 1970 date.
+_FOLLOWUP_BLANK_DATE_SENTINEL = "1970-01-01"
+
+
+def _parse_sequencer_date(value):
+    """Lenient 'YYYY-MM-DD' -> datetime.date, or None for blank / the blank-date sentinel /
+    anything unparseable. Only the first 10 chars are read, so an ISO datetime works too."""
+    text = str(value or "").strip()[:10]
+    if not text or text == _FOLLOWUP_BLANK_DATE_SENTINEL:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def followup_anchor(date_added, next_followup):
+    """The stable day-0 the +4/+9/+16 windows count from.
+
+    Deliberately prefers Date Added over Next Followup Date: the nightly job pushes Next
+    Followup Date forward every time it queues a bump, and re-anchoring on that moving value
+    would make the windows drift and re-fire follow-up #1 indefinitely. Next Followup Date is
+    only the fallback for when Date Added is blank/malformed. Returns a datetime.date or None.
+    """
+    return _parse_sequencer_date(date_added) or _parse_sequencer_date(next_followup)
+
+
+def followup_action(status, date_added, next_followup, today):
+    """Pure: the one thing that should happen to a JOBS row today. Side-effect free.
+
+    Returns one of FOLLOWUP_ACTIONS:
+      - "send_followup_1" / "send_followup_2": Applied, no reply, in the +4..+9 / +9..+16 window
+      - "bury_ghosted": Applied, no reply, >= +16 days -> move to Died + note the reason
+      - "stale_nudge": Replied/Screening/Interviewing untouched > STALE_HOT_DAYS (never auto-buried)
+      - "none": nothing due
+
+    Anchor = followup_anchor(date_added, next_followup) (Date Added, stable). A row whose Next
+    Followup Date is still in the future is always left alone - that covers a manual /f snooze
+    and the nightly job's own re-fire guard. `status` is matched case-insensitively against
+    STATUS_VOCAB; unrecognized / blank / legacy free-text Status -> "none" (never touched).
+
+    `today` is a datetime.date (a datetime is accepted and coerced). `date_added` / `next_followup`
+    are 'YYYY-MM-DD' strings; blank or the '1970-01-01' sentinel both mean unset.
+    """
+    if isinstance(today, datetime):
+        today = today.date()
+
+    rank = status_rank(status)
+    if rank == -1:
+        return "none"
+    canonical = STATUS_VOCAB[rank]
+
+    nf = _parse_sequencer_date(next_followup)
+    if nf is not None and nf > today:
+        return "none"
+
+    if canonical in ("Matched", "Offer", "Rejected"):
+        return "none"
+
+    anchor = _parse_sequencer_date(date_added) or nf
+    if anchor is None:
+        return "none"
+    days = (today - anchor).days
+
+    if canonical in ("Replied", "Screening", "Interviewing"):
+        return "stale_nudge" if days > STALE_HOT_DAYS else "none"
+
+    # canonical == "Applied"
+    if days >= FOLLOWUP_BURY_DAYS:
+        return "bury_ghosted"
+    if days >= FOLLOWUP_2_DAYS:
+        return "send_followup_2"
+    if days >= FOLLOWUP_1_DAYS:
+        return "send_followup_1"
+    return "none"
+
+
 def generate_short_key(raw_id, fallback=None):
     """fallback replaces time.time() as the entropy source when raw_id is falsy, keeping this pure."""
     return hashlib.md5(str(raw_id or fallback or "0").encode()).hexdigest()[:12]
