@@ -2,7 +2,7 @@
 No network, DB, or Flask/APScheduler dependency - safe to run in any environment.
 """
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pipeline_utils as pu
 
@@ -95,6 +95,93 @@ def test_calculate_followup_interval_higher_priority_means_sooner_followup():
 
 def test_calculate_followup_interval_invalid_input_falls_back():
     assert pu.calculate_followup_interval("not-a-number") == 14
+
+
+# ---- Follow-up sequencer policy (pure) ----
+
+_TODAY = date(2026, 6, 1)
+
+
+def _added(days_ago):
+    """Date Added string `days_ago` days before _TODAY."""
+    return (_TODAY - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+
+def test_followup_action_applied_boundary_days_3_4_5():
+    assert pu.followup_action("Applied", _added(3), "", _TODAY) == "none"
+    assert pu.followup_action("Applied", _added(4), "", _TODAY) == "send_followup_1"
+    assert pu.followup_action("Applied", _added(5), "", _TODAY) == "send_followup_1"
+
+
+def test_followup_action_applied_boundary_days_8_9_10():
+    assert pu.followup_action("Applied", _added(8), "", _TODAY) == "send_followup_1"
+    assert pu.followup_action("Applied", _added(9), "", _TODAY) == "send_followup_2"
+    assert pu.followup_action("Applied", _added(10), "", _TODAY) == "send_followup_2"
+
+
+def test_followup_action_applied_boundary_days_15_16_17():
+    assert pu.followup_action("Applied", _added(15), "", _TODAY) == "send_followup_2"
+    assert pu.followup_action("Applied", _added(16), "", _TODAY) == "bury_ghosted"
+    assert pu.followup_action("Applied", _added(17), "", _TODAY) == "bury_ghosted"
+
+
+def test_followup_action_future_next_followup_always_none():
+    future = (_TODAY + timedelta(days=1)).strftime("%Y-%m-%d")
+    assert pu.followup_action("Applied", _added(30), future, _TODAY) == "none"
+    assert pu.followup_action("Interviewing", _added(30), future, _TODAY) == "none"
+
+
+def test_followup_action_next_followup_today_is_not_future():
+    # Due today (== today, not > today) -> the window math still applies.
+    assert pu.followup_action("Applied", _added(20), _TODAY.strftime("%Y-%m-%d"), _TODAY) == "bury_ghosted"
+
+
+def test_followup_action_hot_statuses_stale_nudge_after_five_days():
+    for status in ("Replied", "Screening", "Interviewing"):
+        assert pu.followup_action(status, _added(5), "", _TODAY) == "none"
+        assert pu.followup_action(status, _added(6), "", _TODAY) == "stale_nudge"
+        # Hot statuses never auto-bury, however old.
+        assert pu.followup_action(status, _added(90), "", _TODAY) == "stale_nudge"
+
+
+def test_followup_action_terminal_and_matched_statuses_are_none():
+    for status in ("Matched", "Offer", "Rejected"):
+        assert pu.followup_action(status, _added(90), "", _TODAY) == "none"
+
+
+def test_followup_action_unknown_status_is_none():
+    for status in ("Ghosted", "", None, "pending review", "APPLIED?"):
+        assert pu.followup_action(status, _added(90), "", _TODAY) == "none"
+
+
+def test_followup_action_is_status_case_insensitive():
+    assert pu.followup_action("  applied  ", _added(4), "", _TODAY) == "send_followup_1"
+
+
+def test_followup_action_blank_dates_yield_none():
+    assert pu.followup_action("Applied", "", "", _TODAY) == "none"
+    assert pu.followup_action("Applied", None, None, _TODAY) == "none"
+    assert pu.followup_action("Applied", "1970-01-01", "1970-01-01", _TODAY) == "none"
+
+
+def test_followup_action_malformed_dates_yield_none():
+    assert pu.followup_action("Applied", "not-a-date", "", _TODAY) == "none"
+    assert pu.followup_action("Applied", "2026-13-99", "garbage", _TODAY) == "none"
+
+
+def test_followup_action_falls_back_to_next_followup_when_date_added_blank():
+    # Date Added missing, past Next Followup Date -> used as the anchor.
+    assert pu.followup_action("Applied", "", _added(16), _TODAY) == "bury_ghosted"
+
+
+def test_followup_action_accepts_datetime_for_today():
+    assert pu.followup_action("Applied", _added(4), "", datetime(2026, 6, 1, 7, 30)) == "send_followup_1"
+
+
+def test_followup_anchor_prefers_date_added_over_next_followup():
+    assert pu.followup_anchor("2026-05-01", "2026-05-20") == date(2026, 5, 1)
+    assert pu.followup_anchor("", "2026-05-20") == date(2026, 5, 20)
+    assert pu.followup_anchor("1970-01-01", "") is None
 
 
 # ---- Smart tab routing ----
