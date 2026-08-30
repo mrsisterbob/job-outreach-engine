@@ -281,6 +281,38 @@ def test_sequencer_dry_run_performs_zero_writes(monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
 
 
+# ---- Daily "needs you today" card (render_followup_needs_card) ----
+
+def test_needs_card_renders_every_populated_section(monkeypatch):
+    _mock_sequencer_crm(monkeypatch)
+    card = m.render_followup_needs_card(m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True))
+    assert "Needs You Today" in card
+    assert "Follow-ups ready (1)" in card
+    assert "Going cold (1)" in card and "10d untouched" in card
+    assert "Buried overnight (1)" in card
+    assert "Top 3 untouched matches" in card
+    assert "Summary:</b> 1 follow-ups · 1 going cold · 1 buried · 2 top matches" in card
+
+
+def test_needs_card_empty_result_is_a_single_line():
+    empty = {"followups_ready": [], "going_cold": [], "buried": [], "top_matched": [],
+             "counts": {"followups_ready": 0, "going_cold": 0, "buried": 0, "top_matched": 0}}
+    card = m.render_followup_needs_card(empty)
+    assert "\n" not in card
+    assert "nothing needs you today" in card.lower()
+
+
+def test_needs_card_on_demand_is_labelled_read_only():
+    empty = {"followups_ready": [], "going_cold": [], "buried": [], "top_matched": [], "counts": {}}
+    assert "clear" in m.render_followup_needs_card(empty, on_demand=True).lower()
+    populated = {"followups_ready": [{"company": "Acme", "role": "Ops", "attempt": 1,
+                                     "draft_text": "hi", "short_id": "abc123"}],
+                "going_cold": [], "buried": [], "top_matched": [],
+                "counts": {"followups_ready": 1, "going_cold": 0, "buried": 0, "top_matched": 0}}
+    card = m.render_followup_needs_card(populated, on_demand=True)
+    assert "Queue Preview" in card and "read-only" in card
+
+
 # ---- /draft Gmail MIME attachment correctness ----
 
 def test_create_gmail_draft_attaches_pdf_with_correct_filename(monkeypatch):
