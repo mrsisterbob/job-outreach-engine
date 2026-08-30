@@ -184,6 +184,13 @@ def test_followup_anchor_prefers_date_added_over_next_followup():
     assert pu.followup_anchor("1970-01-01", "") is None
 
 
+def test_followup_cadence_knobs_are_strictly_increasing():
+    # The nightly job pushes Next Followup Date to the next boundary; out-of-order knobs
+    # would skip or repeat a step. STALE_HOT_DAYS is independent.
+    assert 0 < pu.FOLLOWUP_1_DAYS < pu.FOLLOWUP_2_DAYS < pu.FOLLOWUP_BURY_DAYS
+    assert pu.STALE_HOT_DAYS > 0
+
+
 # ---- Smart tab routing ----
 
 def test_resolve_smart_target_tab_carmen_family():

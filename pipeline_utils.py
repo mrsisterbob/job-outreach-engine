@@ -170,11 +170,25 @@ def status_rank(value):
 # Date (Col G) - plus today's date. No schema change: nothing new is stored.
 # ==============================================================================
 
-# Tunable follow-up cadence, in days. See the Item 5 block below for the rationale.
-FOLLOWUP_1_DAYS = 4       # Applied + no reply -> follow-up #1 becomes due
-FOLLOWUP_2_DAYS = 9       # Applied + no reply -> follow-up #2 becomes due
-FOLLOWUP_BURY_DAYS = 16   # Applied + no reply -> auto-bury as ghosted
-STALE_HOT_DAYS = 5        # Replied/Screening/Interviewing untouched longer than this -> stale_nudge
+# ------------------------------------------------------------------------------
+# TUNABLE CADENCE KNOBS (days). Single source of truth for the sequencer's timing -
+# change them here and both the pure policy (followup_action) and the nightly job
+# (main.run_followup_sequencer, which imports these names) pick the new values up.
+# Nothing on the Code.gs / Sheet side needs to change: all sequencing state is
+# derived Python-side from Status, Date Added and Next Followup Date.
+#
+# All four are counted from the anchor = followup_anchor() = Date Added (Col A).
+# Constraints when retuning:
+#   * 0 < FOLLOWUP_1_DAYS < FOLLOWUP_2_DAYS < FOLLOWUP_BURY_DAYS  (strictly increasing -
+#     the job pushes Next Followup Date to the next boundary, so out-of-order values
+#     would skip or repeat a step).
+#   * STALE_HOT_DAYS is independent (it only gates the read-only stale_nudge on hot
+#     statuses, which never auto-bury).
+# ------------------------------------------------------------------------------
+FOLLOWUP_1_DAYS = 4       # Applied + no reply -> follow-up #1 becomes due at anchor + 4d
+FOLLOWUP_2_DAYS = 9       # Applied + no reply -> follow-up #2 becomes due at anchor + 9d
+FOLLOWUP_BURY_DAYS = 16   # Applied + no reply -> auto-bury as ghosted at anchor + 16d
+STALE_HOT_DAYS = 5        # Replied/Screening/Interviewing untouched > 5d -> stale_nudge
 
 # Every value followup_action() can return.
 FOLLOWUP_ACTIONS = ("none", "send_followup_1", "send_followup_2", "bury_ghosted", "stale_nudge")
