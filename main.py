@@ -25,7 +25,9 @@ from pipeline_utils import (
     resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
     generate_dedup_hash, generate_short_key, parse_posted_hours, get_age_badge,
     extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall,
-    derive_job_source, is_unverified_email
+    derive_job_source, is_unverified_email, status_rank, STATUS_VOCAB,
+    followup_action, followup_anchor,
+    FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -437,7 +439,15 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_tg_msg ON sheet_row_map(telegram_message_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_row_map_contact_email ON sheet_row_map(contact_email)")
-        
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS followup_sequencer_log (
+            sheet_uuid TEXT NOT NULL,
+            run_date TEXT NOT NULL,
+            action TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (sheet_uuid, run_date)
+        )""")
+
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
         if cursor.fetchone()[0] == 0:
@@ -720,6 +730,22 @@ def get_sheet_uuid_by_short_id(short_id):
             return row[0] if row else None
     except Exception as e:
         logging.error(f"DB Read Error (sheet_uuid lookup): {e}")
+        return None
+
+def get_short_id_by_sheet_uuid(sheet_uuid):
+    """Reverse of get_sheet_uuid_by_short_id: the cached job's short_id for a sheet_uuid, or None.
+    Used by the follow-up sequencer card so each row carries a short_id for /replied /interview.
+    """
+    if not sheet_uuid:
+        return None
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT short_id FROM jobs WHERE sheet_uuid = ?", (sheet_uuid,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+    except Exception as e:
+        logging.error(f"DB Read Error (short_id lookup): {e}")
         return None
 
 def get_job_by_sheet_uuid(sheet_uuid):
@@ -3050,6 +3076,191 @@ def process_overdue_batch(mode, snooze_days=7):
             result["updated"] += 1
     return result, next_followup
 
+# ==============================================================================
+# NIGHTLY FOLLOW-UP SEQUENCER
+# Reads every live JOBS row via the existing get_followups path, runs the pure
+# pipeline_utils.followup_action() policy on each, buries ghosted rows (the only
+# automatic write), and queues everything else for the morning "needs you today"
+# card. No schema change - state is derived from Status / Date Added / Next
+# Followup Date only.
+# ==============================================================================
+SEQUENCER_SCAN_TABS = (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "Clavicular"))
+
+def _sequencer_already_actioned(sheet_uuid, run_date):
+    """True if this row was already actioned by the sequencer earlier today (same-day idempotency
+    guard - a re-run, or /queue's sibling, must not double-queue or double-bury)."""
+    if not sheet_uuid:
+        return False
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM followup_sequencer_log WHERE sheet_uuid = ? AND run_date = ?",
+                (sheet_uuid, run_date)
+            )
+            return cursor.fetchone() is not None
+    except Exception as e:
+        logging.error(f"Sequencer log read error ({sheet_uuid}): {e}")
+        return False
+
+def _record_sequencer_action(sheet_uuid, run_date, action):
+    """Mark (sheet_uuid, today) as handled so a same-day re-run skips it."""
+    if not sheet_uuid:
+        return
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR IGNORE INTO followup_sequencer_log (sheet_uuid, run_date, action) VALUES (?, ?, ?)",
+                (sheet_uuid, run_date, action)
+            )
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Sequencer log write error ({sheet_uuid}): {e}")
+
+def _parse_fit_score(value):
+    """Best-effort numeric Fit Score from the get_followups raw_priority field (Column E for JOBS)."""
+    try:
+        return float(re.sub(r"[^0-9.\-]", "", str(value or "")) or 0)
+    except (ValueError, TypeError):
+        return 0.0
+
+def build_followup_bump_draft(record, attempt):
+    """Draft the follow-up text from the followup_bumps template bank via the existing
+    resolve_template_text + interpolate_template path. No LLM, no prose authored in Python.
+    Rotates the two bank entries by attempt number (#1 -> entry 0, #2 -> entry 1).
+    """
+    pool = load_outreach_templates().get("followup_bumps", [])
+    idx = 0 if attempt <= 1 else 1
+    fallback_pool = _FALLBACK_OUTREACH_TEMPLATES["followup_bumps"]
+    fallback_text = fallback_pool[idx] if idx < len(fallback_pool) else fallback_pool[0]
+    template = resolve_template_text(pool, idx, fallback_text)
+    return interpolate_template(
+        template,
+        name=record.get("name") or "",
+        company=record.get("company") or "",
+        job_title=record.get("title") or "",
+    )
+
+def run_followup_sequencer(today=None, dry_run=False):
+    """Scan Tetiana Cold/Warm + Clavicular via get_followups, run followup_action() on every row,
+    and return a structured plan: followups_ready / going_cold / buried / top_matched / counts.
+
+    Unless dry_run: queues a +window snooze via update_snooze for each drafted follow-up, buries
+    each ghosted row (append_note '[reason: ghosted]' + update_status -> Died), and records each
+    actioned row in followup_sequencer_log. dry_run=True (the /queue path) performs ZERO writes.
+
+    Idempotent: (a) same-day - followup_sequencer_log skips a row already actioned today;
+    (b) across days - a queued follow-up pushes Next Followup Date to the next window boundary
+    (so followup_action()'s future gate returns "none" until then) and a bury moves the row off
+    the scanned tabs entirely.
+    """
+    if isinstance(today, datetime):
+        today = today.date()
+    today = today or datetime.now().date()
+    run_date = today.strftime("%Y-%m-%d")
+
+    seen_uuids = set()
+    records = []
+    for code, tab_name in SEQUENCER_SCAN_TABS:
+        for rec in fetch_networking_cards(code, qty=None) or []:
+            uuid_val = rec.get("sheet_uuid")
+            if uuid_val and uuid_val in seen_uuids:
+                continue
+            if uuid_val:
+                seen_uuids.add(uuid_val)
+            records.append({**rec, "sheet_tab": tab_name})
+
+    result = {"followups_ready": [], "going_cold": [], "buried": [], "top_matched": [], "counts": {}}
+
+    for rec in records:
+        action = followup_action(rec.get("status"), rec.get("date_added"), rec.get("next_followup"), today)
+        if action == "none":
+            continue
+        sheet_uuid = rec.get("sheet_uuid")
+        company = rec.get("company") or "N/A"
+        role = rec.get("title") or ""
+        short_id = get_short_id_by_sheet_uuid(sheet_uuid) if sheet_uuid else None
+        anchor = followup_anchor(rec.get("date_added"), rec.get("next_followup"))
+        days_since = (today - anchor).days if anchor else None
+        already = (not dry_run) and _sequencer_already_actioned(sheet_uuid, run_date)
+
+        if action in ("send_followup_1", "send_followup_2"):
+            attempt = 1 if action == "send_followup_1" else 2
+            result["followups_ready"].append({
+                "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
+                "attempt": attempt, "draft_text": build_followup_bump_draft(rec, attempt),
+                "sheet_tab": rec.get("sheet_tab"),
+            })
+            if dry_run or already or not sheet_uuid:
+                continue
+            base = anchor or today
+            push_days = FOLLOWUP_2_DAYS if attempt == 1 else FOLLOWUP_BURY_DAYS
+            new_nf = (base + timedelta(days=push_days)).strftime("%Y-%m-%d")
+            enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=new_nf))
+            _record_sequencer_action(sheet_uuid, run_date, action)
+
+        elif action == "bury_ghosted":
+            result["buried"].append({
+                "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
+            })
+            if dry_run or already or not sheet_uuid:
+                continue
+            # The one automatic write: note the reason (row still in its source tab), then move to Died.
+            enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=sheet_uuid, note="[reason: ghosted]"))
+            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Died"))
+            _record_sequencer_action(sheet_uuid, run_date, action)
+
+        elif action == "stale_nudge":
+            result["going_cold"].append({
+                "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
+                "status": rec.get("status") or "", "days": days_since,
+            })
+
+    result["going_cold"].sort(key=lambda r: r["days"] if r["days"] is not None else -1, reverse=True)
+
+    matched = [r for r in records if status_rank(r.get("status")) == status_rank("Matched")]
+    matched.sort(key=lambda r: _parse_fit_score(r.get("raw_priority")), reverse=True)
+    for r in matched[:3]:
+        su = r.get("sheet_uuid")
+        result["top_matched"].append({
+            "company": r.get("company") or "N/A", "role": r.get("title") or "",
+            "short_id": get_short_id_by_sheet_uuid(su) if su else None,
+            "sheet_uuid": su, "fit_score": _parse_fit_score(r.get("raw_priority")),
+        })
+
+    result["counts"] = {k: len(result[k]) for k in ("followups_ready", "going_cold", "buried", "top_matched")}
+    return result
+
+def scheduled_followup_sequencer_job():
+    """APScheduler target: nightly follow-up sequencer pass (07:00 local, before the digest)."""
+    logging.info("[SEQUENCER] Nightly follow-up sequencer cycle triggered")
+    try:
+        result = run_followup_sequencer()
+        c = result["counts"]
+        logging.info(
+            f"[SEQUENCER] followups_ready={c['followups_ready']} going_cold={c['going_cold']} "
+            f"buried={c['buried']} top_matched={c['top_matched']}"
+        )
+    except Exception as e:
+        logging.error(f"[SEQUENCER] Nightly cycle error: {e}")
+    logging.info("[SEQUENCER] Nightly follow-up sequencer cycle completed")
+
+def start_followup_sequencer():
+    """Register the nightly sequencer on the shared background scheduler (07:00 local, ahead of
+    the 08:30 morning digest). Bury-to-Died is its only automatic write.
+    """
+    EMAIL_POLL_SCHEDULER.add_job(
+        scheduled_followup_sequencer_job,
+        trigger="cron",
+        hour=7,
+        minute=0,
+        id="followup_sequencer",
+        max_instances=1,
+        coalesce=True,
+    )
+    logging.info("[SEQUENCER] Nightly follow-up sequencer scheduled: 07:00 local")
+
 def edit_telegram_message(chat_id, message_id, text):
     """Edit an existing Telegram message in-place instead of sending a redundant new one."""
     if not (TELEGRAM_BOT_TOKEN and chat_id and message_id):
@@ -4421,6 +4632,7 @@ if not os.environ.get("PYTEST_CURRENT_TEST"):  # keep background daemons out of 
     start_crm_outbox_worker()
     start_morning_digest()
     start_backup_scheduler()
+    start_followup_sequencer()
 
 # ==============================================================================
 # 10. FLASK SERVER & STACKED WEBHOOK ROUTER
