@@ -3232,8 +3232,86 @@ def run_followup_sequencer(today=None, dry_run=False):
     result["counts"] = {k: len(result[k]) for k in ("followups_ready", "going_cold", "buried", "top_matched")}
     return result
 
+def _seq_id_tag(entry):
+    """short_id for /replied /interview, falling back to a sheet_uuid stub, or an em dash."""
+    return entry.get("short_id") or (str(entry.get("sheet_uuid") or "")[:8]) or "—"
+
+def render_followup_needs_card(result, on_demand=False):
+    """Render the single 'needs you today' Telegram message from a run_followup_sequencer() result.
+    Sections are omitted when empty; an all-empty result collapses to one short line. Pure - no I/O.
+    `on_demand=True` labels it as the read-only /queue preview.
+    """
+    counts = result.get("counts", {})
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if not any(counts.values()):
+        tail = "queue is clear" if on_demand else "nothing needs you today"
+        return f"✅ <b>{tail.capitalize()} · {today_str}</b>"
+
+    header = "Queue Preview" if on_demand else "Needs You Today"
+    note = " <i>(read-only, no writes)</i>" if on_demand else ""
+    lines = [f"🗂️ <b>{header} · {today_str}</b>{note}"]
+
+    ready = result.get("followups_ready", [])
+    if ready:
+        lines.append(f"\n▶ <b>Follow-ups ready ({len(ready)})</b>")
+        for e in ready:
+            role = html.escape(str(e.get("role") or "—"))
+            company = html.escape(str(e.get("company") or "—"))
+            draft = html.escape(str(e.get("draft_text") or "")[:600])
+            lines.append(f"💼 <b>{role}</b> — {company}  ·  #{e.get('attempt', 1)}  ·  🆔 <code>{html.escape(_seq_id_tag(e))}</code>")
+            lines.append(f"<code>{draft}</code>")
+
+    cold = result.get("going_cold", [])
+    if cold:
+        lines.append(f"\n▶ <b>Going cold ({len(cold)})</b> <i>— Replied/Screening/Interviewing, oldest first</i>")
+        for e in cold:
+            company = html.escape(str(e.get("company") or "—"))
+            role = html.escape(str(e.get("role") or "—"))
+            status = html.escape(str(e.get("status") or ""))
+            days = e.get("days")
+            days_str = f"{days}d untouched" if isinstance(days, int) else "stale"
+            lines.append(f"• <b>{company}</b> — {role} · {status} · {days_str} · <code>{html.escape(_seq_id_tag(e))}</code>")
+
+    buried = result.get("buried", [])
+    if buried:
+        lines.append(f"\n▶ <b>Buried overnight ({len(buried)})</b> <i>— auto-moved to Died as ghosted</i>")
+        for e in buried:
+            company = html.escape(str(e.get("company") or "—"))
+            role = html.escape(str(e.get("role") or "—"))
+            lines.append(f"• <b>{company}</b> — {role} · <code>{html.escape(_seq_id_tag(e))}</code>")
+
+    top = result.get("top_matched", [])
+    if top:
+        lines.append("\n▶ <b>Top 3 untouched matches</b> <i>— highest Fit Score, still Matched</i>")
+        for e in top:
+            company = html.escape(str(e.get("company") or "—"))
+            role = html.escape(str(e.get("role") or "—"))
+            fit = e.get("fit_score") or 0
+            lines.append(f"• {fit:g} · <b>{company}</b> — {role} · <code>{html.escape(_seq_id_tag(e))}</code>")
+
+    lines.append(
+        f"\n<b>Summary:</b> {counts.get('followups_ready', 0)} follow-ups · "
+        f"{counts.get('going_cold', 0)} going cold · {counts.get('buried', 0)} buried · "
+        f"{counts.get('top_matched', 0)} top matches"
+    )
+    return "\n".join(lines)
+
+def _send_telegram_card_chunked(chat_id, text, limit=3900):
+    """Send a long HTML card as newline-split chunks so it never trips Telegram's length cap."""
+    chunk = ""
+    for line in text.split("\n"):
+        if chunk and len(chunk) + len(line) + 1 > limit:
+            send_telegram_message(chat_id, chunk)
+            chunk = ""
+        chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        send_telegram_message(chat_id, chunk)
+
 def scheduled_followup_sequencer_job():
-    """APScheduler target: nightly follow-up sequencer pass (07:00 local, before the digest)."""
+    """APScheduler target: nightly follow-up sequencer pass (07:00 local, before the digest).
+    Applies the automatic bury, queues follow-up drafts, and posts the single 'needs you today'
+    card. This is the only morning message at this hour - the standup digest posts at 08:30.
+    """
     logging.info("[SEQUENCER] Nightly follow-up sequencer cycle triggered")
     try:
         result = run_followup_sequencer()
@@ -3242,6 +3320,8 @@ def scheduled_followup_sequencer_job():
             f"[SEQUENCER] followups_ready={c['followups_ready']} going_cold={c['going_cold']} "
             f"buried={c['buried']} top_matched={c['top_matched']}"
         )
+        if TELEGRAM_CHAT_ID:
+            _send_telegram_card_chunked(TELEGRAM_CHAT_ID, render_followup_needs_card(result))
     except Exception as e:
         logging.error(f"[SEQUENCER] Nightly cycle error: {e}")
     logging.info("[SEQUENCER] Nightly follow-up sequencer cycle completed")
