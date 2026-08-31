@@ -271,6 +271,101 @@ def followup_action(status, date_added, next_followup, today):
     return "none"
 
 
+# ==============================================================================
+# OUTREACH VOICE LINTER (pure, no I/O)
+#
+# One rulebook for every candidate-facing sentence, whichever path renders it:
+# the templates/*.json banks the Telegram card interpolates, and the Gmail bodies
+# main.generate_cold_email()/generate_warm_email()/generate_bump_email() return.
+# Both are linted by the same tests, which is what stops the two paths drifting
+# back apart. Also runs on /edit so a phone-typed template gets a warning
+# (never a block - Kevin has to be able to override from Telegram).
+# ==============================================================================
+
+# (compiled pattern, human-readable violation message). Patterns are matched
+# case-insensitively against the rendered text.
+_OUTREACH_BANNED_PATTERNS = [
+    (r"best regards", "'Best regards' - use 'Thanks,' or 'Best,'"),
+    (r"\balign\w*\b", "'align/alignment' - name the work instead"),
+    (r"\bfits?\b(?!\s+(?:in|into)\b)", "'fit' as a skills claim - name the work instead"),
+    (r"hope (?:you|things) (?:are|have been|'ve been|is)[^.]{0,20}\bwell\b", "'hope you have been doing well' filler opener"),
+    (r"\bhi there\b", "'Hi there' - the {name} placeholder renders a bare 'Hi,' when the name is unknown"),
+    (r"\b(?:leverag|utiliz|spearhead|synerg|optimiz)\w*\b", "corporate verb (leverage/utilize/spearhead/synergy/optimize)"),
+    (r"looking forward to hearing", "'Looking forward to hearing from you'"),
+    (r"\b(?:truly|deeply|highly|significantly)\b", "filler adverb (truly/deeply/highly/significantly)"),
+    (r"\b(?:furthermore|additionally|moreover)\b", "essay transition (Furthermore/Additionally/Moreover)"),
+    (r"proven track record", "self-praise ('proven track record')"),
+    (r"my (?:experience|background) (?:centers|is in|lies)", "abstract capability claim - use past-tense proof"),
+    (r"what you(?:'re| are) looking for", "self-deprecating hedge"),
+    (r"if you think I", "self-deprecating hedge"),
+    (r"\b(?:excited|thrilled|exciting|admire|impressive)\b", "performed enthusiasm / company praise"),
+    (r"\b(?:mission|culture|rapid growth)\b", "praise for the company's mission/culture/growth"),
+    (r"\b(?:five|ten|fifteen|thirty|5|10|15|30)[- ]minutes?\b", "timeboxed ask - use 'a quick chat' / 'a few minutes'"),
+]
+
+_OUTREACH_BANNED_RULES = [(re.compile(p, re.IGNORECASE), msg) for p, msg in _OUTREACH_BANNED_PATTERNS]
+
+# At least one of these must appear, or the copy reads like AI business correspondence.
+# An explicit list rather than a generic apostrophe search, so a possessive ("my team's
+# plate") never counts as a contraction.
+_CONTRACTION_RE = re.compile(
+    r"\b(?:I'm|I've|I'd|I'll|you're|you've|you'd|you'll|we're|we've|we'd|they're|it's|that's|there's|"
+    r"here's|let's|isn't|aren't|wasn't|don't|doesn't|didn't|can't|won't|wouldn't|couldn't|shouldn't|"
+    r"haven't|hasn't|hadn't)\b".replace("'", "['’]"),
+    re.IGNORECASE,
+)
+
+OUTREACH_EMAIL_WORD_CAP = 75
+OUTREACH_LINKEDIN_CHAR_CAP = 220
+
+
+def lint_outreach_template(text, kind="email"):
+    """Returns a list of rule-violation strings for one rendered outreach string, empty if clean.
+
+    `kind` is "email" (cold_ops / warm_alumni / followup_bumps, 75-word cap) or "linkedin"
+    (linkedin_templates, 220-char cap). Measure AFTER interpolation - the caps are on what the
+    recipient actually reads, not on the template with its placeholders still in it.
+
+    Punctuation rules exist because main.sanitize_text() *deletes* em/en-dashes, colons and
+    semicolons rather than rewriting around them, so "Hi Dana - saw the role" silently ships as
+    "Hi Dana saw the role". Lint the raw template for those; the banned-phrase and length rules
+    hold on the sanitized render too.
+    """
+    body = str(text or "")
+    violations = []
+
+    for pattern, message in _OUTREACH_BANNED_RULES:
+        match = pattern.search(body)
+        if match:
+            violations.append(f"banned phrase {match.group(0)!r} ({message})")
+
+    if re.search(r"[—–]", body):
+        violations.append("em/en-dash - sanitize_text() deletes it, joining the two clauses")
+    if ":" in body:
+        violations.append("colon - sanitize_text() deletes it, joining the two clauses")
+    if ";" in body:
+        violations.append("semicolon - sanitize_text() deletes it, joining the two clauses")
+    if "!" in body:
+        violations.append("exclamation point")
+
+    if " {name}" in body:
+        violations.append("space before {name} - the placeholder supplies its own leading space, "
+                          "so write 'Hi{name},' not 'Hi {name},'")
+
+    if not _CONTRACTION_RE.search(body):
+        violations.append("no contractions - write \"I've\"/\"I'm\"/\"you're\", not \"I have\"/\"I am\"")
+
+    if kind == "linkedin":
+        if len(body) > OUTREACH_LINKEDIN_CHAR_CAP:
+            violations.append(f"{len(body)} chars, over the {OUTREACH_LINKEDIN_CHAR_CAP}-char LinkedIn note cap")
+    else:
+        words = len(body.split())
+        if words > OUTREACH_EMAIL_WORD_CAP:
+            violations.append(f"{words} words, over the {OUTREACH_EMAIL_WORD_CAP}-word cold email cap")
+
+    return violations
+
+
 def generate_short_key(raw_id, fallback=None):
     """fallback replaces time.time() as the entropy source when raw_id is falsy, keeping this pure."""
     return hashlib.md5(str(raw_id or fallback or "0").encode()).hexdigest()[:12]

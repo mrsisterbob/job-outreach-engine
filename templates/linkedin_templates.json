@@ -1,14 +1,14 @@
 {
   "linkedin_templates": [
-    "Hi {name}. I saw the {job_title} opening at {company} and wanted to connect.",
-    "Hi {name}. I came across your profile while looking at the {job_title} role at {company}. I would love to connect and follow your work.",
-    "Hi {name}. I noticed {company} is growing the operations team for the {job_title} position. I would appreciate connecting here.",
-    "Hi {name}. I saw the {job_title} opening at {company}. Given my background in process automation and data reconciliation, I wanted to reach out and connect.",
-    "Hi {name}. I like what {company} is building. I saw the {job_title} posting and wanted to connect directly with operations leaders at the firm.",
-    "Hi {name}. I recently applied for the {job_title} role at {company}. I would love to connect and keep in touch.",
-    "Hi {name}. I work across Python, SQL, and operations systems, and I noticed the {job_title} role at {company}. I wanted to reach out and connect.",
-    "Hi {name}. I saw the {job_title} opening on your team at {company} and wanted to put a face to the name. I look forward to connecting.",
-    "Hi {name}. I follow operational innovation in Metro Detroit and noticed the opening at {company} for {job_title}. I would love to connect.",
-    "Hi {name}. I am reaching out regarding the {job_title} role at {company}. My background centers on back office automation and CRM systems, and I would value connecting."
+    "Hi{name}. Saw you're hiring a {job_title} at {company}. I'd like to connect.",
+    "Hi{name}. Saw the {job_title} role at {company}. Most of my work is Python and SQL scripts that replaced manual reporting. I'd like to connect.",
+    "Hi{name}. Saw the {job_title} opening at {company}. I've been reconciling custodial ledgers against internal records daily. Happy to connect.",
+    "Hi{name}. Saw the {job_title} role at {company}. I clean up Salesforce ticket queues and the routing errors behind them. Figured I'd connect.",
+    "Hi{name}. I've applied for the {job_title} role at {company}. Wanted to connect here too in case that's easier.",
+    "Hi{name}. Saw the {job_title} posting at {company}. Most of my week is data integrity work across Salesforce and internal databases. I'd like to connect.",
+    "Hi{name}. Saw the {job_title} opening at {company}. I've built Power BI dashboards and SQL variance checks for an operations team in Detroit. Happy to connect.",
+    "Hi{name}. Saw the {job_title} role at {company}. I've automated DocuSign and onboarding workflows for 150+ advisors. I'd like to connect.",
+    "Hi{name}. I'm in Detroit doing wealth operations and process automation. Saw the {job_title} opening at {company} and I'd like to connect.",
+    "Hi{name}. Saw {company} is hiring a {job_title}. I've built Python tools that took manual reconciliation off my team's plate. Open to connecting."
   ]
 }
