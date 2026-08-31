@@ -156,13 +156,17 @@ TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templa
 OUTREACH_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "outreach_templates.json")
 LINKEDIN_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "linkedin_templates.json")
 
+# Voice note for anyone editing these stubs or the JSON banks they mirror: "Hi{name}," is
+# deliberate, not a typo. interpolate_template() renders {name} WITH its own leading space
+# ("Hi Dana,") or as an empty string ("Hi,"), so a template must never put a space of its own
+# before the placeholder. Every string here is also held to pipeline_utils.lint_outreach_template().
 _FALLBACK_OUTREACH_TEMPLATES = {
-    "cold_ops": ["Hi {name},\n\nI saw the {job_title} role at {company} and wanted to reach out. Would you be open to a brief call?\n\nBest regards,\nKevin Miller"],
-    "warm_alumni": ["Hi {name},\n\nHope you have been doing well. Would love to reconnect.\n\nBest regards,\nKevin Miller"],
-    "followup_bumps": ["Hi {name},\n\nBumping this briefly to the top of your inbox.\n\nBest regards,\nKevin Miller"]
+    "cold_ops": ["Hi{name},\n\nSaw you're hiring a {job_title} at {company}.\n\nMost of my recent work is Python and SQL scripts that replaced manual reporting and reconciliation at a wealth firm.\n\nOpen to a quick chat this week?\n\nThanks,\nKevin Miller"],
+    "warm_alumni": ["Hi{name},\n\nFellow Hope grad here. I saw you're at {company}.\n\nI'm doing wealth operations work in Detroit right now, mostly Salesforce and Python cleanup.\n\nAny chance you're up for a quick call?\n\nThanks,\nKevin"],
+    "followup_bumps": ["Hi{name},\n\nCircling back on the {job_title} role in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nThanks,\nKevin Miller"]
 }
 _FALLBACK_LINKEDIN_TEMPLATES = {
-    "linkedin_templates": ["Hi {name}. I saw the {job_title} opening at {company} and wanted to connect."]
+    "linkedin_templates": ["Hi{name}. Saw you're hiring a {job_title} at {company}. I'd like to connect."]
 }
 
 def load_outreach_templates():
@@ -198,11 +202,27 @@ def resolve_template_text(pool, idx, fallback_text=""):
         idx = 0
     return pool[idx]
 
-def interpolate_template(template, name="there", company="", job_title=""):
+def interpolate_template(template, name="", company="", job_title=""):
     """Deterministically fills {name}/{company}/{job_title} placeholders via str.format() - the
-    only place candidate-facing outreach/LinkedIn copy is ever assembled. Never calls Gemini."""
+    only place candidate-facing outreach/LinkedIn copy is ever assembled. Never calls Gemini.
+
+    {name} renders WITH a leading space when a contact name is known and as an empty string when
+    it is not, so a template written "Hi{name}," yields "Hi Dana," or a bare "Hi," - never the old
+    "Hi there,". Templates must therefore not supply their own space before the placeholder; a
+    hand-typed "Hi {name}," from /edit is normalized here so the phone-editing path stays forgiving.
+    The literal "there" is scrubbed too, so any caller still passing the retired sentinel degrades
+    to "Hi," rather than reintroducing it.
+    """
+    clean_name = str(name or "").strip()
+    if clean_name.lower() == "there":
+        clean_name = ""
+    normalized = str(template or "").replace(" {name}", "{name}")
     try:
-        return template.format(name=name or "there", company=company or "your team", job_title=job_title or "this role")
+        return normalized.format(
+            name=f" {clean_name}" if clean_name else "",
+            company=company or "your team",
+            job_title=job_title or "this role",
+        )
     except Exception as e:
         logging.error(f"Template interpolation failed: {e}")
         return template
@@ -1511,31 +1531,49 @@ def get_current_role_blurb():
     sentence = f"I am currently working as a {title} at {company}" + (f" in {location}" if location else "") + "."
     return core_exp, sentence
 
-def generate_cold_email(job_title, company_name, core_exp=None):
-    """Full cold email: greeting, strict 2-sentence body, sign-off as separate paragraphs."""
-    if not core_exp:
-        core_exp, _ = get_current_role_blurb()
-    clean_company = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', str(company_name or ''), flags=re.IGNORECASE).strip().rstrip(',')
-    clean_company = re.sub(r'\s+', ' ', clean_company).strip() or (company_name or "your team")
+def clean_company_for_copy(company_name):
+    """Drops legal-entity suffixes so outreach copy reads 'Atwell', not 'Atwell Group, Inc.'.
+    Falls back to the raw value whenever stripping would leave nothing behind.
+    """
+    raw = str(company_name or "")
+    clean = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', raw, flags=re.IGNORECASE).strip().rstrip(',')
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean or raw or "your team"
 
-    s1 = f"I saw the {job_title} role at {clean_company} and wanted to highlight my background in {core_exp}."
-    s2 = "Would you be open to a brief 5-minute call next week to discuss alignment?"
-    body = enforce_sentence_limit(f"{sanitize_text(s1)} {sanitize_text(s2)}", 2)
-    return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
+def render_outreach_email(pool_key, template_id=0, name="", company="", job_title=""):
+    """THE single rendering path for every candidate-facing email body, cold or warm or bump.
 
-def generate_warm_email(note_context=""):
-    """Full warm email: greeting, strict 3-sentence body, sign-off as separate paragraphs."""
-    _, current_role_sentence = get_current_role_blurb()
-    s1 = sanitize_text(note_context) if note_context else "I hope you have been doing well."
-    s2 = sanitize_text(current_role_sentence)
-    s3 = sanitize_text("I am wondering what you have been up to lately, and would love to reconnect over coffee or a quick call if you have time.")
-    body = enforce_sentence_limit(f"{s1} {s2} {s3}", 3)
-    return f"Hi,\n\n{body}\n\nBest regards,\nKevin Miller"
+    Both consumers go through here - the Telegram card (process_single_candidate) and the Gmail
+    draft (/draft, /e, /eh, batch bumps) - so the email Kevin approves on the card is the exact
+    string that lands in the draft. Keeping one path is the whole point: the previous split, where
+    the card read templates/outreach_templates.json and Gmail used hardcoded f-strings, is what let
+    the two voices drift apart.
 
-def generate_bump_email(contact_name=""):
-    """Short follow-up nudge for threads that went unanswered."""
-    name_str = f" {contact_name}" if contact_name else ""
-    return f"Hi{name_str},\n\nBumping this briefly to the top of your inbox in case it got buried. Would love to connect if you have 5 minutes this week to discuss alignment.\n\nBest regards,\nKevin Miller"
+    Still Strict Deterministic Template Engine: Gemini only routed `template_id`, an integer that
+    resolve_template_text() bounds-checks; no prose is authored in Python or by the model.
+    """
+    pool = load_outreach_templates().get(pool_key, [])
+    fallback_pool = _FALLBACK_OUTREACH_TEMPLATES.get(pool_key) or [""]
+    fallback_text = fallback_pool[template_id] if isinstance(template_id, int) and 0 <= template_id < len(fallback_pool) else fallback_pool[0]
+    template = resolve_template_text(pool, template_id, fallback_text)
+    return sanitize_text(interpolate_template(
+        template, name=name, company=clean_company_for_copy(company), job_title=job_title
+    ))
+
+def generate_cold_email(job_title, company_name, template_id=0, contact_name=""):
+    """Cold email body from the cold_ops bank. `template_id` is the Gemini-routed
+    outreach_template_id persisted on the cached job, so /draft re-renders the same entry the
+    card showed instead of always falling back to cold_ops[0]."""
+    return render_outreach_email("cold_ops", template_id, name=contact_name, company=company_name, job_title=job_title)
+
+def generate_warm_email(contact_name="", company_name="", template_id=0):
+    """Warm alumni email body from the warm_alumni bank (the loosest of the four pools -
+    these are Hope College alumni, not strangers)."""
+    return render_outreach_email("warm_alumni", template_id, name=contact_name, company=company_name)
+
+def generate_bump_email(contact_name="", job_title="", company_name="", template_id=0):
+    """Follow-up nudge from the followup_bumps bank, for threads that went unanswered."""
+    return render_outreach_email("followup_bumps", template_id, name=contact_name, company=company_name, job_title=job_title)
 
 def format_email_block(email_text):
     sanitized = sanitize_text(email_text)
