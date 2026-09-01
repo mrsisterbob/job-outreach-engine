@@ -50,6 +50,11 @@ GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
 GMAIL_USER = os.environ.get("GMAIL_USER")
+# Absolute origin for the links Kevin taps out of Telegram. A relative /stage/<id> href is inert
+# inside a Telegram message, so every card link has to carry a real scheme+host. Render injects
+# RENDER_EXTERNAL_URL into deployed web services automatically; BASE_URL is the manual override for
+# any other host, and localhost is the dev default.
+BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL") or "http://localhost:5000").rstrip("/")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 JSEARCH_TIMEOUT_SECONDS = 12
 JSEARCH_MAX_RETRIES = 1  # additional attempts beyond the first, on timeout/429/5xx
@@ -2245,6 +2250,25 @@ def passes_strict_filter(job):
 
     return True
 
+def resolve_outreach_copy(job):
+    """Re-resolves (linkedin_note, outreach_email) for a cached job from the local template banks.
+
+    Same path process_single_candidate() uses - pool -> persisted template id -> interpolate ->
+    sanitize - so the /stage page can never drift from the copy the pipeline picked. Jobs cached
+    before linkedin_template_id/outreach_template_id were persisted have no id, and
+    resolve_template_text() bounds-checks a missing id down to template 0, so those render the
+    first template in the bank rather than failing.
+    """
+    company_name = job.get("employer_name") or "your team"
+    job_title = job.get("job_title") or "this role"
+    linkedin_pool = load_linkedin_templates().get("linkedin_templates", [])
+    linkedin_template = resolve_template_text(linkedin_pool, job.get("linkedin_template_id"))
+    linkedin_note = sanitize_text(interpolate_template(linkedin_template, name="there", company=company_name, job_title=job_title))[:300]
+    cold_pool = load_outreach_templates().get("cold_ops", [])
+    cold_template = resolve_template_text(cold_pool, job.get("outreach_template_id"))
+    outreach_email = sanitize_text(interpolate_template(cold_template, name="there", company=company_name, job_title=job_title))
+    return linkedin_note, outreach_email
+
 def process_single_candidate(job):
     log_metric_event("ai_screened", source=derive_job_source(job.get("job_id")))
     ai_pass, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id = evaluate_job_with_gemini(job)
@@ -2266,10 +2290,14 @@ def process_single_candidate(job):
         outreach_email = sanitize_text(interpolate_template(cold_template, name="there", company=company_name, job_title=job_title))
 
         # Persist routing keys on the cached job so /cv, /stage, and ATS plaintext all resolve
-        # the exact same bullets later (bounds-checked again by resume_engine.filter_ats_bullets).
+        # the exact same bullets and copy later (bounds-checked again by filter_ats_bullets /
+        # resolve_template_text). The template ids - not the rendered text - are what gets stored,
+        # so an /edit to a template bank changes what /stage shows without re-running the pipeline.
         job["track"] = track
         job["bullet_indices"] = bullet_indices
         job["tone_mode"] = tone_mode
+        job["linkedin_template_id"] = linkedin_template_id
+        job["outreach_template_id"] = outreach_template_id
         sheet_uuid = save_job_to_cache(short_id, job)
         target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
         age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))
@@ -2346,6 +2374,14 @@ def process_single_candidate(job):
                     f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10)</i>\n"
                     f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
                 )
+
+        # Second write, same sheet_uuid: the fit reason, matched skills and final score are all
+        # computed/adjusted below the first save, and /stage is now the only place they are shown.
+        # INSERT OR REPLACE makes this idempotent; without it the stage page has no source for them.
+        job["fit_reason"] = reason
+        job["matched_skills"] = matched_skills
+        job["fit_score"] = score
+        save_job_to_cache(short_id, job, sheet_uuid=sheet_uuid)
 
         return {
             "job": job, "score": score, "reason": reason,
@@ -3531,67 +3567,41 @@ def send_telegram_message(chat_id, text):
         logging.error(f"Telegram Post Error: {e}")
     return None
 
-# The card is read on a phone, so everything above the copy blocks has to fit on one screen.
-# Gemini's fit reason is the one field that runs long, and only its first sentence is ever
-# acted on - the rest is restatement of the JD. Trimmed with a trailing ellipsis so a cut
-# reads as deliberate rather than as a rendering bug.
-CARD_REASON_CHAR_CAP = 160
-
-def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line="", outreach_email="", sheet_tab="Pipeline_Candidates"):
+def send_telegram_card(job, score, target_email, age_badge, salary_str, work_style, overlap_pct, short_id, sheet_uuid=None, alumni_line="", sheet_tab="Pipeline_Candidates"):
     """Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
 
-    Layout is deliberately dense: one metadata line, two link lines, then the blocks Kevin
-    actually copies out (LinkedIn note, ATS bullets, cold draft). Static per-card boilerplate
-    is not on the card - anything identical on every send is noise that pushes the copy blocks
-    below the fold. The swipe legend is the exception: it stays in full because it is the only
-    place the command vocabulary is documented at the point of use.
+    The card is a home page, not a document: identity, the one metadata line, the target email,
+    the Apply link, and one link to everything else. Fit reason, matched skills, ATS bullets, the
+    LinkedIn note, the cold draft and the five research dorks all live on /stage/<short_id>, where
+    a real copy button beats tap-to-copy on a <code> span. Apply is the exception that stays inline
+    - it is the link Kevin taps on nearly every card and it should not cost a round trip through a
+    sleeping free-tier web service. The swipe legend is the bare command list; /help explains them.
     """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return None
-    ats_bullets = ats_bullets or []
     company = html.escape(str(job.get("employer_name") or "N/A"))
     title = html.escape(str(job.get("job_title") or "N/A"))
     apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
-    apollo_url = html.escape(build_apollo_url(company), quote=True)
-    linkedin_url = html.escape(build_linkedin_url(company), quote=True)
-    dork_url = html.escape(build_hiring_manager_dork(company, job.get("job_title")), quote=True)
-    recruiter_dork_url = html.escape(build_recruiter_dork(company), quote=True)
-    alumni_url = html.escape(build_alumni_dork(company), quote=True)
-    # Truncate raw dynamic content BEFORE HTML-escaping/tag-wrapping so tags never get cut mid-string
-    reason_raw = str(reason or "")
-    reason_safe = reason_raw[:CARD_REASON_CHAR_CAP] + ("…" if len(reason_raw) > CARD_REASON_CHAR_CAP else "")
-    matched_str = (", ".join(matched_skills[:4]).title() if matched_skills else "General Ops")[:150]
-    bullets_block = ("\n".join(f"• {b}" for b in ats_bullets) if ats_bullets else "N/A")[:500]
-    linkedin_note_safe = str(linkedin_note or "")[:300]
-    alumni_line_safe = str(alumni_line or "")[:400]
-    outreach_email_safe = str(outreach_email or "")[:600]
+    stage_url = html.escape(f"{BASE_URL}/stage/{short_id}?track={job.get('track', 'a')}", quote=True)
+    # Truncate raw dynamic content BEFORE HTML-escaping/tag-wrapping so tags never get cut mid-string.
+    # alumni_line arrives with a trailing newline from process_single_candidate but without one from
+    # some callers, so it is normalized here rather than leaving a stray blank line on the card.
+    alumni_line_safe = str(alumni_line or "")[:400].rstrip("\n")
+    alumni_block = f"{alumni_line_safe}\n" if alumni_line_safe.strip() else ""
     fit_dot = get_fit_score_indicator(score)
     card_text = (
         f"💼 <b>{title}</b>\n"
         f"🏢 <b>{company}</b>\n"
-        f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code>\n"
-        f"────────────────────\n"
         f"{fit_dot} <b>{score}/100</b> · {html.escape(str(salary_str))} · {html.escape(str(work_style))}"
         f" · {html.escape(str(age_badge))} · Skills {overlap_pct}%\n"
-        f"{alumni_line_safe}\n"
-        f"🧩 <b>Matched Skills:</b> <code>{html.escape(matched_str)}</code>\n\n"
-        f"<b>Fit Reason:</b> {html.escape(reason_safe)}\n\n"
-        f"🔗 <a href='{apply_link}'>Apply</a> · "
-        f"<a href='{apollo_url}'>Apollo</a> · "
-        f"<a href='{linkedin_url}'>LinkedIn</a> · "
-        f"<a href='{alumni_url}'>🎓 Alumni</a>\n"
-        f"🎯 <a href='{dork_url}'>Hiring Manager</a> · "
-        f"<a href='{recruiter_dork_url}'>Recruiter</a>\n\n"
-        f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
-        f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note_safe) if linkedin_note_safe else 'N/A'}</code>\n\n"
-        f"📄 <b>Tailored ATS Resume Bullets:</b>\n<code>{html.escape(bullets_block)}</code>\n\n"
-        f"✉️ <b>Cold Outreach Draft (tap to copy):</b>\n<code>{html.escape(outreach_email_safe) if outreach_email_safe else 'N/A'}</code>\n\n"
-        f"⚡ <b>Swipe Actions (reply to this card):</b>\n"
-        f"  <code>/apply</code> Mark Applied   <code>/draft</code> Gmail Draft\n"
-        f"  <code>/warm</code> Move Warm   <code>/cold</code> Move Cold   <code>/x</code> Dead\n"
-        f"  <code>/f &lt;days&gt;</code> Snooze   <code>/n &lt;note&gt;</code> Log Note\n"
-        f"  <code>/e &lt;email&gt;</code> Lock Apollo Email   <code>/eh</code> API Lookup"
+        f"{alumni_block}"
+        f"📧 <code>{html.escape(target_email)}</code>\n\n"
+        f"🔗 <a href='{apply_link}'>Apply</a>\n"
+        f"📋 <a href='{stage_url}'>Full Card</a> - bullets, LinkedIn note, draft, links, PDF\n"
+        f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code>\n\n"
+        f"⚡ <code>/apply</code> <code>/draft</code> <code>/warm</code> <code>/cold</code> "
+        f"<code>/x</code> <code>/f</code> <code>/n</code> <code>/e</code> <code>/eh</code> · <code>/help</code>"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -3991,14 +4001,11 @@ def run_job_pipeline(chat_id=None, top_n=2):
         job = item["job"]
         is_clavicular = item.get("is_clavicular", False)
         send_telegram_card(
-            job, item["score"], item["reason"], item["target_email"],
+            job, item["score"], item["target_email"],
             item["age_badge"], item["salary_str"], item["work_style"],
-            item["overlap_pct"], item["matched_skills"], item["short_id"],
+            item["overlap_pct"], item["short_id"],
             sheet_uuid=item.get("sheet_uuid"),
-            linkedin_note=item.get("linkedin_note", ""),
-            ats_bullets=item.get("ats_bullets"),
             alumni_line=item.get("alumni_line", ""),
-            outreach_email=item.get("outreach_email", ""),
             sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates"
         )
         note = (
@@ -4691,7 +4698,7 @@ def process_webhook_payload_async(data):
                 caption_text = (
                     f"📄 <b>Tailored Resume ({track.upper()}): {html.escape(comp)}</b>\n\n"
                     f"🖥️ <b>Desktop Staging Link:</b>\n"
-                    f"<code>http://localhost:5000/stage/{short_id}?track={track}</code>"
+                    f"<code>{html.escape(f'{BASE_URL}/stage/{short_id}?track={track}')}</code>"
                 )
                 requests.post(url, data={"chat_id": chat_id, "caption": caption_text, "parse_mode": "HTML"}, files=files, timeout=10)
             except Exception as e:
@@ -4825,11 +4832,13 @@ def process_webhook_payload_async(data):
             )
             return
 
-        # 10. Catch-All Fallback: unrecognized slash commands get a formatted help menu instead of silence
+        # 10. Help. /help asks for the menu; any other unrecognized slash command gets the same menu
+        # behind an "unrecognized" header instead of silence. The job card links here rather than
+        # reprinting the swipe legend on every send, so this is now the canonical command reference.
         if text.startswith("/"):
             send_telegram_message(
                 chat_id,
-                "⚠️ <b>Command Unrecognized</b>\n\n"
+                ("📖 <b>Command Reference</b>\n\n" if text == "/help" else "⚠️ <b>Command Unrecognized</b>\n\n") +
                 "<b>CORE COMMANDS:</b>\n"
                 "/t - Pull fresh job cards\n"
                 "/search - View or update live search filters\n"
@@ -4843,6 +4852,8 @@ def process_webhook_payload_async(data):
                 "/cc - Pull Cold VP Sprint cards\n"
                 "/p - Query priority tier contacts\n\n"
                 "<b>SWIPE-REPLY ACTIONS (reply to a card):</b>\n"
+                "Every card carries a 📋 Full Card link - ATS bullets, LinkedIn note, cold draft,\n"
+                "decision-maker searches and the tailored PDF, each with a copy button.\n"
                 "/apply - Mark Applied (Status only, no tab move)\n"
                 "/replied &lt;id&gt; - Set Status to Replied\n"
                 "/interview &lt;id&gt; - Set Status to Interviewing\n"
@@ -4870,7 +4881,8 @@ def process_webhook_payload_async(data):
                 "/funnel - View pipeline conversion funnel\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
-                "/streak, /daily - View daily outreach scorecard"
+                "/streak, /daily - View daily outreach scorecard\n"
+                "/help - Show this reference"
             )
             return
 
@@ -5005,7 +5017,11 @@ def format_ats_plaintext(job, track="a"):
 
 @app.route("/stage/<short_id>", methods=["GET"])
 def desktop_stage_view(short_id):
-    """Desktop review page showing tailored bullets, apply portal link, and PDF preview."""
+    """Desktop review page - the card's "Full Card" target. Everything the Telegram card used to
+    print inline lives here: fit reason, matched skills, tailored bullets, the LinkedIn note, the
+    cold draft, the five research dorks, and the PDF preview. Each copy block is a readonly
+    textarea plus a Copy button, which beats tap-to-copy on a Telegram <code> span.
+    """
     job = get_job_from_cache(short_id)
     if not job:
         return "<h3>Job not found or cache expired.</h3>", 404
@@ -5018,6 +5034,27 @@ def desktop_stage_view(short_id):
     bullets_html = "".join([f"<li>{html.escape(str(b))}</li>" for b in bullets])
     ats_plaintext = format_ats_plaintext(job, track)
 
+    linkedin_note, outreach_email = resolve_outreach_copy(job)
+    fit_reason = str(job.get("fit_reason") or "Not recorded for this job.")
+    matched_skills = job.get("matched_skills") or []
+    matched_str = ", ".join(str(s) for s in matched_skills[:8]).title() if matched_skills else "General Ops"
+    fit_score = job.get("fit_score")
+    score_str = f"{fit_score}/100" if fit_score is not None else "n/a"
+
+    # Same five decision-maker searches the card used to carry on two link lines. Built from the
+    # raw company name here - the card was passing the HTML-escaped name into these builders.
+    research_links = [
+        ("Apollo", build_apollo_url(comp)),
+        ("LinkedIn Leadership Search", build_linkedin_url(comp)),
+        ("🎓 Hope College Alumni", build_alumni_dork(comp)),
+        ("Hiring Manager", build_hiring_manager_dork(comp, title)),
+        ("Recruiter", build_recruiter_dork(comp)),
+    ]
+    research_html = "".join(
+        f'<a class="btn btn-secondary" href="{html.escape(url, quote=True)}" target="_blank">{html.escape(label)}</a>'
+        for label, url in research_links
+    )
+
     html_page = f"""
     <!DOCTYPE html>
     <html>
@@ -5029,7 +5066,8 @@ def desktop_stage_view(short_id):
             h2 {{ color: #1B2A4A; margin-top: 0; }}
             .btn {{ display: inline-block; padding: 10px 18px; margin-right: 10px; border-radius: 6px; text-decoration: none; font-weight: bold; }}
             .btn-primary {{ background: #1B2A4A; color: white; }}
-            .btn-secondary {{ background: #e9ecef; color: #333; }}
+            .btn-secondary {{ background: #e9ecef; color: #333; margin-bottom: 8px; }}
+            .meta {{ color: #444; line-height: 1.5; }}
             ul {{ line-height: 1.6; }}
             iframe {{ width: 100%; height: 500px; border: 1px solid #ddd; margin-top: 20px; border-radius: 4px; }}
             textarea {{ box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; padding: 10px; margin-top: 8px; }}
@@ -5038,24 +5076,44 @@ def desktop_stage_view(short_id):
     <body>
         <div class="card">
             <h2>{html.escape(title)} @ {html.escape(comp)}</h2>
+            <p class="meta"><b>Fit {html.escape(score_str)}</b> - {html.escape(fit_reason)}</p>
+            <p class="meta"><b>Matched Skills:</b> {html.escape(matched_str)}</p>
+
             <p><b>Targeted ATS Bullets:</b></p>
             <ul>{bullets_html}</ul>
             <div style="margin-top: 20px;">
                 <a class="btn btn-primary" href="/stage/{short_id}/pdf?track={track}" download="Kevin_Miller_Resume_{re.sub(r'[^a-zA-Z0-9]', '', comp)}.pdf">⬇️ Download Tailored PDF</a>
                 <a class="btn btn-secondary" href="{html.escape(apply_link)}" target="_blank">🔗 Open Application Portal</a>
             </div>
-            <iframe src="/stage/{short_id}/pdf?track={track}"></iframe>
+
+            <h3 style="margin-top: 24px;">🤝 LinkedIn Connect Note (&lt;300 chars)</h3>
+            <textarea id="linkedin-note" rows="5" style="width: 100%;" readonly>{html.escape(linkedin_note)}</textarea>
+            <div style="margin-top: 10px;">
+                <button class="btn btn-secondary" onclick="copyField('linkedin-note')" style="border: none; cursor: pointer;">📋 Copy LinkedIn Note</button>
+            </div>
+
+            <h3 style="margin-top: 24px;">✉️ Cold Outreach Draft</h3>
+            <textarea id="cold-draft" rows="12" style="width: 100%;" readonly>{html.escape(outreach_email)}</textarea>
+            <div style="margin-top: 10px;">
+                <button class="btn btn-secondary" onclick="copyField('cold-draft')" style="border: none; cursor: pointer;">📋 Copy Cold Draft</button>
+            </div>
+
+            <h3 style="margin-top: 24px;">🎯 Decision-Maker Research</h3>
+            <div>{research_html}</div>
 
             <h3 style="margin-top: 24px;">Raw ATS Text (Workday / Taleo fallback)</h3>
             <p style="color: #666; font-size: 0.9em;">Legacy ATS parsers sometimes fail to read the PDF - paste this plain-text version into application forms instead.</p>
             <textarea id="ats-raw-text" rows="15" style="width: 100%; font-family: monospace;" readonly>{html.escape(ats_plaintext)}</textarea>
             <div style="margin-top: 10px;">
-                <button class="btn btn-secondary" onclick="copyAtsText()" style="border: none; cursor: pointer;">📋 Copy ATS Text</button>
+                <button class="btn btn-secondary" onclick="copyField('ats-raw-text')" style="border: none; cursor: pointer;">📋 Copy ATS Text</button>
             </div>
+
+            <h3 style="margin-top: 24px;">Tailored PDF Preview</h3>
+            <iframe src="/stage/{short_id}/pdf?track={track}"></iframe>
         </div>
         <script>
-            function copyAtsText() {{
-                const textarea = document.getElementById('ats-raw-text');
+            function copyField(elementId) {{
+                const textarea = document.getElementById(elementId);
                 textarea.select();
                 textarea.setSelectionRange(0, 99999);
                 navigator.clipboard.writeText(textarea.value);
@@ -5112,13 +5170,11 @@ def desktop_ingest():
             result = process_single_candidate(job)
             if result:
                 send_telegram_card(
-                    result["job"], result["score"], result["reason"], result["target_email"],
+                    result["job"], result["score"], result["target_email"],
                     result["age_badge"], result["salary_str"], result["work_style"],
-                    result["overlap_pct"], result["matched_skills"], result["short_id"],
+                    result["overlap_pct"], result["short_id"],
                     sheet_uuid=result.get("sheet_uuid"),
-                    linkedin_note=result.get("linkedin_note", ""),
-                    ats_bullets=result.get("ats_bullets"),
-                    outreach_email=result.get("outreach_email", "")
+                    alumni_line=result.get("alumni_line", "")
                 )
             elif TELEGRAM_CHAT_ID:
                 send_telegram_message(TELEGRAM_CHAT_ID, f"⚠️ Ingested job did not pass AI screening: {html.escape(job['job_title'])}")
