@@ -27,6 +27,7 @@ from pipeline_utils import (
     extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall,
     derive_job_source, is_unverified_email, status_rank, STATUS_VOCAB,
     followup_action, followup_anchor,
+    lint_outreach_template, advise_outreach_template,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
 )
 
@@ -258,10 +259,44 @@ def resolve_edit_target(id_str):
             return (RESUME_BULLETS_BANK_PATH, pool_key, idx)
     return None
 
+# /edit pools that hold candidate-facing outreach copy, mapped to the linter's `kind`.
+# The resume-bullet pools (TA0-TE9) are absent on purpose: they are resume prose, not
+# outreach voice, so the email rules do not apply to them and they are never linted.
+_EDIT_LINT_KINDS = {
+    "linkedin_templates": "linkedin",
+    "cold_ops": "email",
+    "warm_alumni": "email",
+    "followup_bumps": "email",
+}
+
+def lint_edited_template(list_key, new_text):
+    """Returns a Telegram HTML warning block for a /edit'd template, or "" if there is nothing
+    to say. Advisory ONLY - update_template_entry() still writes. Kevin edits from his phone
+    and has to be able to override the rulebook; a blocked write would strand him.
+
+    Lints the INTERPOLATED render, not the raw string, because that is what the recipient reads
+    and what the length caps are measured on. Interpolating also runs the same " {name}" ->
+    "{name}" normalization a real send does, so a hand-typed "Hi {name}," is not warned about.
+    """
+    kind = _EDIT_LINT_KINDS.get(list_key)
+    if not kind:
+        return ""
+
+    rendered = interpolate_template(new_text, name="", company="", job_title="")
+    notes = [("⚠️", v) for v in lint_outreach_template(rendered, kind)]
+    notes += [("💡", n) for n in advise_outreach_template(rendered, kind)]
+    if not notes:
+        return ""
+
+    lines = "\n".join(f"{icon} {html.escape(text)}" for icon, text in notes)
+    return f"\n\n<b>Voice check</b> (saved anyway)\n{lines}"
+
 def update_template_entry(file_path, list_key, idx, new_text):
     """Atomically loads a template JSON bank, overwrites the string at (list_key, idx), and
     writes it back to disk via a temp-file + os.replace swap (crash-safe, no partial writes on
     disk). Returns (ok: bool, message: str) - message is a ready-to-send Telegram HTML string.
+
+    Voice-linter findings are appended to that message as a warning; they NEVER stop the write.
     """
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -284,9 +319,17 @@ def update_template_entry(file_path, list_key, idx, new_text):
     except Exception as e:
         return False, f"❌ Failed to write template bank: {html.escape(str(e))}"
 
+    # Linted after the write, so a linter exception can never cost Kevin the edit.
+    try:
+        warning = lint_edited_template(list_key, new_text)
+    except Exception as e:
+        logging.error(f"Template voice lint failed (edit still saved): {e}")
+        warning = ""
+
     return True, (
         f"✅ <b>Template Updated:</b> <code>{html.escape(str(list_key))}[{idx}]</code>\n\n"
         f"<code>{html.escape(new_text)}</code>"
+        f"{warning}"
     )
 
 # Inbound Email Anti-Spam Gatekeeper: 10 pre-filter shield parameters (raw CSV/string env values,
@@ -3430,9 +3473,21 @@ def send_telegram_message(chat_id, text):
         logging.error(f"Telegram Post Error: {e}")
     return None
 
+# The card is read on a phone, so everything above the copy blocks has to fit on one screen.
+# Gemini's fit reason is the one field that runs long, and only its first sentence is ever
+# acted on - the rest is restatement of the JD. Trimmed with a trailing ellipsis so a cut
+# reads as deliberate rather than as a rendering bug.
+CARD_REASON_CHAR_CAP = 160
+
 def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, work_style, overlap_pct, matched_skills, short_id, sheet_uuid=None, linkedin_note="", ats_bullets=None, alumni_line="", outreach_email="", sheet_tab="Pipeline_Candidates"):
     """Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
+
+    Layout is deliberately dense: one metadata line, two link lines, then the blocks Kevin
+    actually copies out (LinkedIn note, ATS bullets, cold draft). Static per-card boilerplate
+    is not on the card - anything identical on every send is noise that pushes the copy blocks
+    below the fold. The swipe legend is the exception: it stays in full because it is the only
+    place the command vocabulary is documented at the point of use.
     """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return None
@@ -3446,7 +3501,8 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
     recruiter_dork_url = html.escape(build_recruiter_dork(company), quote=True)
     alumni_url = html.escape(build_alumni_dork(company), quote=True)
     # Truncate raw dynamic content BEFORE HTML-escaping/tag-wrapping so tags never get cut mid-string
-    reason_safe = str(reason or "")[:300]
+    reason_raw = str(reason or "")
+    reason_safe = reason_raw[:CARD_REASON_CHAR_CAP] + ("…" if len(reason_raw) > CARD_REASON_CHAR_CAP else "")
     matched_str = (", ".join(matched_skills[:4]).title() if matched_skills else "General Ops")[:150]
     bullets_block = ("\n".join(f"• {b}" for b in ats_bullets) if ats_bullets else "N/A")[:500]
     linkedin_note_safe = str(linkedin_note or "")[:300]
@@ -3458,23 +3514,17 @@ def send_telegram_card(job, score, reason, target_email, age_badge, salary_str, 
         f"🏢 <b>{company}</b>\n"
         f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code>\n"
         f"────────────────────\n"
-        f"{fit_dot} <b>Fit Score:</b> {score}/100  |  <b>Skill Match:</b> {overlap_pct}%\n"
-        f"🕐 <b>Recency:</b> {age_badge}\n"
-        f"💰 <b>Pay &amp; Style:</b> {work_style} | {salary_str}\n"
+        f"{fit_dot} <b>{score}/100</b> · {html.escape(str(salary_str))} · {html.escape(str(work_style))}"
+        f" · {html.escape(str(age_badge))} · Skills {overlap_pct}%\n"
         f"{alumni_line_safe}\n"
         f"🧩 <b>Matched Skills:</b> <code>{html.escape(matched_str)}</code>\n\n"
         f"<b>Fit Reason:</b> {html.escape(reason_safe)}\n\n"
-        f"🔗 <b>Quick Links:</b>\n"
-        f"<a href='{apply_link}'>Direct Apply</a> | "
-        f"<a href='{apollo_url}'>Apollo Operations Leads</a> | "
-        f"<a href='{linkedin_url}'>LinkedIn Leadership Search</a> | "
-        f"<a href='{alumni_url}'>🎓 Alumni Connections</a>\n\n"
-        f"🎯 <b>Direct Decision Makers:</b>\n"
-        f"  👔 <a href='{dork_url}'>Search Director / VP of Ops (Hiring Manager)</a> |\n"
-        f"  🤝 <a href='{recruiter_dork_url}'>Search Senior In-House Recruiter</a>\n\n"
-        f"🧭 <b>Dual-Path Outreach Strategy:</b>\n"
-        f"  👔 <i>To Director/VP:</i> Lead with process automation, efficiency gains, and operational rigor.\n"
-        f"  🤝 <i>To Recruiter:</i> Confirm application submission, reference the specific role, request a brief phone screen.\n\n"
+        f"🔗 <a href='{apply_link}'>Apply</a> · "
+        f"<a href='{apollo_url}'>Apollo</a> · "
+        f"<a href='{linkedin_url}'>LinkedIn</a> · "
+        f"<a href='{alumni_url}'>🎓 Alumni</a>\n"
+        f"🎯 <a href='{dork_url}'>Hiring Manager</a> · "
+        f"<a href='{recruiter_dork_url}'>Recruiter</a>\n\n"
         f"📧 <b>Target (tap to copy):</b>\n<code>{html.escape(target_email)}</code>\n\n"
         f"🤝 <b>LinkedIn Connect Note (&lt;300 chars):</b>\n<code>{html.escape(linkedin_note_safe) if linkedin_note_safe else 'N/A'}</code>\n\n"
         f"📄 <b>Tailored ATS Resume Bullets:</b>\n<code>{html.escape(bullets_block)}</code>\n\n"

@@ -7,6 +7,8 @@ init_db() builds its schema there instead of touching the real jobs_cache.db, an
 worker, morning digest, backup scheduler) so nothing races against these tests' assertions.
 """
 import base64
+import html
+import json
 import os
 import sqlite3
 import tempfile
@@ -494,3 +496,230 @@ def test_funnel_command_handles_error_status_response(monkeypatch):
 
     assert len(sent) == 1
     assert "unavailable" in sent[0].lower()
+
+
+# ---- /edit voice lint: warn, never block ----
+
+@pytest.fixture
+def temp_bank(tmp_path):
+    """Writes a throwaway template bank and returns (path, loader) so a test can read back
+    what actually landed on disk after update_template_entry()'s atomic swap."""
+    path = tmp_path / "bank.json"
+
+    def write(data):
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return str(path)
+
+    def read():
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    return write, read
+
+
+def test_edit_warns_but_still_writes_a_template_with_violations(temp_bank):
+    """The whole point of the /edit lint: Kevin types from his phone, so a rule-breaking
+    template is flagged and SAVED. A blocked write would strand him with no way to override."""
+    write, read = temp_bank
+    path = write({"cold_ops": ["Hi, I'd like to connect."]})
+    bad = "Hi, I wanted to discuss alignment: happy to grab 15 minutes!\n\nBest regards,\nKevin"
+
+    ok, message = m.update_template_entry(path, "cold_ops", 0, bad)
+
+    assert ok is True
+    assert read()["cold_ops"][0] == bad, "the edit must land on disk even with violations"
+    assert "Template Updated" in message
+    assert "Voice check" in message and "saved anyway" in message
+    for expected in ("alignment", "colon", "exclamation", "Best regards", "15 minutes"):
+        assert expected in message, f"lint warning should name {expected!r}"
+
+
+def test_edit_of_a_clean_template_carries_no_warning(temp_bank):
+    write, read = temp_bank
+    path = write({"cold_ops": ["old"]})
+    clean = "Hi, saw the ops role at your team. I'd like to connect."
+
+    ok, message = m.update_template_entry(path, "cold_ops", 0, clean)
+
+    assert ok is True and read()["cold_ops"][0] == clean
+    assert "Voice check" not in message
+
+
+def test_edit_lint_flags_a_contraction_free_template_only_as_advice(temp_bank):
+    # Advisory tier: the note appears, but with the 💡 marker rather than ⚠️, because copy
+    # with no natural place for an apostrophe is a legitimate template.
+    write, _ = temp_bank
+    path = write({"cold_ops": ["old"]})
+
+    ok, message = m.update_template_entry(path, "cold_ops", 0, "Hi, saw the ops role. Worth a quick chat?")
+
+    assert ok is True
+    assert "💡" in message and "no contractions" in message
+    assert "⚠️" not in message
+
+
+def test_edit_lint_measures_the_interpolated_render_not_the_raw_template(temp_bank):
+    """A hand-typed "Hi {name}," is normalized by interpolate_template() on every real send,
+    so warning about it would be a false alarm - but a real violation behind a placeholder
+    still has to surface."""
+    write, _ = temp_bank
+    path = write({"cold_ops": ["old"]})
+
+    _, forgiving = m.update_template_entry(path, "cold_ops", 0, "Hi {name}, I'd like to connect.")
+    assert "Voice check" not in forgiving
+
+    _, caught = m.update_template_entry(path, "cold_ops", 0, "Hi {name}, I'm excited about {company}.")
+    assert "excited" in caught
+
+
+def test_edit_lint_uses_the_linkedin_char_cap_for_linkedin_notes(temp_bank):
+    write, _ = temp_bank
+    path = write({"linkedin_templates": ["old"]})
+    long_note = "Hi, I'd like to connect. " + ("ops work again. " * 20)
+
+    ok, message = m.update_template_entry(path, "linkedin_templates", 0, long_note)
+
+    assert ok is True
+    assert "220-char" in message
+    # The same string is under the 75-word email cap, so the pool really is routing the kind.
+    assert "75-word" not in message
+
+
+def test_edit_of_a_resume_bullet_pool_is_never_voice_linted(temp_bank):
+    """Resume bullets are not outreach prose - colons and em-dashes are fine there, and
+    sanitize_text() never touches them. Linting them would train Kevin to ignore the warning."""
+    write, read = temp_bank
+    path = write({"track_a_wealth_ops": ["old bullet"]})
+    bullet = "Built reconciliation tooling: cut a 3-day close to same-day - across 4 custodians."
+
+    ok, message = m.update_template_entry(path, "track_a_wealth_ops", 0, bullet)
+
+    assert ok is True and read()["track_a_wealth_ops"][0] == bullet
+    assert "Voice check" not in message
+
+
+# ---- Telegram job card layout ----
+
+_CARD_JOB = {
+    "employer_name": "Atwell",
+    "job_title": "Technology Business Operations Specialist",
+    "job_apply_link": "https://boards.example.com/atwell/bizops",
+}
+
+
+@pytest.fixture
+def render_card(monkeypatch):
+    """Returns render(**overrides) -> the exact text send_telegram_card() would POST.
+    The HTTP call is stubbed to a non-200 so the function never touches the message map."""
+    class _Res:
+        status_code = 500
+        text = "stubbed"
+
+        def json(self):
+            return {}
+
+    captured = {}
+
+    def _fake_post(url, json=None, timeout=None, **kw):
+        captured["text"] = (json or {}).get("text", "")
+        return _Res()
+
+    monkeypatch.setattr(m, "TELEGRAM_BOT_TOKEN", "stub-token")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "stub-chat")
+    monkeypatch.setattr(m.requests, "post", _fake_post)
+
+    def render(**overrides):
+        kwargs = dict(
+            job=_CARD_JOB, score=87, reason="Owns the ERP integration queue and reports into the COO.",
+            target_email="dana.reyes@atwell.com", age_badge="⚡ [1-3d RECENT]",
+            salary_str="$95,000 - $120,000 USD/year", work_style="Hybrid", overlap_pct=78,
+            matched_skills=["process automation", "erp"], short_id="a1b2c3d4e5f6",
+            sheet_uuid="4f21c0de-7a9b-4c31-9f0e-2b8d6a11c7e4",
+            linkedin_note="Hi, saw the BizOps role. Worth a quick chat?",
+            ats_bullets=["Cut monthly close from 3 days to same-day."],
+            alumni_line="🎓 <b>Alumni:</b> 3 grads in Ops at Atwell",
+            outreach_email="Hi,\n\nSaw the role. Worth a quick chat?\n\nThanks,\nKevin Miller",
+            sheet_tab="Pipeline_Candidates",
+        )
+        kwargs.update(overrides)
+        m.send_telegram_card(**kwargs)
+        return captured["text"]
+
+    return render
+
+
+def test_card_puts_the_scan_metadata_on_a_single_line(render_card):
+    """Score, pay, style, recency and skill match were four stacked lines that pushed the
+    copy blocks below the fold on a phone. One line, same five values."""
+    text = render_card()
+    meta = [ln for ln in text.splitlines() if "87/100" in ln]
+    assert len(meta) == 1, "the metadata should appear on exactly one line"
+    for value in ("$95,000 - $120,000 USD/year", "Hybrid", "[1-3d RECENT]", "Skills 78%"):
+        assert value in meta[0]
+    # The old stacked labels are gone entirely, not just reordered.
+    for retired in ("<b>Fit Score:</b>", "<b>Recency:</b>", "Pay &amp; Style"):
+        assert retired not in text
+
+
+def test_card_drops_the_static_dual_path_boilerplate(render_card):
+    # Identical on every card, so it carried no per-job information and cost ~4 lines.
+    text = render_card()
+    assert "Dual-Path Outreach Strategy" not in text
+    assert "request a brief phone screen" not in text
+
+
+def test_card_keeps_all_six_links_on_two_lines(render_card):
+    text = render_card()
+    link_lines = [ln for ln in text.splitlines() if "<a href=" in ln]
+    assert len(link_lines) == 2, "six links, collapsed onto two lines"
+    assert sum(ln.count("<a href=") for ln in link_lines) == 6
+    for url in (m.build_apollo_url("Atwell"), m.build_linkedin_url("Atwell"),
+                m.build_alumni_dork("Atwell"), m.build_recruiter_dork("Atwell"),
+                m.build_hiring_manager_dork("Atwell", _CARD_JOB["job_title"]),
+                _CARD_JOB["job_apply_link"]):
+        assert html.escape(url, quote=True) in text
+
+
+def test_card_truncates_a_long_fit_reason_with_an_ellipsis(render_card):
+    long_reason = "Strong overlap with your reconciliation work. " * 10
+    text = render_card(reason=long_reason)
+    line = next(ln for ln in text.splitlines() if ln.startswith("<b>Fit Reason:</b>"))
+    body = line[len("<b>Fit Reason:</b> "):]
+    assert body.endswith("…")
+    assert len(body) == m.CARD_REASON_CHAR_CAP + 1
+    # A short reason is left exactly as-is, with no stray ellipsis.
+    short = render_card(reason="Owns the ERP queue.")
+    assert "<b>Fit Reason:</b> Owns the ERP queue." in short
+    assert "…" not in short
+
+
+def test_card_keeps_the_blocks_kevin_copies_out_and_the_full_swipe_legend(render_card):
+    text = render_card()
+    assert "4f21c0de-7a9b-4c31-9f0e-2b8d6a11c7e4" in text and "Pipeline_Candidates" in text
+    assert "🎓 <b>Alumni:</b> 3 grads in Ops at Atwell" in text
+    for block in ("LinkedIn Connect Note", "Tailored ATS Resume Bullets", "Cold Outreach Draft",
+                  "Target (tap to copy)"):
+        assert block in text
+    for command in ("/apply", "/draft", "/warm", "/cold", "/x", "/f &lt;days&gt;",
+                    "/n &lt;note&gt;", "/e &lt;email&gt;", "/eh"):
+        assert f"<code>{command}</code>" in text
+
+
+def test_card_escapes_interpolated_values_and_respects_the_telegram_length_cap(render_card):
+    """A company or salary string carrying a < or & would break Telegram's HTML parse mode and
+    the card would fail to send outright, so escaping is load-bearing, not cosmetic."""
+    text = render_card(
+        job={**_CARD_JOB, "employer_name": "Smith & <Sons>"},
+        salary_str="$95,000 <negotiable> & up",
+        work_style="On-site & <flex>",
+        target_email="a&b@atwell.com",
+        alumni_line="",
+    )
+    assert "Smith &amp; &lt;Sons&gt;" in text
+    assert "$95,000 &lt;negotiable&gt; &amp; up" in text
+    assert "On-site &amp; &lt;flex&gt;" in text
+    assert "a&amp;b@atwell.com" in text
+    # Only the tags this card builds itself survive as raw markup.
+    assert "<Sons>" not in text and "<negotiable>" not in text
+
+    long_card = render_card(outreach_email="x" * 4000, ats_bullets=["y" * 600] * 5)
+    assert len(long_card) <= 3990
