@@ -28,6 +28,7 @@ from pipeline_utils import (
     derive_job_source, is_unverified_email, status_rank, STATUS_VOCAB,
     followup_action, followup_anchor, is_followup_unscheduled,
     lint_outreach_template, advise_outreach_template,
+    is_probable_company_name, ats_slug_guess,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
 )
 
@@ -3797,10 +3798,17 @@ def auto_expand_ats_slug(company_name):
     /t runs source directly from it. Meant to run on a background daemon thread - silent on no match.
     Distinct from expand_ecosystem_filter() (the Gemini-powered /ecosystem add command), which also
     discovers keyword aliases and returns a Telegram report string - this one is fire-and-forget.
+
+    Names that are obviously people or notes rather than companies are skipped before any HTTP
+    request: resolve_warm_company_ats_slugs() feeds this every unique Carmen Warm "company",
+    and that column holds personal contacts. See pipeline_utils.is_probable_company_name().
     """
-    slug_guess = re.sub(r'[^a-z0-9]', '', str(company_name or '').lower())
-    if not slug_guess:
+    if not is_probable_company_name(company_name):
+        # DEBUG, not INFO: on a warm network of personal contacts this is the common case, and
+        # at INFO it would just replace the probe spam it exists to prevent.
+        logging.debug(f"[ATS EXPANSION] Skipped '{company_name}' - not a probable company name, no board probe")
         return
+    slug_guess = ats_slug_guess(company_name)
     existing_slugs = safe_list(get_filter("ats_company_slugs", []))
     if slug_guess in existing_slugs:
         return  # already tracked
@@ -3820,7 +3828,9 @@ def auto_expand_ats_slug(company_name):
                 return
         except Exception as e:
             logging.error(f"[ATS EXPANSION] {board_name} check failed for '{slug_guess}': {e}")
-    logging.info(f"[ATS EXPANSION] No ATS board match found for '{company_name}' (guessed slug '{slug_guess}')")
+    # DEBUG: a miss is the normal outcome of a speculative slug guess, so this at INFO was
+    # one log line per company per pipeline run for no signal. The match above stays at INFO.
+    logging.debug(f"[ATS EXPANSION] No ATS board match found for '{company_name}' (guessed slug '{slug_guess}')")
 
 def resolve_warm_company_ats_slugs():
     """Resolves an ATS board slug for every unique Carmen Warm CRM company: prefers the

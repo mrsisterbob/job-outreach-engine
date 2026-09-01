@@ -842,3 +842,82 @@ def test_overdue_command_reports_an_empty_list_instead_of_going_silent(monkeypat
     _dispatch("/overdue")
     assert len(capture_sent) == 1
     assert "No overdue records" in capture_sent[0]
+
+
+# ---- ATS auto-expansion: skip guard and log levels ----
+
+@pytest.fixture
+def ats_probe_recorder(monkeypatch):
+    """Records every board URL auto_expand_ats_slug() would probe, without making requests."""
+    probes = []
+
+    class _Res:
+        status_code = 404
+
+        def json(self):
+            return {}
+
+    def _fake_get(url, timeout=None, **kw):
+        probes.append(url)
+        return _Res()
+
+    monkeypatch.setattr(m.requests, "get", _fake_get)
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: [])
+    monkeypatch.setattr(m, "set_filter", lambda key, value: True)
+    return probes
+
+
+def test_auto_expand_makes_zero_http_probes_for_non_company_names(ats_probe_recorder):
+    # Every one of these is a real Carmen Warm "company" value.
+    for junk in ("mom", "cousin", "(fuck)", "Guy from birmingham venture capital",
+                 "https://www.linkedin.com/in/elaine-ezekiel/", "Nathan at speaker event",
+                 "Grandma/ Karen Synagogue contact who knows people"):
+        m.auto_expand_ats_slug(junk)
+    assert ats_probe_recorder == [], "junk names must not reach the network at all"
+
+
+def test_auto_expand_still_probes_all_three_boards_for_a_real_company(ats_probe_recorder):
+    m.auto_expand_ats_slug("Guy Carpenter")
+    assert len(ats_probe_recorder) == 3
+    assert any("greenhouse.io" in u for u in ats_probe_recorder)
+    assert any("lever.co" in u for u in ats_probe_recorder)
+    assert any("ashbyhq.com" in u for u in ats_probe_recorder)
+    assert all("guycarpenter" in u for u in ats_probe_recorder)
+
+
+def test_auto_expand_logs_skips_and_misses_below_info(ats_probe_recorder, caplog):
+    """Both lines are the common case on a warm network of personal contacts. Leaving either
+    at INFO would just swap one log flood for another."""
+    with caplog.at_level("INFO", logger=""):
+        m.auto_expand_ats_slug("mom")
+        m.auto_expand_ats_slug("Atwell")
+    assert caplog.records == [], "no INFO-or-above line for a skip or a miss"
+
+    with caplog.at_level("DEBUG", logger=""):
+        m.auto_expand_ats_slug("mom")
+        m.auto_expand_ats_slug("Atwell")
+    messages = [r.message for r in caplog.records]
+    assert any("Skipped 'mom'" in msg for msg in messages)
+    assert any("No ATS board match found for 'Atwell'" in msg for msg in messages)
+
+
+def test_auto_expand_keeps_a_successful_match_at_info(monkeypatch, caplog):
+    """The success line is rare and actionable - it is the one that must stay visible."""
+    class _Hit:
+        status_code = 200
+
+        def json(self):
+            return [{"id": 1}]
+
+    saved = {}
+    monkeypatch.setattr(m.requests, "get", lambda url, timeout=None, **kw: _Hit())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: [])
+    monkeypatch.setattr(m, "set_filter", lambda key, value: saved.update({key: value}) or True)
+    monkeypatch.setattr(m, "upsert_company_identity", lambda *a, **k: True)
+
+    with caplog.at_level("INFO", logger=""):
+        m.auto_expand_ats_slug("Stellantis")
+
+    assert saved["ats_company_slugs"] == ["stellantis"]
+    assert any("resolved to 'stellantis'" in r.message and r.levelname == "INFO"
+               for r in caplog.records)

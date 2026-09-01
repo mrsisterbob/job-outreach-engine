@@ -650,3 +650,48 @@ def test_is_followup_unscheduled_treats_blank_and_the_sentinel_as_unset():
 def test_is_followup_unscheduled_leaves_real_dates_alone():
     for real in ("2026-08-31", "1970-01-02", "2020-01-01", "1969-12-31"):
         assert pu.is_followup_unscheduled(real) is False, real
+
+
+# ---- ATS auto-expansion name guard ----
+
+def test_ats_guard_rejects_the_personal_contacts_in_the_warm_crm():
+    """Every one of these is a real Carmen Warm 'company' value. Each costs 3 sequential
+    HTTP probes at up to 8s if it gets through."""
+    for junk in ("mom", "cousin", "(fuck)", "Guy from birmingham venture capital",
+                 "https://www.linkedin.com/in/elaine-ezekiel/", "Nathan at speaker event"):
+        assert pu.is_probable_company_name(junk) is False, junk
+
+
+def test_ats_guard_still_accepts_real_company_names():
+    for company in ("Stellantis", "Atwell", "Guy Carpenter", "Recourse Communications, Inc."):
+        assert pu.is_probable_company_name(company) is True, company
+
+
+def test_ats_guard_matches_person_words_only_as_the_whole_name():
+    # The reason the list is whole-name: "Guy Carpenter" is a real reinsurance broker, and
+    # a substring match would silently stop probing it forever.
+    assert pu.is_probable_company_name("guy") is False
+    assert pu.is_probable_company_name("  Mom  ") is False   # trimmed and case-folded
+    assert pu.is_probable_company_name("Guy Carpenter") is True
+    assert pu.is_probable_company_name("Friend Studios") is True
+
+
+def test_ats_guard_rejects_names_too_short_to_be_a_board_slug():
+    for tiny in ("", None, "  ", "AB", "-", "&&&", "A.B."):
+        assert pu.is_probable_company_name(tiny) is False, repr(tiny)
+    assert pu.is_probable_company_name("IBM") is True  # exactly at the 3-char floor
+
+
+def test_ats_guard_rejects_uncapitalized_names_and_pasted_urls():
+    # Capitalization is what catches lowercase junk no keyword list could enumerate.
+    assert pu.is_probable_company_name("some guy i met") is False
+    assert pu.is_probable_company_name("stellantis") is False
+    assert pu.is_probable_company_name("http://acme.com") is False
+    assert pu.is_probable_company_name("www.Acme.com") is False
+    assert pu.is_probable_company_name("Acme Corp") is True
+
+
+def test_ats_slug_guess_strips_to_lowercase_alphanumerics():
+    assert pu.ats_slug_guess("Recourse Communications, Inc.") == "recoursecommunicationsinc"
+    assert pu.ats_slug_guess("Atwell") == "atwell"
+    assert pu.ats_slug_guess(None) == ""
