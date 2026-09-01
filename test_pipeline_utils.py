@@ -1,10 +1,25 @@
 """Unit tests for pipeline_utils.py: pure scoring/dork/dedup/formatting helpers.
-No network, DB, or Flask/APScheduler dependency - safe to run in any environment.
+No network dependency - safe to run in any environment.
+
+The outreach-voice tests at the bottom are the exception to "no main.py import": they have to
+render copy through the real sanitize_text()/interpolate_template() to be worth anything. They
+follow test_main_integration.py's isolation pattern - point JOBS_DB_PATH at a temp file BEFORE
+importing main, so main's init_db() never touches the real jobs_cache.db. setdefault() means
+whichever test module imports main first owns the temp DB and the other reuses it.
 """
+import json
+import os
+import tempfile
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 
 import pipeline_utils as pu
+
+_tmp_db_fd, _TMP_DB_PATH = tempfile.mkstemp(suffix=".db")
+os.close(_tmp_db_fd)
+os.environ.setdefault("JOBS_DB_PATH", _TMP_DB_PATH)
+
+import main as m  # noqa: E402  (must import after JOBS_DB_PATH is set)
 
 
 # ---- Google dork builders ----
@@ -474,4 +489,146 @@ def test_is_unverified_email_false_for_clean_address():
     assert pu.is_unverified_email("jane@acmecorp.com") is False
     assert pu.is_unverified_email("") is False
     assert pu.is_unverified_email(None) is False
+
+
+# ---- Outreach voice linter ----
+
+def test_lint_outreach_template_flags_the_phrases_that_caused_the_rewrite():
+    stiff = ("Hi there,\n\nI saw the role and wanted to discuss alignment. I hope you have been "
+             "doing well. Would you be open to a brief 15-minute call?\n\nBest regards,\nKevin Miller")
+    violations = " | ".join(pu.lint_outreach_template(stiff, "email"))
+    assert "Best regards" in violations
+    assert "alignment" in violations
+    assert "Hi there" in violations
+    assert "15-minute" in violations
+    # ...and the stiffness is only advisory - it never fails a template on its own.
+    assert "no contractions" not in violations
+    assert any("no contractions" in n for n in pu.advise_outreach_template(stiff, "email"))
+
+
+def test_lint_outreach_template_flags_punctuation_sanitize_text_would_delete():
+    # sanitize_text() DELETES these rather than rewriting around them, so "Hi Dana - saw the
+    # role" silently ships as "Hi Dana saw the role". Catch them in the raw template.
+    assert any("em/en-dash" in v for v in pu.lint_outreach_template("Hi Dana — I've seen it.", "email"))
+    assert any("colon" in v for v in pu.lint_outreach_template("Here's the thing: I've seen it.", "email"))
+    assert any("semicolon" in v for v in pu.lint_outreach_template("I've seen it; you have not.", "email"))
+    assert any("exclamation" in v for v in pu.lint_outreach_template("I've seen it!", "email"))
+
+
+def test_lint_outreach_template_enforces_length_caps_per_kind():
+    long_email = "I've " + ("word " * pu.OUTREACH_EMAIL_WORD_CAP)
+    assert any("over the 75-word" in v for v in pu.lint_outreach_template(long_email, "email"))
+    long_note = "I've " + ("x" * pu.OUTREACH_LINKEDIN_CHAR_CAP)
+    assert any("over the 220-char" in v for v in pu.lint_outreach_template(long_note, "linkedin"))
+    # ...and the caps do not cross over: a 100-word email-length string is fine as an email
+    # only under the cap, and a short note is clean either way.
+    assert pu.lint_outreach_template("Hi. Saw the role and I'd like to connect.", "linkedin") == []
+
+
+def test_contraction_advice_is_advisory_and_ignores_possessives():
+    # "team's" is a possessive, not a contraction - it must not satisfy the rule...
+    assert pu.advise_outreach_template("Saw the role on my team's board.", "email") != []
+    assert pu.advise_outreach_template("Saw the role. I'd like to connect.", "email") == []
+    # ...but either way it stays out of the hard violations, so a contraction-free template
+    # that is otherwise clean still ships. cold_ops[2] and followup_bumps[0] are exactly that.
+    assert pu.lint_outreach_template("Saw the role on my team's board.", "email") == []
+    assert pu.lint_outreach_template("Saw the role. I'd like to connect.", "email") == []
+
+
+def test_lint_outreach_template_flags_space_before_name_placeholder():
+    # interpolate_template() supplies {name}'s own leading space; "Hi {name}," would double it.
+    assert any("space before {name}" in v for v in pu.lint_outreach_template("Hi {name}, I've seen it.", "email"))
+
+
+# ---- One voice, both paths: the real banks and the real generators ----
+
+_LINT_COMPANY = "Atwell"
+_LINT_TITLE = "Technology Business Operations Specialist"
+
+
+def _load_bank(filename):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", filename)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_template_banks_have_the_exact_lengths_gemini_routes_against():
+    # Gemini routes by integer index and /edit addresses by position; a resize silently
+    # corrupts routing (a bad index falls back to 0, so every email becomes identical).
+    # These counts are mirrored in response_schema.py (le=9, le=5) and main.build_system_prompt().
+    outreach = _load_bank("outreach_templates.json")
+    linkedin = _load_bank("linkedin_templates.json")
+    assert len(outreach["cold_ops"]) == 6
+    assert len(outreach["warm_alumni"]) == 2
+    assert len(outreach["followup_bumps"]) == 2
+    assert len(linkedin["linkedin_templates"]) == 10
+
+
+def test_every_shipped_template_passes_the_voice_linter():
+    """Interpolate every entry in both real banks, sanitize it the way a send would, and demand
+    zero hard violations - banned phrases, punctuation sanitize_text() eats, {name} spacing, the
+    length caps. Style advice (advise_outreach_template) is deliberately not asserted on: it is a
+    nudge, and good copy is allowed to ignore it. Lints the raw interpolation too, because
+    sanitize_text() would have already swallowed any em-dash/colon/semicolon by the time the
+    sanitized string is inspected."""
+    banks = [
+        ("cold_ops", "email", _load_bank("outreach_templates.json")["cold_ops"]),
+        ("warm_alumni", "email", _load_bank("outreach_templates.json")["warm_alumni"]),
+        ("followup_bumps", "email", _load_bank("outreach_templates.json")["followup_bumps"]),
+        ("linkedin_templates", "linkedin", _load_bank("linkedin_templates.json")["linkedin_templates"]),
+    ]
+    failures = []
+    for pool_key, kind, pool in banks:
+        for idx, template in enumerate(pool):
+            rendered = m.interpolate_template(template, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE)
+            for stage, text in (("raw", rendered), ("sanitized", m.sanitize_text(rendered))):
+                for violation in pu.lint_outreach_template(text, kind):
+                    failures.append(f"{pool_key}[{idx}] ({stage}): {violation}")
+    assert failures == []
+
+
+def test_shipped_templates_open_on_a_bare_hi_when_no_name_is_known():
+    # The card never knows the recipient's name, so the old "Hi there," default is gone.
+    for template in _load_bank("outreach_templates.json")["cold_ops"]:
+        assert m.interpolate_template(template, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE).startswith("Hi,")
+        assert m.interpolate_template(template, name="Dana", company=_LINT_COMPANY, job_title=_LINT_TITLE).startswith("Hi Dana,")
+
+
+def test_gmail_generators_pass_the_same_linter_as_the_card_templates():
+    """The regression guard against the two voice paths re-splitting. generate_*_email() render
+    from the same JSON banks the Telegram card interpolates, so anything that would fail the card
+    copy fails here too - and if someone reintroduces a hardcoded f-string body, this catches it.
+    Hard violations only, matching the bank test above.
+    """
+    generated = [
+        ("generate_cold_email", m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY)),
+        ("generate_warm_email", m.generate_warm_email(company_name=_LINT_COMPANY)),
+        ("generate_bump_email", m.generate_bump_email(job_title=_LINT_TITLE, company_name=_LINT_COMPANY)),
+    ]
+    failures = [f"{name}: {v}" for name, body in generated for v in pu.lint_outreach_template(body, "email")]
+    assert failures == []
+    for name, body in generated:
+        assert body.startswith("Hi,"), f"{name} should open on a bare 'Hi,' with no contact name"
+        assert "Best regards" not in body
+        assert "{" not in body, f"{name} left a placeholder uninterpolated"
+
+
+def test_gmail_generators_render_the_same_string_the_card_shows():
+    """Byte-for-byte parity is the point: /draft re-renders the routed template_id, so the Gmail
+    body is the copy Kevin already approved on the card, not cold_ops[0] every time."""
+    for template_id in range(6):
+        card_copy = m.render_outreach_email(
+            "cold_ops", template_id, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE
+        )
+        gmail_copy = m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, template_id=template_id)
+        assert card_copy == gmail_copy
+    # Distinct entries really are distinct - a silent fallback-to-index-0 would collapse them.
+    assert len({m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, template_id=i) for i in range(6)}) == 6
+
+
+def test_generators_use_the_contact_name_when_one_is_known():
+    assert m.generate_bump_email(contact_name="Dana", job_title=_LINT_TITLE).startswith("Hi Dana,")
+    assert m.generate_warm_email(contact_name="Dana", company_name=_LINT_COMPANY).startswith("Hi Dana,")
+    # The retired "there" sentinel degrades to a bare "Hi," instead of reappearing as "Hi there,".
+    assert m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, contact_name="there").startswith("Hi,")
 

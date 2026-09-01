@@ -280,6 +280,10 @@ def followup_action(status, date_added, next_followup, today):
 # Both are linted by the same tests, which is what stops the two paths drifting
 # back apart. Also runs on /edit so a phone-typed template gets a warning
 # (never a block - Kevin has to be able to override from Telegram).
+#
+# Two tiers: lint_outreach_template() returns hard violations, advise_outreach_template()
+# returns style nudges. Only the hard tier is asserted on in the tests, because a rule
+# that would force a rewrite of copy that already reads well is a bad rule.
 # ==============================================================================
 
 # (compiled pattern, human-readable violation message). Patterns are matched
@@ -305,9 +309,12 @@ _OUTREACH_BANNED_PATTERNS = [
 
 _OUTREACH_BANNED_RULES = [(re.compile(p, re.IGNORECASE), msg) for p, msg in _OUTREACH_BANNED_PATTERNS]
 
-# At least one of these must appear, or the copy reads like AI business correspondence.
-# An explicit list rather than a generic apostrophe search, so a possessive ("my team's
-# plate") never counts as a contraction.
+# A contraction usually makes the copy read like a person wrote it, but it is a style
+# preference, not a rule: cold_ops[2] and followup_bumps[0] are among the strongest
+# entries in the bank and have no natural place for an apostrophe, and wedging one in
+# makes them worse. So this is reported by advise_outreach_template() as a nudge and is
+# never a violation. An explicit list rather than a generic apostrophe search, so a
+# possessive ("my team's plate") never counts as a contraction.
 _CONTRACTION_RE = re.compile(
     r"\b(?:I'm|I've|I'd|I'll|you're|you've|you'd|you'll|we're|we've|we'd|they're|it's|that's|there's|"
     r"here's|let's|isn't|aren't|wasn't|don't|doesn't|didn't|can't|won't|wouldn't|couldn't|shouldn't|"
@@ -320,7 +327,11 @@ OUTREACH_LINKEDIN_CHAR_CAP = 220
 
 
 def lint_outreach_template(text, kind="email"):
-    """Returns a list of rule-violation strings for one rendered outreach string, empty if clean.
+    """Returns a list of hard rule-violation strings for one rendered outreach string, empty if clean.
+
+    Hard rules only - things that are wrong however good the copy is: banned phrases,
+    punctuation sanitize_text() would eat, the {name} spacing bug, and the length caps.
+    Style preferences live in advise_outreach_template() so they can never fail a template.
 
     `kind` is "email" (cold_ops / warm_alumni / followup_bumps, 75-word cap) or "linkedin"
     (linkedin_templates, 220-char cap). Measure AFTER interpolation - the caps are on what the
@@ -352,9 +363,6 @@ def lint_outreach_template(text, kind="email"):
         violations.append("space before {name} - the placeholder supplies its own leading space, "
                           "so write 'Hi{name},' not 'Hi {name},'")
 
-    if not _CONTRACTION_RE.search(body):
-        violations.append("no contractions - write \"I've\"/\"I'm\"/\"you're\", not \"I have\"/\"I am\"")
-
     if kind == "linkedin":
         if len(body) > OUTREACH_LINKEDIN_CHAR_CAP:
             violations.append(f"{len(body)} chars, over the {OUTREACH_LINKEDIN_CHAR_CAP}-char LinkedIn note cap")
@@ -364,6 +372,23 @@ def lint_outreach_template(text, kind="email"):
             violations.append(f"{words} words, over the {OUTREACH_EMAIL_WORD_CAP}-word cold email cap")
 
     return violations
+
+
+def advise_outreach_template(text, kind="email"):
+    """Soft style notes for one rendered outreach string - a nudge, never a failure.
+
+    Kept separate from lint_outreach_template() so /edit can surface both while the test
+    suite only holds the shipped banks to the hard rules. A note here is a suggestion to
+    read the line again, not a defect: ignoring it is a legitimate call.
+    """
+    body = str(text or "")
+    notes = []
+
+    if not _CONTRACTION_RE.search(body):
+        notes.append("no contractions - \"I've\"/\"I'm\"/\"you're\" read warmer than \"I have\"/\"I am\", "
+                     "but leave it alone if the line has no natural place for one")
+
+    return notes
 
 
 def generate_short_key(raw_id, fallback=None):
