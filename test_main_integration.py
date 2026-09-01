@@ -10,6 +10,7 @@ import base64
 import html
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import uuid
@@ -629,15 +630,12 @@ def render_card(monkeypatch):
 
     def render(**overrides):
         kwargs = dict(
-            job=_CARD_JOB, score=87, reason="Owns the ERP integration queue and reports into the COO.",
+            job=_CARD_JOB, score=87,
             target_email="dana.reyes@atwell.com", age_badge="⚡ [1-3d RECENT]",
             salary_str="$95,000 - $120,000 USD/year", work_style="Hybrid", overlap_pct=78,
-            matched_skills=["process automation", "erp"], short_id="a1b2c3d4e5f6",
+            short_id="a1b2c3d4e5f6",
             sheet_uuid="4f21c0de-7a9b-4c31-9f0e-2b8d6a11c7e4",
-            linkedin_note="Hi, saw the BizOps role. Worth a quick chat?",
-            ats_bullets=["Cut monthly close from 3 days to same-day."],
             alumni_line="🎓 <b>Alumni:</b> 3 grads in Ops at Atwell",
-            outreach_email="Hi,\n\nSaw the role. Worth a quick chat?\n\nThanks,\nKevin Miller",
             sheet_tab="Pipeline_Candidates",
         )
         kwargs.update(overrides)
@@ -667,41 +665,61 @@ def test_card_drops_the_static_dual_path_boilerplate(render_card):
     assert "request a brief phone screen" not in text
 
 
-def test_card_keeps_all_six_links_on_two_lines(render_card):
+def test_card_fits_on_one_phone_screen(render_card):
+    """The whole point of the /stage page: the card is a home page, not a document. Everything
+    that used to print inline (bullets, note, draft, dorks, fit reason) is one tap away instead."""
     text = render_card()
-    link_lines = [ln for ln in text.splitlines() if "<a href=" in ln]
-    assert len(link_lines) == 2, "six links, collapsed onto two lines"
-    assert sum(ln.count("<a href=") for ln in link_lines) == 6
-    for url in (m.build_apollo_url("Atwell"), m.build_linkedin_url("Atwell"),
-                m.build_alumni_dork("Atwell"), m.build_recruiter_dork("Atwell"),
-                m.build_hiring_manager_dork("Atwell", _CARD_JOB["job_title"]),
-                _CARD_JOB["job_apply_link"]):
-        assert html.escape(url, quote=True) in text
+    content = [ln for ln in text.splitlines() if ln.strip()]
+    assert len(content) <= 9, f"card grew back to {len(content)} content lines:\n{text}"
+    assert len(text.splitlines()) <= 11, "at most two blank separators"
+    for moved in ("Fit Reason", "Matched Skills", "Tailored ATS Resume Bullets",
+                  "LinkedIn Connect Note", "Cold Outreach Draft", "Quick Links",
+                  "Direct Decision Makers"):
+        assert moved not in text, f"{moved!r} belongs on /stage now, not on the card"
 
 
-def test_card_truncates_a_long_fit_reason_with_an_ellipsis(render_card):
-    long_reason = "Strong overlap with your reconciliation work. " * 10
-    text = render_card(reason=long_reason)
-    line = next(ln for ln in text.splitlines() if ln.startswith("<b>Fit Reason:</b>"))
-    body = line[len("<b>Fit Reason:</b> "):]
-    assert body.endswith("…")
-    assert len(body) == m.CARD_REASON_CHAR_CAP + 1
-    # A short reason is left exactly as-is, with no stray ellipsis.
-    short = render_card(reason="Owns the ERP queue.")
-    assert "<b>Fit Reason:</b> Owns the ERP queue." in short
-    assert "…" not in short
-
-
-def test_card_keeps_the_blocks_kevin_copies_out_and_the_full_swipe_legend(render_card):
+def test_card_carries_only_apply_and_the_full_card_link(render_card):
+    """Apply stays inline - it is tapped on nearly every card and should not cost a round trip
+    through a sleeping free-tier service. The five research dorks moved to /stage."""
     text = render_card()
-    assert "4f21c0de-7a9b-4c31-9f0e-2b8d6a11c7e4" in text and "Pipeline_Candidates" in text
+    assert text.count("<a href=") == 2
+    assert html.escape(_CARD_JOB["job_apply_link"], quote=True) in text
+    for moved_url in (m.build_apollo_url("Atwell"), m.build_linkedin_url("Atwell"),
+                      m.build_alumni_dork("Atwell"), m.build_recruiter_dork("Atwell"),
+                      m.build_hiring_manager_dork("Atwell", _CARD_JOB["job_title"])):
+        assert html.escape(moved_url, quote=True) not in text
+
+
+def test_full_card_link_is_an_absolute_url_carrying_the_track(render_card):
+    """A bare /stage/<id> href is inert inside a Telegram message - it needs a scheme and host."""
+    text = render_card(job={**_CARD_JOB, "track": "c"})
+    line = next(ln for ln in text.splitlines() if "Full Card" in ln)
+    url = re.search(r"href='([^']+)'", line).group(1)
+    assert url.startswith(("http://", "https://")), url
+    assert url == f"{m.BASE_URL}/stage/a1b2c3d4e5f6?track=c"
+    # Missing track falls back to the same default filter_ats_bullets uses.
+    assert "?track=a" in render_card()
+
+
+def test_card_keeps_the_swipe_reply_anchors_and_the_bare_command_list(render_card):
+    """resolve_reply_mapping() recovers a lost mapping from the 🆔 marker, then from the
+    💼/🏢 markers - so those three survive the trim even though the legend text did not."""
+    text = render_card()
+    assert m._parse_sheet_uuid_from_card_text(text) == (
+        "4f21c0de-7a9b-4c31-9f0e-2b8d6a11c7e4", "Pipeline_Candidates")
+    assert m._parse_company_title_from_card_text(text) == ("Atwell", _CARD_JOB["job_title"])
     assert "🎓 <b>Alumni:</b> 3 grads in Ops at Atwell" in text
-    for block in ("LinkedIn Connect Note", "Tailored ATS Resume Bullets", "Cold Outreach Draft",
-                  "Target (tap to copy)"):
-        assert block in text
-    for command in ("/apply", "/draft", "/warm", "/cold", "/x", "/f &lt;days&gt;",
-                    "/n &lt;note&gt;", "/e &lt;email&gt;", "/eh"):
+    for command in ("/apply", "/draft", "/warm", "/cold", "/x", "/f", "/n", "/e", "/eh", "/help"):
         assert f"<code>{command}</code>" in text
+    # The per-command descriptions live in /help now, not on every card.
+    assert "Mark Applied" not in text and "Swipe Actions" not in text
+
+
+def test_card_omits_the_alumni_line_entirely_when_there_is_no_alum(render_card):
+    with_alum = render_card()
+    without = render_card(alumni_line="")
+    assert len(with_alum.splitlines()) - len(without.splitlines()) == 1
+    assert "\n\n\n" not in without
 
 
 def test_card_escapes_interpolated_values_and_respects_the_telegram_length_cap(render_card):
@@ -721,8 +739,70 @@ def test_card_escapes_interpolated_values_and_respects_the_telegram_length_cap(r
     # Only the tags this card builds itself survive as raw markup.
     assert "<Sons>" not in text and "<negotiable>" not in text
 
-    long_card = render_card(outreach_email="x" * 4000, ats_bullets=["y" * 600] * 5)
+    long_card = render_card(job={**_CARD_JOB, "job_title": "z" * 5000})
     assert len(long_card) <= 3990
+
+
+# ---- /stage: the page the card's Full Card link points at ----
+
+
+@pytest.fixture
+def staged_job():
+    """Caches a job the way process_single_candidate() does and returns the rendered /stage HTML."""
+    job = dict(
+        _CARD_JOB,
+        track="a", bullet_indices=[0], tone_mode="conservative",
+        linkedin_template_id=0, outreach_template_id=0,
+        fit_reason="Owns the ERP integration queue and reports into the COO.",
+        matched_skills=["process automation", "erp"], fit_score=87,
+    )
+    m.save_job_to_cache("stage001", job)
+    with m.app.test_client() as client:
+        return client.get("/stage/stage001").get_data(as_text=True), job
+
+
+def test_stage_page_carries_every_block_the_card_dropped(staged_job):
+    page, job = staged_job
+    linkedin_note, outreach_email = m.resolve_outreach_copy(job)
+    assert linkedin_note and outreach_email, "both templates should resolve from the local banks"
+    assert html.escape(linkedin_note) in page
+    assert html.escape(outreach_email) in page
+    assert html.escape(job["fit_reason"]) in page
+    assert "Process Automation, Erp" in page
+    assert "87/100" in page
+    for url in (m.build_apollo_url("Atwell"), m.build_linkedin_url("Atwell"),
+                m.build_alumni_dork("Atwell"), m.build_recruiter_dork("Atwell"),
+                m.build_hiring_manager_dork("Atwell", _CARD_JOB["job_title"])):
+        assert html.escape(url, quote=True) in page
+
+
+def test_stage_page_copy_buttons_share_one_js_helper(staged_job):
+    page, _ = staged_job
+    for element_id in ("linkedin-note", "cold-draft", "ats-raw-text"):
+        assert f'id="{element_id}"' in page
+        assert f"copyField('{element_id}')" in page
+    assert page.count("function copyField") == 1
+
+
+def test_stage_page_degrades_for_a_job_cached_before_template_ids_were_persisted(staged_job):
+    """Older cache rows have no linkedin_template_id, and resolve_template_text() bounds-checks a
+    missing id down to template 0 rather than blowing up - so the page still renders real copy."""
+    legacy = {k: v for k, v in _CARD_JOB.items()}
+    note, draft = m.resolve_outreach_copy(legacy)
+    pool = m.load_linkedin_templates().get("linkedin_templates", [])
+    assert note and draft
+    assert note == m.sanitize_text(m.interpolate_template(
+        pool[0], name="there", company="Atwell", job_title=_CARD_JOB["job_title"]))[:300]
+
+
+def test_stage_page_escapes_a_company_name_carrying_markup():
+    m.save_job_to_cache("stage002", {**_CARD_JOB, "employer_name": "Smith & <Sons>",
+                                     "track": "a", "fit_reason": "Reports to <COO> & CFO"})
+    with m.app.test_client() as client:
+        page = client.get("/stage/stage002").get_data(as_text=True)
+    assert "Smith &amp; &lt;Sons&gt;" in page
+    assert "Reports to &lt;COO&gt; &amp; CFO" in page
+    assert "<Sons>" not in page and "<COO>" not in page
 
 
 # ---- Overdue digest: unscheduled records, the sentinel, and the 10-record cap ----
