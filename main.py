@@ -26,7 +26,7 @@ from pipeline_utils import (
     generate_dedup_hash, generate_short_key, parse_posted_hours, get_age_badge,
     extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall,
     derive_job_source, is_unverified_email, status_rank, STATUS_VOCAB,
-    followup_action, followup_anchor,
+    followup_action, followup_anchor, is_followup_unscheduled,
     lint_outreach_template, advise_outreach_template,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
 )
@@ -2915,6 +2915,66 @@ def start_backup_scheduler():
     )
     logging.info("[BACKUP] Weekly SQLite backup scheduled: Sundays 03:00 local")
 
+# The morning digest previews only the most overdue handful and points at /overdue for the
+# rest. Kevin was getting 100+ lines split across several Telegram messages before he had
+# had coffee, which is the same as getting none of them.
+OVERDUE_DIGEST_PREVIEW_LIMIT = 10
+
+# Telegram hard-caps a message at 4096 chars; this is the existing safety margin.
+TELEGRAM_CHUNK_CHARS = 3900
+
+def format_followup_due(value):
+    """The 'due' cell of one digest line, with Code.gs's blank-date sentinel translated back.
+
+    get_overdue_followups() already drops unscheduled records, so in the normal path this
+    never fires - it is the second line of defence that keeps a literal 'due 1970-01-01'
+    (which is what Kevin saw on every line) out of the UI for any other caller.
+    """
+    return "no date set" if is_followup_unscheduled(value) else str(value)
+
+def render_overdue_lines(overdue):
+    """One HTML-escaped '• <b>Company</b> - Name | Tab | due X' line per overdue record."""
+    lines = []
+    for record in overdue:
+        tab = html.escape(str(record.get("sheet_tab") or "Unknown"))
+        company = html.escape(str(record.get("company") or "N/A"))
+        name = html.escape(str(record.get("name") or ""))
+        due = html.escape(format_followup_due(record.get("next_followup")))
+        lines.append(f"• <b>{company}</b>{f' - {name}' if name else ''} | {tab} | due {due}")
+    return lines
+
+def send_overdue_digest(chat_id, overdue, limit=OVERDUE_DIGEST_PREVIEW_LIMIT):
+    """Send the overdue list to Telegram, chunked to stay under the message size cap.
+
+    limit=None sends everything (that is /overdue); an integer limit sends the N most overdue
+    followed by a pointer to /overdue for the remainder (that is the morning digest). Records
+    arrive next_followup ASC, so the head of the list is the most overdue.
+    """
+    if not overdue:
+        send_telegram_message(chat_id, "✅ <b>No overdue records.</b> Nothing is past its follow-up date.")
+        return
+
+    shown = overdue if limit is None else overdue[:limit]
+    if limit is None:
+        lines = [f"⚠️ <b>All Overdue Records ({len(overdue)}, next follow-up ASC):</b>"]
+    else:
+        lines = [f"⚠️ <b>Most Overdue ({len(shown)} of {len(overdue)}, next follow-up ASC):</b>"]
+    lines.extend(render_overdue_lines(shown))
+    remaining = len(overdue) - len(shown)
+    if remaining > 0:
+        lines.append(f"<i>...and {remaining} more.</i> <code>/overdue</code> for the full list.")
+
+    # Chunked rather than truncated: the capped preview always fits in one message, and
+    # /overdue must not silently drop the tail of a long list.
+    chunk = ""
+    for line in lines:
+        if chunk and len(chunk) + len(line) + 1 > TELEGRAM_CHUNK_CHARS:
+            send_telegram_message(chat_id, chunk)
+            chunk = ""
+        chunk = f"{chunk}\n{line}".strip()
+    if chunk:
+        send_telegram_message(chat_id, chunk)
+
 def send_tuesday_pipeline_executive_hub(chat_id):
     """Send Tuesday's weekly operations hub and all overdue records in Telegram-safe chunks."""
     weekly = get_rolling_metric_counts(days=7)
@@ -2934,29 +2994,14 @@ def send_tuesday_pipeline_executive_hub(chat_id):
         f"• Hunter.io: {api_usage['hunter']} | Prospeo: {api_usage['prospeo']} | GetProspect: {api_usage['getprospect']} (month-to-date local calls)\n\n"
         f"⚠️ <b>Overdue:</b> {len(overdue)} records\n"
         f"<code>/sendall</code> Draft bumps + set all eligible records to +14d\n"
-        f"<code>/snoozeall 7</code> Move all overdue follow-ups by N days"
+        f"<code>/snoozeall 7</code> Move all overdue follow-ups by N days\n"
+        f"<code>/overdue</code> Full overdue list on demand"
     )
     send_telegram_message(chat_id, hub)
     send_telegram_message(chat_id, format_outcome_metrics_message())
     if not overdue:
         return
-
-    lines = ["⚠️ <b>All Overdue Records (next follow-up ASC):</b>"]
-    for record in overdue:
-        tab = html.escape(record.get("sheet_tab") or "Unknown")
-        company = html.escape(str(record.get("company") or "N/A"))
-        name = html.escape(str(record.get("name") or ""))
-        due = html.escape(str(record.get("next_followup") or "N/A"))
-        lines.append(f"• <b>{company}</b>{f' - {name}' if name else ''} | {tab} | due {due}")
-
-    chunk = ""
-    for line in lines:
-        if chunk and len(chunk) + len(line) + 1 > 3900:
-            send_telegram_message(chat_id, chunk)
-            chunk = ""
-        chunk = f"{chunk}\n{line}".strip()
-    if chunk:
-        send_telegram_message(chat_id, chunk)
+    send_overdue_digest(chat_id, overdue)
 
 def send_daily_standup(chat_id):
     """Send the compact 08:30 standup used on every non-Tuesday morning."""
@@ -3112,13 +3157,25 @@ def fetch_networking_cards(target_code="CW", qty=2):
     return []
 
 def get_overdue_followups():
-    """Return every overdue Carmen Warm and Tetiana Cold record sorted by next_followup ASC."""
+    """Return every overdue Carmen Warm and Tetiana Cold record sorted by next_followup ASC.
+
+    UNSCHEDULED RECORDS ARE NOT OVERDUE. Code.gs's formatFollowupDate() turns a blank Next
+    Followup Date cell into the string "1970-01-01" so its own overdue sort never feeds NaN
+    to `new Date(...)`. That sentinel is <= today, so every undated row used to land here and
+    sort to the very front - and since Carmen Warm is personal contacts that are almost never
+    dated, Kevin's entire warm network showed up as maximally overdue every morning.
+
+    This is also what /sendall and /snoozeall iterate (process_overdue_batch), so the filter
+    additionally stops those from drafting bump emails to rows that were never scheduled.
+    """
     today_str = datetime.now().strftime("%Y-%m-%d")
     overdue = []
     for target_code, tab_name in (("CW", "Carmen Warm"), ("TC", "Tetiana Cold")):
         for record in fetch_networking_cards(target_code, qty=None):
             next_followup = str(record.get("next_followup") or "")
-            if next_followup and next_followup <= today_str:
+            if is_followup_unscheduled(next_followup):
+                continue
+            if next_followup <= today_str:
                 overdue.append({**record, "sheet_tab": tab_name})
     return sorted(overdue, key=lambda record: str(record.get("next_followup") or ""))
 
@@ -4296,6 +4353,12 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, render_followup_needs_card(result, on_demand=True))
             return
 
+        if text == "/overdue":
+            # The full list the Tuesday hub used to push unrequested every week. Same lines,
+            # same chunking - it just arrives when Kevin asks for it.
+            send_overdue_digest(chat_id, get_overdue_followups(), limit=None)
+            return
+
         if text == "/outcomes":
             send_telegram_message(chat_id, format_outcome_metrics_message())
             return
@@ -4789,7 +4852,8 @@ def process_webhook_payload_async(data):
                 "/letter - Generate cover letter\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
-                "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n\n"
+                "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"
+                "/overdue - Full overdue list (the morning digest shows only the 10 most overdue)\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
