@@ -632,3 +632,21 @@ def test_generators_use_the_contact_name_when_one_is_known():
     # The retired "there" sentinel degrades to a bare "Hi," instead of reappearing as "Hi there,".
     assert m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, contact_name="there").startswith("Hi,")
 
+
+
+# ---- Unscheduled vs. overdue: Code.gs's blank-date sentinel ----
+
+def test_is_followup_unscheduled_treats_blank_and_the_sentinel_as_unset():
+    # Code.gs coerces a blank Next Followup Date cell to "1970-01-01" so its own overdue
+    # sort never feeds NaN to new Date(). Python has to translate it back, or every undated
+    # row reads as maximally overdue.
+    assert pu.is_followup_unscheduled("") is True
+    assert pu.is_followup_unscheduled(None) is True
+    assert pu.is_followup_unscheduled("   ") is True
+    assert pu.is_followup_unscheduled(pu.FOLLOWUP_BLANK_DATE_SENTINEL) is True
+    assert pu.is_followup_unscheduled("1970-01-01T00:00:00Z") is True  # only the date part is read
+
+
+def test_is_followup_unscheduled_leaves_real_dates_alone():
+    for real in ("2026-08-31", "1970-01-02", "2020-01-01", "1969-12-31"):
+        assert pu.is_followup_unscheduled(real) is False, real

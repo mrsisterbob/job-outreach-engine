@@ -723,3 +723,122 @@ def test_card_escapes_interpolated_values_and_respects_the_telegram_length_cap(r
 
     long_card = render_card(outreach_email="x" * 4000, ats_bullets=["y" * 600] * 5)
     assert len(long_card) <= 3990
+
+
+# ---- Overdue digest: unscheduled records, the sentinel, and the 10-record cap ----
+
+_SENTINEL = "1970-01-01"
+
+
+def _overdue_record(company, next_followup, name=""):
+    return {"sheet_uuid": f"uuid-{company}", "company": company, "name": name,
+            "next_followup": next_followup, "email": f"{company}@example.com"}
+
+
+@pytest.fixture
+def capture_sent(monkeypatch):
+    """Collects every send_telegram_message() body, in order."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    return sent
+
+
+def _mock_followup_tabs(monkeypatch, cw=(), tc=()):
+    by_code = {"CW": list(cw), "TC": list(tc)}
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda target_code="CW", qty=2: by_code.get(target_code, []))
+
+
+def test_unscheduled_records_are_not_counted_as_overdue(monkeypatch):
+    """The root cause of the 100-line morning digest: Code.gs hands blank Next Followup Date
+    cells back as 1970-01-01, which is <= today, so Kevin's whole undated warm network sorted
+    to the front of the overdue list as maximally late."""
+    _mock_followup_tabs(
+        monkeypatch,
+        cw=[_overdue_record("mom", _SENTINEL),
+            _overdue_record("cousin", ""),
+            _overdue_record("Atwell", "2020-01-01")],
+        tc=[_overdue_record("Stellantis", "2020-06-01")],
+    )
+    overdue = m.get_overdue_followups()
+    assert [r["company"] for r in overdue] == ["Atwell", "Stellantis"]
+    assert _SENTINEL not in {r["next_followup"] for r in overdue}
+
+
+def test_future_dated_records_are_still_excluded_and_most_overdue_sorts_first(monkeypatch):
+    _mock_followup_tabs(monkeypatch, cw=[
+        _overdue_record("Later", "2099-01-01"),
+        _overdue_record("Older", "2019-01-01"),
+        _overdue_record("Newer", "2021-01-01"),
+    ])
+    assert [r["company"] for r in m.get_overdue_followups()] == ["Older", "Newer"]
+
+
+def test_digest_renders_the_blank_date_sentinel_as_no_date_set(capture_sent):
+    """Second line of defence. get_overdue_followups() drops these, but nothing should ever
+    put a literal 'due 1970-01-01' in front of Kevin again."""
+    records = [
+        {**_overdue_record("Atwell", _SENTINEL), "sheet_tab": "Carmen Warm"},
+        {**_overdue_record("Stellantis", ""), "sheet_tab": "Tetiana Cold"},
+        {**_overdue_record("Recourse", "2020-01-01"), "sheet_tab": "Carmen Warm"},
+    ]
+    m.send_overdue_digest(1, records)
+    body = "\n".join(capture_sent)
+    assert _SENTINEL not in body
+    assert body.count("due no date set") == 2
+    assert "due 2020-01-01" in body
+
+
+def test_digest_caps_at_ten_records_and_points_at_the_overdue_command(capture_sent):
+    records = [{**_overdue_record(f"Company{i:02d}", f"2020-01-{i + 1:02d}"), "sheet_tab": "Carmen Warm"}
+               for i in range(37)]
+    m.send_overdue_digest(1, records)
+
+    assert len(capture_sent) == 1, "the capped preview must be a single message"
+    body = capture_sent[0]
+    assert m.OVERDUE_DIGEST_PREVIEW_LIMIT == 10
+    assert body.count("• <b>") == 10
+    assert "Most Overdue (10 of 37" in body
+    assert "...and 27 more." in body and "<code>/overdue</code>" in body
+    # The ten shown are the ten most overdue; the 11th is not among them.
+    assert "Company00" in body and "Company09" in body and "Company10" not in body
+
+
+def test_digest_omits_the_more_line_when_everything_fits(capture_sent):
+    records = [{**_overdue_record(f"C{i}", "2020-01-01"), "sheet_tab": "Carmen Warm"} for i in range(4)]
+    m.send_overdue_digest(1, records)
+    assert "more." not in capture_sent[0]
+    assert "Most Overdue (4 of 4" in capture_sent[0]
+
+
+def test_digest_escapes_company_and_name_for_html_parse_mode(capture_sent):
+    """A stray < or & in a CRM cell breaks Telegram's HTML parse and the whole message fails
+    to deliver, not just render oddly."""
+    records = [{**_overdue_record("Smith & <Sons>", "2020-01-01", name="A <b>hack</b>"),
+                "sheet_tab": "Carmen & Warm"}]
+    m.send_overdue_digest(1, records)
+    body = capture_sent[0]
+    assert "Smith &amp; &lt;Sons&gt;" in body
+    assert "A &lt;b&gt;hack&lt;/b&gt;" in body
+    assert "Carmen &amp; Warm" in body
+
+
+def test_overdue_command_sends_the_full_list_chunked(monkeypatch, capture_sent):
+    _mock_followup_tabs(monkeypatch, cw=[
+        _overdue_record(f"Company{i:03d}", f"2020-01-{(i % 28) + 1:02d}") for i in range(120)
+    ])
+    _dispatch("/overdue")
+
+    body = "\n".join(capture_sent)
+    assert len(capture_sent) > 1, "120 records should not fit in one Telegram message"
+    assert all(len(chunk) <= m.TELEGRAM_CHUNK_CHARS for chunk in capture_sent)
+    assert body.count("• <b>") == 120, "the full list must not drop the tail"
+    assert "more." not in body  # uncapped, so no pointer back to itself
+    assert "All Overdue Records (120" in body
+
+
+def test_overdue_command_reports_an_empty_list_instead_of_going_silent(monkeypatch, capture_sent):
+    _mock_followup_tabs(monkeypatch)
+    _dispatch("/overdue")
+    assert len(capture_sent) == 1
+    assert "No overdue records" in capture_sent[0]

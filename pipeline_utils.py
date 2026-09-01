@@ -194,15 +194,28 @@ STALE_HOT_DAYS = 5        # Replied/Screening/Interviewing untouched > 5d -> sta
 FOLLOWUP_ACTIONS = ("none", "send_followup_1", "send_followup_2", "bury_ghosted", "stale_nudge")
 
 # Code.gs's get_followups read path emits this for a blank Next Followup Date cell
-# (see formatFollowupDate); treat it as "unset", not as a real 1970 date.
-_FOLLOWUP_BLANK_DATE_SENTINEL = "1970-01-01"
+# (see formatFollowupDate); treat it as "unset", not as a real 1970 date. The coercion is
+# load-bearing on the Apps Script side - it keeps `new Date(...)` in the overdue sort from
+# returning NaN on an empty string - so Python is where it has to be translated back.
+FOLLOWUP_BLANK_DATE_SENTINEL = "1970-01-01"
+
+
+def is_followup_unscheduled(value):
+    """True when a Next Followup Date is blank or carries Code.gs's blank-date sentinel.
+
+    An unscheduled record is NOT overdue - it was never given a date to be late against.
+    Carmen Warm is personal networking contacts and almost none of them are dated, so
+    reading the sentinel as a real 1970 due date flagged that whole tab as permanently
+    overdue and buried the handful of records that were genuinely due.
+    """
+    return str(value or "").strip()[:10] in ("", FOLLOWUP_BLANK_DATE_SENTINEL)
 
 
 def _parse_sequencer_date(value):
     """Lenient 'YYYY-MM-DD' -> datetime.date, or None for blank / the blank-date sentinel /
     anything unparseable. Only the first 10 chars are read, so an ISO datetime works too."""
     text = str(value or "").strip()[:10]
-    if not text or text == _FOLLOWUP_BLANK_DATE_SENTINEL:
+    if is_followup_unscheduled(text):
         return None
     try:
         return datetime.strptime(text, "%Y-%m-%d").date()
