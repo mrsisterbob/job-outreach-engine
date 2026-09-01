@@ -404,6 +404,67 @@ def advise_outreach_template(text, kind="email"):
     return notes
 
 
+# ==============================================================================
+# ATS AUTO-EXPANSION NAME GUARD (pure, no I/O)
+#
+# The Carmen Warm CRM holds personal networking contacts, not companies: the Company
+# column really does contain "mom", "cousin", "Nathan at speaker event" and pasted
+# LinkedIn profile URLs. auto_expand_ats_slug() probes Greenhouse, Lever and Ashby in
+# sequence at up to 8s each, so every one of those costs 24 seconds and three log lines
+# for a match that cannot exist.
+#
+# The two errors are not symmetric, so this guard is deliberately eager: a false skip
+# loses one auto-discovered board, which Kevin can add by hand; a false probe costs 24
+# seconds of pipeline time on every run, forever.
+# ==============================================================================
+
+# Rejected only as the WHOLE name, so the real company "Guy Carpenter" is still probed.
+_NON_COMPANY_PERSON_WORDS = frozenset({
+    "mom", "dad", "grandma", "grandpa", "cousin", "uncle", "aunt", "guy", "friend", "buddy",
+})
+
+# A pasted profile/company URL slugs into something meaningless ("httpswwwlinkedincomin...").
+_NON_COMPANY_URL_MARKERS = ("http", "linkedin.com", "www.")
+
+# Note text Kevin typed into the Company cell rather than a name. The connectives are
+# space-padded so they match "Nathan at speaker event" but not "Atwell" or "Whom".
+_NON_COMPANY_NOTE_MARKERS = ("?", "/", " at ", " from ", " who ")
+
+# Below this, the slug is too short to be a real board (and covers blank/punctuation-only).
+ATS_MIN_SLUG_LENGTH = 3
+
+
+def ats_slug_guess(company_name):
+    """The lowercase alphanumeric board slug auto_expand_ats_slug() probes for a company."""
+    return re.sub(r"[^a-z0-9]", "", str(company_name or "").lower())
+
+
+def is_probable_company_name(name):
+    """False when a Carmen Warm 'company' is obviously a person or a note, not a company.
+
+    Callers should treat False as "do not spend HTTP requests on this", never as a hard
+    assertion about the string. See the block comment above for why this errs toward skipping.
+    """
+    text = str(name or "").strip()
+
+    if len(ats_slug_guess(text)) < ATS_MIN_SLUG_LENGTH:
+        return False
+
+    lowered = text.lower()
+    if any(marker in lowered for marker in _NON_COMPANY_URL_MARKERS):
+        return False
+    if lowered in _NON_COMPANY_PERSON_WORDS:
+        return False
+    # Real company names are capitalized; "cousin" and "(fuck)" are not. This is the rule
+    # that catches lowercase junk no keyword list could enumerate.
+    if not any(char.isupper() for char in text):
+        return False
+    if any(marker in lowered for marker in _NON_COMPANY_NOTE_MARKERS):
+        return False
+
+    return True
+
+
 def generate_short_key(raw_id, fallback=None):
     """fallback replaces time.time() as the entropy source when raw_id is falsy, keeping this pure."""
     return hashlib.md5(str(raw_id or fallback or "0").encode()).hexdigest()[:12]
