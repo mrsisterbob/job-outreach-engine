@@ -14,7 +14,7 @@ import re
 import sqlite3
 import tempfile
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from email import message_from_bytes
 
 import pytest
@@ -1180,3 +1180,110 @@ def test_ghost_penalty_still_bites_when_layer1_bonus_is_large(run_candidate, mon
     # positives cap to 30 -> clamp(80+30)=100, then ghost -15 -> 85
     assert result["score"] == 85
     assert result["score_boost"] == -15
+
+
+# ---- Carmen Cold as the hot seat: inbound-reply routing (route_inbound_reply_to_crm) ----
+
+@pytest.fixture
+def reply_routing(monkeypatch):
+    """Silences route_inbound_reply_to_crm's side effects (activity log, background ATS probe
+    thread) and hands back a reader for whatever it actually enqueued onto the CRM outbox."""
+    expanded = []
+    monkeypatch.setattr(m, "log_daily_activity", lambda *a, **k: None)
+
+    class _FakeThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            self._args = args
+
+        def start(self):
+            expanded.append(self._args[0])
+
+    monkeypatch.setattr(m.threading, "Thread", _FakeThread)
+
+    def read_outbox():
+        with m.get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM crm_outbox ORDER BY id ASC"
+            ).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    read_outbox.ats_expansions = expanded
+    return read_outbox
+
+
+def _match(tab, sheet_uuid="uuid-1", company="Acme Co", name="Dana Reyes"):
+    return {"name": name, "company": company, "tab": tab, "sheet_uuid": sheet_uuid}
+
+
+def _expected_followup():
+    return (date.today() + timedelta(days=m.REPLY_FOLLOWUP_DAYS)).strftime("%Y-%m-%d")
+
+
+def test_general_reply_from_tetiana_moves_to_carmen_cold_with_note_and_bump(reply_routing):
+    """A live human conversation that started in the job pipeline becomes a Carmen Cold row."""
+    m.route_inbound_reply_to_crm(
+        _match("Tetiana Cold"), "GENERAL",
+        "Re: Data Analyst role", "Happy to chat - are you free Thursday?",
+    )
+    payloads = reply_routing()
+    assert [p["action"] for p in payloads] == ["update_status", "update_snooze", "append_note"]
+
+    move, snooze, note = payloads
+    # The move reuses /warm's exact mechanism - no new CRM action was invented.
+    assert move["new_tab"] == "Carmen Cold"
+    assert move["sheet_uuid"] == "uuid-1"
+    assert snooze["next_followup"] == _expected_followup()
+    # Kevin asked for "the date and notes of the next follow up too".
+    assert note["note"].startswith(f"[{date.today().strftime('%Y-%m-%d')}]")
+    assert "Inbound reply" in note["note"]
+    assert "Re: Data Analyst role" in note["note"]
+    assert "free Thursday" in note["note"]
+    assert "Auto-moved to Carmen Cold from Tetiana Cold" in note["note"]
+    assert _expected_followup() in note["note"]
+
+
+def test_general_reply_already_in_carmen_skips_the_redundant_move(reply_routing):
+    """Already in the hot seat: note + bump only, never a move onto the tab it already occupies."""
+    m.route_inbound_reply_to_crm(
+        _match("Carmen Warm"), "GENERAL", "Re: coffee", "Great catching up last week.",
+    )
+    payloads = reply_routing()
+    assert [p["action"] for p in payloads] == ["update_snooze", "append_note"]
+    assert not any(p["action"] == "update_status" for p in payloads)
+    # No move happened, so the note must not claim one did.
+    assert "Auto-moved" not in payloads[1]["note"]
+    assert reply_routing.ats_expansions == []
+
+
+@pytest.mark.parametrize("origin_tab", ["Tetiana Cold", "Tetiana Warm", "Clavicular",
+                                        "Pipeline_Candidates", "Carmen Cold"])
+@pytest.mark.parametrize("status_label", ["INTERVIEW_SET", "REJECTION"])
+def test_job_status_replies_bump_but_never_move_to_carmen(reply_routing, origin_tab, status_label):
+    """"Tetiana is only jobs": an application-outcome event stays in its origin tab."""
+    m.route_inbound_reply_to_crm(
+        _match(origin_tab), status_label, "Re: your application", "Unfortunately we are moving on.",
+    )
+    payloads = reply_routing()
+    assert [p["action"] for p in payloads] == ["update_snooze"]
+    assert payloads[0]["next_followup"] == _expected_followup()
+    assert not any(p.get("new_tab") for p in payloads)
+    assert reply_routing.ats_expansions == []
+
+
+def test_general_reply_fires_ats_expansion_for_the_replying_company(reply_routing):
+    """Same side effect /warm fires on any move landing in a Carmen tab."""
+    m.route_inbound_reply_to_crm(
+        _match("Tetiana Cold", company="Guy Carpenter"), "GENERAL", "Re: hello", "Let's talk.",
+    )
+    assert reply_routing.ats_expansions == ["Guy Carpenter"]
+
+
+def test_reply_routing_writes_nothing_without_a_sheet_uuid(reply_routing):
+    """A CRM match with no usable row id must not enqueue an unaddressable write."""
+    m.route_inbound_reply_to_crm(_match("Tetiana Cold", sheet_uuid=""), "GENERAL", "Re: hi", "Hello")
+    assert reply_routing() == []
+
+
+def test_every_reply_payload_carries_the_standard_row_operation_order(reply_routing):
+    m.route_inbound_reply_to_crm(_match("Tetiana Cold"), "GENERAL", "Re: hi", "Hello there")
+    assert all(p["rowOperationOrder"] == "DESC" for p in reply_routing())

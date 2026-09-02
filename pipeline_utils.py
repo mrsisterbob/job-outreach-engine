@@ -190,6 +190,12 @@ FOLLOWUP_2_DAYS = 9       # Applied + no reply -> follow-up #2 becomes due at an
 FOLLOWUP_BURY_DAYS = 16   # Applied + no reply -> auto-bury as ghosted at anchor + 16d
 STALE_HOT_DAYS = 5        # Replied/Screening/Interviewing untouched > 5d -> stale_nudge
 
+# Fifth knob, counted from *today* rather than from followup_anchor(): when a verified inbound
+# reply lands (main.check_inbound_gmail_replies), Next Followup Date is pushed to today + this
+# many days. A live thread deserves a tighter loop than the anchor-based cadence above, so this
+# is independent of the four constraints listed there - it only has to stay positive.
+REPLY_FOLLOWUP_DAYS = 4   # Any verified inbound reply -> Next Followup Date = today + 4d
+
 # Every value followup_action() can return.
 FOLLOWUP_ACTIONS = ("none", "send_followup_1", "send_followup_2", "bury_ghosted", "stale_nudge")
 

@@ -30,6 +30,7 @@ from pipeline_utils import (
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
+    REPLY_FOLLOWUP_DAYS,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -2791,6 +2792,80 @@ def passes_email_prefilter(sender: str, subject: str, snippet: str, internal_dat
 
     return True, ""
 
+def route_inbound_reply_to_crm(crm_match, status_label, subject, snippet):
+    """Carmen Cold is the hot seat: every verified inbound reply gets its follow-up pulled in, and a
+    live human conversation additionally gets its contact moved into Carmen Cold with a dated note.
+
+    Called only after BOTH anti-spam gates have already passed (pre-filter shield + CRM whitelist),
+    so every sender reaching here is a known contact who actually wrote back. Two behaviors:
+
+      1. Always (GENERAL / INTERVIEW_SET / REJECTION alike): push Next Followup Date to
+         today + REPLY_FOLLOWUP_DAYS. Any reply is a reason to check back in soon.
+      2. GENERAL only: move the contact into "Carmen Cold" (unless it already lives in a
+         Carmen-family tab) and append a dated note recording the exchange.
+
+    The GENERAL/INTERVIEW_SET/REJECTION split is the line that matters, not the contact's origin
+    tab. INTERVIEW_SET and REJECTION are job-application *status* events - an ATS or recruiter
+    reporting the outcome of one application - which is Tetiana's pipeline, so those rows stay put.
+    GENERAL is what survives the no-reply@ blacklist without looking like a status change: a real
+    person mid-conversation. That belongs in Carmen regardless of which tab first generated it.
+
+    Every write goes through the durable outbox, which drains FIFO (ORDER BY id ASC), so the move
+    is enqueued first and the note/date writes land on the row in its new home. Returns the list of
+    enqueued payloads (for logging and tests); returns [] when there is no usable sheet_uuid.
+    """
+    sheet_uuid = str(crm_match.get("sheet_uuid") or "").strip()
+    if not sheet_uuid:
+        logging.info("[REPLY ROUTING] No sheet_uuid on the CRM match - skipping CRM writes")
+        return []
+
+    source_tab = str(crm_match.get("tab") or "")
+    company = str(crm_match.get("company") or "").strip()
+    # Same Carmen-family test resolve_smart_target_tab uses for /warm, /cold and /x.
+    is_carmen = source_tab.startswith("Carmen")
+    is_conversation = status_label == "GENERAL"
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    payloads = []
+
+    # Move first so the note and the follow-up date land on the row after it has been transposed
+    # into the PEOPLE schema. Reuses /warm's exact mechanism - no new CRM action.
+    if is_conversation and not is_carmen:
+        payloads.append(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Carmen Cold"))
+        # Same side effect the /warm and /cold handlers fire on any move landing in a Carmen tab:
+        # a company Kevin is now actively talking to is worth sourcing future /t runs from.
+        # auto_expand_ats_slug self-guards on is_probable_company_name, so a personal-contact
+        # "company" is skipped before any board probe.
+        if company:
+            threading.Thread(target=auto_expand_ats_slug, args=(company,), daemon=True).start()
+
+    # Part 1: every verified reply pulls the follow-up in. update_snooze writes Column G in place
+    # (never a tab move) - the same action /f uses.
+    next_followup = (datetime.now() + timedelta(days=REPLY_FOLLOWUP_DAYS)).strftime("%Y-%m-%d")
+    payloads.append(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=next_followup))
+
+    if is_conversation:
+        # Kevin asked for "the date and notes of the next follow up too" - reuses the subject and
+        # snippet already pulled for the Telegram alert rather than refetching the message.
+        clean_subject = " ".join(str(subject or "(No Subject)").split())[:120]
+        clean_snippet = " ".join(str(snippet or "").split())[:200]
+        move_clause = "" if is_carmen else f" Auto-moved to Carmen Cold from {source_tab or 'Unknown'}."
+        note = (
+            f"[{today_str}] Inbound reply received (they wrote to Kevin, not a send). "
+            f"Subject: {clean_subject}. Preview: {clean_snippet}"
+            f"{move_clause} Next follow-up {next_followup}."
+        )
+        payloads.append(build_crm_payload("append_note", sheet_uuid=sheet_uuid, note=note))
+
+    for payload in payloads:
+        enqueue_crm_payload(payload)
+    if is_conversation:
+        log_daily_activity("notes_logged")
+    logging.info(
+        f"[REPLY ROUTING] {status_label} reply from {source_tab or 'Unknown'} -> "
+        f"{[p['action'] for p in payloads]} (next_followup={next_followup})"
+    )
+    return payloads
+
 def check_inbound_gmail_replies():
     """Poll Gmail for unread inbound replies. Zero-tolerance anti-spam gatekeeper:
     1) Runs the 10-parameter pre-filter shield, 2) Requires an exact CRM whitelist match.
@@ -2867,6 +2942,14 @@ def check_inbound_gmail_replies():
                 record_application_outcome(crm_match.get("sheet_uuid"), "interview", company=crm_match.get("company"))
             elif status_label == "REJECTION":
                 record_application_outcome(crm_match.get("sheet_uuid"), "rejection", company=crm_match.get("company"))
+
+            # Follow-up bump for every verified reply; Carmen Cold move + dated note for a live
+            # human conversation (GENERAL). Never changes the alert text below - this is what makes
+            # the *system* treat the thread as a priority, not a second notification.
+            try:
+                route_inbound_reply_to_crm(crm_match, status_label, subject, snippet)
+            except Exception as e:
+                logging.error(f"Inbound Reply CRM Routing Error ({msg_id}): {e}")
 
             alert_msg = (
                 f"📬 <b>New Gmail Reply!</b>\n\n"
