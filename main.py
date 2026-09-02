@@ -62,6 +62,21 @@ JSEARCH_SEMAPHORE = threading.Semaphore(4)  # cap concurrent OpenWebNinja reques
 # 100-Query Rolling Master Engine: one oddball theme per 10-query slice, used to badge wildcard matches
 ODDBALL_KEYWORDS = ["supply chain", "revenue operations", "healthcare", "implementation", "erp", "logistics", "claims", "manufacturing", "cloud operations", "procurement", "transformation"]
 
+# Stacking cap for ALL additive score modifiers combined - Layer 1 (calculate_hybrid_score_modifier
+# keyword/salary bonuses) plus Layer 2 (process_single_candidate alumni/warm/Clavicular boosts) -
+# before they are added to Gemini's raw 1-100 base score. Kevin's sourcing targets are built to
+# trip 2-4 bonus categories at once, so without this the additive layers compound past +60 and
+# erase the separation Gemini's holistic score was drawing (every match pins to the 100 clamp).
+# 30 = "your single best relationship signal counts in full, keyword stacking on top of it does
+# not": one warm/Clavicular referral (+30) or one alum (+20) plus a keyword category survives
+# intact; the 2nd/3rd/4th stacked bonus is what gets trimmed. Modelled against synthetic batches
+# (Gemini base ~N(72,13), bonus-trip rates from the CRM sheet) this roughly halves the share of
+# matches pinned to the 100 clamp vs the raw stack, where +35 barely moved it. Only the upside is
+# capped; negative modifiers (ghost listing, call-volume, out-of-state hub) pass through uncapped.
+# The per-layer min(1, ...)/min(100, ...) clamps stay as a separate safety floor/ceiling. Single
+# tunable knob - raise toward 35 to loosen, drop toward 25 to force more spread.
+BONUS_STACK_CAP = 30
+
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
     openweb_key = os.environ.get("OPENWEBNINJA_KEY")
@@ -1694,7 +1709,13 @@ def calculate_keyword_overlap(job_desc):
     return overlap_pct, matches
 
 def calculate_hybrid_score_modifier(job, base_ai_score):
-    score = base_ai_score
+    """Layer 1 of the additive scoring: keyword/salary modifiers on top of Gemini's holistic base.
+    Returns (final_score, layer1_bonus) where final_score is the clamped 1-100 result (unchanged
+    from before this function grew a second return value) and layer1_bonus is the signed shift
+    this layer applied to base_ai_score, with the remote 90-cap already folded in but the final
+    1-100 clamp not - so a caller can reconstruct final_score as clamp(base_ai_score + layer1_bonus).
+    process_single_candidate needs it to enforce BONUS_STACK_CAP across Layer 1 + Layer 2 together."""
+    bonus = 0
     desc = str(job.get("job_description") or "").lower()
     title = str(job.get("job_title") or "").lower()
     company = str(job.get("employer_name") or "").lower()
@@ -1702,30 +1723,34 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     salary_str, max_sal = extract_salary(job)
     tier1_ecosystem = get_filter("tier1_ecosystem", [])
     if any(k in desc or k in company for k in tier1_ecosystem):
-        score += 10
+        bonus += 10
     if max_sal >= 60000:
-        score += 5
+        bonus += 5
     if any(k in desc for k in ["fintech", "payments", "autotech", "saas", "tokenization", "digital assets", "web3", "trading bot"]):
-        score += 15
+        bonus += 15
     if any(k in desc for k in ["schwab", "fidelity", "docusign", "orion", "salesforce", "python", "sql", "etl"]):
-        score += 10
+        bonus += 10
     if any(k in desc for k in ["high call volume", "outbound calling", "phone queue", "call center", "inbound calls", "dialer"]):
-        score -= 20
+        bonus -= 20
     if any(k in title for k in ["data entry", "admin coordinator", "administrative assistant"]) and max_sal < 60000:
-        score -= 15
+        bonus -= 15
     if "wealth" in desc and not any(k in desc for k in ["python", "sql", "automation", "systems"]):
-        score -= 15
+        bonus -= 15
     is_remote = job.get("job_is_remote", False) or "remote" in desc[:300] or "work from home" in desc[:300]
 
     non_mi_hubs = ["chicago", "new york", "austin", "boston", "dallas", "atlanta", "denver", "seattle", "san francisco", "charlotte", "nyc"]
     valid_cities = get_filter("valid_cities", [])
     # Only penalize on-site/hybrid out-of-state hub roles; remote roles are governed by the 90-point cap
     if not is_remote and any(hub in city or hub in desc[:300] for hub in non_mi_hubs) and not any(c in city for c in valid_cities):
-        score -= 15
+        bonus -= 15
 
+    score = base_ai_score + bonus
     if is_remote:
         score = min(score, 90)
-    return max(1, min(100, score))
+    # Fold the remote 90-cap into the reported shift so (base_ai_score + layer1_bonus) reconstructs
+    # the same pre-1-100-clamp value this function used.
+    layer1_bonus = score - base_ai_score
+    return max(1, min(100, score)), layer1_bonus
 
 def resolve_live_alumni_at_company(company_name, school="Hope College"):
     """JIT alumni resolution: live-queries DuckDuckGo HTML search for a LinkedIn profile ath
@@ -2061,10 +2086,13 @@ def evaluate_job_with_gemini(job):
     Template Engine). Gemini returns ONLY a score/reason plus integer routing keys - never
     prose. On failure/timeout, set score=0 and status 'Evaluation Pending'. Thread-safe with
     timeout handling: DO NOT assign fake scores on failure.
-    Returns (pass_bool, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id).
+    Returns (pass_bool, score, reason, track, tone_mode, bullet_indices, linkedin_template_id,
+    outreach_template_id, layer1_bonus, gemini_base). The last two thread the raw Layer 1 modifier
+    sum and Gemini's un-modified base score through to process_single_candidate so it can cap the
+    Layer 1 + Layer 2 bonus stack (BONUS_STACK_CAP) against the true base.
     """
     if not GEMINI_API_KEY:
-        return True, 75, "Fallback pass (No Key)", "a", "conservative", [0, 1, 2], 0, 0
+        return True, 75, "Fallback pass (No Key)", "a", "conservative", [0, 1, 2], 0, 0, 0, 75
 
     try:
         desc_truncated = str(job.get("job_description") or "")[:1800]
@@ -2078,22 +2106,23 @@ def evaluate_job_with_gemini(job):
                 cleaned_text = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
                 validated = GeminiJobScreenerResponse.model_validate_json(cleaned_text)
 
-                final_score = calculate_hybrid_score_modifier(job, validated.score)
+                final_score, layer1_bonus = calculate_hybrid_score_modifier(job, validated.score)
                 return (
                     (final_score >= 65), final_score, validated.reason, validated.track, validated.tone_mode,
-                    validated.bullet_indices, validated.linkedin_template_id, validated.outreach_template_id
+                    validated.bullet_indices, validated.linkedin_template_id, validated.outreach_template_id,
+                    layer1_bonus, validated.score
                 )
             except Exception as e:
                 logging.error(f"Gemini evaluation JSON parse/validation failure: {e}")
                 # On parse/validation error, return 0 score with Evaluation Pending status
-                return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0
-        
+                return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0, 0, 0
+
         # On API failure/timeout, set score to 0 and status to "Evaluation Pending" (NO fake scores)
-        return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0
+        return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0, 0, 0
     
     except Exception as e:
         logging.error(f"Gemini evaluation exception: {e}")
-        return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0
+        return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0, 0, 0
 
 def generate_interview_prep(company, job_title, job_description=""):
     """3 talking points + 2 reverse questions tailored to a role; safe static fallback if Gemini is unavailable."""
@@ -2271,7 +2300,7 @@ def resolve_outreach_copy(job):
 
 def process_single_candidate(job):
     log_metric_event("ai_screened", source=derive_job_source(job.get("job_id")))
-    ai_pass, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id = evaluate_job_with_gemini(job)
+    ai_pass, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id, layer1_bonus, gemini_base = evaluate_job_with_gemini(job)
     if ai_pass:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
         short_id = generate_short_key(raw_id, fallback=time.time())
@@ -2310,10 +2339,11 @@ def process_single_candidate(job):
         if any(kw in oddball_text for kw in ODDBALL_KEYWORDS):
             age_badge = f"{age_badge} 🎲 [WILDCARD ROLE]"
 
-        # Running total of every point added/subtracted below, reported on the card so a
-        # 100/100 next to a low Skills% reads as "earned via relationship boosts hitting the
-        # 100 clamp" rather than "the score is broken". Nominal per-source amounts, not the
-        # post-clamp delta - matches what a reader would add up from the badges/lines below.
+        # Running total of the Layer 2 points added/subtracted below (ghost penalty, alumni, warm/
+        # Clavicular). Consumed two ways after the walk: (1) folded into the BONUS_STACK_CAP check
+        # alongside Layer 1's bonus, (2) recomputed into the card's (+N) so it shows the capped
+        # relationship delta, not the raw stacked sum. Layer 1's own bonus is NOT in here - it
+        # rides in via layer1_bonus from evaluate_job_with_gemini.
         total_boost = 0
 
         # Ghost Listing Penalty: dock score + badge for reposted/evergreen listings (>3 sightings across >45 days)
@@ -2384,6 +2414,25 @@ def process_single_candidate(job):
                     f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10)</i>\n"
                     f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
                 )
+
+        # ---- Combined bonus stacking cap (Layer 1 + Layer 2) ----
+        # score was walked up incrementally above so the Clavicular raw-score gate (>= 70) and the
+        # per-step min(100, ...) clamps still saw the values they always did. Now recompute the
+        # final score once from Gemini's true base: BONUS_STACK_CAP limits the SUM of every
+        # positive additive bonus (Layer 1 keyword/salary + Layer 2 alumni/warm/Clavicular), then
+        # the negative modifiers (Layer 1 hub/call-volume net, ghost-listing dock) apply on top
+        # uncapped so a bad listing still drops. The inner min(100, ...) mirrors the pre-existing
+        # per-step ceiling: bonuses can't push past 100 before a penalty bites into that headroom.
+        ghost_pen = min(0, penalty)                     # ghost-listing dock (<= 0), already in total_boost
+        l1_pos, l1_neg = max(0, layer1_bonus), min(0, layer1_bonus)
+        l2_pos = total_boost - ghost_pen                # alumni + warm/Clavicular only (>= 0)
+        capped_pos = min(BONUS_STACK_CAP, l1_pos + l2_pos)
+        score = max(1, min(100, min(100, gemini_base + capped_pos) + l1_neg + ghost_pen))
+        # Baseline the card's "(+N)" reconstructs to: Gemini + Layer 1 alone, Layer 1's positive
+        # share already cap-limited, Layer 1 negatives kept. score - total_boost == this value
+        # (clamps permitting), never an inflated phantom from summing raw un-applied boosts.
+        score_before_layer2 = max(1, min(100, min(100, gemini_base + min(BONUS_STACK_CAP, l1_pos)) + l1_neg))
+        total_boost = score - score_before_layer2
 
         # Second write, same sheet_uuid: the fit reason, matched skills and final score are all
         # computed/adjusted below the first save, and /stage is now the only place they are shown.

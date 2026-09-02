@@ -1050,3 +1050,119 @@ def test_auto_expand_keeps_a_successful_match_at_info(monkeypatch, caplog):
     assert saved["ats_company_slugs"] == ["stellantis"]
     assert any("resolved to 'stellantis'" in r.message and r.levelname == "INFO"
                for r in caplog.records)
+
+
+# ==============================================================================
+# Combined bonus stacking cap (BONUS_STACK_CAP) - Layer 1 + Layer 2 together
+# ==============================================================================
+
+
+def test_hybrid_score_modifier_returns_the_signed_layer1_shift(monkeypatch):
+    """calculate_hybrid_score_modifier now returns (final_score, layer1_bonus). layer1_bonus is
+    the signed shift it applied on top of the base (remote 90-cap folded in, final 1-100 clamp
+    not), so process_single_candidate can reconstruct clamp(base + layer1_bonus) and fold the
+    same number into the combined stacking cap."""
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: default if default is not None else [])
+    job = {
+        "job_title": "Operations Analyst",
+        "employer_name": "Acme",
+        "job_description": "Fintech payments platform. Python and SQL automation everywhere.",
+        "job_city": "Detroit",
+        "job_max_salary": 95000,
+    }
+    final_score, layer1_bonus = m.calculate_hybrid_score_modifier(job, 60)
+    # +15 fintech/payments, +10 python/sql, +5 salary>=60k, tier-1 filter empty -> +30
+    assert layer1_bonus == 30
+    assert final_score == 90
+
+    penal = {
+        "job_title": "Customer Service Rep",
+        "employer_name": "Acme",
+        "job_description": "High call volume. Inbound calls all day on the dialer queue.",
+        "job_city": "Detroit",
+    }
+    fs2, b2 = m.calculate_hybrid_score_modifier(penal, 80)
+    assert b2 == -20 and fs2 == 60  # negative Layer-1 modifier reported straight through
+
+
+@pytest.fixture
+def run_candidate(monkeypatch):
+    """Drive process_single_candidate with the scoring math live and every network/IO edge stubbed.
+    run_candidate(gemini_base=.., layer1_bonus=..) returns the result dict."""
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: default if default is not None else [])
+    monkeypatch.setattr(m, "resolve_live_alumni_at_company", lambda *a, **k: None)
+    monkeypatch.setattr(m, "get_warm_crm_contacts", lambda: {})
+    monkeypatch.setattr(m, "get_ghost_listing_penalty", lambda job_hash: (0, ""))
+    monkeypatch.setattr(m, "resolve_target_email", lambda *a, **k: "ops@example.com")
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+
+    state = {}
+
+    def fake_eval(job):
+        return (True, state["score"], "fit reason", "a", "conservative",
+                [0, 1, 2], 0, 0, state["layer1_bonus"], state["gemini_base"])
+
+    monkeypatch.setattr(m, "evaluate_job_with_gemini", fake_eval)
+
+    def run(gemini_base, layer1_bonus, job_id="jsearch_1"):
+        state.update(
+            score=max(1, min(100, gemini_base + layer1_bonus)),
+            layer1_bonus=layer1_bonus,
+            gemini_base=gemini_base,
+        )
+        job = {
+            "job_title": "Operations Analyst", "employer_name": "Acme Co",
+            "job_id": job_id, "job_description": "ops role", "job_city": "Detroit",
+        }
+        return m.process_single_candidate(job)
+
+    return run
+
+
+def test_stacking_cap_clamps_a_bonus_stack_that_blows_past_the_cap(run_candidate):
+    """Gemini 55 + Layer-1 +40 (all four keyword categories fire) and no Layer-2: the raw stack
+    would land 55+40=95; BONUS_STACK_CAP (30) trims it to 55+30=85."""
+    assert m.BONUS_STACK_CAP == 30
+    result = run_candidate(gemini_base=55, layer1_bonus=40)
+    assert result["score"] == 85          # clamped to base + cap, not base + raw stack
+    assert result["score_boost"] == 0     # no Layer-2 signal; the trim is not a "boost"
+
+
+def test_stacking_cap_leaves_an_under_cap_stack_untouched(run_candidate):
+    """A stack that never reaches the cap is scored exactly as before."""
+    result = run_candidate(gemini_base=55, layer1_bonus=20)
+    assert result["score"] == 75          # 55 + 20; cap (30) never binds
+    result_at_cap = run_candidate(gemini_base=55, layer1_bonus=30)
+    assert result_at_cap["score"] == 85   # exactly at the cap: still unaffected
+
+
+def test_card_boost_annotation_reflects_the_capped_layer2_delta_not_the_raw_sum(run_candidate, monkeypatch):
+    """Layer-1 +10, plus an alum (+20) and a priority-10 warm contact (+30) = +50 of Layer-2
+    signal on offer. The cap lets only +20 of it actually move the score, and the card's (+N)
+    must show that +20 - so 'score - (+N)' still reconstructs the Gemini+Layer-1 number."""
+    monkeypatch.setattr(
+        m, "resolve_live_alumni_at_company",
+        lambda *a, **k: {"name": "Dana Reyes", "linkedin_url": "https://linkedin.com/in/dana",
+                         "headline": "Ops Lead"},
+    )
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Sam", "raw_company": "Acme Co", "note": "n", "priority_score": 10}},
+    )
+    result = run_candidate(gemini_base=60, layer1_bonus=10)
+    # capped_pos = min(30, 10 + 50) = 30  ->  score = clamp(60 + 30) = 90
+    assert result["score"] == 90
+    # baseline (Gemini + Layer-1, L1 share cap-limited) = clamp(60 + 10) = 70
+    assert result["score_boost"] == 20
+    assert result["score"] - result["score_boost"] == 70
+
+
+def test_ghost_penalty_still_bites_when_layer1_bonus_is_large(run_candidate, monkeypatch):
+    """Negative modifiers pass through the cap uncapped: a ghost-listing dock still costs its
+    full 15 points even when the positive stack was already trimmed to the cap."""
+    monkeypatch.setattr(m, "get_ghost_listing_penalty", lambda job_hash: (-15, " GHOST"))
+    result = run_candidate(gemini_base=80, layer1_bonus=40)
+    # positives cap to 30 -> clamp(80+30)=100, then ghost -15 -> 85
+    assert result["score"] == 85
+    assert result["score_boost"] == -15
