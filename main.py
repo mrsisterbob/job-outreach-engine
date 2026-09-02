@@ -2310,18 +2310,26 @@ def process_single_candidate(job):
         if any(kw in oddball_text for kw in ODDBALL_KEYWORDS):
             age_badge = f"{age_badge} 🎲 [WILDCARD ROLE]"
 
+        # Running total of every point added/subtracted below, reported on the card so a
+        # 100/100 next to a low Skills% reads as "earned via relationship boosts hitting the
+        # 100 clamp" rather than "the score is broken". Nominal per-source amounts, not the
+        # post-clamp delta - matches what a reader would add up from the badges/lines below.
+        total_boost = 0
+
         # Ghost Listing Penalty: dock score + badge for reposted/evergreen listings (>3 sightings across >45 days)
         job_hash = generate_dedup_hash(job.get("employer_name"), job.get("job_title"))
         penalty, ghost_badge = get_ghost_listing_penalty(job_hash)
         if penalty:
             score = max(1, score + penalty)
             age_badge = f"{age_badge}{ghost_badge}"
+            total_boost += penalty
 
         # JIT Hope College Alumni Resolution: live public-search lookup, score boost, auto-log Carmen Warm contact
         alumni_line = ""
         alum = resolve_live_alumni_at_company(job.get("employer_name"))
         if alum:
             score = min(100, score + 20)
+            total_boost += 20
             alum_url_safe = html.escape(alum["linkedin_url"], quote=True)
             alumni_line = f"🎓 <b>Hope Alum Connection:</b> <a href='{alum_url_safe}'>{html.escape(alum['name'])}</a> ({html.escape(alum['headline'])})\n"
             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -2354,6 +2362,7 @@ def process_single_candidate(job):
             if is_ats_sourced:
                 if score >= 70:
                     score = min(100, score + 30)
+                    total_boost += 30
                     is_clavicular = True
                     contact_name = contact_info.get("name", "Contact")
                     contact_note = contact_info.get("note", "Active relationship")
@@ -2366,10 +2375,11 @@ def process_single_candidate(job):
                 # raw score < 70: ATS + warm match does not qualify for any boost or Clavicular routing
             else:
                 priority_score = contact_info.get("priority_score", 5)
-                score_boost = min(30, priority_score * 3)
-                score = min(100, score + score_boost)
+                priority_boost = min(30, priority_score * 3)
+                score = min(100, score + priority_boost)
+                total_boost += priority_boost
                 alumni_line += (
-                    f"🔥 <b>WARM REFERRAL AVAILABLE (+{score_boost} pts):</b> "
+                    f"🔥 <b>WARM REFERRAL AVAILABLE (+{priority_boost} pts):</b> "
                     f"{html.escape(contact_info.get('name', 'Contact'))} "
                     f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10)</i>\n"
                     f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
@@ -2392,6 +2402,7 @@ def process_single_candidate(job):
             "overlap_pct": overlap_pct, "matched_skills": matched_skills,
             "short_id": short_id, "sheet_uuid": sheet_uuid,
             "alumni_line": alumni_line,
+            "score_boost": total_boost,
             "is_clavicular": is_clavicular,
             "contact_name": contact_name,
             "contact_note": contact_note
@@ -3567,37 +3578,68 @@ def send_telegram_message(chat_id, text):
         logging.error(f"Telegram Post Error: {e}")
     return None
 
-def send_telegram_card(job, score, target_email, age_badge, salary_str, work_style, overlap_pct, short_id, sheet_uuid=None, alumni_line="", sheet_tab="Pipeline_Candidates"):
+# extract_salary()/extract_work_style()'s literal not-found sentinels (pipeline_utils.py). Printing
+# these on the card burns the most valuable row telling Kevin nothing is known, so the metadata
+# line drops a part when it equals its sentinel instead - extract_salary/extract_work_style
+# themselves stay untouched since passes_strict_filter and other callers depend on the sentinels.
+SALARY_UNLISTED_SENTINEL = "Salary Unlisted"
+WORK_STYLE_UNSPECIFIED_SENTINEL = "On-Site / Unspecified"
+
+def send_telegram_card(job, score, target_email, age_badge, salary_str, work_style, overlap_pct, short_id, sheet_uuid=None, alumni_line="", sheet_tab="Pipeline_Candidates", score_boost=0):
     """Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
 
     The card is a home page, not a document: identity, the one metadata line, the target email,
-    the Apply link, and one link to everything else. Fit reason, matched skills, ATS bullets, the
-    LinkedIn note, the cold draft and the five research dorks all live on /stage/<short_id>, where
-    a real copy button beats tap-to-copy on a <code> span. Apply is the exception that stays inline
-    - it is the link Kevin taps on nearly every card and it should not cost a round trip through a
-    sleeping free-tier web service. The swipe legend is the bare command list; /help explains them.
+    the people-search links, and one link to everything else. Fit reason, matched skills, ATS
+    bullets, the LinkedIn note and the cold draft all live on /stage/<short_id>, where a real copy
+    button beats tap-to-copy on a <code> span. Apply and the three decision-maker links stay inline
+    - they're triage-moment actions Kevin clicks while deciding, not after, and routing them through
+    a sleeping free-tier web service would cost ~50s per cold tap. The swipe legend is the bare
+    command list; /help explains them.
     """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return None
-    company = html.escape(str(job.get("employer_name") or "N/A"))
-    title = html.escape(str(job.get("job_title") or "N/A"))
+    company_raw = str(job.get("employer_name") or "N/A")
+    title_raw = str(job.get("job_title") or "N/A")
+    company = html.escape(company_raw)
+    title = html.escape(title_raw)
     apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
     stage_url = html.escape(f"{BASE_URL}/stage/{short_id}?track={job.get('track', 'a')}", quote=True)
+    # Built from the RAW company/title, not the HTML-escaped ones above - escaping first and then
+    # URL-encoding double-escapes ("Smith & Sons" would search for "Smith &amp; Sons"). Escaped
+    # only here, for the href, with quote=True - matching apply_link's own handling.
+    dork_url = html.escape(build_hiring_manager_dork(company_raw, title_raw), quote=True)
+    recruiter_dork_url = html.escape(build_recruiter_dork(company_raw), quote=True)
+    apollo_url = html.escape(build_apollo_url(company_raw), quote=True)
     # Truncate raw dynamic content BEFORE HTML-escaping/tag-wrapping so tags never get cut mid-string.
     # alumni_line arrives with a trailing newline from process_single_candidate but without one from
     # some callers, so it is normalized here rather than leaving a stray blank line on the card.
     alumni_line_safe = str(alumni_line or "")[:400].rstrip("\n")
     alumni_block = f"{alumni_line_safe}\n" if alumni_line_safe.strip() else ""
     fit_dot = get_fit_score_indicator(score)
+
+    # Metadata line: score (+ the boost that got it there, if any) always first, then salary and
+    # work style only when actually known, then age and keyword overlap unconditionally.
+    boost_suffix = f" ({score_boost:+d})" if score_boost else ""
+    meta_parts = [f"<b>{score}/100</b>{boost_suffix}"]
+    salary_str_val = str(salary_str)
+    if salary_str_val != SALARY_UNLISTED_SENTINEL:
+        meta_parts.append(html.escape(salary_str_val))
+    work_style_val = str(work_style)
+    if work_style_val != WORK_STYLE_UNSPECIFIED_SENTINEL:
+        meta_parts.append(html.escape(work_style_val))
+    meta_parts.append(html.escape(str(age_badge)))
+    meta_parts.append(f"Skills {overlap_pct}%")
+    meta_line = f"{fit_dot} " + " · ".join(meta_parts)
+
     card_text = (
         f"💼 <b>{title}</b>\n"
         f"🏢 <b>{company}</b>\n"
-        f"{fit_dot} <b>{score}/100</b> · {html.escape(str(salary_str))} · {html.escape(str(work_style))}"
-        f" · {html.escape(str(age_badge))} · Skills {overlap_pct}%\n"
+        f"{meta_line}\n"
         f"{alumni_block}"
         f"📧 <code>{html.escape(target_email)}</code>\n\n"
-        f"🔗 <a href='{apply_link}'>Apply</a>\n"
+        f"🔗 <a href='{apply_link}'>Apply</a> · 🎯 <a href='{dork_url}'>Hiring Mgr</a> · "
+        f"🤝 <a href='{recruiter_dork_url}'>Recruiter</a> · 🔍 <a href='{apollo_url}'>Apollo</a>\n"
         f"📋 <a href='{stage_url}'>Full Card</a> - bullets, LinkedIn note, draft, links, PDF\n"
         f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code>\n\n"
         f"⚡ <code>/apply</code> <code>/draft</code> <code>/warm</code> <code>/cold</code> "
@@ -4006,7 +4048,8 @@ def run_job_pipeline(chat_id=None, top_n=2):
             item["overlap_pct"], item["short_id"],
             sheet_uuid=item.get("sheet_uuid"),
             alumni_line=item.get("alumni_line", ""),
-            sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates"
+            sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates",
+            score_boost=item.get("score_boost", 0)
         )
         note = (
             f"Warm Referral Matched: {item.get('contact_name', 'Contact')} | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
