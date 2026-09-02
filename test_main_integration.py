@@ -825,6 +825,20 @@ def test_stage_page_carries_every_block_the_card_dropped(staged_job):
         assert html.escape(url, quote=True) in page
 
 
+def test_stage_page_puts_the_research_links_and_linkedin_note_in_one_block_before_the_cold_draft(staged_job):
+    """The find-a-name links and the LinkedIn note are one workflow: the links render immediately
+    above the note, a connecting sentence sits between them, and the whole block precedes the
+    separate Cold Outreach Draft (a different channel with a resolved email, not a found person)."""
+    page, _ = staged_job
+    links_at = page.index('class="research-links"')
+    connector_at = page.index("Find a name above, then copy the note below")
+    note_at = page.index('id="linkedin-note"')
+    cold_at = page.index("Cold Outreach Draft")
+    assert links_at < connector_at < note_at < cold_at
+    assert "Find Someone, Then Message Them" in page
+    assert "Decision-Maker Research" not in page
+
+
 def test_stage_page_copy_buttons_share_one_js_helper(staged_job):
     page, _ = staged_job
     for element_id in ("linkedin-note", "cold-draft", "ats-raw-text"):

@@ -5110,9 +5110,10 @@ def format_ats_plaintext(job, track="a"):
 @app.route("/stage/<short_id>", methods=["GET"])
 def desktop_stage_view(short_id):
     """Desktop review page - the card's "Full Card" target. Everything the Telegram card used to
-    print inline lives here: fit reason, matched skills, tailored bullets, the LinkedIn note, the
-    cold draft, the five research dorks, and the PDF preview. Each copy block is a readonly
-    textarea plus a Copy button, which beats tap-to-copy on a Telegram <code> span.
+    print inline lives here: fit reason, matched skills, tailored bullets, then one combined
+    "find someone, then message them" block (the five research dorks followed immediately by the
+    LinkedIn note), the cold draft, the ATS fallback text, and the PDF preview. Each copy block
+    is a readonly textarea plus a Copy button, which beats tap-to-copy on a Telegram <code> span.
     """
     job = get_job_from_cache(short_id)
     if not job:
@@ -5178,7 +5179,9 @@ def desktop_stage_view(short_id):
                 <a class="btn btn-secondary" href="{html.escape(apply_link)}" target="_blank">🔗 Open Application Portal</a>
             </div>
 
-            <h3 style="margin-top: 24px;">🤝 LinkedIn Connect Note (&lt;300 chars)</h3>
+            <h3 style="margin-top: 24px;">🎯 Find Someone, Then Message Them</h3>
+            <div class="research-links">{research_html}</div>
+            <p class="meta" style="margin-top: 12px;">Find a name above, then copy the note below and paste it straight into their LinkedIn connection request - it's already under the 300-character limit.</p>
             <textarea id="linkedin-note" rows="5" style="width: 100%;" readonly>{html.escape(linkedin_note)}</textarea>
             <div style="margin-top: 10px;">
                 <button class="btn btn-secondary" onclick="copyField('linkedin-note')" style="border: none; cursor: pointer;">📋 Copy LinkedIn Note</button>
@@ -5189,9 +5192,6 @@ def desktop_stage_view(short_id):
             <div style="margin-top: 10px;">
                 <button class="btn btn-secondary" onclick="copyField('cold-draft')" style="border: none; cursor: pointer;">📋 Copy Cold Draft</button>
             </div>
-
-            <h3 style="margin-top: 24px;">🎯 Decision-Maker Research</h3>
-            <div>{research_html}</div>
 
             <h3 style="margin-top: 24px;">Raw ATS Text (Workday / Taleo fallback)</h3>
             <p style="color: #666; font-size: 0.9em;">Legacy ATS parsers sometimes fail to read the PDF - paste this plain-text version into application forms instead.</p>
