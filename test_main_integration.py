@@ -658,6 +658,38 @@ def test_card_puts_the_scan_metadata_on_a_single_line(render_card):
         assert retired not in text
 
 
+def test_card_drops_salary_and_work_style_when_the_sentinels_come_back(render_card):
+    """extract_salary()/extract_work_style() return literal 'Salary Unlisted' / 'On-Site /
+    Unspecified' strings when nothing was found - printing those burns the most valuable row
+    on the card to say nothing. Score, age and Skills% stay unconditional."""
+    text = render_card(salary_str=m.SALARY_UNLISTED_SENTINEL, work_style=m.WORK_STYLE_UNSPECIFIED_SENTINEL)
+    meta = next(ln for ln in text.splitlines() if "87/100" in ln)
+    assert m.SALARY_UNLISTED_SENTINEL not in meta
+    assert m.WORK_STYLE_UNSPECIFIED_SENTINEL not in meta
+    for kept in ("[1-3d RECENT]", "Skills 78%"):
+        assert kept in meta
+    # A real salary/style still renders, and salary lands immediately after the score.
+    full = render_card()
+    full_meta = next(ln for ln in full.splitlines() if "87/100" in ln)
+    assert full_meta.index("87/100") < full_meta.index("$95,000") < full_meta.index("Hybrid")
+
+
+def test_card_annotates_the_score_boost_only_when_nonzero(render_card):
+    """A 100/100 next to Skills 10% reads as broken unless the relationship-boost points that
+    got it there are visible right next to the score."""
+    boosted = render_card(score=100, score_boost=50)
+    meta = next(ln for ln in boosted.splitlines() if "100/100" in ln)
+    assert "100/100</b> (+50)" in meta
+
+    penalized = render_card(score_boost=-15)
+    meta = next(ln for ln in penalized.splitlines() if "87/100" in ln)
+    assert "87/100</b> (-15)" in meta
+
+    unboosted = render_card()  # score_boost defaults to 0
+    meta = next(ln for ln in unboosted.splitlines() if "87/100" in ln)
+    assert meta.strip().startswith("🟢 <b>87/100</b> ·"), "no bare parenthetical when nothing boosted it"
+
+
 def test_card_drops_the_static_dual_path_boilerplate(render_card):
     # Identical on every card, so it carried no per-job information and cost ~4 lines.
     text = render_card()
@@ -678,16 +710,33 @@ def test_card_fits_on_one_phone_screen(render_card):
         assert moved not in text, f"{moved!r} belongs on /stage now, not on the card"
 
 
-def test_card_carries_only_apply_and_the_full_card_link(render_card):
-    """Apply stays inline - it is tapped on nearly every card and should not cost a round trip
-    through a sleeping free-tier service. The five research dorks moved to /stage."""
+def test_card_shows_apply_and_the_three_triage_moment_links(render_card):
+    """Apply, Hiring Mgr, Recruiter and Apollo are triage-moment actions Kevin clicks while
+    deciding - they stay inline instead of costing a ~50s cold tap through /stage's sleeping
+    free-tier service. LinkedIn Leadership Search (overlaps Hiring Mgr) and the Alumni dork
+    (already gets its own conditional line when a real alum is found) stay on /stage only."""
     text = render_card()
-    assert text.count("<a href=") == 2
+    assert text.count("<a href=") == 5  # Apply, Hiring Mgr, Recruiter, Apollo, Full Card
     assert html.escape(_CARD_JOB["job_apply_link"], quote=True) in text
-    for moved_url in (m.build_apollo_url("Atwell"), m.build_linkedin_url("Atwell"),
-                      m.build_alumni_dork("Atwell"), m.build_recruiter_dork("Atwell"),
-                      m.build_hiring_manager_dork("Atwell", _CARD_JOB["job_title"])):
-        assert html.escape(moved_url, quote=True) not in text
+    for kept_url in (m.build_apollo_url("Atwell"), m.build_recruiter_dork("Atwell"),
+                     m.build_hiring_manager_dork("Atwell", _CARD_JOB["job_title"])):
+        assert html.escape(kept_url, quote=True) in text
+    for stage_only_url in (m.build_linkedin_url("Atwell"), m.build_alumni_dork("Atwell")):
+        assert html.escape(stage_only_url, quote=True) not in text
+    for link_text in ("Hiring Mgr", "Recruiter", "Apollo"):
+        assert link_text in text
+
+
+def test_card_research_links_are_built_from_the_raw_company_name(render_card):
+    """The old card passed the HTML-escaped company into the URL builders, so 'Smith & Sons'
+    searched for 'Smith &amp; Sons'. The builders must see the raw name; only the href gets
+    escaped afterward, same as apply_link."""
+    text = render_card(job={**_CARD_JOB, "employer_name": "Smith & Sons"})
+    for builder, needs_title in ((m.build_apollo_url, False), (m.build_recruiter_dork, False),
+                                 (m.build_hiring_manager_dork, True)):
+        raw_url = builder("Smith & Sons", _CARD_JOB["job_title"]) if needs_title else builder("Smith & Sons")
+        assert html.escape(raw_url, quote=True) in text
+        assert "&amp;amp;" not in text  # no double-escaping
 
 
 def test_full_card_link_is_an_absolute_url_carrying_the_track(render_card):
