@@ -250,6 +250,25 @@ def interpolate_template(template, name="", company="", job_title=""):
         logging.error(f"Template interpolation failed: {e}")
         return template
 
+def first_name_for_greeting(full_name):
+    """First name to drop into interpolate_template()'s {name} slot, so a resolved contact
+    renders "Hi Dana," and everything else stays a bare "Hi,".
+
+    Returns "" for an empty value, the "Contact" placeholder get_warm_crm_contacts() uses for a
+    nameless row, or anything that doesn't look like a person's name (a URL, an email, a bare
+    number). interpolate_template() already turns "" - and the retired "there" sentinel - back
+    into "Hi,", so a "" here is the safe no-name path.
+    """
+    raw = str(full_name or "").strip()
+    if not raw or raw.lower() == "contact":
+        return ""
+    if "@" in raw or "/" in raw or raw.lower().startswith(("http:", "https:", "www.")):
+        return ""
+    first = raw.split()[0].strip(",.\"'")
+    if len(first) < 2 or not any(ch.isalpha() for ch in first):
+        return ""
+    return first
+
 RESUME_BULLETS_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_bullets_bank.json")
 
 EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|T[A-E])(\d+)$", re.IGNORECASE)
@@ -2422,12 +2441,15 @@ def resolve_outreach_copy(job):
     """
     company_name = job.get("employer_name") or "your team"
     job_title = job.get("job_title") or "this role"
+    # process_single_candidate() persists the resolved contact first name (or "" when none was
+    # found) alongside the template ids; a job cached before that has no key -> "" -> "Hi,".
+    greeting_name = str(job.get("outreach_contact_first_name") or "")
     linkedin_pool = load_linkedin_templates().get("linkedin_templates", [])
     linkedin_template = resolve_template_text(linkedin_pool, job.get("linkedin_template_id"))
-    linkedin_note = sanitize_text(interpolate_template(linkedin_template, name="there", company=company_name, job_title=job_title))[:300]
+    linkedin_note = sanitize_text(interpolate_template(linkedin_template, name=greeting_name, company=company_name, job_title=job_title))[:300]
     cold_pool = load_outreach_templates().get("cold_ops", [])
     cold_template = resolve_template_text(cold_pool, job.get("outreach_template_id"))
-    outreach_email = sanitize_text(interpolate_template(cold_template, name="there", company=company_name, job_title=job_title))
+    outreach_email = sanitize_text(interpolate_template(cold_template, name=greeting_name, company=company_name, job_title=job_title))
     return linkedin_note, outreach_email
 
 def process_single_candidate(job):
@@ -2443,12 +2465,17 @@ def process_single_candidate(job):
         # Python resolves/bounds-checks the actual bullet text and interpolates the actual
         # LinkedIn/outreach copy from local JSON banks. Gemini never authors this text directly.
         ats_bullets = filter_ats_bullets(track, bullet_indices, tone_mode)
+        # Greet a resolved Carmen Warm CRM contact by first name ("Hi Dana,"); fall back to a
+        # bare "Hi," when the company has no known contact. Read-only lookup - get_warm_crm_contacts()
+        # is the same in-process cache the Layer 2 warm/Clavicular scoring below reuses.
+        _warm_contact = get_warm_crm_contacts().get(normalize_company_for_match(job.get("employer_name")))
+        greeting_name = first_name_for_greeting(_warm_contact.get("name") if _warm_contact else "")
         linkedin_pool = load_linkedin_templates().get("linkedin_templates", [])
         linkedin_template = resolve_template_text(linkedin_pool, linkedin_template_id)
-        linkedin_note = sanitize_text(interpolate_template(linkedin_template, name="there", company=company_name, job_title=job_title))[:300]
+        linkedin_note = sanitize_text(interpolate_template(linkedin_template, name=greeting_name, company=company_name, job_title=job_title))[:300]
         cold_pool = load_outreach_templates().get("cold_ops", [])
         cold_template = resolve_template_text(cold_pool, outreach_template_id)
-        outreach_email = sanitize_text(interpolate_template(cold_template, name="there", company=company_name, job_title=job_title))
+        outreach_email = sanitize_text(interpolate_template(cold_template, name=greeting_name, company=company_name, job_title=job_title))
 
         # Persist routing keys on the cached job so /cv, /stage, and ATS plaintext all resolve
         # the exact same bullets and copy later (bounds-checked again by filter_ats_bullets /
@@ -2459,6 +2486,9 @@ def process_single_candidate(job):
         job["tone_mode"] = tone_mode
         job["linkedin_template_id"] = linkedin_template_id
         job["outreach_template_id"] = outreach_template_id
+        # Persist the greeting name (or "") so resolve_outreach_copy() and /stage re-render the
+        # exact "Hi Dana," / "Hi," the pipeline picked without re-querying the CRM.
+        job["outreach_contact_first_name"] = greeting_name
         sheet_uuid = save_job_to_cache(short_id, job)
         target_email = resolve_target_email(job.get("employer_name"), job.get("job_title"), job.get("employer_website"))
         age_badge = get_age_badge(parse_posted_hours(job.get("job_posted_at_datetime_utc")))

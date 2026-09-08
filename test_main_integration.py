@@ -905,6 +905,59 @@ def test_stage_page_degrades_for_a_job_cached_before_template_ids_were_persisted
         pool[0], name="there", company="Atwell", job_title=_CARD_JOB["job_title"]))[:300]
 
 
+@pytest.mark.parametrize("full_name,expected", [
+    ("Dana Reyes", "Dana"),
+    ("dana", "dana"),
+    ("Dana", "Dana"),
+    ("", ""),
+    (None, ""),
+    ("Contact", ""),            # get_warm_crm_contacts()'s nameless-row placeholder
+    ("https://linkedin.com/in/x", ""),
+    ("dana@acme.com", ""),
+    ("1998", ""),
+    ("J", ""),
+])
+def test_first_name_for_greeting_extracts_a_name_or_falls_back_to_blank(full_name, expected):
+    assert m.first_name_for_greeting(full_name) == expected
+
+
+def test_resolve_outreach_copy_uses_a_persisted_contact_first_name():
+    """name present -> "Hi Dana,"; name absent -> bare "Hi," (never "Hi there,")."""
+    base = {"employer_name": "Atwell", "job_title": "Ops Analyst",
+            "outreach_template_id": 0, "linkedin_template_id": 0}
+
+    named = m.resolve_outreach_copy({**base, "outreach_contact_first_name": "Dana"})
+    assert named[0].startswith("Hi Dana.") and named[1].startswith("Hi Dana,")
+
+    for job in ({**base, "outreach_contact_first_name": ""}, base):  # explicit "" and legacy (key absent)
+        note, email = m.resolve_outreach_copy(job)
+        assert email.startswith("Hi,\n") and "Hi there" not in email
+        assert note.startswith("Hi.") and "Hi there" not in note
+
+
+def test_process_single_candidate_threads_a_warm_contact_name_into_the_greeting(run_candidate, monkeypatch):
+    """A resolved Carmen Warm contact for the employer renders "Hi Dana," in both the cold email
+    and the LinkedIn note, and the first name is persisted on the cached job for /stage."""
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Dana Reyes", "raw_company": "Acme Co", "note": "n", "priority_score": 3}},
+    )
+    result = run_candidate(gemini_base=60, layer1_bonus=10)
+    assert result["outreach_email"].startswith("Hi Dana,")
+    assert result["linkedin_note"].startswith("Hi Dana.")
+    assert result["job"]["outreach_contact_first_name"] == "Dana"
+
+
+def test_process_single_candidate_greeting_falls_back_to_bare_hi_with_no_contact(run_candidate):
+    """No warm contact for the employer (fixture default {}) -> "Hi," and a persisted ""."""
+    result = run_candidate(gemini_base=60, layer1_bonus=10)
+    assert result["outreach_email"].startswith("Hi,\n")
+    assert "Hi there" not in result["outreach_email"]
+    assert result["linkedin_note"].startswith("Hi.")
+    assert result["job"]["outreach_contact_first_name"] == ""
+
+
 def test_stage_page_escapes_a_company_name_carrying_markup():
     m.save_job_to_cache("stage002", {**_CARD_JOB, "employer_name": "Smith & <Sons>",
                                      "track": "a", "fit_reason": "Reports to <COO> & CFO"})
