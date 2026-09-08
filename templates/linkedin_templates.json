@@ -1,14 +1,14 @@
 {
   "linkedin_templates": [
-    "Hi{name}. Saw you're hiring a {job_title} at {company}. I'd like to connect.",
-    "Hi{name}. Saw the {job_title} role at {company}. Most of my work is Python and SQL scripts that replaced manual reporting. I'd like to connect.",
+    "Hi{name}. Saw the {job_title} opening at {company}. I'd like to connect.",
+    "Hi{name}. Saw the {job_title} role at {company}. Most of my work is Python and SQL that replaced manual reporting, and I think it'd carry over well at {company}.",
     "Hi{name}. Saw the {job_title} opening at {company}. I've been reconciling custodial ledgers against internal records daily. Happy to connect.",
-    "Hi{name}. Saw the {job_title} role at {company}. I clean up Salesforce ticket queues and the routing errors behind them. Figured I'd connect.",
+    "Hi{name}. Saw {company} is hiring a {job_title}. I clean up Salesforce ticket queues and the routing errors behind them. Figured I'd connect.",
     "Hi{name}. I've applied for the {job_title} role at {company}. Wanted to connect here too in case that's easier.",
-    "Hi{name}. Saw the {job_title} posting at {company}. Most of my week is data integrity work across Salesforce and internal databases. I'd like to connect.",
+    "Hi{name}. Saw the {job_title} posting at {company}. Most of my week is data integrity work across Salesforce and internal databases, curious if that overlaps at {company}.",
     "Hi{name}. Saw the {job_title} opening at {company}. I've built Power BI dashboards and SQL variance checks for an operations team in Detroit. Happy to connect.",
-    "Hi{name}. Saw the {job_title} role at {company}. I've automated DocuSign and onboarding workflows for 150+ advisors. I'd like to connect.",
-    "Hi{name}. I'm in Detroit doing wealth operations and process automation. Saw the {job_title} opening at {company} and I'd like to connect.",
-    "Hi{name}. Saw {company} is hiring a {job_title}. I've built Python tools that took manual reconciliation off my team's plate. Open to connecting."
+    "Hi{name}. Saw {company} posted a {job_title} role. I've automated DocuSign and onboarding workflows for 150+ advisors. I'd like to connect.",
+    "Hi{name}. I'm in Detroit doing wealth operations and process automation. Saw the {job_title} opening at {company} and wanted to connect.",
+    "Hi{name}. Saw {company} is hiring a {job_title}. I've built Python tools that took manual reconciliation off my team's plate, curious how {company} handles it."
   ]
 }

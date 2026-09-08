@@ -1,18 +1,18 @@
 {
   "cold_ops": [
-    "Hi{name},\n\nSaw you're hiring a {job_title} at {company}.\n\nMost of my recent work is Python and SQL scripts that replaced manual reporting and reconciliation at a wealth firm.\n\nOpen to a quick chat this week?\n\nThanks,\nKevin Miller",
-    "Hi{name},\n\nSaw the {job_title} opening at {company}.\n\nI wrote the nightly Python scripts that flag ledger mismatches against our internal records. I've also cleared $250k in ledger variances with SQL.\n\nWorth a quick chat?\n\nThanks,\nKevin Miller",
-    "Hi{name},\n\nSaw the {job_title} posting at {company}.\n\nI found a Salesforce queue collision between our trading and service desks. Fixing it prevented 10 SLA breaches.\n\nFree for a quick chat this week?\n\nThanks,\nKevin Miller",
-    "Hi{name},\n\nSaw you're hiring a {job_title} at {company}.\n\nI cleaned up 1,500+ legacy account records so they'd match the current schema. Most of my week is that kind of work.\n\nOpen to a quick chat?\n\nThanks,\nKevin Miller",
-    "Hi{name},\n\nSaw the {job_title} opening at {company}.\n\nI built DocuSign workflows in Salesforce for 150+ advisors. Packet review went from 60 minutes to 20.\n\nAny chance you've got a few minutes this week?\n\nThanks,\nKevin Miller",
-    "Hi{name},\n\nSaw that {company} is hiring a {job_title}.\n\nI built the Power BI dashboards our team runs on for daily ticket volume and response times. I'd rather show you than describe it.\n\nFree whenever you have a few minutes?\n\nThanks,\nKevin Miller"
+    "Hi{name},\n\nSaw the {job_title} opening at {company}.\n\nMost of my week is Python and SQL that replaced manual reporting and reconciliation at a wealth firm. If {company} is running that by hand right now, that's the part I'd be useful on.\n\nOpen to a quick chat?\n\nThanks,\nKevin Miller",
+    "Hi{name},\n\nSaw {company} is hiring a {job_title}.\n\nI wrote the nightly Python scripts that flag ledger mismatches against our internal records, and cleared $250k in variances with SQL. Happy to walk through how I'd approach the same thing at {company}.\n\nWorth a chat?\n\nThanks,\nKevin Miller",
+    "Hi{name},\n\nSaw the {job_title} posting at {company}.\n\nI found a Salesforce queue collision between our trading and service desks that was quietly costing us SLA breaches. Fixing it prevented 10. Usually that kind of thing is invisible until someone goes looking.\n\nFree for a quick chat this week?\n\nThanks,\nKevin Miller",
+    "Hi{name},\n\nSaw the {job_title} role at {company}.\n\nI cleaned up 1,500+ legacy account records so they'd match the current schema. Unglamorous, but it's the work that decides whether {company}'s reporting is trustworthy.\n\nOpen to a quick chat?\n\nThanks,\nKevin Miller",
+    "Hi{name},\n\nSaw {company} posted a {job_title} role.\n\nI built DocuSign workflows in Salesforce for 150+ advisors and took packet review from 60 minutes to 20. Curious whether {company} is solving that in-house or still doing it manually.\n\nAny chance you've got a few minutes this week?\n\nThanks,\nKevin Miller",
+    "Hi{name},\n\nSaw the {job_title} opening at {company}.\n\nI built the Power BI dashboards our team runs on for daily ticket volume and response times. Happy to show you what that looks like at {company} instead of describing it.\n\nFree whenever you have a few minutes?\n\nThanks,\nKevin Miller"
   ],
   "warm_alumni": [
-    "Hi{name},\n\nI'm a Hope College business grad too, and I saw you're at {company}.\n\nI'm doing wealth operations work in Detroit right now, mostly Salesforce and Python cleanup.\n\nAny chance you're up for a quick call? I'd like to hear how you ended up there.\n\nThanks,\nKevin",
-    "Hi{name},\n\nFellow Hope grad here. I've been following what you're doing at {company}.\n\nI'm in wealth operations in Detroit and working out where to go next.\n\nWould you have time for coffee or a quick call sometime?\n\nThanks,\nKevin"
+    "Hi{name},\n\nI'm a Hope College business grad too, and I saw you're at {company}.\n\nI'm doing wealth operations work in Detroit right now, mostly Salesforce and Python cleanup.\n\nAny chance you're up for a quick call? I'd like to hear how you ended up at {company}.\n\nThanks,\nKevin",
+    "Hi{name},\n\nFellow Hope grad here. I've been following what you're doing at {company}.\n\nI'm in wealth operations in Detroit and working out where to go next, and {company} is on the short list.\n\nWould you have time for coffee or a quick call sometime?\n\nThanks,\nKevin"
   ],
   "followup_bumps": [
-    "Hi{name},\n\nCircling back on the {job_title} role in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nThanks,\nKevin Miller",
-    "Hi{name},\n\nI reached out earlier about the {job_title} role at {company}.\n\nSounds like the timing might not be right. If that changes, I'm around.\n\nThanks,\nKevin Miller"
+    "Hi{name},\n\nCircling back on the {job_title} role at {company} in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nThanks,\nKevin Miller",
+    "Hi{name},\n\nI reached out earlier about the {job_title} role at {company}.\n\nSounds like the timing might not be right at {company} yet. If that changes, I'm around.\n\nThanks,\nKevin Miller"
   ]
 }
