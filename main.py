@@ -2679,6 +2679,19 @@ def get_gmail_access_token():
         logging.error(f"Gmail OAuth Token Refresh Exception: {e}")
         return None
 
+# UI-only company-name fallbacks (see /draft, /eh, /e, process_overdue_batch, /stage). Harmless
+# on a Telegram card, but a real placeholder in an email body to a recruiter ("Saw the role at
+# your team.") - so the Gmail send path refuses them rather than shipping one. Compared
+# case-insensitively after trimming; an empty/whitespace company_name is refused too.
+PLACEHOLDER_COMPANY_NAMES = frozenset({
+    "target firm", "target company", "your team", "your company",
+})
+
+def is_placeholder_company_name(company_name):
+    """True when company_name is empty or one of the known UI placeholder strings."""
+    cleaned = str(company_name or "").strip()
+    return not cleaned or cleaned.lower() in PLACEHOLDER_COMPANY_NAMES
+
 def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note="", custom_body=None, custom_subject=None, pdf_bytes=None, pdf_filename="Kevin_Miller_Resume.pdf"):
     """Create Gmail draft with 24h dedup check and OAuth token expiry handling.
     Returns (success, message, draft_id) - draft_id is populated on success or when a duplicate is found.
@@ -2686,6 +2699,18 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars:
         return False, f"Missing Env Vars: {', '.join(missing_vars)}", None
+
+    # A placeholder company name means the caller never resolved a real employer - blocking here
+    # keeps "Saw the role at your team." out of a recruiter's inbox. Callers already handle a
+    # False return (manual-copy fallback path), so this degrades safely.
+    if is_placeholder_company_name(company_name):
+        blocked_name = str(company_name or "").strip()
+        blocked_to = str(to_email or "").split(" [")[0].strip()
+        logging.error(
+            f"Gmail draft BLOCKED: placeholder company name {blocked_name!r} for {blocked_to} "
+            f"(job_title={job_title!r}) - refusing to email a recruiter an unresolved company."
+        )
+        return False, f"Blocked: placeholder company name ({blocked_name!r})", None
 
     # Strip bracketed confidence tags (e.g. "user@x.com [⚠️ Fallback Email]") before this ever
     # reaches an SMTP header - the tag is a UI-only warning, never part of the real address.

@@ -373,6 +373,53 @@ def test_create_gmail_draft_attaches_pdf_with_correct_filename(monkeypatch):
     assert attachments[0].get_payload(decode=True) == b"%PDF-1.4 fake pdf bytes"
 
 
+@pytest.mark.parametrize("placeholder", ["Target Firm", "target firm", "Target Company", "your team", "your company", "", "   "])
+def test_create_gmail_draft_refuses_a_placeholder_company_name(monkeypatch, placeholder):
+    """A recruiter must never get "Saw the role at your team." - the Gmail send path blocks a
+    placeholder company name before any Gmail API call and returns (False, reason, None)."""
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "cid")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("GMAIL_REFRESH_TOKEN", "rtoken")
+    monkeypatch.setenv("GMAIL_USER", "me@example.com")
+
+    calls = []
+    monkeypatch.setattr(m.requests, "post", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: (_ for _ in ()).throw(AssertionError("must not reach OAuth")))
+
+    ok, msg, draft_id = m.create_gmail_draft(
+        to_email="recruiter@acme.com", company_name=placeholder, job_title="Ops Analyst",
+    )
+
+    assert ok is False
+    assert draft_id is None
+    assert "placeholder company name" in msg.lower()
+    assert calls == []  # no Gmail API call was made
+
+
+def test_create_gmail_draft_allows_a_real_company_name(monkeypatch):
+    """The block is narrow: a normal company name still drafts."""
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "cid")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("GMAIL_REFRESH_TOKEN", "rtoken")
+    monkeypatch.setenv("GMAIL_USER", "me@example.com")
+    monkeypatch.setattr(m, "check_existing_gmail_draft", lambda to_email, subject: None)
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: "fake-token")
+    monkeypatch.setattr(m, "save_gmail_draft_record", lambda *a, **k: True)
+
+    class FakeDraftResponse:
+        status_code = 200
+        def json(self):
+            return {"id": "draft-ok"}
+
+    monkeypatch.setattr(m.requests, "post", lambda *a, **k: FakeDraftResponse())
+
+    ok, msg, draft_id = m.create_gmail_draft(
+        to_email="recruiter@acme.com", company_name="Atwell", job_title="Ops Analyst",
+    )
+    assert ok is True
+    assert draft_id == "draft-ok"
+
+
 # ---- Canonical Status writes: /apply, /replied, /interview (Status field only, no tab move) ----
 
 def _dispatch(text, reply_to_message=None):
