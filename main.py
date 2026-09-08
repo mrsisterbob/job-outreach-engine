@@ -1097,6 +1097,137 @@ def get_rolling_metric_counts(days=7):
         logging.error(f"Rolling Metric Read Error ({days}d): {e}")
     return counts
 
+# ==============================================================================
+# TEMPLATE REPLY-RATE REPORT (READ-ONLY)
+# ==============================================================================
+# Join path, no schema change: application_outcomes.sheet_uuid -> jobs.sheet_uuid
+# (UNIQUE) -> json_extract(jobs.job_json, '$.outreach_template_id' / '$.linkedin_template_id').
+# process_single_candidate() persists both ids on the cached job; the Gmail inbound poller
+# and /apply, /offer write application_outcomes rows keyed by the same sheet_uuid, so a
+# template id maps to its outcomes directly.
+#
+# Known gap: a GENERAL inbound reply (real human, not an interview/rejection) is routed to
+# the CRM by route_inbound_reply_to_crm() but is NOT written to application_outcomes, so it
+# is invisible here. "replied" below therefore means "got an interview / rejection / offer
+# signal", the reply statuses that are actually persisted with a sheet_uuid.
+TEMPLATE_REPLY_STATUSES = ("interview", "rejection", "offer")
+
+def get_template_reply_rates():
+    """READ-ONLY. Reply rate grouped by outreach_template_id and by linkedin_template_id,
+    keeping the raw (sent, replied) counts visible so a 1/1 never hides behind "100%".
+
+    Definitions (event-sourced application_outcomes, one row per transition):
+      sent    - a sheet_uuid with an 'applied' row (/apply records this when outreach goes
+                out; it is the send signal joinable to a template id).
+      replied - that same sheet_uuid also has an 'interview', 'rejection', or 'offer' row.
+                'withdrawn' is Kevin's own action, not a reply, so it never counts.
+
+    Returns:
+      {"by_outreach_template": {tid_or_None: {"sent", "replied", "reply_rate"}},
+       "by_linkedin_template":  {tid_or_None: {...}},
+       "totals": {"sent", "replied", "reply_rate"},
+       "unjoinable_applied": <'applied' rows whose sheet_uuid has no cached job>}
+    A None template id key means the cached job predates id persistence (json_extract -> NULL).
+    Never writes.
+    """
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT ao.sheet_uuid, ao.status, "
+                "  json_extract(j.job_json, '$.outreach_template_id') AS otid, "
+                "  json_extract(j.job_json, '$.linkedin_template_id') AS ltid, "
+                "  (j.sheet_uuid IS NULL) AS job_missing "
+                "FROM application_outcomes ao "
+                "LEFT JOIN jobs j ON j.sheet_uuid = ao.sheet_uuid"
+            )
+            rows = cursor.fetchall()
+    except Exception as e:
+        logging.error(f"Template Reply Rate Read Error: {e}")
+        rows = []
+
+    # Collapse the event rows to one record per application (sheet_uuid).
+    per_uuid = {}
+    for sheet_uuid, status, otid, ltid, job_missing in rows:
+        rec = per_uuid.setdefault(
+            sheet_uuid,
+            {"statuses": set(), "otid": None, "ltid": None, "job_missing": bool(job_missing)},
+        )
+        rec["statuses"].add(status)
+        if rec["otid"] is None:
+            rec["otid"] = otid
+        if rec["ltid"] is None:
+            rec["ltid"] = ltid
+
+    by_outreach, by_linkedin = {}, {}
+    totals = {"sent": 0, "replied": 0}
+    unjoinable_applied = 0
+
+    for rec in per_uuid.values():
+        if "applied" not in rec["statuses"]:
+            continue
+        if rec["job_missing"]:
+            unjoinable_applied += 1
+            continue
+        replied = bool(rec["statuses"].intersection(TEMPLATE_REPLY_STATUSES))
+        for bucket, tid in ((by_outreach, rec["otid"]), (by_linkedin, rec["ltid"])):
+            stats = bucket.setdefault(tid, {"sent": 0, "replied": 0})
+            stats["sent"] += 1
+            if replied:
+                stats["replied"] += 1
+        totals["sent"] += 1
+        if replied:
+            totals["replied"] += 1
+
+    for bucket in (by_outreach, by_linkedin):
+        for stats in bucket.values():
+            stats["reply_rate"] = (stats["replied"] / stats["sent"] * 100) if stats["sent"] else 0.0
+    totals["reply_rate"] = (totals["replied"] / totals["sent"] * 100) if totals["sent"] else 0.0
+
+    return {
+        "by_outreach_template": by_outreach,
+        "by_linkedin_template": by_linkedin,
+        "totals": totals,
+        "unjoinable_applied": unjoinable_applied,
+    }
+
+def format_template_reply_rates_message():
+    """Render get_template_reply_rates() as an HTML Telegram message (used by /treplies)."""
+    data = get_template_reply_rates()
+    lines = [
+        "📊 <b>Reply Rate by Template</b>",
+        "<i>sent = has an 'applied' outcome · replied = also got interview/rejection/offer</i>",
+    ]
+
+    for label, bucket in (
+        ("Outreach email — by outreach_template_id", data["by_outreach_template"]),
+        ("LinkedIn note — by linkedin_template_id", data["by_linkedin_template"]),
+    ):
+        lines.append("")
+        lines.append(f"<b>{label}:</b>")
+        if not bucket:
+            lines.append("• No sent outreach recorded yet.")
+            continue
+        for tid in sorted(bucket, key=lambda t: (t is None, t if t is not None else -1)):
+            stats = bucket[tid]
+            tid_str = "(unset)" if tid is None else f"#{tid}"
+            lines.append(
+                f"• {tid_str}: {stats['sent']} sent → {stats['replied']} replied "
+                f"({stats['reply_rate']:.1f}%)"
+            )
+
+    t = data["totals"]
+    lines.append("")
+    lines.append(
+        f"<b>All templates:</b> {t['sent']} sent → {t['replied']} replied ({t['reply_rate']:.1f}%)"
+    )
+    if data["unjoinable_applied"]:
+        lines.append(
+            f"<i>{data['unjoinable_applied']} applied row(s) skipped — no cached job to "
+            f"read a template id from.</i>"
+        )
+    return "\n".join(lines)
+
 DAILY_ACTIVITY_COLUMNS = ("drafts_staged", "applied_count", "notes_logged")
 
 def log_daily_activity(activity_type):
@@ -4555,6 +4686,10 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, format_outcome_metrics_message())
             return
 
+        if text in ("/treplies", "/templatereplies"):
+            send_telegram_message(chat_id, format_template_reply_rates_message())
+            return
+
         if text in ["/streak", "/daily"]:
             today_activity = get_daily_activity(datetime.now().strftime("%Y-%m-%d"))
             lifetime = get_lifetime_activity_totals()
@@ -5056,6 +5191,7 @@ def process_webhook_payload_async(data):
                 "/funnel - View pipeline conversion funnel\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
+                "/treplies - View reply rate grouped by outreach & LinkedIn template id (read-only)\n"
                 "/streak, /daily - View daily outreach scorecard\n"
                 "/help - Show this reference"
             )

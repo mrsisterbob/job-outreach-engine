@@ -1287,3 +1287,62 @@ def test_reply_routing_writes_nothing_without_a_sheet_uuid(reply_routing):
 def test_every_reply_payload_carries_the_standard_row_operation_order(reply_routing):
     m.route_inbound_reply_to_crm(_match("Tetiana Cold"), "GENERAL", "Re: hi", "Hello there")
     assert all(p["rowOperationOrder"] == "DESC" for p in reply_routing())
+
+
+# ---- Reply rate by template (read-only report) ----
+
+@pytest.fixture
+def clean_outcomes():
+    """clean_tables (autouse) truncates `jobs` but not `application_outcomes`; do that here."""
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM application_outcomes")
+        conn.commit()
+    yield
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM application_outcomes")
+        conn.commit()
+
+
+def test_template_reply_rates_joins_outcomes_back_to_persisted_template_ids(clean_outcomes):
+    """application_outcomes.sheet_uuid -> jobs.sheet_uuid -> job_json template ids. Raw
+    (sent, replied) counts stay visible per template so a 1/1 doesn't hide behind 100%."""
+    def _job(short_id, otid, ltid):
+        return m.save_job_to_cache(short_id, {
+            "employer_name": "Atwell", "job_title": "Ops",
+            "outreach_template_id": otid, "linkedin_template_id": ltid,
+        })
+
+    uuid_a = _job("rrA", 0, 2)   # applied + interview  -> replied
+    uuid_b = _job("rrB", 0, 2)   # applied only         -> not replied
+    uuid_c = _job("rrC", 1, 2)   # applied + rejection  -> replied
+    uuid_d = _job("rrD", 1, 3)   # interview only, never /applied -> not a "sent"
+
+    for u in (uuid_a, uuid_b, uuid_c):
+        m.record_application_outcome(u, "applied", company="Atwell")
+    m.record_application_outcome(uuid_a, "interview", company="Atwell")
+    m.record_application_outcome(uuid_c, "rejection", company="Atwell")
+    m.record_application_outcome(uuid_d, "interview", company="Atwell")
+    m.record_application_outcome("uuid-with-no-cached-job", "applied", company="Ghost")
+
+    data = m.get_template_reply_rates()
+
+    assert data["by_outreach_template"][0] == {"sent": 2, "replied": 1, "reply_rate": 50.0}
+    assert data["by_outreach_template"][1] == {"sent": 1, "replied": 1, "reply_rate": 100.0}
+    assert data["by_linkedin_template"][2] == {"sent": 3, "replied": 2, "reply_rate": pytest.approx(66.667, abs=0.01)}
+    assert 3 not in data["by_linkedin_template"]  # job D was never "sent"
+    assert data["totals"] == {"sent": 3, "replied": 2, "reply_rate": pytest.approx(66.667, abs=0.01)}
+    assert data["unjoinable_applied"] == 1
+
+
+def test_template_reply_rates_buckets_a_job_cached_before_ids_were_persisted(clean_outcomes):
+    """json_extract -> NULL for a legacy job with no template ids; it lands in the (unset) bucket
+    rather than being dropped or crashing."""
+    legacy = m.save_job_to_cache("rrLegacy", {"employer_name": "Atwell", "job_title": "Ops"})
+    m.record_application_outcome(legacy, "applied", company="Atwell")
+    m.record_application_outcome(legacy, "interview", company="Atwell")
+
+    data = m.get_template_reply_rates()
+    assert data["by_outreach_template"][None] == {"sent": 1, "replied": 1, "reply_rate": 100.0}
+    assert data["by_linkedin_template"][None] == {"sent": 1, "replied": 1, "reply_rate": 100.0}
+    msg = m.format_template_reply_rates_message()
+    assert "(unset): 1 sent → 1 replied (100.0%)" in msg
