@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Pin collection to the two real suites. Without this, a bare `pytest` walks the repo root and
+# picks up anything matching test_*.py - which is how scripts/clean_crm_contacts.py (then named
+# test_crm_fix.py) used to fail the entire run at collection time before it had run a single test.
+# Both suites are fully offline: no network, no live CRM, their own temp SQLite file.
+testpaths = ["test_pipeline_utils.py", "test_main_integration.py"]

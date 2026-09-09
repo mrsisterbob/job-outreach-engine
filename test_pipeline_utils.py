@@ -559,7 +559,11 @@ def test_template_banks_have_the_exact_lengths_gemini_routes_against():
     outreach = _load_bank("outreach_templates.json")
     linkedin = _load_bank("linkedin_templates.json")
     assert len(outreach["cold_ops"]) == 6
-    assert len(outreach["warm_alumni"]) == 2
+    # warm_alumni is the one pool Gemini does NOT route into: outreach_template_id is le=5 and
+    # selects cold_ops, while generate_warm_email takes an explicit template_id (default 0). So
+    # this count is a /edit addressing contract (W0-W5), not a routing one, and growing the pool
+    # is safe. Six entries so the highest-converting path has real variety in the ask.
+    assert len(outreach["warm_alumni"]) == 6
     assert len(outreach["followup_bumps"]) == 2
     assert len(linkedin["linkedin_templates"]) == 10
 

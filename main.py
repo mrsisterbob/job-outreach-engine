@@ -1,3 +1,4 @@
+import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -8,6 +9,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -5287,7 +5289,20 @@ def process_webhook_payload_async(data):
     except Exception as e:
         logging.error(f"Async Webhook Processing Error: {e}")
 
-if not os.environ.get("PYTEST_CURRENT_TEST"):  # keep background daemons out of the test process
+def _is_oneshot_invocation():
+    """True when this process was launched as `python main.py --once` (the CI batch entrypoint).
+
+    Reads sys.argv directly rather than the argparse result in __main__: the scheduler block below
+    runs while this module is still being imported, which is strictly before __main__ executes, so
+    an args object would not exist yet. sys.argv is populated by the interpreter before any module
+    code runs at all, making it the earliest thing that can answer the question.
+    """
+    return "--once" in sys.argv[1:]
+
+# Background daemons belong to the long-lived Flask server only. Two exclusions, both at import
+# time: pytest (must never poll Gmail or write to the live CRM) and --once (a one-shot batch run -
+# these threads would keep the process alive past the pipeline and could write to the CRM mid-run).
+if not os.environ.get("PYTEST_CURRENT_TEST") and not _is_oneshot_invocation():
     start_gmail_poller()
     start_crm_outbox_worker()
     start_morning_digest()
@@ -5584,4 +5599,30 @@ def desktop_ingest():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Job outreach engine: Flask server, or a one-shot batch pipeline run.")
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Run one job pipeline pass, then exit (the CI / workflow_dispatch entrypoint). "
+             "Background daemons stay off - see _is_oneshot_invocation(). Without this flag the "
+             "Flask server starts as before."
+    )
+    parser.add_argument(
+        "--top-n", type=int, default=2,
+        help="Cards to dispatch in --once mode (default 2, matching /t's qty default and "
+             "run_job_pipeline's own signature)."
+    )
+    args = parser.parse_args()
+
+    if args.once:
+        logging.info(f"[ONCE] One-shot pipeline run starting (top_n={args.top_n}, no background daemons)")
+        try:
+            dispatched = run_job_pipeline(chat_id=TELEGRAM_CHAT_ID, top_n=args.top_n)
+        except Exception as e:
+            # Exit non-zero so a failed run shows red in Actions instead of passing silently.
+            logging.error(f"[ONCE] Pipeline run failed: {e}", exc_info=True)
+            sys.exit(1)
+        # A run that dispatches nothing is a valid outcome (no new matches), not a failure.
+        logging.info(f"[ONCE] Pipeline run completed: {dispatched} cards dispatched")
+        sys.exit(0)
+
     app.run(host="0.0.0.0", port=5000)

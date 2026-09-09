@@ -1,14 +1,14 @@
 {
   "linkedin_templates": [
-    "Hi{name}. Saw the {job_title} opening at {company}. I'd like to connect.",
+    "Hi{name}. Most of my week is Python and SQL that replaced manual reconciliation at a wealth firm. The {job_title} opening at {company} is that same work.",
     "Hi{name}. Saw the {job_title} role at {company}. Most of my work is Python and SQL that replaced manual reporting, and I think it'd carry over well at {company}.",
     "Hi{name}. Saw the {job_title} opening at {company}. I've been reconciling custodial ledgers against internal records daily. Happy to connect.",
-    "Hi{name}. Saw {company} is hiring a {job_title}. I clean up Salesforce ticket queues and the routing errors behind them. Figured I'd connect.",
+    "Hi{name}. I traced a Salesforce routing collision between our trading and service desks that was quietly causing SLA breaches. Fixing it prevented 10. Might be relevant at {company}.",
     "Hi{name}. I've applied for the {job_title} role at {company}. Wanted to connect here too in case that's easier.",
-    "Hi{name}. Saw the {job_title} posting at {company}. Most of my week is data integrity work across Salesforce and internal databases, curious if that overlaps at {company}.",
+    "Hi{name}. My week is mostly data integrity work across Salesforce and internal databases. The {job_title} role at {company} overlaps. Happy to connect.",
     "Hi{name}. Saw the {job_title} opening at {company}. I've built Power BI dashboards and SQL variance checks for an operations team in Detroit. Happy to connect.",
     "Hi{name}. Saw {company} posted a {job_title} role. I've automated DocuSign and onboarding workflows for 150+ advisors. I'd like to connect.",
     "Hi{name}. I'm in Detroit doing wealth operations and process automation. Saw the {job_title} opening at {company} and wanted to connect.",
-    "Hi{name}. Saw {company} is hiring a {job_title}. I've built Python tools that took manual reconciliation off my team's plate, curious how {company} handles it."
+    "Hi{name}. I've built Python tools that took manual reconciliation off my team's plate. Curious how {company} handles it now. Happy to connect."
   ]
 }

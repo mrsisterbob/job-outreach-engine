@@ -1,5 +1,6 @@
 # job-outreach-engine
 
+[![Tests](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml)
 <!-- AUTO-STATS:START -->
 ![Lines of source](https://img.shields.io/badge/source-5985_lines-c9a24b)
 ![Tests](https://img.shields.io/badge/tests-54-4a8a5c)

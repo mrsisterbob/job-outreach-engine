@@ -1,3 +1,16 @@
+"""Manual one-off: dry-run Gemini's CRM contact cleaner over the first 10 'Carmen Warm' rows.
+
+NOT a test and not part of the automated suite - it makes a live Gemini API call and prints its
+findings for eyeballing rather than asserting anything. It lived at test_crm_fix.py, where pytest
+collected test_clean_crm() by name and failed the whole run at collection.
+
+Requires, neither of which CI has:
+  * a local "Job_Outreach_CRM (5).xlsx" export sitting next to this script's working directory
+    (it is deliberately untracked - it holds real contact data)
+  * a live GEMINI_API_KEY in the environment
+
+Run it by hand:  python scripts/clean_crm_contacts.py
+"""
 import os
 import json
 import re
@@ -26,7 +39,7 @@ def call_gemini(prompt):
         print(f"API Exception: {e}")
     return None
 
-def test_clean_crm():
+def clean_crm_contacts():
     if not os.path.exists(EXCEL_PATH):
         print(f"❌ Could not find {EXCEL_PATH} in the project folder. Make sure it's in the root directory.")
         return
@@ -79,4 +92,4 @@ Respond ONLY with a JSON list matching the input order:
         print(f"❌ JSON Parse Error: {e}\nRaw Response:\n{response_text}")
 
 if __name__ == "__main__":
-    test_clean_crm()
+    clean_crm_contacts()
