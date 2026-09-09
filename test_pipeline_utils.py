@@ -592,10 +592,15 @@ def test_every_shipped_template_passes_the_voice_linter():
 
 
 def test_shipped_templates_open_on_a_bare_hi_when_no_name_is_known():
-    # The card never knows the recipient's name, so the old "Hi there," default is gone.
+    # The card never knows the recipient's name, so the old "Hi there," default is gone. A
+    # template may use {name} ("Hi{name},") or the bare-name-on-its-own-line form ({name_bare},
+    # per the forensic voice report's rule 11 for a senior external stranger) - both must still
+    # degrade to a bare "Hi," when no contact name is resolved, since neither is a name to open on.
     for template in _load_bank("outreach_templates.json")["cold_ops"]:
-        assert m.interpolate_template(template, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE).startswith("Hi,")
-        assert m.interpolate_template(template, name="Dana", company=_LINT_COMPANY, job_title=_LINT_TITLE).startswith("Hi Dana,")
+        no_name = m.interpolate_template(template, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE)
+        with_name = m.interpolate_template(template, name="Dana", company=_LINT_COMPANY, job_title=_LINT_TITLE)
+        assert no_name.startswith("Hi,")
+        assert with_name.startswith("Hi Dana,") or with_name.startswith("Dana,")
 
 
 def test_gmail_generators_pass_the_same_linter_as_the_card_templates():

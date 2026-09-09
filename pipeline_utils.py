@@ -329,7 +329,12 @@ _OUTREACH_BANNED_PATTERNS = [
     (r"if you think I", "self-deprecating hedge"),
     (r"\b(?:excited|thrilled|exciting|admire|impressive)\b", "performed enthusiasm / company praise"),
     (r"\b(?:mission|culture|rapid growth)\b", "praise for the company's mission/culture/growth"),
-    (r"\b(?:five|ten|fifteen|thirty|5|10|15|30)[- ]minutes?\b", "timeboxed ask - use 'a quick chat' / 'a few minutes'"),
+    # Round-number minute asks read like a scheduling tool, not a person. Kevin's own sent mail
+    # (forensic voice report, Sep 2026) shows the opposite of "vague ask" being the fix: his real
+    # habit is an odd, specific number - "Do you have 16 minutes?", "14 minutes" - never a round
+    # 5/10/15/30 and never a vague "quick chat" either. So this bans the round numbers only;
+    # odd counts (11, 13, 14, 16, ...) are the voice, not a violation.
+    (r"\b(?:five|ten|fifteen|twenty|thirty|5|10|15|20|30)[- ]minutes?\b", "round-number timeboxed ask - use an odd specific count instead (e.g. '13 minutes', '16 minutes')"),
 ]
 
 _OUTREACH_BANNED_RULES = [(re.compile(p, re.IGNORECASE), msg) for p, msg in _OUTREACH_BANNED_PATTERNS]

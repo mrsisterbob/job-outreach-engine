@@ -228,8 +228,9 @@ def resolve_template_text(pool, idx, fallback_text=""):
     return pool[idx]
 
 def interpolate_template(template, name="", company="", job_title=""):
-    """Deterministically fills {name}/{company}/{job_title} placeholders via str.format() - the
-    only place candidate-facing outreach/LinkedIn copy is ever assembled. Never calls Gemini.
+    """Deterministically fills {name}/{name_bare}/{company}/{job_title} placeholders via
+    str.format() - the only place candidate-facing outreach/LinkedIn copy is ever assembled.
+    Never calls Gemini.
 
     {name} renders WITH a leading space when a contact name is known and as an empty string when
     it is not, so a template written "Hi{name}," yields "Hi Dana," or a bare "Hi," - never the old
@@ -237,6 +238,11 @@ def interpolate_template(template, name="", company="", job_title=""):
     hand-typed "Hi {name}," from /edit is normalized here so the phone-editing path stays forgiving.
     The literal "there" is scrubbed too, so any caller still passing the retired sentinel degrades
     to "Hi," rather than reintroducing it.
+
+    {name_bare} is the "<First>," salutation-on-its-own-line form (voice rule: reserved for a
+    senior external stranger, never a generic greeting) - it needs a real first name to make
+    sense, so a template opening with it must have "Hi{name}," as a fallback line for when no
+    contact name is resolved. See resolve_outreach_copy()/process_single_candidate() callers.
     """
     clean_name = str(name or "").strip()
     if clean_name.lower() == "there":
@@ -245,6 +251,7 @@ def interpolate_template(template, name="", company="", job_title=""):
     try:
         return normalized.format(
             name=f" {clean_name}" if clean_name else "",
+            name_bare=f"{clean_name}," if clean_name else "Hi,",
             company=company or "your team",
             job_title=job_title or "this role",
         )
