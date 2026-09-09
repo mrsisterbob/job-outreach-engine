@@ -257,7 +257,8 @@ def test_sequencer_stale_nudge_and_top_matched_do_not_write(monkeypatch):
     assert [r["sheet_uuid"] for r in result["top_matched"]] == ["seq-m1", "seq-m2"]
     assert result["top_matched"][0]["fit_score"] == 88.0
     assert all(p["sheet_uuid"] not in ("seq-m1", "seq-m2") for p in enqueued)
-    assert result["counts"] == {"followups_ready": 1, "going_cold": 1, "buried": 1, "top_matched": 2}
+    assert result["counts"] == {"followups_ready": 1, "going_cold": 1, "buried": 1,
+                                "top_matched": 2, "buries_suppressed": 0}
 
 
 def test_sequencer_is_idempotent_across_two_consecutive_runs(monkeypatch):
@@ -278,10 +279,94 @@ def test_sequencer_dry_run_performs_zero_writes(monkeypatch):
     enqueued = _mock_sequencer_crm(monkeypatch)
     result = m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True)
 
-    assert result["counts"] == {"followups_ready": 1, "going_cold": 1, "buried": 1, "top_matched": 2}
+    assert result["counts"] == {"followups_ready": 1, "going_cold": 1, "buried": 1,
+                                "top_matched": 2, "buries_suppressed": 0}
     assert enqueued == []
     with m.get_db_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
+
+
+# ---- Bury safety cap (MAX_AUTO_BURIES_PER_RUN) ----
+
+def _mock_bury_backlog(monkeypatch, count):
+    """Stand up `count` Applied rows all well past FOLLOWUP_BURY_DAYS - the stale-CRM shape where
+    the whole backlog turns bury-eligible on one pass."""
+    rows = [{"sheet_uuid": f"bury-{i}", "company": f"Co{i}", "title": "Ops", "name": "",
+             "status": "Applied", "date_added": "2026-04-01", "next_followup": "1970-01-01",
+             "raw_priority": "50"} for i in range(count)]
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(r) for r in rows] if code == "TC" else [])
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    return enqueued
+
+
+def _logged_uuids():
+    with m.get_db_conn() as conn:
+        return {row[0] for row in conn.execute("SELECT sheet_uuid FROM followup_sequencer_log")}
+
+
+def test_sequencer_under_the_bury_cap_writes_every_row(monkeypatch):
+    under = m.MAX_AUTO_BURIES_PER_RUN - 1
+    enqueued = _mock_bury_backlog(monkeypatch, under)
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert len(result["buried"]) == under
+    assert len([p for p in enqueued if p["action"] == "update_status"]) == under
+    assert result["counts"]["buries_suppressed"] == 0
+    assert len(_logged_uuids()) == under
+
+
+def test_sequencer_over_the_bury_cap_writes_exactly_max_and_reports_the_rest(monkeypatch):
+    over = m.MAX_AUTO_BURIES_PER_RUN + 5
+    enqueued = _mock_bury_backlog(monkeypatch, over)
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    # Every eligible row is reported on the card...
+    assert len(result["buried"]) == over
+    # ...but only MAX are actually written (append_note + update_status each).
+    assert len([p for p in enqueued if p["action"] == "update_status"]) == m.MAX_AUTO_BURIES_PER_RUN
+    assert len([p for p in enqueued if p["action"] == "append_note"]) == m.MAX_AUTO_BURIES_PER_RUN
+    assert result["counts"]["buries_suppressed"] == 5
+
+
+def test_sequencer_suppressed_buries_stay_eligible_for_the_next_run(monkeypatch):
+    over = m.MAX_AUTO_BURIES_PER_RUN + 5
+    enqueued = _mock_bury_backlog(monkeypatch, over)
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    # The withheld rows must NOT be logged as actioned, or they would never be retried.
+    written = {p["sheet_uuid"] for p in enqueued}
+    assert _logged_uuids() == written
+    assert len(_logged_uuids()) == m.MAX_AUTO_BURIES_PER_RUN
+
+    # A second pass drains the remainder rather than skipping it as already-actioned.
+    enqueued.clear()
+    second = m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert len([p for p in enqueued if p["action"] == "update_status"]) == 5
+    assert second["counts"]["buries_suppressed"] == 0
+    assert len(_logged_uuids()) == over
+
+
+def test_sequencer_dry_run_is_unaffected_by_the_bury_cap(monkeypatch):
+    over = m.MAX_AUTO_BURIES_PER_RUN + 5
+    enqueued = _mock_bury_backlog(monkeypatch, over)
+    result = m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True)
+
+    assert len(result["buried"]) == over
+    assert result["counts"]["buries_suppressed"] == 0  # nothing was withheld because nothing was written
+    assert enqueued == []
+    assert _logged_uuids() == set()
+
+
+def test_needs_card_flags_withheld_buries_in_the_buried_section_and_summary(monkeypatch):
+    _mock_bury_backlog(monkeypatch, m.MAX_AUTO_BURIES_PER_RUN + 5)
+    card = m.render_followup_needs_card(m.run_followup_sequencer(today=_SEQ_TODAY))
+
+    assert "Buried overnight (15)" in card
+    assert "5 of these were withheld by the safety cap" in card
+    assert "re-run" in card.lower()
+    assert "5 buries capped" in card
 
 
 # ---- Daily "needs you today" card (render_followup_needs_card) ----
@@ -1197,6 +1282,38 @@ def test_hybrid_score_modifier_returns_the_signed_layer1_shift(monkeypatch):
     }
     fs2, b2 = m.calculate_hybrid_score_modifier(penal, 80)
     assert b2 == -20 and fs2 == 60  # negative Layer-1 modifier reported straight through
+
+
+# ---- Gemini screening fails closed without a key ----
+
+def test_evaluate_job_without_a_key_fails_closed_instead_of_passing(monkeypatch):
+    monkeypatch.setattr(m, "GEMINI_API_KEY", "")
+    monkeypatch.setattr(m, "should_send_alert", lambda *a, **k: False)
+    result = m.evaluate_job_with_gemini({"job_title": "Ops Analyst", "employer_name": "Acme"})
+
+    passed, score, reason = result[0], result[1], result[2]
+    assert passed is False and score == 0     # must not clear the >= 65 gate
+    assert reason == "Evaluation Pending"
+    # identical to the API-failure / parse-failure sibling returns
+    assert result == (False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0, 0, 0)
+
+
+def test_evaluate_job_without_a_key_alerts_but_only_through_the_debounce(monkeypatch):
+    monkeypatch.setattr(m, "GEMINI_API_KEY", "")
+    alerts, gate = [], {"open": True}
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+
+    def fake_gate(key, cooldown_hours=6):
+        assert key == "gemini_key_missing"
+        was_open, gate["open"] = gate["open"], False   # mirrors should_send_alert's one-shot cooldown
+        return was_open
+
+    monkeypatch.setattr(m, "should_send_alert", fake_gate)
+
+    for _ in range(20):   # the ThreadPoolExecutor width - an undebounced alert would fire 20 times
+        m.evaluate_job_with_gemini({"job_title": "Ops Analyst", "employer_name": "Acme"})
+    assert len(alerts) == 1
+    assert "GEMINI_API_KEY" in alerts[0]
 
 
 @pytest.fixture

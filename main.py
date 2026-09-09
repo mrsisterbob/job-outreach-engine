@@ -30,7 +30,7 @@ from pipeline_utils import (
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
-    REPLY_FOLLOWUP_DAYS,
+    REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -2243,7 +2243,13 @@ def evaluate_job_with_gemini(job):
     Layer 1 + Layer 2 bonus stack (BONUS_STACK_CAP) against the true base.
     """
     if not GEMINI_API_KEY:
-        return True, 75, "Fallback pass (No Key)", "a", "conservative", [0, 1, 2], 0, 0, 0, 75
+        # Fail closed like every other failure path below: a missing key means nothing was screened,
+        # and passing at a fabricated 75 would clear the >= 65 gate and ship every job unscreened.
+        # Debounced because this runs inside a 20-worker pool - send_health_alert has no cooldown
+        # of its own, so without should_send_alert one keyless run would fire 20 Telegram messages.
+        if should_send_alert("gemini_key_missing"):
+            send_health_alert("GEMINI_API_KEY is unset - every candidate is failing closed as 'Evaluation Pending'. Expect a zero-result run until the key is restored.")
+        return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0, 0, 0
 
     try:
         desc_truncated = str(job.get("job_description") or "")[:1800]
@@ -3658,6 +3664,8 @@ def run_followup_sequencer(today=None, dry_run=False):
     (b) across days - a queued follow-up pushes Next Followup Date to the next window boundary
     (so followup_action()'s future gate returns "none" until then) and a bury moves the row off
     the scanned tabs entirely.
+
+    Buries are capped at MAX_AUTO_BURIES_PER_RUN per pass (see counts["buries_suppressed"]).
     """
     if isinstance(today, datetime):
         today = today.date()
@@ -3676,6 +3684,8 @@ def run_followup_sequencer(today=None, dry_run=False):
             records.append({**rec, "sheet_tab": tab_name})
 
     result = {"followups_ready": [], "going_cold": [], "buried": [], "top_matched": [], "counts": {}}
+    buries_written = 0
+    buries_suppressed = 0
 
     for rec in records:
         action = followup_action(rec.get("status"), rec.get("date_added"), rec.get("next_followup"), today)
@@ -3710,10 +3720,17 @@ def run_followup_sequencer(today=None, dry_run=False):
             })
             if dry_run or already or not sheet_uuid:
                 continue
+            if buries_written >= MAX_AUTO_BURIES_PER_RUN:
+                # Over the safety cap: report the row on the card but write nothing. Deliberately
+                # skipping _record_sequencer_action too - logging it would mark the row actioned
+                # and it would never be retried, turning a deferred bury into a lost one.
+                buries_suppressed += 1
+                continue
             # The one automatic write: note the reason (row still in its source tab), then move to Died.
             enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=sheet_uuid, note="[reason: ghosted]"))
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Died"))
             _record_sequencer_action(sheet_uuid, run_date, action)
+            buries_written += 1
 
         elif action == "stale_nudge":
             result["going_cold"].append({
@@ -3734,6 +3751,10 @@ def run_followup_sequencer(today=None, dry_run=False):
         })
 
     result["counts"] = {k: len(result[k]) for k in ("followups_ready", "going_cold", "buried", "top_matched")}
+    # Not a section length like the four above: how many of result["buried"] were reported but
+    # left unwritten by the cap. Never nonzero on its own (it implies buried > 0), so the card's
+    # all-empty early return stays correct.
+    result["counts"]["buries_suppressed"] = buries_suppressed
     return result
 
 def _seq_id_tag(entry):
@@ -3783,6 +3804,14 @@ def render_followup_needs_card(result, on_demand=False):
             company = html.escape(str(e.get("company") or "—"))
             role = html.escape(str(e.get("role") or "—"))
             lines.append(f"• <b>{company}</b> — {role} · <code>{html.escape(_seq_id_tag(e))}</code>")
+        suppressed = counts.get("buries_suppressed", 0)
+        if suppressed:
+            # The listed rows above are a mix of written and withheld - say so, or the card
+            # would claim buries the CRM never received.
+            lines.append(
+                f"🛑 <i>{suppressed} of these were withheld by the safety cap "
+                f"(max {MAX_AUTO_BURIES_PER_RUN}/run) and not written — re-run to process the rest.</i>"
+            )
 
     top = result.get("top_matched", [])
     if top:
@@ -3793,11 +3822,14 @@ def render_followup_needs_card(result, on_demand=False):
             fit = e.get("fit_score") or 0
             lines.append(f"• {fit:g} · <b>{company}</b> — {role} · <code>{html.escape(_seq_id_tag(e))}</code>")
 
-    lines.append(
+    summary = (
         f"\n<b>Summary:</b> {counts.get('followups_ready', 0)} follow-ups · "
         f"{counts.get('going_cold', 0)} going cold · {counts.get('buried', 0)} buried · "
         f"{counts.get('top_matched', 0)} top matches"
     )
+    if counts.get("buries_suppressed", 0):
+        summary += f" · {counts['buries_suppressed']} buries capped"
+    lines.append(summary)
     return "\n".join(lines)
 
 def _send_telegram_card_chunked(chat_id, text, limit=3900):

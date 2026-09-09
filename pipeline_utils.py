@@ -196,6 +196,12 @@ STALE_HOT_DAYS = 5        # Replied/Screening/Interviewing untouched > 5d -> sta
 # is independent of the four constraints listed there - it only has to stay positive.
 REPLY_FOLLOWUP_DAYS = 4   # Any verified inbound reply -> Next Followup Date = today + 4d
 
+# Ceiling, not a cadence knob: a bury is two irreversible CRM writes (append_note + move to Died),
+# and eligibility is purely date-driven - so a CRM left stale for a month makes the entire Applied
+# backlog bury-eligible on the same pass, with no chance to intervene. Cap what one run may bury;
+# the overflow stays unlogged and eligible, so re-running drains the rest a batch at a time.
+MAX_AUTO_BURIES_PER_RUN = 10
+
 # Every value followup_action() can return.
 FOLLOWUP_ACTIONS = ("none", "send_followup_1", "send_followup_2", "bury_ghosted", "stale_nudge")
 
