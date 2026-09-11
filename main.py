@@ -1633,6 +1633,24 @@ def resolve_reply_mapping(msg, chat_id, command_label):
     send_telegram_message(chat_id, f"⚠️ <b>Record Not Found:</b> No CRM record is mapped to this card for <code>{html.escape(command_label)}</code>. Please retry with /t or /c to regenerate it.")
     return None
 
+# Sent when a swipe-reply command resolves a mapping but has no company data behind it - see
+# _job_data_available. Names the real cause (a restart wiped the cache, nothing expired by TTL)
+# so the fix - resurface the card - is obvious from the message itself.
+STALE_CARD_WARNING = (
+    "⚠️ <b>Card Data Gone:</b> This card predates the last deploy/restart, and the jobs cache "
+    "it was built from lives on ephemeral disk. Reply <code>/t</code> or <code>/c</code> to "
+    "resurface fresh cards, then re-run the command on one of those."
+)
+
+def _job_data_available(job, mapping):
+    """True if either the cached job JSON or the CRM mapping has real company data to work from.
+    False only when both are empty, meaning the caller is about to fall through to a hardcoded
+    placeholder like 'Target Firm' - the signal that a restart wiped the jobs cache for this
+    sheet_uuid with no CRM fallback available. A /quick Carmen contact (no cached job, but a
+    contact_company on the mapping) is a legitimate path, not a symptom, and passes.
+    """
+    return bool(job.get("employer_name")) or bool(mapping.get("contact_company"))
+
 # ==============================================================================
 # 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE
 # ==============================================================================
@@ -5152,6 +5170,9 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            if not _job_data_available(job, mapping):
+                send_telegram_message(chat_id, STALE_CARD_WARNING)
+                return
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
@@ -5208,6 +5229,9 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            if not _job_data_available(job, mapping):
+                send_telegram_message(chat_id, STALE_CARD_WARNING)
+                return
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
@@ -5261,6 +5285,9 @@ def process_webhook_payload_async(data):
                 return
             new_email = raw_email
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            if not _job_data_available(job, mapping):
+                send_telegram_message(chat_id, STALE_CARD_WARNING)
+                return
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
@@ -5301,6 +5328,9 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            if not _job_data_available(job, mapping):
+                send_telegram_message(chat_id, STALE_CARD_WARNING)
+                return
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             job_title = job.get("job_title") or "this role"
             prep = generate_interview_prep(comp, job_title, job.get("job_description", ""))
@@ -5319,6 +5349,9 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            if not _job_data_available(job, mapping):
+                send_telegram_message(chat_id, STALE_CARD_WARNING)
+                return
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             job_title = job.get("job_title") or "this role"
             pitch = generate_elevator_pitch(comp, job_title)
@@ -5334,6 +5367,9 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            if not _job_data_available(job, mapping):
+                send_telegram_message(chat_id, STALE_CARD_WARNING)
+                return
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             job_title = job.get("job_title") or "this role"
             letter = generate_cover_letter(comp, job_title, job.get("job_description", ""))
@@ -5351,6 +5387,9 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            if not _job_data_available(job, mapping):
+                send_telegram_message(chat_id, STALE_CARD_WARNING)
+                return
 
             # Fallback to the networking-record mapping (e.g. /quick contacts with no cached job) instead of blocking
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Company"
@@ -5711,7 +5750,16 @@ def desktop_stage_view(short_id):
     """
     job = get_job_from_cache(short_id)
     if not job:
-        return "<h3>Job not found or cache expired.</h3>", 404
+        # Nothing here has a TTL - the jobs cache sits on Render's ephemeral disk and is wiped by
+        # every deploy/restart, so say that instead of blaming an expiry that does not exist.
+        return (
+            "<div style='font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:520px;"
+            "margin:80px auto;padding:0 20px;color:#333;'>"
+            "<h3 style='margin-bottom:8px;'>This card's data is gone.</h3>"
+            "<p style='color:#666;line-height:1.5;'>It predates the last deploy/restart, which "
+            "wipes the job cache. Reply <code>/t</code> in Telegram to resurface fresh cards.</p>"
+            "</div>"
+        ), 404
 
     track = request.args.get("track") or job.get("track") or "a"
     comp = job.get("employer_name", "Target Firm")
@@ -5815,7 +5863,16 @@ def desktop_stage_pdf(short_id):
     """Serves raw PDF bytes for browser preview and download."""
     job = get_job_from_cache(short_id)
     if not job:
-        return "Job cache expired", 404
+        # Same restart-wipe cause as the /stage page above - not a TTL expiry.
+        return (
+            "<div style='font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:520px;"
+            "margin:80px auto;padding:0 20px;color:#333;'>"
+            "<h3 style='margin-bottom:8px;'>This resume's source data is gone.</h3>"
+            "<p style='color:#666;line-height:1.5;'>The card predates the last deploy/restart, "
+            "which wipes the job cache. Reply <code>/t</code> in Telegram to resurface fresh "
+            "cards, then re-run <code>/cv</code>.</p>"
+            "</div>"
+        ), 404
     track = request.args.get("track") or job.get("track") or "a"
     comp = job.get("employer_name", "Target Firm")
     bullet_indices = job.get("bullet_indices")
