@@ -2449,7 +2449,17 @@ def passes_strict_filter(job):
     description = str(job.get("job_description") or "").lower()
     company = str(job.get("employer_name") or "").lower()
     city = str(job.get("job_city") or "").lower()
+    state = str(job.get("job_state") or "").strip().lower()
     salary_str, max_sal = extract_salary(job)
+
+    # Reject employer names that look like a job-board's internal listing ID rather than a real
+    # company (e.g. "AWSPRODVK1" from a ZipRecruiter aggregator posting with no employer resolved) -
+    # no spaces, no lowercase letters, and at least one digit. A real company name may be all-caps
+    # (e.g. "IBM") but won't also contain a digit with zero spaces.
+    raw_employer = str(job.get("employer_name") or "").strip()
+    if raw_employer and " " not in raw_employer and raw_employer == raw_employer.upper() and any(c.isdigit() for c in raw_employer):
+        logging.info(f"[EXCLUDED] employer_name '{raw_employer}' looks like a job-board ID, not a real company.")
+        return False
 
     if is_company_on_cooldown(company):
         return False
@@ -2458,9 +2468,14 @@ def passes_strict_filter(job):
     if company in applied_companies or clean_company in applied_companies:
         logging.info(f"[EXCLUDED] {company} is already in Tetiana Warm (applied).")
         return False
-    
+
     min_sal_floor = safe_int(get_filter("min_salary"), 50000)
     if max_sal > 0 and max_sal < min_sal_floor:
+        return False
+
+    # Same-named city in another state (e.g. Birmingham AL vs. Birmingham MI) would otherwise
+    # pass the city substring check below - reject it first when the API told us the state.
+    if state and state not in ("mi", "michigan"):
         return False
 
     valid_cities = get_filter("valid_cities", [])
@@ -2473,6 +2488,18 @@ def passes_strict_filter(job):
     is_in_metro_area = any(c in city for c in valid_cities)
     if not is_in_metro_area:
         return False
+
+    # JSearch/OpenWebNinja can flag a posting as expired (job board removed it since being scraped)
+    # even though it's still returned for the "month" date_posted window - reject it outright when
+    # the API tells us; a missing/blank field is not treated as "expired" (fail open, not closed).
+    expiration = job.get("job_offer_expiration_datetime_utc")
+    if expiration:
+        try:
+            expiry_dt = datetime.fromisoformat(str(expiration).replace("Z", "+00:00"))
+            if expiry_dt < datetime.now(timezone.utc):
+                return False
+        except (ValueError, TypeError):
+            pass
 
     exp_floor = safe_int(get_filter("experience_salary_floor"), 60000)
     if any(k in description for k in ["3+ years", "3-5 years", "4+ years"]) and (0 < max_sal < exp_floor):
