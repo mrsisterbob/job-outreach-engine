@@ -8,6 +8,7 @@ it only ever selects a track letter (a-e) and a list of pool indices, which this
 and bounds-checks against the actual bullet pool before rendering.
 """
 
+import difflib
 import io
 import json
 import logging
@@ -89,12 +90,10 @@ TRACK_BULLET_POOL_KEYS = {
     "e": "track_e_bizops",
 }
 
-# Indices within specific (track, tone_mode) pairs that contain Web3/crypto/tokenization
-# references - excluded whenever tone_mode is "conservative", regardless of what Gemini routed.
-TRACK_TONE_CONSTRAINTS = {
-    ("c", "conservative"): [2],  # e.g., Form D digital asset/tokenization bullet
-}
-_SAFE_FALLBACK_INDICES = [0, 1, 3]
+# Indices within specific (track, tone_mode) pairs to exclude regardless of what Gemini routed.
+# apply_tone_filter() already scrubs crypto/Web3 wording from bullet prose, so an index belongs
+# here only when the underlying work itself is off-message for the tone - not merely its phrasing.
+TRACK_TONE_CONSTRAINTS = {}
 
 # Persona framing only (subtitle/keywords/skills prose) - every skill named here must already
 # exist in evidence_bank.json's technical_skills; factual content (jobs, dates, bullets) lives in the bank.
@@ -102,7 +101,7 @@ TRACKS = {
     "a": {
         "subtitle": "Financial Systems & Operations",
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
-        "summary": "I reconcile custodial accounts and automate onboarding paperwork using Python and Salesforce.",
+        "summary": "I reconcile custodial accounts across 500+ client files and automate onboarding paperwork with Python and Salesforce.",
         "skills": [
             ("Core Operations", "Custodial Cashiering & Reconciliations, Ticketing Queue Management, RIA Audits, Automation."),
             ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Python, SQL, Excel.")
@@ -111,7 +110,7 @@ TRACKS = {
     "b": {
         "subtitle": "Data & Systems Engineering",
         "keywords": ("Python", "SQL", "REST APIs", "ETL", "Schema Architecture", "Process Automation"),
-        "summary": "I build lightweight Python scripts and database tools to automate manual back-office tasks.",
+        "summary": "I build Python and SQL tools that cut manual reporting work, including a pipeline that cleaned 1,500+ legacy account records.",
         "skills": [
             ("Engineering & Data", "Python, SQL, REST APIs, Webhook Integrations, SQLite WAL, Data Reconciliation."),
             ("Platforms & Stack", "Salesforce, HubSpot CRM, Flask, Typst, Schwab Advisor Center, Fidelity Wealthscape.")
@@ -120,7 +119,7 @@ TRACKS = {
     "c": {
         "subtitle": "Risk & Regulatory Compliance",
         "keywords": ("Regulatory Compliance", "SEC/FinCEN Filings", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
-        "summary": "I audit client onboarding files and draft SEC filings to catch compliance risks early.",
+        "summary": "I audit onboarding files across 500+ accounts and draft SEC Form D filings to catch compliance risks before execution.",
         "skills": [
             ("Compliance & Risk", "SEC & FinCEN Filings, Suitability Reviews, Custodial Exception Audits, Form D."),
             ("Systems & Controls", "Salesforce Queue Routing, DocuSign API, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
@@ -129,7 +128,7 @@ TRACKS = {
     "d": {
         "subtitle": "Business Intelligence & Analytics",
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
-        "summary": "I build SQL queries and Power BI dashboards to reconcile complex financial data.",
+        "summary": "I write SQL and build Power BI dashboards that resolved $250k in ledger variances across institutional custody accounts.",
         "skills": [
             ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Advanced Excel Modeling."),
             ("Systems & Data", "Salesforce Reports, bSwift, Schwab Advisor Center, Fidelity Wealthscape, Python (pandas).")
@@ -138,13 +137,36 @@ TRACKS = {
     "e": {
         "subtitle": "Business Operations & CRM Systems",
         "keywords": ("Business Operations", "Salesforce", "HubSpot CRM", "Process Automation", "Ticket Routing", "Python"),
-        "summary": "I design Salesforce ticket queues and DocuSign workflows to cut operational response times.",
+        "summary": "I design Salesforce queues and DocuSign workflows that cut advisor packet review from 60 minutes to 20.",
         "skills": [
             ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management, Process Design."),
             ("Systems & Tools", "Salesforce, HubSpot CRM, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Python.")
         ]
     }
 }
+
+# Above this similarity, a routed pool bullet is treated as the same claim as a static bullet.
+_DUPLICATE_BULLET_RATIO = 0.80
+
+
+def _bullets_of_other_jobs(evidence: dict) -> list:
+    """Static bullets belonging to every job EXCEPT the first one.
+
+    Routed bullets replace job 0's bullets, so a pool entry matching job 0 renders in the only
+    place it would have appeared anyway. Matching a LATER job is the problem: the same sentence
+    then appears twice on the page under two different employers, which reads as padding and
+    silently credits one job's work to another.
+    """
+    return [b for job in evidence.get("experience", [])[1:] for b in job.get("bullets", [])]
+
+
+def _is_duplicate_of_other_job(bullet: str, other_bullets: list) -> bool:
+    text = str(bullet or "").lower()
+    return any(
+        difflib.SequenceMatcher(None, text, str(other or "").lower()).ratio() >= _DUPLICATE_BULLET_RATIO
+        for other in other_bullets
+    )
+
 
 def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> list:
     """Resolves the actual bullet strings for a track + list of pool indices. Gemini only ever
@@ -178,15 +200,36 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode:
     if forbidden and any(i in forbidden for i in indices):
         original_len = len(indices)
         indices = [i for i in indices if i not in forbidden]
-        for fallback_i in _SAFE_FALLBACK_INDICES:
+        # Backfill from anywhere in the pool, not a fixed shortlist: a hardcoded [0, 1, 3] is a
+        # no-op whenever those indices are already selected, which silently shipped a short
+        # experience block instead of replacing the dropped bullet.
+        for fallback_i in range(len(pool)):
             if len(indices) >= original_len:
                 break
-            if fallback_i not in indices and fallback_i not in forbidden and 0 <= fallback_i < len(pool):
+            if fallback_i not in indices and fallback_i not in forbidden:
                 indices.append(fallback_i)
         if not indices:
             indices = [0]
 
-    selected = [pool[i] for i in indices if not any(bw in str(pool[i]).lower() for bw in banned)]
+    other_job_bullets = _bullets_of_other_jobs(evidence_bank)
+    target_len = len(indices)
+    kept = [
+        i for i in indices
+        if not any(bw in str(pool[i]).lower() for bw in banned)
+        and not _is_duplicate_of_other_job(pool[i], other_job_bullets)
+    ]
+    for fallback_i in range(len(pool)):
+        if len(kept) >= target_len:
+            break
+        if fallback_i in kept or fallback_i in forbidden:
+            continue
+        if any(bw in str(pool[fallback_i]).lower() for bw in banned):
+            continue
+        if _is_duplicate_of_other_job(pool[fallback_i], other_job_bullets):
+            continue
+        kept.append(fallback_i)
+
+    selected = [pool[i] for i in kept]
     return selected or pool[:4]
 
 def _render_experience_block(evidence: dict, dynamic_bullets: list = None) -> str:
@@ -248,14 +291,22 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative") -> s
     tone_key = str(tone_mode or "conservative").lower()
     projects = evidence.get("projects", [])
     for idx, proj in enumerate(projects):
-        name = escape_typst(apply_tone_filter(proj.get("name", ""), tone_key))
+        # A project name is a proper noun, so it is swapped wholesale via name_conservative rather
+        # than run through apply_tone_filter() - the regex turned "Crypto Breakout Alert" into
+        # "custodial systems Breakout Alert" on every conservative resume.
+        if tone_key == "conservative" and proj.get("name_conservative"):
+            name = escape_typst(proj["name_conservative"])
+        else:
+            name = escape_typst(proj.get("name", ""))
         location = escape_typst(proj.get("location", ""))
         start = escape_typst(proj.get("start", ""))
         end = escape_typst(proj.get("end", ""))
         bullets = proj.get("bullets", [])
         if idx > 0:
             lines.append("#v(6.0pt)")
-        lines.append(f"*{name}* #h(1fr) {location} | {start} -- {end}")
+        repo_raw = str(proj.get("repo", "") or "")
+        repo_link = f' | #link("https://{repo_raw}")[Source]' if repo_raw else ""
+        lines.append(f"*{name}*{repo_link} #h(1fr) {location} | {start} -- {end}")
         for b in bullets:
             clean_b = apply_tone_filter(b, tone_key)
             lines.append(f"- {escape_typst(clean_b)}")
@@ -293,6 +344,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     location = escape_typst(identity.get("location", ""))
     website_raw = str(identity.get("website", "") or "")
     linkedin_raw = str(identity.get("linkedin", "linkedin.com/in/kevinmiller") or "")
+    github_raw = str(identity.get("github", "") or "")
     website_label = escape_typst(website_raw)
 
     # Native Typst #link()[] syntax (never markdown [text](url)) - pipe-joined, skipping blank fields
@@ -302,6 +354,8 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
         contact_fields.append(f'#link("https://{website_raw}")[{website_label}]')
     if linkedin_raw:
         contact_fields.append(f'#link("https://{linkedin_raw}")[LinkedIn]')
+    if github_raw:
+        contact_fields.append(f'#link("https://{github_raw}")[GitHub]')
     contact_line = " • ".join(contact_fields)
 
     experience_block = _render_experience_block(evidence, dynamic_bullets=selected_bullets)

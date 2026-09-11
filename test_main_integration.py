@@ -927,14 +927,15 @@ def test_card_shows_apply_and_the_three_triage_moment_links(render_card):
     free-tier service. LinkedIn Leadership Search (overlaps Hiring Mgr) and the Alumni dork
     (already gets its own conditional line when a real alum is found) stay on /stage only."""
     text = render_card()
-    assert text.count("<a href=") == 5  # Apply, Hiring Mgr, Recruiter, Apollo, Full Card
+    assert text.count("<a href=") == 6  # Apply, Hiring Mgr, Recruiter, Apollo, Co. Posts, Full Card
     assert html.escape(_CARD_JOB["job_apply_link"], quote=True) in text
     for kept_url in (m.build_apollo_url("Atwell"), m.build_recruiter_dork("Atwell"),
-                     m.build_hiring_manager_dork("Atwell", _CARD_JOB["job_title"])):
+                     m.build_hiring_manager_dork("Atwell", _CARD_JOB["job_title"]),
+                     m.build_linkedin_company_posts_url("Atwell")):
         assert html.escape(kept_url, quote=True) in text
     for stage_only_url in (m.build_linkedin_url("Atwell"), m.build_alumni_dork("Atwell")):
         assert html.escape(stage_only_url, quote=True) not in text
-    for link_text in ("Hiring Mgr", "Recruiter", "Apollo"):
+    for link_text in ("Hiring Mgr", "Recruiter", "Apollo", "Co. Posts"):
         assert link_text in text
 
 

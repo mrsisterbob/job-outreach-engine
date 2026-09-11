@@ -29,6 +29,14 @@ def build_linkedin_url(company_name):
     return f"https://www.linkedin.com/search/results/people/?keywords={encoded}"
 
 
+def build_linkedin_company_posts_url(company_name):
+    """Best-effort LinkedIn company posts feed. The slug is guessed from the display name, so it
+    404s for companies whose handle differs (Ford -> ford-motor-company) - fine for a manual click.
+    """
+    slug = re.sub(r'\s+', '-', _strip_legal_suffixes(company_name).lower())
+    return f"https://www.linkedin.com/company/{urllib.parse.quote(slug)}/posts/?feedView=all"
+
+
 def _strip_legal_suffixes(company_name):
     """Strip common legal-entity suffixes (Inc, LLC, Corp, Holdings, etc.) and punctuation noise
     so decision-maker dorks never search on a garbled/truncated company name.

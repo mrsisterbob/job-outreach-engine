@@ -5,7 +5,8 @@
     "phone": "248-709-6326",
     "location": "Detroit, MI",
     "website": "montelattice.com",
-    "linkedin": "linkedin.com/in/kevinmiller"
+    "linkedin": "linkedin.com/in/kevinmiller",
+    "github": "github.com/mrsisterbob"
   },
   "experience": [
     {
@@ -82,6 +83,7 @@
     {
       "name": "Automated Job Pipeline & Custom Telegram CRM",
       "category": "systems",
+      "repo": "github.com/mrsisterbob/job-outreach-engine",
       "location": "Detroit, MI",
       "start": "07/2026",
       "end": "08/2026",
@@ -92,7 +94,9 @@
     },
     {
       "name": "Crypto Breakout Alert and Real Time Paper Trading Engine",
+      "name_conservative": "Market Breakout Alert and Real Time Paper Trading Engine",
       "category": "systems",
+      "repo": "github.com/mrsisterbob/crypto-trading-engine",
       "location": "Detroit, MI",
       "start": "04/2026",
       "end": "08/2026",

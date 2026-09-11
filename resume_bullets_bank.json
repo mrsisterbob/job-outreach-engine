@@ -20,7 +20,7 @@
     "Wrote strict JSON schema validation models in Python to block invalid payloads on REST API endpoints.",
     "Tested Salesforce and Orion Eclipse data connections alongside software teams to keep trading feeds stable.",
     "Wrote automated Python data scrapers using pandas, saving 15 hours of manual lookup time each week.",
-    "Set up dynamic reporting pipelines linking REST APIs to internal database tables for daily metrics.",
+    "Set up recurring reporting pipelines linking REST APIs to internal database tables for daily metrics.",
     "Built automated DocuSign API scripts that check account packages and trigger follow-up alerts for missing signatures."
   ],
   "track_c_risk_compliance": [

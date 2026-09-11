@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from resume_engine import compile_resume_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from response_schema import GeminiJobScreenerResponse
 from pipeline_utils import (
-    build_apollo_url, build_linkedin_url, build_hiring_manager_dork, build_recruiter_dork,
+    build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
     resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
     generate_dedup_hash, generate_short_key, parse_posted_hours, get_age_badge,
@@ -188,7 +188,8 @@ LINKEDIN_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "linkedin_templates.json")
 _FALLBACK_OUTREACH_TEMPLATES = {
     "cold_ops": ["Hi{name},\n\nYour {job_title} posting is what got me to write, but I mostly wanted your perspective on where the manual work still sits.\n\nMy day job is Python and SQL that replaces reporting people used to run by hand. Do you have 10 minutes for a brief call?\n\nHappy to work around your schedule.\n\nBest,\nKevin Miller"],
     "warm_alumni": ["Hi{name},\n\n[how you know them, and the specific occasion you last spoke]. [one concrete detail so this reads like you].\n\n[the one thing you want their perspective on at {company}]. [your ask, and a concrete time window].\n\nBest,\nKevin"],
-    "followup_bumps": ["Hi{name},\n\nCircling back on the {job_title} role in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nThanks,\nKevin Miller"]
+    "followup_bumps": ["Hi{name},\n\nCircling back on the {job_title} role in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nThanks,\nKevin Miller"],
+    "recruiter": ["Hi{name},\n\nI recently applied for the {job_title} role at {company} and wanted to reach out directly. Most of my recent work is custodial reconciliation and Python that replaces manual reporting.\n\nIs the search still open, and is there a rough timeline for first interviews? A one-line reply is plenty.\n\nBest,\nKevin Miller"]
 }
 
 # Follow-up bump copy for PEOPLE-schema rows (Carmen Cold networking contacts): these tabs have
@@ -324,6 +325,7 @@ _EDIT_LINT_KINDS = {
     "cold_ops": "email",
     "warm_alumni": "email",
     "followup_bumps": "email",
+    "recruiter": "email",
 }
 
 def lint_edited_template(list_key, new_text):
@@ -4141,6 +4143,7 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
     dork_url = html.escape(build_hiring_manager_dork(company_raw, title_raw), quote=True)
     recruiter_dork_url = html.escape(build_recruiter_dork(company_raw), quote=True)
     apollo_url = html.escape(build_apollo_url(company_raw), quote=True)
+    company_posts_url = html.escape(build_linkedin_company_posts_url(company_raw), quote=True)
     # Truncate raw dynamic content BEFORE HTML-escaping/tag-wrapping so tags never get cut mid-string.
     # alumni_line arrives with a trailing newline from process_single_candidate but without one from
     # some callers, so it is normalized here rather than leaving a stray blank line on the card.
@@ -4169,7 +4172,8 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
         f"{alumni_block}"
         f"📧 <code>{html.escape(target_email)}</code>\n\n"
         f"🔗 <a href='{apply_link}'>Apply</a> · 🎯 <a href='{dork_url}'>Hiring Mgr</a> · "
-        f"🤝 <a href='{recruiter_dork_url}'>Recruiter</a> · 🔍 <a href='{apollo_url}'>Apollo</a>\n"
+        f"🤝 <a href='{recruiter_dork_url}'>Recruiter</a> · 🔍 <a href='{apollo_url}'>Apollo</a> · "
+        f"📣 <a href='{company_posts_url}'>Co. Posts</a>\n"
         f"📋 <a href='{stage_url}'>Full Card</a> - bullets, LinkedIn note, draft, links, PDF\n"
         f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code>\n\n"
         f"⚡ <code>/apply</code> <code>/draft</code> <code>/warm</code> <code>/cold</code> "
@@ -4610,21 +4614,12 @@ def run_job_pipeline(chat_id=None, top_n=2):
     tier1_matches = [m for m in top_matches if m["score"] >= 80][:5]
     tier2_matches = [m for m in top_matches if 65 <= m["score"] < 80][:5]
 
-    # Dispatch Tier-1 matches as full interactive cards & stage in CRM, routed by Clavicular flag
+    # Write Tier-1 rows to CRM first, routed by Clavicular flag, then dispatch cards only for rows that landed
     clavicular_rows = []
     standard_rows = []
     for item in tier1_matches:
         job = item["job"]
         is_clavicular = item.get("is_clavicular", False)
-        send_telegram_card(
-            job, item["score"], item["target_email"],
-            item["age_badge"], item["salary_str"], item["work_style"],
-            item["overlap_pct"], item["short_id"],
-            sheet_uuid=item.get("sheet_uuid"),
-            alumni_line=item.get("alumni_line", ""),
-            sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates",
-            score_boost=item.get("score_boost", 0)
-        )
         note = (
             f"Warm Referral Matched: {item.get('contact_name', 'Contact')} | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
             if is_clavicular else f"Matched via Pipeline | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
@@ -4644,6 +4639,40 @@ def run_job_pipeline(chat_id=None, top_n=2):
             ]
         }
         (clavicular_rows if is_clavicular else standard_rows).append(row)
+
+    written = {
+        True: log_to_sheets_crm(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows)) if clavicular_rows else True,
+        False: log_to_sheets_crm(build_crm_payload("batch_add_rows", target_code="TC", rows=standard_rows)) if standard_rows else True,
+    }
+    for is_clavicular, ok in written.items():
+        if not ok:
+            withheld = [
+                f"{m['job'].get('employer_name')} - {m['job'].get('job_title')} ({m['score']})"
+                for m in tier1_matches if m.get("is_clavicular", False) == is_clavicular
+            ]
+            tab = "Clavicular" if is_clavicular else "Tetiana Cold"
+            logging.error(f"Tier-1 CRM write to {tab} FAILED; withholding {len(withheld)} card(s): {withheld}")
+            send_health_alert(
+                f"Tier-1 CRM write to {tab} failed - {len(withheld)} card(s) withheld, rows NOT in the sheet: "
+                + "; ".join(withheld)
+            )
+
+    cards_sent = 0
+    for item in tier1_matches:
+        job = item["job"]
+        is_clavicular = item.get("is_clavicular", False)
+        if not written[is_clavicular]:
+            continue
+        send_telegram_card(
+            job, item["score"], item["target_email"],
+            item["age_badge"], item["salary_str"], item["work_style"],
+            item["overlap_pct"], item["short_id"],
+            sheet_uuid=item.get("sheet_uuid"),
+            alumni_line=item.get("alumni_line", ""),
+            sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates",
+            score_boost=item.get("score_boost", 0)
+        )
+        cards_sent += 1
         time.sleep(1.1)
 
     # Dispatch Tier-2 as leaderboard digest ONLY (do NOT add to batch_rows/CRM)
@@ -4662,15 +4691,10 @@ def run_job_pipeline(chat_id=None, top_n=2):
         )
         send_telegram_message(TELEGRAM_CHAT_ID, digest_msg)
 
-    # Write Tier-1 rows to CRM under separate execution locks per destination tab
-    if clavicular_rows:
-        enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows))
-    if standard_rows:
-        enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="TC", rows=standard_rows))
-    
-    logging.info(f"Stage 2 Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.")
+    withheld_note = f" ({len(tier1_matches) - cards_sent} withheld: CRM write failed)" if cards_sent < len(tier1_matches) else ""
+    logging.info(f"Stage 2 Complete: {cards_sent} Tier-1 cards{withheld_note} + {len(tier2_matches)} Tier-2 digest entries dispatched.")
     if chat_id:
-        send_status_update(chat_id, f"Pipeline Complete: {len(tier1_matches)} Tier-1 cards + {len(tier2_matches)} Tier-2 digest entries dispatched.")
+        send_status_update(chat_id, f"Pipeline Complete: {cards_sent} Tier-1 cards{withheld_note} + {len(tier2_matches)} Tier-2 digest entries dispatched.")
     
     return len(tier1_matches) + len(tier2_matches)
 

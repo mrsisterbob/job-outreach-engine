@@ -64,6 +64,19 @@ def test_dork_builders_strip_special_characters():
     assert "&" not in decoded.split("site:")[0]  # special chars stripped before querystring encoding
 
 
+def test_build_linkedin_company_posts_url_slugs_the_company_name():
+    assert pu.build_linkedin_company_posts_url("Crain Communications Inc") == (
+        "https://www.linkedin.com/company/crain-communications/posts/?feedView=all"
+    )
+    assert pu.build_linkedin_company_posts_url("Acme & Co. (Detroit)!") == (
+        "https://www.linkedin.com/company/acme-detroit/posts/?feedView=all"
+    )
+    assert pu.build_linkedin_company_posts_url("  Ann   Arbor SPARK, LLC ") == (
+        "https://www.linkedin.com/company/ann-arbor-spark/posts/?feedView=all"
+    )
+    assert pu.build_linkedin_company_posts_url(None).startswith("https://www.linkedin.com/company/")
+
+
 def test_dork_builders_handle_missing_company():
     # Should not raise on None/empty input
     assert pu.build_hiring_manager_dork(None).startswith("https://www.google.com/search?q=")
@@ -615,6 +628,7 @@ def test_every_shipped_template_passes_the_voice_linter():
         ("cold_ops", "email", _load_bank("outreach_templates.json")["cold_ops"]),
         ("warm_alumni", "email", _load_bank("outreach_templates.json")["warm_alumni"]),
         ("followup_bumps", "email", _load_bank("outreach_templates.json")["followup_bumps"]),
+        ("recruiter", "email", _load_bank("outreach_templates.json")["recruiter"]),
         ("linkedin_templates", "linkedin", _load_bank("linkedin_templates.json")["linkedin_templates"]),
     ]
     failures = []
@@ -642,17 +656,26 @@ def test_shipped_templates_open_on_a_bare_hi_when_no_name_is_known():
 
 def test_cold_ops_encodes_the_professional_corpus_voice():
     """Rules traceable to counts in the correct mailbox (kjmiller406@gmail.com, 62 emails):
-    a 10-minute 'brief' ask, one question about the recipient's work ('perspective'/'day to day'),
-    the verbatim release line on its own, 'Best,' + full name, and no college-corpus habits."""
+    a 10-minute timebox, 'Best,' + full name, and no college-corpus habits.
+
+    The corpus markers that are habits rather than invariants - the word 'brief', the verbatim
+    release line, and a 'perspective'/'day to day' question - are asserted as BANK COVERAGE, not
+    per template. Requiring all three in all six is what collapsed the bank into six near-copies
+    of one email sharing ~80% of their words, which at pipeline volume means two people on the
+    same team can receive visibly identical notes. Coverage keeps the voice anchored in the
+    corpus while letting each entry open and close differently.
+    """
     cold = _load_bank("outreach_templates.json")["cold_ops"]
     assert len(cold) == 6
-    for idx, template in enumerate(cold):
-        rendered = m.interpolate_template(template, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE)
+    rendered_all = [
+        m.interpolate_template(t, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE)
+        for t in cold
+    ]
+
+    for idx, (template, rendered) in enumerate(zip(cold, rendered_all)):
         ctx = f"cold_ops[{idx}]"
-        assert "10 minutes" in rendered and "brief" in rendered, ctx
-        assert "\nHappy to work around your schedule.\n" in rendered, ctx
+        assert "10 minutes" in rendered, ctx
         assert rendered.rstrip().endswith("Best,\nKevin Miller"), ctx
-        assert ("perspective" in rendered) or ("day to day" in rendered), ctx
         # college-corpus tells the professional corpus disproves
         assert "Yours In Service" not in rendered and "YIS" not in rendered, ctx
         assert "{name_bare}" not in template, ctx
@@ -661,6 +684,10 @@ def test_cold_ops_encodes_the_professional_corpus_voice():
         assert "I built" not in rendered and "I automated" not in rendered, ctx
         # does not open by announcing the posting
         assert not rendered.split("\n\n")[1].startswith(("I saw you're hiring", "I saw the", "Saw you're hiring")), ctx
+
+    assert sum("brief" in r for r in rendered_all) >= 2
+    assert sum("\nHappy to work around your schedule.\n" in r for r in rendered_all) >= 2
+    assert sum(("perspective" in r) or ("day to day" in r) for r in rendered_all) >= 2
 
 
 def test_gmail_generators_pass_the_same_linter_as_the_card_templates():
