@@ -1848,6 +1848,31 @@ def generate_cold_email(job_title, company_name, template_id=0, contact_name="")
     card showed instead of always falling back to cold_ops[0]."""
     return render_outreach_email("cold_ops", template_id, name=contact_name, company=company_name, job_title=job_title)
 
+def resolve_outreach_body(job, mapping, job_title, company_name, is_warm):
+    """THE body every Telegram command (/draft, /eh, /e) shows AND drafts into Gmail.
+
+    Reads the greeting name and the Gemini-routed template id off the cached job, which is what
+    the three handlers used to drop on the floor: calling generate_cold_email(title, comp)
+    positionally left contact_name="" and template_id=0, so a card routed to cold_ops[3] with a
+    resolved contact still rendered a nameless cold_ops[0]. Callers pass the result to
+    create_gmail_draft(custom_body=...) so the draft is the same string, rendered once.
+    """
+    # Gemini's outreach_template_id routes cold_ops only (response_schema caps it at le=5), and
+    # warm copy is a hand-finished scaffold anyway, so warm stays on index 0 by design.
+    if is_warm:
+        return generate_warm_email(
+            (mapping or {}).get("contact_name", ""),
+            company_name=company_name,
+        )
+    greeting_name = str((job or {}).get("outreach_contact_first_name") or "")
+    if not greeting_name:
+        greeting_name = first_name_for_greeting((mapping or {}).get("contact_name", ""))
+    return generate_cold_email(
+        job_title, company_name,
+        template_id=(job or {}).get("outreach_template_id") or 0,
+        contact_name=greeting_name,
+    )
+
 def generate_warm_email(contact_name="", company_name="", template_id=0):
     """Render a warm_alumni SCAFFOLD, not sendable copy.
 
@@ -2859,14 +2884,24 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     # reaches an SMTP header - the tag is a UI-only warning, never part of the real address.
     clean_to_email = str(to_email or "").split(" [")[0].strip()
 
+    # Body and subject are resolved independently. A caller-supplied custom_body is used verbatim
+    # (that is how /draft, /eh and /e hand over the exact string the Telegram card showed), but it
+    # no longer drags the subject to "Following up -" with it: a first-touch cold email passed in
+    # as custom_body still gets the cold subject. Only an explicit custom_subject overrides, and
+    # the bump path passes one. Note check_existing_gmail_draft() dedups on subject, so changing
+    # this changes what counts as a duplicate.
     if custom_body is not None:
         body_content = custom_body
-        subject = custom_subject or f"Following up - {company_name}"
     elif is_warm:
         body_content = generate_warm_email(custom_note)
-        subject = f"Reconnecting - {company_name}"
     else:
         body_content = generate_cold_email(job_title, company_name)
+
+    if custom_subject:
+        subject = custom_subject
+    elif is_warm:
+        subject = f"Reconnecting - {company_name}"
+    else:
         subject = f"Operations & Systems Alignment - {job_title} @ {company_name}"
 
     existing = check_existing_gmail_draft(clean_to_email, subject)
@@ -4810,7 +4845,17 @@ def process_webhook_payload_async(data):
                 edit_telegram_message(chat_id, loading_msg_id, "✅ <b>Data retrieved.</b>")
             for c in cards:
                 is_warm = (cmd_type in ["c", "cw"])
-                draft_text = generate_warm_email(c.get("note", "")) if is_warm else generate_cold_email(c.get("title") or "", c.get("company", "Target Firm"))
+                # A CRM contact row has no cached job behind it, so there is no routed
+                # outreach_template_id to honour here - index 0 is correct. The contact's name is
+                # not: these rows always have one, so the greeting is filled rather than bare.
+                draft_text = (
+                    generate_warm_email(c.get("note", ""))
+                    if is_warm else
+                    generate_cold_email(
+                        c.get("title") or "", c.get("company", "Target Firm"),
+                        contact_name=first_name_for_greeting(c.get("name", "")),
+                    )
+                )
                 monospaced_draft = format_email_block(draft_text)
                 contact_sheet_uuid = c.get("sheet_uuid", "")
                 card_msg = (
@@ -5199,11 +5244,11 @@ def process_webhook_payload_async(data):
             pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
             pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft", tone_mode=tone_mode)
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
+            raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
             ok, gmail_msg, draft_id = create_gmail_draft(
                 to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
-                pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+                custom_body=raw_email_text, pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
             )
-            raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
             monospaced_body = format_email_block(raw_email_text)
             draft_link_line = ""
             if draft_id:
@@ -5252,11 +5297,11 @@ def process_webhook_payload_async(data):
             pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
             pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/eh", tone_mode=tone_mode)
 
+            raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
             ok, gmail_msg, draft_id = create_gmail_draft(
                 to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
-                pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+                custom_body=raw_email_text, pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
             )
-            raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
             monospaced_body = format_email_block(raw_email_text)
             draft_link_line = ""
             if draft_id:
@@ -5301,11 +5346,11 @@ def process_webhook_payload_async(data):
             pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
             pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/e", tone_mode=tone_mode)
 
+            raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
             ok, gmail_msg, draft_id = create_gmail_draft(
                 to_email=new_email, company_name=comp, job_title=title, is_warm=is_warm,
-                pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+                custom_body=raw_email_text, pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
             )
-            raw_email_text = generate_warm_email(mapping.get("contact_name", "")) if is_warm else generate_cold_email(title, comp)
             monospaced_body = format_email_block(raw_email_text)
             draft_link_line = ""
             if draft_id:
