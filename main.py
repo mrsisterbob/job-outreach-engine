@@ -574,12 +574,36 @@ def init_db():
             defaults = {
                 "min_salary": 50000,
                 "experience_salary_floor": 60000,
-                "radius_miles": 35,
+                "radius_miles": 45,
                 "valid_cities": [
                     "farmington", "detroit", "ann arbor", "novi", "troy", "southfield",
                     "auburn hills", "plymouth", "royal oak", "livonia", "dearborn",
                     "birmingham", "bloomfield", "warren", "sterling heights", "canton",
-                    "rochester", "wixom", "madison heights"
+                    "rochester", "wixom", "madison heights",
+                    # Added: real Metro Detroit suburbs within ~35mi of Farmington that were missing
+                    # from the original list and would otherwise pass JSearch's radius sourcing only
+                    # to be silently dropped by this filter's exact-string check.
+                    "redford", "walled lake", "west bloomfield", "waterford", "pontiac",
+                    "ferndale", "oak park", "northville", "westland", "dearborn heights",
+                    "garden city", "milford", "south lyon", "commerce", "clawson", "berkley",
+                    "beverly hills", "franklin", "hazel park", "wyandotte", "allen park",
+                    "melvindale", "lathrup village", "farmington hills", "highland",
+                    "white lake", "inkster", "taylor", "southgate", "lincoln park",
+                    "romulus", "belleville", "davisburg", "clarkston", "lake orion",
+                    "shelby", "new hudson",
+                    # Added: full Metro Detroit MSA - Macomb County, Downriver, Grosse Pointes,
+                    # Livingston edge. These run 35-45mi from Farmington (outside the original
+                    # anchor's radius_miles), which is why radius_miles was widened to 45 alongside
+                    # this and dedicated query anchors were added for the regions no existing
+                    # query anchor reaches even at the wider radius.
+                    "clinton township", "roseville", "st. clair shores", "saint clair shores",
+                    "eastpointe", "fraser", "chesterfield", "new baltimore", "macomb township",
+                    "utica", "washington township", "mount clemens",
+                    "trenton", "riverview", "woodhaven", "flat rock", "brownstown", "grosse ile",
+                    "grosse pointe", "harper woods",
+                    "huntington woods", "pleasant ridge", "keego harbor", "orchard lake",
+                    "bingham farms", "wolverine lake", "union lake",
+                    "brighton", "howell", "hartland", "fenton"
                 ],
                 "title_exclusions": [
                     "sales", "account executive", "bdr", "sdr", "financial advisor", "financial planner",
@@ -618,61 +642,70 @@ def init_db():
                     "Business Operations Analyst Farmington MI", "Custodial Operations Schwab Fidelity Farmington MI",
                     "Financial Systems Process Automation Farmington MI", "Operations Specialist Farmington MI",
                     "Salesforce Administrator Farmington MI", "Business Systems Analyst Farmington MI",
-                    "Financial Operations Analyst Remote", "Supply Chain Operations Analyst Farmington MI",
+                    "Financial Operations Analyst Birmingham MI", "Supply Chain Operations Analyst Farmington MI",
 
                     "Trade Operations Analyst Detroit MI", "Compliance Operations Specialist Detroit MI",
                     "Risk Operations Analyst Detroit MI", "Client Operations Associate Detroit MI",
                     "Treasury Operations Analyst Detroit MI", "Data Operations Analyst Detroit MI",
                     "Process Improvement Analyst Detroit MI", "Onboarding Specialist Detroit MI",
-                    "Data Operations Analyst Remote", "Revenue Operations Analyst Detroit MI",
+                    "Data Operations Analyst Warren MI", "Revenue Operations Analyst Detroit MI",
 
                     "Wealth Management Operations Ann Arbor MI", "Business Intelligence Analyst Ann Arbor MI",
                     "Fintech Systems Analyst Ann Arbor MI", "Custodial Reconciliation Analyst Ann Arbor MI",
                     "Salesforce Administrator Ann Arbor MI", "Operations Analyst Ann Arbor MI",
                     "Business Systems Analyst Ann Arbor MI", "Financial Analyst Operations Ann Arbor MI",
-                    "Business Operations Analyst Remote", "Healthcare Operations Analyst Ann Arbor MI",
+                    "Business Operations Analyst Plymouth MI", "Healthcare Operations Analyst Ann Arbor MI",
 
                     "Wealth Operations Novi MI", "Fintech Operations Novi MI",
                     "Business Operations Analyst Novi MI", "Custodial Operations Schwab Fidelity Novi MI",
                     "Financial Systems Process Automation Novi MI", "Operations Specialist Novi MI",
                     "Salesforce Administrator Novi MI", "Business Systems Analyst Novi MI",
-                    "Client Success Operations Remote", "Implementation Specialist Novi MI",
+                    "Client Success Operations Wixom MI", "Implementation Specialist Novi MI",
 
                     "Wealth Operations Troy MI", "Fintech Operations Troy MI",
                     "Business Operations Analyst Troy MI", "Custodial Operations Schwab Fidelity Troy MI",
                     "Financial Systems Process Automation Troy MI", "Operations Specialist Troy MI",
                     "Salesforce Administrator Troy MI", "Business Systems Analyst Troy MI",
-                    "Process Improvement Analyst Remote", "ERP Systems Analyst Troy MI",
+                    "Process Improvement Analyst Rochester MI", "ERP Systems Analyst Troy MI",
 
                     "Wealth Operations Southfield MI", "Fintech Operations Southfield MI",
                     "Business Operations Analyst Southfield MI", "Custodial Operations Schwab Fidelity Southfield MI",
                     "Financial Systems Process Automation Southfield MI", "Operations Specialist Southfield MI",
                     "Salesforce Administrator Southfield MI", "Business Systems Analyst Southfield MI",
-                    "Trade Operations Analyst Remote", "Logistics Operations Analyst Southfield MI",
+                    "Trade Operations Analyst Bloomfield MI", "Logistics Operations Analyst Southfield MI",
 
                     "Wealth Operations Auburn Hills MI", "Fintech Operations Auburn Hills MI",
                     "Business Operations Analyst Auburn Hills MI", "Custodial Operations Schwab Fidelity Auburn Hills MI",
                     "Financial Systems Process Automation Auburn Hills MI", "Operations Specialist Auburn Hills MI",
                     "Salesforce Administrator Auburn Hills MI", "Business Systems Analyst Auburn Hills MI",
-                    "Compliance Operations Specialist Remote", "Claims Operations Analyst Auburn Hills MI",
+                    "Compliance Operations Specialist Sterling Heights MI", "Claims Operations Analyst Auburn Hills MI",
 
                     "Wealth Operations Royal Oak MI", "Fintech Operations Royal Oak MI",
                     "Business Operations Analyst Royal Oak MI", "Custodial Operations Schwab Fidelity Royal Oak MI",
                     "Financial Systems Process Automation Royal Oak MI", "Operations Specialist Royal Oak MI",
                     "Salesforce Administrator Royal Oak MI", "Business Systems Analyst Royal Oak MI",
-                    "Treasury Operations Analyst Remote", "Manufacturing Operations Analyst Royal Oak MI",
+                    "Treasury Operations Analyst Madison Heights MI", "Manufacturing Operations Analyst Royal Oak MI",
 
                     "Wealth Operations Livonia MI", "Fintech Operations Livonia MI",
                     "Business Operations Analyst Livonia MI", "Custodial Operations Schwab Fidelity Livonia MI",
                     "Financial Systems Process Automation Livonia MI", "Operations Specialist Livonia MI",
                     "Salesforce Administrator Livonia MI", "Business Systems Analyst Livonia MI",
-                    "Onboarding Specialist Remote", "Cloud Operations Analyst Livonia MI",
+                    "Onboarding Specialist Canton MI", "Cloud Operations Analyst Livonia MI",
 
                     "Wealth Operations Dearborn MI", "Fintech Operations Dearborn MI",
                     "Business Operations Analyst Dearborn MI", "Custodial Operations Schwab Fidelity Dearborn MI",
                     "Financial Systems Process Automation Dearborn MI", "Operations Specialist Dearborn MI",
                     "Salesforce Administrator Dearborn MI", "Business Systems Analyst Dearborn MI",
-                    "Data Operations Analyst Remote", "Procurement Operations Analyst Dearborn MI"
+                    "Data Operations Analyst Dearborn MI", "Procurement Operations Analyst Dearborn MI",
+
+                    # Macomb County + Downriver + Grosse Pointes: no earlier anchor city reaches these
+                    # even at the widened 45mi radius_miles, so they get dedicated query anchors instead
+                    # of relying on overlap from the western/central Oakland-Wayne anchors above.
+                    "Wealth Operations Clinton Township MI", "Fintech Operations Clinton Township MI",
+                    "Business Operations Analyst Clinton Township MI", "Operations Specialist Clinton Township MI",
+                    "Salesforce Administrator Clinton Township MI", "Business Systems Analyst Roseville MI",
+                    "Financial Systems Process Automation Sterling Heights MI", "Client Operations Associate Mount Clemens MI",
+                    "Business Operations Analyst Trenton MI", "Operations Specialist Grosse Pointe MI"
                 ],
                 "query_bank_pointer": 0
             }
@@ -1917,19 +1950,15 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
         bonus -= 15
     if "wealth" in desc and not any(k in desc for k in ["python", "sql", "automation", "systems"]):
         bonus -= 15
-    is_remote = job.get("job_is_remote", False) or "remote" in desc[:300] or "work from home" in desc[:300]
 
     non_mi_hubs = ["chicago", "new york", "austin", "boston", "dallas", "atlanta", "denver", "seattle", "san francisco", "charlotte", "nyc"]
     valid_cities = get_filter("valid_cities", [])
-    # Only penalize on-site/hybrid out-of-state hub roles; remote roles are governed by the 90-point cap
-    if not is_remote and any(hub in city or hub in desc[:300] for hub in non_mi_hubs) and not any(c in city for c in valid_cities):
+    # passes_strict_filter already requires an in-metro city, so this only catches an out-of-state
+    # hub name that slipped past that check (e.g. mentioned in the description, not job_city).
+    if any(hub in city or hub in desc[:300] for hub in non_mi_hubs) and not any(c in city for c in valid_cities):
         bonus -= 15
 
     score = base_ai_score + bonus
-    if is_remote:
-        score = min(score, 90)
-    # Fold the remote 90-cap into the reported shift so (base_ai_score + layer1_bonus) reconstructs
-    # the same pre-1-100-clamp value this function used.
     layer1_bonus = score - base_ai_score
     return max(1, min(100, score)), layer1_bonus
 
@@ -2437,9 +2466,12 @@ def passes_strict_filter(job):
     valid_cities = get_filter("valid_cities", [])
     # Metro-area allowlist only (~35mi of Farmington MI via radius_miles) - state=="MI" alone is NOT
     # sufficient, since that would also admit Grand Rapids/Lansing/Traverse City etc. outside the radius.
+    # Remote is intentionally NOT a pass condition here - local-only by design, and the substring
+    # "remote"/"work from home" check was unreliable anyway (no negation handling, e.g. "not remote").
+    # valid_cities is a hand-maintained suburb allowlist, not a computed geofence - a real in-radius
+    # city missing from the list is silently dropped here, not sourced-but-then-filtered.
     is_in_metro_area = any(c in city for c in valid_cities)
-    is_remote = job.get("job_is_remote", False) or "remote" in description[:300] or "work from home" in description[:300]
-    if not (is_in_metro_area or is_remote):
+    if not is_in_metro_area:
         return False
 
     exp_floor = safe_int(get_filter("experience_salary_floor"), 60000)
@@ -4177,7 +4209,7 @@ def fetch_single_query_jobs(query_args):
     """
     query, api_url, headers = query_args
     is_remote_query = "remote" in query.lower()
-    radius_miles = safe_int(get_filter("radius_miles"), 35)
+    radius_miles = safe_int(get_filter("radius_miles"), 45)
     start_page = get_query_start_page(query)
     all_jobs = []
     for offset in range(3):
