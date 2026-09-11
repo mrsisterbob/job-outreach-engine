@@ -332,6 +332,7 @@ function doPost(e) {
     // 6. Networking Card Pull (/c, /cw, /cc, TW suppression -> {"action": "get_followups", "tab": target_code})
     if (action === "get_followups") {
       const tabName = payload.tab === "CW" ? "Carmen Warm" :
+                      payload.tab === "CC" ? "Carmen Cold" :
                       payload.tab === "TC" ? "Tetiana Cold" :
                       payload.tab === "TW" ? "Tetiana Warm" :
                       payload.tab === "CL" ? "Clavicular" : null;
@@ -352,8 +353,10 @@ function doPost(e) {
         // JOBS tabs have no contact name (Col B = Company, Col C = Role); PEOPLE tabs have no job title
         const name = schemaType === "JOBS" ? "" : row[1];
         const company = schemaType === "JOBS" ? row[1] : row[2];
-        // JOBS: the real role from Column C, "" when blank/missing (never a stubbed title).
-        const title = schemaType === "JOBS" ? (row[2] || "") : "Operations Specialist";
+        // JOBS: the real role from Column C, "" when blank/missing. PEOPLE (Carmen Cold/Warm) have
+        // NO role column at all - return "" so follow-up bump copy never references a fake title. A
+        // hardcoded "Operations Specialist" here would flow into a bump email visible to the recipient.
+        const title = schemaType === "JOBS" ? (row[2] || "") : "";
 
         results.push({
           sheet_uuid: row[9] || "",

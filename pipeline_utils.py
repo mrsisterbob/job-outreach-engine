@@ -329,12 +329,14 @@ _OUTREACH_BANNED_PATTERNS = [
     (r"if you think I", "self-deprecating hedge"),
     (r"\b(?:excited|thrilled|exciting|admire|impressive)\b", "performed enthusiasm / company praise"),
     (r"\b(?:mission|culture|rapid growth)\b", "praise for the company's mission/culture/growth"),
-    # Round-number minute asks read like a scheduling tool, not a person. Kevin's own sent mail
-    # (forensic voice report, Sep 2026) shows the opposite of "vague ask" being the fix: his real
-    # habit is an odd, specific number - "Do you have 16 minutes?", "14 minutes" - never a round
-    # 5/10/15/30 and never a vague "quick chat" either. So this bans the round numbers only;
-    # odd counts (11, 13, 14, 16, ...) are the voice, not a violation.
-    (r"\b(?:five|ten|fifteen|twenty|thirty|5|10|15|20|30)[- ]minutes?\b", "round-number timeboxed ask - use an odd specific count instead (e.g. '13 minutes', '16 minutes')"),
+    # Ban the vague ask, not the timeboxed one. The forensic analysis of the correct mailbox
+    # (kjmiller406@gmail.com, 62 professional emails, May 2025 - Sep 2026) shows Kevin's real
+    # habit is a specific, mostly round timebox - "10 minutes" x3, "15 minute call" x1, and zero
+    # odd-minute asks. An earlier pass banned round numbers and pushed odd counts ("13 minutes",
+    # "17 minutes"); that was calibrated on the wrong corpus (kevin.miller@hope.edu, a pre-job
+    # college mailbox) and is reverted here. "quick chat" has zero uses in the professional
+    # corpus, so that is what stays banned.
+    (r"\bquick chat\b", "'quick chat' - vague ask with zero uses in the corpus; name a specific length like '10 minutes' or 'a brief call'"),
 ]
 
 _OUTREACH_BANNED_RULES = [(re.compile(p, re.IGNORECASE), msg) for p, msg in _OUTREACH_BANNED_PATTERNS]

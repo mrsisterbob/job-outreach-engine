@@ -186,10 +186,20 @@ LINKEDIN_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "linkedin_templates.json")
 # ("Hi Dana,") or as an empty string ("Hi,"), so a template must never put a space of its own
 # before the placeholder. Every string here is also held to pipeline_utils.lint_outreach_template().
 _FALLBACK_OUTREACH_TEMPLATES = {
-    "cold_ops": ["Hi{name},\n\nSaw you're hiring a {job_title} at {company}.\n\nMost of my recent work is Python and SQL scripts that replaced manual reporting and reconciliation at a wealth firm.\n\nOpen to a quick chat this week?\n\nThanks,\nKevin Miller"],
-    "warm_alumni": ["Hi{name},\n\nFellow Hope grad here. I saw you're at {company}.\n\nI'm doing wealth operations work in Detroit right now, mostly Salesforce and Python cleanup.\n\nAny chance you're up for a quick call?\n\nThanks,\nKevin"],
+    "cold_ops": ["Hi{name},\n\nYour {job_title} posting is what got me to write, but I mostly wanted your perspective on where the manual work still sits.\n\nMy day job is Python and SQL that replaces reporting people used to run by hand. Do you have 10 minutes for a brief call?\n\nHappy to work around your schedule.\n\nBest,\nKevin Miller"],
+    "warm_alumni": ["Hi{name},\n\n[how you know them, and the specific occasion you last spoke]. [one concrete detail so this reads like you].\n\n[the one thing you want their perspective on at {company}]. [your ask, and a concrete time window].\n\nBest,\nKevin"],
     "followup_bumps": ["Hi{name},\n\nCircling back on the {job_title} role in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nThanks,\nKevin Miller"]
 }
+
+# Follow-up bump copy for PEOPLE-schema rows (Carmen Cold networking contacts): these tabs have
+# no Role column, so the followup_bumps bank's "the {job_title} role at {company}" phrasing would
+# render "the this role role at your team". Same register as the bank, anchored on the person and
+# company instead of a role. build_followup_bump_draft()/generate_bump_email() route here on a
+# blank title. Held to lint_outreach_template() by test_pipeline_utils.py like every other bank.
+_ROLELESS_FOLLOWUP_BUMPS = [
+    "Hi{name},\n\nCircling back on my earlier note to {company} in case it got buried.\n\nStill keen to connect. Happy to answer anything useful.\n\nBest,\nKevin",
+    "Hi{name},\n\nI reached out earlier about {company} and wanted to try once more.\n\nMy guess is this isn't the right time, which is completely fine. If that changes, I am around.\n\nBest,\nKevin",
+]
 _FALLBACK_LINKEDIN_TEMPLATES = {
     "linkedin_templates": ["Hi{name}. Saw you're hiring a {job_title} at {company}. I'd like to connect."]
 }
@@ -228,9 +238,8 @@ def resolve_template_text(pool, idx, fallback_text=""):
     return pool[idx]
 
 def interpolate_template(template, name="", company="", job_title=""):
-    """Deterministically fills {name}/{name_bare}/{company}/{job_title} placeholders via
-    str.format() - the only place candidate-facing outreach/LinkedIn copy is ever assembled.
-    Never calls Gemini.
+    """Deterministically fills {name}/{company}/{job_title} placeholders via str.format() - the
+    only place candidate-facing outreach/LinkedIn copy is ever assembled. Never calls Gemini.
 
     {name} renders WITH a leading space when a contact name is known and as an empty string when
     it is not, so a template written "Hi{name}," yields "Hi Dana," or a bare "Hi," - never the old
@@ -239,10 +248,9 @@ def interpolate_template(template, name="", company="", job_title=""):
     The literal "there" is scrubbed too, so any caller still passing the retired sentinel degrades
     to "Hi," rather than reintroducing it.
 
-    {name_bare} is the "<First>," salutation-on-its-own-line form (voice rule: reserved for a
-    senior external stranger, never a generic greeting) - it needs a real first name to make
-    sense, so a template opening with it must have "Hi{name}," as a fallback line for when no
-    contact name is resolved. See resolve_outreach_copy()/process_single_candidate() callers.
+    The {name_bare} salutation-on-its-own-line form was retired: the forensic analysis of the
+    correct mailbox (kjmiller406@gmail.com) shows name-alone openers are a warm marker for people
+    already spoken to, not a cold voice, so no shipped template uses it and it is not supported.
     """
     clean_name = str(name or "").strip()
     if clean_name.lower() == "there":
@@ -251,7 +259,6 @@ def interpolate_template(template, name="", company="", job_title=""):
     try:
         return normalized.format(
             name=f" {clean_name}" if clean_name else "",
-            name_bare=f"{clean_name}," if clean_name else "Hi,",
             company=company or "your team",
             job_title=job_title or "this role",
         )
@@ -1791,12 +1798,26 @@ def generate_cold_email(job_title, company_name, template_id=0, contact_name="")
     return render_outreach_email("cold_ops", template_id, name=contact_name, company=company_name, job_title=job_title)
 
 def generate_warm_email(contact_name="", company_name="", template_id=0):
-    """Warm alumni email body from the warm_alumni bank (the loosest of the four pools -
-    these are Hope College alumni, not strangers)."""
+    """Render a warm_alumni SCAFFOLD, not sendable copy.
+
+    Warm outreach is written by hand now. Its value is in the specific detail a template cannot
+    produce ("great catching up with Don at my birthday dinner last Saturday"), and a generic
+    warm email actively damages a real relationship. Every warm_alumni entry is therefore an
+    obviously-unfinished skeleton with bracketed blanks; this interpolates one so the /warm path
+    still works as a drafting aid, but nothing generic can be fired off by accident.
+    """
     return render_outreach_email("warm_alumni", template_id, name=contact_name, company=company_name)
 
 def generate_bump_email(contact_name="", job_title="", company_name="", template_id=0):
-    """Follow-up nudge from the followup_bumps bank, for threads that went unanswered."""
+    """Follow-up nudge from the followup_bumps bank, for threads that went unanswered.
+
+    A blank job_title (PEOPLE-schema Carmen Cold rows have no Role column) routes to
+    _ROLELESS_FOLLOWUP_BUMPS so the copy never renders "the this role role at your team".
+    """
+    if not str(job_title or "").strip():
+        pool = _ROLELESS_FOLLOWUP_BUMPS
+        template = pool[template_id] if isinstance(template_id, int) and 0 <= template_id < len(pool) else pool[0]
+        return sanitize_text(interpolate_template(template, name=contact_name, company=clean_company_for_copy(company_name)))
     return render_outreach_email("followup_bumps", template_id, name=contact_name, company=company_name, job_title=job_title)
 
 def format_email_block(email_text):
@@ -3538,7 +3559,14 @@ def fetch_networking_cards(target_code="CW", qty=2):
     return []
 
 def get_overdue_followups():
-    """Return every overdue Carmen Warm and Tetiana Cold record sorted by next_followup ASC.
+    """Return every overdue Carmen Cold, Carmen Warm and Tetiana Cold record sorted by
+    next_followup ASC.
+
+    Carmen Cold is scanned because it is now the active outreach cycle - replies auto-move
+    contacts here, so its overdue rows are the hottest leads and must reach the morning digest.
+    Carmen Warm stays scanned even though it is now mostly storage: the is_followup_unscheduled()
+    filter below already drops its undated bulk, and a warm contact with an explicit Next
+    Followup Date is a reminder Kevin set by hand and would want surfaced.
 
     UNSCHEDULED RECORDS ARE NOT OVERDUE. Code.gs's formatFollowupDate() turns a blank Next
     Followup Date cell into the string "1970-01-01" so its own overdue sort never feeds NaN
@@ -3551,7 +3579,7 @@ def get_overdue_followups():
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
     overdue = []
-    for target_code, tab_name in (("CW", "Carmen Warm"), ("TC", "Tetiana Cold")):
+    for target_code, tab_name in (("CC", "Carmen Cold"), ("CW", "Carmen Warm"), ("TC", "Tetiana Cold")):
         for record in fetch_networking_cards(target_code, qty=None):
             next_followup = str(record.get("next_followup") or "")
             if is_followup_unscheduled(next_followup):
@@ -3581,7 +3609,11 @@ def process_overdue_batch(mode, snooze_days=7):
                 to_email=email,
                 company_name=record.get("company") or "Target Firm",
                 job_title=record.get("title") or "",
-                custom_body=generate_bump_email(record.get("name") or ""),
+                custom_body=generate_bump_email(
+                    record.get("name") or "",
+                    job_title=record.get("title") or "",
+                    company_name=record.get("company") or "",
+                ),
                 custom_subject=f"Following up - {record.get('company') or 'Target Firm'}"
             )
             if not draft_ok and draft_message != "Draft already exists in Gmail":
@@ -3603,7 +3635,17 @@ def process_overdue_batch(mode, snooze_days=7):
 # card. No schema change - state is derived from Status / Date Added / Next
 # Followup Date only.
 # ==============================================================================
-SEQUENCER_SCAN_TABS = (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "Clavicular"))
+SEQUENCER_SCAN_TABS = (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "Clavicular"),
+                       ("CC", "Carmen Cold"))
+
+# PEOPLE-schema tabs the sequencer scans. Carmen Cold is now the active outreach cycle - every
+# verified inbound reply auto-moves its contact here (route_inbound_reply_to_crm), so it receives
+# the hottest leads and must sit in the same follow-up cadence as the JOBS tabs. But these rows
+# are people, not job applications: followup_action() can still flag one "bury_ghosted" off a
+# stale "Applied" Status carried over by the tab move, and auto-moving a live networking contact
+# into the Died JOBS tab on a 16-day clock is wrong (and crosses schemas). So a would-be bury on
+# a PEOPLE row is surfaced on the card as "going cold" for a human call, never written.
+SEQUENCER_PEOPLE_SCHEMA_TABS = frozenset({"Carmen Cold"})
 
 def _sequencer_already_actioned(sheet_uuid, run_date):
     """True if this row was already actioned by the sequencer earlier today (same-day idempotency
@@ -3648,17 +3690,26 @@ def build_followup_bump_draft(record, attempt):
     """Draft the follow-up text from the followup_bumps template bank via the existing
     resolve_template_text + interpolate_template path. No LLM, no prose authored in Python.
     Rotates the two bank entries by attempt number (#1 -> entry 0, #2 -> entry 1).
+
+    PEOPLE-schema rows (Carmen Cold networking contacts) have no Role column, so a blank title
+    routes to the roleless bump pair instead - the followup_bumps bank's "the {job_title} role at
+    {company}" phrasing would otherwise render "the this role role at X".
     """
-    pool = load_outreach_templates().get("followup_bumps", [])
+    title = str(record.get("title") or "").strip()
     idx = 0 if attempt <= 1 else 1
-    fallback_pool = _FALLBACK_OUTREACH_TEMPLATES["followup_bumps"]
-    fallback_text = fallback_pool[idx] if idx < len(fallback_pool) else fallback_pool[0]
-    template = resolve_template_text(pool, idx, fallback_text)
+    if not title:
+        pool = _ROLELESS_FOLLOWUP_BUMPS
+        template = pool[idx] if idx < len(pool) else pool[0]
+    else:
+        pool = load_outreach_templates().get("followup_bumps", [])
+        fallback_pool = _FALLBACK_OUTREACH_TEMPLATES["followup_bumps"]
+        fallback_text = fallback_pool[idx] if idx < len(fallback_pool) else fallback_pool[0]
+        template = resolve_template_text(pool, idx, fallback_text)
     return interpolate_template(
         template,
         name=record.get("name") or "",
         company=record.get("company") or "",
-        job_title=record.get("title") or "",
+        job_title=title,
     )
 
 def run_followup_sequencer(today=None, dry_run=False):
@@ -3724,6 +3775,14 @@ def run_followup_sequencer(today=None, dry_run=False):
             _record_sequencer_action(sheet_uuid, run_date, action)
 
         elif action == "bury_ghosted":
+            if rec.get("sheet_tab") in SEQUENCER_PEOPLE_SCHEMA_TABS:
+                # Networking contact, not a job application - never auto-bury to Died. Report it
+                # as going cold so Kevin decides; write nothing. See SEQUENCER_PEOPLE_SCHEMA_TABS.
+                result["going_cold"].append({
+                    "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
+                    "status": rec.get("status") or "", "days": days_since,
+                })
+                continue
             result["buried"].append({
                 "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
             })
@@ -4026,6 +4085,50 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
             return telegram_message_id
     except Exception as e:
         logging.error(f"Failed to post card to Telegram: {e}")
+    return None
+
+def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid):
+    """Lean /w warm-radar card: no AI fit score, no fit reason, no tailored outreach copy - just
+    the role, the warm contact it maps to, and Apply. Swipe-replies (/apply, /x, /n, /f) resolve
+    against the Clavicular tab via the embedded 🆔 marker, exactly like a Clavicular pipeline card.
+    """
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return None
+    company = html.escape(str(job.get("employer_name") or "N/A"))
+    title = html.escape(str(job.get("job_title") or "N/A"))
+    apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
+    card_text = (
+        f"🤝 <b>{title}</b>\n"
+        f"🏢 <b>{company}</b>\n"
+        f"👤 <b>Warm contact:</b> {html.escape(str(contact_name or 'Contact'))}\n"
+        f"📝 <i>{html.escape(str(contact_note or 'Active relationship'))}</i>\n\n"
+        f"🔗 <a href='{apply_link}'>Apply</a>\n"
+        f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>Clavicular</code>\n\n"
+        f"⚡ <code>/apply</code> <code>/draft</code> <code>/warm</code> <code>/cold</code> "
+        f"<code>/x</code> <code>/f</code> <code>/n</code> <code>/e</code> <code>/eh</code> · <code>/help</code>"
+    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": card_text[:3990],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 429:
+            retry_after = res.json().get("parameters", {}).get("retry_after", 1)
+            logging.warning(f"Telegram 429 Rate Limit (warm radar card) - retrying after {retry_after}s")
+            time.sleep(retry_after)
+            res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            telegram_message_id = res.json().get("result", {}).get("message_id")
+            log_metric_event("message_sent", sheet_uuid)
+            if telegram_message_id and sheet_uuid:
+                save_message_mapping(telegram_message_id, sheet_uuid, "Clavicular", company, "", "")
+            return telegram_message_id
+    except Exception as e:
+        logging.error(f"Failed to post warm radar card to Telegram: {e}")
     return None
 
 # ==============================================================================
@@ -4459,6 +4562,103 @@ def run_job_pipeline(chat_id=None, top_n=2):
     
     return len(tier1_matches) + len(tier2_matches)
 
+def run_warm_radar_scan(chat_id=None):
+    """/w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen
+    Warm CRM contact already exists. Resolves each warm company's ATS slug straight from the
+    company_identities cache (no live board probing at all - resolve_warm_company_ats_slugs() is
+    deliberately not called), pulls its Greenhouse/Lever/Ashby postings, and reports any new role
+    against the contact it maps to. Shares the /t dedup ledger (seen_jobs) so it never re-alerts a
+    role /t already surfaced, and only stamps the ones it newly surfaces itself. No Gemini scoring.
+    """
+    warm_contacts = get_warm_crm_contacts()
+    if not warm_contacts:
+        if chat_id:
+            send_telegram_message(chat_id, "⚠️ <b>Warm Radar:</b> no Carmen Warm contacts found.")
+        return 0
+
+    # Cache-only slug resolution: every warm company that already has a verified ats_slug row.
+    # A warm company with no cached slug is skipped silently - it gets picked up whenever /t or
+    # /eco add next populates company_identities for it.
+    try:
+        with get_db_conn() as conn:
+            identity_rows = conn.execute(
+                "SELECT normalized_name, ats_slug FROM company_identities WHERE ats_slug IS NOT NULL AND ats_slug != ''"
+            ).fetchall()
+    except Exception as e:
+        logging.error(f"Warm Radar Identity Lookup Error: {e}")
+        identity_rows = []
+    slug_to_contact = {}
+    for normalized_name, slug in identity_rows:
+        contact = warm_contacts.get(normalized_name)
+        if contact:
+            slug_to_contact.setdefault(slug, contact)
+
+    if not slug_to_contact:
+        if chat_id:
+            send_telegram_message(chat_id, "🔭 <b>Warm Radar:</b> no warm companies have a cached ATS board yet - run /t or /eco add first.")
+        return 0
+
+    if chat_id:
+        send_status_update(chat_id, f"Warm Radar: scanning {len(slug_to_contact)} warm companies with a cached ATS board (no AI scoring)...")
+
+    slugs = list(slug_to_contact)
+    seen_hashes = set()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
+    clavicular_rows = []
+    match_count = 0
+
+    for job in fetch_ats_jobs(slugs):
+        company = job.get("employer_name") or ""
+        title = job.get("job_title") or ""
+        job_hash = generate_dedup_hash(company, title)
+        # Mirror _add_candidate's ordering: check the in-run set AND the shared seen_jobs ledger
+        # before stamping anything, so a role /t already surfaced is skipped without a re-stamp.
+        if job_hash in seen_hashes or is_job_seen_db(job_hash):
+            continue
+
+        # Tie the posting back to its warm contact by the slug baked into its job_id
+        # (gh_/lever_/ashby_<slug>_...), falling back to a normalized-name match on the ATS
+        # employer label. Postings we can't attribute to a warm contact aren't /w's to surface.
+        job_id = str(job.get("job_id") or "")
+        contact = next(
+            (c for s, c in slug_to_contact.items() if job_id.startswith((f"gh_{s}_", f"lever_{s}_", f"ashby_{s}_"))),
+            None
+        ) or warm_contacts.get(normalize_company_for_match(company))
+        if not contact:
+            continue
+
+        seen_hashes.add(job_hash)
+        save_seen_job_db(job_hash)
+        match_count += 1
+
+        raw_id = job.get("job_id") or f"{company}_{title}"
+        short_id = generate_short_key(raw_id, fallback=time.time())
+        target_email = resolve_target_email(company, title, job.get("employer_website"))
+        job["target_email"] = target_email
+        sheet_uuid = save_job_to_cache(short_id, job)
+
+        contact_name = contact.get("name", "Contact")
+        send_warm_radar_card(job, contact_name, contact.get("note", "Active relationship"), sheet_uuid)
+
+        clavicular_rows.append({
+            "sheet_uuid": sheet_uuid,
+            "row_data": [
+                today_str, company, title, target_email, "",
+                "Matched", followup_date, job.get("job_apply_link", ""),
+                f"Warm Radar Match (no AI score): {contact_name}"
+            ]
+        })
+        time.sleep(1.1)  # same inter-card Telegram pacing run_job_pipeline uses
+
+    if clavicular_rows:
+        enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows))
+
+    logging.info(f"Warm Radar Complete: {match_count} new matches across {len(slugs)} warm companies.")
+    if chat_id:
+        send_telegram_message(chat_id, f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies checked.")
+    return match_count
+
 # ==============================================================================
 # 9. ASYNC WORKLOAD PROCESSOR & WEBHOOK CONTROLLER
 # ==============================================================================
@@ -4507,6 +4707,12 @@ def process_webhook_payload_async(data):
             )
             count = run_job_pipeline(chat_id, top_n=qty)
             send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
+            return
+
+        # 2b. Warm Network Radar (/w): zero-LLM, cache-only scan of warm-contact companies
+        if re.match(r"^/w$", text):
+            send_telegram_message(chat_id, "🔭 <b>Warm Network Radar:</b> checking cached ATS boards for your warm contacts (no AI scoring)...")
+            run_warm_radar_scan(chat_id)
             return
 
         # 3. Networking Cards Pull Triggers (/c, /cw, /cc [qty])
@@ -5247,6 +5453,7 @@ def process_webhook_payload_async(data):
                 ("📖 <b>Command Reference</b>\n\n" if text == "/help" else "⚠️ <b>Command Unrecognized</b>\n\n") +
                 "<b>CORE COMMANDS:</b>\n"
                 "/t - Pull fresh job cards\n"
+                "/w - Warm radar: new roles at your warm-contact companies (no AI, instant)\n"
                 "/search - View or update live search filters\n"
                 "/quick - Create contact (Name @ Firm Priority Note)\n"
                 "/cold, /warm - Quick-add a Cold/Warm contact (Name @ Firm Priority Note)\n"

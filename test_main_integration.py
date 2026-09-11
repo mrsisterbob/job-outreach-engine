@@ -369,6 +369,85 @@ def test_needs_card_flags_withheld_buries_in_the_buried_section_and_summary(monk
     assert "5 buries capped" in card
 
 
+# ---- Carmen Cold in the follow-up cadence (sequencer scan + overdue + roleless bumps) ----
+
+def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeypatch):
+    """Carmen Cold is now the active outreach cycle - replies auto-move contacts here - so it
+    must be scanned by run_followup_sequencer() like the JOBS tabs. A CC row 4d into 'Applied'
+    (Status carried over by the tab move) draws a follow-up #1 with a roleless draft."""
+    assert ("CC", "Carmen Cold") in m.SEQUENCER_SCAN_TABS
+    cc_row = {"sheet_uuid": "cc-fu1", "company": "Nliven", "title": "", "name": "Dana Reyes",
+              "status": "Applied", "date_added": "2026-05-28", "next_followup": "1970-01-01",
+              "raw_priority": "High"}
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(cc_row)] if code == "CC" else [])
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    ready = result["followups_ready"]
+    assert [r["sheet_uuid"] for r in ready] == ["cc-fu1"]
+    draft = ready[0]["draft_text"]
+    assert draft.startswith("Hi Dana Reyes,")
+    assert "{" not in draft
+    assert "this role" not in draft and "the  role" not in draft
+    assert any(p["action"] == "update_snooze" and p["sheet_uuid"] == "cc-fu1" for p in enqueued)
+
+
+def test_carmen_cold_row_is_never_auto_buried_to_died(monkeypatch):
+    """A networking contact is not a job application. A CC row well past FOLLOWUP_BURY_DAYS is
+    surfaced as 'going cold' for a human call - never an append_note/update_status->Died write."""
+    cc_row = {"sheet_uuid": "cc-old", "company": "Nliven", "title": "", "name": "Sam",
+              "status": "Applied", "date_added": "2026-04-01", "next_followup": "1970-01-01",
+              "raw_priority": "Medium"}
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(cc_row)] if code == "CC" else [])
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert [r["sheet_uuid"] for r in result["buried"]] == []
+    assert [r["sheet_uuid"] for r in result["going_cold"]] == ["cc-old"]
+    assert enqueued == []  # zero writes for a would-be bury on a PEOPLE row
+
+
+def test_overdue_scan_includes_carmen_cold(monkeypatch):
+    by_code = {
+        "CC": [_overdue_record("HotLead", "2020-01-01")],
+        "CW": [_overdue_record("OldFriend", "2020-02-01")],
+        "TC": [_overdue_record("Stellantis", "2020-03-01")],
+    }
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda target_code="CW", qty=2: by_code.get(target_code, []))
+    overdue = m.get_overdue_followups()
+    assert [r["company"] for r in overdue] == ["HotLead", "OldFriend", "Stellantis"]
+    assert {r["sheet_tab"] for r in overdue} == {"Carmen Cold", "Carmen Warm", "Tetiana Cold"}
+
+
+def test_build_followup_bump_draft_renders_cleanly_with_no_role():
+    """PEOPLE rows have no title; the draft must not read 'the this role role at X' or 'the  role at X'."""
+    record = {"name": "Dana", "company": "Nliven", "title": ""}
+    for attempt in (1, 2):
+        draft = m.build_followup_bump_draft(record, attempt)
+        assert draft.startswith("Hi Dana,")
+        assert "{" not in draft
+        assert "this role" not in draft
+        assert "the  role" not in draft and " role at" not in draft
+    # With a real role it still uses the followup_bumps bank's "the X role at Y" register.
+    with_role = m.build_followup_bump_draft({"name": "Dana", "company": "Nliven", "title": "Ops Analyst"}, 1)
+    assert "Ops Analyst role at Nliven" in with_role
+
+
+def test_generate_bump_email_routes_to_roleless_copy_when_title_is_blank():
+    blank = m.generate_bump_email(contact_name="Dana", company_name="Nliven")
+    assert blank.startswith("Hi Dana,")
+    assert "this role" not in blank and "{" not in blank
+    titled = m.generate_bump_email(contact_name="Dana", job_title="Ops Analyst", company_name="Nliven")
+    assert "Ops Analyst role at Nliven" in titled
+
+
 # ---- Daily "needs you today" card (render_followup_needs_card) ----
 
 def test_needs_card_renders_every_populated_section(monkeypatch):
@@ -654,7 +733,7 @@ def test_edit_warns_but_still_writes_a_template_with_violations(temp_bank):
     template is flagged and SAVED. A blocked write would strand him with no way to override."""
     write, read = temp_bank
     path = write({"cold_ops": ["Hi, I'd like to connect."]})
-    bad = "Hi, I wanted to discuss alignment: happy to grab 15 minutes!\n\nBest regards,\nKevin"
+    bad = "Hi, I wanted to discuss alignment: happy to grab a quick chat!\n\nBest regards,\nKevin"
 
     ok, message = m.update_template_entry(path, "cold_ops", 0, bad)
 
@@ -662,7 +741,7 @@ def test_edit_warns_but_still_writes_a_template_with_violations(temp_bank):
     assert read()["cold_ops"][0] == bad, "the edit must land on disk even with violations"
     assert "Template Updated" in message
     assert "Voice check" in message and "saved anyway" in message
-    for expected in ("alignment", "colon", "exclamation", "Best regards", "15 minutes"):
+    for expected in ("alignment", "colon", "exclamation", "Best regards", "quick chat"):
         assert expected in message, f"lint warning should name {expected!r}"
 
 
@@ -683,7 +762,7 @@ def test_edit_lint_flags_a_contraction_free_template_only_as_advice(temp_bank):
     write, _ = temp_bank
     path = write({"cold_ops": ["old"]})
 
-    ok, message = m.update_template_entry(path, "cold_ops", 0, "Hi, saw the ops role. Worth a quick chat?")
+    ok, message = m.update_template_entry(path, "cold_ops", 0, "Hi, saw the ops role. Worth a brief call?")
 
     assert ok is True
     assert "💡" in message and "no contractions" in message

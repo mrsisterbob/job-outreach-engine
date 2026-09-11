@@ -495,12 +495,12 @@ def test_is_unverified_email_false_for_clean_address():
 
 def test_lint_outreach_template_flags_the_phrases_that_caused_the_rewrite():
     stiff = ("Hi there,\n\nI saw the role and wanted to discuss alignment. I hope you have been "
-             "doing well. Would you be open to a brief 15-minute call?\n\nBest regards,\nKevin Miller")
+             "doing well. Would you be open to a quick chat?\n\nBest regards,\nKevin Miller")
     violations = " | ".join(pu.lint_outreach_template(stiff, "email"))
     assert "Best regards" in violations
     assert "alignment" in violations
     assert "Hi there" in violations
-    assert "15-minute" in violations
+    assert "quick chat" in violations
     # ...and the stiffness is only advisory - it never fails a template on its own.
     assert "no contractions" not in violations
     assert any("no contractions" in n for n in pu.advise_outreach_template(stiff, "email"))
@@ -538,6 +538,42 @@ def test_contraction_advice_is_advisory_and_ignores_possessives():
 def test_lint_outreach_template_flags_space_before_name_placeholder():
     # interpolate_template() supplies {name}'s own leading space; "Hi {name}," would double it.
     assert any("space before {name}" in v for v in pu.lint_outreach_template("Hi {name}, I've seen it.", "email"))
+
+
+def test_lint_allows_a_ten_minute_ask_but_still_flags_quick_chat():
+    """Reverted after the wrong-mailbox pass: the correct corpus (kjmiller406@gmail.com) has
+    '10 minutes' x3 and zero odd-minute asks, so a round timebox is the voice. 'quick chat'
+    has zero uses and stays banned."""
+    assert pu.lint_outreach_template("Do you have 10 minutes for a brief call?", "email") == []
+    assert pu.lint_outreach_template("Do you have 15 minutes for a brief call?", "email") == []
+    assert pu.lint_outreach_template("Do you have 13 minutes for a call?", "email") == []
+    assert any("quick chat" in v for v in pu.lint_outreach_template("Open to a quick chat this week?", "email"))
+
+
+def test_roleless_followup_bumps_pass_the_voice_linter():
+    """PEOPLE-schema (Carmen Cold) bump copy is held to the same hard rules as the JSON banks,
+    raw and sanitized, since it is authored in main.py rather than a template file."""
+    failures = []
+    for idx, template in enumerate(m._ROLELESS_FOLLOWUP_BUMPS):
+        for name in ("", "Dana"):
+            rendered = m.interpolate_template(template, name=name, company=_LINT_COMPANY)
+            for stage, text in (("raw", rendered), ("sanitized", m.sanitize_text(rendered))):
+                for violation in pu.lint_outreach_template(text, "email"):
+                    failures.append(f"_ROLELESS_FOLLOWUP_BUMPS[{idx}] ({stage}, name={name!r}): {violation}")
+    assert failures == []
+
+
+def test_warm_alumni_entries_are_unsendable_scaffolds():
+    """Warm outreach is hand-written now. Each warm_alumni entry must be an obviously-unfinished
+    skeleton (explicit bracketed blanks) so nothing generic can be fired off by /warm, yet still
+    pass the voice linter and keep the 6-entry addressing contract (W0-W5)."""
+    warm = _load_bank("outreach_templates.json")["warm_alumni"]
+    assert len(warm) == 6
+    for idx, template in enumerate(warm):
+        rendered = m.interpolate_template(template, name="", company=_LINT_COMPANY)
+        assert rendered.count("[") >= 3 and rendered.count("]") >= 3, f"warm_alumni[{idx}] has no blanks"
+        assert pu.lint_outreach_template(rendered, "email") == [], f"warm_alumni[{idx}] fails lint"
+        assert pu.lint_outreach_template(m.sanitize_text(rendered), "email") == []
 
 
 # ---- One voice, both paths: the real banks and the real generators ----
@@ -592,15 +628,39 @@ def test_every_shipped_template_passes_the_voice_linter():
 
 
 def test_shipped_templates_open_on_a_bare_hi_when_no_name_is_known():
-    # The card never knows the recipient's name, so the old "Hi there," default is gone. A
-    # template may use {name} ("Hi{name},") or the bare-name-on-its-own-line form ({name_bare},
-    # per the forensic voice report's rule 11 for a senior external stranger) - both must still
-    # degrade to a bare "Hi," when no contact name is resolved, since neither is a name to open on.
+    # The card never knows the recipient's name, so the old "Hi there," default is gone. The
+    # forensic analysis of the correct mailbox (kjmiller406@gmail.com) shows name-alone openers
+    # are a warm marker for people already spoken to, not a cold voice, so {name_bare} is retired:
+    # every cold template opens "Hi{name}," and must degrade to a bare "Hi," with no contact name
+    # and render "Hi Dana," (never "Dana,") when one is known.
     for template in _load_bank("outreach_templates.json")["cold_ops"]:
         no_name = m.interpolate_template(template, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE)
         with_name = m.interpolate_template(template, name="Dana", company=_LINT_COMPANY, job_title=_LINT_TITLE)
         assert no_name.startswith("Hi,")
-        assert with_name.startswith("Hi Dana,") or with_name.startswith("Dana,")
+        assert with_name.startswith("Hi Dana,")
+
+
+def test_cold_ops_encodes_the_professional_corpus_voice():
+    """Rules traceable to counts in the correct mailbox (kjmiller406@gmail.com, 62 emails):
+    a 10-minute 'brief' ask, one question about the recipient's work ('perspective'/'day to day'),
+    the verbatim release line on its own, 'Best,' + full name, and no college-corpus habits."""
+    cold = _load_bank("outreach_templates.json")["cold_ops"]
+    assert len(cold) == 6
+    for idx, template in enumerate(cold):
+        rendered = m.interpolate_template(template, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE)
+        ctx = f"cold_ops[{idx}]"
+        assert "10 minutes" in rendered and "brief" in rendered, ctx
+        assert "\nHappy to work around your schedule.\n" in rendered, ctx
+        assert rendered.rstrip().endswith("Best,\nKevin Miller"), ctx
+        assert ("perspective" in rendered) or ("day to day" in rendered), ctx
+        # college-corpus tells the professional corpus disproves
+        assert "Yours In Service" not in rendered and "YIS" not in rendered, ctx
+        assert "{name_bare}" not in template, ctx
+        for banned_minutes in ("13 minute", "14 minute", "16 minute", "17 minute"):
+            assert banned_minutes not in rendered, ctx
+        assert "I built" not in rendered and "I automated" not in rendered, ctx
+        # does not open by announcing the posting
+        assert not rendered.split("\n\n")[1].startswith(("I saw you're hiring", "I saw the", "Saw you're hiring")), ctx
 
 
 def test_gmail_generators_pass_the_same_linter_as_the_card_templates():
