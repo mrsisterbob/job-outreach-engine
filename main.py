@@ -52,6 +52,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL")
 CRM_SHARED_SECRET = os.environ.get("CRM_SHARED_SECRET")
+if not CRM_SHARED_SECRET:
+    logging.warning(
+        "[CONFIG WARNING] CRM_SHARED_SECRET is unset - outbound CRM requests will carry no secret, "
+        "and Code.gs (deployed Execute as: Me, Access: Anyone) now fails closed and will reject them."
+    )
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")

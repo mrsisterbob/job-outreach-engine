@@ -113,12 +113,14 @@ const HEADER_ROW_HEIGHT = 35;
 const FORMAT_BUFFER_ROWS = 1000; // ensures banding/conditional formatting cover future appended rows
 
 // Shared-secret auth: set via Project Settings > Script Properties > CRM_SHARED_SECRET.
-// If unset, every request is allowed through (unauthenticated) - set this in production so the
-// webhook URL alone (which can leak via logs/history) isn't enough to read/write the CRM.
+// Fails CLOSED: an unset/blank secret refuses every request rather than falling through to
+// "authorized". This script is deployed "Execute as: Me, Access: Anyone" - the shared secret is
+// the only thing standing between the internet and full read/write on the CRM, so a missing
+// property must never be silently treated as "no auth required".
 function isRequestAuthorized(providedSecret) {
   const expected = PropertiesService.getScriptProperties().getProperty("CRM_SHARED_SECRET");
   if (!expected) {
-    return true;
+    return false;
   }
   return (providedSecret || "") === expected;
 }
