@@ -519,6 +519,37 @@ def test_queue_command_previews_without_any_writes(monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
 
 
+# ---- Resume PDF attachment filename ----
+
+def test_resume_pdf_filename_drops_track_code_and_legal_suffix():
+    # The recruiter-visible name carries the company and nothing internal: no Track A-E routing
+    # key, no mangled run-together words, no legal suffix.
+    assert m.resume_pdf_filename("Atwell, LLC") == "Kevin_Miller_Resume_Atwell.pdf"
+    assert m.resume_pdf_filename("Goldman Sachs") == "Kevin_Miller_Resume_Goldman_Sachs.pdf"
+    assert m.resume_pdf_filename("Ernst & Young LLP") == "Kevin_Miller_Resume_Ernst_Young.pdf"
+    assert m.resume_pdf_filename("Booz Allen Hamilton Holdings Corporation") == (
+        "Kevin_Miller_Resume_Booz_Allen_Hamilton.pdf"
+    )
+
+
+def test_resume_pdf_filename_preserves_brand_casing_and_separates_words():
+    # "thyssenkrupp" styles its own name lowercase; title-casing it would be wrong. The old
+    # re.sub(r'[^a-zA-Z0-9]', '') deleted the spaces instead of converting them, yielding
+    # "thyssenkruppMaterialsCALtd".
+    assert m.resume_pdf_filename("thyssenkrupp Materials CA Ltd") == (
+        "Kevin_Miller_Resume_thyssenkrupp_Materials_CA.pdf"
+    )
+    # "&" joins words rather than separating them.
+    assert m.resume_pdf_filename("AT&T Inc.") == "Kevin_Miller_Resume_ATT.pdf"
+
+
+def test_resume_pdf_filename_omits_company_when_unresolved():
+    # clean_company_for_copy() answers "your team" for an empty company, which reads fine in prose
+    # but must never reach a filename.
+    for unresolved in ["", None, "   ", "your team", "Target Firm"]:
+        assert m.resume_pdf_filename(unresolved) == "Kevin_Miller_Resume.pdf"
+
+
 # ---- /draft Gmail MIME attachment correctness ----
 
 def test_create_gmail_draft_attaches_pdf_with_correct_filename(monkeypatch):

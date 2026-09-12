@@ -1893,6 +1893,41 @@ def clean_company_for_copy(company_name):
     clean = re.sub(r'\s+', ' ', clean).strip()
     return clean or raw or "your team"
 
+def resume_pdf_filename(company_name):
+    """The filename a recruiter sees on the resume attachment: "Kevin_Miller_Resume_Atwell.pdf".
+
+    Three things this fixes over the old inline f-string, which was copy-pasted at five call sites:
+
+      - No Track letter. Track A-E is the internal bullet-pool routing key
+        (TRACK_BULLET_POOL_KEYS); to a recruiter "TrackE" is meaningless, and it advertises that
+        the resume is one of five machine-generated variants. The track is still shown in the
+        Telegram caption, so Kevin can see which one he sent.
+      - Separators are converted, not deleted. The old re.sub(r'[^a-zA-Z0-9]', '') welded
+        "thyssenkrupp Materials CA Ltd" into "thyssenkruppMaterialsCALtd".
+      - Legal suffixes are stripped, reusing clean_company_for_copy() so the attachment and the
+        email body refer to the company the same way.
+
+    Company casing is preserved verbatim: "thyssenkrupp" styles its own name lowercase, and
+    title-casing it would be wrong in a way a recruiter there would notice.
+    """
+    raw = str(company_name or "").strip()
+    # clean_company_for_copy() falls back to "your team" for an empty company, which reads fine
+    # mid-sentence but not as "Kevin_Miller_Resume_your_team.pdf" - guard before calling it.
+    if not raw or is_placeholder_company_name(raw):
+        return "Kevin_Miller_Resume.pdf"
+    clean = clean_company_for_copy(raw)
+    # "LLP" outlives clean_company_for_copy()'s suffix list (it has llc/plc, not llp), and it is
+    # as much noise on a filename as "Inc." is.
+    clean = re.sub(r'\bllp\b\.?', '', clean, flags=re.IGNORECASE).strip().rstrip(',')
+    # "&" joins words rather than separating them: "AT&T" -> "ATT", not "AT_T".
+    clean = clean.replace("&", "")
+    # Collapse each remaining run of non-alphanumerics to one underscore, so "A.B. Smith" -> "A_B_Smith".
+    slug = re.sub(r'[^A-Za-z0-9]+', '_', clean).strip('_')
+    # 64 chars keeps the whole filename comfortably clear of the 255-byte limit some ATS
+    # upload forms and Windows paths enforce, without truncating any realistic company name.
+    slug = slug[:64].rstrip('_')
+    return f"Kevin_Miller_Resume_{slug}.pdf" if slug else "Kevin_Miller_Resume.pdf"
+
 def render_outreach_email(pool_key, template_id=0, name="", company="", job_title=""):
     """THE single rendering path for every candidate-facing email body, cold or warm or bump.
 
@@ -5880,8 +5915,7 @@ def process_webhook_payload_async(data):
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
             tone_mode = job.get("tone_mode", "conservative")
-            clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
-            pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
+            pdf_filename = resume_pdf_filename(comp)
             pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft", tone_mode=tone_mode)
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
             raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
@@ -5936,8 +5970,7 @@ def process_webhook_payload_async(data):
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
             tone_mode = job.get("tone_mode", "conservative")
-            clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
-            pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
+            pdf_filename = resume_pdf_filename(comp)
             pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/eh", tone_mode=tone_mode)
 
             raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
@@ -5988,8 +6021,7 @@ def process_webhook_payload_async(data):
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
             tone_mode = job.get("tone_mode", "conservative")
-            clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
-            pdf_filename = f"Kevin_Miller_Resume_{clean_comp}_Track{str(track).upper()}.pdf"
+            pdf_filename = resume_pdf_filename(comp)
             pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/e", tone_mode=tone_mode)
 
             raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
@@ -6091,8 +6123,7 @@ def process_webhook_payload_async(data):
 
             try:
                 pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
-                clean_comp = re.sub(r'[^a-zA-Z0-9]', '', comp)
-                filename = f"Kevin_Miller_Resume_{clean_comp}_Track{track.upper()}.pdf"
+                filename = resume_pdf_filename(comp)
 
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
                 files = {"document": (filename, io.BytesIO(pdf_bytes), "application/pdf")}
@@ -6514,7 +6545,7 @@ def desktop_stage_view(short_id):
             <p><b>Targeted ATS Bullets:</b></p>
             <ul>{bullets_html}</ul>
             <div style="margin-top: 20px;">
-                <a class="btn btn-primary" href="/stage/{short_id}/pdf?track={track}" download="Kevin_Miller_Resume_{re.sub(r'[^a-zA-Z0-9]', '', comp)}.pdf">⬇️ Download Tailored PDF</a>
+                <a class="btn btn-primary" href="/stage/{short_id}/pdf?track={track}" download="{html.escape(resume_pdf_filename(comp))}">⬇️ Download Tailored PDF</a>
                 <a class="btn btn-secondary" href="{html.escape(apply_link)}" target="_blank">🔗 Open Application Portal</a>
             </div>
 
