@@ -879,3 +879,22 @@ def test_carmen_ladder_tolerates_a_late_sequencer_run():
     past its rung must still read as that rung instead of skipping ahead."""
     action, _ = pu.plan_carmen_followup("2026-09-12", "2026-09-15", date(2026, 9, 17))
     assert action == "nudge_1"
+
+
+# ---- Untouched "Matched" row expiry ----
+
+def test_expired_matched_row_only_retires_untouched_pipeline_output():
+    """A row Kevin never engaged with ages out at 30d; anything he touched never does."""
+    today = date(2026, 9, 12)
+    assert pu.is_expired_matched_row("Matched", "2026-08-13", today) is True   # 30d
+    assert pu.is_expired_matched_row("Matched", "2026-08-14", today) is False  # 29d
+    for engaged in ("Applied", "Replied", "Screening", "Interviewing", "Offer"):
+        assert pu.is_expired_matched_row(engaged, "2026-01-01", today) is False, engaged
+
+
+def test_expired_matched_row_never_fires_without_a_parseable_date():
+    """A stale row beats silently retiring one whose Date Added simply failed to parse."""
+    today = date(2026, 9, 12)
+    assert pu.is_expired_matched_row("Matched", "", today) is False
+    assert pu.is_expired_matched_row("Matched", "1970-01-01", today) is False
+    assert pu.is_expired_matched_row("Matched", "not-a-date", today) is False

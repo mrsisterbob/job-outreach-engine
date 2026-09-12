@@ -32,6 +32,7 @@ from pipeline_utils import (
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     plan_carmen_followup, CARMEN_LADDER_DAYS,
+    is_expired_matched_row, MATCHED_EXPIRY_DAYS,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
     REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
 )
@@ -1561,6 +1562,30 @@ def _parse_sheet_uuid_from_card_text(text):
         return None, None
     return match.group(1), html.unescape((match.group(2) or "Pipeline_Candidates").strip())
 
+def _parse_routing_from_card_text(text):
+    """Extracts Gemini's routing decisions from a card's own 🧭 marker: the resume track letter,
+    tone mode, bullet indices and outreach template id, as "a|conservative|0,1,2,3|4".
+
+    These live only in the ephemeral jobs cache, so before this marker a deploy left /draft and /e
+    with no way to rebuild the copy or the resume they had already routed - the card was blocked
+    outright rather than degraded. Embedding them in the Telegram message makes the cache a pure
+    optimization: the message is the durable copy, exactly as it already is for sheet_uuid.
+
+    Returns {} when the marker is absent (any card dispatched before this shipped).
+    """
+    if not text:
+        return {}
+    match = re.search(r'🧭\s*(?:<code>)?([a-e])\|(conservative|tech)\|([0-9,]*)\|(\d+)(?:</code>)?', str(text))
+    if not match:
+        return {}
+    bullets = [int(i) for i in match.group(3).split(",") if i.strip().isdigit()]
+    return {
+        "track": match.group(1),
+        "tone_mode": match.group(2),
+        "bullet_indices": bullets or None,
+        "outreach_template_id": int(match.group(4)),
+    }
+
 def _fuzzy_find_job_in_sheets(company, title):
     """Searches Tetiana Cold then Clavicular via get_followups for a legal-suffix/case-insensitive
     dedup-hash match on (company, title), returning (sheet_uuid, sheet_tab) or None.
@@ -1644,6 +1669,43 @@ STALE_CARD_WARNING = (
     "it was built from lives on ephemeral disk. Reply <code>/t</code> or <code>/c</code> to "
     "resurface fresh cards, then re-run the command on one of those."
 )
+
+# Sent when a command rebuilt its job from the card text instead of the wiped cache. Never silent:
+# a card dispatched before the 🧭 marker shipped recovers company/title but falls back to a
+# default-routed resume, and shipping a track-A PDF for a compliance role without saying so is
+# worse than the old hard block.
+CARD_RECOVERED_NOTICE = (
+    "♻️ <b>Rebuilt from the card</b> - the jobs cache was wiped by a deploy. Copy and routing "
+    "came from the card itself. If it carries no <code>🧭</code> line, the resume is default-routed; "
+    "reply <code>/t</code> for a fresh card when the tailored one matters."
+)
+
+def rebuild_job_from_card(job, card_text):
+    """Backfill a wiped job dict from the card's own text so /draft and /e still work.
+
+    The jobs cache lives on Render's ephemeral disk and is wiped by every deploy, but the card is
+    a Telegram message and is not: company, title, sheet_uuid and (since the 🧭 marker) Gemini's
+    routing all survive there. Everything /draft and /e actually need is therefore recoverable -
+    the email body is interpolated in Python from the local template banks, never from the job
+    description, so no cached prose is required.
+
+    Returns (job, recovered) where `recovered` is True only when the cache was empty and the card
+    supplied the data, so the caller can say so rather than silently shipping a default-routed
+    resume. A card with no 🧭 marker (dispatched before this shipped) still recovers company and
+    title; only the routing falls back to defaults.
+    """
+    job = dict(job or {})
+    if job.get("employer_name"):
+        return job, False
+    company, title = _parse_company_title_from_card_text(card_text)
+    if not (company and title):
+        return job, False
+    job["employer_name"] = company
+    job["job_title"] = title
+    for key, value in _parse_routing_from_card_text(card_text).items():
+        if value is not None:
+            job.setdefault(key, value)
+    return job, True
 
 def _job_data_available(job, mapping):
     """True if either the cached job JSON or the CRM mapping has real company data to work from.
@@ -1927,9 +1989,17 @@ NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. 
 
 Determine the target firm's conservatism level. If the company is a traditional bank, broker-dealer, legacy RIA, or insurance carrier, set "tone_mode" to "conservative". If the company is a fintech, crypto platform, tokenization startup, or software vendor, set "tone_mode" to "tech". When "tone_mode" is "conservative", DO NOT select bullet indices referencing crypto, Bitcoin, or Web3.
 
+SCORING BANDS - use the whole range. Most real postings land in 50-79; reserve 90+ for a genuine match, not merely a plausible one:
+90-100: Does what the candidate already does. Names his actual tools (Salesforce, Schwab/Fidelity, DocuSign, Python, SQL) AND is clearly entry-level (0-2 yrs).
+80-89: Strong match on the work itself, but one real gap - a tool he has not used, or 3+ years requested.
+70-79: Adjacent. Transferable skills, different function or domain. He could do it; it is not what he does.
+50-69: Plausible stretch. Meaningful gaps in function, seniority or industry.
+25-49: Weak. Wrong function, or seniority he cannot credibly claim.
+1-24: Disqualifying - sales/commission, senior/lead/manager, CPA track, or a domain with no overlap.
+
 Evaluate the job description and respond ONLY with a JSON object containing:
 {{
-"score": <integer between 1 and 100 representing fit signal>,
+"score": <integer 1-100, anchored to the bands below - an unanchored score clusters in the 70s and 80s and makes every candidate look alike, which is useless for ranking>,
 "reason": "<1-sentence concise explanation of why this role fits or does not fit>",
 "track": "<one letter a|b|c|d|e selecting the resume bullet pool that best matches this role: a=wealth operations, b=data/systems engineering, c=risk & regulatory compliance, d=business intelligence & analytics, e=business operations & CRM systems>",
 "tone_mode": "<'conservative' or 'tech' - conservative for traditional banks/broker-dealers/legacy RIAs/insurance carriers, tech for fintech/crypto/tokenization startups/software vendors>",
@@ -1968,6 +2038,24 @@ def calculate_keyword_overlap(job_desc):
     overlap_pct = int((len(matches) / len(core_skills)) * 100) if core_skills else 0
     return overlap_pct, matches
 
+SOFT_CAP_KNEE = 90
+
+
+def soft_cap_score(raw_score):
+    """Clamp to 1-100, but compress above SOFT_CAP_KNEE instead of flattening.
+
+    A hard min(100, ...) destroys ordering exactly where it matters most: everything from 100 to
+    135 collapsed onto the same value, so the Tier-1 top-5 cut was slicing a pile of ties and the
+    "best" five were whichever the sort happened to touch first. Above the knee each additional
+    raw point is worth a tenth of a point, so a 130 still outranks a 105 while both stay inside
+    the 1-100 scale the cards, sheet and filters already assume.
+    """
+    score = int(raw_score)
+    if score <= SOFT_CAP_KNEE:
+        return max(1, score)
+    return min(100, SOFT_CAP_KNEE + int(round((score - SOFT_CAP_KNEE) / 10.0)))
+
+
 def calculate_hybrid_score_modifier(job, base_ai_score):
     """Layer 1 of the additive scoring: keyword/salary modifiers on top of Gemini's holistic base.
     Returns (final_score, layer1_bonus) where final_score is the clamped 1-100 result (unchanged
@@ -1984,12 +2072,59 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     tier1_ecosystem = get_filter("tier1_ecosystem", [])
     if any(k in desc or k in company for k in tier1_ecosystem):
         bonus += 10
-    if max_sal >= 60000:
-        bonus += 5
-    if any(k in desc for k in ["fintech", "payments", "autotech", "saas", "tokenization", "digital assets", "web3", "trading bot"]):
-        bonus += 15
-    if any(k in desc for k in ["schwab", "fidelity", "docusign", "orion", "salesforce", "python", "sql", "etl"]):
+    # Graduated rather than a single cliff at 60k: a binary +5 treated a 62k listing and a 130k
+    # listing as identical, throwing away the clearest quality signal a posting carries.
+    if max_sal >= 110000:
         bonus += 10
+    elif max_sal >= 90000:
+        bonus += 8
+    elif max_sal >= 75000:
+        bonus += 6
+    elif max_sal >= 60000:
+        bonus += 4
+    # Scaled by DISTINCT matches rather than firing a flat bonus on any single hit. Nearly every
+    # ops posting mentions Salesforce or SQL somewhere, so a flat +10/+15 was close to a constant:
+    # it lifted good and mediocre jobs equally, then the 100-clamp erased what was left of the
+    # spread. Counting distinct terms makes a role wanting Python AND SQL AND Salesforce actually
+    # outrank one that says "Salesforce" once.
+    domain_hits = sum(1 for k in ["fintech", "payments", "autotech", "saas", "tokenization", "digital assets", "web3", "trading bot"] if k in desc)
+    bonus += min(12, domain_hits * 6)
+    tool_hits = sum(1 for k in ["schwab", "fidelity", "docusign", "orion", "salesforce", "python", "sql", "etl"] if k in desc)
+    bonus += min(12, tool_hits * 4)
+    # Seniority, read off the title. The system prompt forbids senior/lead/manager roles, but
+    # nothing downstream enforced it, so a "Senior Operations Manager" could still outscore a
+    # genuine entry-level opening on keywords alone. Entry-level markers earn a bonus for the
+    # same reason: they are the roles actually winnable at 0-2 years.
+    if re.search(r'\b(senior|sr\.?|lead|principal|staff|head of|director|vp|manager|mgr)\b', title):
+        bonus -= 18
+    elif re.search(r'\b(junior|jr\.?|associate|entry[ -]?level|analyst i|i{1,2}\b|coordinator|specialist)\b', title):
+        bonus += 6
+
+    # Years-of-experience demand: a 0-2yr candidate is a real match at 0-3 and a stretch past 5.
+    exp_match = re.search(r'(\d+)\+?\s*(?:-\s*\d+\s*)?year', desc)
+    if exp_match:
+        years = safe_int(exp_match.group(1), 0)
+        if years >= 7:
+            bonus -= 15
+        elif years >= 5:
+            bonus -= 10
+        elif years >= 3:
+            bonus -= 4
+        else:
+            bonus += 6
+
+    # Posting freshness. get_age_badge() already computes this for the card; feeding it into the
+    # score too means a role posted yesterday outranks an identical one going stale, which is the
+    # closest cheap proxy for "winnable" the pipeline has.
+    posted_hours = parse_posted_hours(job)
+    if posted_hours is not None:
+        if posted_hours <= 72:
+            bonus += 8
+        elif posted_hours <= 168:
+            bonus += 4
+        elif posted_hours >= 720:
+            bonus -= 8
+
     if any(k in desc for k in ["high call volume", "outbound calling", "phone queue", "call center", "inbound calls", "dialer"]):
         bonus -= 20
     if any(k in title for k in ["data entry", "admin coordinator", "administrative assistant"]) and max_sal < 60000:
@@ -2006,7 +2141,7 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
 
     score = base_ai_score + bonus
     layer1_bonus = score - base_ai_score
-    return max(1, min(100, score)), layer1_bonus
+    return soft_cap_score(score), layer1_bonus
 
 def resolve_live_alumni_at_company(company_name, school="Hope College"):
     """JIT alumni resolution: live-queries DuckDuckGo HTML search for a LinkedIn profile ath
@@ -4044,6 +4179,31 @@ def run_followup_sequencer(today=None, dry_run=False):
             _record_sequencer_action(sheet_uuid, run_date, ladder_action)
             continue
 
+        # Retire untouched pipeline output. followup_action() returns "none" for "Matched", so
+        # without this a row Kevin never engaged with sits in Tetiana Cold forever and the tab
+        # grows without bound. Shares the bury cap and the same note-then-move writes.
+        if is_expired_matched_row(rec.get("status"), rec.get("date_added"), today):
+            sheet_uuid = rec.get("sheet_uuid")
+            result["buried"].append({
+                "company": rec.get("company") or "N/A",
+                "role": rec.get("title") or "",
+                "short_id": get_short_id_by_sheet_uuid(sheet_uuid) if sheet_uuid else None,
+                "sheet_uuid": sheet_uuid,
+            })
+            if dry_run or not sheet_uuid or _sequencer_already_actioned(sheet_uuid, run_date):
+                continue
+            if buries_written >= MAX_AUTO_BURIES_PER_RUN:
+                buries_suppressed += 1
+                continue
+            enqueue_crm_payload(build_crm_payload(
+                "append_note", sheet_uuid=sheet_uuid,
+                note=f"[reason: never actioned after {MATCHED_EXPIRY_DAYS}d]",
+            ))
+            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Died"))
+            _record_sequencer_action(sheet_uuid, run_date, "expire_matched")
+            buries_written += 1
+            continue
+
         action = followup_action(rec.get("status"), rec.get("date_added"), rec.get("next_followup"), today)
         if action == "none":
             continue
@@ -4335,6 +4495,17 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
     alumni_block = f"{alumni_line_safe}\n" if alumni_line_safe.strip() else ""
     fit_dot = get_fit_score_indicator(score)
 
+    # Gemini's routing decisions, carried in the message itself so a deploy that wipes the jobs
+    # cache degrades /draft and /e instead of blocking them. Parsed back by
+    # _parse_routing_from_card_text(); keep the two in sync.
+    _bullets = job.get("bullet_indices") or []
+    routing_tag = "{}|{}|{}|{}".format(
+        str(job.get("track") or "a").lower()[:1],
+        "tech" if str(job.get("tone_mode") or "").lower() == "tech" else "conservative",
+        ",".join(str(int(i)) for i in _bullets if str(i).lstrip("-").isdigit()),
+        int(job.get("outreach_template_id") or 0),
+    )
+
     # Metadata line: score (+ the boost that got it there, if any) always first, then salary and
     # work style only when actually known, then age and keyword overlap unconditionally.
     boost_suffix = f" ({score_boost:+d})" if score_boost else ""
@@ -4359,7 +4530,7 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
         f"🤝 <a href='{recruiter_dork_url}'>Recruiter</a> · 🔍 <a href='{apollo_url}'>Apollo</a> · "
         f"📣 <a href='{company_posts_url}'>Co. Posts</a>\n"
         f"📋 <a href='{stage_url}'>Full Card</a> - bullets, LinkedIn note, draft, links, PDF\n"
-        f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code>\n\n"
+        f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code> · 🧭 <code>{routing_tag}</code>\n\n"
         f"⚡ <code>/apply</code> <code>/draft</code> <code>/warm</code> <code>/cold</code> "
         f"<code>/x</code> <code>/f</code> <code>/n</code> <code>/e</code> <code>/eh</code> · <code>/help</code>"
     )
@@ -5423,9 +5594,12 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            job, from_card = rebuild_job_from_card(job, (msg.get("reply_to_message") or {}).get("text", ""))
             if not _job_data_available(job, mapping):
                 send_telegram_message(chat_id, STALE_CARD_WARNING)
                 return
+            if from_card:
+                send_telegram_message(chat_id, CARD_RECOVERED_NOTICE)
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
@@ -5482,9 +5656,12 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            job, from_card = rebuild_job_from_card(job, (msg.get("reply_to_message") or {}).get("text", ""))
             if not _job_data_available(job, mapping):
                 send_telegram_message(chat_id, STALE_CARD_WARNING)
                 return
+            if from_card:
+                send_telegram_message(chat_id, CARD_RECOVERED_NOTICE)
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
@@ -5538,9 +5715,12 @@ def process_webhook_payload_async(data):
                 return
             new_email = raw_email
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            job, from_card = rebuild_job_from_card(job, (msg.get("reply_to_message") or {}).get("text", ""))
             if not _job_data_available(job, mapping):
                 send_telegram_message(chat_id, STALE_CARD_WARNING)
                 return
+            if from_card:
+                send_telegram_message(chat_id, CARD_RECOVERED_NOTICE)
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")

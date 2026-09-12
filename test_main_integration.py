@@ -1373,18 +1373,66 @@ def test_hybrid_score_modifier_returns_the_signed_layer1_shift(monkeypatch):
         "job_max_salary": 95000,
     }
     final_score, layer1_bonus = m.calculate_hybrid_score_modifier(job, 60)
-    # +15 fintech/payments, +10 python/sql, +5 salary>=60k, tier-1 filter empty -> +30
-    assert layer1_bonus == 30
-    assert final_score == 90
+    # Keyword bonuses scale with DISTINCT matches: 2 domain terms (fintech, payments) -> +12 at
+    # the cap, 2 tools (python, sql) -> +8, +8 salary in the 90k band, +6 "Analyst" entry-level
+    # title, +6 no years-of-experience demand. A flat +10/+15 per category fired on any single
+    # hit, which nearly every ops posting clears.
+    assert layer1_bonus == 36
+    # 96 raw, compressed by soft_cap_score() rather than flattened at the 100 clamp.
+    assert final_score == 91
 
+
+def test_keyword_bonuses_separate_a_tool_rich_posting_from_a_passing_mention(monkeypatch):
+    """The point of scaling by distinct matches: a role wanting the whole stack must outrank one
+    that name-drops Salesforce once. Under the old flat bonus both got the same +10 and, after the
+    100-clamp, frequently the same final score - which is what made the top-5 cut arbitrary."""
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: default if default is not None else [])
+    base = {"job_title": "Operations Analyst", "employer_name": "Acme",
+            "job_city": "Detroit", "job_max_salary": 95000}
+
+    rich = dict(base, job_description="Salesforce, Python, SQL and ETL pipelines daily.")
+    thin = dict(base, job_description="Some Salesforce administration.")
+    # Scored below the soft-cap knee so this measures the keyword scaling itself, not compression.
+    assert m.calculate_hybrid_score_modifier(rich, 40)[1] > m.calculate_hybrid_score_modifier(thin, 40)[1]
+    assert m.calculate_hybrid_score_modifier(rich, 40)[0] > m.calculate_hybrid_score_modifier(thin, 40)[0]
+
+
+def test_soft_cap_preserves_ordering_above_the_knee():
+    """A hard min(100, ...) collapsed every raw score from 100 upward onto one value, so the
+    Tier-1 top-5 cut was slicing a pile of ties. Compression keeps the ranking inside 1-100."""
+    assert m.soft_cap_score(85) == 85            # below the knee: untouched
+    assert m.soft_cap_score(200) <= 100          # never escapes the scale
+    assert m.soft_cap_score(-5) >= 1
+    assert m.soft_cap_score(125) > m.soft_cap_score(110) > m.soft_cap_score(100)
+    assert all(m.soft_cap_score(i) <= m.soft_cap_score(i + 1) for i in range(1, 200))
+
+
+def test_seniority_and_experience_demands_push_a_role_down():
+    """The system prompt forbids senior roles but nothing downstream enforced it, so a
+    'Senior Operations Manager' could outscore a real entry-level opening on keywords alone."""
+    base = {"employer_name": "Acme", "job_city": "Detroit", "job_max_salary": 95000,
+            "job_description": "Salesforce and SQL reporting."}
+    junior = dict(base, job_title="Operations Analyst I")
+    senior = dict(base, job_title="Senior Operations Manager")
+    assert m.calculate_hybrid_score_modifier(junior, 70)[1] > m.calculate_hybrid_score_modifier(senior, 70)[1]
+
+    entry_exp = dict(junior, job_description="Salesforce and SQL reporting. 2 years experience.")
+    deep_exp = dict(junior, job_description="Salesforce and SQL reporting. 8 years experience.")
+    assert m.calculate_hybrid_score_modifier(entry_exp, 70)[1] > m.calculate_hybrid_score_modifier(deep_exp, 70)[1]
+
+
+def test_negative_layer1_modifiers_pass_through_uncapped():
+    """Penalties are never trimmed by the stacking cap - a call-centre listing must be able to
+    fall as far as its modifiers take it."""
     penal = {
         "job_title": "Customer Service Rep",
         "employer_name": "Acme",
         "job_description": "High call volume. Inbound calls all day on the dialer queue.",
         "job_city": "Detroit",
     }
-    fs2, b2 = m.calculate_hybrid_score_modifier(penal, 80)
-    assert b2 == -20 and fs2 == 60  # negative Layer-1 modifier reported straight through
+    final_score, layer1_bonus = m.calculate_hybrid_score_modifier(penal, 80)
+    assert layer1_bonus < 0
+    assert final_score < 80
 
 
 # ---- Gemini screening fails closed without a key ----
@@ -1666,3 +1714,90 @@ def test_template_reply_rates_buckets_a_job_cached_before_ids_were_persisted(cle
     assert data["by_linkedin_template"][None] == {"sent": 1, "replied": 1, "reply_rate": 100.0}
     msg = m.format_template_reply_rates_message()
     assert "(unset): 1 sent → 1 replied (100.0%)" in msg
+
+
+def test_untouched_matched_row_expires_to_died(monkeypatch):
+    """Tetiana Cold self-cleans: a 'Matched' row Kevin never actioned is retired to Died after
+    MATCHED_EXPIRY_DAYS, which is what stops the tab growing without bound."""
+    stale = (_SEQ_TODAY - timedelta(days=m.MATCHED_EXPIRY_DAYS + 1)).strftime("%Y-%m-%d")
+    tc_row = {"sheet_uuid": "tc-stale", "company": "Stellantis", "title": "Ops Analyst",
+              "name": "", "status": "Matched", "date_added": stale,
+              "next_followup": "1970-01-01", "raw_priority": "90"}
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(tc_row)] if code == "TC" else [])
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert [r["sheet_uuid"] for r in result["buried"]] == ["tc-stale"]
+    assert [p["action"] for p in enqueued] == ["append_note", "update_status"]
+    assert enqueued[1]["new_tab"] == "Died"
+
+
+def test_recent_matched_row_is_left_alone(monkeypatch):
+    """Inside the window a Matched row is untouched - no nudge, no bury, no writes."""
+    fresh = (_SEQ_TODAY - timedelta(days=5)).strftime("%Y-%m-%d")
+    tc_row = {"sheet_uuid": "tc-fresh", "company": "Affirm", "title": "Ops Analyst",
+              "name": "", "status": "Matched", "date_added": fresh,
+              "next_followup": "1970-01-01", "raw_priority": "98"}
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(tc_row)] if code == "TC" else [])
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert result["buried"] == []
+    assert enqueued == []
+
+
+def test_routing_marker_round_trips_through_the_card_text():
+    """The 🧭 marker is what makes the jobs cache a pure optimization: Gemini's routing survives a
+    deploy inside the Telegram message, the same way sheet_uuid already does."""
+    card = (
+        "\U0001f4bc <b>Legal Operations Analyst II</b>\n"
+        "\U0001f3e2 <b>Affirm</b>\n"
+        "\U0001f194 <code>e8441263-7e9e-4051-ab11-34710bb88e2e</code> \u00b7 <code>Pipeline_Candidates</code>\n"
+        "\U0001f9ed <code>c|tech|0,2,3,5|4</code>\n"
+    )
+    assert m._parse_routing_from_card_text(card) == {
+        "track": "c", "tone_mode": "tech", "bullet_indices": [0, 2, 3, 5], "outreach_template_id": 4,
+    }
+    assert m._parse_routing_from_card_text("no marker here") == {}
+
+
+def test_rebuild_job_from_card_restores_a_wiped_job():
+    """A deploy empties the jobs cache; /draft and /e must degrade, not block."""
+    card = (
+        "\U0001f4bc <b>Legal Operations Analyst II</b>\n"
+        "\U0001f3e2 <b>Affirm</b>\n"
+        "\U0001f9ed <code>c|tech|1,2|3</code>\n"
+    )
+    job, recovered = m.rebuild_job_from_card({}, card)
+    assert recovered is True
+    assert job["employer_name"] == "Affirm"
+    assert job["job_title"] == "Legal Operations Analyst II"
+    assert job["track"] == "c"
+    assert job["bullet_indices"] == [1, 2]
+    assert job["outreach_template_id"] == 3
+    assert m._job_data_available(job, {}) is True
+
+
+def test_rebuild_job_from_card_leaves_a_live_cache_alone():
+    """A populated cache is authoritative - the card must never overwrite it."""
+    cached = {"employer_name": "Stellantis", "job_title": "Ops Analyst", "track": "a"}
+    job, recovered = m.rebuild_job_from_card(cached, "\U0001f3e2 <b>Affirm</b>\n\U0001f9ed <code>c|tech|1|2</code>")
+    assert recovered is False
+    assert job["employer_name"] == "Stellantis"
+    assert job["track"] == "a"
+
+
+def test_rebuild_job_from_card_handles_a_card_predating_the_marker():
+    """Old cards still recover company/title; only the routing falls back to defaults."""
+    job, recovered = m.rebuild_job_from_card(
+        {}, "\U0001f4bc <b>Ops Analyst</b>\n\U0001f3e2 <b>Affirm</b>\n"
+    )
+    assert recovered is True
+    assert job["employer_name"] == "Affirm"
+    assert "track" not in job

@@ -862,3 +862,26 @@ def plan_carmen_followup(date_added, next_followup, today):
     if anchor is None:
         anchor = today
     return carmen_ladder_action(anchor, scheduled, today)
+
+
+# Days an untouched "Matched" pipeline row may sit in Tetiana Cold before the sequencer retires
+# it to Died. followup_action() returns "none" for "Matched", so without this these rows never
+# age out and the tab grows without bound - the real cause of a swarmed Tetiana Cold is
+# accumulation over weeks, not the <=5 rows any single pipeline run writes.
+MATCHED_EXPIRY_DAYS = 30
+
+
+def is_expired_matched_row(status, date_added, today, expiry_days=MATCHED_EXPIRY_DAYS):
+    """True for a JOBS row still sitting at 'Matched' (never applied to, never replied to)
+    `expiry_days` or more after it was added.
+
+    Only "Matched" expires: any other status means Kevin engaged with the row, and engaged rows
+    are governed by followup_action()'s own windows. A row with no parseable Date Added never
+    expires - better a stale row than silently retiring one whose date simply failed to parse.
+    """
+    if str(status or "").strip().lower() != "matched":
+        return False
+    anchor = _parse_sequencer_date(date_added)
+    if anchor is None:
+        return False
+    return (today - anchor).days >= expiry_days
