@@ -30,7 +30,8 @@ from pipeline_utils import (
     derive_job_source, is_unverified_email, status_rank, STATUS_VOCAB,
     followup_action, followup_anchor, is_followup_unscheduled,
     lint_outreach_template, advise_outreach_template,
-    is_probable_company_name, ats_slug_guess,
+    is_probable_company_name, ats_slug_guess, build_sent_contact,
+    plan_carmen_followup, CARMEN_LADDER_DAYS,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
     REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
 )
@@ -3306,6 +3307,129 @@ def check_inbound_gmail_replies():
 # decoupled from Telegram webhook traffic (never triggered by incoming webhook pings).
 EMAIL_POLL_SCHEDULER = BackgroundScheduler(daemon=True)
 
+# Sent mail is rescanned over a rolling window rather than tracked by a stored watermark: the
+# SQLite backing that would hold one is wiped by every Render deploy, which would silently reset
+# the baseline and skip whatever was sent in between. Rescanning is safe because
+# is_verified_crm_contact() already makes capture idempotent - a person already in the CRM is
+# skipped - so the only cost of an overlap is a few extra lookups.
+SENT_CAPTURE_LOOKBACK_HOURS = 6
+
+
+def get_all_crm_job_companies():
+    """Every company that has ever appeared as a job, across all job tabs.
+
+    This is the gate for sent-mail contact capture: a person is only worth a Carmen Cold row
+    when Kevin emailed them because of a job he is tracking. Tetiana Warm (applied) is included
+    via get_applied_crm_companies(); the rest come from the live job tabs.
+    """
+    companies = set()
+    for target_code in ("TC", "TW", "CL"):
+        for record in fetch_networking_cards(target_code, qty=None):
+            company = str(record.get("company") or "").strip()
+            if company:
+                companies.add(company)
+    return companies
+
+
+def capture_contacts_from_sent_mail():
+    """Auto-populate Carmen Cold with every unique person emailed at a tracked job company.
+
+    Scans recent Gmail SENT mail and writes one Carmen Cold row per new person. Role mailboxes
+    (operations@, careers@) are skipped - those are the job pipeline's own targets and already
+    live as job rows - as are consumer/ATS domains and anyone already in the CRM. Writes go
+    straight to Sheets rather than through crm_outbox, whose SQLite backing is wiped by every
+    Render deploy.
+
+    The rolling lookback window means only mail sent from here on is ever captured; the existing
+    Sent backlog is never bulk-imported.
+    """
+    missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
+    if missing_vars:
+        return 0
+    access_token = get_gmail_access_token()
+    if not access_token:
+        return 0
+
+    after_epoch = int(time.time()) - SENT_CAPTURE_LOOKBACK_HOURS * 3600
+    crm_companies = get_all_crm_job_companies()
+    if not crm_companies:
+        return 0
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        res = requests.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers=headers,
+            params={"q": f"in:sent after:{after_epoch}", "maxResults": 25},
+            timeout=10,
+        )
+        if res.status_code != 200:
+            logging.error(f"[SENT] Gmail list error: {res.status_code}")
+            return 0
+        message_ids = [m["id"] for m in res.json().get("messages", [])]
+    except Exception as e:
+        logging.error(f"[SENT] Gmail list exception: {e}")
+        return 0
+
+    captured = 0
+    for msg_id in message_ids:
+        try:
+            detail_res = requests.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                headers=headers,
+                params={"format": "metadata", "metadataHeaders": ["To", "Subject"]},
+                timeout=10,
+            )
+            if detail_res.status_code != 200:
+                continue
+            header_list = detail_res.json().get("payload", {}).get("headers", [])
+            to_header = next((h["value"] for h in header_list if h["name"] == "To"), "")
+            subject = next((h["value"] for h in header_list if h["name"] == "Subject"), "")
+
+            contact = build_sent_contact(to_header, crm_companies)
+            if not contact:
+                continue
+            if is_verified_crm_contact(contact["email"]):
+                continue
+
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            sheet_uuid = str(uuid.uuid4())
+            # First rung of the Carmen Cold ladder, not the priority-derived interval: a cold
+            # contact is worth a nudge in 3 days, where calculate_followup_interval(5) waits 19.
+            next_followup = (datetime.now() + timedelta(days=CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d")
+            payload = build_crm_payload(
+                "quick_add",
+                target_code="CC",
+                sheet_uuid=sheet_uuid,
+                first_contact=today_str,
+                last_contact=today_str,
+                name=contact["name"],
+                company=contact["company"],
+                email=contact["email"],
+                priority=5,
+                status="Cold Lead",
+                next_followup=next_followup,
+                source="Auto-captured from Sent",
+                note=f"[{today_str}] Emailed: {subject}".strip(),
+            )
+            if log_to_sheets_crm(payload):
+                captured += 1
+                logging.info(f"[SENT] Captured {contact['email']} ({contact['company']}) to Carmen Cold")
+                if TELEGRAM_CHAT_ID:
+                    send_telegram_message(
+                        TELEGRAM_CHAT_ID,
+                        f"👤 <b>Contact Captured</b> · <code>Carmen Cold</code>\n"
+                        f"<b>{html.escape(contact['name'])}</b> at {html.escape(contact['company'])}\n"
+                        f"📧 <code>{html.escape(contact['email'])}</code>"
+                    )
+        except Exception as e:
+            logging.error(f"[SENT] Capture error on message {msg_id}: {e}")
+
+    if captured:
+        logging.info(f"[SENT] Sent-mail capture complete: {captured} new contact(s).")
+    return captured
+
+
 def scheduled_email_poll_job():
     """APScheduler job target: fires exactly once every 15 minutes, independent of webhook load."""
     logging.info("[POLL] 15-minute email poll cycle triggered")
@@ -3313,6 +3437,10 @@ def scheduled_email_poll_job():
         check_inbound_gmail_replies()
     except Exception as e:
         logging.error(f"[POLL] Gmail Poller Cycle Error: {e}")
+    try:
+        capture_contacts_from_sent_mail()
+    except Exception as e:
+        logging.error(f"[POLL] Sent-mail Capture Error: {e}")
     logging.info("[POLL] 15-minute email poll cycle completed")
 
 def start_gmail_poller():
@@ -3862,6 +3990,60 @@ def run_followup_sequencer(today=None, dry_run=False):
     buries_suppressed = 0
 
     for rec in records:
+        # Carmen Cold runs the 3/7/14 people ladder instead of the JOBS +4/+9/+16 windows: these
+        # are networking contacts, so the cadence is tighter and the sequence ends quietly rather
+        # than burying. Rung is read from the row's own dates, so a contact dragged in by hand
+        # joins the ladder on this pass with nothing to configure.
+        if rec.get("sheet_tab") in SEQUENCER_PEOPLE_SCHEMA_TABS:
+            ladder_action, ladder_next = plan_carmen_followup(
+                rec.get("date_added"), rec.get("next_followup"), today
+            )
+            if ladder_action == "none":
+                continue
+            sheet_uuid = rec.get("sheet_uuid")
+            if ladder_action == "exhausted":
+                # All three nudges sent and still nothing back. Surface it once for a human call
+                # rather than burying - a networking contact is not a job application - and write
+                # nothing, so the row stops appearing after Kevin acts on it.
+                ladder_anchor = followup_anchor(rec.get("date_added"), rec.get("next_followup"))
+                result["going_cold"].append({
+                    "company": rec.get("company") or "N/A",
+                    "role": rec.get("title") or "",
+                    "short_id": get_short_id_by_sheet_uuid(sheet_uuid) if sheet_uuid else None,
+                    "sheet_uuid": sheet_uuid,
+                    "status": rec.get("status") or "",
+                    "days": (today - ladder_anchor).days if ladder_anchor else None,
+                })
+                continue
+            if ladder_action == "schedule":
+                if not (dry_run or not sheet_uuid):
+                    enqueue_crm_payload(build_crm_payload(
+                        "update_snooze", sheet_uuid=sheet_uuid,
+                        next_followup=ladder_next.strftime("%Y-%m-%d"),
+                    ))
+                continue
+
+            attempt = int(ladder_action.rsplit("_", 1)[1])
+            result["followups_ready"].append({
+                "company": rec.get("company") or "N/A",
+                "role": rec.get("title") or "",
+                "short_id": get_short_id_by_sheet_uuid(sheet_uuid) if sheet_uuid else None,
+                "sheet_uuid": sheet_uuid,
+                "attempt": attempt,
+                "draft_text": build_followup_bump_draft(rec, attempt),
+                "sheet_tab": rec.get("sheet_tab"),
+                "ladder_day": CARMEN_LADDER_DAYS[attempt - 1],
+            })
+            if dry_run or not sheet_uuid or _sequencer_already_actioned(sheet_uuid, run_date):
+                continue
+            if ladder_next is not None:
+                enqueue_crm_payload(build_crm_payload(
+                    "update_snooze", sheet_uuid=sheet_uuid,
+                    next_followup=ladder_next.strftime("%Y-%m-%d"),
+                ))
+            _record_sequencer_action(sheet_uuid, run_date, ladder_action)
+            continue
+
         action = followup_action(rec.get("status"), rec.get("date_added"), rec.get("next_followup"), today)
         if action == "none":
             continue
@@ -3965,7 +4147,9 @@ def render_followup_needs_card(result, on_demand=False):
             role = html.escape(str(e.get("role") or "—"))
             company = html.escape(str(e.get("company") or "—"))
             draft = html.escape(str(e.get("draft_text") or "")[:600])
-            lines.append(f"💼 <b>{role}</b> — {company}  ·  #{e.get('attempt', 1)}  ·  🆔 <code>{html.escape(_seq_id_tag(e))}</code>")
+            ladder_day = e.get("ladder_day")
+            attempt_tag = f"#{e.get('attempt', 1)}" + (f" · day {ladder_day}" if ladder_day else "")
+            lines.append(f"💼 <b>{role}</b> — {company}  ·  {attempt_tag}  ·  🆔 <code>{html.escape(_seq_id_tag(e))}</code>")
             lines.append(f"<code>{draft}</code>")
 
     cold = result.get("going_cold", [])

@@ -791,3 +791,91 @@ def test_ats_slug_guess_strips_to_lowercase_alphanumerics():
     assert pu.ats_slug_guess("Recourse Communications, Inc.") == "recoursecommunicationsinc"
     assert pu.ats_slug_guess("Atwell") == "atwell"
     assert pu.ats_slug_guess(None) == ""
+
+
+_SENT_CRM_COMPANIES = {"Affirm", "Signal Advisors", "Crain Communications", "AAA-The Auto Club", "Stellantis"}
+
+
+def test_sent_capture_takes_real_people_at_tracked_job_companies():
+    """The capture gate: a person is worth a Carmen Cold row only when Kevin emailed them
+    because of a job already in the CRM."""
+    got = pu.build_sent_contact('"Eina Assali" <eina.assali@affirm.com>', _SENT_CRM_COMPANIES)
+    assert got == {"name": "Eina Assali", "email": "eina.assali@affirm.com", "company": "Affirm"}
+
+    # No display name in the header - derive one from the local part rather than dropping it.
+    derived = pu.build_sent_contact("eina.assali@affirm.com", _SENT_CRM_COMPANIES)
+    assert derived["name"] == "Eina Assali"
+
+    # A corporate mail subdomain still resolves to its company.
+    assert pu.build_sent_contact("Jen <jen@mail.crain.com>", _SENT_CRM_COMPANIES)["company"] == "Crain Communications"
+
+
+def test_sent_capture_skips_everything_that_is_not_a_tracked_person():
+    """Role mailboxes are the job pipeline's own targets and already exist as job rows; consumer
+    and ATS domains carry no employer; an untracked company means the email was not job outreach."""
+    for header in (
+        "operations@affirm.com",
+        "wealthops@signaladvisors.com",
+        "careers@stellantis.com",
+        "Sandy <sandy.jones@gmail.com>",
+        "recruiter@greenhouse.io",
+        "Rob <rjk@some-untracked-co.com>",
+        "",
+    ):
+        assert pu.build_sent_contact(header, _SENT_CRM_COMPANIES) is None, header
+
+
+def test_sent_capture_domain_match_is_not_a_loose_substring():
+    """'aa.com' must not match 'AAA-The Auto Club' - a substring test would credit a stranger's
+    email to a tracked company and write a bogus contact."""
+    assert pu.build_sent_contact("Bob <bob@aa.com>", _SENT_CRM_COMPANIES) is None
+    assert pu.domain_matches_company("kevin@signaladvisors.com", "Signal Advisors") is True
+    assert pu.domain_matches_company("bob@aa.com", "AAA-The Auto Club") is False
+
+
+# ---- Carmen Cold 3/7/14 follow-up ladder ----
+
+_LADDER_TODAY = date(2026, 9, 12)
+
+
+def test_carmen_ladder_walks_three_seven_fourteen_then_stops():
+    """The whole point: three nudges at 3, 7 and 14 days from the day the contact landed."""
+    anchor = "2026-09-12"
+    action, nxt = pu.plan_carmen_followup(anchor, "", _LADDER_TODAY)
+    assert (action, nxt) == ("schedule", date(2026, 9, 15))
+
+    action, nxt = pu.plan_carmen_followup(anchor, "2026-09-15", date(2026, 9, 15))
+    assert (action, nxt) == ("nudge_1", date(2026, 9, 19))
+
+    action, nxt = pu.plan_carmen_followup(anchor, "2026-09-19", date(2026, 9, 19))
+    assert (action, nxt) == ("nudge_2", date(2026, 9, 26))
+
+    # Final rung fires with no next date - the ladder ends rather than nagging forever.
+    action, nxt = pu.plan_carmen_followup(anchor, "2026-09-26", date(2026, 9, 26))
+    assert (action, nxt) == ("nudge_3", None)
+
+
+def test_carmen_ladder_starts_a_manually_moved_row_from_today():
+    """A row dragged into Carmen Cold by hand carries a stale Date Added and no follow-up date.
+    It must enter the ladder on the next pass, not be skipped and not fire all three at once."""
+    action, nxt = pu.plan_carmen_followup("2026-01-04", "", _LADDER_TODAY)
+    assert action == "schedule"
+    assert nxt == _LADDER_TODAY + timedelta(days=3)
+
+    # Same for a row with no Date Added at all.
+    action, nxt = pu.plan_carmen_followup("", "", _LADDER_TODAY)
+    assert action == "schedule"
+    assert nxt == _LADDER_TODAY + timedelta(days=3)
+
+
+def test_carmen_ladder_is_quiet_until_due_and_after_exhaustion():
+    assert pu.plan_carmen_followup("2026-09-12", "2026-09-30", _LADDER_TODAY) == ("none", None)
+    # Past the last rung: stop asking for attention rather than looping.
+    assert pu.plan_carmen_followup("2026-09-12", "2026-10-20", date(2026, 10, 20))[0] == "exhausted"
+
+
+def test_carmen_ladder_tolerates_a_late_sequencer_run():
+    """The nightly job only advances rows on days it actually runs, so a date a couple of days
+    past its rung must still read as that rung instead of skipping ahead."""
+    action, _ = pu.plan_carmen_followup("2026-09-12", "2026-09-15", date(2026, 9, 17))
+    assert action == "nudge_1"

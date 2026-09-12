@@ -372,13 +372,14 @@ def test_needs_card_flags_withheld_buries_in_the_buried_section_and_summary(monk
 # ---- Carmen Cold in the follow-up cadence (sequencer scan + overdue + roleless bumps) ----
 
 def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeypatch):
-    """Carmen Cold is now the active outreach cycle - replies auto-move contacts here - so it
-    must be scanned by run_followup_sequencer() like the JOBS tabs. A CC row 4d into 'Applied'
-    (Status carried over by the tab move) draws a follow-up #1 with a roleless draft."""
+    """Carmen Cold is scanned by run_followup_sequencer() like the JOBS tabs, but runs the 3/7/14
+    people ladder. A row sitting on its first rung's due date draws follow-up #1 with a roleless
+    draft and is advanced to the 7-day rung."""
     assert ("CC", "Carmen Cold") in m.SEQUENCER_SCAN_TABS
+    anchor = (_SEQ_TODAY - timedelta(days=3)).strftime("%Y-%m-%d")
     cc_row = {"sheet_uuid": "cc-fu1", "company": "Nliven", "title": "", "name": "Dana Reyes",
-              "status": "Applied", "date_added": "2026-05-28", "next_followup": "1970-01-01",
-              "raw_priority": "High"}
+              "status": "Applied", "date_added": anchor,
+              "next_followup": _SEQ_TODAY.strftime("%Y-%m-%d"), "raw_priority": "High"}
     monkeypatch.setattr(m, "fetch_networking_cards",
                         lambda code, qty=None: [dict(cc_row)] if code == "CC" else [])
     enqueued = []
@@ -388,6 +389,7 @@ def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeyp
 
     ready = result["followups_ready"]
     assert [r["sheet_uuid"] for r in ready] == ["cc-fu1"]
+    assert ready[0]["ladder_day"] == 3
     draft = ready[0]["draft_text"]
     assert draft.startswith("Hi Dana Reyes,")
     assert "{" not in draft
@@ -395,11 +397,32 @@ def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeyp
     assert any(p["action"] == "update_snooze" and p["sheet_uuid"] == "cc-fu1" for p in enqueued)
 
 
+def test_carmen_cold_undated_row_joins_the_ladder_instead_of_drafting(monkeypatch):
+    """A contact dragged into Carmen Cold by hand has no follow-up date. The sequencer starts the
+    ladder at +3 rather than firing a nudge immediately - that is the manual-move path working
+    with no Apps Script trigger involved."""
+    cc_row = {"sheet_uuid": "cc-manual", "company": "Affirm", "title": "", "name": "Sahjar",
+              "status": "Cold Lead", "date_added": "2026-01-04", "next_followup": "1970-01-01",
+              "raw_priority": "Medium"}
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(cc_row)] if code == "CC" else [])
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert result["followups_ready"] == []
+    expected = (_SEQ_TODAY + timedelta(days=3)).strftime("%Y-%m-%d")
+    assert [(p["action"], p["next_followup"]) for p in enqueued] == [("update_snooze", expected)]
+
+
 def test_carmen_cold_row_is_never_auto_buried_to_died(monkeypatch):
-    """A networking contact is not a job application. A CC row well past FOLLOWUP_BURY_DAYS is
-    surfaced as 'going cold' for a human call - never an append_note/update_status->Died write."""
+    """A networking contact is not a job application. A CC row that has exhausted the 3/7/14
+    ladder is surfaced as 'going cold' for a human call - never an append_note/update_status->Died
+    write, and no further nudges."""
+    exhausted_nf = (_SEQ_TODAY - timedelta(days=1)).strftime("%Y-%m-%d")
     cc_row = {"sheet_uuid": "cc-old", "company": "Nliven", "title": "", "name": "Sam",
-              "status": "Applied", "date_added": "2026-04-01", "next_followup": "1970-01-01",
+              "status": "Applied", "date_added": "2026-04-01", "next_followup": exhausted_nf,
               "raw_priority": "Medium"}
     monkeypatch.setattr(m, "fetch_networking_cards",
                         lambda code, qty=None: [dict(cc_row)] if code == "CC" else [])

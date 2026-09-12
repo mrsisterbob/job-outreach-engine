@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -651,3 +651,214 @@ def is_unverified_email(email_str):
     """
     return "[\u26a0\ufe0f" in str(email_str or "")
 
+
+
+# ==============================================================================
+# SENT-MAIL CONTACT CAPTURE (pure, no I/O)
+#
+# Every unique person Kevin emails at a company that already exists as a job in the
+# CRM becomes a Carmen Cold row automatically. His Sent folder is the outreach log:
+# the To: header carries the name, address and (via the domain) the company, so a
+# contact costs zero typing. LinkedIn DMs are deliberately not a capture path - no
+# server-readable record of one exists that does not require scraping.
+# ==============================================================================
+
+# Role/shared mailboxes are the job pipeline's own targets (resolve_target_email() invents
+# these), already tracked as job rows. Carmen Cold is people, so they never capture here.
+_ROLE_MAILBOX_LOCALPARTS = frozenset({
+    "operations", "bizops", "wealthops", "compliance", "careers", "jobs", "recruiting",
+    "recruitment", "talent", "hr", "people", "info", "hello", "contact", "support",
+    "admin", "help", "sales", "team", "noreply", "no-reply", "donotreply",
+})
+
+# Mail providers and ATS/job-board senders: the domain says nothing about an employer,
+# so company matching would be meaningless even when the local part is a real person.
+_NON_COMPANY_EMAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com",
+    "aol.com", "icloud.com", "me.com", "msn.com", "proton.me", "protonmail.com", "gmx.com",
+    "greenhouse.io", "lever.co", "ashbyhq.com", "myworkday.com", "icims.com", "taleo.net",
+    "smartrecruiters.com", "jobvite.com", "workable.com", "bamboohr.com", "indeed.com",
+    "ziprecruiter.com", "linkedin.com", "glassdoor.com", "monster.com",
+})
+
+
+def parse_email_recipient(to_header):
+    """Split one RFC-5322 To: value into (display_name, email). Returns (None, None) if no
+    address is present. Only the FIRST address is read - a multi-recipient blast is not the
+    one-to-one outreach this capture path is for, and the caller drops those.
+    """
+    raw = str(to_header or "").strip()
+    match = re.search(r'([^<>,]*)<\s*([^<>@\s,]+@[^<>@\s,]+)\s*>', raw)
+    if match:
+        name = match.group(1).strip().strip('"').strip()
+        return (name or None), match.group(2).strip().lower()
+    bare = re.fullmatch(r'\s*([^<>@\s,]+@[^<>@\s,]+)\s*', raw)
+    if bare:
+        return None, bare.group(1).strip().lower()
+    return None, None
+
+
+def is_role_mailbox(email):
+    """True for shared/role addresses (operations@, careers@, noreply@) - not a person."""
+    local = str(email or "").split("@")[0].strip().lower()
+    local = re.sub(r'[._-]?\d+$', '', local)
+    return local in _ROLE_MAILBOX_LOCALPARTS
+
+
+def company_domain_of(email):
+    """The employer-bearing domain of an address, or '' for consumer mail and ATS senders.
+    Strips one level of mail subdomain ('mail.crain.com' -> 'crain.com') so a corporate
+    relay still matches the company it belongs to.
+    """
+    domain = str(email or "").split("@")[-1].strip().lower().strip(".")
+    if not domain or "." not in domain:
+        return ""
+    if domain in _NON_COMPANY_EMAIL_DOMAINS:
+        return ""
+    parts = domain.split(".")
+    if len(parts) > 2 and parts[0] in ("mail", "email", "careers", "jobs", "smtp", "mx"):
+        domain = ".".join(parts[1:])
+    return "" if domain in _NON_COMPANY_EMAIL_DOMAINS else domain
+
+
+def domain_matches_company(email, company_name):
+    """True if an address's domain plausibly belongs to `company_name`.
+
+    Compares the domain's registrable label against the normalized company name with all
+    non-alphanumerics removed, so "Signal Advisors" matches signaladvisors.com and
+    "40 Acres" matches 40acres.com. Deliberately strict: a substring test would let
+    'aa.com' match 'AAA-The Auto Club'.
+    """
+    domain = company_domain_of(email)
+    if not domain:
+        return False
+    # Mirrors main.normalize_company_for_match() rather than importing it: pipeline_utils is the
+    # pure layer and must not depend on main.
+    normalized = str(company_name or "").strip().lower()
+    normalized = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', normalized)
+    label = re.sub(r'[^a-z0-9]', '', domain.split(".")[0])
+    company = re.sub(r'[^a-z0-9]', '', normalized)
+    if not label or not company:
+        return False
+    return label == company or (len(label) >= 5 and label in company) or (len(company) >= 5 and company in label)
+
+
+def match_email_to_crm_company(email, crm_companies):
+    """Return the CRM company name an address belongs to, or None.
+
+    `crm_companies` is every company that has ever appeared as a job (any tab). This is the
+    gate on the whole capture path: a person is only worth a Carmen Cold row when Kevin
+    emailed them BECAUSE of a job he is tracking.
+    """
+    if not email or is_role_mailbox(email) or not company_domain_of(email):
+        return None
+    for company in crm_companies:
+        if company and domain_matches_company(email, company):
+            return company
+    return None
+
+
+def name_from_email_local_part(email):
+    """Fall back to a display name derived from the address ('eina.assali@x' -> 'Eina Assali')
+    when the To: header carried no display name.
+    """
+    local = str(email or "").split("@")[0].strip()
+    local = re.sub(r'\d+$', '', local)
+    words = [w for w in re.split(r'[._\-+]+', local) if w]
+    return " ".join(w.capitalize() for w in words) if words else ""
+
+
+def build_sent_contact(to_header, crm_companies):
+    """One Sent message -> a Carmen Cold contact dict, or None when it should not capture.
+
+    Returns {name, email, company} only for a one-to-one message to a real person at a
+    company already tracked as a job. Everything else (role mailboxes, consumer domains,
+    unknown companies) returns None and is skipped silently.
+    """
+    name, email = parse_email_recipient(to_header)
+    if not email:
+        return None
+    company = match_email_to_crm_company(email, crm_companies)
+    if not company:
+        return None
+    return {
+        "name": name or name_from_email_local_part(email),
+        "email": email,
+        "company": company,
+    }
+
+
+# ==============================================================================
+# CARMEN COLD 3/7/14 FOLLOW-UP LADDER (pure, no I/O)
+#
+# A networking contact gets three nudges at fixed offsets from the day they landed in
+# Carmen Cold, then stops. Distinct from followup_action()'s JOBS windows (+4/+9/+16 with
+# an auto-bury) because these are people: the ladder ends quietly rather than burying, and
+# the cadence is tighter since a cold intro goes stale faster than a job application.
+#
+# Ladder position is read from the row itself, never from local state: the sequencer
+# advances Next Followup Date along CARMEN_LADDER_DAYS, so the gap between the anchor and
+# the scheduled date says which rung a row is on. That survives the SQLite wipe on every
+# Render deploy, and it means a row dragged into Carmen Cold by hand enters the ladder on
+# the next nightly pass with no trigger, no stamp, and nothing to configure.
+# ==============================================================================
+
+CARMEN_LADDER_DAYS = (3, 7, 14)
+
+
+def carmen_ladder_rung(anchor, next_followup):
+    """Which rung a Carmen Cold row currently sits on, from the gap between its anchor and
+    its scheduled date. 0 = not yet scheduled, 1/2/3 = the 3/7/14-day nudges, 4 = ladder done.
+
+    Tolerates drift: the sequencer can only advance a row on a day it actually runs, so a
+    date a day or two past its nominal rung still reads as that rung rather than falling off.
+    """
+    if anchor is None or next_followup is None:
+        return 0
+    gap = (next_followup - anchor).days
+    if gap <= 0:
+        return 0
+    for rung, offset in enumerate(CARMEN_LADDER_DAYS, start=1):
+        if gap <= offset:
+            return rung
+    return len(CARMEN_LADDER_DAYS) + 1
+
+
+def carmen_ladder_action(anchor, next_followup, today):
+    """Pure: what a Carmen Cold row needs today. Side-effect free.
+
+    Returns (action, next_date):
+      ("schedule", d)  - undated row (incl. one just dragged in by hand): start the ladder at +3
+      ("nudge_N", d)   - rung N is due: alert Kevin, advance to the next rung
+      ("exhausted", None) - all three nudges sent; the row stops asking for attention
+      ("none", None)   - scheduled for a future date, nothing to do
+    """
+    if anchor is None:
+        return "none", None
+    if next_followup is None:
+        return "schedule", today + timedelta(days=CARMEN_LADDER_DAYS[0])
+    if next_followup > today:
+        return "none", None
+
+    rung = carmen_ladder_rung(anchor, next_followup)
+    if rung == 0:
+        return "schedule", today + timedelta(days=CARMEN_LADDER_DAYS[0])
+    if rung > len(CARMEN_LADDER_DAYS):
+        return "exhausted", None
+    if rung == len(CARMEN_LADDER_DAYS):
+        return f"nudge_{rung}", None
+    return f"nudge_{rung}", anchor + timedelta(days=CARMEN_LADDER_DAYS[rung])
+
+
+def plan_carmen_followup(date_added, next_followup, today):
+    """String-in wrapper over carmen_ladder_action() for raw CRM row values.
+
+    An undated row anchors on `today` rather than being skipped - that is the manual-move case:
+    a contact dragged into Carmen Cold carries no useful date, so the ladder starts when the
+    sequencer first sees them.
+    """
+    anchor = _parse_sequencer_date(date_added)
+    scheduled = None if is_followup_unscheduled(next_followup) else _parse_sequencer_date(next_followup)
+    if anchor is None:
+        anchor = today
+    return carmen_ladder_action(anchor, scheduled, today)
