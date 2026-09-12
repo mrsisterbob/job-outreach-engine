@@ -26,7 +26,11 @@ services:
     # job twice - duplicate follow-up emails and double CRM writes.
     startCommand: gunicorn main:app --workers 1 --bind 0.0.0.0:$PORT --timeout 120
     healthCheckPath: /health
-    autoDeploy: true
+    # Off on purpose. APScheduler runs in-process (15m Gmail poll, 07:00 sequencer, Sunday
+    # backup), so every deploy restarts the container mid-cycle and can interrupt an in-flight
+    # poll or a half-written CRM batch. On the free tier this was harmless because nothing was
+    # running; on an always-on paid instance it is not. Deploy manually when no job is mid-run.
+    autoDeploy: false
     disk:
       name: jobs-data
       mountPath: /var/data
