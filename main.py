@@ -3834,6 +3834,43 @@ def start_backup_scheduler():
     )
     logging.info("[BACKUP] Weekly SQLite backup scheduled: Sundays 03:00 local")
 
+PERSISTENCE_WATCH_TABLES = ("seen_jobs", "pipeline_metrics", "application_outcomes", "daily_activity")
+
+def count_backup_snapshots(backup_dir):
+    """Whether backup_dir exists and how many jobs_cache_*.db snapshots are in it.
+
+    Pulled out of get_persistence_status() so the directory-scan logic (the part most likely
+    to silently do the wrong thing on a misconfigured mount) can be unit-tested against a
+    real tmp_path without needing a live DB connection.
+    """
+    if not os.path.isdir(backup_dir):
+        return False, 0
+    count = sum(1 for f in os.listdir(backup_dir) if f.startswith("jobs_cache_") and f.endswith(".db"))
+    return True, count
+
+def get_persistence_status():
+    """Row counts for the tables a wiped/misconfigured disk used to silently zero out, plus the
+    resolved DB_PATH/BACKUP_DIR and on-disk snapshot count - so /health (both the JSON route and
+    the Telegram card) can show whether the Render persistent disk is actually mounted and data
+    is surviving redeploys, instead of that only being discoverable after weeks of silent loss.
+    """
+    row_counts = {}
+    with get_db_conn() as conn:
+        cursor = conn.cursor()
+        for table in PERSISTENCE_WATCH_TABLES:
+            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+            row_counts[table] = cursor.fetchone()[0]
+
+    backup_dir_exists, snapshot_count = count_backup_snapshots(BACKUP_DIR)
+
+    return {
+        "db_path": os.path.abspath(DB_PATH),
+        "row_counts": row_counts,
+        "backup_dir": os.path.abspath(BACKUP_DIR),
+        "backup_dir_exists": backup_dir_exists,
+        "backup_snapshot_count": snapshot_count,
+    }
+
 # The morning digest previews only the most overdue handful and points at /overdue for the
 # rest. Kevin was getting 100+ lines split across several Telegram messages before he had
 # had coffee, which is the same as getting none of them.
@@ -5560,11 +5597,26 @@ def process_webhook_payload_async(data):
             uptime_str = str(timedelta(seconds=int(time.time() - APP_START_TIME)))
             api_usage = get_monthly_api_usage()
             month_label = datetime.now().strftime("%B %Y")
+            try:
+                persistence = get_persistence_status()
+                rc = persistence["row_counts"]
+                persistence_lines = (
+                    f"💽 <b>Persistence:</b>\n"
+                    f"  DB: <code>{html.escape(persistence['db_path'])}</code>\n"
+                    f"  seen_jobs: {rc['seen_jobs']} | pipeline_metrics: {rc['pipeline_metrics']} | "
+                    f"application_outcomes: {rc['application_outcomes']} | daily_activity: {rc['daily_activity']}\n"
+                    f"  Backups: <code>{html.escape(persistence['backup_dir'])}</code> "
+                    f"({'exists' if persistence['backup_dir_exists'] else 'MISSING'}, "
+                    f"{persistence['backup_snapshot_count']} snapshot(s))\n"
+                )
+            except Exception as e:
+                persistence_lines = f"💽 <b>Persistence:</b> error reading status ({html.escape(str(e))})\n"
             send_telegram_message(
                 chat_id,
                 f"🟢 <b>System Health:</b> Operational\n"
                 f"💾 <b>SQLite Mode:</b> {html.escape(str(wal_mode)).upper()} ({db_elapsed_ms}ms)\n"
                 f"⏱️ <b>Uptime:</b> {uptime_str}\n"
+                f"{persistence_lines}"
                 f"📇 <b>Email Waterfall Usage ({month_label}, local count):</b>\n"
                 f"  Hunter.io: {api_usage['hunter']} | Prospeo: {api_usage['prospeo']} | GetProspect: {api_usage['getprospect']}"
             )
@@ -6208,8 +6260,14 @@ def health_check():
             cursor = conn.cursor()
             cursor.execute("PRAGMA journal_mode")
             mode = cursor.fetchone()[0]
+        persistence = get_persistence_status()
         elapsed_ms = (time.time() - start_time) * 1000
-        return jsonify({"status": "ok", "mode": mode, "elapsed_ms": round(elapsed_ms, 2)}), 200
+        return jsonify({
+            "status": "ok",
+            "mode": mode,
+            "elapsed_ms": round(elapsed_ms, 2),
+            "persistence": persistence,
+        }), 200
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
         return jsonify({"status": "error", "error": str(e), "elapsed_ms": round(elapsed_ms, 2)}), 500

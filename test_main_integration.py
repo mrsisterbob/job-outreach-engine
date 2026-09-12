@@ -1837,3 +1837,47 @@ def test_classifier_checks_rejection_before_acceptance_phrasing():
 def test_classifier_leaves_ordinary_replies_general():
     for snippet in ("Thanks for reaching out, let me look into it.", "Got it, thanks for the note."):
         assert m.classify_inbound_ats_email("x@co.com", "Re: role", snippet)[0] == "GENERAL", snippet
+
+
+# ---- Persistence observability (/health) ----
+
+def test_count_backup_snapshots_missing_dir_reports_not_exists():
+    exists, count = m.count_backup_snapshots(os.path.join(tempfile.gettempdir(), "no-such-backup-dir-xyz"))
+    assert exists is False
+    assert count == 0
+
+
+def test_count_backup_snapshots_counts_only_matching_files(tmp_path):
+    (tmp_path / "jobs_cache_20260101_030000.db").write_text("x")
+    (tmp_path / "jobs_cache_20260108_030000.db").write_text("x")
+    (tmp_path / "not_a_snapshot.txt").write_text("x")
+    exists, count = m.count_backup_snapshots(str(tmp_path))
+    assert exists is True
+    assert count == 2
+
+
+def test_count_backup_snapshots_empty_dir_exists_with_zero_count(tmp_path):
+    exists, count = m.count_backup_snapshots(str(tmp_path))
+    assert exists is True
+    assert count == 0
+
+
+def test_get_persistence_status_reports_resolved_paths_and_row_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "BACKUP_DIR", str(tmp_path))
+    (tmp_path / "jobs_cache_20260101_030000.db").write_text("x")
+
+    status = m.get_persistence_status()
+
+    assert status["db_path"] == os.path.abspath(m.DB_PATH)
+    assert status["backup_dir"] == os.path.abspath(str(tmp_path))
+    assert status["backup_dir_exists"] is True
+    assert status["backup_snapshot_count"] == 1
+    for table in ("seen_jobs", "pipeline_metrics", "application_outcomes", "daily_activity"):
+        assert isinstance(status["row_counts"][table], int)
+
+
+def test_get_persistence_status_flags_missing_backup_dir(monkeypatch):
+    monkeypatch.setattr(m, "BACKUP_DIR", os.path.join(tempfile.gettempdir(), "no-such-backup-dir-xyz"))
+    status = m.get_persistence_status()
+    assert status["backup_dir_exists"] is False
+    assert status["backup_snapshot_count"] == 0
