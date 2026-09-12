@@ -3466,7 +3466,14 @@ EMAIL_POLL_SCHEDULER = BackgroundScheduler(daemon=True)
 # the baseline and skip whatever was sent in between. Rescanning is safe because
 # is_verified_crm_contact() already makes capture idempotent - a person already in the CRM is
 # skipped - so the only cost of an overlap is a few extra lookups.
-SENT_CAPTURE_LOOKBACK_HOURS = 6
+#
+# The window is the ONLY thing standing between a sent message and permanent silent loss: mail
+# that ages out before a poll sees it is never captured, and nothing reports that it was missed.
+# 6h only survived a clean deploy gap - not a crashed worker, a Gmail 5xx, a free-tier spin-down,
+# or mail sent late in the evening before an overnight restart. 72h gives three days of slack
+# against all of those. It costs nothing: the dedup guard is per-message, not per-window, so a
+# wider sweep re-examines already-captured people and skips them.
+SENT_CAPTURE_LOOKBACK_HOURS = 72
 
 
 def get_all_crm_job_companies():
