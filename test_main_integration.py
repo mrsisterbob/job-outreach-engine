@@ -1801,3 +1801,39 @@ def test_rebuild_job_from_card_handles_a_card_predating_the_marker():
     assert recovered is True
     assert job["employer_name"] == "Affirm"
     assert "track" not in job
+
+
+def test_classifier_catches_peer_to_peer_acceptances_not_just_ats_phrasing():
+    """Kevin's outreach is peer-to-peer cold email, so the reply that matters says "happy to chat,
+    do you have 15 minutes Thursday?" - not "invitation to interview". Those scored GENERAL, so
+    the interview metric and the outcome record never fired on the conversations the whole
+    pipeline exists to produce."""
+    for snippet in (
+        "Happy to chat! Do you have 15 minutes Thursday?",
+        "Would love to connect. Are you free next week?",
+        "Can you send over some times that work for you?",
+        "Sure, grab 15 on my calendly.com/x",
+        "Let's chat next week",
+        "We would like to invite you to interview",
+    ):
+        label, _ = m.classify_inbound_ats_email("x@co.com", "Re: role", snippet)
+        assert label == "INTERVIEW_SET", snippet
+
+
+def test_classifier_checks_rejection_before_acceptance_phrasing():
+    """"We were impressed but are pursuing other applicants" carries an acceptance-shaped clause
+    inside a decline. Mislabelling that as an interview corrupts the outcome metrics in the
+    direction that flatters, so rejection is matched first."""
+    for snippet in (
+        "We were impressed with your background, but are pursuing other applicants.",
+        "Unfortunately we are not moving forward.",
+        "We have decided to move forward with other candidates.",
+        "The role was filled, will keep your resume on file.",
+    ):
+        label, _ = m.classify_inbound_ats_email("x@co.com", "Re: role", snippet)
+        assert label == "REJECTION", snippet
+
+
+def test_classifier_leaves_ordinary_replies_general():
+    for snippet in ("Thanks for reaching out, let me look into it.", "Got it, thanks for the note."):
+        assert m.classify_inbound_ats_email("x@co.com", "Re: role", snippet)[0] == "GENERAL", snippet

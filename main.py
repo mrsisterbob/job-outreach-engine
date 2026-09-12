@@ -3183,20 +3183,38 @@ def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
     """
     text = f"{subject} {snippet}".lower()
 
-    interview_patterns = [
-        r"invitation to interview", r"interview request", r"schedule a (?:call|time|screen|chat)",
-        r"selected for an interview", r"next steps with", r"speaking with our team",
-        r"move forward with your application"
-    ]
-    if any(re.search(p, text) for p in interview_patterns):
-        return "INTERVIEW_SET", "update_interview"
-
+    # Rejection is checked FIRST: "we were impressed but decided to move forward with other
+    # candidates" contains an acceptance-shaped phrase inside a decline, and mislabelling a
+    # rejection as an interview corrupts the outcome metrics in the direction that flatters.
     rejection_patterns = [
         r"unfortunately", r"not moving forward", r"other candidates",
-        r"decided to pursue", r"position has been filled", r"impressed with your background, but"
+        r"decided to pursue", r"(?:position|role|it)\s+(?:has been|was)\s+filled",
+        r"impressed with your background, but", r"will not be", r"no longer (?:available|open)",
+        r"pursuing other", r"not a (?:fit|match) at this time", r"keep your (?:resume|application) on file",
     ]
     if any(re.search(p, text) for p in rejection_patterns):
         return "REJECTION", "update_rejected"
+
+    # Two families. The formal ATS phrasings were all this used to match, but Kevin's outreach is
+    # peer-to-peer cold email, and a peer agreeing to talk does not write "invitation to
+    # interview" - they write "happy to chat, do you have 15 minutes Thursday?". Those replies
+    # scored GENERAL, so the interview metric and the outcome record never fired on exactly the
+    # conversations the whole pipeline exists to produce.
+    interview_patterns = [
+        # formal / ATS
+        r"invit(?:ation|e you|ing you) to (?:an? )?interview", r"interview request",
+        r"schedule a (?:call|time|screen|chat|meeting)",
+        r"selected for an interview", r"next steps with", r"speaking with our team",
+        r"move forward with your application", r"set (?:up|something up)",
+        # peer-to-peer acceptance
+        r"happy to (?:chat|talk|connect|hop on)", r"(?:would|i'?d) love to (?:chat|talk|connect)",
+        r"(?:are|r) you (?:free|available)", r"do you have (?:a few|some|\d+)\s*(?:minutes|mins)",
+        r"send (?:over|me) some times", r"what(?:'s| is) your availability",
+        r"works for me", r"let'?s (?:chat|talk|connect|set)", r"grab (?:15|20|30|a few)",
+        r"calendly\.com", r"book a time",
+    ]
+    if any(re.search(p, text) for p in interview_patterns):
+        return "INTERVIEW_SET", "update_interview"
 
     return "GENERAL", None
 
