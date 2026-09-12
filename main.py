@@ -1932,7 +1932,7 @@ def resolve_outreach_body(job, mapping, job_title, company_name, is_warm):
     # warm copy is a hand-finished scaffold anyway, so warm stays on index 0 by design.
     if is_warm:
         return generate_warm_email(
-            (mapping or {}).get("contact_name", ""),
+            first_name_for_greeting((mapping or {}).get("contact_name", "")),
             company_name=company_name,
         )
     greeting_name = str((job or {}).get("outreach_contact_first_name") or "")
@@ -3030,7 +3030,7 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
 
     # Body and subject are resolved independently. A caller-supplied custom_body is used verbatim
     # (that is how /draft, /eh and /e hand over the exact string the Telegram card showed), but it
-    # no longer drags the subject to "Following up -" with it: a first-touch cold email passed in
+    # no longer drags the subject to the bump's "Re:" form with it: a first-touch cold email passed in
     # as custom_body still gets the cold subject. Only an explicit custom_subject overrides, and
     # the bump path passes one. Note check_existing_gmail_draft() dedups on subject, so changing
     # this changes what counts as a duplicate.
@@ -3041,12 +3041,17 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     else:
         body_content = generate_cold_email(job_title, company_name)
 
+    # Subjects front-load the role and carry no prefix. "Operations & Systems Alignment - " said
+    # nothing a hiring manager could act on and pushed the role past the ~45-char mobile preview
+    # cutoff, so the one fact that earns the open was the part that got truncated. Dash-joined
+    # prefixes are retired across all three paths (cold/warm/bump) - see also the bump's
+    # custom_subject at the /followup sendall path.
     if custom_subject:
         subject = custom_subject
     elif is_warm:
-        subject = f"Reconnecting - {company_name}"
+        subject = f"Reconnecting about {company_name}"
     else:
-        subject = f"Operations & Systems Alignment - {job_title} @ {company_name}"
+        subject = f"{job_title} @ {company_name}"
 
     existing = check_existing_gmail_draft(clean_to_email, subject)
     if existing:
@@ -4215,11 +4220,18 @@ def process_overdue_batch(mode, snooze_days=7):
                 company_name=record.get("company") or "Target Firm",
                 job_title=record.get("title") or "",
                 custom_body=generate_bump_email(
-                    record.get("name") or "",
+                    first_name_for_greeting(record.get("name") or ""),
                     job_title=record.get("title") or "",
                     company_name=record.get("company") or "",
                 ),
-                custom_subject=f"Following up - {record.get('company') or 'Target Firm'}"
+                # "Re:" because this genuinely follows a prior send, so it threads in the
+                # recipient's inbox. A Carmen Cold PEOPLE row has no Role column, so fall back to
+                # the company-only form rather than rendering "Re:  @ Atwell".
+                custom_subject=(
+                    f"Re: {record.get('title')} @ {record.get('company') or 'Target Firm'}"
+                    if str(record.get("title") or "").strip()
+                    else f"Re: {record.get('company') or 'Target Firm'}"
+                )
             )
             if not draft_ok and draft_message != "Draft already exists in Gmail":
                 result["skipped"] += 1
@@ -5455,8 +5467,11 @@ def process_webhook_payload_async(data):
                 # A CRM contact row has no cached job behind it, so there is no routed
                 # outreach_template_id to honour here - index 0 is correct. The contact's name is
                 # not: these rows always have one, so the greeting is filled rather than bare.
+                # The warm path took c["note"] in the contact_name slot, which rendered the CRM
+                # note itself as the salutation ("Hi Met at the SEC panel,"); it takes the name,
+                # first-name-reduced like every other greeting.
                 draft_text = (
-                    generate_warm_email(c.get("note", ""))
+                    generate_warm_email(first_name_for_greeting(c.get("name", "")))
                     if is_warm else
                     generate_cold_email(
                         c.get("title") or "", c.get("company", "Target Firm"),
