@@ -31,6 +31,7 @@ from pipeline_utils import (
     followup_action, followup_anchor, is_followup_unscheduled,
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
+    is_guessed_contact_email, resolve_sent_email_backfill,
     plan_carmen_followup, CARMEN_LADDER_DAYS,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
@@ -3583,6 +3584,110 @@ def capture_contacts_from_sent_mail():
     return captured
 
 
+def get_job_rows_with_guessed_email():
+    """Every live JOBS row whose Contact Email is still a pipeline guess.
+
+    Scanned across the job tabs (Tetiana Cold / Warm / Clavicular) so the back-fill can replace a
+    placeholder with the address actually emailed. Rows already carrying a real address are
+    filtered out here so the per-message match loop stays small.
+    """
+    rows = []
+    for target_code in ("TC", "TW", "CL"):
+        for record in fetch_networking_cards(target_code, qty=None):
+            if not str(record.get("sheet_uuid") or "").strip():
+                continue
+            if not is_guessed_contact_email(record.get("email")):
+                continue
+            rows.append({
+                "sheet_uuid": record.get("sheet_uuid"),
+                "company": record.get("company"),
+                "email": record.get("email"),
+            })
+    return rows
+
+
+def backfill_contact_emails_from_sent_mail():
+    """Replace guessed JOBS Contact Emails with the address actually emailed.
+
+    resolve_target_email() writes an invented `operations@<company>.com` when a job is first
+    logged, because there is no real contact yet. Once a human is emailed at that company, the
+    Sent message carries the address that actually works - this promotes it onto the job row so
+    the CRM shows who was contacted instead of a placeholder that may not even resolve.
+
+    Only placeholder cells are ever overwritten (is_guessed_contact_email), so a hand-typed /e
+    address and an already-back-filled one both survive, and rescanning the rolling Sent window
+    is idempotent. Complements capture_contacts_from_sent_mail(), which files the same person as
+    a Carmen Cold row; this one fixes the job row they were emailed about.
+    """
+    missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
+    if missing_vars:
+        return 0
+    access_token = get_gmail_access_token()
+    if not access_token:
+        return 0
+
+    job_rows = get_job_rows_with_guessed_email()
+    if not job_rows:
+        return 0
+
+    after_epoch = int(time.time()) - SENT_CAPTURE_LOOKBACK_HOURS * 3600
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        res = requests.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers=headers,
+            params={"q": f"in:sent after:{after_epoch}", "maxResults": 25},
+            timeout=10,
+        )
+        if res.status_code != 200:
+            logging.error(f"[BACKFILL] Gmail list error: {res.status_code}")
+            return 0
+        message_ids = [m["id"] for m in res.json().get("messages", [])]
+    except Exception as e:
+        logging.error(f"[BACKFILL] Gmail list exception: {e}")
+        return 0
+
+    updated = 0
+    for msg_id in message_ids:
+        try:
+            detail_res = requests.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                headers=headers,
+                params={"format": "metadata", "metadataHeaders": ["To"]},
+                timeout=10,
+            )
+            if detail_res.status_code != 200:
+                continue
+            header_list = detail_res.json().get("payload", {}).get("headers", [])
+            to_header = next((h["value"] for h in header_list if h["name"] == "To"), "")
+
+            match = resolve_sent_email_backfill(to_header, job_rows)
+            if not match:
+                continue
+            sheet_uuid, real_email = match
+
+            if not log_to_sheets_crm(build_crm_payload("update_contact_email", sheet_uuid=sheet_uuid, email=real_email)):
+                continue
+            updated += 1
+            # Drop the row from the working set so a second message to the same company in this
+            # same batch can't overwrite the address just written.
+            job_rows = [r for r in job_rows if r.get("sheet_uuid") != sheet_uuid]
+            logging.info(f"[BACKFILL] Contact email set to {real_email} on job row {sheet_uuid}")
+            if TELEGRAM_CHAT_ID:
+                send_telegram_message(
+                    TELEGRAM_CHAT_ID,
+                    f"📧 <b>Contact Email Back-filled</b>\n"
+                    f"<code>{html.escape(real_email)}</code>\n"
+                    f"<i>replaced a guessed address on the job row</i>"
+                )
+        except Exception as e:
+            logging.error(f"[BACKFILL] Error on message {msg_id}: {e}")
+
+    if updated:
+        logging.info(f"[BACKFILL] Contact-email back-fill complete: {updated} row(s) updated.")
+    return updated
+
+
 def scheduled_email_poll_job():
     """APScheduler job target: fires exactly once every 15 minutes, independent of webhook load."""
     logging.info("[POLL] 15-minute email poll cycle triggered")
@@ -3594,6 +3699,10 @@ def scheduled_email_poll_job():
         capture_contacts_from_sent_mail()
     except Exception as e:
         logging.error(f"[POLL] Sent-mail Capture Error: {e}")
+    try:
+        backfill_contact_emails_from_sent_mail()
+    except Exception as e:
+        logging.error(f"[POLL] Contact-email Back-fill Error: {e}")
     logging.info("[POLL] 15-minute email poll cycle completed")
 
 def start_gmail_poller():

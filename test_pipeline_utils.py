@@ -898,3 +898,65 @@ def test_expired_matched_row_never_fires_without_a_parseable_date():
     assert pu.is_expired_matched_row("Matched", "", today) is False
     assert pu.is_expired_matched_row("Matched", "1970-01-01", today) is False
     assert pu.is_expired_matched_row("Matched", "not-a-date", today) is False
+
+
+# ---- Sent-mail contact-email back-fill ----
+
+def test_is_guessed_contact_email_flags_pipeline_placeholders():
+    """Every address resolve_target_email() can invent must read as a guess, tagged or not."""
+    for guess in (
+        "operations@affirm.com",
+        "bizops@ally.com",
+        "wealthops@recoursecommunicationsinc.com",
+        "compliance@mersino.com",
+        "operations@intactinsurancespecialtysolutions.com [⚠️ Fallback Email]",
+        "",
+        None,
+    ):
+        assert pu.is_guessed_contact_email(guess) is True, guess
+
+
+def test_is_guessed_contact_email_protects_real_people():
+    """A human address - however it got there - is never a placeholder to overwrite."""
+    for real in ("eina.assali@affirm.com", "jeremy@mainfinancialgroup.com", "sshruti@hcltech.com"):
+        assert pu.is_guessed_contact_email(real) is False, real
+
+
+def test_resolve_sent_email_backfill_promotes_the_real_address():
+    """The address actually emailed replaces the guess on that company's job row."""
+    rows = [{"sheet_uuid": "u-1", "company": "HCLTech", "email": "operations@hcltech.com"}]
+    assert pu.resolve_sent_email_backfill("Soumya <sshruti@hcltech.com>", rows) == ("u-1", "sshruti@hcltech.com")
+
+
+def test_resolve_sent_email_backfill_ignores_role_mailboxes():
+    """Mail sent TO a generic inbox is not evidence of a real contact."""
+    rows = [{"sheet_uuid": "u-1", "company": "HCLTech", "email": "operations@hcltech.com"}]
+    assert pu.resolve_sent_email_backfill("operations@hcltech.com", rows) is None
+
+
+def test_resolve_sent_email_backfill_never_clobbers_a_real_address():
+    """Idempotence: a row already carrying a person is left alone on the next scan."""
+    rows = [{"sheet_uuid": "u-1", "company": "HCLTech", "email": "sshruti@hcltech.com"}]
+    assert pu.resolve_sent_email_backfill("Someone <other.person@hcltech.com>", rows) is None
+
+
+def test_resolve_sent_email_backfill_requires_a_domain_company_match():
+    """A personal address at an unrelated domain must not land on someone else's row."""
+    rows = [{"sheet_uuid": "u-1", "company": "HCLTech", "email": "operations@hcltech.com"}]
+    assert pu.resolve_sent_email_backfill("Recruiter <jeremy@totallyunrelated.com>", rows) is None
+    assert pu.resolve_sent_email_backfill("Friend <someone@gmail.com>", rows) is None
+
+
+def test_resolve_sent_email_backfill_picks_the_matching_company_row():
+    """With several guessed rows live, only the domain-matching one is updated."""
+    rows = [
+        {"sheet_uuid": "u-affirm", "company": "Affirm", "email": "operations@affirm.com"},
+        {"sheet_uuid": "u-hcl", "company": "HCLTech", "email": "operations@hcltech.com"},
+    ]
+    assert pu.resolve_sent_email_backfill("Eina <eina.assali@affirm.com>", rows) == ("u-affirm", "eina.assali@affirm.com")
+
+
+def test_resolve_sent_email_backfill_skips_rows_without_a_uuid():
+    """No UUID means no addressable row - nothing to update."""
+    rows = [{"sheet_uuid": "", "company": "HCLTech", "email": "operations@hcltech.com"}]
+    assert pu.resolve_sent_email_backfill("Soumya <sshruti@hcltech.com>", rows) is None

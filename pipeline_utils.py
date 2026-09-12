@@ -788,6 +788,49 @@ def build_sent_contact(to_header, crm_companies):
     }
 
 
+def is_guessed_contact_email(email):
+    """True when a JOBS row's Contact Email is a pipeline guess rather than a real person.
+
+    resolve_target_email() invents `operations@`/`bizops@`/`wealthops@`/`compliance@` addresses
+    from the company name and tags the worst ones "[⚠️ Fallback Email]". Those are placeholders,
+    so they are the only values the sent-mail back-fill is allowed to overwrite - a real address
+    (typed via /e, or already back-filled) must never be clobbered by a later message.
+    """
+    raw = str(email or "").strip()
+    if not raw:
+        return True
+    if "Fallback Email" in raw:
+        return True
+    # Strip the bracketed confidence tag the same way the send path does before inspecting.
+    bare = re.sub(r'\s*\[.*?\]\s*', '', raw).strip()
+    return is_role_mailbox(bare)
+
+
+def resolve_sent_email_backfill(to_header, job_rows):
+    """One Sent message -> (sheet_uuid, real_email) for a JOBS row whose Contact Email is still
+    a guess, or None.
+
+    `job_rows` is an iterable of dicts as returned by get_followups: {sheet_uuid, company, email}.
+    A row only qualifies when the recipient is a real person (not a role mailbox), the address's
+    domain matches that row's company, and the row's current Contact Email is a placeholder.
+    Rows already carrying a real address are left alone, which keeps the back-fill idempotent -
+    rescanning the same Sent window twice is a no-op.
+    """
+    _, email = parse_email_recipient(to_header)
+    if not email or is_role_mailbox(email) or not company_domain_of(email):
+        return None
+    for row in job_rows or []:
+        uuid_value = str((row or {}).get("sheet_uuid") or "").strip()
+        if not uuid_value:
+            continue
+        if not domain_matches_company(email, (row or {}).get("company")):
+            continue
+        if not is_guessed_contact_email((row or {}).get("email")):
+            continue
+        return uuid_value, email
+    return None
+
+
 # ==============================================================================
 # CARMEN COLD 3/7/14 FOLLOW-UP LADDER (pure, no I/O)
 #
