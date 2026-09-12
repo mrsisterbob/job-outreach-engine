@@ -4025,18 +4025,64 @@ def start_morning_digest():
 def log_to_sheets_crm(payload, max_retries=3):
     """Log to Google Sheets CRM. Payload may include row UUID and note timestamp.
     Support apps script bottom-to-top search loops via rowOperationOrder: 'DESC'.
+
+    HTTP 200 is NOT success here. An Apps Script web app answers 200 for everything it handles,
+    including its own {"status": "error"} bodies - an unset/mismatched CRM_SHARED_SECRET Script
+    Property makes doPost reject every write as "Unauthorized" behind a 200. Trusting the status
+    code alone let a fully-rejected batch read as a successful write, which opened the Tier-1 card
+    gate in run_job_pipeline() and dispatched Telegram cards for rows that never reached the sheet.
+    So the body decides: status must be "success", and for a row-writing action the reported count
+    must match the number of rows sent (a short count means the Apps Script dedup guard suppressed
+    some, which the caller needs to know about rather than read as a clean write).
+
+    An auth rejection is not retryable - the secret will not fix itself between attempts - so it
+    alerts and returns immediately instead of burning the backoff.
     """
     if not CRM_WEBHOOK_URL:
         return False
     # Ensure row operation order is DESC for backwards loop searches
     if "rowOperationOrder" not in payload:
         payload["rowOperationOrder"] = "DESC"
+    action = payload.get("action", "unknown")
+    expected_rows = len(payload.get("rows") or []) if action == "batch_add_rows" else None
     delay = 1.0
     for attempt in range(max_retries):
         try:
             res = crm_post(payload)
             if res and res.status_code == 200:
-                return True
+                try:
+                    body = res.json()
+                except Exception:
+                    # A non-JSON 200 is the Apps Script HTML error/login page, not a written row.
+                    logging.error(f"CRM '{action}': non-JSON 200 response: {res.text[:200]}")
+                    body = None
+
+                if isinstance(body, dict):
+                    status = str(body.get("status", "")).lower()
+                    message = str(body.get("message", ""))
+                    if status == "success":
+                        if expected_rows is not None:
+                            written = safe_int(body.get("count"), 0)
+                            if written < expected_rows:
+                                logging.error(
+                                    f"CRM batch_add_rows wrote {written}/{expected_rows} rows: {message}"
+                                )
+                                send_health_alert(
+                                    f"CRM batch wrote only {written} of {expected_rows} row(s) - "
+                                    f"{expected_rows - written} suppressed as duplicate(s). {message}"
+                                )
+                                return False
+                        return True
+
+                    logging.error(f"CRM '{action}' rejected by Apps Script: {message}")
+                    if "unauthorized" in message.lower():
+                        send_health_alert(
+                            "CRM webhook is rejecting every write as Unauthorized - rows are NOT "
+                            "reaching the sheet. Set the CRM_SHARED_SECRET Script Property in the "
+                            "Apps Script project to match Render's CRM_SHARED_SECRET, then redeploy "
+                            "the web app (Deploy > Manage deployments > New version)."
+                        )
+                        return False
         except Exception as e:
             logging.error(f"CRM Webhook Attempt {attempt+1} Failed: {e}")
         time.sleep(delay)
