@@ -3728,7 +3728,13 @@ def start_gmail_poller():
     EMAIL_POLL_SCHEDULER.start()
     logging.info("[POLL] Gmail inbound poller scheduled: every 15 minutes")
 
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+# Overridable so the host can point backups at the same mounted disk as JOBS_DB_PATH. Backups
+# written next to the code are lost with the container on every deploy - a snapshot that dies
+# with the thing it was protecting is not a backup.
+BACKUP_DIR = os.environ.get(
+    "BACKUP_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups"),
+)
 BACKUP_RETENTION_COUNT = 8  # ~2 months of weekly snapshots
 BACKUP_CRITICAL_TABLES = ("jobs", "sheet_row_map", "crm_outbox", "application_outcomes", "pipeline_metrics")
 

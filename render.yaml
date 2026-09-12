@@ -1,0 +1,66 @@
+# Render blueprint for job-outreach-engine.
+#
+# In the Render dashboard: New + -> Blueprint -> pick this repo. If the service already exists,
+# attach the disk and env vars below to it by hand instead - the disk is the part that matters.
+#
+# WHY THE DISK EXISTS
+# -------------------
+# Everything durable this engine owns lives in SQLite: seen_jobs (cross-run listing dedup),
+# application_outcomes / pipeline_metrics / daily_activity (the only evidence of whether outreach
+# actually works), crm_outbox (queued CRM writes awaiting retry) and sheet_row_map (Telegram
+# swipe-reply -> CRM row mapping). Render's filesystem is ephemeral: without a mounted disk every
+# deploy silently resets all of it to zero rows, which makes cross-run dedup impossible and means
+# reply/interview rates can never accumulate past a single deploy cycle.
+#
+# The disk makes JOBS_DB_PATH and BACKUP_DIR point at storage that survives deploys and restarts.
+# NOTE: persistent disks require a paid instance type - the free plan has no durable storage, so
+# on free the metrics keep resetting no matter what these variables say.
+services:
+  - type: web
+    name: job-outreach-engine
+    runtime: python
+    plan: starter          # NOT free: free has no persistent disk (see above)
+    buildCommand: pip install -r requirements.txt
+    # One worker on purpose: APScheduler runs in-process (Gmail poll every 15m, nightly
+    # sequencer, weekly backup). A second worker would boot a second scheduler and fire every
+    # job twice - duplicate follow-up emails and double CRM writes.
+    startCommand: gunicorn main:app --workers 1 --bind 0.0.0.0:$PORT --timeout 120
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: jobs-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      # --- Durable state (the whole point of the disk) ---
+      - key: JOBS_DB_PATH
+        value: /var/data/jobs_cache.db
+      - key: BACKUP_DIR
+        value: /var/data/backups
+
+      # --- Secrets: set each in the dashboard (Environment tab) so they never land in git ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CRM_WEBHOOK_URL
+        sync: false
+      - key: CRM_SHARED_SECRET
+        sync: false
+      - key: RAPIDAPI_KEY
+        sync: false
+      - key: OPENWEBNINJA_KEY
+        sync: false
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REFRESH_TOKEN
+        sync: false
+      - key: GMAIL_USER
+        sync: false
+
+      - key: PYTHON_VERSION
+        value: "3.12"
