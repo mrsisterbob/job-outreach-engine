@@ -14,7 +14,7 @@
   "track_b_engineering": [
     "Built a Python and Flask backend with SQLite in WAL mode to handle live Telegram webhook updates without dropped records.",
     "Wrote nightly Python reconciliation scripts that flag mismatches between custodial ledgers and internal records.",
-    "Wired a headless Typst compiler into the pipeline to generate tailored 1-page PDF resumes on demand.",
+    "Wired a headless Typst compiler into the pipeline to generate tailored 1-page PDF documents on demand.",
     "Created two-way webhook synchronization between HubSpot CRM tables and local SQLite databases.",
     "Cleaned and reformatted 1,500+ legacy account records across internal databases to match updated database schemas.",
     "Wrote strict JSON schema validation models in Python to block invalid payloads on REST API endpoints.",
@@ -51,7 +51,7 @@
     "Set up automated DocuSign workflows in Salesforce for 150+ advisors, cutting packet review from 60 to 20 minutes.",
     "Fixed a Salesforce queue collision between trading and service desks, preventing 10 critical SLA breaches.",
     "Mapped account workflows from initial Salesforce submission through execution in Orion Eclipse.",
-    "Built a custom outreach engine in Python connected to SQLite and Telegram to run a 500+ contact pipeline.",
+    "Built a custom contact pipeline in Python connected to SQLite and Telegram to manage 500+ records end to end.",
     "Set up standardized escalation paths for custodial account transfers, cutting turnaround time by 25%.",
     "Cleaned multi-source CRM records into a single pipeline view to remove duplicate contact entries.",
     "Automated routine data entry and compliance checks to clear weekly administrative backlogs.",

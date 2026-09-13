@@ -41,7 +41,7 @@
       "start": "05/2025",
       "end": "08/2025",
       "bullets": [
-        "Learned the client sales and acquisition process, preparing financial planning proposals and leading 15+ prospecting reviews under RIA suitability guidelines.",
+        "Prepared financial planning proposals and led 15+ prospecting reviews under RIA suitability guidelines.",
         "Engaged with institutional custodians to verify prospective client financial profiles and expedite account transfer paperwork.",
         "Tracked onboarding paperwork exceptions across prospective client files to resolve documentation hold-ups with partner firms."
       ]
@@ -81,15 +81,16 @@
   ],
   "projects": [
     {
-      "name": "Automated Job Pipeline & Custom Telegram CRM",
+      "name": "Document Automation Pipeline & Custom CRM",
       "category": "systems",
       "repo": "github.com/mrsisterbob/job-outreach-engine",
       "location": "Detroit, MI",
       "start": "07/2026",
       "end": "08/2026",
       "bullets": [
-        "Built a Python and Flask backend with SQLite to track job applications and sync live status updates over Telegram webhooks.",
-        "Integrated Gemini API to screen job postings against a resume bank and compile tailored 1-page PDF resumes on demand using Typst."
+        "Built a Python and Flask backend with SQLite to track pipeline records and sync live status updates over webhooks.",
+        "Integrated the Gemini API to screen inbound records against a structured content bank and compile tailored 1-page PDFs on demand using Typst.",
+        "Designed the screening layer as a deterministic template engine, so the model routes and scores while every output line comes from banked copy rather than generated text."
       ]
     },
     {
@@ -101,8 +102,8 @@
       "start": "04/2026",
       "end": "08/2026",
       "bullets": [
-        "Built a concurrent Python backend utilizing SQLite in WAL mode with explicit write locks to process live exchange data and manage virtual portfolios.",
-        "Engineered a real time WebSocket reconciliation feed and historical backtester for automated breakout detection and trade execution."
+        "Built a concurrent Python backend on SQLite in WAL mode with explicit write locks to process live exchange data and manage virtual portfolios.",
+        "Engineered a real time WebSocket reconciliation feed and historical backtester for automated breakout detection and simulated execution."
       ]
     }
   ],
