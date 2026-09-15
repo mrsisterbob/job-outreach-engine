@@ -464,6 +464,148 @@ def get_db_conn():
     conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
+# Seed values for a brand-new search_filters table. Module-level (not inlined in init_db) so
+# restore_core_sourcing_filters() can put target_queries back if a restart ever leaves it blank.
+DEFAULT_SEARCH_FILTERS = {
+    "min_salary": 50000,
+    "experience_salary_floor": 60000,
+    "radius_miles": 45,
+    "valid_cities": [
+        "farmington", "detroit", "ann arbor", "novi", "troy", "southfield",
+        "auburn hills", "plymouth", "royal oak", "livonia", "dearborn",
+        "birmingham", "bloomfield", "warren", "sterling heights", "canton",
+        "rochester", "wixom", "madison heights",
+        # Added: real Metro Detroit suburbs within ~35mi of Farmington that were missing
+        # from the original list and would otherwise pass JSearch's radius sourcing only
+        # to be silently dropped by this filter's exact-string check.
+        "redford", "walled lake", "west bloomfield", "waterford", "pontiac",
+        "ferndale", "oak park", "northville", "westland", "dearborn heights",
+        "garden city", "milford", "south lyon", "commerce", "clawson", "berkley",
+        "beverly hills", "franklin", "hazel park", "wyandotte", "allen park",
+        "melvindale", "lathrup village", "farmington hills", "highland",
+        "white lake", "inkster", "taylor", "southgate", "lincoln park",
+        "romulus", "belleville", "davisburg", "clarkston", "lake orion",
+        "shelby", "new hudson",
+        # Added: full Metro Detroit MSA - Macomb County, Downriver, Grosse Pointes,
+        # Livingston edge. These run 35-45mi from Farmington (outside the original
+        # anchor's radius_miles), which is why radius_miles was widened to 45 alongside
+        # this and dedicated query anchors were added for the regions no existing
+        # query anchor reaches even at the wider radius.
+        "clinton township", "roseville", "st. clair shores", "saint clair shores",
+        "eastpointe", "fraser", "chesterfield", "new baltimore", "macomb township",
+        "utica", "washington township", "mount clemens",
+        "trenton", "riverview", "woodhaven", "flat rock", "brownstown", "grosse ile",
+        "grosse pointe", "harper woods",
+        "huntington woods", "pleasant ridge", "keego harbor", "orchard lake",
+        "bingham farms", "wolverine lake", "union lake",
+        "brighton", "howell", "hartland", "fenton"
+    ],
+    "title_exclusions": [
+        "sales", "account executive", "bdr", "sdr", "financial advisor", "financial planner",
+        "client relationship manager", "agent", "wholesaler", "producer", "insurance agent",
+        "teller", "branch", "personal banker", "loan officer", "mortgage", "cpa",
+        "customer service representative", "call center", "door to door", "cold call",
+        "administrative", "receptionist", "office assistant", "logistics clerk",
+        "patient intake", "intake coordinator", "front desk", "office coordinator"
+    ],
+    "company_exclusions": [
+        "cybercoders", "robert half", "kforce", "jobot", "actalent", "insight global"
+    ],
+    "hard_ban_keywords": [
+        "lead generation", "upselling", "quota-driven", "client acquisition",
+        "hunter mentality", "pipeline development", "uncapped earnings",
+        "cold outreach", "deal closing", "solution pitching",
+        "uncapped potential", "commission", "hustle", "grind", "door-to-door",
+        "phone jockey", "call jockey", "cold calling",
+        "physical filing", "answering phones", "switchboard", "data entry clerk",
+        "schedule travel arrangements", "clerical duties", "errands"
+    ],
+    "seniority_exclusions": [
+        "senior", " lead", " manager", "director", "vp", " executive", " principal", "head of"
+    ],
+    "core_skills": [
+        "python", "sql", "salesforce", "excel", "schwab sac", "schwab advisor center",
+        "fidelity wealthscape", "docusign", "process automation", "reconciliation"
+    ],
+    "tier1_ecosystem": [
+        "downtown detroit", "inveniam", "rivian", "rocket", "quicken", "stockx", "venture"
+    ],
+    "required_keywords": [],
+    "ats_company_slugs": [],
+    "target_queries": [
+        "Wealth Operations Farmington MI", "Fintech Operations Farmington MI",
+        "Business Operations Analyst Farmington MI", "Custodial Operations Schwab Fidelity Farmington MI",
+        "Financial Systems Process Automation Farmington MI", "Operations Specialist Farmington MI",
+        "Salesforce Administrator Farmington MI", "Business Systems Analyst Farmington MI",
+        "Financial Operations Analyst Birmingham MI", "Supply Chain Operations Analyst Farmington MI",
+
+        "Trade Operations Analyst Detroit MI", "Compliance Operations Specialist Detroit MI",
+        "Risk Operations Analyst Detroit MI", "Client Operations Associate Detroit MI",
+        "Treasury Operations Analyst Detroit MI", "Data Operations Analyst Detroit MI",
+        "Process Improvement Analyst Detroit MI", "Onboarding Specialist Detroit MI",
+        "Data Operations Analyst Warren MI", "Revenue Operations Analyst Detroit MI",
+
+        "Wealth Management Operations Ann Arbor MI", "Business Intelligence Analyst Ann Arbor MI",
+        "Fintech Systems Analyst Ann Arbor MI", "Custodial Reconciliation Analyst Ann Arbor MI",
+        "Salesforce Administrator Ann Arbor MI", "Operations Analyst Ann Arbor MI",
+        "Business Systems Analyst Ann Arbor MI", "Financial Analyst Operations Ann Arbor MI",
+        "Business Operations Analyst Plymouth MI", "Healthcare Operations Analyst Ann Arbor MI",
+
+        "Wealth Operations Novi MI", "Fintech Operations Novi MI",
+        "Business Operations Analyst Novi MI", "Custodial Operations Schwab Fidelity Novi MI",
+        "Financial Systems Process Automation Novi MI", "Operations Specialist Novi MI",
+        "Salesforce Administrator Novi MI", "Business Systems Analyst Novi MI",
+        "Client Success Operations Wixom MI", "Implementation Specialist Novi MI",
+
+        "Wealth Operations Troy MI", "Fintech Operations Troy MI",
+        "Business Operations Analyst Troy MI", "Custodial Operations Schwab Fidelity Troy MI",
+        "Financial Systems Process Automation Troy MI", "Operations Specialist Troy MI",
+        "Salesforce Administrator Troy MI", "Business Systems Analyst Troy MI",
+        "Process Improvement Analyst Rochester MI", "ERP Systems Analyst Troy MI",
+
+        "Wealth Operations Southfield MI", "Fintech Operations Southfield MI",
+        "Business Operations Analyst Southfield MI", "Custodial Operations Schwab Fidelity Southfield MI",
+        "Financial Systems Process Automation Southfield MI", "Operations Specialist Southfield MI",
+        "Salesforce Administrator Southfield MI", "Business Systems Analyst Southfield MI",
+        "Trade Operations Analyst Bloomfield MI", "Logistics Operations Analyst Southfield MI",
+
+        "Wealth Operations Auburn Hills MI", "Fintech Operations Auburn Hills MI",
+        "Business Operations Analyst Auburn Hills MI", "Custodial Operations Schwab Fidelity Auburn Hills MI",
+        "Financial Systems Process Automation Auburn Hills MI", "Operations Specialist Auburn Hills MI",
+        "Salesforce Administrator Auburn Hills MI", "Business Systems Analyst Auburn Hills MI",
+        "Compliance Operations Specialist Sterling Heights MI", "Claims Operations Analyst Auburn Hills MI",
+
+        "Wealth Operations Royal Oak MI", "Fintech Operations Royal Oak MI",
+        "Business Operations Analyst Royal Oak MI", "Custodial Operations Schwab Fidelity Royal Oak MI",
+        "Financial Systems Process Automation Royal Oak MI", "Operations Specialist Royal Oak MI",
+        "Salesforce Administrator Royal Oak MI", "Business Systems Analyst Royal Oak MI",
+        "Treasury Operations Analyst Madison Heights MI", "Manufacturing Operations Analyst Royal Oak MI",
+
+        "Wealth Operations Livonia MI", "Fintech Operations Livonia MI",
+        "Business Operations Analyst Livonia MI", "Custodial Operations Schwab Fidelity Livonia MI",
+        "Financial Systems Process Automation Livonia MI", "Operations Specialist Livonia MI",
+        "Salesforce Administrator Livonia MI", "Business Systems Analyst Livonia MI",
+        "Onboarding Specialist Canton MI", "Cloud Operations Analyst Livonia MI",
+
+        "Wealth Operations Dearborn MI", "Fintech Operations Dearborn MI",
+        "Business Operations Analyst Dearborn MI", "Custodial Operations Schwab Fidelity Dearborn MI",
+        "Financial Systems Process Automation Dearborn MI", "Operations Specialist Dearborn MI",
+        "Salesforce Administrator Dearborn MI", "Business Systems Analyst Dearborn MI",
+        "Data Operations Analyst Dearborn MI", "Procurement Operations Analyst Dearborn MI",
+
+        # Macomb County + Downriver + Grosse Pointes: no earlier anchor city reaches these
+        # even at the widened 45mi radius_miles, so they get dedicated query anchors instead
+        # of relying on overlap from the western/central Oakland-Wayne anchors above.
+        "Wealth Operations Clinton Township MI", "Fintech Operations Clinton Township MI",
+        "Business Operations Analyst Clinton Township MI", "Operations Specialist Clinton Township MI",
+        "Salesforce Administrator Clinton Township MI", "Business Systems Analyst Roseville MI",
+        "Financial Systems Process Automation Sterling Heights MI", "Client Operations Associate Mount Clemens MI",
+        "Business Operations Analyst Trenton MI", "Operations Specialist Grosse Pointe MI"
+    ],
+    "query_bank_pointer": 0
+}
+
+
 def init_db():
     """Initializes local SQLite tables with WAL mode enabled for multithreaded concurrency."""
     with get_db_conn() as conn:
@@ -603,145 +745,7 @@ def init_db():
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
         if cursor.fetchone()[0] == 0:
-            defaults = {
-                "min_salary": 50000,
-                "experience_salary_floor": 60000,
-                "radius_miles": 45,
-                "valid_cities": [
-                    "farmington", "detroit", "ann arbor", "novi", "troy", "southfield",
-                    "auburn hills", "plymouth", "royal oak", "livonia", "dearborn",
-                    "birmingham", "bloomfield", "warren", "sterling heights", "canton",
-                    "rochester", "wixom", "madison heights",
-                    # Added: real Metro Detroit suburbs within ~35mi of Farmington that were missing
-                    # from the original list and would otherwise pass JSearch's radius sourcing only
-                    # to be silently dropped by this filter's exact-string check.
-                    "redford", "walled lake", "west bloomfield", "waterford", "pontiac",
-                    "ferndale", "oak park", "northville", "westland", "dearborn heights",
-                    "garden city", "milford", "south lyon", "commerce", "clawson", "berkley",
-                    "beverly hills", "franklin", "hazel park", "wyandotte", "allen park",
-                    "melvindale", "lathrup village", "farmington hills", "highland",
-                    "white lake", "inkster", "taylor", "southgate", "lincoln park",
-                    "romulus", "belleville", "davisburg", "clarkston", "lake orion",
-                    "shelby", "new hudson",
-                    # Added: full Metro Detroit MSA - Macomb County, Downriver, Grosse Pointes,
-                    # Livingston edge. These run 35-45mi from Farmington (outside the original
-                    # anchor's radius_miles), which is why radius_miles was widened to 45 alongside
-                    # this and dedicated query anchors were added for the regions no existing
-                    # query anchor reaches even at the wider radius.
-                    "clinton township", "roseville", "st. clair shores", "saint clair shores",
-                    "eastpointe", "fraser", "chesterfield", "new baltimore", "macomb township",
-                    "utica", "washington township", "mount clemens",
-                    "trenton", "riverview", "woodhaven", "flat rock", "brownstown", "grosse ile",
-                    "grosse pointe", "harper woods",
-                    "huntington woods", "pleasant ridge", "keego harbor", "orchard lake",
-                    "bingham farms", "wolverine lake", "union lake",
-                    "brighton", "howell", "hartland", "fenton"
-                ],
-                "title_exclusions": [
-                    "sales", "account executive", "bdr", "sdr", "financial advisor", "financial planner",
-                    "client relationship manager", "agent", "wholesaler", "producer", "insurance agent",
-                    "teller", "branch", "personal banker", "loan officer", "mortgage", "cpa",
-                    "customer service representative", "call center", "door to door", "cold call",
-                    "administrative", "receptionist", "office assistant", "logistics clerk",
-                    "patient intake", "intake coordinator", "front desk", "office coordinator"
-                ],
-                "company_exclusions": [
-                    "cybercoders", "robert half", "kforce", "jobot", "actalent", "insight global"
-                ],
-                "hard_ban_keywords": [
-                    "lead generation", "upselling", "quota-driven", "client acquisition",
-                    "hunter mentality", "pipeline development", "uncapped earnings",
-                    "cold outreach", "deal closing", "solution pitching",
-                    "uncapped potential", "commission", "hustle", "grind", "door-to-door",
-                    "phone jockey", "call jockey", "cold calling",
-                    "physical filing", "answering phones", "switchboard", "data entry clerk",
-                    "schedule travel arrangements", "clerical duties", "errands"
-                ],
-                "seniority_exclusions": [
-                    "senior", " lead", " manager", "director", "vp", " executive", " principal", "head of"
-                ],
-                "core_skills": [
-                    "python", "sql", "salesforce", "excel", "schwab sac", "schwab advisor center",
-                    "fidelity wealthscape", "docusign", "process automation", "reconciliation"
-                ],
-                "tier1_ecosystem": [
-                    "downtown detroit", "inveniam", "rivian", "rocket", "quicken", "stockx", "venture"
-                ],
-                "required_keywords": [],
-                "ats_company_slugs": [],
-                "target_queries": [
-                    "Wealth Operations Farmington MI", "Fintech Operations Farmington MI",
-                    "Business Operations Analyst Farmington MI", "Custodial Operations Schwab Fidelity Farmington MI",
-                    "Financial Systems Process Automation Farmington MI", "Operations Specialist Farmington MI",
-                    "Salesforce Administrator Farmington MI", "Business Systems Analyst Farmington MI",
-                    "Financial Operations Analyst Birmingham MI", "Supply Chain Operations Analyst Farmington MI",
-
-                    "Trade Operations Analyst Detroit MI", "Compliance Operations Specialist Detroit MI",
-                    "Risk Operations Analyst Detroit MI", "Client Operations Associate Detroit MI",
-                    "Treasury Operations Analyst Detroit MI", "Data Operations Analyst Detroit MI",
-                    "Process Improvement Analyst Detroit MI", "Onboarding Specialist Detroit MI",
-                    "Data Operations Analyst Warren MI", "Revenue Operations Analyst Detroit MI",
-
-                    "Wealth Management Operations Ann Arbor MI", "Business Intelligence Analyst Ann Arbor MI",
-                    "Fintech Systems Analyst Ann Arbor MI", "Custodial Reconciliation Analyst Ann Arbor MI",
-                    "Salesforce Administrator Ann Arbor MI", "Operations Analyst Ann Arbor MI",
-                    "Business Systems Analyst Ann Arbor MI", "Financial Analyst Operations Ann Arbor MI",
-                    "Business Operations Analyst Plymouth MI", "Healthcare Operations Analyst Ann Arbor MI",
-
-                    "Wealth Operations Novi MI", "Fintech Operations Novi MI",
-                    "Business Operations Analyst Novi MI", "Custodial Operations Schwab Fidelity Novi MI",
-                    "Financial Systems Process Automation Novi MI", "Operations Specialist Novi MI",
-                    "Salesforce Administrator Novi MI", "Business Systems Analyst Novi MI",
-                    "Client Success Operations Wixom MI", "Implementation Specialist Novi MI",
-
-                    "Wealth Operations Troy MI", "Fintech Operations Troy MI",
-                    "Business Operations Analyst Troy MI", "Custodial Operations Schwab Fidelity Troy MI",
-                    "Financial Systems Process Automation Troy MI", "Operations Specialist Troy MI",
-                    "Salesforce Administrator Troy MI", "Business Systems Analyst Troy MI",
-                    "Process Improvement Analyst Rochester MI", "ERP Systems Analyst Troy MI",
-
-                    "Wealth Operations Southfield MI", "Fintech Operations Southfield MI",
-                    "Business Operations Analyst Southfield MI", "Custodial Operations Schwab Fidelity Southfield MI",
-                    "Financial Systems Process Automation Southfield MI", "Operations Specialist Southfield MI",
-                    "Salesforce Administrator Southfield MI", "Business Systems Analyst Southfield MI",
-                    "Trade Operations Analyst Bloomfield MI", "Logistics Operations Analyst Southfield MI",
-
-                    "Wealth Operations Auburn Hills MI", "Fintech Operations Auburn Hills MI",
-                    "Business Operations Analyst Auburn Hills MI", "Custodial Operations Schwab Fidelity Auburn Hills MI",
-                    "Financial Systems Process Automation Auburn Hills MI", "Operations Specialist Auburn Hills MI",
-                    "Salesforce Administrator Auburn Hills MI", "Business Systems Analyst Auburn Hills MI",
-                    "Compliance Operations Specialist Sterling Heights MI", "Claims Operations Analyst Auburn Hills MI",
-
-                    "Wealth Operations Royal Oak MI", "Fintech Operations Royal Oak MI",
-                    "Business Operations Analyst Royal Oak MI", "Custodial Operations Schwab Fidelity Royal Oak MI",
-                    "Financial Systems Process Automation Royal Oak MI", "Operations Specialist Royal Oak MI",
-                    "Salesforce Administrator Royal Oak MI", "Business Systems Analyst Royal Oak MI",
-                    "Treasury Operations Analyst Madison Heights MI", "Manufacturing Operations Analyst Royal Oak MI",
-
-                    "Wealth Operations Livonia MI", "Fintech Operations Livonia MI",
-                    "Business Operations Analyst Livonia MI", "Custodial Operations Schwab Fidelity Livonia MI",
-                    "Financial Systems Process Automation Livonia MI", "Operations Specialist Livonia MI",
-                    "Salesforce Administrator Livonia MI", "Business Systems Analyst Livonia MI",
-                    "Onboarding Specialist Canton MI", "Cloud Operations Analyst Livonia MI",
-
-                    "Wealth Operations Dearborn MI", "Fintech Operations Dearborn MI",
-                    "Business Operations Analyst Dearborn MI", "Custodial Operations Schwab Fidelity Dearborn MI",
-                    "Financial Systems Process Automation Dearborn MI", "Operations Specialist Dearborn MI",
-                    "Salesforce Administrator Dearborn MI", "Business Systems Analyst Dearborn MI",
-                    "Data Operations Analyst Dearborn MI", "Procurement Operations Analyst Dearborn MI",
-
-                    # Macomb County + Downriver + Grosse Pointes: no earlier anchor city reaches these
-                    # even at the widened 45mi radius_miles, so they get dedicated query anchors instead
-                    # of relying on overlap from the western/central Oakland-Wayne anchors above.
-                    "Wealth Operations Clinton Township MI", "Fintech Operations Clinton Township MI",
-                    "Business Operations Analyst Clinton Township MI", "Operations Specialist Clinton Township MI",
-                    "Salesforce Administrator Clinton Township MI", "Business Systems Analyst Roseville MI",
-                    "Financial Systems Process Automation Sterling Heights MI", "Client Operations Associate Mount Clemens MI",
-                    "Business Operations Analyst Trenton MI", "Operations Specialist Grosse Pointe MI"
-                ],
-                "query_bank_pointer": 0
-            }
-            for k, v in defaults.items():
+            for k, v in DEFAULT_SEARCH_FILTERS.items():
                 conn.execute("INSERT INTO search_filters (key, value_json) VALUES (?, ?)", (k, json.dumps(v)))
             conn.commit()
 
@@ -774,9 +778,16 @@ def init_db():
         conn.commit()
 
     hydrate_filters_from_sheets()
+    restore_core_sourcing_filters()
 
 def hydrate_filters_from_sheets():
-    """On startup, pull load_system_config from Sheets so local filters reflect any manual spreadsheet edits."""
+    """On startup, pull load_system_config from Sheets so local filters reflect any manual spreadsheet edits.
+
+    A remote value may not replace a populated local list with an empty or non-list value. A blank
+    or non-JSON System_Config cell comes back from Code.gs as "" and, written straight through,
+    silently zeroed target_queries on restart - /t then scanned 0 rules and pulled only the warm
+    boards. Sheets can still edit a list; it just cannot blank one.
+    """
     res = crm_get({"action": "load_system_config"})
     if not res or res.status_code != 200:
         return
@@ -787,11 +798,51 @@ def hydrate_filters_from_sheets():
             for key, val in remote_filters.items():
                 if key == "query_bank_pointer":
                     continue  # rolling-slice cursor is purely local - Sheets must never clobber it
+                if not (isinstance(val, list) and val):
+                    row = conn.execute("SELECT value_json FROM search_filters WHERE key = ?", (key,)).fetchone()
+                    local_val = json.loads(row[0]) if row and row[0] else None
+                    if isinstance(local_val, list) and local_val:
+                        logging.warning(
+                            f"[HYDRATE] Ignored System_Config '{key}' = {val!r}: would have replaced "
+                            f"{len(local_val)} local entries with an empty/non-list value"
+                        )
+                        continue
                 conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(val)))
             conn.commit()
         logging.info(f"Hydrated {len(remote_filters)} filters from Google Sheets System_Config")
     except Exception as e:
         logging.error(f"Filter Hydration Error: {e}")
+
+def restore_core_sourcing_filters():
+    """Put target_queries back from DEFAULT_SEARCH_FILTERS if it is missing, not a list, or empty.
+
+    Without queries the pipeline skips JSearch entirely and a run pulls a handful of warm-board
+    listings with no error anywhere, so an empty value is never a deliberate setting worth keeping.
+    Reads the row directly rather than via get_filter, which swallows read errors and returns its
+    default: a DB that is merely unreadable must not be mistaken for an empty one and overwritten.
+    ats_company_slugs is not restored - its default is [] and the real list is built up live.
+    Returns True if it restored the row.
+    """
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT value_json FROM search_filters WHERE key = 'target_queries'").fetchone()
+            current = json.loads(row[0]) if row and row[0] else None
+            if isinstance(current, list) and current:
+                return False
+            defaults = DEFAULT_SEARCH_FILTERS["target_queries"]
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('target_queries', ?)", (json.dumps(defaults),))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"[FILTER RESTORE] Could not check target_queries, left untouched: {e}")
+        return False
+    logging.warning(f"[FILTER RESTORE] target_queries was {current!r}; restored {len(defaults)} default queries")
+    # Repair the System_Config row too, or the next restart's hydration reads the bad value again.
+    try:
+        crm_post({"action": "update_system_config", "key": "target_queries", "value": defaults}, timeout=5)
+    except Exception as e:
+        logging.error(f"System_Config dual-write failed (target_queries restore): {e}")
+    return True
 
 init_db()
 
@@ -5561,7 +5612,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
 
     # 100-Query Rolling Master Engine: scan a fresh 10-query slice each run instead of all 100 at
     # once, then atomically advance query_bank_pointer so the next /t run resumes at the next slice.
-    target_queries = get_filter("target_queries", [])
+    target_queries = safe_list(get_filter("target_queries", []))
     query_bank_pointer = safe_int(get_filter("query_bank_pointer"), 0)
     if target_queries:
         query_bank_pointer = query_bank_pointer % len(target_queries)
@@ -5926,8 +5977,17 @@ def process_webhook_payload_async(data):
         if re.match(r"^/t(?:\s+(\d+))?$", text):
             m = re.match(r"^/t(?:\s+(\d+))?$", text)
             qty = safe_int(m.group(1), 2)
-            target_queries = get_filter("target_queries", [])
-            ats_slugs = get_filter("ats_company_slugs", [])
+            target_queries = safe_list(get_filter("target_queries", []))
+            ats_slugs = safe_list(get_filter("ats_company_slugs", []))
+            if not target_queries:
+                # Without queries JSearch is skipped and the run quietly pulls only warm-board
+                # listings, which looks like a slow day rather than a broken config. Say so up front.
+                send_telegram_message(
+                    chat_id,
+                    "⚠️ <b>target_queries is empty or unreadable.</b> JSearch will be skipped, so this "
+                    "run only covers ATS boards. Check /health and the Render logs for "
+                    "<code>Filter Read Error</code>. If the value was blanked, a restart restores the default queries."
+                )
             send_telegram_message(
                 chat_id,
                 f"🚀 <b>Triggering Job Search Pipeline (Top {qty})</b>\n"

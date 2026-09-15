@@ -2273,3 +2273,93 @@ def test_describe_gear_lists_every_gear_and_marks_the_active_one():
         assert f"{num}." in text
     assert "▶️" in text
     assert "gear 3" in text.lower()
+
+
+# ==============================================================================
+# Sourcing filters survive gear changes and restarts
+# ==============================================================================
+
+def _raw_filter(key):
+    with m.get_db_conn() as conn:
+        row = conn.execute("SELECT value_json FROM search_filters WHERE key = ?", (key,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+@pytest.fixture
+def sourcing_filters():
+    """Snapshot the two sourcing lists and put them back, so these tests can blank them freely."""
+    saved = {k: _raw_filter(k) for k in ("target_queries", "ats_company_slugs")}
+    yield
+    with m.get_db_conn() as conn:
+        for key, val in saved.items():
+            conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(val)))
+        conn.commit()
+
+
+def test_every_gear_leaves_queries_and_watchlist_untouched(monkeypatch, sourcing_filters):
+    """Regression: /t reported 0 target rules & 0 ATS boards after /gear 3. Gears only move the
+    breadth knobs; the lists they gate must come through every gear change intact."""
+    monkeypatch.setattr(m, "crm_post", lambda *a, **k: None)
+    m.set_filter("ats_company_slugs", ["stripe", "rocket", "rivian"])
+    queries_before = _raw_filter("target_queries")
+    assert len(queries_before) == len(m.DEFAULT_SEARCH_FILTERS["target_queries"])
+    for gear in sorted(m.SEARCH_GEARS):
+        m.apply_search_gear(gear)
+        assert _raw_filter("target_queries") == queries_before
+        assert _raw_filter("ats_company_slugs") == ["stripe", "rocket", "rivian"]
+
+
+@pytest.mark.parametrize("blank", ["", [], None])
+def test_hydration_cannot_blank_a_populated_list(monkeypatch, sourcing_filters, blank):
+    """A blank System_Config cell comes back from Code.gs as "" and used to overwrite the 110 local
+    queries on every restart."""
+    queries_before = _raw_filter("target_queries")
+    resp = _FakeResp({"filters": {"target_queries": blank, "radius_miles": 45}})
+    resp.status_code = 200
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: resp)
+    m.hydrate_filters_from_sheets()
+    assert _raw_filter("target_queries") == queries_before
+
+
+def test_hydration_still_applies_a_real_list_edit(monkeypatch, sourcing_filters):
+    resp = _FakeResp({"filters": {"target_queries": ["Operations Analyst Detroit MI"]}})
+    resp.status_code = 200
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: resp)
+    m.hydrate_filters_from_sheets()
+    assert _raw_filter("target_queries") == ["Operations Analyst Detroit MI"]
+
+
+@pytest.mark.parametrize("bad_row", ["delete", "", []])
+def test_restore_reseeds_missing_or_blank_target_queries(monkeypatch, sourcing_filters, bad_row):
+    posted = []
+    monkeypatch.setattr(m, "crm_post", lambda payload, **k: posted.append(payload))
+    with m.get_db_conn() as conn:
+        if bad_row == "delete":
+            conn.execute("DELETE FROM search_filters WHERE key = 'target_queries'")
+        else:
+            conn.execute("UPDATE search_filters SET value_json = ? WHERE key = 'target_queries'", (json.dumps(bad_row),))
+        conn.commit()
+    assert m.restore_core_sourcing_filters() is True
+    assert _raw_filter("target_queries") == m.DEFAULT_SEARCH_FILTERS["target_queries"]
+    assert posted and posted[0]["key"] == "target_queries"
+
+
+def test_restore_leaves_a_populated_list_alone(monkeypatch, sourcing_filters):
+    monkeypatch.setattr(m, "crm_post", lambda *a, **k: pytest.fail("must not rewrite Sheets"))
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE search_filters SET value_json = ? WHERE key = 'target_queries'", (json.dumps(["Custom Q"]),))
+        conn.commit()
+    assert m.restore_core_sourcing_filters() is False
+    assert _raw_filter("target_queries") == ["Custom Q"]
+
+
+def test_t_warns_when_target_queries_is_empty(monkeypatch, sourcing_filters):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
+    monkeypatch.setattr(m, "run_job_pipeline", lambda chat_id, top_n=2: 0)
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE search_filters SET value_json = '[]' WHERE key = 'target_queries'")
+        conn.commit()
+    _dispatch("/t")
+    assert any("target_queries is empty" in s for s in sent)
+    assert any("Scanning 0 target rules" in s for s in sent)
