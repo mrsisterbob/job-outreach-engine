@@ -1990,9 +1990,9 @@ def test_cover_letter_every_combo_is_clean_and_well_formed():
         ctx = f"track={track} tone={tone} idx={idx}"
         assert "{" not in letter and "}" not in letter, ctx
         assert letter.startswith("Dear Acme Hiring Team,"), ctx
-        assert letter.endswith("\n\nBest,\nKevin Miller"), ctx
-        assert letter.count("\n\n") == 4, ctx
-        assert 140 <= len(letter.split()) <= 210, f"{ctx} words={len(letter.split())}"
+        assert letter.endswith("\n\nBest regards,\nKevin Miller"), ctx
+        assert letter.count("\n\n") == 5, ctx
+        assert 110 <= len(letter.split()) <= 185, f"{ctx} words={len(letter.split())}"
         for word in banned:
             assert not re.search(rf"\b{re.escape(word)}\b", letter, re.I), f"{ctx} {word}"
 
@@ -2017,3 +2017,35 @@ def test_cover_letter_falls_back_when_bank_is_unreadable(monkeypatch):
     letter = m.generate_cover_letter("Crain", "Billing Operations Analyst", "e", 0)
     assert letter.startswith("Dear Crain Hiring Team,")
     assert "Billing Operations Analyst" in letter
+
+
+def test_cover_letter_never_repeats_a_phrase_across_paragraphs():
+    """Paragraph 1 and paragraph 2 are drawn from independent pools, so a phrase written into both
+    reads as a copy-paste error to the one person who matters. Checks every routed combination for
+    a repeated 6-word run."""
+    bank = m.load_cover_letter_templates()
+    pool_keys = m.TRACK_BULLET_POOL_KEYS
+    for track, tone, idx in _all_letter_combos():
+        bodies = bank[pool_keys[track]]
+        bridges = bank[f"bridges_{tone}"]
+        # Strip placeholders first: {company}/{job_title} legitimately recur across paragraphs,
+        # so only the banked prose around them is under test.
+        combined = re.sub(r"\{\w+\}", " ",
+                          bodies[idx % len(bodies)] + " " + bridges[idx % len(bridges)])
+        words = re.findall(r"[a-z']+", combined.lower())
+        grams = [" ".join(words[i:i + 6]) for i in range(len(words) - 5)]
+        dupes = {g for g in grams if grams.count(g) > 1}
+        assert not dupes, f"track={track} tone={tone} idx={idx} repeats: {sorted(dupes)[:2]}"
+
+
+def test_cover_letter_billing_copy_only_reaches_billing_roles():
+    """Index 0 of the shared bridge/closer pools is billing-flavored. It is the right copy for a
+    billing title and actively wrong for any other, so a non-billing role must never see it."""
+    billing = m.generate_cover_letter("Crain", "Billing Operations Analyst", "e", 0, "", "conservative")
+    assert "order-to-cash" in billing
+
+    for title in ("Client Onboarding Specialist", "Financial Analyst", "Operations Associate"):
+        letter = m.generate_cover_letter("Acme", title, "a", 0, "", "conservative")
+        assert "order-to-cash" not in letter, title
+        assert "dedicated billing" not in letter, title
+        assert "before an invoice goes out" not in letter, title

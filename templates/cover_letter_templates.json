@@ -1,59 +1,65 @@
 {
-  "_comment": "Deterministic cover letter bank. Gemini routes a track letter (a-e) + an integer index; Python assembles. Same contract as resume_bullets_bank.json. Every sentence here must be traceable to evidence_bank.json - no claim appears in this file that isn't already on the resume. {company}/{job_title} are the only placeholders; {name} is NOT supported (letters open 'Dear <Company> Hiring Team').",
+  "_comment": "Deterministic cover letter bank. Gemini routes a track letter (a-e) + an integer index; Python assembles. Same contract as resume_bullets_bank.json. {company}/{job_title} are the only placeholders; {name} is NOT supported (letters open 'Dear <Company> Hiring Team').",
+
+  "_voice": "Plain and calm, one claim per sentence. This bank is deliberately UNDER-dense: these are $55-65k operations roles asking for 1-3 years, and a wall of custodial jargon reads as either overqualified or as someone hiding behind vocabulary. Rules: (1) Lead paragraph 1 with ADJACENCY, not expertise - say what desk I actually sit on and what I saw from there. Claiming to have run a function I only worked next to is the one thing that gets a letter thrown out. (2) No more than two specifics per paragraph. (3) Short sentences. If a sentence needs a comma-spliced list of three tools, cut it in half. (4) No colons, no em-dashes, no single-word 'X, Y, and Z' triples - sanitize_text() eats all three. See test_cover_letter_bank_survives_sanitize_text_unchanged.",
 
   "openers": [
-    "I'm writing to apply for the {job_title} position at {company}.",
-    "I'm applying for the {job_title} role at {company}.",
-    "This is an application for the {job_title} opening at {company}."
+    "I am writing to express my interest in the {job_title} position at {company}.",
+    "I am applying for the {job_title} role at {company}.",
+    "I would like to be considered for the {job_title} opening at {company}."
   ],
 
   "track_a_wealth_ops": [
-    "Most of my work is daily transaction intake, account maintenance, and the documentation exceptions that stall them. At Signal Advisors I audited onboarding paperwork across 500+ accounts to verify advisory agreements and risk profiles under SEC rules, processed cashiering and ACAT transfers through Schwab Advisor Center and Fidelity Wealthscape, and worked custodians directly to clear advisor requests inside 1-to-2 hour SLAs.",
-    "My day is custodial reconciliation and queue work. I audited advisory agreements and risk profiles across 500+ onboarding accounts at Signal Advisors, ran daily cashiering and ACAT transfers across two custodial platforms, and reconciled account records against custodial data during offboarding so active client files handed off clean.",
-    "I spend most of my time on account transfers and the paperwork exceptions that hold them up. At Signal Advisors that meant standardizing transfer checklists across Schwab and Fidelity, clearing margin and cash distribution mismatches across clearing feeds without a service breach, and managing the Salesforce queue those requests arrive in."
+    "I work in operations at an investment advisory firm, where most of my day is account paperwork and the exceptions that hold it up. I audit onboarding agreements before accounts go live, and I process the daily transfers and account maintenance that follow. It is detail work on a deadline, which is the part I am good at.",
+    "My current role is wealth operations, which means I spend the day on transaction intake and account records. I check advisory paperwork against what the custodian has on file and chase down anything that does not match. Most of what I do is catching a problem before it reaches the client.",
+    "I sit on the operations desk at an advisory firm and handle account transfers from intake through to resolution. When paperwork gets rejected, it comes back to me to find out why. That has made me careful about getting a file right the first time."
   ],
 
   "track_b_engineering": [
-    "Most of my week is Python and SQL that replaced work a team used to do by hand. I write nightly reconciliation scripts that flag mismatches between custodial ledgers and internal records, built a Flask and SQLite backend that handles live webhook updates without dropping records, and wrote schema validation models that block malformed payloads before they reach the database.",
-    "I build the tooling that takes manual steps off an operations desk. That's included automated DocuSign scripts that check account packages and fire follow-up alerts on missing signatures, Python scrapers that cut 15 hours of weekly manual lookup, and two-way webhook sync between a CRM and a local SQLite store.",
-    "My background is operations work plus the code that automates it. I've wired recurring reporting pipelines from REST APIs into internal tables, reformatted 1,500+ legacy account records to match an updated schema, and tested Salesforce and Orion Eclipse data connections alongside a software team to keep trading feeds stable."
+    "I work in operations, and a lot of my week is writing small Python tools that take manual steps off my own desk. I built a script that checks our ledgers against internal records overnight so nobody has to eyeball a spreadsheet in the morning. The habit is finding the thing being done by hand every week and making it run on its own.",
+    "My background is operations work plus the code I write to automate it. I taught myself Python and SQL on the job, mostly because I got tired of repeating the same reconciliation every month. Now that check runs on a schedule and I only look at what it flags.",
+    "I am an operations person who writes code. Most of my projects started as something tedious I was doing manually, like chasing missing signatures on account packages, and turned into a script that does it for me. I would rather fix a process than get faster at working around it."
   ],
 
   "track_c_risk_compliance": [
-    "My work centers on documentation integrity and regulatory review. I audited client paperwork across 500+ onboarding accounts against SEC and FinCEN identity standards at Signal Advisors, drafted SEC Form D and Regulation Crowdfunding filings at 40 Acres, and verified licensing across 20 insurance carriers for 600+ partner RIAs.",
-    "Most of my time goes to audit trails and exception handling. I cleaned 1,500+ legacy account files to confirm required advisory agreements were on record, set up compliance intake checkpoints and suitability reviews for incoming platform investors, and traced a Salesforce queue conflict between two desks that was quietly misrouting tickets.",
-    "I do the review work that keeps a file defensible. That's meant auditing advisory agreements and risk profiles under SEC rules across 500+ accounts, reviewing property documentation and title records for custodial data parity, and reconciling IAA agreements against custodial data during offboarding."
+    "I work in operations at an advisory firm, where a good part of my day is making sure client files hold up to review. I audit onboarding paperwork against the requirements before an account opens, and I clean up records that do not have what they should. Getting the documentation right is most of the job.",
+    "My current work is compliance-adjacent operations. I check client paperwork against identity and suitability requirements, and I have drafted securities filings for a smaller firm on the side. I am used to work where the standard is whether a file would survive someone auditing it.",
+    "I spend my day on documentation review and exception handling at an advisory firm. When a record is missing a required agreement, finding and fixing that is my task. It is not glamorous work but it is the kind that keeps a firm out of trouble."
   ],
 
   "track_d_business_intelligence": [
-    "Most of my work is reconciliation and the reporting built on top of it. I reconciled 401(k) and healthcare deduction variances across 500+ accounts in bSwift and Excel at ABC Technologies, built structured audit checklists that caught recurring deduction errors across 70+ manufacturing facilities, and maintained the supporting schedules behind recurring variance reports.",
-    "I work in the gap between raw records and the reporting that depends on them. I write SQL variance checks and build Power BI dashboards for an operations team, prepared and maintained supporting schedules for recurring internal financial reports, and keep account records matched to the current schema so the reporting on top of them holds.",
-    "My background is data integrity work across financial systems. That's included cross-referencing multi-plant payroll data to surface recurring errors, writing Python reconciliation scripts that flag ledger mismatches nightly, and cleaning 1,500+ legacy records across internal databases."
+    "I work in operations and spend most of my time reconciling records and building the reporting that sits on top of them. In a prior role I matched benefit deductions across several hundred employee accounts and built the checklist that caught the errors nobody had noticed. I like the part where the numbers finally agree.",
+    "My day is data integrity work. I write SQL checks and build dashboards so an operations team can see variances without assembling a spreadsheet by hand. The reporting is only as good as the records underneath it, so I spend real time on those.",
+    "I work between raw records and the reports that depend on them. That has meant cleaning up legacy account data to match a new system and maintaining the schedules behind recurring internal reports. It is careful repetitive work and it is worth doing right."
   ],
 
   "track_e_bizops": [
-    "Most of my work is transaction intake, contract audit, and queue management. At Signal Advisors I managed Salesforce ticketing queues against 1-to-2 hour SLAs, audited advisor billing and fee schedules to eliminate recurring monthly invoicing errors, and built automated DocuSign workflows that cut packet review from 60 minutes to 20.",
-    "My day is CRM queue work and the billing records underneath it. I audited advisor billing and fee schedules across Salesforce to clear recurring invoicing errors, ran daily transaction processing across two custodial platforms, and trained new analysts on DocuSign and Salesforce, cutting onboarding ramp from three weeks to ten days.",
-    "I work the intake-to-resolution path on an operations desk. That's meant standardizing transfer checklists to cut rejected paperwork resubmissions, tracing a Salesforce routing conflict between two queues that was causing SLA breaches, and writing Python scripts that reconcile recurring discrepancies instead of chasing them manually."
+    "Working within the operations side of an investment advisory firm, I sit on the same floor as our billing department. Over time I have made it a point to shadow their team, which gave me a clear look at how daily order intake and billing cycles actually run. Much of my own day is already auditing contracts and resolving discrepancies in Salesforce.",
+    "I work in operations at an advisory firm, one desk over from the billing team. My own day is contract review and clearing discrepancies in Salesforce, and I have spent enough time with the billing side to understand how invoices get built and what makes them go wrong. The workflows in your posting look familiar.",
+    "My role is operations at an investment advisory firm, where I manage a shared Salesforce queue and audit agreements before they are processed. Billing sits next to us, and I have made a point of learning how their cycle works from order intake through to the invoice going out. It is the same discipline applied to a different ledger."
   ],
 
-  "_bridges_comment": "Paragraph 2. Selected by tone_mode, not track: a 'tech' company gets the tooling framed as engineering, a 'conservative' one gets it framed as process discipline. Same underlying facts from evidence_bank.json either way.",
+  "_bridges_comment": "Paragraph 2. Selected by tone_mode, not track. A 'tech' company hears the automation framed as building, a 'conservative' one hears it as process discipline. Same facts either way. Keep these to two specifics maximum.",
 
   "bridges_conservative": [
-    "Earlier roles set that habit. At 40 Acres I built intake checklists and suitability reviews for incoming investors, and at Northwestern Mutual I tracked onboarding paperwork exceptions across client files to clear documentation hold-ups with partner firms. When a reconciliation is recurring, I write a Python script to handle it rather than rechecking it by hand every month.",
-    "That approach carried over from earlier work. At ABC Technologies I reconciled deduction variances across 500+ accounts and built the audit checklists that caught recurring errors across 70+ facilities. I write Python and SQL where the manual version is error-prone, which keeps the checking consistent instead of dependent on who ran it.",
-    "I've done the same kind of work on the way here. At 40 Acres I reviewed property documentation and title records for data parity across active offerings, and at Northwestern Mutual I worked with custodians to expedite transfer paperwork. The recurring pieces I automate, so the exceptions are the only thing left to look at."
+    "The workflows in your job description feel familiar from where I sit now. I understand what has to be true before an invoice goes out, and I know how much that accuracy matters to everyone downstream.",
+    "The reason this role appeals to me is that I am already doing a version of it. I check agreements against records, resolve what does not match, and keep the file clean enough that the next person does not have to redo it. I would like to do that work in a role where it is the main focus rather than one piece of a wider desk.",
+    "I am used to a queue with a deadline attached. At my current firm, requests come in with a service window and it is on me to resolve them or escalate them before the clock runs out. That has taught me to sort what is urgent from what is merely noisy."
   ],
 
   "bridges_tech": [
-    "I also build the tooling around that work. I've written nightly Python reconciliation scripts that flag ledger mismatches before anyone opens a report, automated DocuSign checks that catch missing signatures on account packages, and a Flask and SQLite service that keeps CRM records in sync over webhooks. The pattern is the same each time. I find the recurring manual check and make it run on its own.",
-    "The systems side is a real part of how I work. I've built two-way webhook sync between a CRM and a local SQLite store, written schema validation that rejects malformed payloads before they land, and automated recurring reporting pipelines from REST APIs into internal tables. Most of it started as something I was doing by hand and got tired of repeating.",
-    "I write the tooling that removes the manual step. That's included Python scrapers that cut 15 hours of weekly lookup work, DocuSign automation that flags incomplete packets, and reconciliation scripts that compare custodial ledgers against internal records on a schedule. I'd rather fix the process than get faster at the workaround."
+    "The workflows described in your posting are close to what I handle now, so the learning curve would be short. I have also written Python scripts to take over the reconciliations I was repeating by hand, so I tend to look for where a manual step can be removed.",
+    "The work in your posting overlaps with what I already do, which is contract review and fixing records that do not agree. I have built small tools to automate the repetitive parts of that, including a script that flags mismatches between two systems overnight. I bring that instinct with me rather than a mandate to rebuild anything.",
+    "I am comfortable in Salesforce and in the reporting around it, and I write Python where a check is worth automating. Mostly that has meant taking a weekly manual comparison and turning it into something that runs on its own. I would expect to spend my first months learning your process before suggesting changes to it."
   ],
 
   "closers": [
-    "I know clean billing schedules, clean handoffs between departments, and fast dispute resolution are what keep cash flow steady. I'd welcome the chance to bring that to the team at {company}.",
-    "Clean records, clear handoffs, and exceptions caught before anyone downstream sees them are what I'm actually good at. I'd be glad to talk about how that fits the {job_title} role at {company}.",
-    "The work I do well is the unglamorous kind. Matched records, closed tickets, and nothing landing downstream that someone else has to chase. I'd welcome a conversation about the {job_title} role at {company}."
+    "I am looking to bring this background directly into a dedicated billing role. I would welcome the opportunity to support the team at {company} and help keep the order-to-cash process running smoothly.",
+    "I would like to bring this experience into the {job_title} role at {company}. I would welcome the chance to talk about how I could help the team.",
+    "I am hoping to move this kind of operations work into a more focused role, and the {job_title} position at {company} looks like the right fit. I would welcome the chance to discuss it."
+  ],
+
+  "signoffs": [
+    "Thank you for your time and consideration."
   ]
 }

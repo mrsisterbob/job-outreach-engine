@@ -2688,6 +2688,16 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
     bridges = bank.get(f"bridges_{tone_key}") or bank.get("bridges_conservative") or []
     closers = bank.get("closers") or _FALLBACK_COVER_LETTER_TEMPLATES["closers"]
 
+    # Index 0 of the shared bridge/closer pools is deliberately billing-flavored ("before an
+    # invoice goes out", "order-to-cash"): it is the strongest copy for a billing role and the
+    # wrong copy for anything else. Skip past it unless the title actually says billing, so a
+    # Client Onboarding Specialist is never told Kevin wants "a dedicated billing seat".
+    if not re.search(r"\b(billing|invoic|revenue|order.to.cash|accounts receivable|\bAR\b)", role, re.I):
+        if len(bridges) > 1:
+            bridges = bridges[1:]
+        if len(closers) > 1:
+            closers = closers[1:]
+
     # Each pool is sized independently, so wrap per-pool rather than bounds-failing to index 0 -
     # a routed index of 2 should still vary the opener even if the openers pool is shorter.
     opener = str(openers[idx % len(openers)])
@@ -2695,6 +2705,9 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
     bridge = str(bridges[idx % len(bridges)]) if bridges else ""
     closer = str(closers[idx % len(closers)])
 
+    # The location rides in the opener only for a role whose posting is location-defining (a
+    # Detroit desk job). It is deliberately omitted otherwise: a remote or multi-site posting that
+    # gets "in Detroit, MI" appended reads as a candidate who misread the listing.
     loc = str(job_location or "").strip()
     if loc:
         opener = opener.rstrip(".") + f" in {loc}."
@@ -2707,10 +2720,13 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
         paragraphs.append(fill(bridge))
     paragraphs.append(fill(closer))
 
+    signoffs = bank.get("signoffs") or ["Thank you for your time and consideration."]
+    paragraphs.append(fill(signoffs[idx % len(signoffs)]))
+
     letter = (
         f"Dear {clean_company} Hiring Team,\n\n"
         + "\n\n".join(paragraphs)
-        + "\n\nBest,\nKevin Miller"
+        + "\n\nBest regards,\nKevin Miller"
     )
     return sanitize_text(letter)
 
