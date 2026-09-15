@@ -5152,6 +5152,117 @@ def fetch_ashby_jobs(slug):
         logging.error(f"Ashby Fetch Exception ({slug}): {e}")
         return []
 
+# ==============================================================================
+# SEARCH BREADTH GEARS
+# ==============================================================================
+# Breadth used to be five uncoordinated knobs: target_queries, ats_watchlist_enabled,
+# remote_feeds_enabled, radius_miles and min_salary, spread across /ats, /remote and /edit. You
+# could not tell what state the pipeline was in without checking all five, and the settings
+# interact - radius 45 with remote on and 22 boards is not three decisions, it is one decision
+# about how much noise tonight's run should carry.
+#
+# Deliberately a throttle, not a gearbox: unlike a car's gears these are CUMULATIVE. Every gear
+# keeps the local JSearch queries and adds sources on top, because the Detroit metro results are
+# always wanted - wider settings supplement them, never replace them.
+#
+# passes_strict_filter still applies at every gear. A higher gear widens what gets SOURCED, never
+# what gets accepted, so a commission sales role is rejected in gear 5 exactly as in gear 1.
+SEARCH_GEARS = {
+    1: {
+        "label": "Tight",
+        "blurb": "JSearch metro queries only, 25 mile radius.",
+        "radius_miles": 25, "ats_watchlist_enabled": False, "remote_feeds_enabled": False,
+        "remote_feed_cap": 0,
+    },
+    2: {
+        "label": "Local",
+        "blurb": "Metro queries plus warm-contact ATS boards.",
+        "radius_miles": 45, "ats_watchlist_enabled": False, "remote_feeds_enabled": False,
+        "remote_feed_cap": 0,
+    },
+    3: {
+        "label": "Boards",
+        "blurb": "Adds the company ATS watchlist (Greenhouse/Lever/Ashby).",
+        "radius_miles": 45, "ats_watchlist_enabled": True, "remote_feeds_enabled": False,
+        "remote_feed_cap": 0,
+    },
+    4: {
+        "label": "Wide",
+        "blurb": "Adds keyless remote feeds, capped at 40 per run.",
+        "radius_miles": 45, "ats_watchlist_enabled": True, "remote_feeds_enabled": True,
+        "remote_feed_cap": 40,
+    },
+    5: {
+        "label": "Everything",
+        "blurb": "60 mile radius, remote uncapped to 100. Expect noise.",
+        "radius_miles": 60, "ats_watchlist_enabled": True, "remote_feeds_enabled": True,
+        "remote_feed_cap": 100,
+    },
+}
+DEFAULT_SEARCH_GEAR = 3
+
+
+def apply_search_gear(gear):
+    """Write one gear's settings into the filter store. Returns the applied gear dict.
+
+    Out-of-range gears clamp rather than raise: this is reachable from a Telegram command, and a
+    typed /gear 9 should land in the widest gear instead of erroring or leaving a half-applied
+    mix of settings behind.
+    """
+    gear_num = safe_int(gear, DEFAULT_SEARCH_GEAR)
+    gear_num = max(min(gear_num, max(SEARCH_GEARS)), min(SEARCH_GEARS))
+    config = SEARCH_GEARS[gear_num]
+    for key in ("radius_miles", "ats_watchlist_enabled", "remote_feeds_enabled", "remote_feed_cap"):
+        set_filter(key, config[key])
+    set_filter("search_gear", gear_num)
+    logging.info(f"[GEAR] Search breadth set to {gear_num} ({config['label']})")
+    return config
+
+
+def current_search_gear():
+    """The gear the filters are actually in, not merely the last one set.
+
+    A later /ats off or /remote on edits one setting without touching search_gear, so the stored
+    number can disagree with reality. Comparing the live settings against each gear's definition
+    keeps /gear honest about that instead of reporting a gear the pipeline is no longer in.
+    """
+    live = (
+        safe_int(get_filter("radius_miles"), 45),
+        bool(get_filter("ats_watchlist_enabled")),
+        bool(get_filter("remote_feeds_enabled")),
+    )
+    for num, config in sorted(SEARCH_GEARS.items()):
+        if live == (config["radius_miles"], config["ats_watchlist_enabled"], config["remote_feeds_enabled"]):
+            return num, config
+    return None, None
+
+
+def describe_search_gear():
+    """Telegram-ready summary of the current breadth, including the live source counts."""
+    gear_num, config = current_search_gear()
+    slug_count = len(safe_list(get_filter("ats_company_slugs", [])))
+    query_count = len(safe_list(get_filter("target_queries", [])))
+    lines = []
+    for num, cfg in sorted(SEARCH_GEARS.items()):
+        marker = "▶️" if num == gear_num else "　"
+        lines.append(f"{marker} <b>{num}. {cfg['label']}</b> - {cfg['blurb']}")
+    if gear_num:
+        header = f"⚙️ <b>Search breadth: gear {gear_num} ({config['label']})</b>"
+    else:
+        header = "⚙️ <b>Search breadth: custom</b> (settings don't match a gear)"
+    sources = [f"JSearch queries: {query_count}"]
+    sources.append(f"Warm-contact ATS boards: always on")
+    sources.append(f"Watchlist boards: {slug_count} ({'ON' if get_filter('ats_watchlist_enabled') else 'off'})")
+    cap = safe_int(get_filter("remote_feed_cap"), 0)
+    sources.append(f"Remote feeds: {'ON, cap ' + str(cap) if get_filter('remote_feeds_enabled') else 'off'}")
+    sources.append(f"Radius: {safe_int(get_filter('radius_miles'), 45)} mi")
+    return (
+        f"{header}\n\n" + "\n".join(lines) +
+        "\n\n<b>Sourcing now</b>\n" + "\n".join(f"· {s}" for s in sources) +
+        "\n\nSet with /gear 1-5. Filters still reject bad roles at every gear."
+    )
+
+
 def _strip_html_to_text(raw):
     """Board descriptions arrive as HTML. The AI prompt and the CRM both want plain text."""
     return html.unescape(re.sub(r'<[^>]+>', ' ', str(raw or ''))).strip()
@@ -6396,6 +6507,20 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, pitch_msg)
             return
 
+        gear_match = re.match(r"^/gear(?:\s+([1-9]\d*))?$", text, re.IGNORECASE)
+        if gear_match:
+            if gear_match.group(1):
+                config = apply_search_gear(gear_match.group(1))
+                gear_num, _ = current_search_gear()
+                send_telegram_message(
+                    chat_id,
+                    f"⚙️ <b>Gear {gear_num} - {config['label']}</b>\n{html.escape(config['blurb'])}\n\n"
+                    "Run /t to source with the new breadth."
+                )
+            else:
+                send_telegram_message(chat_id, describe_search_gear())
+            return
+
         remote_match = re.match(r"^/remote(?:\s+(on|off))?$", text, re.IGNORECASE)
         if remote_match:
             action = (remote_match.group(1) or "").lower()
@@ -6685,6 +6810,7 @@ def process_webhook_payload_async(data):
                 "/prep - Interview talking points & reverse questions\n"
                 "/pitch - 30-second elevator pitch\n"
                 "/letter - Cover letter (same track as the resume)\n"
+                "/gear - Search breadth 1-5 (one dial for all sources)\n"
                 "/ats - Company board watchlist (on/off/add/remove)\n"
                 "/remote - Keyless remote feeds (on/off)\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"

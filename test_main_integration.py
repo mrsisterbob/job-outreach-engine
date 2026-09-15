@@ -2215,3 +2215,61 @@ def test_remoteok_skips_the_legal_stub_element():
     assert len(jobs) == 1
     assert jobs[0]["job_title"] == "Analyst"
     assert "<p>" not in jobs[0]["job_description"]
+
+
+# ==============================================================================
+# Search breadth gears
+# ==============================================================================
+
+def test_gears_are_cumulative_never_subtractive():
+    """This is a throttle, not a gearbox. Every gear keeps the local sources and adds on top, so
+    no higher gear may turn OFF something a lower gear had on."""
+    ordered = [m.SEARCH_GEARS[n] for n in sorted(m.SEARCH_GEARS)]
+    for lower, higher in zip(ordered, ordered[1:]):
+        assert higher["radius_miles"] >= lower["radius_miles"]
+        assert higher["ats_watchlist_enabled"] >= lower["ats_watchlist_enabled"]
+        assert higher["remote_feeds_enabled"] >= lower["remote_feeds_enabled"]
+        assert higher["remote_feed_cap"] >= lower["remote_feed_cap"]
+
+
+def test_apply_search_gear_writes_every_setting():
+    m.apply_search_gear(5)
+    assert m.get_filter("radius_miles") == 60
+    assert m.get_filter("ats_watchlist_enabled") is True
+    assert m.get_filter("remote_feeds_enabled") is True
+    assert m.get_filter("remote_feed_cap") == 100
+    m.apply_search_gear(1)
+    assert m.get_filter("radius_miles") == 25
+    assert m.get_filter("ats_watchlist_enabled") is False
+    assert m.get_filter("remote_feeds_enabled") is False
+
+
+def test_out_of_range_gear_clamps_instead_of_raising():
+    """Reachable from a Telegram command, so a typed /gear 9 must land somewhere valid rather than
+    erroring or leaving a half-applied mix of settings behind."""
+    m.apply_search_gear(99)
+    assert m.current_search_gear()[0] == max(m.SEARCH_GEARS)
+    m.apply_search_gear(0)
+    assert m.current_search_gear()[0] == min(m.SEARCH_GEARS)
+    m.apply_search_gear("nonsense")
+    assert m.current_search_gear()[0] is not None
+
+
+def test_current_gear_reports_custom_after_a_manual_override():
+    """A later /remote off edits one setting without touching search_gear. Reporting the stored
+    number would then lie about what the pipeline is actually sourcing."""
+    m.apply_search_gear(5)
+    assert m.current_search_gear()[0] == 5
+    m.set_filter("remote_feeds_enabled", False)
+    gear_num, config = m.current_search_gear()
+    assert gear_num is None and config is None
+    assert "custom" in m.describe_search_gear().lower()
+
+
+def test_describe_gear_lists_every_gear_and_marks_the_active_one():
+    m.apply_search_gear(3)
+    text = m.describe_search_gear()
+    for num in m.SEARCH_GEARS:
+        assert f"{num}." in text
+    assert "▶️" in text
+    assert "gear 3" in text.lower()
