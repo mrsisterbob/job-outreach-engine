@@ -188,6 +188,7 @@ def build_evidence_context_block(mode="eval"):
 TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 OUTREACH_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "outreach_templates.json")
 LINKEDIN_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "linkedin_templates.json")
+COVER_LETTER_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "cover_letter_templates.json")
 
 # Voice note for anyone editing these stubs or the JSON banks they mirror: "Hi{name}," is
 # deliberate, not a typo. interpolate_template() renders {name} WITH its own leading space
@@ -213,6 +214,15 @@ _FALLBACK_LINKEDIN_TEMPLATES = {
     "linkedin_templates": ["Hi{name}. Saw you're hiring a {job_title} at {company}. I'd like to connect."]
 }
 
+# Cover letter stub. Unlike the outreach banks this one is keyed by the SAME track letters as
+# resume_bullets_bank.json, because the letter and the resume PDF must argue the same case - see
+# generate_cover_letter().
+_FALLBACK_COVER_LETTER_TEMPLATES = {
+    "openers": ["I'm writing to apply for the {job_title} position at {company}."],
+    "track_a_wealth_ops": ["Most of my work is daily transaction intake, account maintenance, and the documentation exceptions that stall them. At Signal Advisors I audited onboarding paperwork across 500+ accounts, processed cashiering and ACAT transfers through Schwab Advisor Center and Fidelity Wealthscape, and cleared advisor requests inside 1-to-2 hour SLAs."],
+    "closers": ["Clean records, clear handoffs, and exceptions caught before they reach anyone downstream are what I'm actually good at. I'd welcome a conversation about the {job_title} role at {company}."]
+}
+
 def load_outreach_templates():
     """Hot-reloads the cold/warm/bump email template bank from templates/outreach_templates.json.
     Falls back to a minimal safe stub on any read/parse failure. Called fresh on every use so
@@ -235,6 +245,17 @@ def load_linkedin_templates():
     except Exception as e:
         logging.error(f"LinkedIn templates load failed, using fallback stub: {e}")
         return _FALLBACK_LINKEDIN_TEMPLATES
+
+def load_cover_letter_templates():
+    """Hot-reloads the track-keyed cover letter bank from templates/cover_letter_templates.json.
+    Falls back to a minimal safe stub on any read/parse failure. See load_outreach_templates().
+    """
+    try:
+        with open(COVER_LETTER_TEMPLATES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Cover letter templates load failed, using fallback stub: {e}")
+        return _FALLBACK_COVER_LETTER_TEMPLATES
 
 def resolve_template_text(pool, idx, fallback_text=""):
     """Bounds-checks an integer template index against a template pool, defaulting to index 0
@@ -2630,38 +2651,68 @@ def generate_elevator_pitch(company, job_title):
             logging.error(f"Elevator pitch parse failure: {e}")
     return fallback
 
-def generate_cover_letter(company, job_title, job_description=""):
-    """Tailored 3-paragraph plain-text cover letter; safe static fallback if Gemini is unavailable."""
-    fallback = (
-        f"Dear Hiring Manager,\n\n"
-        f"I'm writing to express my interest in the {job_title or 'operations'} role at {company or 'your organization'}. "
-        "My background in wealth operations, process automation, and reconciliation gives me a strong foundation for this kind of work, "
-        "and I've built Python and SQL tools that meaningfully cut down manual processing time in similar environments.\n\n"
-        f"I'm particularly drawn to {company or 'your team'} because of the operational rigor the role demands, and I believe my "
-        "combination of technical fluency and financial operations experience would let me contribute quickly.\n\n"
-        "I'd welcome the opportunity to discuss how I can support your team. Thank you for your consideration.\n\nBest regards,\nKevin Miller"
+def generate_cover_letter(company, job_title, track="a", letter_index=0, job_location="", tone_mode="conservative"):
+    """Assembles a 3-paragraph plain-text cover letter deterministically from the track-keyed
+    bank in templates/cover_letter_templates.json. Never calls Gemini.
+
+    This used to be a free-text Gemini call, which made it the one candidate-facing surface in the
+    pipeline that could invent experience - the exact failure the Strict Deterministic Template
+    Engine exists to prevent everywhere else (see filter_ats_bullets / interpolate_template). It
+    also skipped sanitize_text(), so it was the only path where a banned word could reach a
+    recruiter, and it ignored the routed track entirely - meaning the letter could argue wealth-ops
+    while the attached PDF argued bizops.
+
+    Now it takes the SAME (track, index) routing Gemini already returned for the resume, so the
+    letter and the PDF make one case. Body paragraphs are keyed by TRACK_BULLET_POOL_KEYS, the same
+    map resume_engine.py resolves bullets through, so the two banks cannot drift apart on naming.
+
+    `tone_mode` picks paragraph 2 the same way it constrains bullet selection in filter_ats_bullets:
+    a "tech" company hears the automation framed as engineering, a conservative one hears it framed
+    as process discipline. The underlying facts are identical - only the register moves.
+
+    `job_location` is appended to the opener only when known; a letter that guesses a city is worse
+    than one that omits it.
+    """
+    bank = load_cover_letter_templates()
+    track_key = str(track or "a").lower()
+    tone_key = "tech" if str(tone_mode or "").lower() == "tech" else "conservative"
+    pool_key = TRACK_BULLET_POOL_KEYS.get(track_key, TRACK_BULLET_POOL_KEYS["a"])
+
+    clean_company = clean_company_for_copy(company)
+    role = job_title or "this role"
+
+    idx = letter_index if isinstance(letter_index, int) and letter_index >= 0 else 0
+
+    openers = bank.get("openers") or _FALLBACK_COVER_LETTER_TEMPLATES["openers"]
+    bodies = bank.get(pool_key) or bank.get(TRACK_BULLET_POOL_KEYS["a"]) or _FALLBACK_COVER_LETTER_TEMPLATES["track_a_wealth_ops"]
+    bridges = bank.get(f"bridges_{tone_key}") or bank.get("bridges_conservative") or []
+    closers = bank.get("closers") or _FALLBACK_COVER_LETTER_TEMPLATES["closers"]
+
+    # Each pool is sized independently, so wrap per-pool rather than bounds-failing to index 0 -
+    # a routed index of 2 should still vary the opener even if the openers pool is shorter.
+    opener = str(openers[idx % len(openers)])
+    body = str(bodies[idx % len(bodies)])
+    bridge = str(bridges[idx % len(bridges)]) if bridges else ""
+    closer = str(closers[idx % len(closers)])
+
+    loc = str(job_location or "").strip()
+    if loc:
+        opener = opener.rstrip(".") + f" in {loc}."
+
+    def fill(text):
+        return str(text).replace("{company}", clean_company).replace("{job_title}", role)
+
+    paragraphs = [f"{fill(opener)} {fill(body)}"]
+    if bridge:
+        paragraphs.append(fill(bridge))
+    paragraphs.append(fill(closer))
+
+    letter = (
+        f"Dear {clean_company} Hiring Team,\n\n"
+        + "\n\n".join(paragraphs)
+        + "\n\nBest,\nKevin Miller"
     )
-    if not GEMINI_API_KEY:
-        return fallback
-    desc_truncated = str(job_description or "")[:800]
-    prompt = (
-        f"Company: {company or 'N/A'}\nRole: {job_title or 'N/A'}\nDescription:\n{desc_truncated}\n\n"
-        "Write a tailored 3-paragraph plain-text cover letter for an early-career candidate with a Python/SQL/Salesforce/"
-        "process-automation/wealth-ops background. Paragraph 1: intro + role interest. Paragraph 2: relevant experience "
-        "tied to this specific role. Paragraph 3: closing + call to action. No markdown formatting. "
-        'Respond ONLY with JSON: {"letter": "<full 3-paragraph plain-text letter>"}'
-    )
-    raw_text = call_gemini_api(prompt)
-    if raw_text:
-        try:
-            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', "", raw_text).strip()
-            data = json.loads(cleaned)
-            letter = data.get("letter", "")
-            if letter:
-                return str(letter)
-        except Exception as e:
-            logging.error(f"Cover letter parse failure: {e}")
-    return fallback
+    return sanitize_text(letter)
 
 # ==============================================================================
 # 6. STAGE 1 STRICT FILTER & SINGLE CANDIDATE EVALUATION
@@ -6095,9 +6146,19 @@ def process_webhook_payload_async(data):
                 return
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             job_title = job.get("job_title") or "this role"
-            letter = generate_cover_letter(comp, job_title, job.get("job_description", ""))
+            # Reuse the resume's own routing so the letter and the attached PDF argue one case.
+            track = job.get("track", "a")
+            indices = job.get("bullet_indices") or [0]
+            letter_index = indices[0] if isinstance(indices, list) and indices and isinstance(indices[0], int) else 0
+            city = str(job.get("job_city") or "").strip()
+            state = str(job.get("job_state") or "").strip()
+            job_location = ", ".join([p for p in (city, state) if p])
+            letter = generate_cover_letter(
+                comp, job_title, track, letter_index, job_location,
+                job.get("tone_mode", "conservative"),
+            )
             letter_msg = (
-                f"✉️ <b>Cover Letter - {html.escape(comp)}</b>\n\n"
+                f"✉️ <b>Cover Letter - {html.escape(comp)}</b> · Track {html.escape(str(track).upper())}\n\n"
                 f"<code>{html.escape(letter)}</code>"
             )
             send_telegram_message(chat_id, letter_msg)
@@ -6303,7 +6364,7 @@ def process_webhook_payload_async(data):
                 "/cv, /resume - Compile tailored resume PDF\n"
                 "/prep - Interview talking points & reverse questions\n"
                 "/pitch - 30-second elevator pitch\n"
-                "/letter - Generate cover letter\n\n"
+                "/letter - Cover letter (same track as the resume)\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
                 "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"

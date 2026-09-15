@@ -2,8 +2,8 @@
 
 [![Tests](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml)
 <!-- AUTO-STATS:START -->
-![Lines of source](https://img.shields.io/badge/source-5985_lines-c9a24b)
-![Tests](https://img.shields.io/badge/tests-54-4a8a5c)
+![Lines of source](https://img.shields.io/badge/source-9268_lines-c9a24b)
+![Tests](https://img.shields.io/badge/tests-256-4a8a5c)
 <!-- AUTO-STATS:END -->
 
 An AI-assisted job search pipeline: sources listings from multiple job boards, screens/tailors
@@ -18,16 +18,21 @@ main.py            Orchestration: Flask routes, Telegram bot, CRM sync, Gmail, A
 pipeline_utils.py   Pure helpers (no I/O): dork builders, scoring/dedup/formatting. Unit-tested.
 resume_engine.py    Deterministic Typst->PDF resume compiler from the local bullet bank.
 Code.gs             Google Apps Script Web App - the CRM backend (Sheets tabs) main.py talks to.
-templates/          Editable JSON banks for cold/warm/LinkedIn outreach copy (live-reloaded).
+templates/          Editable JSON banks for cold/warm/LinkedIn outreach + cover letter copy (live-reloaded).
 resume_bullets_bank.json   Track-based (a-e) resume bullet pools, resolved deterministically.
 evidence_bank.json  Single source of truth for real experience/skills fed into every AI prompt.
 test_pipeline_utils.py     Unit tests for pipeline_utils.py (pytest, no network/DB required).
 ```
 
 Gemini is strictly a *classifier/router*: it returns a fit score, a track letter, and integer
-template indices. It never authors resume bullets or outreach prose directly - Python resolves
-those deterministically from the JSON banks. This keeps every candidate-facing word traceable to
-a human-edited source of truth.
+template indices. It never authors resume bullets, outreach prose, or cover letter copy directly -
+Python resolves those deterministically from the JSON banks. This keeps every candidate-facing word
+traceable to a human-edited source of truth.
+
+The cover letter (`/letter`) reuses the *same* track + tone routing as the resume PDF, so the two
+never argue different cases for the same job: `track` picks the body paragraph from
+`cover_letter_templates.json`, and `tone_mode` picks whether the automation work is framed as
+engineering (`tech`) or as process discipline (`conservative`).
 
 ## Setup
 

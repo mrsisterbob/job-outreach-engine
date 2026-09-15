@@ -1912,3 +1912,108 @@ def test_get_persistence_status_flags_missing_backup_dir(monkeypatch):
     status = m.get_persistence_status()
     assert status["backup_dir_exists"] is False
     assert status["backup_snapshot_count"] == 0
+
+
+# ==============================================================================
+# Deterministic cover letter assembly (generate_cover_letter)
+# ==============================================================================
+# These guard the property the Strict Deterministic Template Engine exists to enforce: every
+# candidate-facing word traces to templates/cover_letter_templates.json, never to a model.
+
+def _all_letter_combos():
+    for track in "abcde":
+        for tone in ("conservative", "tech"):
+            for idx in range(6):
+                yield track, tone, idx
+
+
+def test_cover_letter_never_calls_gemini(monkeypatch):
+    """The whole point of the rewrite: no model in the path, so no invented experience."""
+    def explode(*args, **kwargs):
+        raise AssertionError("generate_cover_letter must not call Gemini")
+
+    monkeypatch.setattr(m, "call_gemini_api", explode)
+    letter = m.generate_cover_letter("Crain Communications", "Billing Operations Analyst", "e", 1)
+    assert "Billing Operations Analyst" in letter
+
+
+def test_cover_letter_body_comes_from_the_routed_track_bank():
+    """Track e must pull from track_e_bizops, not the track-a default the old code always used."""
+    bank = m.load_cover_letter_templates()
+    letter = m.generate_cover_letter("Crain", "Billing Operations Analyst", "e", 1)
+    body = bank["track_e_bizops"][1 % len(bank["track_e_bizops"])]
+    # Compare on a distinctive clause, since sanitize_text() rewrites punctuation in both.
+    assert body.split(".")[0].strip() in letter
+
+
+def test_cover_letter_tone_mode_swaps_only_the_bridge_paragraph():
+    conservative = m.generate_cover_letter("Crain", "Billing Operations Analyst", "e", 0, "", "conservative")
+    tech = m.generate_cover_letter("Crain", "Billing Operations Analyst", "e", 0, "", "tech")
+    assert conservative != tech
+    # Paragraph 1 and the closer are tone-independent; only paragraph 2 moves.
+    assert conservative.split("\n\n")[1] == tech.split("\n\n")[1]
+    assert conservative.split("\n\n")[3] == tech.split("\n\n")[3]
+
+
+def test_cover_letter_unknown_track_falls_back_to_track_a():
+    bogus = m.generate_cover_letter("Crain", "Analyst", "z", 0)
+    track_a = m.generate_cover_letter("Crain", "Analyst", "a", 0)
+    assert bogus == track_a
+
+
+def test_cover_letter_out_of_range_index_wraps_instead_of_raising():
+    """Gemini routes bullet indices sized for the resume pool (10), not the letter pool (3)."""
+    letter = m.generate_cover_letter("Crain", "Analyst", "e", 9)
+    assert letter.startswith("Dear Crain Hiring Team,")
+    assert letter.endswith("Kevin Miller")
+
+
+def test_cover_letter_strips_legal_suffix_from_company():
+    letter = m.generate_cover_letter("Crain Communications, Inc.", "Analyst", "e", 0)
+    assert "Crain Communications, Inc." not in letter
+    assert "Dear Crain Communications Hiring Team," in letter
+
+
+def test_cover_letter_appends_location_only_when_known():
+    with_loc = m.generate_cover_letter("Crain", "Analyst", "e", 0, "Detroit, MI")
+    without = m.generate_cover_letter("Crain", "Analyst", "e", 0, "")
+    assert "in Detroit, MI." in with_loc
+    assert "Detroit" not in without
+
+
+def test_cover_letter_every_combo_is_clean_and_well_formed():
+    """No banned word, no unfilled placeholder, 3 paragraphs, recruiter-plausible length."""
+    banned = [w.lower() for w in m.load_evidence_bank().get("banned_words", [])]
+    for track, tone, idx in _all_letter_combos():
+        letter = m.generate_cover_letter("Acme Group, Inc.", "Billing Operations Analyst",
+                                         track, idx, "Detroit, MI", tone)
+        ctx = f"track={track} tone={tone} idx={idx}"
+        assert "{" not in letter and "}" not in letter, ctx
+        assert letter.startswith("Dear Acme Hiring Team,"), ctx
+        assert letter.endswith("\n\nBest,\nKevin Miller"), ctx
+        assert letter.count("\n\n") == 4, ctx
+        assert 140 <= len(letter.split()) <= 210, f"{ctx} words={len(letter.split())}"
+        for word in banned:
+            assert not re.search(rf"\b{re.escape(word)}\b", letter, re.I), f"{ctx} {word}"
+
+
+def test_cover_letter_bank_survives_sanitize_text_unchanged():
+    """sanitize_text() deletes colons and collapses 'X, Y, and Z' triples to 'X and Y'. Bank copy
+    must be written around that, or a banked sentence silently loses its third item in the letter
+    a recruiter actually reads."""
+    bank = m.load_cover_letter_templates()
+    for key, pool in bank.items():
+        if key.startswith("_"):
+            continue
+        for i, entry in enumerate(pool):
+            assert not re.search(r"[;:]", entry), f"{key}[{i}] has a colon/semicolon"
+            assert not re.search(r"[—–]", entry), f"{key}[{i}] has an em/en dash"
+            triple = re.search(r"\b(\w+),\s*(\w+),\s*and\s+(\w+)\b", entry)
+            assert not triple, f"{key}[{i}] single-word triple would drop '{triple.group(3)}'"
+
+
+def test_cover_letter_falls_back_when_bank_is_unreadable(monkeypatch):
+    monkeypatch.setattr(m, "COVER_LETTER_TEMPLATES_PATH", "/no/such/cover_letter_templates.json")
+    letter = m.generate_cover_letter("Crain", "Billing Operations Analyst", "e", 0)
+    assert letter.startswith("Dear Crain Hiring Team,")
+    assert "Billing Operations Analyst" in letter
