@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from xml.etree import ElementTree
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 import requests
@@ -2733,6 +2734,56 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
 # ==============================================================================
 # 6. STAGE 1 STRICT FILTER & SINGLE CANDIDATE EVALUATION
 # ==============================================================================
+def _passes_remote_filter(job):
+    """passes_strict_filter minus the geography gates, for genuinely remote postings.
+
+    The metro gates (valid_cities allowlist + the Michigan state check) exist to keep a Detroit
+    desk search local, and they reject every remote feed posting on sight since job_city is the
+    literal string "Remote". Every OTHER gate still has to apply - a commission sales role or a
+    senior title is just as wrong remote as it is in Farmington - so this reuses the same filter
+    lists rather than reimplementing them, and any gate added to passes_strict_filter's
+    non-geographic half should be added here too.
+    """
+    title = str(job.get("job_title") or "").lower()
+    description = str(job.get("job_description") or "").lower()
+    company = str(job.get("employer_name") or "").lower()
+    if not title or not company:
+        return False
+    if not job.get("job_is_remote"):
+        return False
+
+    if is_company_on_cooldown(company):
+        return False
+    applied_companies = get_applied_crm_companies()
+    clean_company = normalize_company_for_match(company)
+    if company in applied_companies or clean_company in applied_companies:
+        return False
+
+    _, max_sal = extract_salary(job)
+    if max_sal > 0 and max_sal < safe_int(get_filter("min_salary"), 50000):
+        return False
+
+    if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
+        return False
+    if any(comp in company for comp in get_filter("company_exclusions", [])):
+        return False
+    if any(trigger in description for trigger in get_filter("hard_ban_keywords", [])):
+        return False
+    if any(sen in title for sen in get_filter("seniority_exclusions", [])):
+        return False
+
+    # Remote feeds skew heavily engineering, so require at least one core skill rather than
+    # surfacing every open SRE req. Matched on word boundaries, not substrings: a plain
+    # `"excel" in description` also fires on "excellent communication skills", which is boilerplate
+    # in almost every posting - that one bug alone passed 22 of 39 otherwise-irrelevant remote
+    # jobs when this gate was first written.
+    core_skills = [str(s).lower() for s in get_filter("core_skills", []) if str(s).strip()]
+    haystack = f"{title} {description}"
+    if core_skills and not any(re.search(rf"\b{re.escape(s)}\b", haystack) for s in core_skills):
+        return False
+    return True
+
+
 def passes_strict_filter(job):
     title = str(job.get("job_title") or "").lower()
     description = str(job.get("job_description") or "").lower()
@@ -5101,6 +5152,162 @@ def fetch_ashby_jobs(slug):
         logging.error(f"Ashby Fetch Exception ({slug}): {e}")
         return []
 
+def _strip_html_to_text(raw):
+    """Board descriptions arrive as HTML. The AI prompt and the CRM both want plain text."""
+    return html.unescape(re.sub(r'<[^>]+>', ' ', str(raw or ''))).strip()
+
+
+# Keyless public remote-job feeds. These need no API key, no account and no scraping - each one
+# publishes JSON or RSS openly. They are REMOTE-ONLY by nature, so passes_strict_filter's city
+# gate would reject every posting; _add_candidate is fed these only when the remote path is
+# allowed, and each job is stamped job_is_remote=True so the existing remote handling applies.
+REMOTE_FEED_TIMEOUT = 12
+_REMOTE_FEED_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; job-outreach-engine)"}
+
+
+def fetch_remoteok_jobs(limit=100):
+    """RemoteOK public JSON. Element 0 is a legal/metadata stub, not a posting - skip it."""
+    try:
+        res = requests.get("https://remoteok.com/api", timeout=REMOTE_FEED_TIMEOUT, headers=_REMOTE_FEED_HEADERS)
+        if res.status_code != 200:
+            return []
+        postings = res.json()
+        jobs = []
+        for p in postings[1:limit + 1]:
+            if not isinstance(p, dict) or not p.get("position"):
+                continue
+            jobs.append({
+                "job_id": f"remoteok_{p.get('id')}",
+                "employer_name": p.get("company", ""),
+                "job_title": p.get("position", ""),
+                "job_description": _strip_html_to_text(p.get("description")),
+                "job_apply_link": p.get("apply_url") or p.get("url", ""),
+                "job_city": "Remote",
+                "job_state": "",
+                "job_is_remote": True,
+                "job_posted_at_datetime_utc": p.get("date", ""),
+            })
+        return jobs
+    except Exception as e:
+        logging.error(f"RemoteOK Fetch Exception: {e}")
+        return []
+
+
+def fetch_himalayas_jobs(limit=100):
+    """Himalayas public JSON. pubDate is a unix epoch string, not ISO."""
+    try:
+        res = requests.get("https://himalayas.app/jobs/api", params={"limit": limit},
+                           timeout=REMOTE_FEED_TIMEOUT, headers=_REMOTE_FEED_HEADERS)
+        if res.status_code != 200:
+            return []
+        jobs = []
+        for p in res.json().get("jobs", []):
+            posted = ""
+            try:
+                posted = datetime.fromtimestamp(int(p.get("pubDate") or 0), tz=timezone.utc).isoformat()
+            except Exception:
+                posted = ""
+            jobs.append({
+                "job_id": f"himalayas_{p.get('guid')}",
+                "employer_name": p.get("companyName", ""),
+                "job_title": p.get("title", ""),
+                "job_description": _strip_html_to_text(p.get("description") or p.get("excerpt")),
+                "job_apply_link": p.get("applicationLink", ""),
+                "job_city": "Remote",
+                "job_state": "",
+                "job_is_remote": True,
+                "job_posted_at_datetime_utc": posted,
+            })
+        return jobs
+    except Exception as e:
+        logging.error(f"Himalayas Fetch Exception: {e}")
+        return []
+
+
+def fetch_remotive_jobs(limit=100):
+    """Remotive public JSON."""
+    try:
+        res = requests.get("https://remotive.com/api/remote-jobs", params={"limit": limit},
+                           timeout=REMOTE_FEED_TIMEOUT, headers=_REMOTE_FEED_HEADERS)
+        if res.status_code != 200:
+            return []
+        jobs = []
+        for p in res.json().get("jobs", []):
+            jobs.append({
+                "job_id": f"remotive_{p.get('id')}",
+                "employer_name": p.get("company_name", ""),
+                "job_title": p.get("title", ""),
+                "job_description": _strip_html_to_text(p.get("description")),
+                "job_apply_link": p.get("url", ""),
+                "job_city": "Remote",
+                "job_state": "",
+                "job_is_remote": True,
+                "job_posted_at_datetime_utc": p.get("publication_date", ""),
+            })
+        return jobs
+    except Exception as e:
+        logging.error(f"Remotive Fetch Exception: {e}")
+        return []
+
+
+# WeWorkRemotely publishes one RSS feed per category. These are the categories that overlap the
+# operations/finance/data work this pipeline targets; the programming feeds are deliberately
+# omitted since passes_strict_filter would drop almost all of them anyway.
+WWR_FEEDS = (
+    "https://weworkremotely.com/categories/remote-business-exec-management-jobs.rss",
+    "https://weworkremotely.com/categories/remote-customer-support-jobs.rss",
+    "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",
+)
+
+
+def fetch_weworkremotely_jobs(limit=100):
+    """WeWorkRemotely RSS. Titles arrive as 'Company: Role', so the employer is split off the
+    title rather than carried in its own element."""
+    jobs = []
+    for feed_url in WWR_FEEDS:
+        try:
+            res = requests.get(feed_url, timeout=REMOTE_FEED_TIMEOUT, headers=_REMOTE_FEED_HEADERS)
+            if res.status_code != 200:
+                continue
+            root = ElementTree.fromstring(res.content)
+            for item in root.findall(".//item")[:limit]:
+                def _text(tag):
+                    node = item.find(tag)
+                    return (node.text or "").strip() if node is not None else ""
+                raw_title = _text("title")
+                company, _, role = raw_title.partition(":")
+                if not role:
+                    company, role = "", raw_title
+                jobs.append({
+                    "job_id": f"wwr_{_text('guid') or raw_title}",
+                    "employer_name": company.strip(),
+                    "job_title": role.strip(),
+                    "job_description": _strip_html_to_text(_text("description")),
+                    "job_apply_link": _text("link"),
+                    "job_city": "Remote",
+                    "job_state": "",
+                    "job_is_remote": True,
+                    "job_posted_at_datetime_utc": _text("pubDate"),
+                })
+        except Exception as e:
+            logging.error(f"WeWorkRemotely Fetch Exception ({feed_url}): {e}")
+    return jobs
+
+
+def fetch_remote_feed_jobs(limit=100):
+    """Pull every keyless remote feed in parallel. One dead feed never blocks the others."""
+    fetchers = (fetch_remoteok_jobs, fetch_himalayas_jobs, fetch_remotive_jobs, fetch_weworkremotely_jobs)
+    all_jobs = []
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
+        futures = [executor.submit(fn, limit) for fn in fetchers]
+        for future in futures:
+            try:
+                all_jobs.extend(future.result(timeout=REMOTE_FEED_TIMEOUT + 8))
+            except Exception as e:
+                logging.error(f"Remote Feed Future Error: {e}")
+    return all_jobs
+
+
 def fetch_ats_jobs(company_slugs):
     """Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in parallel."""
     if not company_slugs:
@@ -5288,6 +5495,26 @@ def run_job_pipeline(chat_id=None, top_n=2):
                 send_status_update(chat_id, f"Stage 1c: Sourcing direct ATS postings from {len(watchlist)} watchlist companies...")
             for job in fetch_ats_jobs(watchlist):
                 _add_candidate(job)
+
+    # Stage 1d: keyless public remote feeds (RemoteOK, Himalayas, Remotive, WeWorkRemotely).
+    # These are remote-only, so passes_strict_filter's valid_cities gate rejects all of them - that
+    # allowlist is a Detroit suburb list and "Remote" is in none of it. Rather than weaken the
+    # metro geofence every local posting depends on, remote jobs bypass the city check explicitly
+    # here via _passes_remote_filter, which applies every OTHER gate (salary, seniority, title and
+    # company exclusions, hard bans, cooldown, already-applied). Off by default: this pipeline is
+    # tuned for a Detroit desk, and nationwide remote listings crowd that out - which is why the
+    # JSearch "Remote" query is already capped at 1 result per run.
+    if get_filter("remote_feeds_enabled"):
+        if chat_id:
+            send_status_update(chat_id, "Stage 1d: Sourcing keyless remote feeds (RemoteOK, Himalayas, Remotive, WWR)...")
+        remote_cap = safe_int(get_filter("remote_feed_cap"), 40)
+        remote_added = 0
+        for job in fetch_remote_feed_jobs(100):
+            if remote_added >= remote_cap:
+                break
+            if _passes_remote_filter(job):
+                _add_candidate(job)
+                remote_added += 1
 
 
     logging.info(f"Stage 1 Complete: {raw_discovered_count} raw listings pulled, {len(candidate_pool)} candidates passed strict filter.")
@@ -6169,6 +6396,27 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, pitch_msg)
             return
 
+        remote_match = re.match(r"^/remote(?:\s+(on|off))?$", text, re.IGNORECASE)
+        if remote_match:
+            action = (remote_match.group(1) or "").lower()
+            if action == "on":
+                set_filter("remote_feeds_enabled", True)
+                send_telegram_message(chat_id, "✅ <b>Remote feeds ON</b> - /t will also pull RemoteOK, Himalayas, Remotive and WeWorkRemotely.")
+            elif action == "off":
+                set_filter("remote_feeds_enabled", False)
+                send_telegram_message(chat_id, "🚫 <b>Remote feeds OFF</b> - /t stays local to the Detroit metro.")
+            else:
+                state = "ON" if get_filter("remote_feeds_enabled") else "OFF"
+                cap = safe_int(get_filter("remote_feed_cap"), 40)
+                send_telegram_message(
+                    chat_id,
+                    f"🌐 <b>Remote feeds: {state}</b> (cap {cap}/run)\n\n"
+                    "Keyless public feeds: RemoteOK, Himalayas, Remotive, WeWorkRemotely.\n"
+                    "These skip the Detroit city filter but keep every other gate.\n\n"
+                    "/remote on · /remote off"
+                )
+            return
+
         ats_match = re.match(r"^/ats(?:\s+(on|off|list|add|remove)\s*(.*))?$", text, re.IGNORECASE)
         if ats_match:
             action = (ats_match.group(1) or "list").lower()
@@ -6437,7 +6685,8 @@ def process_webhook_payload_async(data):
                 "/prep - Interview talking points & reverse questions\n"
                 "/pitch - 30-second elevator pitch\n"
                 "/letter - Cover letter (same track as the resume)\n"
-                "/ats - Company board watchlist (on/off/add/remove)\n\n"
+                "/ats - Company board watchlist (on/off/add/remove)\n"
+                "/remote - Keyless remote feeds (on/off)\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
                 "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"

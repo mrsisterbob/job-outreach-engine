@@ -2133,3 +2133,85 @@ def test_ats_watchlist_skips_slugs_already_covered_by_warm_radar():
     warm = ["shinola"]
     remaining = [s for s in watchlist if s not in set(warm)]
     assert remaining == ["stockx", "carta"]
+
+
+# ==============================================================================
+# Stage 1d: keyless remote feeds
+# ==============================================================================
+
+def _remote_job(**over):
+    # Deliberately not "Acme": other tests in this module push that name into the applied-company
+    # and cooldown caches, which would make these assertions fail for the wrong reason.
+    job = {"job_title": "Billing Operations Analyst", "employer_name": "Northwind Remote Co",
+           "job_description": "Reconciliation in Salesforce and Excel.", "job_is_remote": True,
+           "job_city": "Remote", "job_state": ""}
+    job.update(over)
+    return job
+
+
+def test_remote_filter_requires_a_core_skill_on_word_boundaries():
+    """`"excel" in description` also matches "excellent communication skills", which is boilerplate
+    in nearly every posting. That substring bug passed 22 of 39 irrelevant remote jobs."""
+    assert m._passes_remote_filter(_remote_job(job_description="Daily reconciliation in Excel."))
+    assert not m._passes_remote_filter(
+        _remote_job(job_description="We want excellent communication skills and a team player.")
+    )
+
+
+def test_remote_filter_rejects_non_remote_jobs():
+    assert not m._passes_remote_filter(_remote_job(job_is_remote=False))
+
+
+def test_remote_filter_still_applies_the_non_geographic_gates():
+    """Geography is the only thing this filter drops. A commission sales role or a senior title is
+    just as wrong remote as it is in Farmington."""
+    assert not m._passes_remote_filter(_remote_job(job_title="Senior Billing Analyst"))
+    assert not m._passes_remote_filter(_remote_job(job_title="Account Executive"))
+    assert not m._passes_remote_filter(_remote_job(employer_name="Robert Half"))
+    assert not m._passes_remote_filter(
+        _remote_job(job_description="Salesforce work with uncapped earnings and cold outreach.")
+    )
+
+
+def test_remote_filter_requires_title_and_company():
+    assert not m._passes_remote_filter(_remote_job(job_title=""))
+    assert not m._passes_remote_filter(_remote_job(employer_name=""))
+
+
+def test_remote_feeds_are_off_by_default():
+    """This pipeline is tuned for a Detroit desk; nationwide remote listings crowd that out."""
+    m.set_filter("remote_feeds_enabled", False)
+    assert not m.get_filter("remote_feeds_enabled")
+
+
+def test_remote_feed_fetchers_survive_a_dead_endpoint(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("feed down")
+    monkeypatch.setattr(m.requests, "get", boom)
+    assert m.fetch_remoteok_jobs() == []
+    assert m.fetch_himalayas_jobs() == []
+    assert m.fetch_remotive_jobs() == []
+    assert m.fetch_weworkremotely_jobs() == []
+    assert m.fetch_remote_feed_jobs() == []
+
+
+def test_remoteok_skips_the_legal_stub_element():
+    """RemoteOK's element 0 is a legal/metadata notice, not a posting."""
+    class FakeRes:
+        status_code = 200
+        @staticmethod
+        def json():
+            return [{"legal": "notice"}, {"id": 5, "company": "Acme", "position": "Analyst",
+                                          "description": "<p>work</p>", "apply_url": "https://x",
+                                          "date": "2026-09-01"}]
+    import types
+    monkey = types.SimpleNamespace(get=lambda *a, **k: FakeRes())
+    orig = m.requests.get
+    m.requests.get = monkey.get
+    try:
+        jobs = m.fetch_remoteok_jobs()
+    finally:
+        m.requests.get = orig
+    assert len(jobs) == 1
+    assert jobs[0]["job_title"] == "Analyst"
+    assert "<p>" not in jobs[0]["job_description"]
