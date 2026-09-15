@@ -530,7 +530,7 @@ def test_lint_outreach_template_flags_punctuation_sanitize_text_would_delete():
 
 def test_lint_outreach_template_enforces_length_caps_per_kind():
     long_email = "I've " + ("word " * pu.OUTREACH_EMAIL_WORD_CAP)
-    assert any("over the 75-word" in v for v in pu.lint_outreach_template(long_email, "email"))
+    assert any(f"over the {pu.OUTREACH_EMAIL_WORD_CAP}-word" in v for v in pu.lint_outreach_template(long_email, "email"))
     long_note = "I've " + ("x" * pu.OUTREACH_LINKEDIN_CHAR_CAP)
     assert any("over the 220-char" in v for v in pu.lint_outreach_template(long_note, "linkedin"))
     # ...and the caps do not cross over: a 100-word email-length string is fine as an email

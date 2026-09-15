@@ -362,7 +362,11 @@ _CONTRACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-OUTREACH_EMAIL_WORD_CAP = 75
+# Raised from 75 to 100 deliberately. The deferential register used for senior contacts -
+# naming the application, crediting the recipient's vantage point, then asking - does not fit in
+# 75 words, and the hand-written email this bank is modeled on runs 79. The cap exists to stop a
+# cold email sprawling, not to force every note into the same clipped shape.
+OUTREACH_EMAIL_WORD_CAP = 100
 OUTREACH_LINKEDIN_CHAR_CAP = 220
 
 
