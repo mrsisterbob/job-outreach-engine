@@ -833,6 +833,23 @@ def test_sent_capture_domain_match_is_not_a_loose_substring():
     assert pu.domain_matches_company("bob@aa.com", "AAA-The Auto Club") is False
 
 
+def test_brand_token_matches_a_company_whose_domain_differs_from_its_legal_name():
+    """'Intact Services USA LLC' sends from intactinsurance.com. Neither whole string contains
+    the other, so every substring test missed and a real contact Kevin had already drafted to was
+    silently dropped from capture. The brand token (first significant word) has to carry it."""
+    assert pu.domain_matches_company("sszajner@intactinsurance.com", "Intact Services USA LLC") is True
+    assert pu.domain_matches_company("a@marinerwealthadvisors.com", "Mariner") is True
+
+    # ...without opening up a generic lead word as a match. "First Financial" must not claim
+    # firstsolar.com, and the token must be a PREFIX, so contactcenter.com is not "Intact".
+    assert pu.domain_matches_company("a@firstsolar.com", "First Financial") is False
+    assert pu.domain_matches_company("a@unitedairlines.com", "United Wholesale Mortgage") is False
+    assert pu.domain_matches_company("a@contactcenter.com", "Intact Services USA LLC") is False
+    assert pu.domain_matches_company("a@mainstreetbank.com", "Main Financial Group") is False
+    # The short-token floor still holds: a 4-char brand cannot match on its own.
+    assert pu.domain_matches_company("a@autozone.com", "Auto Club") is False
+
+
 # ---- Carmen Cold 3/7/14 follow-up ladder ----
 
 _LADDER_TODAY = date(2026, 9, 12)

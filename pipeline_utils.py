@@ -725,6 +725,17 @@ def company_domain_of(email):
     return "" if domain in _NON_COMPANY_EMAIL_DOMAINS else domain
 
 
+# Lead words too generic to identify a company on their own. Without this, "First Financial"
+# brand-matches firstsolar.com and "United Wholesale" matches unitedairlines.com. A company whose
+# name STARTS with one of these still matches through the whole-string tests above.
+_GENERIC_BRAND_TOKENS = frozenset({
+    "first", "united", "national", "american", "general", "global", "premier", "advanced",
+    "allied", "associated", "consolidated", "federal", "international", "standard", "superior",
+    "universal", "western", "eastern", "northern", "southern", "central", "pacific", "atlantic",
+    "capital", "financial", "insurance", "services", "solutions", "systems", "partners", "group",
+})
+
+
 def domain_matches_company(email, company_name):
     """True if an address's domain plausibly belongs to `company_name`.
 
@@ -744,7 +755,24 @@ def domain_matches_company(email, company_name):
     company = re.sub(r'[^a-z0-9]', '', normalized)
     if not label or not company:
         return False
-    return label == company or (len(label) >= 5 and label in company) or (len(company) >= 5 and company in label)
+    if label == company or (len(label) >= 5 and label in company) or (len(company) >= 5 and company in label):
+        return True
+    # Brand-token match. A company's legal name and its mail domain often share only the brand:
+    # "Intact Services USA LLC" sends from intactinsurance.com, where neither whole string
+    # contains the other, so the tests above all miss and a real contact is dropped. Compare the
+    # first significant word of the company name against the domain label instead.
+    #
+    # Deliberately narrow, because this is the loosest test here: the token must be >= 5 chars
+    # (so "auto", "first", "main" style words cannot carry a match on their own), it must be the
+    # FIRST word (the brand, not a descriptor deeper in the name), and it must be a prefix of the
+    # domain label rather than appearing anywhere inside it - "intact" matches intactinsurance.com
+    # but not contactcenter.com.
+    words = [w for w in re.split(r'[^a-z0-9]+', normalized) if w]
+    if words:
+        brand = words[0]
+        if len(brand) >= 5 and brand not in _GENERIC_BRAND_TOKENS and label.startswith(brand):
+            return True
+    return False
 
 
 def match_email_to_crm_company(email, crm_companies):

@@ -3741,17 +3741,22 @@ def get_all_crm_job_companies():
     return companies
 
 
-def capture_contacts_from_sent_mail():
+def capture_contacts_from_sent_mail(lookback_hours=None, max_messages=25, dry_run=False):
     """Auto-populate Carmen Cold with every unique person emailed at a tracked job company.
 
-    Scans recent Gmail SENT mail and writes one Carmen Cold row per new person. Role mailboxes
+    Scans Gmail SENT mail and writes one Carmen Cold row per new person. Role mailboxes
     (operations@, careers@) are skipped - those are the job pipeline's own targets and already
     live as job rows - as are consumer/ATS domains and anyone already in the CRM. Writes go
     straight to Sheets rather than through crm_outbox, whose SQLite backing is wiped by every
     Render deploy.
 
-    The rolling lookback window means only mail sent from here on is ever captured; the existing
-    Sent backlog is never bulk-imported.
+    Defaults scan the rolling SENT_CAPTURE_LOOKBACK_HOURS window, so the scheduled poll only ever
+    considers recent mail. `lookback_hours=0` drops the date filter entirely and `max_messages`
+    raises the page size, which is how /backfillcontacts sweeps the whole Sent backlog through
+    this same path rather than duplicating the capture rules. `dry_run` resolves and reports
+    contacts without writing anything, so a bulk sweep can be previewed before it touches Sheets.
+
+    Returns the number of contacts captured (or, in dry_run, the number that would be).
     """
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars:
@@ -3760,28 +3765,44 @@ def capture_contacts_from_sent_mail():
     if not access_token:
         return 0
 
-    after_epoch = int(time.time()) - SENT_CAPTURE_LOOKBACK_HOURS * 3600
+    hours = SENT_CAPTURE_LOOKBACK_HOURS if lookback_hours is None else lookback_hours
     crm_companies = get_all_crm_job_companies()
     if not crm_companies:
         return 0
 
     headers = {"Authorization": f"Bearer {access_token}"}
+    query = "in:sent"
+    if hours:
+        query += f" after:{int(time.time()) - int(hours) * 3600}"
+    # Gmail caps maxResults at 500 per page, so a full-backlog sweep has to follow nextPageToken.
+    message_ids = []
+    page_token = None
     try:
-        res = requests.get(
-            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-            headers=headers,
-            params={"q": f"in:sent after:{after_epoch}", "maxResults": 25},
-            timeout=10,
-        )
-        if res.status_code != 200:
-            logging.error(f"[SENT] Gmail list error: {res.status_code}")
-            return 0
-        message_ids = [m["id"] for m in res.json().get("messages", [])]
+        while len(message_ids) < max_messages:
+            params = {"q": query, "maxResults": min(500, max_messages - len(message_ids))}
+            if page_token:
+                params["pageToken"] = page_token
+            res = requests.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                headers=headers, params=params, timeout=10,
+            )
+            if res.status_code != 200:
+                logging.error(f"[SENT] Gmail list error: {res.status_code}")
+                return 0
+            body = res.json()
+            message_ids.extend(m["id"] for m in body.get("messages", []))
+            page_token = body.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as e:
         logging.error(f"[SENT] Gmail list exception: {e}")
         return 0
 
     captured = 0
+    # Sent mail holds several messages to the same person (an outreach note, then a follow-up),
+    # so a multi-message sweep would resolve the same contact repeatedly. is_verified_crm_contact()
+    # only sees contacts recorded on a PREVIOUS run, so track this run's own captures too.
+    seen_emails = set()
     for msg_id in message_ids:
         try:
             detail_res = requests.get(
@@ -3799,7 +3820,16 @@ def capture_contacts_from_sent_mail():
             contact = build_sent_contact(to_header, crm_companies)
             if not contact:
                 continue
+            email_key = str(contact["email"]).strip().lower()
+            if email_key in seen_emails:
+                continue
             if is_verified_crm_contact(contact["email"]):
+                continue
+            seen_emails.add(email_key)
+
+            if dry_run:
+                captured += 1
+                logging.info(f"[SENT][DRY RUN] would capture {contact['email']} ({contact['company']})")
                 continue
 
             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -3839,7 +3869,9 @@ def capture_contacts_from_sent_mail():
                     contact_email=contact["email"],
                 )
                 logging.info(f"[SENT] Captured {contact['email']} ({contact['company']}) to Carmen Cold")
-                if TELEGRAM_CHAT_ID:
+                # One alert per contact is right for the daily poll's handful, and spam for a
+                # backlog sweep - /backfillcontacts reports a single summary instead.
+                if TELEGRAM_CHAT_ID and max_messages <= 25:
                     send_telegram_message(
                         TELEGRAM_CHAT_ID,
                         f"👤 <b>Contact Captured</b> · <code>Carmen Cold</code>\n"
@@ -6594,6 +6626,35 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
             return
 
+        if text == "/backfillcontacts" or text == "/backfillcontacts go":
+            # One-off sweep of the whole Sent backlog, which the rolling lookback window can never
+            # reach. Previews by default: this writes to the same Carmen Cold tab Kevin curates by
+            # hand, so the contact list is shown before anything is created.
+            commit = text.endswith(" go")
+            send_telegram_message(
+                chat_id,
+                ("📇 Scanning full Sent history and capturing..." if commit
+                 else "📇 Scanning full Sent history (preview, nothing will be written)...")
+            )
+            def _backfill_and_notify():
+                try:
+                    n = capture_contacts_from_sent_mail(
+                        lookback_hours=0, max_messages=1000, dry_run=not commit
+                    )
+                    if commit:
+                        send_telegram_message(chat_id, f"✅ <b>Backfill complete.</b> {n} contact(s) added to Carmen Cold.")
+                    else:
+                        send_telegram_message(
+                            chat_id,
+                            f"🔍 <b>Preview:</b> {n} new contact(s) would be added.\n"
+                            f"Check the logs for the list, then reply <code>/backfillcontacts go</code> to write them."
+                        )
+                except Exception as e:
+                    logging.error(f"/backfillcontacts Error: {e}")
+                    send_telegram_message(chat_id, f"❌ Backfill error: {html.escape(str(e)[:200])}")
+            threading.Thread(target=_backfill_and_notify, daemon=True).start()
+            return
+
         if text == "/poll":
             # On-demand email poll. Exists because the scheduled cadence is now daily (or off):
             # when a reply is expected right now, this runs the same cycle without waiting for it.
@@ -6954,7 +7015,8 @@ def process_webhook_payload_async(data):
                 "/gear - Search breadth 1-5 (one dial for all sources)\n"
                 "/ats - Company board watchlist (on/off/add/remove)\n"
                 "/remote - Keyless remote feeds (on/off)\n"
-                "/poll - Run the email poll cycle now (scheduled: daily)\n\n"
+                "/poll - Run the email poll cycle now (scheduled: daily)\n"
+                "/backfillcontacts - Preview a full Sent-history contact sweep (add 'go' to write)\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
                 "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"
