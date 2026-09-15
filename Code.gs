@@ -499,7 +499,17 @@ function doGet(e) {
         return respondJSON({ status: "success", found: false });
       }
 
-      for (const tabName of ALL_TABS) {
+      // people_only=1 restricts the search to the PEOPLE tabs. The default all-tabs search answers
+      // "do I know this sender?" for the inbound-mail whitelist, where a hit on a JOBS row's
+      // Contact Email is a legitimate match. Sent-mail capture asks a different question - "is this
+      // person already logged as a contact?" - and an address sitting on a job row is a TARGET, not
+      // a logged person. Conflating the two meant every contact reached via /e was treated as
+      // already captured, so the capture path could only ever log people Kevin had never emailed
+      // through the pipeline, which is backwards.
+      const peopleOnly = String(e.parameter.people_only || "") === "1";
+      const searchTabs = peopleOnly ? ALL_TABS.filter(t => TAB_MAP[t] === "PEOPLE") : ALL_TABS;
+
+      for (const tabName of searchTabs) {
         const sheet = ss.getSheetByName(tabName);
         if (!sheet) continue;
         const schemaType = TAB_MAP[tabName] || "PEOPLE";

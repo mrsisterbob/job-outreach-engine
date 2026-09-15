@@ -1452,6 +1452,69 @@ def test_seniority_and_experience_demands_push_a_role_down():
     assert m.calculate_hybrid_score_modifier(entry_exp, 70)[1] > m.calculate_hybrid_score_modifier(deep_exp, 70)[1]
 
 
+class _FakeLookupResp:
+    def __init__(self, body, status_code=200):
+        self._body = body
+        self.status_code = status_code
+
+    def json(self):
+        return self._body
+
+
+def test_sent_capture_gate_ignores_an_address_sitting_on_a_job_row(monkeypatch):
+    """A contact reached via /e has their address written into the Contact Email column of the
+    JOBS row. is_verified_crm_contact() searches ALL tabs, so reusing it as the capture gate made
+    every such person read as "already logged" and capture skipped exactly who it existed to log
+    (the Sheets query answered "match found for lvezzetti@crain.com" off the Crain job row).
+    The gate must ask the PEOPLE tabs only, and must say so in the request."""
+    params_seen = []
+
+    def fake_crm_get(params, *a, **k):
+        params_seen.append(params)
+        # The PEOPLE-only search finds nothing: she is on a JOBS row, not in Carmen Cold.
+        return _FakeLookupResp({"status": "success", "found": False})
+
+    monkeypatch.setattr(m, "crm_get", fake_crm_get)
+    assert m.is_logged_person_contact("lvezzetti@crain.com") is False
+    assert params_seen and params_seen[0].get("people_only") == "1", params_seen
+
+    # ...and someone genuinely in a PEOPLE tab is still skipped.
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _FakeLookupResp(
+        {"status": "success", "found": True, "sheet_tab": "Carmen Cold"}))
+    assert m.is_logged_person_contact("eina.assali@affirm.com") is True
+
+    # A lookup failure must not silently drop a real contact: err toward capturing, since the
+    # quick_add dedup guard collapses a duplicate but a dropped contact is lost with no report.
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: None)
+    assert m.is_logged_person_contact("someone@newcompany.com") is False
+
+
+def test_addressed_contacts_bypass_the_company_gate_but_not_the_junk_filters(monkeypatch):
+    """/e is Kevin typing the address himself, which is stronger evidence than any domain
+    heuristic - so an agency recruiter at an untracked firm (NextPath working a Raymond James
+    role) must log, where the passive sweep's company gate would drop her. The consumer-domain
+    and role-mailbox refusals still apply: /e on careers@ addresses an inbox, not a person."""
+    written = []
+    monkeypatch.setattr(m, "is_logged_person_contact", lambda e: False)
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, *a, **k: written.append(payload) or True)
+    monkeypatch.setattr(m, "record_captured_contact", lambda **k: True)
+
+    assert m.log_addressed_contact_to_carmen_cold("marjorie@nextpath.com", company="Raymond James") is True
+    assert written and written[-1]["email"] == "marjorie@nextpath.com"
+    assert written[-1]["company"] == "Raymond James"
+
+    # Falls back to a name/company derived from the address when none is supplied.
+    assert m.log_addressed_contact_to_carmen_cold("jane.doe@acmecorp.com") is True
+    assert written[-1]["name"] == "Jane Doe"
+
+    for junk in ("careers@somefirm.com", "no-reply@render.com", "sandy@gmail.com", ""):
+        assert m.log_addressed_contact_to_carmen_cold(junk) is False, junk
+
+    # Already in a PEOPLE tab -> no second row.
+    monkeypatch.setattr(m, "is_logged_person_contact", lambda e: True)
+    assert m.log_addressed_contact_to_carmen_cold("marjorie@nextpath.com") is False
+
+
 def test_engineering_titles_cannot_reach_the_tier1_card_gate():
     """A "Salesforce Developer (Remote)" at Mariner, $68.1k-$178k, scored 83 and dispatched a
     Tier-1 card. Nothing caught it: the seniority regex only knew seniority WORDS, so a different

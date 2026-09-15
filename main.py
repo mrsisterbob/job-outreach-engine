@@ -33,6 +33,7 @@ from pipeline_utils import (
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     is_guessed_contact_email, resolve_sent_email_backfill,
+    is_role_mailbox, company_domain_of, name_from_email_local_part,
     plan_carmen_followup, CARMEN_LADDER_DAYS,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
@@ -3713,8 +3714,8 @@ EMAIL_POLL_SCHEDULER = BackgroundScheduler(daemon=True)
 # Sent mail is rescanned over a rolling window rather than tracked by a stored watermark: the
 # SQLite backing that would hold one is wiped by every Render deploy, which would silently reset
 # the baseline and skip whatever was sent in between. Rescanning is safe because
-# is_verified_crm_contact() already makes capture idempotent - a person already in the CRM is
-# skipped - so the only cost of an overlap is a few extra lookups.
+# is_logged_person_contact() already makes capture idempotent - a person already in a PEOPLE tab
+# is skipped - so the only cost of an overlap is a few extra lookups.
 #
 # The window is the ONLY thing standing between a sent message and permanent silent loss: mail
 # that ages out before a poll sees it is never captured, and nothing reports that it was missed.
@@ -3739,6 +3740,101 @@ def get_all_crm_job_companies():
             if company:
                 companies.add(company)
     return companies
+
+
+def is_logged_person_contact(email):
+    """True when this address is already a row in a PEOPLE tab (Carmen Cold / Carmen Warm / Killed).
+
+    The sent-mail capture gate. Deliberately NOT is_verified_crm_contact(), which searches every
+    tab: an address on a JOBS row is the pipeline's outreach TARGET for that job, not a logged
+    person, and the two records are both supposed to exist. Using the broad check here meant every
+    contact Kevin reached via /e already "existed", so capture skipped exactly the people it was
+    built to log - the Sheets whitelist query returned "match found for lvezzetti@crain.com" off
+    the Crain job row and Angela was never written to Carmen Cold.
+
+    Local sheet_row_map first (fast, and the only record of a contact captured on a previous run),
+    then the live PEOPLE-tab lookup as the authority. Errs toward False: a lookup failure means the
+    contact is written and the quick_add dedup guard in Code.gs collapses any duplicate, which is
+    the safer direction than silently dropping a real contact.
+    """
+    clean = str(email or "").split(" [")[0].strip().lower()
+    if not clean:
+        return True  # nothing to capture
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM sheet_row_map WHERE LOWER(contact_email) = ? AND sheet_tab IN ('Carmen Cold','Carmen Warm','Killed') LIMIT 1",
+                (clean,)
+            )
+            if cursor.fetchone():
+                return True
+    except Exception as e:
+        logging.error(f"[SENT] Local person lookup error for {clean}: {e}")
+
+    res = crm_get({"action": "find_contact_by_email", "email": clean, "people_only": "1"})
+    if res is None:
+        logging.warning(f"[SENT] PEOPLE-tab lookup unavailable for {clean} - treating as new")
+        return False
+    try:
+        if res.status_code == 200:
+            return bool(res.json().get("found"))
+    except Exception as e:
+        logging.error(f"[SENT] PEOPLE-tab lookup parse error for {clean}: {e}")
+    return False
+
+
+def log_addressed_contact_to_carmen_cold(email, company="", name="", note=""):
+    """Log a person Kevin explicitly addressed via /e or /eh into Carmen Cold.
+
+    The passive sent-mail sweep gates on match_email_to_crm_company(), which is right for a bulk
+    scan: without it, every vendor, retailer and support thread in Sent becomes a "Cold Lead" with
+    a follow-up date. But that gate also drops agency recruiters - a NextPath recruiter working a
+    Raymond James role is a live conversation at an untracked company - and it throws away the
+    strongest signal available, which is Kevin typing the address himself. A hand-typed /e IS the
+    intent, so this path skips the company check entirely.
+
+    Consumer domains and role mailboxes are still refused: /e on careers@ is addressing an inbox,
+    not a person. Idempotent via is_logged_person_contact(), and the quick_add dedup guard in
+    Code.gs is the backstop if two commands race.
+    """
+    clean = str(email or "").split(" [")[0].strip().lower()
+    if not clean or is_role_mailbox(clean) or not company_domain_of(clean):
+        return False
+    if is_logged_person_contact(clean):
+        return False
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    sheet_uuid = str(uuid.uuid4())
+    next_followup = (datetime.now() + timedelta(days=CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d")
+    contact_name = str(name or "").strip() or name_from_email_local_part(clean)
+    contact_company = str(company or "").strip() or (company_domain_of(clean) or "").split(".")[0].title()
+    payload = build_crm_payload(
+        "quick_add",
+        target_code="CC",
+        sheet_uuid=sheet_uuid,
+        first_contact=today_str,
+        last_contact=today_str,
+        name=contact_name,
+        company=contact_company,
+        email=clean,
+        priority=5,
+        status="Cold Lead",
+        next_followup=next_followup,
+        source="Addressed via /e",
+        note=(note or f"[{today_str}] Emailed directly").strip(),
+    )
+    if not log_to_sheets_crm(payload):
+        return False
+    record_captured_contact(
+        sheet_uuid=sheet_uuid,
+        sheet_tab="Carmen Cold",
+        contact_name=contact_name,
+        contact_company=contact_company,
+        contact_email=clean,
+    )
+    logging.info(f"[/e] Logged addressed contact {clean} ({contact_company}) to Carmen Cold")
+    return True
 
 
 def capture_contacts_from_sent_mail(lookback_hours=None, max_messages=25, dry_run=False):
@@ -3800,7 +3896,7 @@ def capture_contacts_from_sent_mail(lookback_hours=None, max_messages=25, dry_ru
 
     captured = 0
     # Sent mail holds several messages to the same person (an outreach note, then a follow-up),
-    # so a multi-message sweep would resolve the same contact repeatedly. is_verified_crm_contact()
+    # so a multi-message sweep would resolve the same contact repeatedly. is_logged_person_contact()
     # only sees contacts recorded on a PREVIOUS run, so track this run's own captures too.
     seen_emails = set()
     for msg_id in message_ids:
@@ -3823,7 +3919,7 @@ def capture_contacts_from_sent_mail(lookback_hours=None, max_messages=25, dry_ru
             email_key = str(contact["email"]).strip().lower()
             if email_key in seen_emails:
                 continue
-            if is_verified_crm_contact(contact["email"]):
+            if is_logged_person_contact(contact["email"]):
                 continue
             seen_emails.add(email_key)
 
@@ -3854,7 +3950,7 @@ def capture_contacts_from_sent_mail(lookback_hours=None, max_messages=25, dry_ru
             )
             if log_to_sheets_crm(payload):
                 captured += 1
-                # Record the contact locally BEFORE the Telegram send. is_verified_crm_contact()
+                # Record the contact locally BEFORE the Telegram send. is_logged_person_contact()
                 # above reads sheet_row_map, so without this row the next poll re-captures the
                 # same sent message as a brand-new contact - the sheet-side guard would suppress
                 # the duplicate row, but the poller would still burn a write and fire a second
@@ -6545,6 +6641,13 @@ def process_webhook_payload_async(data):
             log_email_enrichment_attempt(mapping["sheet_uuid"], "waterfall", target, confidence)
             update_job_target_email(mapping["sheet_uuid"], target)
             enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=target))
+            # Same reasoning as /e: an address resolved and drafted to here is one Kevin is
+            # actively working, so it belongs in Carmen Cold regardless of company tracking.
+            # Unverified waterfall guesses never reach this line - that branch returns above.
+            log_addressed_contact_to_carmen_cold(
+                target, company=comp, name=mapping.get("contact_name", ""),
+                note=f"[{datetime.now().strftime('%Y-%m-%d')}] Emailed: {title}"
+            )
 
             # Compile the same tailored resume PDF /draft and /e attach, so /eh never regresses to a bare-text draft
             track = job.get("track", "a")
@@ -6624,6 +6727,13 @@ def process_webhook_payload_async(data):
             if ok:
                 log_daily_activity("drafts_staged")
             enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
+            # Typing the address IS the intent to track this person, so log them to Carmen Cold
+            # without the company gate the passive sweep uses - that gate drops agency recruiters
+            # at untracked firms, which is most of who /e gets used on.
+            if log_addressed_contact_to_carmen_cold(
+                new_email, company=comp, note=f"[{datetime.now().strftime('%Y-%m-%d')}] Emailed: {title}"
+            ):
+                send_telegram_message(chat_id, f"👤 Logged <code>{html.escape(new_email)}</code> to Carmen Cold.")
             return
 
         if text == "/backfillcontacts" or text == "/backfillcontacts go":
