@@ -10,21 +10,21 @@
   ],
 
   "track_a_wealth_ops": [
-    "I work in operations at an investment advisory firm, where most of my day is account paperwork and the exceptions that hold it up. I audit onboarding agreements before accounts go live, and I process the daily transfers and account maintenance that follow. It is detail work on a deadline, which is the part I am good at.",
-    "My current role is wealth operations, which means I spend the day on transaction intake and account records. I check advisory paperwork against what the custodian has on file and chase down anything that does not match. Most of what I do is catching a problem before it reaches the client.",
+    "I work in operations at an investment advisory firm, where most of my day is account paperwork and the exceptions that hold it up. I audit onboarding agreements before accounts go live, and I process the daily transfers and account maintenance that follow. It's detail work on a deadline, which is the part I am good at.",
+    "My current role is wealth operations, which means I spend the day on transaction intake and account records. I check advisory paperwork against what the custodian has on file and chase down anything that doesn't match. Most of what I do is catching a problem before it reaches the client.",
     "I sit on the operations desk at an advisory firm and handle account transfers from intake through to resolution. When paperwork gets rejected, it comes back to me to find out why. That has made me careful about getting a file right the first time."
   ],
 
   "track_b_engineering": [
     "I work in operations, and a lot of my week is writing small Python tools that take manual steps off my own desk. I built a script that checks our ledgers against internal records overnight so nobody has to eyeball a spreadsheet in the morning. The habit is finding the thing being done by hand every week and making it run on its own.",
     "My background is operations work plus the code I write to automate it. I taught myself Python and SQL on the job, mostly because I got tired of repeating the same reconciliation every month. Now that check runs on a schedule and I only look at what it flags.",
-    "I am an operations person who writes code. Most of my projects started as something tedious I was doing manually, like chasing missing signatures on account packages, and turned into a script that does it for me. I would rather fix a process than get faster at working around it."
+    "I'm an operations person who writes code. Most of my projects started as something tedious I was doing manually, like chasing missing signatures on account packages, and turned into a script that does it for me. I'd rather fix a process than get faster at working around it."
   ],
 
   "track_c_risk_compliance": [
-    "I work in operations at an advisory firm, where a good part of my day is making sure client files hold up to review. I audit onboarding paperwork against the requirements before an account opens, and I clean up records that do not have what they should. Getting the documentation right is most of the job.",
-    "My current work is compliance-adjacent operations. I check client paperwork against identity and suitability requirements, and I have drafted securities filings for a smaller firm on the side. I am used to work where the standard is whether a file would survive someone auditing it.",
-    "I spend my day on documentation review and exception handling at an advisory firm. When a record is missing a required agreement, finding and fixing that is my task. It is not glamorous work but it is the kind that keeps a firm out of trouble."
+    "I work in operations at an advisory firm, where a good part of my day is making sure client files hold up to review. I audit onboarding paperwork against the requirements before an account opens, and I clean up records that don't have what they should. Getting the documentation right is most of the job.",
+    "My current work is compliance-adjacent operations. I check client paperwork against identity and suitability requirements, and I've drafted securities filings for a smaller firm on the side. I'm used to work where the standard is whether a file would survive someone auditing it.",
+    "I spend my day on documentation review and exception handling at an advisory firm. When a record is missing a required agreement, finding and fixing that is my task. It's not glamorous work but it is the kind that keeps a firm out of trouble."
   ],
 
   "track_d_business_intelligence": [
@@ -34,29 +34,29 @@
   ],
 
   "track_e_bizops": [
-    "Working within the operations side of an investment advisory firm, I sit on the same floor as our billing department. Over time I have made it a point to shadow their team, which gave me a clear look at how daily order intake and billing cycles actually run. Much of my own day is already auditing contracts and resolving discrepancies in Salesforce.",
-    "I work in operations at an advisory firm, one desk over from the billing team. My own day is contract review and clearing discrepancies in Salesforce, and I have spent enough time with the billing side to understand how invoices get built and what makes them go wrong. The workflows in your posting look familiar.",
-    "My role is operations at an investment advisory firm, where I manage a shared Salesforce queue and audit agreements before they are processed. Billing sits next to us, and I have made a point of learning how their cycle works from order intake through to the invoice going out. It is the same discipline applied to a different ledger."
+    "Working within the operations side of an investment advisory firm, I sit on the same floor as our billing department. Over time I've made it a point to shadow their team, which gave me a clear look at how daily order intake and billing cycles actually run. Much of my own day is already auditing contracts and resolving discrepancies in Salesforce.",
+    "I work in operations at an advisory firm, one desk over from the billing team. My own day is contract review and clearing discrepancies in Salesforce, and I've spent enough time with the billing side to understand how invoices get built and what makes them go wrong. The workflows in your posting look familiar.",
+    "My role is operations at an investment advisory firm, where I manage a shared Salesforce queue and audit agreements before they are processed. Billing sits next to us, and I've made a point of learning how their cycle works from order intake through to the invoice going out. It is the same discipline applied to a different ledger."
   ],
 
   "_bridges_comment": "Paragraph 2. Selected by tone_mode, not track. A 'tech' company hears the automation framed as building, a 'conservative' one hears it as process discipline. Same facts either way. Keep these to two specifics maximum.",
 
   "bridges_conservative": [
     "The workflows in your job description feel familiar from where I sit now. I understand what has to be true before an invoice goes out, and I know how much that accuracy matters to everyone downstream.",
-    "The reason this role appeals to me is that I am already doing a version of it. I check agreements against records, resolve what does not match, and keep the file clean enough that the next person does not have to redo it. I would like to do that work in a role where it is the main focus rather than one piece of a wider desk.",
-    "I am used to a queue with a deadline attached. At my current firm, requests come in with a service window and it is on me to resolve them or escalate them before the clock runs out. That has taught me to sort what is urgent from what is merely noisy."
+    "The reason this role appeals to me is that I'm already doing a version of it. I check agreements against records, resolve what doesn't match, and keep the file clean enough that the next person doesn't have to redo it. I would like to do that work in a role where it is the main focus rather than one piece of a wider desk.",
+    "I'm used to a queue with a deadline attached. At my current firm, requests come in with a service window and it's on me to resolve them or escalate them before the clock runs out. That has taught me to sort what is urgent from what is merely noisy."
   ],
 
   "bridges_tech": [
-    "The workflows described in your posting are close to what I handle now, so the learning curve would be short. I have also written Python scripts to take over the reconciliations I was repeating by hand, so I tend to look for where a manual step can be removed.",
-    "The work in your posting overlaps with what I already do, which is contract review and fixing records that do not agree. I have built small tools to automate the repetitive parts of that, including a script that flags mismatches between two systems overnight. I bring that instinct with me rather than a mandate to rebuild anything.",
-    "I am comfortable in Salesforce and in the reporting around it, and I write Python where a check is worth automating. Mostly that has meant taking a weekly manual comparison and turning it into something that runs on its own. I would expect to spend my first months learning your process before suggesting changes to it."
+    "The workflows described in your posting are close to what I handle now, so the learning curve would be short. I've also written Python scripts to take over the reconciliations I was repeating by hand, so I tend to look for where a manual step can be removed.",
+    "The work in your posting overlaps with what I already do, which is contract review and fixing records that don't agree. I've built small tools to automate the repetitive parts of that, including a script that flags mismatches between two systems overnight. I bring that instinct with me rather than a mandate to rebuild anything.",
+    "I'm comfortable in Salesforce and in the reporting around it, and I write Python where a check is worth automating. Mostly that has meant taking a weekly manual comparison and turning it into something that runs on its own. I'd expect to spend my first months learning your process before suggesting changes to it."
   ],
 
   "closers": [
-    "I am looking to bring this background directly into a dedicated billing role. I would welcome the opportunity to support the team at {company} and help keep the order-to-cash process running smoothly.",
+    "I'm looking to bring this background directly into a dedicated billing role. I would welcome the opportunity to support the team at {company} and help keep the order-to-cash process running smoothly.",
     "I would like to bring this experience into the {job_title} role at {company}. I would welcome the chance to talk about how I could help the team.",
-    "I am hoping to move this kind of operations work into a more focused role, and the {job_title} position at {company} looks like the right fit. I would welcome the chance to discuss it."
+    "I'm hoping to move this kind of operations work into a more focused role, and the {job_title} position at {company} looks like the right fit. I would welcome the chance to discuss it."
   ],
 
   "signoffs": [

@@ -2049,3 +2049,16 @@ def test_cover_letter_billing_copy_only_reaches_billing_roles():
         assert "order-to-cash" not in letter, title
         assert "dedicated billing" not in letter, title
         assert "before an invoice goes out" not in letter, title
+
+
+def test_cover_letter_bank_uses_contractions():
+    """The hand-written reference letter contracts ("I've made it a point"). An all-formal bank
+    reads stiff and machine-written, which is the exact failure mode this copy exists to avoid.
+    Assert the habit is present across the prose pools rather than checking any one sentence."""
+    bank = m.load_cover_letter_templates()
+    prose_keys = [k for k in bank if k.startswith("track_") or k.startswith("bridges_")]
+    entries = [s for k in prose_keys for s in bank[k]]
+    contracted = [s for s in entries if re.search(r"\b(I've|I'm|I'd|don't|doesn't|it's|that's)\b", s)]
+    assert len(contracted) >= len(entries) // 2, (
+        f"only {len(contracted)}/{len(entries)} banked paragraphs use a contraction"
+    )
