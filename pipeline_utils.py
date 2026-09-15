@@ -864,7 +864,7 @@ def resolve_sent_email_backfill(to_header, job_rows):
 
 
 # ==============================================================================
-# CARMEN COLD 3/7/14 FOLLOW-UP LADDER (pure, no I/O)
+# CARMEN COLD 4/11/21 FOLLOW-UP LADDER (pure, no I/O)
 #
 # A networking contact gets three nudges at fixed offsets from the day they landed in
 # Carmen Cold, then stops. Distinct from followup_action()'s JOBS windows (+4/+9/+16 with
@@ -878,12 +878,12 @@ def resolve_sent_email_backfill(to_header, job_rows):
 # the next nightly pass with no trigger, no stamp, and nothing to configure.
 # ==============================================================================
 
-CARMEN_LADDER_DAYS = (3, 7, 14)
+CARMEN_LADDER_DAYS = (4, 11, 21)
 
 
 def carmen_ladder_rung(anchor, next_followup):
     """Which rung a Carmen Cold row currently sits on, from the gap between its anchor and
-    its scheduled date. 0 = not yet scheduled, 1/2/3 = the 3/7/14-day nudges, 4 = ladder done.
+    its scheduled date. 0 = not yet scheduled, 1/2/3 = the 4/11/21-day nudges, 4 = ladder done.
 
     Tolerates drift: the sequencer can only advance a row on a day it actually runs, so a
     date a day or two past its nominal rung still reads as that rung rather than falling off.

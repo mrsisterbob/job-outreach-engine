@@ -372,11 +372,11 @@ def test_needs_card_flags_withheld_buries_in_the_buried_section_and_summary(monk
 # ---- Carmen Cold in the follow-up cadence (sequencer scan + overdue + roleless bumps) ----
 
 def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeypatch):
-    """Carmen Cold is scanned by run_followup_sequencer() like the JOBS tabs, but runs the 3/7/14
-    people ladder. A row sitting on its first rung's due date draws follow-up #1 with a roleless
-    draft and is advanced to the 7-day rung."""
+    """Carmen Cold is scanned by run_followup_sequencer() like the JOBS tabs, but runs the
+    CARMEN_LADDER_DAYS people ladder. A row sitting on its first rung's due date draws follow-up
+    #1 with a roleless draft and is advanced to the second rung."""
     assert ("CC", "Carmen Cold") in m.SEQUENCER_SCAN_TABS
-    anchor = (_SEQ_TODAY - timedelta(days=3)).strftime("%Y-%m-%d")
+    anchor = (_SEQ_TODAY - timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d")
     cc_row = {"sheet_uuid": "cc-fu1", "company": "Nliven", "title": "", "name": "Dana Reyes",
               "status": "Applied", "date_added": anchor,
               "next_followup": _SEQ_TODAY.strftime("%Y-%m-%d"), "raw_priority": "High"}
@@ -389,7 +389,7 @@ def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeyp
 
     ready = result["followups_ready"]
     assert [r["sheet_uuid"] for r in ready] == ["cc-fu1"]
-    assert ready[0]["ladder_day"] == 3
+    assert ready[0]["ladder_day"] == m.CARMEN_LADDER_DAYS[0]
     draft = ready[0]["draft_text"]
     assert draft.startswith("Hi Dana Reyes,")
     assert "{" not in draft
@@ -412,12 +412,12 @@ def test_carmen_cold_undated_row_joins_the_ladder_instead_of_drafting(monkeypatc
     result = m.run_followup_sequencer(today=_SEQ_TODAY)
 
     assert result["followups_ready"] == []
-    expected = (_SEQ_TODAY + timedelta(days=3)).strftime("%Y-%m-%d")
+    expected = (_SEQ_TODAY + timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d")
     assert [(p["action"], p["next_followup"]) for p in enqueued] == [("update_snooze", expected)]
 
 
 def test_carmen_cold_row_is_never_auto_buried_to_died(monkeypatch):
-    """A networking contact is not a job application. A CC row that has exhausted the 3/7/14
+    """A networking contact is not a job application. A CC row that has exhausted the
     ladder is surfaced as 'going cold' for a human call - never an append_note/update_status->Died
     write, and no further nudges."""
     exhausted_nf = (_SEQ_TODAY - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -665,6 +665,67 @@ def test_apply_swipe_writes_status_applied_and_never_moves_tabs(monkeypatch):
     assert enqueued[0]["status"] == "Applied"
     assert enqueued[0]["sheet_uuid"] == "uuid-apply"
     assert "new_tab" not in enqueued[0]  # Status write only - no tab move
+
+
+def test_warm_on_a_job_row_starts_the_followup_ladder(monkeypatch):
+    """Moving a job row to Tetiana Warm is how Kevin marks "I engaged with this one", but the tab
+    is a location and the ladder keys off Status - followup_action() returns "none" for Matched at
+    every age. So /warm must also write Applied AND re-anchor Next Followup Date: cards are created
+    with a priority-derived +19d date, and any future date hard-skips the row, which is what made
+    the morning digest report "Overdue: 0" for rows that had already been emailed."""
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-warm", "sheet_tab": "Tetiana Cold", "contact_company": "Acme Corp"})
+    for name in ("send_telegram_message", "log_metric_event", "log_daily_activity",
+                 "add_company_cooldown", "upsert_company_identity"):
+        monkeypatch.setattr(m, name, lambda *a, **k: None)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    _dispatch("/warm")
+
+    actions = [p["action"] for p in enqueued]
+    assert actions == ["update_status", "set_status", "update_snooze"], actions
+    assert enqueued[0]["new_tab"] == "Tetiana Warm"
+    assert enqueued[1]["status"] == "Applied"
+    due = date.today() + timedelta(days=m.FOLLOWUP_1_DAYS)
+    expected = due.strftime("%Y-%m-%d")
+    assert enqueued[2]["next_followup"] == expected
+
+    # The row is now on rung 1 rather than skipped: the ladder fires on that date.
+    assert m.followup_action("Applied", date.today().strftime("%Y-%m-%d"), expected, due) == "send_followup_1"
+
+
+def test_warm_on_a_carmen_contact_does_not_write_applied(monkeypatch):
+    """A networking contact is not an application. Carmen rows run plan_carmen_followup instead,
+    and "Applied" is meaningless on a person - so the ladder writes must not fire there."""
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-cc", "sheet_tab": "Carmen Cold", "contact_company": "Acme Corp"})
+    for name in ("send_telegram_message", "log_metric_event", "log_daily_activity",
+                 "add_company_cooldown", "upsert_company_identity", "auto_expand_ats_slug"):
+        monkeypatch.setattr(m, name, lambda *a, **k: None)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    _dispatch("/warm")
+
+    assert [p["action"] for p in enqueued] == ["update_status"]
+    assert enqueued[0]["new_tab"] == "Carmen Warm"
+
+
+def test_cold_never_starts_the_followup_ladder(monkeypatch):
+    """/cold is a demotion. It must stay a pure tab move - writing Applied there would start a
+    follow-up clock on a row Kevin just set aside."""
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-cold", "sheet_tab": "Tetiana Warm", "contact_company": "Acme Corp"})
+    for name in ("send_telegram_message", "log_metric_event", "log_daily_activity",
+                 "add_company_cooldown", "upsert_company_identity"):
+        monkeypatch.setattr(m, name, lambda *a, **k: None)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+
+    _dispatch("/cold")
+
+    assert [p["action"] for p in enqueued] == ["update_status"]
 
 
 @pytest.mark.parametrize("command,short_id,expected_status", [

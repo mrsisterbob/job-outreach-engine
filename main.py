@@ -4763,7 +4763,7 @@ def run_followup_sequencer(today=None, dry_run=False):
     buries_suppressed = 0
 
     for rec in records:
-        # Carmen Cold runs the 3/7/14 people ladder instead of the JOBS +4/+9/+16 windows: these
+        # Carmen Cold runs the 4/11/21 people ladder instead of the JOBS +4/+9/+16 windows: these
         # are networking contacts, so the cadence is tighter and the sequence ends quietly rather
         # than burying. Rung is read from the row's own dates, so a contact dragged in by hand
         # joins the ladder on this pass with nothing to configure.
@@ -7007,12 +7007,44 @@ def process_webhook_payload_async(data):
             direction = "warm" if text == "/warm" else "cold"
             new_tab = resolve_smart_target_tab(mapping.get("sheet_tab"), direction)
             confirm_text = "🔥 Moved to Warm" if direction == "warm" else "🧊 Moved to Cold"
+
+            # /warm on a JOB row also starts the follow-up ladder. Moving a row to Tetiana Warm is
+            # how Kevin marks "I have engaged with this one", but the tab is a LOCATION and the
+            # ladder keys off Status: followup_action() returns "none" for Matched at every age, so
+            # a row could sit in Warm for weeks having been emailed and still report Overdue: 0.
+            # Carmen tabs are excluded - a networking contact is not an application, and the
+            # Carmen ladder (plan_carmen_followup) drives those rows instead.
+            starts_ladder = direction == "warm" and new_tab == "Tetiana Warm"
+            if starts_ladder:
+                confirm_text += " · Applied (follow-up ladder started)"
+
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, confirm_text)
             # Auto-ATS Expansion: Carmen-family contacts (Cold or Warm) get monitored for future /t job runs
             if new_tab.startswith("Carmen") and mapping.get("contact_company"):
                 threading.Thread(target=auto_expand_ats_slug, args=(mapping["contact_company"],), daemon=True).start()
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+            if starts_ladder:
+                # Queued AFTER the move so the row is in its destination tab when the Status write
+                # lands; set_status finds the row by sheet_uuid in whatever tab it now lives in.
+                enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status="Applied"))
+                # Re-anchor the follow-up date onto the ladder. Cards are created with a
+                # priority-derived date (calculate_followup_interval(5) = +19d), and
+                # followup_action() hard-skips any row whose Next Followup Date is still in the
+                # future - so without this the row would sit Applied and silently overdue-free for
+                # another two weeks. FOLLOWUP_1_DAYS from today puts it on rung 1.
+                ladder_start = (datetime.now() + timedelta(days=FOLLOWUP_1_DAYS)).strftime("%Y-%m-%d")
+                enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=ladder_start))
+                log_metric_event("applied", sheet_uuid)
+                log_daily_activity("applied_count")
+                company = mapping.get("contact_company")
+                if company:
+                    _APPLIED_CRM_CACHE["data"].add(str(company).strip().lower())
+                    normalized_company = normalize_company_for_match(company)
+                    if normalized_company:
+                        _APPLIED_CRM_CACHE["data"].add(normalized_company)
+                    add_company_cooldown(company)
+                    upsert_company_identity(company, crm_status="Tetiana Warm", applied=True)
             return
 
         if text == "/x":

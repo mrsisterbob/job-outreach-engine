@@ -850,25 +850,30 @@ def test_brand_token_matches_a_company_whose_domain_differs_from_its_legal_name(
     assert pu.domain_matches_company("a@autozone.com", "Auto Club") is False
 
 
-# ---- Carmen Cold 3/7/14 follow-up ladder ----
+# ---- Carmen Cold follow-up ladder ----
 
 _LADDER_TODAY = date(2026, 9, 12)
 
 
-def test_carmen_ladder_walks_three_seven_fourteen_then_stops():
-    """The whole point: three nudges at 3, 7 and 14 days from the day the contact landed."""
-    anchor = "2026-09-12"
+def test_carmen_ladder_walks_every_rung_then_stops():
+    """The whole point: three nudges at CARMEN_LADDER_DAYS offsets from the day the contact
+    landed. Dates are derived from the constant rather than hardcoded, so retuning the cadence
+    is a one-line change instead of a test rewrite."""
+    anchor_date = date(2026, 9, 12)
+    anchor = anchor_date.isoformat()
+    d1, d2, d3 = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS)
+
     action, nxt = pu.plan_carmen_followup(anchor, "", _LADDER_TODAY)
-    assert (action, nxt) == ("schedule", date(2026, 9, 15))
+    assert (action, nxt) == ("schedule", d1)
 
-    action, nxt = pu.plan_carmen_followup(anchor, "2026-09-15", date(2026, 9, 15))
-    assert (action, nxt) == ("nudge_1", date(2026, 9, 19))
+    action, nxt = pu.plan_carmen_followup(anchor, d1.isoformat(), d1)
+    assert (action, nxt) == ("nudge_1", d2)
 
-    action, nxt = pu.plan_carmen_followup(anchor, "2026-09-19", date(2026, 9, 19))
-    assert (action, nxt) == ("nudge_2", date(2026, 9, 26))
+    action, nxt = pu.plan_carmen_followup(anchor, d2.isoformat(), d2)
+    assert (action, nxt) == ("nudge_2", d3)
 
     # Final rung fires with no next date - the ladder ends rather than nagging forever.
-    action, nxt = pu.plan_carmen_followup(anchor, "2026-09-26", date(2026, 9, 26))
+    action, nxt = pu.plan_carmen_followup(anchor, d3.isoformat(), d3)
     assert (action, nxt) == ("nudge_3", None)
 
 
@@ -877,12 +882,12 @@ def test_carmen_ladder_starts_a_manually_moved_row_from_today():
     It must enter the ladder on the next pass, not be skipped and not fire all three at once."""
     action, nxt = pu.plan_carmen_followup("2026-01-04", "", _LADDER_TODAY)
     assert action == "schedule"
-    assert nxt == _LADDER_TODAY + timedelta(days=3)
+    assert nxt == _LADDER_TODAY + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
 
     # Same for a row with no Date Added at all.
     action, nxt = pu.plan_carmen_followup("", "", _LADDER_TODAY)
     assert action == "schedule"
-    assert nxt == _LADDER_TODAY + timedelta(days=3)
+    assert nxt == _LADDER_TODAY + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
 
 
 def test_carmen_ladder_is_quiet_until_due_and_after_exhaustion():
