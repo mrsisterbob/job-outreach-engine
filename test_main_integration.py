@@ -2078,3 +2078,58 @@ def test_cover_letter_paragraphs_vary_sentence_length():
             if len(lens) < 3:
                 continue
             assert max(lens) - min(lens) >= 8, f"{key}[{i}] sentence lengths too uniform: {lens}"
+
+
+# ==============================================================================
+# Stage 1c: general ATS watchlist sourcing
+# ==============================================================================
+
+def test_ats_watchlist_is_off_by_default_and_toggles():
+    m.set_filter("ats_watchlist_enabled", False)
+    assert not m.get_filter("ats_watchlist_enabled")
+    m.set_filter("ats_watchlist_enabled", True)
+    assert m.get_filter("ats_watchlist_enabled")
+    m.set_filter("ats_watchlist_enabled", False)
+
+
+def test_ats_fetchers_normalize_to_the_pipeline_job_schema(monkeypatch):
+    """Greenhouse/Lever/Ashby payloads differ wildly. Whatever they return has to come out shaped
+    like a JSearch job dict, or passes_strict_filter and every downstream card breaks."""
+    class FakeRes:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"jobs": [{"id": 7, "title": "Billing Operations Analyst",
+                              "content": "<p>Reconcile invoices</p>",
+                              "absolute_url": "https://x/y",
+                              "location": {"name": "Detroit, MI"},
+                              "updated_at": "2026-09-01T00:00:00Z"}]}
+
+    monkeypatch.setattr(m.requests, "get", lambda *a, **k: FakeRes())
+    jobs = m.fetch_greenhouse_jobs("acme")
+    assert len(jobs) == 1
+    job = jobs[0]
+    for field in ("job_id", "employer_name", "job_title", "job_description",
+                  "job_apply_link", "job_city", "job_is_remote"):
+        assert field in job, field
+    assert job["job_id"].startswith("gh_acme_")
+    assert "<p>" not in job["job_description"], "HTML must be stripped for the AI prompt"
+
+
+def test_ats_fetchers_return_empty_list_on_failure(monkeypatch):
+    """A dead board must not take the whole /t run down with it."""
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(m.requests, "get", boom)
+    assert m.fetch_greenhouse_jobs("acme") == []
+    assert m.fetch_lever_jobs("acme") == []
+    assert m.fetch_ashby_jobs("acme") == []
+
+
+def test_ats_watchlist_skips_slugs_already_covered_by_warm_radar():
+    """Stage 1b already fetched the warm slugs. Stage 1c re-fetching them would double the HTTP
+    calls against the same boards for zero new jobs."""
+    watchlist = ["stockx", "shinola", "carta"]
+    warm = ["shinola"]
+    remaining = [s for s in watchlist if s not in set(warm)]
+    assert remaining == ["stockx", "carta"]

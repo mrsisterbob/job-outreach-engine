@@ -5264,15 +5264,32 @@ def run_job_pipeline(chat_id=None, top_n=2):
             for job in jobs:
                 _add_candidate(job)
 
-    # Stage 1b: ATS direct-source expansion strictly scoped to Carmen Warm network companies -
-    # untracked general enterprise boards (ats_company_slugs) are intentionally never sourced here.
+    # Stage 1b: ATS direct-source expansion strictly scoped to Carmen Warm network companies.
     warm_ats_slugs = resolve_warm_company_ats_slugs()
     if warm_ats_slugs:
         if chat_id:
             send_status_update(chat_id, f"Stage 1b: Sourcing direct ATS postings from {len(warm_ats_slugs)} Carmen Warm companies...")
         for job in fetch_ats_jobs(warm_ats_slugs):
             _add_candidate(job)
-    
+
+    # Stage 1c: the general enterprise watchlist (ats_company_slugs), sourced straight from
+    # Greenhouse/Lever/Ashby with no API key and no aggregator in between. This is off by default
+    # and gated on the ats_watchlist_enabled filter, because these boards are national - a single
+    # large employer can return 1,700+ postings and drown the metro-area JSearch queries this
+    # pipeline is tuned around. passes_strict_filter() still applies the city/radius/salary gates
+    # inside _add_candidate, so what survives is genuinely local, but the raw volume is the reason
+    # this is opt-in rather than always on. Enable with /ats on.
+    if get_filter("ats_watchlist_enabled"):
+        watchlist = safe_list(get_filter("ats_company_slugs", []))
+        # Warm slugs already ran in 1b; re-fetching them here would double the HTTP calls.
+        watchlist = [s for s in watchlist if s not in set(warm_ats_slugs or [])]
+        if watchlist:
+            if chat_id:
+                send_status_update(chat_id, f"Stage 1c: Sourcing direct ATS postings from {len(watchlist)} watchlist companies...")
+            for job in fetch_ats_jobs(watchlist):
+                _add_candidate(job)
+
+
     logging.info(f"Stage 1 Complete: {raw_discovered_count} raw listings pulled, {len(candidate_pool)} candidates passed strict filter.")
     if raw_discovered_count == 0:
         send_health_alert(
@@ -6152,6 +6169,45 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, pitch_msg)
             return
 
+        ats_match = re.match(r"^/ats(?:\s+(on|off|list|add|remove)\s*(.*))?$", text, re.IGNORECASE)
+        if ats_match:
+            action = (ats_match.group(1) or "list").lower()
+            arg = (ats_match.group(2) or "").strip().lower()
+            slugs = safe_list(get_filter("ats_company_slugs", []))
+            if action == "on":
+                set_filter("ats_watchlist_enabled", True)
+                send_telegram_message(chat_id, f"✅ <b>ATS watchlist ON</b> - /t will now also source {len(slugs)} company boards directly.")
+            elif action == "off":
+                set_filter("ats_watchlist_enabled", False)
+                send_telegram_message(chat_id, "🚫 <b>ATS watchlist OFF</b> - /t sources JSearch + warm companies only.")
+            elif action == "add" and arg:
+                # Only persist a slug whose board actually resolves, so a typo never becomes a
+                # permanent no-op costing three HTTP calls on every future run.
+                added = []
+                for slug in re.split(r"[\s,]+", arg):
+                    if not slug or slug in slugs:
+                        continue
+                    found = len(fetch_greenhouse_jobs(slug)) + len(fetch_lever_jobs(slug)) + len(fetch_ashby_jobs(slug))
+                    if found:
+                        slugs.append(slug)
+                        added.append(f"{slug} ({found})")
+                set_filter("ats_company_slugs", slugs)
+                send_telegram_message(chat_id, f"➕ Added: {html.escape(', '.join(added))}" if added else "⚠️ No board resolved for that slug.")
+            elif action == "remove" and arg:
+                removed = [s for s in re.split(r"[\s,]+", arg) if s in slugs]
+                slugs = [s for s in slugs if s not in removed]
+                set_filter("ats_company_slugs", slugs)
+                send_telegram_message(chat_id, f"➖ Removed: {html.escape(', '.join(removed))}" if removed else "⚠️ Not on the list.")
+            else:
+                state = "ON" if get_filter("ats_watchlist_enabled") else "OFF"
+                send_telegram_message(
+                    chat_id,
+                    f"📋 <b>ATS Watchlist ({state})</b> - {len(slugs)} companies\n\n"
+                    f"<code>{html.escape(', '.join(slugs)) or 'empty'}</code>\n\n"
+                    "/ats on · /ats off · /ats add &lt;slug&gt; · /ats remove &lt;slug&gt;"
+                )
+            return
+
         if text == "/letter":
             mapping = resolve_reply_mapping(msg, chat_id, "/letter")
             if not mapping:
@@ -6380,7 +6436,8 @@ def process_webhook_payload_async(data):
                 "/cv, /resume - Compile tailored resume PDF\n"
                 "/prep - Interview talking points & reverse questions\n"
                 "/pitch - 30-second elevator pitch\n"
-                "/letter - Cover letter (same track as the resume)\n\n"
+                "/letter - Cover letter (same track as the resume)\n"
+                "/ats - Company board watchlist (on/off/add/remove)\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
                 "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"
