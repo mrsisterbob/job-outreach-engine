@@ -1522,6 +1522,32 @@ def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_
         logging.error(f"DB Message Mapping Save Error ({telegram_message_id}): {e}")
         return False
 
+def record_captured_contact(sheet_uuid, sheet_tab, contact_name="", contact_company="", contact_email=""):
+    """Persist a CRM contact that was created without a Telegram card behind it.
+
+    save_message_mapping() is the usual writer for sheet_row_map, but it keys on
+    telegram_message_id and bails when there isn't one. Contacts auto-captured from sent mail have
+    no card, so they never reached the table - which left is_verified_crm_contact() checking a
+    table that could not contain them, and made the sent-mail poller re-capture the same person on
+    every cycle. telegram_message_id is left NULL here; nothing reads it for these rows.
+    """
+    if not sheet_uuid:
+        return False
+    clean_email = str(contact_email or "").split(" [")[0].strip().lower()
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                INSERT OR REPLACE INTO sheet_row_map
+                (sheet_uuid, sheet_tab, contact_name, contact_company, contact_email, created_at)
+                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sheet_row_map WHERE sheet_uuid = ?), CURRENT_TIMESTAMP))
+            """, (sheet_uuid, sheet_tab, contact_name, contact_company, clean_email, sheet_uuid))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"DB Captured Contact Save Error ({sheet_uuid}): {e}")
+        return False
+
 def get_mapping_from_message_id(telegram_message_id):
     """Resolve a replied-to Telegram message back to its CRM sheet_uuid/tab, or None if unmapped."""
     if not telegram_message_id:
@@ -3738,6 +3764,20 @@ def capture_contacts_from_sent_mail():
             )
             if log_to_sheets_crm(payload):
                 captured += 1
+                # Record the contact locally BEFORE the Telegram send. is_verified_crm_contact()
+                # above reads sheet_row_map, so without this row the next poll re-captures the
+                # same sent message as a brand-new contact - the sheet-side guard would suppress
+                # the duplicate row, but the poller would still burn a write and fire a second
+                # "Contact Captured" alert every 15 minutes for as long as the message stays in
+                # the lookback window. save_message_mapping() requires a telegram_message_id and
+                # returns False without one, so this path records the mapping directly.
+                record_captured_contact(
+                    sheet_uuid=sheet_uuid,
+                    sheet_tab="Carmen Cold",
+                    contact_name=contact["name"],
+                    contact_company=contact["company"],
+                    contact_email=contact["email"],
+                )
                 logging.info(f"[SENT] Captured {contact['email']} ({contact['company']}) to Carmen Cold")
                 if TELEGRAM_CHAT_ID:
                     send_telegram_message(

@@ -57,6 +57,7 @@ const UUID_COL = 10;    // Column J - the only field ever used to identify/move/
 const NOTES_COL = 9;
 const FOLLOWUP_COL = 7;
 const STATUS_COL = 6;   // Column F - Status (shared JOBS/PEOPLE schema position)
+const PEOPLE_EMAIL_COL = 4; // Column D - Contact Email (PEOPLE only; JOBS col D is Role)
 
 // Canonical Status vocabulary, ordered least- to most-advanced. Mirrors
 // pipeline_utils.STATUS_VOCAB / status_rank() on the Python side. statusRank() returns the
@@ -233,6 +234,15 @@ function doPost(e) {
         payload.source || "Telegram /quick",
         payload.note || ""
       ];
+      // In-append dedup guard (PEOPLE): one row per email address per tab. Without this,
+      // quick_add appends unconditionally and any caller that re-sends the same contact - the
+      // 15-minute sent-mail poller especially - stacks a fresh row every cycle. Hand back the
+      // existing UUID so the caller's mapping still resolves to the row that is already there.
+      const existingPersonUuid = findPeopleDuplicate(sheet, payload.email);
+      if (existingPersonUuid !== null) {
+        return respondJSON({ status: "success", message: "duplicate suppressed", sheet_uuid: existingPersonUuid });
+      }
+
       const newRow = sheet.getLastRow() + 1;
       sheet.getRange(newRow, 1, 1, rowData.length).setValues([rowData]); // Columns A-I only
       sheet.getRange(newRow, UUID_COL).setValue(payload.sheet_uuid || ""); // Column J reserved for UUID
@@ -598,6 +608,38 @@ function findRecordBySheetUuid(ss, sheetUuid) {
   return null;
 }
 
+// Canonical key for spotting a PEOPLE row logged twice. Email is the only reliable identity for
+// a contact - names vary in spelling and capitalization across sources, addresses do not - so a
+// row with no email is never treated as a duplicate of anything. Returns "" for a blank email.
+function normalizePeopleKey(email) {
+  const raw = (email == null ? "" : email.toString()).toLowerCase();
+  // Strip the " [⚠️ Fallback Email]" style annotations main.py appends to an unverified address,
+  // so the annotated and bare forms of one address collapse to the same key.
+  const match = raw.match(/[\w.\-+]+@[\w.\-]+\.\w+/);
+  return match ? match[0].trim() : "";
+}
+
+// Returns the Sheet UUID (possibly "") of an existing PEOPLE row in `sheet` with the same
+// normalized email, or null when there is no duplicate. The PEOPLE mirror of
+// findLiveJobsDuplicate: quick_add previously appended unconditionally, so the 15-minute sent-mail
+// poller re-captured the same contact on every cycle the message stayed in its lookback window.
+// Killed is the PEOPLE archive and is skipped for the same reason Died is on the JOBS side - a
+// contact deliberately killed should be re-addable.
+function findPeopleDuplicate(sheet, email) {
+  if (sheet.getName() === "Killed") return null;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+  const targetKey = normalizePeopleKey(email);
+  if (!targetKey) return null;
+  const data = sheet.getRange(2, 1, lastRow - 1, SCHEMAS.PEOPLE.length).getValues();
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (normalizePeopleKey(data[i][PEOPLE_EMAIL_COL - 1]) === targetKey) {
+      return data[i][UUID_COL - 1] || "";
+    }
+  }
+  return null;
+}
+
 // Returns the Sheet UUID (possibly "") of an existing non-terminal JOBS row in `sheet` whose
 // normalized Company+Role matches (company, role), or null when there is no live duplicate.
 // "Non-terminal" = Status is not Rejected and the sheet is not the Died archive. Scans
@@ -680,6 +722,73 @@ function dedupeJobsTabs(dryRun) {
     });
 
     Logger.log("dedupeJobsTabs(dryRun=%s): %s duplicate row(s) %s.",
+               dryRun, totalDropped, dryRun ? "would be deleted" : "deleted");
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// One-time cleanup callable from the Apps Script editor. Collapses duplicate PEOPLE rows (same
+// normalized email) in every PEOPLE tab down to one row: winner = most-advanced Status, then
+// earliest Last Contact Date, then lowest row number - so a contact who progressed keeps the row
+// carrying that progress, and an all-equal pile keeps the original. dryRun (default true) only
+// logs; dryRun=false deletes the losers bottom-up under the script lock, then re-formats the tab.
+// Rows with no parsable email are never grouped. JOBS tabs are never touched.
+function dedupePeopleTabs(dryRun) {
+  if (dryRun === undefined) dryRun = true;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    Logger.log("dedupePeopleTabs: could not acquire script lock - aborting, nothing changed.");
+    return;
+  }
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const peopleTabs = ALL_TABS.filter(name => TAB_MAP[name] === "PEOPLE" && name !== "Killed");
+    let totalDropped = 0;
+
+    peopleTabs.forEach(tabName => {
+      const sheet = ss.getSheetByName(tabName);
+      if (!sheet || sheet.getLastRow() < 3) return; // need >=2 data rows for a duplicate
+
+      const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, SCHEMAS.PEOPLE.length).getValues();
+      const groups = {};
+      values.forEach((row, idx) => {
+        const key = normalizePeopleKey(row[PEOPLE_EMAIL_COL - 1]);
+        if (!key) return; // no parsable email - leave alone
+        (groups[key] = groups[key] || []).push({
+          rowNum: idx + 2,
+          uuid: row[UUID_COL - 1] || "",
+          rank: statusRank(row[STATUS_COL - 1]),
+          lastContact: (row[0] || "").toString()
+        });
+      });
+
+      const loserRows = [];
+      Object.keys(groups).forEach(key => {
+        const rows = groups[key];
+        if (rows.length < 2) return;
+        const sorted = rows.slice().sort((a, b) => {
+          if (b.rank !== a.rank) return b.rank - a.rank;                         // most-advanced Status
+          if (a.lastContact !== b.lastContact) return a.lastContact < b.lastContact ? -1 : 1; // earliest
+          return a.rowNum - b.rowNum;                                            // lowest row number
+        });
+        const keeper = sorted[0];
+        const losers = sorted.slice(1);
+        losers.forEach(l => loserRows.push(l.rowNum));
+        totalDropped += losers.length;
+        Logger.log("[%s] email='%s' KEEP uuid=%s (row %s) | DROP %s rows: %s",
+                   tabName, key, keeper.uuid || "(none)", keeper.rowNum, losers.length,
+                   losers.map(l => "row" + l.rowNum).join(", "));
+      });
+
+      if (!dryRun && loserRows.length > 0) {
+        loserRows.sort((a, b) => b - a).forEach(rowNum => sheet.deleteRow(rowNum)); // bottom-up
+        formatSheet(sheet);
+        Logger.log("[%s] deleted %s duplicate row(s).", tabName, loserRows.length);
+      }
+    });
+
+    Logger.log("dedupePeopleTabs(dryRun=%s): %s duplicate row(s) %s.",
                dryRun, totalDropped, dryRun ? "would be deleted" : "deleted");
   } finally {
     lock.releaseLock();
