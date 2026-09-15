@@ -3,7 +3,7 @@
 [![Tests](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml)
 <!-- AUTO-STATS:START -->
 ![Lines of source](https://img.shields.io/badge/source-9284_lines-c9a24b)
-![Tests](https://img.shields.io/badge/tests-259-4a8a5c)
+![Tests](https://img.shields.io/badge/tests-260-4a8a5c)
 <!-- AUTO-STATS:END -->
 
 An AI-assisted job search pipeline: sources listings from multiple job boards, screens/tailors

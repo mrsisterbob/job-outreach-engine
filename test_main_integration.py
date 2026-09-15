@@ -1992,7 +1992,7 @@ def test_cover_letter_every_combo_is_clean_and_well_formed():
         assert letter.startswith("Dear Acme Hiring Team,"), ctx
         assert letter.endswith("\n\nBest regards,\nKevin Miller"), ctx
         assert letter.count("\n\n") == 5, ctx
-        assert 110 <= len(letter.split()) <= 185, f"{ctx} words={len(letter.split())}"
+        assert 110 <= len(letter.split()) <= 200, f"{ctx} words={len(letter.split())}"
         for word in banned:
             assert not re.search(rf"\b{re.escape(word)}\b", letter, re.I), f"{ctx} {word}"
 
@@ -2062,3 +2062,19 @@ def test_cover_letter_bank_uses_contractions():
     assert len(contracted) >= len(entries) // 2, (
         f"only {len(contracted)}/{len(entries)} banked paragraphs use a contraction"
     )
+
+
+def test_cover_letter_paragraphs_vary_sentence_length():
+    """Uniform sentence length is the loudest tell of generated text. The hand-written reference
+    letter runs 13/20/25/24/27/16/16 words - a standard deviation above 5. Any banked paragraph
+    whose sentences all land within a couple of words of each other reads flat, so require real
+    variance in every multi-sentence entry."""
+    bank = m.load_cover_letter_templates()
+    for key, pool in bank.items():
+        if key.startswith("_") or key in ("signoffs", "openers"):
+            continue
+        for i, entry in enumerate(pool):
+            lens = [len(s.split()) for s in re.split(r"(?<=\.)\s+", entry) if s.strip()]
+            if len(lens) < 3:
+                continue
+            assert max(lens) - min(lens) >= 8, f"{key}[{i}] sentence lengths too uniform: {lens}"

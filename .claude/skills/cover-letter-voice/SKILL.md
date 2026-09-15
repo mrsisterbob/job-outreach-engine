@@ -46,25 +46,76 @@ Why it works, in priority order:
 4. **It is slightly under-qualified in tone.** He is asking to move into this work, not
    announcing he has mastered it. For a 1-3 years posting that reads as honest.
 
-## Hard rules for any banked sentence
+## The 20 rules
 
-- **Never claim a function Kevin has not held.** `evidence_bank.json` is the only source of
-  truth for what he has done. It contains **no billing bullet** - if a claim about billing,
-  invoicing, or AR is not in that file, it must be framed as adjacency ("I sit next to",
-  "I have shadowed", "one desk over") or not written.
-- **No colons, no semicolons, no em/en dashes.** `sanitize_text()` in `main.py` deletes them.
-- **Never write a single-word "X, Y, and Z" triple.** `sanitize_text()` rewrites it to "X and Y"
-  and silently drops the third item.
-- **Two specifics per paragraph, maximum.** A third turns the paragraph into a resume.
-- **No banned words.** They hot-reload from `evidence_bank.json`'s `banned_words`.
-- **Short sentences.** If one needs a comma-spliced list of tools, split it in two.
-- **Contractions are fine and preferred.** "I've made it a point" reads human; "I have made it
-  a point" reads stiff. The reference letter uses them.
+Rules 1-8 are what make the reference letter sound like a person. Rules 9-15 are the failure
+modes that make copy sound generated. Rules 16-20 are mechanical constraints this codebase
+imposes. When they conflict, the lower number wins.
 
-Things that make a letter sound machine-written, all of which are banned here: opening with a
-throat-clearing clause about the industry ("Given the analytical demands of modern publishing"),
-naming the company without saying anything about it, stacking three metrics in one sentence, and
-any sentence that would be equally true of forty other applicants.
+**Structure and stance**
+
+1. **Concede before you claim.** Lead with what you have *not* done, then what you have seen from
+   next to it. "I sit on the same floor as our billing department" earns every sentence after it.
+   A letter that opens by asserting expertise has nothing left to prove and reads like everyone
+   else's.
+2. **Explain the mechanism, don't assert the skill.** "I understand the mechanics behind
+   reconciling accounts and ensuring data parity before invoices go out" shows the knowledge.
+   "Expert in reconciliation" only claims it. Anyone can claim.
+3. **Say why you want it, not just that you can do it.** "I am looking to bring this background
+   directly into a dedicated billing role" tells them this is a deliberate move. Ambition that
+   names its direction is more credible than enthusiasm.
+4. **Write slightly under your level.** These are 1-3 year postings. Sounding like you have
+   already mastered the job reads as either a lie or as someone who will leave in six months.
+5. **One concrete anchor per paragraph, and make it physical.** A floor, a desk, a queue, a
+   morning. "I sit on the same floor" beats "I have exposure to billing operations" because a
+   reader can picture it.
+
+**Rhythm**
+
+6. **Average about 20 words per sentence, and vary hard.** The reference letter runs 13, 20, 25,
+   24, 27, 16, 16. Uniform sentence length is the single loudest tell of generated text, in
+   either direction: all-long reads as bureaucratic, all-short reads as clipped and robotic.
+   Never write three consecutive sentences within two words of each other.
+7. **Avoid the sub-10-word sentence in body paragraphs.** "My day is data integrity work." is
+   punchy in isolation and mechanical in a letter. The reference letter has none.
+8. **Use contractions where speech would.** "I've made it a point", "it doesn't match". An
+   all-formal letter reads stiff. Do not contract everything either; "I am writing to express my
+   interest" is correct as-is because that opener is a convention.
+
+**Things that make copy sound generated**
+
+9. **No throat-clearing opener.** Never begin with a clause about the industry or the state of
+   the market ("Given the analytical demands of modern publishing"). Start at the point.
+10. **No tricolon.** "Clean billing schedules, cross-department handoffs, and rapid dispute
+    resolution" is the most recognizable LLM cadence there is. Two items, or restructure.
+11. **No sentence that would be true of forty other applicants.** "I am detail-oriented and
+    thrive in fast-paced environments" carries zero information. Cut or replace with the specific
+    thing you actually did.
+12. **No stacked metrics.** One number per paragraph at most. Three numbers in a sentence reads
+    as a resume that wandered into the wrong field.
+13. **No adjective pile-up.** "Comprehensive, detail-oriented operational support" is three words
+    doing the work of none. Prefer a verb.
+14. **Do not name the company more than twice**, and never in consecutive sentences. Repeating it
+    is what a mail-merge does.
+15. **No closing flourish.** "I would be thrilled for the opportunity to contribute to your
+    continued success" is filler. End on a concrete offer or a plain request.
+
+**Mechanical constraints of this codebase**
+
+16. **Never claim a function that is not in `evidence_bank.json`.** It has no billing bullet. Any
+    billing/invoicing/AR claim must be framed as adjacency or not written. This is the one rule
+    that gets a letter thrown out if broken.
+17. **No colons, semicolons, em dashes or en dashes.** `sanitize_text()` deletes them, mid-sentence,
+    silently.
+18. **No single-word "X, Y, and Z" triple.** `sanitize_text()` rewrites it to "X and Y" and drops
+    the third item. This overlaps rule 10 and is enforced by a test.
+19. **No banned words.** They hot-reload from `evidence_bank.json`'s `banned_words`.
+20. **Nothing role-specific in a shared pool.** `openers`, `bridges_*`, `closers` and `signoffs`
+    are used by every track. A word like "billing" or "invoice" belongs in a track pool or behind
+    the title gate in `generate_cover_letter()`.
+
+Rules 6, 7, 10, 17, 18, 19 and 20 are enforced by tests. The rest are judgment, which is why
+step 4 of the workflow below is reading the letter aloud.
 
 ## How the file is structured
 
