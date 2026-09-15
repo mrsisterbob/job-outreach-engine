@@ -1452,6 +1452,32 @@ def test_seniority_and_experience_demands_push_a_role_down():
     assert m.calculate_hybrid_score_modifier(entry_exp, 70)[1] > m.calculate_hybrid_score_modifier(deep_exp, 70)[1]
 
 
+def test_engineering_titles_cannot_reach_the_tier1_card_gate():
+    """A "Salesforce Developer (Remote)" at Mariner, $68.1k-$178k, scored 83 and dispatched a
+    Tier-1 card. Nothing caught it: the seniority regex only knew seniority WORDS, so a different
+    job family took no penalty, while the description maxed the tool-keyword bonus by naming
+    Salesforce/SQL/Python and the $178k ceiling maxed the salary bonus. The engineering penalty
+    has to outweigh a fully-maxed keyword+salary stack, not merely dent it."""
+    dev = {"employer_name": "Mariner", "job_city": "", "job_is_remote": True,
+           "job_min_salary": 68100, "job_max_salary": 178000,
+           "job_title": "Salesforce Developer (Remote)",
+           "job_description": ("Salesforce developer. Apex, Visualforce, Lightning Web Components, "
+                               "SQL, Python, ETL and API integrations. 5+ years of development experience.")}
+    # Even with a generous Gemini base, the final score must stay under the >= 80 Tier-1 cut.
+    assert m.calculate_hybrid_score_modifier(dev, 70)[0] < 80
+    assert m.calculate_hybrid_score_modifier(dev, 79)[0] < 80
+
+    for title in ("Data Engineer", "Software Engineer", "Solutions Architect",
+                  "Programmer Analyst", "DevOps Engineer"):
+        role = dict(dev, job_title=title)
+        assert m.calculate_hybrid_score_modifier(role, 70)[1] < 0, title
+
+    # ...and the ops roles Kevin actually wants are untouched by the new penalty.
+    ops = dict(dev, job_title="Business Operations Analyst",
+               job_description="Salesforce cleanup, SQL reporting, DocuSign onboarding. 1-2 years.")
+    assert m.calculate_hybrid_score_modifier(ops, 70)[1] > 0
+
+
 def test_negative_layer1_modifiers_pass_through_uncapped():
     """Penalties are never trimmed by the stacking cap - a call-centre listing must be able to
     fall as far as its modifiers take it."""

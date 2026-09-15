@@ -2121,6 +2121,7 @@ def build_system_prompt():
     return f"""You are a strict technical job screener and template router evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
 High Priority Skills: Python, SQL, Salesforce, Excel, Schwab SAC, Fidelity Wealthscape, DocuSign, Process Automation.
 Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles, retail bank tellers, CPA tracks, Senior/Lead/Manager roles.
+ALSO FORBIDDEN - software engineering job families. The candidate writes Python and SQL to automate his own operations work; he is NOT a professional software engineer and cannot compete for engineering reqs. Score 1-24 any role whose TITLE is Developer, Engineer, Architect, Programmer, SWE, SDET or DevOps (for example "Salesforce Developer", "Data Engineer", "Software Engineer"), however many of his tools the description names. A posting naming Salesforce, SQL or Python is not a match on that basis alone - what matters is whether the ROLE is operations work.
 
 EVIDENCE BANK (the only source of truth for this candidate's real background):
 {evidence_block}
@@ -2237,6 +2238,14 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     # same reason: they are the roles actually winnable at 0-2 years.
     if re.search(r'\b(senior|sr\.?|lead|principal|staff|head of|director|vp|manager|mgr)\b', title):
         bonus -= 18
+    # Wrong job family, read off the title. Seniority words were the only title filter, so a
+    # "Salesforce Developer" or "Data Engineer" - a different profession, not a senior version of
+    # this one - took no penalty at all, while its description maxed out the tool-keyword bonus
+    # (+12) by naming Salesforce/SQL/Python repeatedly and the salary bonus (+10) on a six-figure
+    # engineering ceiling. That is how a $178k Salesforce Developer req scored 83 and cleared the
+    # 80-point Tier-1 card gate. -30 so a maxed keyword+salary stack cannot buy it back.
+    elif re.search(r'\b(developer|engineer|engineering|architect|programmer|swe|sdet|devops)\b', title):
+        bonus -= 30
     elif re.search(r'\b(junior|jr\.?|associate|entry[ -]?level|analyst i|i{1,2}\b|coordinator|specialist)\b', title):
         bonus += 6
 
@@ -3950,8 +3959,8 @@ def backfill_contact_emails_from_sent_mail():
 
 
 def scheduled_email_poll_job():
-    """APScheduler job target: fires exactly once every 15 minutes, independent of webhook load."""
-    logging.info("[POLL] 15-minute email poll cycle triggered")
+    """APScheduler job target: fires on the EMAIL_POLL_HOURS cadence, independent of webhook load."""
+    logging.info("[POLL] Email poll cycle triggered")
     try:
         check_inbound_gmail_replies()
     except Exception as e:
@@ -3964,23 +3973,40 @@ def scheduled_email_poll_job():
         backfill_contact_emails_from_sent_mail()
     except Exception as e:
         logging.error(f"[POLL] Contact-email Back-fill Error: {e}")
-    logging.info("[POLL] 15-minute email poll cycle completed")
+    logging.info("[POLL] Email poll cycle completed")
+
+# How often the Gmail poller runs, in hours. Was a hardcoded 15 minutes, which cost more than it
+# returned: each cycle takes SQLite write locks (BEGIN IMMEDIATE, 5s busy_timeout) for inbound
+# replies, sent-mail capture and email back-fill, so a cycle landing mid-/t contends with the
+# pipeline's own writes across 20 concurrently scored jobs. Once a day is the default; set
+# EMAIL_POLL_HOURS to tune it, or EMAIL_POLL_ENABLED=false to turn scheduled polling off
+# entirely. /poll always runs a cycle on demand regardless of either setting.
+EMAIL_POLL_HOURS = float(os.environ.get("EMAIL_POLL_HOURS", "24"))
+EMAIL_POLL_ENABLED = os.environ.get("EMAIL_POLL_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
 
 def start_gmail_poller():
-    """Register the Gmail reply poller on a strict 15-minute interval trigger (APScheduler),
+    """Register the Gmail reply poller on an EMAIL_POLL_HOURS interval trigger (APScheduler),
     replacing the old fixed-sleep thread loop. Ensures polling never runs on webhook requests.
+
+    No longer fires immediately on boot. Render restarts the container on every deploy, so an
+    immediate run meant a full poll cycle competing with startup - and with whatever /t was
+    dispatched right after - each time the service came up.
     """
+    if not EMAIL_POLL_ENABLED:
+        EMAIL_POLL_SCHEDULER.start()
+        logging.info("[POLL] Scheduled Gmail polling DISABLED (EMAIL_POLL_ENABLED=false). Use /poll to run on demand.")
+        return
     EMAIL_POLL_SCHEDULER.add_job(
         scheduled_email_poll_job,
         trigger="interval",
-        minutes=15,
+        hours=EMAIL_POLL_HOURS,
         id="gmail_inbound_poll",
-        next_run_time=datetime.now(),  # fire once immediately on boot, then every 15 minutes
+        next_run_time=datetime.now() + timedelta(hours=EMAIL_POLL_HOURS),
         max_instances=1,
         coalesce=True
     )
     EMAIL_POLL_SCHEDULER.start()
-    logging.info("[POLL] Gmail inbound poller scheduled: every 15 minutes")
+    logging.info(f"[POLL] Gmail inbound poller scheduled: every {EMAIL_POLL_HOURS} hour(s)")
 
 # Overridable so the host can point backups at the same mounted disk as JOBS_DB_PATH. Backups
 # written next to the code are lost with the container on every deploy - a snapshot that dies
@@ -6568,6 +6594,21 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
             return
 
+        if text == "/poll":
+            # On-demand email poll. Exists because the scheduled cadence is now daily (or off):
+            # when a reply is expected right now, this runs the same cycle without waiting for it.
+            # Off the request thread so the webhook still acknowledges instantly.
+            send_telegram_message(chat_id, "📬 Running email poll cycle...")
+            def _poll_and_notify():
+                try:
+                    scheduled_email_poll_job()
+                    send_telegram_message(chat_id, "✅ Email poll cycle complete.")
+                except Exception as e:
+                    logging.error(f"/poll Error: {e}")
+                    send_telegram_message(chat_id, f"❌ Poll error: {html.escape(str(e)[:200])}")
+            threading.Thread(target=_poll_and_notify, daemon=True).start()
+            return
+
         if text == "/prep":
             mapping = resolve_reply_mapping(msg, chat_id, "/prep")
             if not mapping:
@@ -6912,7 +6953,8 @@ def process_webhook_payload_async(data):
                 "/letter - Cover letter (same track as the resume)\n"
                 "/gear - Search breadth 1-5 (one dial for all sources)\n"
                 "/ats - Company board watchlist (on/off/add/remove)\n"
-                "/remote - Keyless remote feeds (on/off)\n\n"
+                "/remote - Keyless remote feeds (on/off)\n"
+                "/poll - Run the email poll cycle now (scheduled: daily)\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
                 "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"
