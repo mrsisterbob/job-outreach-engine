@@ -34,6 +34,7 @@ from pipeline_utils import (
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     is_guessed_contact_email, resolve_sent_email_backfill,
     is_role_mailbox, company_domain_of, name_from_email_local_part,
+    match_email_to_crm_company,
     plan_carmen_followup, CARMEN_LADDER_DAYS,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
     parse_job_command, parse_job_page_html, build_ingest_job_dict,
@@ -3447,6 +3448,43 @@ def is_verified_crm_contact(sender_raw):
 
     return None
 
+def match_unknown_sender_to_crm_company(sender_raw):
+    """Second-chance lookup for a sender the strict whitelist rejected: does their DOMAIN belong
+    to a company already tracked in the CRM?
+
+    is_verified_crm_contact() is an exact-address match, which is what keeps a 7,000-message inbox
+    out of Telegram. But it also silently swallows the one case that matters most - a reply from
+    someone at the target firm Kevin never emailed directly: a colleague looped into the thread, an
+    assistant answering for the manager, or an in-house recruiter picking up the req. Those land on
+    a brand-new address at a KNOWN company, get dropped, and are marked read, so they are invisible
+    in Telegram and in Gmail both.
+
+    Reuses the same domain->company matcher the sent-mail capture path uses, so "Signal Advisors"
+    still matches signaladvisors.com and a random unrelated domain still matches nothing. Returns a
+    crm_match-shaped dict (sheet_uuid deliberately blank - there is no row for this person) or None.
+
+    The caller alerts on this as UNVERIFIED and performs no CRM writes: a domain match is a reason
+    to show Kevin the message, never a reason to move a stage or record an interview outcome.
+    """
+    email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender_raw or "")
+    sender_email = email_match.group(0).lower().strip() if email_match else ""
+    if not sender_email or is_role_mailbox(sender_email):
+        return None
+    try:
+        company = match_email_to_crm_company(sender_email, get_all_crm_job_companies())
+    except Exception as e:
+        logging.error(f"Unknown-sender domain match error ({sender_email}): {e}")
+        return None
+    if not company:
+        return None
+    logging.info(f"[UNVERIFIED] {sender_email} is not a CRM contact, but its domain matches tracked company '{company}'")
+    return {
+        "name": name_from_email_local_part(sender_email),
+        "company": company,
+        "tab": "Unverified",
+        "sheet_uuid": "",
+    }
+
 def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
     """
     Classifies ATS email into 'interview', 'rejection', or 'general'.
@@ -3679,12 +3717,20 @@ def check_inbound_gmail_replies():
 
             # GATE 2: Strict CRM whitelist - zero tolerance for unverified senders
             crm_match = is_verified_crm_contact(sender)
+            is_unverified = False
+            if not crm_match:
+                # GATE 2b: not a known contact, but the domain may belong to a tracked company -
+                # a colleague, assistant or in-house recruiter replying from an address Kevin
+                # never emailed. Surfaced as unverified rather than dropped; see
+                # match_unknown_sender_to_crm_company() for why that case is worth the noise.
+                crm_match = match_unknown_sender_to_crm_company(sender)
+                is_unverified = bool(crm_match)
             if not crm_match:
                 logging.info(f"[BLOCKED] Unverified sender (not found in SQLite/Sheets CRM): {sender}")
                 requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
                 continue
 
-            logging.info(f"[ALLOWED] Verified CRM sender {sender} matched to {crm_match.get('company')} ({crm_match.get('tab')})")
+            logging.info(f"[ALLOWED] {'Unverified domain-match' if is_unverified else 'Verified CRM'} sender {sender} matched to {crm_match.get('company')} ({crm_match.get('tab')})")
 
             thread_link = html.escape(f"https://mail.google.com/mail/u/0/#inbox/{thread_id}", quote=True)
             match_name = html.escape(str(crm_match.get("name") or "Unknown"))
@@ -3698,7 +3744,12 @@ def check_inbound_gmail_replies():
                 "REJECTION": "⚠️ <b>Rejection Detected</b>\n"
             }
             status_line = status_badges.get(status_label, "")
-            if status_label == "INTERVIEW_SET":
+            # Outcome metrics and CRM routing are skipped for a domain-only match: there is no
+            # sheet_uuid to attach them to, and a guess about WHO replied must never move a stage
+            # or book an interview against the wrong row. Kevin gets the alert and decides.
+            if is_unverified:
+                logging.info(f"[UNVERIFIED] Skipping CRM writes for domain-match sender {sender}")
+            elif status_label == "INTERVIEW_SET":
                 log_metric_event("interview_set")
                 record_application_outcome(crm_match.get("sheet_uuid"), "interview", company=crm_match.get("company"))
             elif status_label == "REJECTION":
@@ -3707,14 +3758,24 @@ def check_inbound_gmail_replies():
             # Follow-up bump for every verified reply; Carmen Cold move + dated note for a live
             # human conversation (GENERAL). Never changes the alert text below - this is what makes
             # the *system* treat the thread as a priority, not a second notification.
-            try:
-                route_inbound_reply_to_crm(crm_match, status_label, subject, snippet)
-            except Exception as e:
-                logging.error(f"Inbound Reply CRM Routing Error ({msg_id}): {e}")
+            if not is_unverified:
+                try:
+                    route_inbound_reply_to_crm(crm_match, status_label, subject, snippet)
+                except Exception as e:
+                    logging.error(f"Inbound Reply CRM Routing Error ({msg_id}): {e}")
 
+            header_line = (
+                "📬 <b>New Gmail Reply!</b>" if not is_unverified
+                else "⚠️ <b>Unverified Reply (domain match)</b>"
+            )
+            unverified_note = (
+                "" if not is_unverified
+                else "<i>Not a CRM contact - matched by company domain. No CRM changes were made.</i>\n"
+            )
             alert_msg = (
-                f"📬 <b>New Gmail Reply!</b>\n\n"
+                f"{header_line}\n\n"
                 f"{status_line}"
+                f"{unverified_note}"
                 f"<b>From:</b> {html.escape(sender)}\n"
                 f"{crm_line}"
                 f"<b>Subject:</b> {html.escape(subject)}\n"
