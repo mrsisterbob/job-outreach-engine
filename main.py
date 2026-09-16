@@ -563,10 +563,17 @@ DEFAULT_SEARCH_FILTERS = {
     # ats_company_slugs these cannot be auto-discovered from a company name, so they are
     # curated by hand and seeded with the Metro Detroit financial employers Workday hosts.
     "workday_boards": [],
+    # Search phrases, scanned as a rolling 10-query slice per /t run. Each must read like a job
+    # TITLE someone would actually post, not a skills summary: JSearch reads the Google-for-Jobs
+    # surface, whose own guidance is to keep titles broad and put skills in keywords. Two former
+    # entries broke that rule and were replaced - "Financial Systems Process Automation" (four
+    # abstract nouns, not a title any employer writes) and "Custodial Operations Schwab Fidelity"
+    # (four terms ANDed, and "custodial" means janitorial outside finance, so it surfaced building
+    # maintenance rather than securities custody). /queries reports lifetime yield per phrase.
     "target_queries": [
         "Wealth Operations Farmington MI", "Fintech Operations Farmington MI",
-        "Business Operations Analyst Farmington MI", "Custodial Operations Schwab Fidelity Farmington MI",
-        "Financial Systems Process Automation Farmington MI", "Operations Specialist Farmington MI",
+        "Business Operations Analyst Farmington MI", "Investment Operations Analyst Farmington MI",
+        "Financial Systems Analyst Farmington MI", "Operations Specialist Farmington MI",
         "Salesforce Administrator Farmington MI", "Business Systems Analyst Farmington MI",
         "Financial Operations Analyst Birmingham MI", "Supply Chain Operations Analyst Farmington MI",
 
@@ -577,50 +584,50 @@ DEFAULT_SEARCH_FILTERS = {
         "Data Operations Analyst Warren MI", "Revenue Operations Analyst Detroit MI",
 
         "Wealth Management Operations Ann Arbor MI", "Business Intelligence Analyst Ann Arbor MI",
-        "Fintech Systems Analyst Ann Arbor MI", "Custodial Reconciliation Analyst Ann Arbor MI",
+        "Fintech Systems Analyst Ann Arbor MI", "Reconciliation Analyst Ann Arbor MI",
         "Salesforce Administrator Ann Arbor MI", "Operations Analyst Ann Arbor MI",
         "Business Systems Analyst Ann Arbor MI", "Financial Analyst Operations Ann Arbor MI",
         "Business Operations Analyst Plymouth MI", "Healthcare Operations Analyst Ann Arbor MI",
 
         "Wealth Operations Novi MI", "Fintech Operations Novi MI",
-        "Business Operations Analyst Novi MI", "Custodial Operations Schwab Fidelity Novi MI",
-        "Financial Systems Process Automation Novi MI", "Operations Specialist Novi MI",
+        "Business Operations Analyst Novi MI", "Reconciliation Analyst Novi MI",
+        "Middle Office Analyst Novi MI", "Operations Specialist Novi MI",
         "Salesforce Administrator Novi MI", "Business Systems Analyst Novi MI",
         "Client Success Operations Wixom MI", "Implementation Specialist Novi MI",
 
         "Wealth Operations Troy MI", "Fintech Operations Troy MI",
-        "Business Operations Analyst Troy MI", "Custodial Operations Schwab Fidelity Troy MI",
-        "Financial Systems Process Automation Troy MI", "Operations Specialist Troy MI",
+        "Business Operations Analyst Troy MI", "Investment Operations Analyst Troy MI",
+        "Brokerage Operations Analyst Troy MI", "Operations Specialist Troy MI",
         "Salesforce Administrator Troy MI", "Business Systems Analyst Troy MI",
         "Process Improvement Analyst Rochester MI", "ERP Systems Analyst Troy MI",
 
         "Wealth Operations Southfield MI", "Fintech Operations Southfield MI",
-        "Business Operations Analyst Southfield MI", "Custodial Operations Schwab Fidelity Southfield MI",
-        "Financial Systems Process Automation Southfield MI", "Operations Specialist Southfield MI",
+        "Business Operations Analyst Southfield MI", "Reconciliation Analyst Southfield MI",
+        "Financial Systems Analyst Southfield MI", "Operations Specialist Southfield MI",
         "Salesforce Administrator Southfield MI", "Business Systems Analyst Southfield MI",
         "Trade Operations Analyst Bloomfield MI", "Logistics Operations Analyst Southfield MI",
 
         "Wealth Operations Auburn Hills MI", "Fintech Operations Auburn Hills MI",
-        "Business Operations Analyst Auburn Hills MI", "Custodial Operations Schwab Fidelity Auburn Hills MI",
-        "Financial Systems Process Automation Auburn Hills MI", "Operations Specialist Auburn Hills MI",
+        "Business Operations Analyst Auburn Hills MI", "Portfolio Operations Analyst Auburn Hills MI",
+        "Business Process Analyst Auburn Hills MI", "Operations Specialist Auburn Hills MI",
         "Salesforce Administrator Auburn Hills MI", "Business Systems Analyst Auburn Hills MI",
         "Compliance Operations Specialist Sterling Heights MI", "Claims Operations Analyst Auburn Hills MI",
 
         "Wealth Operations Royal Oak MI", "Fintech Operations Royal Oak MI",
-        "Business Operations Analyst Royal Oak MI", "Custodial Operations Schwab Fidelity Royal Oak MI",
-        "Financial Systems Process Automation Royal Oak MI", "Operations Specialist Royal Oak MI",
+        "Business Operations Analyst Royal Oak MI", "Client Service Associate Royal Oak MI",
+        "Financial Systems Analyst Royal Oak MI", "Operations Specialist Royal Oak MI",
         "Salesforce Administrator Royal Oak MI", "Business Systems Analyst Royal Oak MI",
         "Treasury Operations Analyst Madison Heights MI", "Manufacturing Operations Analyst Royal Oak MI",
 
         "Wealth Operations Livonia MI", "Fintech Operations Livonia MI",
-        "Business Operations Analyst Livonia MI", "Custodial Operations Schwab Fidelity Livonia MI",
-        "Financial Systems Process Automation Livonia MI", "Operations Specialist Livonia MI",
+        "Business Operations Analyst Livonia MI", "Retirement Plan Administrator Livonia MI",
+        "Business Process Analyst Livonia MI", "Operations Specialist Livonia MI",
         "Salesforce Administrator Livonia MI", "Business Systems Analyst Livonia MI",
         "Onboarding Specialist Canton MI", "Cloud Operations Analyst Livonia MI",
 
         "Wealth Operations Dearborn MI", "Fintech Operations Dearborn MI",
-        "Business Operations Analyst Dearborn MI", "Custodial Operations Schwab Fidelity Dearborn MI",
-        "Financial Systems Process Automation Dearborn MI", "Operations Specialist Dearborn MI",
+        "Business Operations Analyst Dearborn MI", "Trust Operations Specialist Dearborn MI",
+        "Settlements Analyst Dearborn MI", "Operations Specialist Dearborn MI",
         "Salesforce Administrator Dearborn MI", "Business Systems Analyst Dearborn MI",
         "Data Operations Analyst Dearborn MI", "Procurement Operations Analyst Dearborn MI",
 
@@ -630,7 +637,7 @@ DEFAULT_SEARCH_FILTERS = {
         "Wealth Operations Clinton Township MI", "Fintech Operations Clinton Township MI",
         "Business Operations Analyst Clinton Township MI", "Operations Specialist Clinton Township MI",
         "Salesforce Administrator Clinton Township MI", "Business Systems Analyst Roseville MI",
-        "Financial Systems Process Automation Sterling Heights MI", "Client Operations Associate Mount Clemens MI",
+        "Fund Administration Analyst Sterling Heights MI", "Client Operations Associate Mount Clemens MI",
         "Business Operations Analyst Trenton MI", "Operations Specialist Grosse Pointe MI"
     ],
     "query_bank_pointer": 0
