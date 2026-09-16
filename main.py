@@ -3485,6 +3485,47 @@ def match_unknown_sender_to_crm_company(sender_raw):
         "sheet_uuid": "",
     }
 
+def is_thread_kevin_started(thread_id, access_token):
+    """True when this Gmail thread already contains a message Kevin SENT.
+
+    The last and widest of the three gates, and the one that catches what the other two
+    structurally cannot: a NEW participant in an existing conversation. An introduction
+    ("Kevin, meet Sarah at Vanguard - she's hiring"), a hiring manager looping in their
+    recruiter, or a contact replying from a personal address all arrive from a sender that
+    is neither a CRM contact (Gate 2) nor at a CRM company's domain (Gate 2b) - so both
+    drop them silently, and an introduction is the single highest-value email this pipeline
+    can receive.
+
+    Thread participation is the right trust signal because Kevin STARTED the conversation:
+    a stranger cannot inject themselves into a thread he began. That makes this safe to
+    trust where a bare sender check is not. Spam arrives in new threads, so Gate 1's
+    pre-filter and the two sender gates still carry the anti-spam load for first contact.
+
+    Checks the SENT label on the thread rather than parsing participants, so one API call
+    answers it. Errs toward False: a lookup failure silently falls through to the existing
+    behaviour rather than opening the gate.
+    """
+    if not thread_id or not access_token:
+        return False
+    try:
+        res = requests.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"format": "minimal"},
+            timeout=10,
+        )
+        if res.status_code != 200:
+            logging.info(f"Thread-participation check: HTTP {res.status_code} for thread {thread_id}")
+            return False
+        for message in res.json().get("messages", []):
+            if "SENT" in (message.get("labelIds") or []):
+                return True
+        return False
+    except Exception as e:
+        logging.error(f"Thread-participation check error ({thread_id}): {e}")
+        return False
+
+
 def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
     """
     Classifies ATS email into 'interview', 'rejection', or 'general'.
@@ -3718,6 +3759,7 @@ def check_inbound_gmail_replies():
             # GATE 2: Strict CRM whitelist - zero tolerance for unverified senders
             crm_match = is_verified_crm_contact(sender)
             is_unverified = False
+            match_reason = ""
             if not crm_match:
                 # GATE 2b: not a known contact, but the domain may belong to a tracked company -
                 # a colleague, assistant or in-house recruiter replying from an address Kevin
@@ -3725,12 +3767,27 @@ def check_inbound_gmail_replies():
                 # match_unknown_sender_to_crm_company() for why that case is worth the noise.
                 crm_match = match_unknown_sender_to_crm_company(sender)
                 is_unverified = bool(crm_match)
+            if not crm_match and is_thread_kevin_started(thread_id, access_token):
+                # GATE 2c: sender is a stranger, but this is a thread KEVIN STARTED - an
+                # introduction, a looped-in colleague, or a contact writing from a personal
+                # address. The widest gate and the last one, because it is the only one that
+                # can see a new participant in an existing conversation.
+                crm_match = {
+                    "name": name_from_email_local_part(sender),
+                    "company": "Unknown",
+                    "tab": "Thread participant",
+                    "sheet_uuid": "",
+                }
+                is_unverified = True
+                match_reason = "thread participant"
+            elif is_unverified:
+                match_reason = "domain match"
             if not crm_match:
                 logging.info(f"[BLOCKED] Unverified sender (not found in SQLite/Sheets CRM): {sender}")
                 requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
                 continue
 
-            logging.info(f"[ALLOWED] {'Unverified domain-match' if is_unverified else 'Verified CRM'} sender {sender} matched to {crm_match.get('company')} ({crm_match.get('tab')})")
+            logging.info(f"[ALLOWED] {'Unverified (' + match_reason + ')' if is_unverified else 'Verified CRM'} sender {sender} matched to {crm_match.get('company')} ({crm_match.get('tab')})")
 
             thread_link = html.escape(f"https://mail.google.com/mail/u/0/#inbox/{thread_id}", quote=True)
             match_name = html.escape(str(crm_match.get("name") or "Unknown"))
@@ -3766,12 +3823,13 @@ def check_inbound_gmail_replies():
 
             header_line = (
                 "📬 <b>New Gmail Reply!</b>" if not is_unverified
-                else "⚠️ <b>Unverified Reply (domain match)</b>"
+                else f"⚠️ <b>Unverified Reply ({html.escape(match_reason)})</b>"
             )
-            unverified_note = (
-                "" if not is_unverified
-                else "<i>Not a CRM contact - matched by company domain. No CRM changes were made.</i>\n"
-            )
+            unverified_notes = {
+                "domain match": "<i>Not a CRM contact - matched by company domain. No CRM changes were made.</i>\n",
+                "thread participant": "<i>New person in a thread you started - possibly an introduction. No CRM changes were made.</i>\n",
+            }
+            unverified_note = "" if not is_unverified else unverified_notes.get(match_reason, "")
             alert_msg = (
                 f"{header_line}\n\n"
                 f"{status_line}"
