@@ -2824,3 +2824,83 @@ def test_ingest_blocked_message_does_not_blame_linkedin_for_other_hosts(monkeypa
 
     assert ok is False
     assert "LinkedIn" not in message
+
+
+# ---- Funnel telemetry (why candidates were dropped) ----
+
+def test_funnel_trace_ranks_rejections_most_common_first():
+    """The summary exists so a 0-candidate run explains itself. Ordering matters: the dominant
+    reason is the one Kevin acts on."""
+    trace = m.FunnelTrace()
+    trace.raw = 112
+    for reason in ["city_allowlist"] * 94 + ["seniority"] * 8 + ["salary_floor"] * 5:
+        trace.note(reason)
+    trace.passed = 5
+
+    line = trace.summary_line()
+
+    assert line.startswith("112 raw -> 5 passed")
+    assert line.index("City not in metro allowlist: 94") < line.index("Too senior: 8")
+    assert line.index("Too senior: 8") < line.index("Below minimum salary: 5")
+
+
+def test_funnel_trace_is_silent_when_nothing_was_dropped():
+    trace = m.FunnelTrace()
+    trace.raw = 4
+    trace.passed = 4
+    assert trace.summary_line() == ""
+
+
+def test_funnel_trace_keeps_unlabeled_reasons_visible():
+    """A gate added without a FUNNEL_REJECTION_LABELS entry must still surface, under its raw
+    key - silently dropping it would recreate the blind spot this class exists to remove."""
+    trace = m.FunnelTrace()
+    trace.raw = 1
+    trace.note("some_new_gate")
+    assert "some_new_gate: 1" in trace.summary_line()
+
+
+def test_passes_strict_filter_records_the_gate_that_rejected(monkeypatch):
+    """The trace must name the ACTUAL gate, not just that something failed."""
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000,
+        "valid_cities": ["farmington", "detroit"],
+        "title_exclusions": [],
+        "company_exclusions": [],
+        "hard_ban_keywords": [],
+        "seniority_exclusions": [],
+    }.get(key, default if default is not None else []))
+
+    trace = m.FunnelTrace()
+    out_of_area = {
+        "employer_name": "Acme Corp",
+        "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL.",
+        "job_city": "Austin",
+        "job_state": "TX",
+    }
+
+    assert m.passes_strict_filter(out_of_area, trace=trace) is False
+    assert trace.reasons.get("out_of_state") == 1
+
+
+def test_passes_strict_filter_works_without_a_trace(monkeypatch):
+    """trace is optional - every existing caller passes nothing and must keep working."""
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000,
+        "valid_cities": ["farmington"],
+    }.get(key, default if default is not None else []))
+
+    job = {
+        "employer_name": "Acme Corp",
+        "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL.",
+        "job_city": "Austin",
+        "job_state": "TX",
+    }
+
+    assert m.passes_strict_filter(job) is False

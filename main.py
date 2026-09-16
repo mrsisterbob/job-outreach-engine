@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import contextlib
+import hashlib
 import sqlite3
 import sys
 import threading
@@ -2896,7 +2897,68 @@ def _passes_remote_filter(job):
     return True
 
 
-def passes_strict_filter(job):
+# ==============================================================================
+# FUNNEL TELEMETRY
+# ==============================================================================
+# Every gate below silently returns False, which is correct for the pipeline and terrible for
+# diagnosis: a run reporting "112 raw listings, 2 passed strict criteria" gives no way to tell
+# whether 110 jobs died on the city allowlist, the salary floor, or content dedup. That ambiguity
+# is what made a dedup bug look for weeks like an over-tuned filter.
+#
+# FunnelTrace is a per-run counter, not a persisted table: the question it answers ("where did
+# THIS run's jobs go?") is always about the run in front of you, and pipeline_metrics already
+# covers long-horizon counts. Kept deliberately dumb - a dict, a note() call per gate, and one
+# formatted summary - so adding a gate is a one-line change and can never raise into the pipeline.
+
+FUNNEL_REJECTION_LABELS = {
+    "dedup_title": "Already seen (company+title)",
+    "dedup_content": "Already seen (description)",
+    "board_id_employer": "Employer looks like a board ID",
+    "company_cooldown": "Company on 14-day cooldown",
+    "already_applied": "Already applied (Tetiana Warm)",
+    "salary_floor": "Below minimum salary",
+    "out_of_state": "Outside Michigan",
+    "city_allowlist": "City not in metro allowlist",
+    "expired": "Posting expired",
+    "experience_salary": "Experience demand vs. salary",
+    "title_exclusion": "Excluded title",
+    "company_exclusion": "Excluded company",
+    "hard_ban_keyword": "Hard-ban keyword in description",
+    "seniority": "Too senior",
+    "no_systems_anchor": "Finance role, no systems anchor",
+}
+
+
+class FunnelTrace:
+    """Counts why candidates were dropped during one pipeline run."""
+
+    def __init__(self):
+        self.raw = 0
+        self.passed = 0
+        self.reasons = {}
+
+    def note(self, reason):
+        """Record one rejection. Unknown reasons are counted under their raw key rather than
+        dropped, so a gate added without a label still shows up in the summary."""
+        self.reasons[reason] = self.reasons.get(reason, 0) + 1
+
+    def summary_line(self):
+        """One-line funnel breakdown, most common rejection first, or "" when nothing was dropped."""
+        if not self.reasons:
+            return ""
+        ranked = sorted(self.reasons.items(), key=lambda kv: kv[1], reverse=True)
+        parts = [f"{FUNNEL_REJECTION_LABELS.get(key, key)}: {count}" for key, count in ranked]
+        return f"{self.raw} raw -> {self.passed} passed | " + " · ".join(parts)
+
+
+def passes_strict_filter(job, trace=None):
+    """True when a job clears every hard gate. `trace`, if given, records WHICH gate rejected it -
+    see FunnelTrace above for why that is worth threading through."""
+    def reject(reason):
+        if trace is not None:
+            trace.note(reason)
+        return False
+
     title = str(job.get("job_title") or "").lower()
     description = str(job.get("job_description") or "").lower()
     company = str(job.get("employer_name") or "").lower()
@@ -2911,24 +2973,24 @@ def passes_strict_filter(job):
     raw_employer = str(job.get("employer_name") or "").strip()
     if raw_employer and " " not in raw_employer and raw_employer == raw_employer.upper() and any(c.isdigit() for c in raw_employer):
         logging.info(f"[EXCLUDED] employer_name '{raw_employer}' looks like a job-board ID, not a real company.")
-        return False
+        return reject("board_id_employer")
 
     if is_company_on_cooldown(company):
-        return False
+        return reject("company_cooldown")
     applied_companies = get_applied_crm_companies()
     clean_company = normalize_company_for_match(company)
     if company in applied_companies or clean_company in applied_companies:
         logging.info(f"[EXCLUDED] {company} is already in Tetiana Warm (applied).")
-        return False
+        return reject("already_applied")
 
     min_sal_floor = safe_int(get_filter("min_salary"), 50000)
     if max_sal > 0 and max_sal < min_sal_floor:
-        return False
+        return reject("salary_floor")
 
     # Same-named city in another state (e.g. Birmingham AL vs. Birmingham MI) would otherwise
     # pass the city substring check below - reject it first when the API told us the state.
     if state and state not in ("mi", "michigan"):
-        return False
+        return reject("out_of_state")
 
     valid_cities = get_filter("valid_cities", [])
     # Metro-area allowlist only (~35mi of Farmington MI via radius_miles) - state=="MI" alone is NOT
@@ -2939,7 +3001,12 @@ def passes_strict_filter(job):
     # city missing from the list is silently dropped here, not sourced-but-then-filtered.
     is_in_metro_area = any(c in city for c in valid_cities)
     if not is_in_metro_area:
-        return False
+        # Logged with the city, not just counted: this allowlist is hand-maintained, so a real
+        # in-radius suburb missing from it looks identical to a genuine out-of-area reject. The
+        # city name is the only way to tell them apart, and the only way to know what to add.
+        if trace is not None:
+            logging.info(f"[EXCLUDED] city '{city}' not in valid_cities allowlist")
+        return reject("city_allowlist")
 
     # JSearch/OpenWebNinja can flag a posting as expired (job board removed it since being scraped)
     # even though it's still returned for the "month" date_posted window - reject it outright when
@@ -2949,22 +3016,22 @@ def passes_strict_filter(job):
         try:
             expiry_dt = datetime.fromisoformat(str(expiration).replace("Z", "+00:00"))
             if expiry_dt < datetime.now(timezone.utc):
-                return False
+                return reject("expired")
         except (ValueError, TypeError):
             pass
 
     exp_floor = safe_int(get_filter("experience_salary_floor"), 60000)
     if any(k in description for k in ["3+ years", "3-5 years", "4+ years"]) and (0 < max_sal < exp_floor):
-        return False
+        return reject("experience_salary")
 
     if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
-        return False
+        return reject("title_exclusion")
     if any(comp in company for comp in get_filter("company_exclusions", [])):
-        return False
+        return reject("company_exclusion")
     if any(trigger in description for trigger in get_filter("hard_ban_keywords", [])):
-        return False
+        return reject("hard_ban_keyword")
     if any(sen in title for sen in get_filter("seniority_exclusions", [])):
-        return False
+        return reject("seniority")
 
     # Gate wealth/finance roles: require at least one systems, automation, or tooling anchor
     if any(term in title or term in description for term in ["wealth", "financial", "advisor", "branch", "banking"]):
@@ -2973,7 +3040,7 @@ def passes_strict_filter(job):
             "docusign", "reconciliation", "excel", "hubspot", "api", "etl"
         ]
         if not any(k in description for k in core_systems_keywords):
-            return False
+            return reject("no_systems_anchor")
 
     return True
 
@@ -6278,27 +6345,44 @@ def run_job_pipeline(chat_id=None, top_n=2):
     seen_hashes = set()
     candidate_pool = []
     raw_discovered_count = 0
+    funnel = FunnelTrace()
 
     def _add_candidate(job):
         nonlocal raw_discovered_count
         raw_discovered_count += 1
+        funnel.raw += 1
         company = job.get("employer_name") or ""
         title = job.get("job_title") or ""
         job_hash = generate_dedup_hash(company, title)
         if job_hash in seen_hashes or is_job_seen_db(job_hash):
+            funnel.note("dedup_title")
             return
         seen_hashes.add(job_hash)
-        save_seen_job_db(job_hash)
 
-        # Fuzzy content dedup: catches identical postings cross-posted under reworded titles/companies
+        # Fuzzy content dedup: catches identical postings cross-posted under reworded titles.
+        # "" means the description was missing or too short to identify a job - never dedup on
+        # that, or the first description-less posting buries every later one (see
+        # compute_description_simhash).
         content_hash = compute_description_simhash(job.get("job_description"))
-        if is_content_seen(content_hash):
+        if content_hash and is_content_seen(content_hash):
+            funnel.note("dedup_content")
             return
-        save_content_hash(content_hash)
 
         log_metric_event("listing_discovered", source=derive_job_source(job.get("job_id")))
-        if passes_strict_filter(job):
-            candidate_pool.append(job)
+        if not passes_strict_filter(job, trace=funnel):
+            # Deliberately NOT marked seen. A rejected job is not a job Kevin has considered - it
+            # failed today's filters, in today's posted state. Recording it here is what buried
+            # hundreds of roles: a posting rejected once for a missing salary or a city not yet on
+            # the allowlist could never be reconsidered, even after the filters changed or the
+            # employer reposted it with better data. Only jobs that actually reach the candidate
+            # pool are remembered, so the ledger means "seen and judged", not "glanced at once".
+            return
+
+        save_seen_job_db(job_hash)
+        if content_hash:
+            save_content_hash(content_hash)
+        funnel.passed += 1
+        candidate_pool.append(job)
     
     # Stage 1: Parallel JSearch fetching (rolling 10-query slice) + strict filtering
     headers, api_url = build_jsearch_request_config()
@@ -6368,11 +6452,18 @@ def run_job_pipeline(chat_id=None, top_n=2):
             "validity and the target_queries filter - this usually means the API key expired or every "
             "query is misconfigured, and it will silently produce zero candidates every run until fixed."
         )
+    funnel_line = funnel.summary_line()
+    if funnel_line:
+        logging.info(f"[FUNNEL] {funnel_line}")
     if chat_id:
+        # The funnel breakdown rides along with the ingest count so a 0-candidate run explains
+        # itself in Telegram instead of requiring a log dig.
+        funnel_block = f"🔎 <b>Dropped:</b> {html.escape(funnel_line)}\n" if funnel_line else ""
         send_status_update(
             chat_id,
             f"📊 <b>Batch Ingested:</b> {raw_discovered_count} raw listings pulled.\n"
             f"🎯 <b>Filtered:</b> {len(candidate_pool)} passed strict criteria.\n"
+            f"{funnel_block}"
             f"🧠 <b>Stage 2:</b> Running Gemini AI scoring & Hope Alumni cross-referencing..."
         )
     
@@ -6829,6 +6920,43 @@ def process_webhook_payload_async(data):
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
             send_telegram_message(chat_id, "\n".join(lines))
             return
+        if text == "/unbury" or text == "/unbury go":
+            # Repairs the damage the empty-description simhash collision already did. Every job
+            # dropped by that bug was recorded against the SAME poisoned hash (the empty-string
+            # MD5), so deleting that one row makes every posting hidden behind it eligible again.
+            # Also clears seen_jobs rows that were written before a job had been judged - the
+            # pre-fix _add_candidate marked jobs seen BEFORE passes_strict_filter ran, so rejected
+            # postings are sitting in the ledger as if Kevin had already considered them.
+            commit = text.endswith(" go")
+            EMPTY_DESC_HASH = hashlib.md5(b"").hexdigest()
+            try:
+                with get_db_conn() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM seen_content_hashes WHERE content_hash = ?", (EMPTY_DESC_HASH,))
+                    poisoned = cursor.fetchone()[0]
+                    cursor.execute("SELECT COUNT(*) FROM seen_jobs")
+                    total_seen = cursor.fetchone()[0]
+                    cursor.execute("SELECT COUNT(*) FROM seen_jobs WHERE seen_count <= 1 AND first_seen < datetime('now', '-1 day')")
+                    stale_singles = cursor.fetchone()[0]
+                    if commit:
+                        conn.execute("BEGIN IMMEDIATE")
+                        conn.execute("DELETE FROM seen_content_hashes WHERE content_hash = ?", (EMPTY_DESC_HASH,))
+                        conn.execute("DELETE FROM seen_jobs WHERE seen_count <= 1 AND first_seen < datetime('now', '-1 day')")
+                        conn.commit()
+                send_telegram_message(
+                    chat_id,
+                    (f"🪦 <b>Unbury {'complete' if commit else '(preview)'}</b>\n\n"
+                     f"Poisoned empty-description hash rows: <b>{poisoned}</b>\n"
+                     f"seen_jobs total: <b>{total_seen}</b>\n"
+                     f"Seen-once rows older than a day: <b>{stale_singles}</b>\n\n"
+                     + ("✅ Cleared. Those jobs can surface again on the next <code>/t</code>."
+                        if commit else
+                        "Nothing was deleted. Run <code>/unbury go</code> to clear them."))
+                )
+            except Exception as e:
+                send_telegram_message(chat_id, f"⚠️ Unbury failed: {html.escape(str(e))}")
+            return
+
         if text == "/health":
             db_check_start = time.time()
             try:

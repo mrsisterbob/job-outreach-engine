@@ -555,12 +555,27 @@ def extract_work_style(job):
     return "On-Site / Unspecified"
 
 
+MIN_SIMHASH_TOKENS = 8
+
+
 def compute_description_simhash(text: str) -> str:
-    """Computes a normalized SimHash token on the core job description."""
+    """Normalized SimHash token for a job description, or "" when the text cannot identify a job.
+
+    Returning "" (rather than the MD5 of an empty string) is the whole point of this signature.
+    The old version hashed every description-less posting to d41d8cd9... - the empty-string MD5 -
+    so the FIRST such job saved that token to seen_content_hashes and every later one collided
+    with it and was dropped, permanently and silently, across all future runs. Greenhouse returned
+    no description at all until the content=true fix, and Workday's list endpoint still does before
+    its detail fetch, so a single poisoned hash could bury an unbounded number of unrelated jobs.
+
+    A too-short description is the same hazard in slower motion: two 3-word blurbs collide far more
+    easily than two real postings, so anything under MIN_SIMHASH_TOKENS tokens is treated as
+    unidentifiable too. Callers MUST treat "" as "no content signature - do not dedup on this".
+    """
     clean = re.sub(r'[^a-zA-Z0-9\s]', '', str(text or "")[:400].lower())
     tokens = clean.split()
-    if not tokens:
-        return hashlib.md5(b"").hexdigest()
+    if len(tokens) < MIN_SIMHASH_TOKENS:
+        return ""
     # Normalize 3-grams to catch reworded titles with identical bodies
     shingles = [" ".join(tokens[i:i+3]) for i in range(max(1, len(tokens)-2))]
     return hashlib.md5("".join(sorted(shingles)).encode()).hexdigest()

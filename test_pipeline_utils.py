@@ -380,6 +380,33 @@ def test_compute_description_simhash_empty_text_does_not_raise():
     assert pu.compute_description_simhash("") == pu.compute_description_simhash(None)
 
 
+def test_compute_description_simhash_returns_blank_for_unidentifiable_text():
+    """Empty/short descriptions must yield "" (no signature), NOT a real hash.
+
+    Regression guard for the bug that buried hundreds of roles: every description-less posting
+    used to hash to the empty-string MD5, so the first one saved that token and every later one
+    collided with it and was dropped permanently. Greenhouse returned no description at all
+    before the content=true fix, so one poisoned hash could bury unbounded unrelated jobs.
+    """
+    assert pu.compute_description_simhash("") == ""
+    assert pu.compute_description_simhash(None) == ""
+    assert pu.compute_description_simhash("   ") == ""
+    assert pu.compute_description_simhash("Operations analyst role") == ""
+
+
+def test_compute_description_simhash_distinguishes_real_postings():
+    """Two unrelated real postings must not collide - the dedup is only safe above the
+    MIN_SIMHASH_TOKENS floor, and must still do its actual job there."""
+    a = ("We are seeking an operations analyst to manage reconciliation workflows "
+         "using SQL and Salesforce across our wealth platform.")
+    b = ("The healthcare operations specialist will drive process improvement across "
+         "intake, billing and claims using Excel and internal tooling.")
+    hash_a, hash_b = pu.compute_description_simhash(a), pu.compute_description_simhash(b)
+    assert hash_a and hash_b
+    assert hash_a != hash_b
+    assert hash_a == pu.compute_description_simhash(a)
+
+
 # ---- Email waterfall (network calls mocked/disabled) ----
 
 def test_resolve_email_waterfall_falls_back_without_api_keys(monkeypatch):
