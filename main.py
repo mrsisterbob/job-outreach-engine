@@ -74,8 +74,13 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 # any other host, and localhost is the dev default.
 BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL") or "http://localhost:5000").rstrip("/")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
-JSEARCH_TIMEOUT_SECONDS = 12
+JSEARCH_TIMEOUT_SECONDS = 25  # deep pages are slow; 12s dropped whole queries on a 0.5-CPU instance
 JSEARCH_MAX_RETRIES = 1  # additional attempts beyond the first, on timeout/429/5xx
+# Pages 1-3 only. JSearch orders by relevance, so a metro-scoped query has its real matches on the
+# first page or two and nothing but noise after - and the rolling pointer used to walk to page 20,
+# where every request timed out and the query returned nothing at all.
+JSEARCH_PAGES_PER_RUN = 2
+JSEARCH_MAX_PAGE = 3
 JSEARCH_SEMAPHORE = threading.Semaphore(4)  # cap concurrent OpenWebNinja requests to avoid rate-limit timeouts
 # 100-Query Rolling Master Engine: one oddball theme per 10-query slice, used to badge wildcard matches
 ODDBALL_KEYWORDS = ["supply chain", "revenue operations", "healthcare", "implementation", "erp", "logistics", "claims", "manufacturing", "cloud operations", "procurement", "transformation"]
@@ -5649,10 +5654,28 @@ def fetch_single_query_jobs(query_args):
     is_remote_query = "remote" in query.lower()
     radius_miles = safe_int(get_filter("radius_miles"), 45)
     start_page = get_query_start_page(query)
+    # Never page past JSEARCH_MAX_PAGE. Relevance is ordered, so page 1 holds the best matches for
+    # a metro-scoped query and the tail is noise - and worse, deep pages are slow enough that they
+    # time out on a 0.5-CPU instance. A run where the pointer had walked into pages 4-5 returned
+    # ZERO raw listings across all ten queries: every page timed out, the only candidates came from
+    # ATS boards, and the run looked like a filter problem when JSearch had simply never answered.
+    if start_page > JSEARCH_MAX_PAGE:
+        start_page = 1
     all_jobs = []
-    for offset in range(3):
+    for offset in range(JSEARCH_PAGES_PER_RUN):
         page = start_page + offset
-        params = {"query": query, "page": str(page), "num_pages": "1", "date_posted": "month"}
+        if page > JSEARCH_MAX_PAGE:
+            break
+        params = {
+            "query": query,
+            "page": str(page),
+            "num_pages": "1",
+            "date_posted": "month",
+            # Without this JSearch answers a "... Auburn Hills MI" query with postings in Singapore,
+            # Dubai, Warsaw and Gibraltar. They are all rejected downstream, but they consume the
+            # page budget that local listings should have filled.
+            "country": "us",
+        }
         if not is_remote_query and radius_miles:
             params["radius"] = str(radius_miles)
         time.sleep(0.3)  # stagger outbound requests to avoid slamming JSearch concurrently
@@ -5663,8 +5686,8 @@ def fetch_single_query_jobs(query_args):
             break  # no more results or retries exhausted, stop paging early
     if is_remote_query:
         all_jobs = all_jobs[:1]
-    next_page = start_page + 3
-    if next_page > 20:
+    next_page = start_page + JSEARCH_PAGES_PER_RUN
+    if next_page > JSEARCH_MAX_PAGE:
         next_page = 1
     save_query_next_page(query, next_page)
     return all_jobs
@@ -7102,6 +7125,28 @@ def process_webhook_payload_async(data):
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
             send_telegram_message(chat_id, "\n".join(lines))
             return
+        if text == "/resetpages":
+            # The rolling pointer used to walk to page 20, and those offsets are persisted. Until
+            # they are cleared, queries keep resuming on a deep page that JSearch times out on -
+            # the cap in fetch_single_query_jobs only stops them going FURTHER.
+            try:
+                with get_db_conn() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM query_pagination WHERE last_page > ?", (JSEARCH_MAX_PAGE,))
+                    deep = cursor.fetchone()[0]
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("DELETE FROM query_pagination")
+                    conn.commit()
+                send_telegram_message(
+                    chat_id,
+                    (f"🔄 <b>Query pages reset</b>\n\n"
+                     f"Pointers past page {JSEARCH_MAX_PAGE}: <b>{deep}</b>\n"
+                     f"All pagination cleared - every query restarts at page 1.")
+                )
+            except Exception as e:
+                send_telegram_message(chat_id, f"⚠️ Reset failed: {html.escape(str(e))}")
+            return
+
         if text == "/queries":
             rows = get_query_yield_rows(limit=25)
             if not rows:
@@ -7969,6 +8014,7 @@ def process_webhook_payload_async(data):
                 "/funnel - View pipeline conversion funnel\n"
                 "/unbury - Preview buried-listing cleanup (add 'go' to clear)\n"
                 "/queries - Per-query yield: which search phrases earn their slot\n"
+                "/resetpages - Restart every query at JSearch page 1\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
                 "/treplies - View reply rate grouped by outreach & LinkedIn template id (read-only)\n"

@@ -3061,3 +3061,47 @@ def test_unknown_location_with_no_michigan_signal_is_still_rejected(_geo_filters
         trace = m.FunnelTrace()
         assert m.passes_strict_filter(_geo_job(city), trace=trace) is False
         assert trace.reasons.get("city_allowlist") == 1
+
+
+# ---- JSearch pagination bounds ----
+
+def test_jsearch_never_pages_past_the_max(monkeypatch):
+    """The rolling pointer used to walk to page 20, where every request timed out and a query
+    returned nothing - a whole run came back with 0 raw listings from all ten queries."""
+    requested = []
+
+    def _capture(api_url, headers, params, query, page):
+        requested.append(int(params["page"]))
+        return [{"job_id": f"x{page}"}], False
+
+    monkeypatch.setattr(m, "_fetch_jsearch_page_with_retry", _capture)
+    monkeypatch.setattr(m, "get_query_start_page", lambda q: 9)  # a stale deep pointer
+    monkeypatch.setattr(m, "save_query_next_page", lambda q, p: None)
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: 45 if key == "radius_miles" else default)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    m.fetch_single_query_jobs(("Operations Analyst Troy MI", "http://x", {}))
+
+    assert requested, "should have requested at least one page"
+    assert max(requested) <= m.JSEARCH_MAX_PAGE
+    assert requested[0] == 1, "a stale deep pointer must fall back to page 1"
+
+
+def test_jsearch_requests_are_scoped_to_the_us(monkeypatch):
+    """Without country=us, JSearch answers a '... Auburn Hills MI' query with postings in
+    Singapore, Dubai and Warsaw, which burn the page budget local listings should fill."""
+    seen = {}
+
+    def _capture(api_url, headers, params, query, page):
+        seen.update(params)
+        return [], True
+
+    monkeypatch.setattr(m, "_fetch_jsearch_page_with_retry", _capture)
+    monkeypatch.setattr(m, "get_query_start_page", lambda q: 1)
+    monkeypatch.setattr(m, "save_query_next_page", lambda q, p: None)
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: 45 if key == "radius_miles" else default)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    m.fetch_single_query_jobs(("Operations Analyst Troy MI", "http://x", {}))
+
+    assert seen.get("country") == "us"
