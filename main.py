@@ -7768,6 +7768,7 @@ def process_webhook_payload_async(data):
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
                 "/funnel - View pipeline conversion funnel\n"
+                "/unbury - Preview buried-listing cleanup (add 'go' to clear)\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
                 "/treplies - View reply rate grouped by outreach & LinkedIn template id (read-only)\n"
