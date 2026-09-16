@@ -71,6 +71,17 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
   your environment together (a mismatch fails closed - the webhook returns `Unauthorized`).
 - **Editing outreach copy without a redeploy:** use the Telegram `/edit` command, or edit
   `templates/*.json` / `resume_bullets_bank.json` directly - both are hot-reloaded on every use.
+- **Adding a job you found yourself:** `/job <linkedin-url>` pushes one hand-picked posting
+  through the *same* Stage 2 path `/t` uses (`process_single_candidate` → `dispatch_tier1_matches`),
+  so it lands in Tetiana Cold as a real card with a live `sheet_uuid` - swipe-reply (`/apply`,
+  `/n`, `/f`), the follow-up sequencer and `/funnel` all work on it. Unlike `/t` there is **no
+  score>=80 gate**: a posting you chose is already vetted, so any score writes the row.
+  Re-pasting the same job dedups instead of writing a second row.
+  - LinkedIn serves job pages to a logged-in browser, not to a server. `/job` reads the public
+    `jobs-guest` endpoint, which usually works; when it is blocked the command replies asking for
+    `/job Title @ Company <url>` rather than filing a `Manual Ingest` row. The desktop bookmarklet
+    (`POST /ingest`) scrapes inside your own session, so it always has the full description and
+    scores best - prefer it when you are at a desk.
 
 ## Tests
 

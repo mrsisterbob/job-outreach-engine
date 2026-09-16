@@ -30,8 +30,11 @@ import main as m  # noqa: E402  (must import after JOBS_DB_PATH is set)
 def clean_tables():
     """Truncate the tables under test before every test so cases don't bleed into each other."""
     with m.get_db_conn() as conn:
+        # seen_jobs/seen_content_hashes are the dedup ledgers: without truncating them, a test that
+        # ingests a posting makes every later test using the same company/title silently take the
+        # "already in the pipeline" branch instead of the path it meant to exercise.
         for table in ("crm_outbox", "sheet_row_map", "company_cooldown", "company_identities",
-                      "jobs", "followup_sequencer_log"):
+                      "jobs", "followup_sequencer_log", "seen_jobs", "seen_content_hashes"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
     yield
@@ -2513,3 +2516,270 @@ def test_t_warns_when_target_queries_is_empty(monkeypatch, sourcing_filters):
     _dispatch("/t")
     assert any("target_queries is empty" in s for s in sent)
     assert any("Scanning 0 target rules" in s for s in sent)
+
+
+# ---- Shared Tier-1 dispatch (/t and manual ingest) ----
+
+def _fake_match(score=88, clavicular=False, company="Huntington", title="FX Ops Analyst"):
+    """A minimal process_single_candidate() result - only the keys dispatch_tier1_matches reads."""
+    return {
+        "job": {
+            "employer_name": company,
+            "job_title": title,
+            "job_apply_link": "https://www.linkedin.com/jobs/view/4461280495/",
+        },
+        "score": score,
+        "reason": "Strong ops/settlement overlap",
+        "target_email": "ops@huntington.com",
+        "age_badge": "NEW",
+        "salary_str": "$65,000",
+        "work_style": "On-site",
+        "overlap_pct": 71,
+        "short_id": "abc123",
+        "sheet_uuid": "uuid-1",
+        "alumni_line": "",
+        "score_boost": 0,
+        "is_clavicular": clavicular,
+        "contact_name": "Dana" if clavicular else "",
+        "tone_mode": "conservative",
+    }
+
+
+def test_dispatch_tier1_writes_the_row_before_sending_the_card(monkeypatch):
+    """Ordering is load-bearing: a card carrying a sheet_uuid with no row behind it would leave
+    /apply, /n, /f and the follow-up sequencer resolving against nothing."""
+    order = []
+
+    def _write(p, **kw):
+        order.append(("write", p.get("target_code")))
+        return True
+
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: order.append(("card", None)))
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    sent = m.dispatch_tier1_matches([_fake_match()])
+
+    assert sent == 1
+    assert order == [("write", "TC"), ("card", None)]
+
+
+def test_dispatch_tier1_routes_standard_rows_to_tetiana_cold(monkeypatch):
+    captured = {}
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    m.dispatch_tier1_matches([_fake_match(clavicular=False)])
+
+    assert "TC" in captured and "CL" not in captured
+    row = captured["TC"]["rows"][0]["row_data"]
+    assert row[1] == "Huntington"        # company
+    assert row[2] == "FX Ops Analyst"    # title
+    assert row[5] == "Matched"           # status the sequencer keys off
+
+
+def test_dispatch_tier1_routes_clavicular_rows_to_the_clavicular_tab(monkeypatch):
+    captured = {}
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    m.dispatch_tier1_matches([_fake_match(clavicular=True)])
+
+    assert "CL" in captured and "TC" not in captured
+    assert "Warm Referral Matched: Dana" in captured["CL"]["rows"][0]["row_data"][8]
+
+
+def test_dispatch_tier1_withholds_the_card_when_the_crm_write_fails(monkeypatch):
+    cards = []
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda p, **kw: False)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: cards.append(1))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    assert m.dispatch_tier1_matches([_fake_match()]) == 0
+    assert cards == []
+
+
+def test_dispatch_tier1_note_prefix_marks_hand_pasted_rows(monkeypatch):
+    """The sheet note column is how Kevin tells a pasted row from a sourced one."""
+    captured = {}
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    m.dispatch_tier1_matches([_fake_match()], note_prefix="Manually ingested via /job")
+    assert captured["TC"]["rows"][0]["row_data"][8].startswith("Manually ingested via /job")
+
+    captured.clear()
+    m.dispatch_tier1_matches([_fake_match()])
+    assert captured["TC"]["rows"][0]["row_data"][8].startswith("Matched via Pipeline")
+
+
+def test_dispatch_tier1_handles_an_empty_match_list(monkeypatch):
+    def _fail(p, **kw):
+        pytest.fail("should not write")
+
+    monkeypatch.setattr(m, "log_to_sheets_crm", _fail)
+    assert m.dispatch_tier1_matches([]) == 0
+
+
+# ---- Manual job ingest orchestration (/job + bookmarklet) ----
+
+class _NoopThread:
+    def __init__(self, *a, **kw):
+        pass
+
+    def start(self):
+        pass
+
+
+def test_ingest_manual_job_lands_a_row_and_a_card(monkeypatch):
+    captured = {}
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    ok, message = m.ingest_manual_job(title="FX Ops Analyst", company="Huntington")
+
+    assert ok is True and message == ""
+    assert "TC" in captured
+
+
+def test_ingest_manual_job_has_no_score_gate(monkeypatch):
+    """A hand-picked job Kevin chose is already vetted - a 61 must still land in Tetiana Cold.
+    The >=80 Tier-1 gate exists to triage hundreds of machine-sourced listings, not this."""
+    captured = {}
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match(score=61))
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    ok, _ = m.ingest_manual_job(title="FX Ops Analyst", company="Huntington")
+
+    assert ok is True
+    assert captured["TC"]["rows"][0]["row_data"][4] == 61
+
+
+def test_ingest_manual_job_asks_for_typed_details_when_linkedin_blocks(monkeypatch):
+    """The auth wall is the normal datacenter outcome - it must prompt, not file a junk row."""
+    def _fail(p, **kw):
+        pytest.fail("no row should be written")
+
+    monkeypatch.setattr(m, "scrape_linkedin_job", lambda url, timeout=8: ("", "", ""))
+    monkeypatch.setattr(m, "log_to_sheets_crm", _fail)
+
+    ok, message = m.ingest_manual_job(url="https://www.linkedin.com/jobs/view/4461280495/")
+
+    assert ok is False
+    assert "@" in message  # shows the Title @ Company fallback form
+
+
+def test_ingest_manual_job_dedups_a_repasted_posting(monkeypatch):
+    def _no_score(job):
+        pytest.fail("should not re-score an already-seen posting")
+
+    def _no_write(p, **kw):
+        pytest.fail("no duplicate row")
+
+    monkeypatch.setattr(m, "process_single_candidate", _no_score)
+    monkeypatch.setattr(m, "log_to_sheets_crm", _no_write)
+    m.save_seen_job_db(m.generate_dedup_hash("Huntington", "FX Ops Analyst"))
+
+    ok, message = m.ingest_manual_job(title="FX Ops Analyst", company="Huntington")
+
+    assert ok is False
+    assert "Already in the pipeline" in message
+
+
+def test_ingest_manual_job_reports_an_ai_rejection_without_writing(monkeypatch):
+    def _no_write(p, **kw):
+        pytest.fail("no row without a score")
+
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_to_sheets_crm", _no_write)
+
+    ok, message = m.ingest_manual_job(title="Senior Rust Engineer", company="Acme")
+
+    assert ok is False
+    assert "AI screening" in message
+
+
+def test_ingest_manual_job_scrapes_when_only_a_url_is_given(monkeypatch):
+    """The happy path: a bare LinkedIn URL resolves to a real title/company via the scraper."""
+    captured = {}
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    monkeypatch.setattr(
+        m, "scrape_linkedin_job",
+        lambda url, timeout=8: ("FX Ops Analyst 2", "Huntington National Bank", "Settle trades."),
+    )
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    ok, _ = m.ingest_manual_job(
+        url="https://www.linkedin.com/jobs/search-results/?currentJobId=4461280495&refId=x"
+    )
+
+    assert ok is True
+    assert "TC" in captured
+
+
+def test_ingest_manual_job_skips_the_scrape_when_details_are_typed(monkeypatch):
+    """The explicit form must not pay for a doomed HTTP round trip."""
+    def _no_scrape(url, timeout=8):
+        pytest.fail("scrape should be skipped when title and company are supplied")
+
+    monkeypatch.setattr(m, "scrape_linkedin_job", _no_scrape)
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda p, **kw: True)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    ok, _ = m.ingest_manual_job(
+        url="https://www.linkedin.com/jobs/view/4461280495/",
+        title="FX Ops Analyst 2",
+        company="Huntington National Bank",
+    )
+    assert ok is True

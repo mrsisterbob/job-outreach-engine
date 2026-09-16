@@ -1,7 +1,6 @@
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import html
 import io
 import json
@@ -36,6 +35,8 @@ from pipeline_utils import (
     is_role_mailbox, company_domain_of, name_from_email_local_part,
     plan_carmen_followup, CARMEN_LADDER_DAYS,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
+    parse_job_command, parse_linkedin_job_html, build_ingest_job_dict,
+    canonical_linkedin_job_url, is_linkedin_job_url, strip_html_to_text,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
     REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
 )
@@ -5752,6 +5753,208 @@ def resolve_warm_company_ats_slugs():
             slugs.append(row[0])
     return list(dict.fromkeys(slugs))  # de-dup while preserving discovery order
 
+def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
+    """Land a set of scored matches in the CRM, then card the ones whose row actually wrote.
+
+    This is the single Tier-1 delivery path, shared by run_job_pipeline() and the manual-ingest
+    entrypoints (/job and POST /ingest). Extracted rather than duplicated because the ordering is
+    load-bearing: the CRM write happens FIRST and a card is withheld when its write failed, so a
+    card can never point at a sheet_uuid with no row behind it - which would leave /apply, /n, /f
+    and the follow-up sequencer resolving against nothing.
+
+    Rows route by the Clavicular flag (CL vs TC), matching what the caller already computed in
+    process_single_candidate. `note_prefix` distinguishes a hand-pasted row from a sourced one in
+    the sheet's note column; the Clavicular warm-referral note overrides it as before.
+
+    Returns the number of cards dispatched.
+    """
+    if not matches:
+        return 0
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
+
+    clavicular_rows = []
+    standard_rows = []
+    for item in matches:
+        job = item["job"]
+        is_clavicular = item.get("is_clavicular", False)
+        note = (
+            f"Warm Referral Matched: {item.get('contact_name', 'Contact')} | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
+            if is_clavicular else f"{note_prefix} | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
+        )
+        row = {
+            "sheet_uuid": item.get("sheet_uuid"),
+            "row_data": [
+                today_str,
+                job.get("employer_name"),
+                job.get("job_title"),
+                item["target_email"],
+                item["score"],
+                "Matched",
+                followup_date,
+                job.get("job_apply_link", ""),
+                note
+            ]
+        }
+        (clavicular_rows if is_clavicular else standard_rows).append(row)
+
+    written = {
+        True: log_to_sheets_crm(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows)) if clavicular_rows else True,
+        False: log_to_sheets_crm(build_crm_payload("batch_add_rows", target_code="TC", rows=standard_rows)) if standard_rows else True,
+    }
+    for is_clavicular, ok in written.items():
+        if not ok:
+            withheld = [
+                f"{m['job'].get('employer_name')} - {m['job'].get('job_title')} ({m['score']})"
+                for m in matches if m.get("is_clavicular", False) == is_clavicular
+            ]
+            tab = "Clavicular" if is_clavicular else "Tetiana Cold"
+            logging.error(f"Tier-1 CRM write to {tab} FAILED; withholding {len(withheld)} card(s): {withheld}")
+            send_health_alert(
+                f"Tier-1 CRM write to {tab} failed - {len(withheld)} card(s) withheld, rows NOT in the sheet: "
+                + "; ".join(withheld)
+            )
+
+    cards_sent = 0
+    for item in matches:
+        job = item["job"]
+        is_clavicular = item.get("is_clavicular", False)
+        if not written[is_clavicular]:
+            continue
+        send_telegram_card(
+            job, item["score"], item["target_email"],
+            item["age_badge"], item["salary_str"], item["work_style"],
+            item["overlap_pct"], item["short_id"],
+            sheet_uuid=item.get("sheet_uuid"),
+            alumni_line=item.get("alumni_line", ""),
+            sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates",
+            score_boost=item.get("score_boost", 0)
+        )
+        cards_sent += 1
+        time.sleep(1.1)
+
+    return cards_sent
+
+# LinkedIn's guest job endpoint: the one public surface that renders a posting without a session.
+# The logged-in /jobs/view/ page returns an auth wall to any server-side fetch, so a bare GET on
+# the URL Kevin copies out of his address bar yields nothing usable.
+_LINKEDIN_GUEST_JOB_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+_LINKEDIN_SCRAPE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def scrape_linkedin_job(url, timeout=8):
+    """Best-effort server-side fetch of a LinkedIn posting -> (title, company, description).
+
+    Tries the public jobs-guest endpoint first (no session required), then the canonical permalink.
+    Returns ("", "", "") when LinkedIn serves an auth wall or challenge, which is a NORMAL outcome
+    from a datacenter IP - callers must treat an empty result as "ask Kevin to type it", never as
+    an error. This is why /job accepts the explicit `Title @ Company <url>` form.
+    """
+    job_id = None
+    try:
+        from pipeline_utils import extract_linkedin_job_id
+        job_id = extract_linkedin_job_id(url)
+    except Exception:
+        pass
+
+    attempts = []
+    if job_id:
+        attempts.append(_LINKEDIN_GUEST_JOB_URL.format(job_id=job_id))
+        attempts.append(canonical_linkedin_job_url(url))
+    elif url:
+        attempts.append(str(url))
+
+    for attempt_url in attempts:
+        try:
+            res = requests.get(attempt_url, headers=_LINKEDIN_SCRAPE_HEADERS, timeout=timeout)
+        except Exception as e:
+            logging.warning(f"[INGEST] LinkedIn fetch failed for {attempt_url}: {e}")
+            continue
+        if res.status_code != 200 or not res.text:
+            logging.warning(f"[INGEST] LinkedIn returned {res.status_code} for {attempt_url}")
+            continue
+        title, company, description = parse_linkedin_job_html(res.text)
+        if title or company:
+            logging.info(f"[INGEST] Scraped '{title}' @ '{company}' ({len(description)} desc chars) from {attempt_url}")
+            return (title, company, description)
+
+    logging.info(f"[INGEST] No usable content scraped from {url} - auth wall or unsupported page")
+    return ("", "", "")
+
+
+def ingest_manual_job(url="", title="", company="", description="", chat_id=None, source_label="/job"):
+    """Run one hand-picked posting through the exact Stage 2 path /t uses, then land it in the CRM.
+
+    This is the shared core behind the Telegram /job command and the desktop bookmarklet's
+    POST /ingest. It deliberately reuses process_single_candidate() + dispatch_tier1_matches()
+    rather than reimplementing either, so a pasted job gets the same Gemini scoring, deterministic
+    bullet/template routing, JIT Hope-alumni lookup (which auto-creates the Carmen Warm contact),
+    warm/Clavicular routing and Tetiana Cold row that a pipeline-sourced one does.
+
+    One deliberate divergence from run_job_pipeline: there is NO score>=80 Tier-1 gate. Kevin
+    already vetted this posting by choosing to paste it, so the score is reported on the card but
+    never used to discard the row. A pasted job that scores 61 still lands in Tetiana Cold; the
+    gate exists to triage hundreds of machine-sourced listings, which is not this.
+
+    Returns (ok, message) for the caller to relay.
+    """
+    scraped_title, scraped_company, scraped_desc = ("", "", "")
+    if url and is_linkedin_job_url(url) and not (title and company):
+        scraped_title, scraped_company, scraped_desc = scrape_linkedin_job(url)
+
+    final_title = (title or scraped_title or "").strip()
+    final_company = (company or scraped_company or "").strip()
+    final_desc = (description or scraped_desc or "").strip()
+
+    if not (final_title and final_company):
+        return (False, (
+            "🔒 <b>LinkedIn blocked the page read.</b> That's expected - it won't serve job pages to a server.\n\n"
+            "Send it with the title and company spelled out instead:\n"
+            f"<code>/job Foreign Exchange Ops Analyst 2 @ Huntington National Bank {html.escape(str(url or ''))}</code>"
+        ))
+
+    job = build_ingest_job_dict(final_title, final_company, final_desc, url)
+
+    # Dedup against everything /t and previous pastes have already surfaced, so re-pasting a link
+    # you already ingested doesn't create a second Tetiana Cold row for the same posting.
+    job_hash = generate_dedup_hash(job["employer_name"], job["job_title"])
+    if is_job_seen_db(job_hash):
+        return (False, (
+            f"♻️ <b>Already in the pipeline:</b> {html.escape(final_title)} @ {html.escape(final_company)}.\n"
+            "This posting was surfaced before, so no duplicate row was written."
+        ))
+
+    log_metric_event("listing_discovered", source="manual_ingest")
+    result = process_single_candidate(job)
+    if not result:
+        # AI screening rejected it. The row is still Kevin's call, but process_single_candidate
+        # returns nothing to write - no score, no sheet_uuid, no resolved copy - so there is no
+        # row to land. Report the rejection rather than fabricating a partial record.
+        save_seen_job_db(job_hash)
+        return (False, (
+            f"⚠️ <b>Did not pass AI screening:</b> {html.escape(final_title)} @ {html.escape(final_company)}.\n"
+            "No row written. If you still want it tracked, add it with "
+            f"<code>/quick</code> or re-check the posting text."
+        ))
+
+    save_seen_job_db(job_hash)
+    cards = dispatch_tier1_matches([result], note_prefix=f"Manually ingested via {source_label}")
+    if not cards:
+        return (False, (
+            f"❌ <b>CRM write failed</b> for {html.escape(final_title)} @ {html.escape(final_company)}. "
+            "The card was withheld so it can't point at a missing row - check /health and retry."
+        ))
+
+    # Pull the company onto the ATS watchlist so /t and /w source it directly from here on.
+    threading.Thread(target=auto_expand_ats_slug, args=(final_company,), daemon=True).start()
+    return (True, "")
+
+
 def run_job_pipeline(chat_id=None, top_n=2):
     """Job search pipeline with two-stage architecture:
     Stage 1: Pre-filter candidates (JSearch multi-page + ATS direct-source, strict filters)
@@ -5792,8 +5995,6 @@ def run_job_pipeline(chat_id=None, top_n=2):
     seen_hashes = set()
     candidate_pool = []
     raw_discovered_count = 0
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
 
     def _add_candidate(job):
         nonlocal raw_discovered_count
@@ -5911,66 +6112,9 @@ def run_job_pipeline(chat_id=None, top_n=2):
     tier1_matches = [m for m in top_matches if m["score"] >= 80][:5]
     tier2_matches = [m for m in top_matches if 65 <= m["score"] < 80][:5]
 
-    # Write Tier-1 rows to CRM first, routed by Clavicular flag, then dispatch cards only for rows that landed
-    clavicular_rows = []
-    standard_rows = []
-    for item in tier1_matches:
-        job = item["job"]
-        is_clavicular = item.get("is_clavicular", False)
-        note = (
-            f"Warm Referral Matched: {item.get('contact_name', 'Contact')} | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
-            if is_clavicular else f"Matched via Pipeline | {item['reason']} | Tone: {item.get('tone_mode', 'conservative')}"
-        )
-        row = {
-            "sheet_uuid": item.get("sheet_uuid"),
-            "row_data": [
-                today_str,
-                job.get("employer_name"),
-                job.get("job_title"),
-                item["target_email"],
-                item["score"],
-                "Matched",
-                followup_date,
-                job.get("job_apply_link", ""),
-                note
-            ]
-        }
-        (clavicular_rows if is_clavicular else standard_rows).append(row)
-
-    written = {
-        True: log_to_sheets_crm(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows)) if clavicular_rows else True,
-        False: log_to_sheets_crm(build_crm_payload("batch_add_rows", target_code="TC", rows=standard_rows)) if standard_rows else True,
-    }
-    for is_clavicular, ok in written.items():
-        if not ok:
-            withheld = [
-                f"{m['job'].get('employer_name')} - {m['job'].get('job_title')} ({m['score']})"
-                for m in tier1_matches if m.get("is_clavicular", False) == is_clavicular
-            ]
-            tab = "Clavicular" if is_clavicular else "Tetiana Cold"
-            logging.error(f"Tier-1 CRM write to {tab} FAILED; withholding {len(withheld)} card(s): {withheld}")
-            send_health_alert(
-                f"Tier-1 CRM write to {tab} failed - {len(withheld)} card(s) withheld, rows NOT in the sheet: "
-                + "; ".join(withheld)
-            )
-
-    cards_sent = 0
-    for item in tier1_matches:
-        job = item["job"]
-        is_clavicular = item.get("is_clavicular", False)
-        if not written[is_clavicular]:
-            continue
-        send_telegram_card(
-            job, item["score"], item["target_email"],
-            item["age_badge"], item["salary_str"], item["work_style"],
-            item["overlap_pct"], item["short_id"],
-            sheet_uuid=item.get("sheet_uuid"),
-            alumni_line=item.get("alumni_line", ""),
-            sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates",
-            score_boost=item.get("score_boost", 0)
-        )
-        cards_sent += 1
-        time.sleep(1.1)
+    # Write Tier-1 rows to CRM first, routed by Clavicular flag, then dispatch cards only for rows
+    # that landed. Shared with the manual-ingest path - see dispatch_tier1_matches().
+    cards_sent = dispatch_tier1_matches(tier1_matches)
 
     # Dispatch Tier-2 as leaderboard digest ONLY (do NOT add to batch_rows/CRM)
     if tier2_matches:
@@ -6155,6 +6299,43 @@ def process_webhook_payload_async(data):
         if re.match(r"^/w$", text):
             send_telegram_message(chat_id, "🔭 <b>Warm Network Radar:</b> checking cached ATS boards for your warm contacts (no AI scoring)...")
             run_warm_radar_scan(chat_id)
+            return
+
+        # 2c. Manual Job Ingest (/job, /j): push a single hand-picked posting through the exact
+        # Stage 2 path /t uses, so it lands in Tetiana Cold (or Clavicular) as a real card with a
+        # live sheet_uuid - swipe-reply, the follow-up sequencer and /funnel all work on it after.
+        if re.match(r"^/(job|j)\b", text, re.IGNORECASE):
+            parsed = parse_job_command(text)
+            if not parsed:
+                send_telegram_message(
+                    chat_id,
+                    "📋 <b>Add a job to the pipeline</b>\n\n"
+                    "Paste the link:\n"
+                    "<code>/job https://www.linkedin.com/jobs/view/4461280495/</code>\n\n"
+                    "If LinkedIn blocks the read, spell it out:\n"
+                    "<code>/job Foreign Exchange Ops Analyst 2 @ Huntington National Bank</code>"
+                )
+                return
+            ing_title, ing_company, ing_url = parsed
+            send_telegram_message(
+                chat_id,
+                "⏳ <b>Ingesting job...</b> scoring it through the same pipeline as /t "
+                "(Gemini fit, alumni lookup, warm routing)."
+            )
+
+            def _ingest_and_report(u=ing_url, t=ing_title, c=ing_company, cid=chat_id):
+                try:
+                    ok, message = ingest_manual_job(url=u, title=t or "", company=c or "", chat_id=cid, source_label="/job")
+                    if not ok and message:
+                        send_telegram_message(cid, message)
+                except Exception as e:
+                    logging.error(f"/job Ingest Error: {e}", exc_info=True)
+                    send_telegram_message(cid, f"❌ <b>Ingest failed:</b> {html.escape(str(e))}")
+
+            # Backgrounded for the same reason /t is: Gemini scoring plus the alumni lookup can run
+            # well past Telegram's webhook timeout, and a timed-out webhook is retried - which would
+            # score and write the same posting twice.
+            threading.Thread(target=_ingest_and_report, daemon=True).start()
             return
 
         # 3. Networking Cards Pull Triggers (/c, /cw, /cc [qty])
@@ -7123,6 +7304,7 @@ def process_webhook_payload_async(data):
                 ("📖 <b>Command Reference</b>\n\n" if text == "/help" else "⚠️ <b>Command Unrecognized</b>\n\n") +
                 "<b>CORE COMMANDS:</b>\n"
                 "/t - Pull fresh job cards\n"
+                "/job, /j &lt;url&gt; - Add a job you found yourself (scores &amp; files it like /t)\n"
                 "/w - Warm radar: new roles at your warm-contact companies (no AI, instant)\n"
                 "/search - View or update live search filters\n"
                 "/quick - Create contact (Name @ Firm Priority Note)\n"
@@ -7465,7 +7647,13 @@ def desktop_stage_pdf(short_id):
 
 @app.route("/ingest", methods=["POST"])
 def desktop_ingest():
-    """Secure endpoint for desktop bookmarklet ingestion of manual job links/text."""
+    """Secure endpoint for desktop bookmarklet ingestion of manual job links/text.
+
+    The bookmarklet scrapes the page inside Kevin's logged-in browser, so unlike the Telegram
+    /job command it can hand over the full job description that LinkedIn refuses to serve to a
+    server-side fetch. Both funnel into ingest_manual_job(), which is what actually writes the
+    Tetiana Cold row - this endpoint previously carded without ever writing one.
+    """
     ingest_secret = os.environ.get("INGEST_SECRET")
     if ingest_secret:
         incoming_secret = request.headers.get("X-Ingest-Secret") or request.args.get("secret")
@@ -7477,33 +7665,30 @@ def desktop_ingest():
         raw_text = str(data.get("text") or "").strip()
         url = str(data.get("url") or "").strip()
         title = str(data.get("title") or "").strip()
+        company = str(data.get("company") or "").strip()
         if not raw_text and not url:
             return jsonify({"status": "error", "message": "No job text or URL provided"}), 400
 
-        job = {
-            "job_id": f"ingest_{hashlib.md5((url or raw_text).encode()).hexdigest()[:12]}",
-            "employer_name": data.get("company") or "Manual Ingest",
-            "job_title": title or "Manually Ingested Role",
-            "job_description": raw_text or title,
-            "job_apply_link": url,
-            "job_city": "",
-            "job_state": "",
-            "job_is_remote": False,
-            "job_posted_at_datetime_utc": datetime.now(timezone.utc).isoformat()
-        }
+        # The bookmarklet often sends the raw document.title verbatim; when it carries LinkedIn's
+        # "Company hiring Title in City" shape, recover both halves rather than storing the whole
+        # string as the job title.
+        if url and not (title and company):
+            parsed_title, parsed_company, parsed_desc = parse_linkedin_job_html(raw_text) if raw_text else ("", "", "")
+            title = title or parsed_title
+            company = company or parsed_company
+            if parsed_desc and len(parsed_desc) > len(raw_text or ""):
+                raw_text = parsed_desc
 
-        def _process_and_dispatch():
-            result = process_single_candidate(job)
-            if result:
-                send_telegram_card(
-                    result["job"], result["score"], result["target_email"],
-                    result["age_badge"], result["salary_str"], result["work_style"],
-                    result["overlap_pct"], result["short_id"],
-                    sheet_uuid=result.get("sheet_uuid"),
-                    alumni_line=result.get("alumni_line", "")
+        def _process_and_dispatch(u=url, t=title, c=company, d=raw_text):
+            try:
+                ok, message = ingest_manual_job(
+                    url=u, title=t, company=c, description=d,
+                    chat_id=TELEGRAM_CHAT_ID, source_label="bookmarklet",
                 )
-            elif TELEGRAM_CHAT_ID:
-                send_telegram_message(TELEGRAM_CHAT_ID, f"⚠️ Ingested job did not pass AI screening: {html.escape(job['job_title'])}")
+                if not ok and message and TELEGRAM_CHAT_ID:
+                    send_telegram_message(TELEGRAM_CHAT_ID, message)
+            except Exception as e:
+                logging.error(f"Ingest Dispatch Error: {e}", exc_info=True)
 
         threading.Thread(target=_process_and_dispatch, daemon=True).start()
         return jsonify({"status": "ok", "message": "Ingestion queued"}), 200

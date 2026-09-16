@@ -960,3 +960,204 @@ def is_expired_matched_row(status, date_added, today, expiry_days=MATCHED_EXPIRY
     if anchor is None:
         return False
     return (today - anchor).days >= expiry_days
+
+
+# ==============================================================================
+# MANUAL JOB INGEST (/job + the desktop bookmarklet) - pure parsing, no I/O
+# ==============================================================================
+
+# A LinkedIn job URL carries its numeric posting id either as the last path segment
+# (/jobs/view/4461280495/) or as the currentJobId query param on a search-results page - the
+# latter is what copying the address bar off a job search actually yields.
+_LINKEDIN_JOB_PATH_RE = re.compile(r"/jobs/view/(\d+)")
+
+
+def extract_linkedin_job_id(url):
+    """Pull the numeric posting id out of a LinkedIn job URL, or None.
+
+    Handles both the canonical /jobs/view/<id> permalink and the /jobs/search-results/?currentJobId=<id>
+    form you get by copying the address bar while browsing results.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    path_match = _LINKEDIN_JOB_PATH_RE.search(raw)
+    if path_match:
+        return path_match.group(1)
+    try:
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(raw).query)
+    except Exception:
+        return None
+    # Matched case-insensitively so a URL that passed through a lowercasing client still resolves.
+    for key, vals in params.items():
+        if key.lower() != "currentjobid":
+            continue
+        if vals and str(vals[0]).isdigit():
+            return str(vals[0])
+    return None
+
+
+def canonical_linkedin_job_url(url):
+    """Normalize any LinkedIn job URL to its bare /jobs/view/<id> permalink.
+
+    Search-results URLs carry a long tail of tracking params (eBP, refId, trackingId) that differ
+    per visit, so the raw URL is useless as a dedup key and ugly as a stored apply link. Returns
+    the input unchanged when it carries no recoverable job id.
+    """
+    job_id = extract_linkedin_job_id(url)
+    if not job_id:
+        return str(url or "").strip()
+    return f"https://www.linkedin.com/jobs/view/{job_id}/"
+
+
+def is_linkedin_job_url(url):
+    """True if this looks like a LinkedIn URL carrying a job posting id.
+
+    Only the host check is case-folded: the query param is `currentJobId`, and lowercasing the
+    whole URL before extraction would make that key unmatchable.
+    """
+    raw = str(url or "").strip()
+    return "linkedin.com" in raw.lower() and extract_linkedin_job_id(raw) is not None
+
+
+def parse_job_command(text_input):
+    """Parse `/job <url>` and `/job Title @ Company <url>` into (title, company, url).
+
+    The bare-URL form returns (None, None, url) and leaves title/company for the scraper to fill.
+    The explicit form is the fallback for when LinkedIn blocks the server-side fetch: everything
+    before the '@' is the title, everything after it (minus a trailing URL) is the company.
+
+    Returns None when no URL and no '@' form is present - i.e. nothing usable.
+    """
+    body = str(text_input or "").strip()
+    # Strip the leading /job or /j token
+    body = re.sub(r"^/(?:job|j)\b\s*", "", body, flags=re.IGNORECASE).strip()
+    if not body:
+        return None
+
+    # A URL may sit anywhere in the text; pull the first one out and treat the rest as title/company.
+    url_match = re.search(r"https?://\S+", body)
+    url = url_match.group(0).rstrip(".,);") if url_match else ""
+    remainder = (body[:url_match.start()] + " " + body[url_match.end():]).strip() if url_match else body
+
+    if "@" in remainder:
+        title_part, _, company_part = remainder.partition("@")
+        title = title_part.strip(" -–—")
+        company = company_part.strip(" -–—")
+        if title and company:
+            return (title, company, url)
+
+    if url:
+        return (None, None, url)
+    return None
+
+
+def parse_linkedin_job_html(html_text):
+    """Best-effort extraction of (title, company, description) from a LinkedIn job page.
+
+    LinkedIn serves a JSON-LD JobPosting block on its public guest pages, which is far more stable
+    than the CSS class names - those are minified and rotate. Falls back to the guest-page markup,
+    then to the <title> tag ("Company hiring Title in City | LinkedIn").
+
+    Returns (title, company, description), any of which may be "" when the page is an auth wall.
+    """
+    body = str(html_text or "")
+    if not body:
+        return ("", "", "")
+
+    title = company = description = ""
+
+    # 1. JSON-LD JobPosting - the most reliable source when the guest page renders.
+    for blob in re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', body, re.DOTALL | re.IGNORECASE):
+        try:
+            import json as _json
+            parsed = _json.loads(blob.strip())
+        except Exception:
+            continue
+        candidates = parsed if isinstance(parsed, list) else [parsed]
+        for node in candidates:
+            if not isinstance(node, dict):
+                continue
+            if node.get("@type") != "JobPosting":
+                continue
+            title = title or str(node.get("title") or "")
+            org = node.get("hiringOrganization")
+            if isinstance(org, dict):
+                company = company or str(org.get("name") or "")
+            description = description or strip_html_to_text(node.get("description"))
+
+    # 2. Guest-page markup fallback. The jobs-guest endpoint renders the job title in an <h2>
+    # (class top-card-layout__title / topcard__title), NOT an <h1> - matching only <h1> here
+    # silently produced a blank title on the one endpoint that actually answers a server fetch.
+    if not title:
+        m = re.search(
+            r'<h[12][^>]*(?:top-card-layout__title|topcard__title)[^>]*>(.*?)</h[12]>',
+            body, re.DOTALL | re.IGNORECASE,
+        )
+        if not m:
+            m = re.search(r'<h1[^>]*>(.*?)</h1>', body, re.DOTALL | re.IGNORECASE)
+        if m:
+            title = strip_html_to_text(m.group(1))
+    if not company:
+        m = re.search(r'<a[^>]*(?:topcard__org-name-link|top-card-layout__second-subline)[^>]*>(.*?)</a>', body, re.DOTALL | re.IGNORECASE)
+        if m:
+            company = strip_html_to_text(m.group(1))
+    if not description:
+        m = re.search(r'<div[^>]*(?:show-more-less-html__markup|description__text)[^>]*>(.*?)</div>\s*</div>', body, re.DOTALL | re.IGNORECASE)
+        if m:
+            description = strip_html_to_text(m.group(1))
+
+    # 3. <title> tag: "Company hiring Job Title in City, State | LinkedIn"
+    if not (title and company):
+        m = re.search(r'<title[^>]*>(.*?)</title>', body, re.DOTALL | re.IGNORECASE)
+        if m:
+            head = strip_html_to_text(m.group(1))
+            head = re.sub(r'\s*\|\s*LinkedIn\s*$', '', head, flags=re.IGNORECASE)
+            hiring = re.search(r'^(.*?)\s+hiring\s+(.*?)(?:\s+in\s+.*)?$', head, flags=re.IGNORECASE)
+            if hiring:
+                company = company or hiring.group(1).strip()
+                title = title or hiring.group(2).strip()
+
+    return (title.strip(), company.strip(), description.strip())
+
+
+def strip_html_to_text(raw):
+    """Flatten an HTML fragment to readable plain text - tags dropped, entities decoded,
+    <br>/<p>/<li> turned into newlines so a scraped job description keeps its bullet structure.
+    """
+    import html as _html
+    body = str(raw or "")
+    if not body:
+        return ""
+    body = re.sub(r'<\s*(br|/p|/div|/li|/ul|/ol)\s*/?\s*>', '\n', body, flags=re.IGNORECASE)
+    body = re.sub(r'<\s*li[^>]*>', '\n- ', body, flags=re.IGNORECASE)
+    body = re.sub(r'<[^>]+>', ' ', body)
+    body = _html.unescape(body)
+    body = re.sub(r'[ \t ]+', ' ', body)
+    body = re.sub(r'\n\s*\n\s*\n+', '\n\n', body)
+    return body.strip()
+
+
+def build_ingest_job_dict(title, company, description, url, now=None):
+    """Assemble a manually-ingested posting into the same job dict shape the JSearch/ATS feeds
+    produce, so process_single_candidate() cannot tell it apart.
+
+    The `ingest_` job_id prefix is what derive_job_source() maps to "manual_ingest" for per-source
+    outcome attribution, and what keeps these out of the ATS-sourced Clavicular gate (which keys
+    on gh_/lever_/ashby_ prefixes). The id is hashed off the canonical URL so re-pasting the same
+    posting produces the same id and trips the existing dedup ledger instead of double-carding.
+    """
+    stamp = now or datetime.now(timezone.utc)
+    canonical = canonical_linkedin_job_url(url) if url else ""
+    seed = canonical or url or f"{company}|{title}"
+    return {
+        "job_id": f"ingest_{hashlib.md5(str(seed).encode('utf-8', 'ignore')).hexdigest()[:12]}",
+        "employer_name": (company or "").strip() or "Manual Ingest",
+        "job_title": (title or "").strip() or "Manually Ingested Role",
+        "job_description": (description or "").strip() or (title or ""),
+        "job_apply_link": canonical or str(url or ""),
+        "job_city": "",
+        "job_state": "",
+        "job_is_remote": False,
+        "job_posted_at_datetime_utc": stamp.isoformat(),
+    }

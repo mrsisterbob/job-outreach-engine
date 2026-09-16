@@ -982,3 +982,157 @@ def test_resolve_sent_email_backfill_skips_rows_without_a_uuid():
     """No UUID means no addressable row - nothing to update."""
     rows = [{"sheet_uuid": "", "company": "HCLTech", "email": "operations@hcltech.com"}]
     assert pu.resolve_sent_email_backfill("Soumya <sshruti@hcltech.com>", rows) is None
+
+
+# ---- Manual job ingest (/job + bookmarklet) ----
+
+# The URL Kevin actually copies out of the address bar while browsing job search results:
+# the posting id rides in currentJobId, not the path, and a long tracking tail follows it.
+SEARCH_RESULTS_URL = (
+    "https://www.linkedin.com/jobs/search-results/?currentJobId=4461280495"
+    "&eBP=NON_CHARGEABLE_CHANNEL&refId=oYcnP6aWR%2B5Ez3mob"
+)
+PERMALINK_URL = "https://www.linkedin.com/jobs/view/4461280495/"
+
+
+def test_extract_linkedin_job_id_reads_both_url_shapes():
+    assert pu.extract_linkedin_job_id(SEARCH_RESULTS_URL) == "4461280495"
+    assert pu.extract_linkedin_job_id(PERMALINK_URL) == "4461280495"
+    assert pu.extract_linkedin_job_id("https://example.com/careers/123") is None
+    assert pu.extract_linkedin_job_id("") is None
+    assert pu.extract_linkedin_job_id(None) is None
+
+
+def test_canonical_linkedin_job_url_strips_tracking_tail():
+    """Both shapes of the same posting must collapse to one URL, or the dedup key is per-visit."""
+    assert pu.canonical_linkedin_job_url(SEARCH_RESULTS_URL) == PERMALINK_URL
+    assert pu.canonical_linkedin_job_url(PERMALINK_URL) == PERMALINK_URL
+
+
+def test_canonical_linkedin_job_url_passes_through_non_linkedin():
+    assert pu.canonical_linkedin_job_url("https://boards.greenhouse.io/acme/jobs/1") == \
+        "https://boards.greenhouse.io/acme/jobs/1"
+
+
+def test_is_linkedin_job_url_is_not_broken_by_the_camelcase_param():
+    """Regression: lowercasing the whole URL before extraction makes currentJobId unmatchable,
+    which silently disabled the scraper for exactly the URL Kevin pastes most."""
+    assert pu.is_linkedin_job_url(SEARCH_RESULTS_URL) is True
+    assert pu.is_linkedin_job_url(SEARCH_RESULTS_URL.lower()) is True
+    assert pu.is_linkedin_job_url(PERMALINK_URL) is True
+    assert pu.is_linkedin_job_url("https://example.com/careers/123") is False
+    assert pu.is_linkedin_job_url("https://www.linkedin.com/feed/") is False
+
+
+def test_parse_job_command_bare_url_defers_title_to_the_scraper():
+    assert pu.parse_job_command(f"/job {PERMALINK_URL}") == (None, None, PERMALINK_URL)
+    assert pu.parse_job_command(f"/j {PERMALINK_URL}") == (None, None, PERMALINK_URL)
+
+
+def test_parse_job_command_explicit_form_is_the_auth_wall_fallback():
+    assert pu.parse_job_command(
+        "/job Foreign Exchange Ops Analyst 2 @ Huntington National Bank https://x.co/1"
+    ) == ("Foreign Exchange Ops Analyst 2", "Huntington National Bank", "https://x.co/1")
+
+
+def test_parse_job_command_explicit_form_without_a_url():
+    assert pu.parse_job_command("/job Analyst @ Ally") == ("Analyst", "Ally", "")
+
+
+def test_parse_job_command_rejects_unusable_input():
+    assert pu.parse_job_command("/job") is None
+    assert pu.parse_job_command("/job    ") is None
+    assert pu.parse_job_command("") is None
+    assert pu.parse_job_command(None) is None
+
+
+def test_parse_linkedin_job_html_prefers_json_ld():
+    body = (
+        '<html><head><script type="application/ld+json">'
+        '{"@type":"JobPosting","title":"FX Ops Analyst 2",'
+        '"hiringOrganization":{"name":"Huntington National Bank"},'
+        '"description":"<p>Settle trades.</p><ul><li>Reconcile</li></ul>"}'
+        '</script></head><body></body></html>'
+    )
+    title, company, description = pu.parse_linkedin_job_html(body)
+    assert title == "FX Ops Analyst 2"
+    assert company == "Huntington National Bank"
+    assert "Settle trades." in description
+    assert "Reconcile" in description
+    assert "<p>" not in description  # markup flattened, not passed through to Gemini
+
+
+def test_parse_linkedin_job_html_falls_back_to_the_title_tag():
+    body = "<html><head><title>Ally hiring Associate Analyst in Detroit, MI | LinkedIn</title></head></html>"
+    title, company, _ = pu.parse_linkedin_job_html(body)
+    assert title == "Associate Analyst"
+    assert company == "Ally"
+
+
+def test_parse_linkedin_job_html_returns_empty_on_an_auth_wall():
+    """An auth wall is the NORMAL datacenter-IP outcome, not an error - it must come back empty
+    so the caller asks Kevin to type the title rather than filing a 'Manual Ingest' row."""
+    assert pu.parse_linkedin_job_html("<html><body>Sign in to continue</body></html>") == ("", "", "")
+    assert pu.parse_linkedin_job_html("") == ("", "", "")
+    assert pu.parse_linkedin_job_html(None) == ("", "", "")
+
+
+def test_strip_html_to_text_keeps_bullet_structure():
+    out = pu.strip_html_to_text("<p>Duties:</p><ul><li>Reconcile trades</li><li>SWIFT</li></ul>")
+    assert "Duties:" in out
+    assert "- Reconcile trades" in out
+    assert "- SWIFT" in out
+    assert "<" not in out
+
+
+def test_strip_html_to_text_decodes_entities():
+    assert "Smith & Sons" in pu.strip_html_to_text("<p>Smith &amp; Sons</p>")
+
+
+def test_build_ingest_job_dict_matches_the_feed_job_shape():
+    """process_single_candidate() must not be able to tell a pasted job from a sourced one."""
+    job = pu.build_ingest_job_dict("FX Ops Analyst", "Huntington", "Settle trades", SEARCH_RESULTS_URL)
+    for key in (
+        "job_id", "employer_name", "job_title", "job_description", "job_apply_link",
+        "job_city", "job_state", "job_is_remote", "job_posted_at_datetime_utc",
+    ):
+        assert key in job
+    assert job["employer_name"] == "Huntington"
+    assert job["job_title"] == "FX Ops Analyst"
+    assert job["job_apply_link"] == PERMALINK_URL  # stored canonical, not the tracking URL
+
+
+def test_build_ingest_job_dict_id_is_attributable_and_not_ats():
+    job = pu.build_ingest_job_dict("FX Ops", "Huntington", "d", PERMALINK_URL)
+    assert pu.derive_job_source(job["job_id"]) == "manual_ingest"
+    # The Clavicular +30 gate keys on ATS prefixes; a pasted job must not slip through it.
+    assert not job["job_id"].startswith(("gh_", "lever_", "ashby_"))
+
+
+def test_build_ingest_job_dict_id_is_stable_across_url_shapes():
+    """Re-pasting the same posting from a fresh search must dedup, not write a second row."""
+    a = pu.build_ingest_job_dict("FX Ops", "Huntington", "d", SEARCH_RESULTS_URL)
+    b = pu.build_ingest_job_dict("FX Ops", "Huntington", "d", PERMALINK_URL)
+    assert a["job_id"] == b["job_id"]
+
+
+def test_build_ingest_job_dict_falls_back_when_fields_are_blank():
+    job = pu.build_ingest_job_dict("", "", "", "")
+    assert job["employer_name"] == "Manual Ingest"
+    assert job["job_title"] == "Manually Ingested Role"
+
+
+def test_parse_linkedin_job_html_reads_the_guest_endpoint_h2_title():
+    """Regression, caught against the live endpoint: the jobs-guest page - the only surface that
+    answers a server-side fetch - puts the job title in an <h2 class="...topcard__title">, not an
+    <h1>. Matching only <h1> filed every scraped job as "Manually Ingested Role"."""
+    body = (
+        '<a class="topcard__link"><h2 class="top-card-layout__title font-sans text-lg font-bold '
+        'topcard__title">Foreign Exchange Ops Analyst 2</h2></a>'
+        '<div class="topcard__flavor-row"><span class="topcard__flavor">'
+        '<a class="topcard__org-name-link topcard__flavor--black-link" href="/company/x">'
+        'Huntington National Bank</a></span></div>'
+    )
+    title, company, _ = pu.parse_linkedin_job_html(body)
+    assert title == "Foreign Exchange Ops Analyst 2"
+    assert company == "Huntington National Bank"
