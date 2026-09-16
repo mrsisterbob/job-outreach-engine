@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import contextlib
 import sqlite3
 import sys
 import threading
@@ -459,13 +460,30 @@ ALIAS_MAP = {
     "ats": "ats_company_slugs"
 }
 
+@contextlib.contextmanager
 def get_db_conn():
-    """Returns a SQLite connection tuned for concurrent writers: WAL + NORMAL sync + busy_timeout."""
+    """Yields a SQLite connection tuned for concurrent writers: WAL + NORMAL sync + busy_timeout.
+
+    A context manager, NOT a bare connection: `with sqlite3.connect(...) as conn` only wraps a
+    TRANSACTION (commit on clean exit, rollback on exception) and leaves the connection itself
+    open. Every `with get_db_conn() as conn:` call site therefore leaked a connection - each
+    holding a file handle plus its own WAL page cache and statement cache. crm_outbox_worker_loop
+    runs process_crm_outbox_batch every 5 seconds forever, so an idle instance leaked ~720
+    connections/hour and walked a 512MB box into an OOM restart roughly every 3.5 hours.
+
+    Commit/rollback semantics are preserved so no call site has to change: the inner
+    `with conn:` block still ends the transaction the same way, and the connection is closed
+    in the finally.
+    """
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    return conn
+    try:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 # Seed values for a brand-new search_filters table. Module-level (not inlined in init_db) so
 # restore_core_sourcing_filters() can put target_queries back if a restart ever leaves it blank.
