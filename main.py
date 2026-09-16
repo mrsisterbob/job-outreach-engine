@@ -1859,6 +1859,12 @@ _WARM_CRM_CACHE = {"data": {}, "fetched_at": 0.0}
 _WARM_CRM_CACHE_TTL_SECONDS = 300
 _APPLIED_CRM_CACHE = {"data": set(), "fetched_at": 0.0}
 _APPLIED_CRM_CACHE_TTL_SECONDS = 300
+# Separate cache from _APPLIED_CRM_CACHE: that one suppresses whole COMPANIES already applied to
+# (Tetiana Warm), while this one is keyed company+title and answers a different question - "is this
+# exact role already a row in a job tab?" A company can have one role in Tetiana Cold and another
+# worth surfacing, so the two must not share a store.
+_TRACKED_ROLE_CACHE = {"data": set(), "fetched_at": 0.0}
+_TRACKED_ROLE_CACHE_TTL_SECONDS = 300
 
 def normalize_company_for_match(company_name):
     """Lowercase and strip legal suffixes so CRM and scraped company-name variants compare reliably."""
@@ -1905,6 +1911,51 @@ def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applie
     except Exception as e:
         logging.error(f"Company Identity Upsert Error ({normalized}): {e}")
         return False
+
+def get_tracked_job_keys():
+    """Every role already sitting in a JOB tab (Tetiana Cold + Tetiana Warm), as company+title hashes.
+
+    This is the ONLY thing allowed to suppress a rediscovered listing. The seen_jobs ledger answers
+    "has the pipeline ever looked at this?", which is the wrong question: a job glanced at during a
+    run that produced no card is not a job Kevin has seen, and blocking it there is what made
+    repeat runs return 114-of-121 "already seen" while dispatching almost nothing. What he actually
+    wants suppressed is a role he is ALREADY TRACKING - one that has a CRM row he could open.
+
+    Keyed on the same generate_dedup_hash(company, title) the discovery path uses, so a company can
+    keep surfacing new roles while the specific role already in a tab stays out.
+
+    Errs OPEN: a Sheets failure returns the stale cache (usually empty), so listings flow through
+    and the worst case is a duplicate card - never a silently empty pipeline.
+    """
+    now = time.time()
+    if now - _TRACKED_ROLE_CACHE["fetched_at"] < _TRACKED_ROLE_CACHE_TTL_SECONDS:
+        return _TRACKED_ROLE_CACHE["data"]
+    tracked = set()
+    fetched_any = False
+    for target_code in ("TC", "TW"):
+        res = crm_post({"action": "get_followups", "tab": target_code})
+        if not res:
+            continue
+        try:
+            if res.status_code != 200:
+                continue
+            data = res.json()
+            if data.get("status") != "success":
+                continue
+            fetched_any = True
+            for row in data.get("followups", []):
+                company = str(row.get("company") or "").strip()
+                title = str(row.get("job_title") or row.get("title") or "").strip()
+                if company and title:
+                    tracked.add(generate_dedup_hash(company, title))
+        except Exception as e:
+            logging.error(f"get_tracked_job_keys Error ({target_code}): {e}")
+    if fetched_any:
+        _TRACKED_ROLE_CACHE["data"] = tracked
+        _TRACKED_ROLE_CACHE["fetched_at"] = now
+        logging.info(f"Tracked-role suppression set refreshed: {len(tracked)} roles across Tetiana Cold + Warm")
+    return _TRACKED_ROLE_CACHE["data"]
+
 
 def get_applied_crm_companies():
     """Fetch Tetiana Warm companies as a short-lived suppression set for fresh job discovery."""
@@ -2915,8 +2966,9 @@ def _passes_remote_filter(job):
 # formatted summary - so adding a gate is a one-line change and can never raise into the pipeline.
 
 FUNNEL_REJECTION_LABELS = {
-    "dedup_title": "Already seen (company+title)",
-    "dedup_content": "Already seen (description)",
+    "dedup_title": "Duplicate within this run",
+    "dedup_content": "Duplicate description this run",
+    "already_tracked": "Already in Tetiana Cold/Warm",
     "board_id_employer": "Employer looks like a board ID",
     "company_cooldown": "Company on 14-day cooldown",
     "already_applied": "Already applied (Tetiana Warm)",
@@ -6274,13 +6326,13 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
 
     job = build_ingest_job_dict(final_title, final_company, final_desc, url)
 
-    # Dedup against everything /t and previous pastes have already surfaced, so re-pasting a link
-    # you already ingested doesn't create a second Tetiana Cold row for the same posting.
+    # Dedup against roles already TRACKED in a job tab, not against everything /t has ever
+    # glanced at - re-pasting a link for a role with no CRM row should still produce a card.
     job_hash = generate_dedup_hash(job["employer_name"], job["job_title"])
-    if is_job_seen_db(job_hash):
+    if job_hash in get_tracked_job_keys():
         return (False, (
             f"♻️ <b>Already in the pipeline:</b> {html.escape(final_title)} @ {html.escape(final_company)}.\n"
-            "This posting was surfaced before, so no duplicate row was written."
+            "This role already has a Tetiana Cold/Warm row, so no duplicate was written."
         ))
 
     log_metric_event("listing_discovered", source="manual_ingest")
@@ -6347,9 +6399,13 @@ def run_job_pipeline(chat_id=None, top_n=2):
         send_status_update(chat_id, slice_status)
 
     seen_hashes = set()
+    seen_content_hashes_this_run = set()
     candidate_pool = []
     raw_discovered_count = 0
     funnel = FunnelTrace()
+    # Fetched once per run, not per candidate: this is the cross-run suppression set (roles already
+    # in Tetiana Cold/Warm) and it is the only memory allowed to block a rediscovered listing.
+    tracked_job_keys = get_tracked_job_keys()
 
     def _add_candidate(job):
         nonlocal raw_discovered_count
@@ -6358,19 +6414,32 @@ def run_job_pipeline(chat_id=None, top_n=2):
         company = job.get("employer_name") or ""
         title = job.get("job_title") or ""
         job_hash = generate_dedup_hash(company, title)
-        if job_hash in seen_hashes or is_job_seen_db(job_hash):
+        # Within ONE run, collapse the same role arriving from several queries/boards. This is pure
+        # duplicate suppression and has no memory past the run.
+        if job_hash in seen_hashes:
             funnel.note("dedup_title")
             return
         seen_hashes.add(job_hash)
 
-        # Fuzzy content dedup: catches identical postings cross-posted under reworded titles.
-        # "" means the description was missing or too short to identify a job - never dedup on
-        # that, or the first description-less posting buries every later one (see
-        # compute_description_simhash).
+        # ACROSS runs, the only thing that suppresses a role is already having a CRM row for it.
+        # Deliberately NOT is_job_seen_db(): the seen_jobs ledger records every listing the pipeline
+        # ever looked at, so a role glanced at during a run that dispatched no card was blocked
+        # forever afterwards - 114 of 121 listings on a typical run, with almost nothing dispatched.
+        # A rediscovered role Kevin never acted on is exactly the role he wants a card for.
+        if job_hash in tracked_job_keys:
+            funnel.note("already_tracked")
+            return
+
+        # Fuzzy content dedup, in-run only for the same reason: catches one posting cross-listed
+        # under reworded titles without remembering it past today. "" means the description was
+        # missing or too short to identify a job - never dedup on that, or the first
+        # description-less posting buries every later one (see compute_description_simhash).
         content_hash = compute_description_simhash(job.get("job_description"))
-        if content_hash and is_content_seen(content_hash):
+        if content_hash and content_hash in seen_content_hashes_this_run:
             funnel.note("dedup_content")
             return
+        if content_hash:
+            seen_content_hashes_this_run.add(content_hash)
 
         log_metric_event("listing_discovered", source=derive_job_source(job.get("job_id")))
         if not passes_strict_filter(job, trace=funnel):
@@ -6382,9 +6451,10 @@ def run_job_pipeline(chat_id=None, top_n=2):
             # pool are remembered, so the ledger means "seen and judged", not "glanced at once".
             return
 
+        # seen_jobs is still written - the repost/evergreen penalty in score_job_layer1 reads
+        # first_seen/seen_count to spot a listing that has been recycled for months. It is a
+        # SIGNAL now, not a gate: nothing above consults it to block a candidate.
         save_seen_job_db(job_hash)
-        if content_hash:
-            save_content_hash(content_hash)
         funnel.passed += 1
         candidate_pool.append(job)
     
@@ -6571,9 +6641,9 @@ def run_warm_radar_scan(chat_id=None):
         company = job.get("employer_name") or ""
         title = job.get("job_title") or ""
         job_hash = generate_dedup_hash(company, title)
-        # Mirror _add_candidate's ordering: check the in-run set AND the shared seen_jobs ledger
-        # before stamping anything, so a role /t already surfaced is skipped without a re-stamp.
-        if job_hash in seen_hashes or is_job_seen_db(job_hash):
+        # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
+        # when the role is already tracked in a job tab - never merely because /t once saw it.
+        if job_hash in seen_hashes or job_hash in get_tracked_job_keys():
             continue
 
         # Tie the posting back to its warm contact by the slug baked into its job_id

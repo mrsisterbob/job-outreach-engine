@@ -2706,21 +2706,41 @@ def test_ingest_manual_job_asks_for_typed_details_when_linkedin_blocks(monkeypat
     assert "@" in message  # shows the Title @ Company fallback form
 
 
-def test_ingest_manual_job_dedups_a_repasted_posting(monkeypatch):
+def test_ingest_manual_job_dedups_a_role_already_in_a_job_tab(monkeypatch):
+    """Suppression comes from having a CRM row, not from seen_jobs."""
     def _no_score(job):
-        pytest.fail("should not re-score an already-seen posting")
+        pytest.fail("should not re-score a role already tracked in Tetiana Cold/Warm")
 
     def _no_write(p, **kw):
         pytest.fail("no duplicate row")
 
     monkeypatch.setattr(m, "process_single_candidate", _no_score)
     monkeypatch.setattr(m, "log_to_sheets_crm", _no_write)
-    m.save_seen_job_db(m.generate_dedup_hash("Huntington", "FX Ops Analyst"))
+    monkeypatch.setattr(
+        m, "get_tracked_job_keys",
+        lambda: {m.generate_dedup_hash("Huntington", "FX Ops Analyst")},
+    )
 
     ok, message = m.ingest_manual_job(title="FX Ops Analyst", company="Huntington")
 
     assert ok is False
     assert "Already in the pipeline" in message
+
+
+def test_ingest_manual_job_still_scores_a_seen_but_untracked_posting(monkeypatch):
+    """The inverse, and the whole point of the change: a posting the pipeline has looked at before
+    but that never became a CRM row must still produce a card. Blocking on seen_jobs is what made
+    repeat runs reject 114 of 121 listings while dispatching almost nothing."""
+    scored = []
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: scored.append(job) or None)
+    monkeypatch.setattr(m, "get_tracked_job_keys", lambda: set())
+    # Seen before by /t, but never tracked - must NOT suppress.
+    m.save_seen_job_db(m.generate_dedup_hash("Huntington", "FX Ops Analyst"))
+
+    ok, message = m.ingest_manual_job(title="FX Ops Analyst", company="Huntington")
+
+    assert scored, "a seen-but-untracked posting must still be scored"
+    assert "Already in the pipeline" not in message
 
 
 def test_ingest_manual_job_reports_an_ai_rejection_without_writing(monkeypatch):
