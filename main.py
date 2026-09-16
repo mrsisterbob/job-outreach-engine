@@ -3138,19 +3138,25 @@ def passes_strict_filter(job, trace=None):
         return reject("out_of_state")
 
     valid_cities = get_filter("valid_cities", [])
-    # Metro-area allowlist only (~35mi of Farmington MI via radius_miles) - state=="MI" alone is NOT
-    # sufficient, since that would also admit Grand Rapids/Lansing/Traverse City etc. outside the radius.
-    # Remote is intentionally NOT a pass condition here - local-only by design, and the substring
-    # "remote"/"work from home" check was unreliable anyway (no negation handling, e.g. "not remote").
-    # valid_cities is a hand-maintained suburb allowlist, not a computed geofence - a real in-radius
-    # city missing from the list is silently dropped here, not sourced-but-then-filtered.
+    # Two ways to clear the geography gate:
+    #   1. The city matches the hand-maintained metro allowlist (the precise path).
+    #   2. The posting is in Michigan at all, per an explicit state field or a "..., MI" city string.
+    #
+    # Rule 2 exists because rule 1 alone was rejecting a third of every run. valid_cities is a
+    # hand-curated suburb list, not a computed geofence, so a real in-radius job whose city string
+    # is merely unfamiliar ("Bingham Farms", "Detroit Metro", "Southeast Michigan") looked exactly
+    # like an out-of-area reject and was dropped silently. Every JSearch query is already
+    # radius-limited to radius_miles around a metro anchor, so a Michigan result that survived
+    # sourcing is overwhelmingly local; letting Grand Rapids through occasionally is far cheaper
+    # than dropping a Farmington Hills job because the suburb was never typed into a list.
     is_in_metro_area = any(c in city for c in valid_cities)
-    if not is_in_metro_area:
-        # Logged with the city, not just counted: this allowlist is hand-maintained, so a real
-        # in-radius suburb missing from it looks identical to a genuine out-of-area reject. The
-        # city name is the only way to tell them apart, and the only way to know what to add.
+    is_michigan = state in ("mi", "michigan") or bool(re.search(r",\s*mi\b", city)) or "michigan" in city
+    if not (is_in_metro_area or is_michigan):
+        # Logged with the city, not just counted: a real in-radius suburb missing from the list
+        # looks identical to a genuine out-of-area reject, and the city name is the only way to
+        # tell them apart - or to know what is worth adding.
         if trace is not None:
-            logging.info(f"[EXCLUDED] city '{city}' not in valid_cities allowlist")
+            logging.info(f"[EXCLUDED] city '{city}' not in valid_cities allowlist (state={state!r})")
         return reject("city_allowlist")
 
     # JSearch/OpenWebNinja can flag a posting as expired (job board removed it since being scraped)

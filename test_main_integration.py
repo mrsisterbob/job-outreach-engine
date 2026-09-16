@@ -3010,3 +3010,54 @@ def test_query_yield_report_puts_the_worst_performer_first():
 
 def test_query_yield_report_is_empty_without_attribution():
     assert m.FunnelTrace().query_yield_report() == ""
+
+
+# ---- Geography gate: Michigan as a fallback for unrecognized city strings ----
+
+def _geo_job(city, state=""):
+    return {
+        "employer_name": "Acme Corp",
+        "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL and Salesforce.",
+        "job_city": city,
+        "job_state": state,
+    }
+
+
+@pytest.fixture
+def _geo_filters(monkeypatch):
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000,
+        "valid_cities": ["farmington", "detroit", "troy"],
+    }.get(key, default if default is not None else []))
+
+
+def test_michigan_job_passes_even_when_the_city_is_not_allowlisted(_geo_filters):
+    """valid_cities is hand-curated, so an unfamiliar in-radius suburb used to look identical to an
+    out-of-area reject. Every query is already radius-limited, so a Michigan result that survived
+    sourcing is overwhelmingly local."""
+    for city, state in [
+        ("Bingham Farms", "MI"),   # real metro suburb, not on the list
+        ("Detroit Metro", "MI"),   # vague metro string
+        ("Southeast Michigan", ""),  # state named inside the city field
+        ("Ann Arbor, MI", ""),     # "city, MI" form with no state field
+        ("", "MI"),                # ATS postings often send a blank city
+    ]:
+        assert m.passes_strict_filter(_geo_job(city, state)) is True, f"{city!r}/{state!r} should pass"
+
+
+def test_out_of_state_is_still_rejected(_geo_filters):
+    trace = m.FunnelTrace()
+    assert m.passes_strict_filter(_geo_job("Chicago", "IL"), trace=trace) is False
+    assert trace.reasons.get("out_of_state") == 1
+
+
+def test_unknown_location_with_no_michigan_signal_is_still_rejected(_geo_filters):
+    """Michigan is a fallback, not an opening of the gate - "Remote" and a blank location carry no
+    geographic signal at all and must not slip through."""
+    for city in ("Remote", ""):
+        trace = m.FunnelTrace()
+        assert m.passes_strict_filter(_geo_job(city), trace=trace) is False
+        assert trace.reasons.get("city_allowlist") == 1
