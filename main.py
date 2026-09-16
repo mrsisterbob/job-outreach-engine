@@ -534,11 +534,15 @@ DEFAULT_SEARCH_FILTERS = {
     "company_exclusions": [
         "cybercoders", "robert half", "kforce", "jobot", "actalent", "insight global"
     ],
+    # Matched as raw substrings of the whole description, so each term must name the sales role
+    # itself, not a task an ops role also does: bare "commission" rejected "commission calculations
+    # and reporting", "pipeline development" rejected data-pipeline work, and "client acquisition"
+    # rejected roles that merely support advisor onboarding.
     "hard_ban_keywords": [
-        "lead generation", "upselling", "quota-driven", "client acquisition",
-        "hunter mentality", "pipeline development", "uncapped earnings",
+        "lead generation", "upselling", "quota-driven",
+        "hunter mentality", "sales pipeline", "uncapped earnings",
         "cold outreach", "deal closing", "solution pitching",
-        "uncapped potential", "commission", "hustle", "grind", "door-to-door",
+        "uncapped potential", "commission-only", "hustle", "grind", "door-to-door",
         "phone jockey", "call jockey", "cold calling",
         "physical filing", "answering phones", "switchboard", "data entry clerk",
         "schedule travel arrangements", "clerical duties", "errands"

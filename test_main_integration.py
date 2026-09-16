@@ -2886,6 +2886,35 @@ def test_passes_strict_filter_records_the_gate_that_rejected(monkeypatch):
     assert trace.reasons.get("out_of_state") == 1
 
 
+def test_hard_ban_keywords_reject_commission_pay_not_commission_reporting(monkeypatch):
+    """Bare "commission" used to reject ops roles that merely report on commissions. Uses the shipped
+    defaults so a regression in DEFAULT_SEARCH_FILTERS itself is caught."""
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000,
+        "valid_cities": ["farmington"],
+        "hard_ban_keywords": m.DEFAULT_SEARCH_FILTERS["hard_ban_keywords"],
+    }.get(key, default if default is not None else []))
+
+    def job(description):
+        return {
+            "employer_name": "Acme Wealth",
+            "job_title": "Operations Analyst",
+            "job_description": description,
+            "job_city": "Farmington Hills",
+            "job_state": "MI",
+        }
+
+    reporting = job("Own commission calculations and reporting; reconciliation in SQL and Excel.")
+    assert m.passes_strict_filter(reporting) is True
+
+    trace = m.FunnelTrace()
+    commission_pay = job("Commission-only compensation; reconciliation in SQL and Excel.")
+    assert m.passes_strict_filter(commission_pay, trace=trace) is False
+    assert trace.reasons.get("hard_ban_keyword") == 1
+
+
 def test_passes_strict_filter_works_without_a_trace(monkeypatch):
     """trace is optional - every existing caller passes nothing and must keep working."""
     monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
