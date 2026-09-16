@@ -5463,7 +5463,10 @@ def fetch_greenhouse_jobs(slug):
     baseline dropped from ~477MB to ~95MB.
     """
     try:
-        res = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true", timeout=10)
+        # 30s, not the 10s the other boards use: content=true returns ~12x the bytes (a large
+        # board goes 0.7MB -> 9MB), and on a 0.5-CPU instance the old timeout started dropping
+        # whole boards - every ATS board timing out at once is what a 0-candidate /t run looks like.
+        res = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true", timeout=30)
         if res.status_code != 200:
             return []
         postings = res.json().get("jobs", [])
@@ -5907,15 +5910,22 @@ def fetch_remote_feed_jobs(limit=100):
     return all_jobs
 
 
-def fetch_ats_jobs(company_slugs):
-    """Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, plus
-    every configured Workday board, in parallel.
+def fetch_ats_jobs(company_slugs, include_workday=False):
+    """Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in
+    parallel; with include_workday=True, also every board in the `workday_boards` filter.
 
-    Workday boards come from their own `workday_boards` filter rather than ats_company_slugs: a
-    Workday address needs a tenant/host/site triple ("flagstar/wd1/Flagstar_Careers"), not the
-    single slug the other three boards take, and auto_expand_ats_slug() cannot guess one.
+    Workday is OPT-IN per caller, not per slug, because it is scoped differently from the other
+    three: a Workday address needs a tenant/host/site triple ("flagstar/wd1/Flagstar_Careers")
+    rather than a single company slug, so auto_expand_ats_slug() cannot discover one and the list
+    is curated by hand. Those hand-picked boards are national employers, which makes them Stage 1c
+    watchlist material - NOT Stage 1b, which is deliberately scoped to Kevin's Carmen Warm network
+    only. Defaulting to False keeps the warm stage warm: sourcing national boards there would
+    contaminate the one stage whose whole purpose is that every posting traces to a real contact.
     """
-    workday_boards = [str(b).strip() for b in get_filter("workday_boards", []) if str(b).strip()]
+    workday_boards = (
+        [str(b).strip() for b in safe_list(get_filter("workday_boards", [])) if str(b).strip()]
+        if include_workday else []
+    )
     if not company_slugs and not workday_boards:
         return []
     all_jobs = []
@@ -5931,7 +5941,9 @@ def fetch_ats_jobs(company_slugs):
         workday_futures = [executor.submit(fetch_workday_jobs, board) for board in workday_boards]
         for future in futures:
             try:
-                all_jobs.extend(future.result(timeout=15))
+                # Must exceed the slowest single-board request (Greenhouse at 30s) or a board that
+                # is merely slow gets counted as a failure while its thread keeps running.
+                all_jobs.extend(future.result(timeout=45))
             except Exception as e:
                 logging.error(f"ATS Fetch Future Error: {e}")
         for future in workday_futures:
@@ -6318,10 +6330,14 @@ def run_job_pipeline(chat_id=None, top_n=2):
         watchlist = safe_list(get_filter("ats_company_slugs", []))
         # Warm slugs already ran in 1b; re-fetching them here would double the HTTP calls.
         watchlist = [s for s in watchlist if s not in set(warm_ats_slugs or [])]
-        if watchlist:
+        workday_count = len(safe_list(get_filter("workday_boards", [])))
+        if watchlist or workday_count:
             if chat_id:
-                send_status_update(chat_id, f"Stage 1c: Sourcing direct ATS postings from {len(watchlist)} watchlist companies...")
-            for job in fetch_ats_jobs(watchlist):
+                workday_note = f" + {workday_count} Workday board(s)" if workday_count else ""
+                send_status_update(chat_id, f"Stage 1c: Sourcing direct ATS postings from {len(watchlist)} watchlist companies{workday_note}...")
+            # Workday rides with the watchlist, never with Stage 1b: both are national boards
+            # behind the same /gear opt-in, so /ats off silences them together.
+            for job in fetch_ats_jobs(watchlist, include_workday=True):
                 _add_candidate(job)
 
     # Stage 1d: keyless public remote feeds (RemoteOK, Himalayas, Remotive, WeWorkRemotely).
