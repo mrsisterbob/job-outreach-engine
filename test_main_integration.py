@@ -2953,3 +2953,60 @@ def test_passes_strict_filter_works_without_a_trace(monkeypatch):
     }
 
     assert m.passes_strict_filter(job) is False
+
+
+# ---- Per-query yield attribution ----
+
+def test_funnel_trace_attributes_candidates_to_their_source_query():
+    trace = m.FunnelTrace()
+
+    trace.set_query("Operations Specialist Troy MI")
+    for _ in range(4):
+        trace.raw += 1
+        trace._bump("raw")
+    trace.passed += 1
+    trace._bump("passed")
+
+    trace.set_query("Custodial Operations Schwab Fidelity Troy MI")
+    trace.raw += 1
+    trace._bump("raw")
+
+    assert trace.per_query["Operations Specialist Troy MI"] == {"raw": 4, "passed": 1}
+    assert trace.per_query["Custodial Operations Schwab Fidelity Troy MI"] == {"raw": 1, "passed": 0}
+
+
+def test_funnel_trace_ignores_candidates_with_no_source_query():
+    """ATS boards, remote feeds and warm sweeps have no search phrase, so they must not be
+    credited to whichever query happened to run last."""
+    trace = m.FunnelTrace()
+    trace.set_query("Operations Specialist Troy MI")
+    trace.raw += 1
+    trace._bump("raw")
+
+    trace.set_query(None)
+    for _ in range(5):
+        trace.raw += 1
+        trace._bump("raw")
+
+    assert trace.per_query == {"Operations Specialist Troy MI": {"raw": 1, "passed": 0}}
+    assert trace.raw == 6
+
+
+def test_query_yield_report_puts_the_worst_performer_first():
+    trace = m.FunnelTrace()
+    trace.per_query = {
+        "good query": {"raw": 12, "passed": 3},
+        "dead query": {"raw": 0, "passed": 0},
+        "wasteful query": {"raw": 40, "passed": 0},
+    }
+
+    lines = trace.query_yield_report().splitlines()
+
+    # Zero-passed first, and among those the one burning the most raw listings leads.
+    assert "wasteful query" in lines[0]
+    assert "dead query" in lines[1]
+    assert "good query" in lines[2]
+
+
+def test_query_yield_report_is_empty_without_attribution():
+    assert m.FunnelTrace().query_yield_report() == ""

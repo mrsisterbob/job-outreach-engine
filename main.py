@@ -699,6 +699,19 @@ def init_db():
             query_text TEXT PRIMARY KEY,
             last_page INTEGER DEFAULT 1
         )""")
+        # Lifetime yield per search phrase. A single run says almost nothing about a query - the
+        # rolling slice means each one fires roughly every 11 runs, and any one firing can be
+        # unlucky. Accumulated across runs it separates a phrase that is structurally broken
+        # (never returns anything, or only listings every gate rejects) from one that is merely
+        # quiet this week, which is the only honest basis for pruning the 110-query bank.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS query_yield (
+            query_text TEXT PRIMARY KEY,
+            runs INTEGER DEFAULT 0,
+            raw_total INTEGER DEFAULT 0,
+            passed_total INTEGER DEFAULT 0,
+            last_run TIMESTAMP
+        )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS crm_outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1912,6 +1925,46 @@ def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applie
         logging.error(f"Company Identity Upsert Error ({normalized}): {e}")
         return False
 
+def _record_query_yield(per_query):
+    """Accumulate this run's per-query raw/passed counts into the query_yield table.
+
+    Never raises: this is telemetry, and a bookkeeping failure must not take down a /t run.
+    """
+    if not per_query:
+        return
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for query, stats in per_query.items():
+                conn.execute("""
+                    INSERT INTO query_yield (query_text, runs, raw_total, passed_total, last_run)
+                    VALUES (?, 1, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(query_text) DO UPDATE SET
+                        runs = runs + 1,
+                        raw_total = raw_total + excluded.raw_total,
+                        passed_total = passed_total + excluded.passed_total,
+                        last_run = CURRENT_TIMESTAMP
+                """, (query, stats["raw"], stats["passed"]))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Query yield persist error: {e}")
+
+
+def get_query_yield_rows(limit=25):
+    """Lifetime query yield, worst first (fewest passed, then most wasted raw)."""
+    try:
+        with get_db_conn() as conn:
+            return conn.execute("""
+                SELECT query_text, runs, raw_total, passed_total
+                FROM query_yield
+                ORDER BY passed_total ASC, raw_total DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+    except Exception as e:
+        logging.error(f"Query yield read error: {e}")
+        return []
+
+
 def get_tracked_job_keys():
     """Every role already sitting in a JOB tab (Tetiana Cold + Tetiana Warm), as company+title hashes.
 
@@ -2986,17 +3039,46 @@ FUNNEL_REJECTION_LABELS = {
 
 
 class FunnelTrace:
-    """Counts why candidates were dropped during one pipeline run."""
+    """Counts why candidates were dropped during one pipeline run.
+
+    Also attributes raw/passed counts back to the SOURCE QUERY when one is set, which answers a
+    question the rejection tally cannot: is a given search phrase earning its slot in the 110-query
+    bank? A phrase that returns nothing, or only listings that every gate rejects, is costing an
+    API call per run for no candidates - and there is no other way to tell it apart from a phrase
+    that is merely unlucky this slice.
+    """
 
     def __init__(self):
         self.raw = 0
         self.passed = 0
         self.reasons = {}
+        self.current_query = None
+        self.per_query = {}
+
+    def set_query(self, query):
+        """Attribute subsequent candidates to `query` (None = non-JSearch sources: ATS boards,
+        remote feeds, warm sweeps - those have no search phrase to credit)."""
+        self.current_query = query or None
+        if self.current_query and self.current_query not in self.per_query:
+            self.per_query[self.current_query] = {"raw": 0, "passed": 0}
+
+    def _bump(self, field):
+        if self.current_query:
+            self.per_query[self.current_query][field] += 1
 
     def note(self, reason):
         """Record one rejection. Unknown reasons are counted under their raw key rather than
         dropped, so a gate added without a label still shows up in the summary."""
         self.reasons[reason] = self.reasons.get(reason, 0) + 1
+
+    def query_yield_report(self, limit=12):
+        """Per-query raw->passed counts, worst first. Empty when no query was ever attributed."""
+        if not self.per_query:
+            return ""
+        ranked = sorted(self.per_query.items(), key=lambda kv: (kv[1]["passed"], -kv[1]["raw"]))
+        lines = [f"{stats['raw']:>3} raw -> {stats['passed']} passed  {query}"
+                 for query, stats in ranked[:limit]]
+        return "\n".join(lines)
 
     def summary_line(self):
         """One-line funnel breakdown, most common rejection first, or "" when nothing was dropped."""
@@ -6411,6 +6493,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
         nonlocal raw_discovered_count
         raw_discovered_count += 1
         funnel.raw += 1
+        funnel._bump("raw")
         company = job.get("employer_name") or ""
         title = job.get("job_title") or ""
         job_hash = generate_dedup_hash(company, title)
@@ -6456,6 +6539,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
         # SIGNAL now, not a gate: nothing above consults it to block a candidate.
         save_seen_job_db(job_hash)
         funnel.passed += 1
+        funnel._bump("passed")
         candidate_pool.append(job)
     
     # Stage 1: Parallel JSearch fetching (rolling 10-query slice) + strict filtering
@@ -6464,10 +6548,15 @@ def run_job_pipeline(chat_id=None, top_n=2):
     query_tasks = [(q, api_url, headers) for q in active_queries]
     
     with ThreadPoolExecutor(max_workers=min(len(active_queries), 8) or 4) as executor:
+        # executor.map preserves input order, so zipping results back against active_queries
+        # attributes each listing to the phrase that found it. Ingestion stays single-threaded
+        # here, so setting funnel.current_query around each batch is safe.
         query_results = executor.map(fetch_single_query_jobs, query_tasks)
-        for jobs in query_results:
+        for query, jobs in zip(active_queries, query_results):
+            funnel.set_query(query)
             for job in jobs:
                 _add_candidate(job)
+        funnel.set_query(None)  # later stages (ATS, remote feeds) have no search phrase to credit
 
     # Stage 1b: ATS direct-source expansion strictly scoped to Carmen Warm network companies.
     warm_ats_slugs = resolve_warm_company_ats_slugs()
@@ -6529,6 +6618,12 @@ def run_job_pipeline(chat_id=None, top_n=2):
     funnel_line = funnel.summary_line()
     if funnel_line:
         logging.info(f"[FUNNEL] {funnel_line}")
+    # Logged rather than pushed to Telegram: this is a slow-moving question about the query bank,
+    # not something to act on mid-run, and one line per query would drown the run card.
+    yield_report = funnel.query_yield_report(limit=len(active_queries) or 10)
+    if yield_report:
+        logging.info("[QUERY YIELD] worst-performing first:\n" + yield_report)
+        _record_query_yield(funnel.per_query)
     if chat_id:
         # The funnel breakdown rides along with the ingest count so a 0-candidate run explains
         # itself in Telegram instead of requiring a log dig.
@@ -6994,6 +7089,27 @@ def process_webhook_payload_async(data):
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
             send_telegram_message(chat_id, "\n".join(lines))
             return
+        if text == "/queries":
+            rows = get_query_yield_rows(limit=25)
+            if not rows:
+                send_telegram_message(
+                    chat_id,
+                    "📊 <b>Query Yield</b>\n\nNo data yet. Each <code>/t</code> records the raw and "
+                    "passed counts per search phrase; a phrase needs a few runs before its numbers "
+                    "mean anything (the rolling slice fires each one roughly every 11 runs)."
+                )
+                return
+            lines = ["📊 <b>Query Yield</b> (lifetime, worst first)\n"]
+            for query_text, runs, raw_total, passed_total in rows:
+                flag = " ⚠️" if runs >= 3 and passed_total == 0 else ""
+                lines.append(
+                    f"<code>{raw_total:>4} raw → {passed_total:>2} passed</code> "
+                    f"({runs}r){flag}\n  {html.escape(str(query_text))}"
+                )
+            lines.append("\n⚠️ = 3+ runs, never produced a candidate.")
+            send_telegram_message(chat_id, "\n".join(lines))
+            return
+
         if text == "/unbury" or text == "/unbury go":
             # Repairs the damage the empty-description simhash collision already did. Every job
             # dropped by that bug was recorded against the SAME poisoned hash (the empty-string
@@ -7839,6 +7955,7 @@ def process_webhook_payload_async(data):
                 "/efficiency - View Input to Interview Golden Ratio\n"
                 "/funnel - View pipeline conversion funnel\n"
                 "/unbury - Preview buried-listing cleanup (add 'go' to clear)\n"
+                "/queries - Per-query yield: which search phrases earn their slot\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
                 "/treplies - View reply rate grouped by outreach & LinkedIn template id (read-only)\n"
