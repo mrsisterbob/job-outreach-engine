@@ -35,8 +35,9 @@ from pipeline_utils import (
     is_role_mailbox, company_domain_of, name_from_email_local_part,
     plan_carmen_followup, CARMEN_LADDER_DAYS,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
-    parse_job_command, parse_linkedin_job_html, build_ingest_job_dict,
-    canonical_linkedin_job_url, is_linkedin_job_url, strip_html_to_text,
+    parse_job_command, parse_job_page_html, build_ingest_job_dict,
+    canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
+    strip_tracking_params, strip_html_to_text,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
     REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
 )
@@ -5840,29 +5841,37 @@ def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
 # The logged-in /jobs/view/ page returns an auth wall to any server-side fetch, so a bare GET on
 # the URL Kevin copies out of his address bar yields nothing usable.
 _LINKEDIN_GUEST_JOB_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
-_LINKEDIN_SCRAPE_HEADERS = {
+_JOB_SCRAPE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 
-def scrape_linkedin_job(url, timeout=8):
-    """Best-effort server-side fetch of a LinkedIn posting -> (title, company, description).
+def scrape_job_page(url, timeout=12):
+    """Best-effort server-side fetch of ANY job posting page -> (title, company, description).
 
-    Tries the public jobs-guest endpoint first (no session required), then the canonical permalink.
-    Returns ("", "", "") when LinkedIn serves an auth wall or challenge, which is a NORMAL outcome
-    from a datacenter IP - callers must treat an empty result as "ask Kevin to type it", never as
-    an error. This is why /job accepts the explicit `Title @ Company <url>` form.
+    Not LinkedIn-specific. The parser keys on the schema.org JobPosting JSON-LD block that nearly
+    every ATS and corporate careers site emits (Workday, iCIMS, Greenhouse, Phenom, and the
+    employer-hosted pages LinkedIn's "Apply" button forwards to), falling back to page markup and
+    the <title> tag. An employer careers page is usually a BETTER source than LinkedIn: it answers
+    a plain GET with the full description, where LinkedIn serves an auth wall.
+
+    LinkedIn is the one host needing special handling - its posting id is rewritten to the public
+    jobs-guest endpoint first, since the canonical /jobs/view/ URL is the one that gets walled.
+
+    Returns ("", "", "") when nothing usable comes back, which is a NORMAL outcome (auth wall, JS-
+    only page, bot challenge) - callers must treat it as "ask Kevin to type it", never as an error.
     """
+    attempts = []
     job_id = None
     try:
         from pipeline_utils import extract_linkedin_job_id
-        job_id = extract_linkedin_job_id(url)
+        if is_linkedin_job_url(url):
+            job_id = extract_linkedin_job_id(url)
     except Exception:
         pass
 
-    attempts = []
     if job_id:
         attempts.append(_LINKEDIN_GUEST_JOB_URL.format(job_id=job_id))
         attempts.append(canonical_linkedin_job_url(url))
@@ -5871,19 +5880,19 @@ def scrape_linkedin_job(url, timeout=8):
 
     for attempt_url in attempts:
         try:
-            res = requests.get(attempt_url, headers=_LINKEDIN_SCRAPE_HEADERS, timeout=timeout)
+            res = requests.get(attempt_url, headers=_JOB_SCRAPE_HEADERS, timeout=timeout, allow_redirects=True)
         except Exception as e:
-            logging.warning(f"[INGEST] LinkedIn fetch failed for {attempt_url}: {e}")
+            logging.warning(f"[INGEST] Fetch failed for {attempt_url}: {e}")
             continue
         if res.status_code != 200 or not res.text:
-            logging.warning(f"[INGEST] LinkedIn returned {res.status_code} for {attempt_url}")
+            logging.warning(f"[INGEST] HTTP {res.status_code} for {attempt_url}")
             continue
-        title, company, description = parse_linkedin_job_html(res.text)
+        title, company, description = parse_job_page_html(res.text)
         if title or company:
             logging.info(f"[INGEST] Scraped '{title}' @ '{company}' ({len(description)} desc chars) from {attempt_url}")
             return (title, company, description)
 
-    logging.info(f"[INGEST] No usable content scraped from {url} - auth wall or unsupported page")
+    logging.info(f"[INGEST] No usable content scraped from {url} - auth wall, JS-only page, or unsupported layout")
     return ("", "", "")
 
 
@@ -5903,17 +5912,22 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
 
     Returns (ok, message) for the caller to relay.
     """
+    # Scrape ANY posting URL, not just LinkedIn: employer careers pages (the destination behind
+    # LinkedIn's own Apply button) answer a plain GET with a full schema.org JobPosting block,
+    # so they are the better source whenever Kevin has that link.
     scraped_title, scraped_company, scraped_desc = ("", "", "")
-    if url and is_linkedin_job_url(url) and not (title and company):
-        scraped_title, scraped_company, scraped_desc = scrape_linkedin_job(url)
+    if url and not (title and company):
+        scraped_title, scraped_company, scraped_desc = scrape_job_page(url)
 
     final_title = (title or scraped_title or "").strip()
     final_company = (company or scraped_company or "").strip()
     final_desc = (description or scraped_desc or "").strip()
 
     if not (final_title and final_company):
+        blocked_host = "LinkedIn" if is_linkedin_job_url(url) else "That page"
         return (False, (
-            "🔒 <b>LinkedIn blocked the page read.</b> That's expected - it won't serve job pages to a server.\n\n"
+            f"🔒 <b>{blocked_host} didn't return a readable posting.</b> Usually an auth wall or a "
+            "JavaScript-only page.\n\n"
             "Send it with the title and company spelled out instead:\n"
             f"<code>/job Foreign Exchange Ops Analyst 2 @ Huntington National Bank {html.escape(str(url or ''))}</code>"
         ))
@@ -7673,7 +7687,7 @@ def desktop_ingest():
         # "Company hiring Title in City" shape, recover both halves rather than storing the whole
         # string as the job title.
         if url and not (title and company):
-            parsed_title, parsed_company, parsed_desc = parse_linkedin_job_html(raw_text) if raw_text else ("", "", "")
+            parsed_title, parsed_company, parsed_desc = parse_job_page_html(raw_text) if raw_text else ("", "", "")
             title = title or parsed_title
             company = company or parsed_company
             if parsed_desc and len(parsed_desc) > len(raw_text or ""):

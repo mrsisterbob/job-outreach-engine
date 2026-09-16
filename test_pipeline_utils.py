@@ -1046,7 +1046,7 @@ def test_parse_job_command_rejects_unusable_input():
     assert pu.parse_job_command(None) is None
 
 
-def test_parse_linkedin_job_html_prefers_json_ld():
+def test_parse_job_page_html_prefers_json_ld():
     body = (
         '<html><head><script type="application/ld+json">'
         '{"@type":"JobPosting","title":"FX Ops Analyst 2",'
@@ -1054,7 +1054,7 @@ def test_parse_linkedin_job_html_prefers_json_ld():
         '"description":"<p>Settle trades.</p><ul><li>Reconcile</li></ul>"}'
         '</script></head><body></body></html>'
     )
-    title, company, description = pu.parse_linkedin_job_html(body)
+    title, company, description = pu.parse_job_page_html(body)
     assert title == "FX Ops Analyst 2"
     assert company == "Huntington National Bank"
     assert "Settle trades." in description
@@ -1062,19 +1062,19 @@ def test_parse_linkedin_job_html_prefers_json_ld():
     assert "<p>" not in description  # markup flattened, not passed through to Gemini
 
 
-def test_parse_linkedin_job_html_falls_back_to_the_title_tag():
+def test_parse_job_page_html_falls_back_to_the_title_tag():
     body = "<html><head><title>Ally hiring Associate Analyst in Detroit, MI | LinkedIn</title></head></html>"
-    title, company, _ = pu.parse_linkedin_job_html(body)
+    title, company, _ = pu.parse_job_page_html(body)
     assert title == "Associate Analyst"
     assert company == "Ally"
 
 
-def test_parse_linkedin_job_html_returns_empty_on_an_auth_wall():
+def test_parse_job_page_html_returns_empty_on_an_auth_wall():
     """An auth wall is the NORMAL datacenter-IP outcome, not an error - it must come back empty
     so the caller asks Kevin to type the title rather than filing a 'Manual Ingest' row."""
-    assert pu.parse_linkedin_job_html("<html><body>Sign in to continue</body></html>") == ("", "", "")
-    assert pu.parse_linkedin_job_html("") == ("", "", "")
-    assert pu.parse_linkedin_job_html(None) == ("", "", "")
+    assert pu.parse_job_page_html("<html><body>Sign in to continue</body></html>") == ("", "", "")
+    assert pu.parse_job_page_html("") == ("", "", "")
+    assert pu.parse_job_page_html(None) == ("", "", "")
 
 
 def test_strip_html_to_text_keeps_bullet_structure():
@@ -1122,7 +1122,7 @@ def test_build_ingest_job_dict_falls_back_when_fields_are_blank():
     assert job["job_title"] == "Manually Ingested Role"
 
 
-def test_parse_linkedin_job_html_reads_the_guest_endpoint_h2_title():
+def test_parse_job_page_html_reads_the_guest_endpoint_h2_title():
     """Regression, caught against the live endpoint: the jobs-guest page - the only surface that
     answers a server-side fetch - puts the job title in an <h2 class="...topcard__title">, not an
     <h1>. Matching only <h1> filed every scraped job as "Manually Ingested Role"."""
@@ -1133,6 +1133,94 @@ def test_parse_linkedin_job_html_reads_the_guest_endpoint_h2_title():
         '<a class="topcard__org-name-link topcard__flavor--black-link" href="/company/x">'
         'Huntington National Bank</a></span></div>'
     )
-    title, company, _ = pu.parse_linkedin_job_html(body)
+    title, company, _ = pu.parse_job_page_html(body)
     assert title == "Foreign Exchange Ops Analyst 2"
     assert company == "Huntington National Bank"
+
+
+# ---- Non-LinkedIn job pages (employer careers sites) ----
+
+# The employer-hosted page behind LinkedIn's Apply button. Unlike LinkedIn it answers a plain
+# GET with a full schema.org JobPosting, so it is the BETTER source when Kevin has this link.
+CAREERS_BASE = (
+    "https://huntington-careers.com/search/jobdetails/foreign-exchange-ops-analyst-2/"
+    "d9b4805d-d019-42f1-a408-c824ed2c36bb"
+)
+CAREERS_URL = CAREERS_BASE + (
+    "?utm_source=linkedin&utm_medium=paid_job_board&utm_campaign=linkedin_paid"
+    "&source=LinkedIn_Corporate_Page"
+)
+
+
+def test_strip_tracking_params_drops_campaign_noise():
+    assert pu.strip_tracking_params(CAREERS_URL) == CAREERS_BASE
+
+
+def test_strip_tracking_params_keeps_functional_params():
+    """Only arrival-tracking is noise - a param that identifies the posting must survive."""
+    assert pu.strip_tracking_params("https://x.co/job?jobId=99&utm_source=li") == \
+        "https://x.co/job?jobId=99"
+
+
+def test_strip_tracking_params_passes_through_bare_urls():
+    assert pu.strip_tracking_params(CAREERS_BASE) == CAREERS_BASE
+    assert pu.strip_tracking_params("") == ""
+    assert pu.strip_tracking_params(None) == ""
+
+
+def test_canonical_job_url_handles_both_linkedin_and_careers_pages():
+    assert pu.canonical_job_url(SEARCH_RESULTS_URL) == PERMALINK_URL
+    assert pu.canonical_job_url(CAREERS_URL) == CAREERS_BASE
+
+
+def test_ingest_id_is_stable_across_ad_sources():
+    """The same careers posting reached from a LinkedIn ad and an Indeed ad is ONE job - without
+    stripping tracking params it would write two Tetiana Cold rows for the same role."""
+    via_linkedin = pu.build_ingest_job_dict("t", "c", "d", CAREERS_BASE + "?utm_source=linkedin")
+    via_indeed = pu.build_ingest_job_dict("t", "c", "d", CAREERS_BASE + "?utm_source=indeed")
+    assert via_linkedin["job_id"] == via_indeed["job_id"]
+
+
+def test_ingest_stores_the_clean_apply_link():
+    job = pu.build_ingest_job_dict("t", "c", "d", CAREERS_URL)
+    assert job["job_apply_link"] == CAREERS_BASE
+    assert "utm_" not in job["job_apply_link"]
+
+
+def test_parse_job_page_html_reads_a_generic_careers_page_json_ld():
+    """No LinkedIn markup anywhere - this is the shape Workday/iCIMS/Phenom emit."""
+    body = (
+        '<html><head><script type="application/ld+json">'
+        '{"@context":"https://schema.org/","@type":"JobPosting",'
+        '"title":"Foreign Exchange Ops Analyst 2",'
+        '"hiringOrganization":{"@type":"Organization","name":"Huntington"},'
+        '"description":"<p>Supports daily FX settlement.</p>"}'
+        '</script></head><body></body></html>'
+    )
+    title, company, description = pu.parse_job_page_html(body)
+    assert title == "Foreign Exchange Ops Analyst 2"
+    assert company == "Huntington"
+    assert "FX settlement" in description
+
+
+def test_parse_job_page_html_reads_a_pipe_delimited_title_tag():
+    """Careers-page convention: "Role | Location | Employer" - first segment is the role,
+    last is the employer, and anything between is a location to discard."""
+    body = "<html><head><title>Foreign Exchange Ops Analyst 2 | Multiple Locations | Huntington</title></head></html>"
+    title, company, _ = pu.parse_job_page_html(body)
+    assert title == "Foreign Exchange Ops Analyst 2"
+    assert company == "Huntington"
+
+
+def test_parse_job_page_html_pipe_fallback_needs_two_segments():
+    """A single-segment title is just a page name - guessing an employer from it would be wrong."""
+    title, company, _ = pu.parse_job_page_html("<html><head><title>Careers</title></head></html>")
+    assert title == ""
+    assert company == ""
+
+
+def test_linkedin_title_shape_still_wins_over_the_pipe_fallback():
+    body = "<html><head><title>Ally hiring Associate Analyst in Detroit, MI | LinkedIn</title></head></html>"
+    title, company, _ = pu.parse_job_page_html(body)
+    assert title == "Associate Analyst"
+    assert company == "Ally"

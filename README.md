@@ -77,11 +77,19 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
   `/n`, `/f`), the follow-up sequencer and `/funnel` all work on it. Unlike `/t` there is **no
   score>=80 gate**: a posting you chose is already vetted, so any score writes the row.
   Re-pasting the same job dedups instead of writing a second row.
-  - LinkedIn serves job pages to a logged-in browser, not to a server. `/job` reads the public
-    `jobs-guest` endpoint, which usually works; when it is blocked the command replies asking for
-    `/job Title @ Company <url>` rather than filing a `Manual Ingest` row. The desktop bookmarklet
-    (`POST /ingest`) scrapes inside your own session, so it always has the full description and
-    scores best - prefer it when you are at a desk.
+  - Works with **any** posting URL, not just LinkedIn: the scraper keys on the schema.org
+    `JobPosting` JSON-LD block that nearly every ATS and corporate careers site emits. An
+    employer careers page (the destination behind LinkedIn's Apply button) is usually the
+    *better* link to paste - it answers a plain GET with the full description, where LinkedIn
+    serves an auth wall to any server-side fetch. LinkedIn URLs are rewritten to the public
+    `jobs-guest` endpoint, which usually works.
+  - Campaign params (`utm_*`, `source`, `refId`, …) are stripped before the URL is used as the
+    dedup key or stored as the apply link, so the same job reached from a LinkedIn ad and an
+    Indeed ad is one row, not two.
+  - When a page can't be read (auth wall, JS-only rendering), the command replies asking for
+    `/job Title @ Company <url>` rather than filing a `Manual Ingest` row. The desktop
+    bookmarklet (`POST /ingest`) scrapes inside your own session, so it always has the full
+    description - prefer it when you are at a desk and the page is JS-only.
 
 ## Tests
 

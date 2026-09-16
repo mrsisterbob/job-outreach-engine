@@ -997,17 +997,53 @@ def extract_linkedin_job_id(url):
     return None
 
 
-def canonical_linkedin_job_url(url):
-    """Normalize any LinkedIn job URL to its bare /jobs/view/<id> permalink.
+# Campaign/analytics params that identify how Kevin ARRIVED at a posting, never which posting it
+# is. Two links to the same job from a LinkedIn ad and an Indeed ad differ only by these, so they
+# are stripped before the URL is used as a dedup key or stored as the apply link.
+_TRACKING_PARAM_PREFIXES = ("utm_", "sc_", "gh_", "_hs")
+_TRACKING_PARAM_NAMES = {
+    "source", "src", "ref", "refid", "referrer", "trackingid", "trk", "ebp",
+    "gclid", "fbclid", "mc_cid", "mc_eid", "campaign", "medium", "recruiter",
+}
 
-    Search-results URLs carry a long tail of tracking params (eBP, refId, trackingId) that differ
-    per visit, so the raw URL is useless as a dedup key and ugly as a stored apply link. Returns
-    the input unchanged when it carries no recoverable job id.
+
+def strip_tracking_params(url):
+    """Drop campaign/analytics query params, preserving everything that identifies the posting.
+
+    Order of surviving params is preserved. A URL with no query string comes back unchanged.
     """
-    job_id = extract_linkedin_job_id(url)
-    if not job_id:
-        return str(url or "").strip()
-    return f"https://www.linkedin.com/jobs/view/{job_id}/"
+    raw = str(url or "").strip()
+    if not raw or "?" not in raw:
+        return raw
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        kept = [
+            (k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+            if not (k.lower() in _TRACKING_PARAM_NAMES or k.lower().startswith(_TRACKING_PARAM_PREFIXES))
+        ]
+        return urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(kept), "")
+        )
+    except Exception:
+        return raw
+
+
+def canonical_job_url(url):
+    """Normalize any job URL for use as a dedup key and stored apply link.
+
+    LinkedIn collapses to its bare /jobs/view/<id> permalink - search-results URLs carry a long
+    tail of per-visit tracking (eBP, refId, trackingId) around the same posting id. Every other
+    host keeps its path (which is what identifies the posting) minus tracking params and fragment.
+    """
+    job_id = extract_linkedin_job_id(url) if "linkedin.com" in str(url or "").lower() else None
+    if job_id:
+        return f"https://www.linkedin.com/jobs/view/{job_id}/"
+    return strip_tracking_params(url)
+
+
+def canonical_linkedin_job_url(url):
+    """Back-compat alias for canonical_job_url(). Prefer canonical_job_url in new code."""
+    return canonical_job_url(url)
 
 
 def is_linkedin_job_url(url):
@@ -1052,14 +1088,18 @@ def parse_job_command(text_input):
     return None
 
 
-def parse_linkedin_job_html(html_text):
-    """Best-effort extraction of (title, company, description) from a LinkedIn job page.
+def parse_job_page_html(html_text):
+    """Best-effort extraction of (title, company, description) from ANY job posting page.
 
-    LinkedIn serves a JSON-LD JobPosting block on its public guest pages, which is far more stable
-    than the CSS class names - those are minified and rotate. Falls back to the guest-page markup,
-    then to the <title> tag ("Company hiring Title in City | LinkedIn").
+    Order of preference:
+      1. schema.org JobPosting JSON-LD - emitted by nearly every ATS and corporate careers site
+         (Workday, iCIMS, Greenhouse, Phenom) and by LinkedIn's public guest pages. Far more
+         stable than CSS class names, which are minified and rotate.
+      2. LinkedIn guest-page markup (topcard__title / topcard__org-name-link).
+      3. The <title> tag, including LinkedIn's "Company hiring Title in City" shape.
 
-    Returns (title, company, description), any of which may be "" when the page is an auth wall.
+    Returns (title, company, description), any of which may be "" when the page is an auth wall
+    or renders its content only via JavaScript.
     """
     body = str(html_text or "")
     if not body:
@@ -1107,7 +1147,9 @@ def parse_linkedin_job_html(html_text):
         if m:
             description = strip_html_to_text(m.group(1))
 
-    # 3. <title> tag: "Company hiring Job Title in City, State | LinkedIn"
+    # 3. <title> tag. Two shapes are worth recognizing:
+    #      LinkedIn:      "Company hiring Job Title in City, State | LinkedIn"
+    #      Careers pages: "Job Title | Multiple Locations | Company"  (pipe-delimited)
     if not (title and company):
         m = re.search(r'<title[^>]*>(.*?)</title>', body, re.DOTALL | re.IGNORECASE)
         if m:
@@ -1117,6 +1159,14 @@ def parse_linkedin_job_html(html_text):
             if hiring:
                 company = company or hiring.group(1).strip()
                 title = title or hiring.group(2).strip()
+            else:
+                # Pipe-delimited: first segment is the role, last is the employer. Anything
+                # between them is a location and is discarded. Requires >= 2 segments, and is
+                # only a guess - JSON-LD above is authoritative whenever the page provides it.
+                segments = [s.strip() for s in head.split("|") if s.strip()]
+                if len(segments) >= 2:
+                    title = title or segments[0]
+                    company = company or segments[-1]
 
     return (title.strip(), company.strip(), description.strip())
 
@@ -1148,7 +1198,7 @@ def build_ingest_job_dict(title, company, description, url, now=None):
     posting produces the same id and trips the existing dedup ledger instead of double-carding.
     """
     stamp = now or datetime.now(timezone.utc)
-    canonical = canonical_linkedin_job_url(url) if url else ""
+    canonical = canonical_job_url(url) if url else ""
     seed = canonical or url or f"{company}|{title}"
     return {
         "job_id": f"ingest_{hashlib.md5(str(seed).encode('utf-8', 'ignore')).hexdigest()[:12]}",

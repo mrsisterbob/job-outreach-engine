@@ -2697,7 +2697,7 @@ def test_ingest_manual_job_asks_for_typed_details_when_linkedin_blocks(monkeypat
     def _fail(p, **kw):
         pytest.fail("no row should be written")
 
-    monkeypatch.setattr(m, "scrape_linkedin_job", lambda url, timeout=8: ("", "", ""))
+    monkeypatch.setattr(m, "scrape_job_page", lambda url, timeout=8: ("", "", ""))
     monkeypatch.setattr(m, "log_to_sheets_crm", _fail)
 
     ok, message = m.ingest_manual_job(url="https://www.linkedin.com/jobs/view/4461280495/")
@@ -2746,7 +2746,7 @@ def test_ingest_manual_job_scrapes_when_only_a_url_is_given(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        m, "scrape_linkedin_job",
+        m, "scrape_job_page",
         lambda url, timeout=8: ("FX Ops Analyst 2", "Huntington National Bank", "Settle trades."),
     )
     monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
@@ -2769,7 +2769,7 @@ def test_ingest_manual_job_skips_the_scrape_when_details_are_typed(monkeypatch):
     def _no_scrape(url, timeout=8):
         pytest.fail("scrape should be skipped when title and company are supplied")
 
-    monkeypatch.setattr(m, "scrape_linkedin_job", _no_scrape)
+    monkeypatch.setattr(m, "scrape_job_page", _no_scrape)
     monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
     monkeypatch.setattr(m, "log_to_sheets_crm", lambda p, **kw: True)
     monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
@@ -2783,3 +2783,44 @@ def test_ingest_manual_job_skips_the_scrape_when_details_are_typed(monkeypatch):
         company="Huntington National Bank",
     )
     assert ok is True
+
+
+def test_ingest_scrapes_non_linkedin_careers_pages(monkeypatch):
+    """Regression: the scrape was gated behind is_linkedin_job_url(), so an employer careers
+    URL - the destination behind LinkedIn's own Apply button, and a BETTER source since it
+    answers a plain GET - was never fetched and fell through to the typed-details prompt."""
+    captured = {}
+    scraped = []
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    def _scrape(url, timeout=12):
+        scraped.append(url)
+        return ("Foreign Exchange Ops Analyst 2", "Huntington", "Settle FX trades.")
+
+    monkeypatch.setattr(m, "scrape_job_page", _scrape)
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    ok, _ = m.ingest_manual_job(
+        url="https://huntington-careers.com/search/jobdetails/fx-analyst/abc?utm_source=linkedin"
+    )
+
+    assert ok is True
+    assert scraped, "a non-LinkedIn careers URL must still be scraped"
+    assert "TC" in captured
+
+
+def test_ingest_blocked_message_does_not_blame_linkedin_for_other_hosts(monkeypatch):
+    monkeypatch.setattr(m, "scrape_job_page", lambda url, timeout=12: ("", "", ""))
+
+    ok, message = m.ingest_manual_job(url="https://careers.example.com/job/123")
+
+    assert ok is False
+    assert "LinkedIn" not in message
