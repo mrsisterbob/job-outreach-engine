@@ -581,18 +581,75 @@ def compute_description_simhash(text: str) -> str:
     return hashlib.md5("".join(sorted(shingles)).encode()).hexdigest()
 
 
+# Names the pipeline invents when it has no real contact. None of them is a person, so the
+# person-finder providers can only miss on them.
+_PLACEHOLDER_CONTACT_NAMES = frozenset({
+    "operations lead", "operations", "hiring manager", "recruiter", "talent",
+    "hiring team", "team", "contact", "unknown",
+})
+
+
+def _hunter_domain_search(domain, on_provider_attempt=None):
+    """Hunter's domain-search: who is publicly listed at this company, when no NAME is known.
+
+    The right endpoint for the no-name case. email-finder answers "what is THIS PERSON's address"
+    and needs a real first/last; handed a placeholder like "Operations Lead" it searches for a
+    human by that name, finds none, and reports no match - which is what made /eh look broken
+    while quietly spending a credit per provider. Prefers a generic/role mailbox when Hunter
+    flags one, else the highest-confidence personal address it lists.
+    """
+    hunter_key = os.environ.get("HUNTER_API_KEY")
+    if not (hunter_key and domain):
+        return None
+    try:
+        res = requests.get(
+            "https://api.hunter.io/v2/domain-search",
+            params={"domain": domain, "api_key": hunter_key, "limit": 10},
+            timeout=10,
+        )
+        if on_provider_attempt:
+            on_provider_attempt("hunter_domain")
+        emails = (res.json().get("data") or {}).get("emails") or []
+        if not emails:
+            return None
+        generic = [e for e in emails if e.get("type") == "generic" and e.get("value")]
+        if generic:
+            return generic[0]["value"]
+        ranked = sorted(
+            (e for e in emails if e.get("value")),
+            key=lambda e: e.get("confidence") or 0,
+            reverse=True,
+        )
+        return ranked[0]["value"] if ranked else None
+    except Exception as e:
+        logging.error(f"Hunter.io domain-search failed ({domain}): {e}")
+    return None
+
+
 def resolve_email_waterfall(full_name, company_name, domain_hint=None, on_provider_attempt=None):
-    """Cascading email discovery for a named contact: Hunter.io -> Prospeo -> GetProspect ->
-    deterministic guess. Tries each configured provider in order and returns the first hit
-    immediately (early-exit, no downstream providers are called once a match is found); falls
-    back to a flagged best-guess address if no provider is configured or none finds a match.
+    """Cascading email discovery: Hunter.io -> Prospeo -> GetProspect -> deterministic guess.
+    Tries each configured provider in order and returns the first hit immediately (early-exit, no
+    downstream providers are called once a match is found); falls back to a flagged best-guess
+    address if no provider is configured or none finds a match.
     on_provider_attempt(provider_name), if given, fires once per completed provider request
     (whether or not it found an email) so the caller can track local monthly usage in its own DB.
+
+    With no REAL name, the person-finder providers are skipped entirely in favour of Hunter's
+    domain-search - see _hunter_domain_search. All three finders take a first/last name, so a
+    placeholder ("Operations Lead", "Hiring Manager") guarantees three misses and a fallback
+    guess, which is exactly the failure that made /eh appear dead.
     """
     domain = domain_hint or (re.sub(r'\s+', '', str(company_name or '').lower()) + ".com")
     parts = str(full_name or "").strip().split()
     first = parts[0] if parts else ""
     last = parts[-1] if len(parts) > 1 else ""
+
+    # A placeholder is not a person: go straight to domain-search rather than burning a credit
+    # per provider looking for someone who does not exist.
+    if not last or str(full_name or "").strip().lower() in _PLACEHOLDER_CONTACT_NAMES:
+        found = _hunter_domain_search(domain, on_provider_attempt=on_provider_attempt)
+        if found:
+            return found
 
     hunter_key = os.environ.get("HUNTER_API_KEY")
     if hunter_key:

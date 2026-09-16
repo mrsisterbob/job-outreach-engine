@@ -10,6 +10,7 @@ whichever test module imports main first owns the temp DB and the other reuses i
 import json
 import os
 import tempfile
+import types
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 
@@ -1251,3 +1252,57 @@ def test_linkedin_title_shape_still_wins_over_the_pipe_fallback():
     title, company, _ = pu.parse_job_page_html(body)
     assert title == "Associate Analyst"
     assert company == "Ally"
+
+
+# ---- Email waterfall: no-name path uses domain-search ----
+
+def _hunter_stub(monkeypatch, calls):
+    """Records which Hunter endpoint was hit and returns a hit from each."""
+    def _get(url, params=None, timeout=None, headers=None):
+        calls.append("domain-search" if "domain-search" in url else "email-finder")
+        res = types.SimpleNamespace()
+        if "domain-search" in url:
+            res.json = lambda: {"data": {"emails": [
+                {"value": "careers@ups.com", "type": "generic", "confidence": 90}]}}
+        else:
+            res.json = lambda: {"data": {"email": "sarah.chen@ups.com"}}
+        return res
+    monkeypatch.setenv("HUNTER_API_KEY", "k")
+    monkeypatch.delenv("PROSPEO_API_KEY", raising=False)
+    monkeypatch.delenv("GETPROSPECT_API_KEY", raising=False)
+    monkeypatch.setattr(pu.requests, "get", _get)
+
+
+def test_waterfall_uses_domain_search_when_no_real_name_is_known(monkeypatch):
+    """A placeholder is not a person. All three finders take a first/last name, so "Operations
+    Lead" guaranteed three misses and a fallback guess - the failure that made /eh look dead."""
+    for placeholder in ("Operations Lead", "Hiring Manager", "Operations", ""):
+        calls = []
+        _hunter_stub(monkeypatch, calls)
+        found = pu.resolve_email_waterfall(placeholder, "UPS", domain_hint="ups.com")
+        assert calls == ["domain-search"], f"{placeholder!r} should not hit email-finder"
+        assert found == "careers@ups.com"
+
+
+def test_waterfall_still_uses_email_finder_for_a_real_name(monkeypatch):
+    calls = []
+    _hunter_stub(monkeypatch, calls)
+
+    found = pu.resolve_email_waterfall("Sarah Chen", "UPS", domain_hint="ups.com")
+
+    assert calls == ["email-finder"]
+    assert found == "sarah.chen@ups.com"
+
+
+def test_domain_search_prefers_a_generic_mailbox_over_a_personal_one(monkeypatch):
+    """A role mailbox is the safer target when nobody specific has been identified."""
+    def _get(url, params=None, timeout=None, headers=None):
+        res = types.SimpleNamespace()
+        res.json = lambda: {"data": {"emails": [
+            {"value": "j.smith@ups.com", "type": "personal", "confidence": 99},
+            {"value": "careers@ups.com", "type": "generic", "confidence": 50}]}}
+        return res
+    monkeypatch.setenv("HUNTER_API_KEY", "k")
+    monkeypatch.setattr(pu.requests, "get", _get)
+
+    assert pu._hunter_domain_search("ups.com") == "careers@ups.com"
