@@ -3065,9 +3065,10 @@ def test_unknown_location_with_no_michigan_signal_is_still_rejected(_geo_filters
 
 # ---- JSearch pagination bounds ----
 
-def test_jsearch_never_pages_past_the_max(monkeypatch):
-    """The rolling pointer used to walk to page 20, where every request timed out and a query
-    returned nothing - a whole run came back with 0 raw listings from all ten queries."""
+def test_jsearch_always_fetches_from_page_one(monkeypatch):
+    """No rolling offset. The old pointer advanced 3 pages per run and only wrapped at 20, so
+    queries drifted onto deep pages that time out - 99 of 110 were stranded there returning zero -
+    and on alternating runs a query skipped page 1 entirely to fetch a worse page alone."""
     requested = []
 
     def _capture(api_url, headers, params, query, page):
@@ -3075,16 +3076,17 @@ def test_jsearch_never_pages_past_the_max(monkeypatch):
         return [{"job_id": f"x{page}"}], False
 
     monkeypatch.setattr(m, "_fetch_jsearch_page_with_retry", _capture)
-    monkeypatch.setattr(m, "get_query_start_page", lambda q: 9)  # a stale deep pointer
-    monkeypatch.setattr(m, "save_query_next_page", lambda q, p: None)
     monkeypatch.setattr(m, "get_filter", lambda key, default=None: 45 if key == "radius_miles" else default)
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
 
+    # Two consecutive runs must request exactly the same pages - there is no state to drift.
+    m.fetch_single_query_jobs(("Operations Analyst Troy MI", "http://x", {}))
+    first_run = list(requested)
+    requested.clear()
     m.fetch_single_query_jobs(("Operations Analyst Troy MI", "http://x", {}))
 
-    assert requested, "should have requested at least one page"
-    assert max(requested) <= m.JSEARCH_MAX_PAGE
-    assert requested[0] == 1, "a stale deep pointer must fall back to page 1"
+    assert first_run == list(range(1, m.JSEARCH_PAGES_PER_RUN + 1))
+    assert requested == first_run, "consecutive runs must fetch the same pages"
 
 
 def test_jsearch_requests_are_scoped_to_the_us(monkeypatch):
