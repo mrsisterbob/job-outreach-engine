@@ -27,7 +27,7 @@ from pipeline_utils import (
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
     resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
-    generate_dedup_hash, generate_short_key, parse_posted_hours, get_age_badge,
+    generate_dedup_hash, normalize_dedup_key, generate_short_key, parse_posted_hours, get_age_badge,
     extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall,
     derive_job_source, is_unverified_email, status_rank, STATUS_VOCAB,
     followup_action, followup_anchor, is_followup_unscheduled,
@@ -2042,7 +2042,7 @@ def get_query_yield_rows(limit=25):
 
 
 def get_tracked_job_keys():
-    """Every role already sitting in a JOB tab (Tetiana Cold + Tetiana Warm), as company+title hashes.
+    """Every role already sitting in a live JOB tab (Tetiana Cold + Warm + Clavicular), as hashes.
 
     This is the ONLY thing allowed to suppress a rediscovered listing. The seen_jobs ledger answers
     "has the pipeline ever looked at this?", which is the wrong question: a job glanced at during a
@@ -2055,13 +2055,23 @@ def get_tracked_job_keys():
 
     Errs OPEN: a Sheets failure returns the stale cache (usually empty), so listings flow through
     and the worst case is a duplicate card - never a silently empty pipeline.
+
+    Reads every tab dispatch_tier1_matches can WRITE to. It previously read only TC+TW while rows
+    also land in Clavicular (target_code "CL"), so a warm-referral role was tracked in the sheet but
+    invisible here: the ingest gate in ingest_manual_job() saw "not tracked" and let the card
+    through, while Code.gs's batch_add_rows dedup guard saw the existing row and suppressed the
+    write. That mismatch is what dispatched a card whose sheet_uuid had no row behind it, leaving
+    every later /warm and /apply on it rejected as "No record found".
+
+    Died is deliberately NOT read: an archived role is one Kevin killed, and re-surfacing it if it
+    is reposted is the intended behavior - the tab is a graveyard, not a live tracking state.
     """
     now = time.time()
     if now - _TRACKED_ROLE_CACHE["fetched_at"] < _TRACKED_ROLE_CACHE_TTL_SECONDS:
         return _TRACKED_ROLE_CACHE["data"]
     tracked = set()
     fetched_any = False
-    for target_code in ("TC", "TW"):
+    for target_code in ("TC", "TW", "CL"):
         res = crm_post({"action": "get_followups", "tab": target_code})
         if not res:
             continue
@@ -2076,14 +2086,40 @@ def get_tracked_job_keys():
                 company = str(row.get("company") or "").strip()
                 title = str(row.get("job_title") or row.get("title") or "").strip()
                 if company and title:
+                    # Two keys per row, because two different dedup algorithms decide this job's
+                    # fate and they do not agree. generate_dedup_hash() (strips legal suffixes,
+                    # keeps punctuation) is what the discovery path hashes against. Code.gs's
+                    # batch_add_rows guard instead keys on normalizeDedupKey() (strips punctuation
+                    # and stop tokens), mirrored here by normalize_dedup_key(). Storing only the
+                    # first let a row the Apps Script guard WOULD suppress read as untracked, so
+                    # the card shipped and the write silently did not. Tracking both makes the
+                    # local gate a superset of the remote guard: anything Sheets would refuse to
+                    # write is now refused here first, before a card is ever dispatched.
                     tracked.add(generate_dedup_hash(company, title))
+                    tracked.add(normalize_dedup_key(company, title))
         except Exception as e:
             logging.error(f"get_tracked_job_keys Error ({target_code}): {e}")
     if fetched_any:
         _TRACKED_ROLE_CACHE["data"] = tracked
         _TRACKED_ROLE_CACHE["fetched_at"] = now
-        logging.info(f"Tracked-role suppression set refreshed: {len(tracked)} roles across Tetiana Cold + Warm")
+        logging.info(
+            f"Tracked-role suppression set refreshed: {len(tracked)} keys "
+            f"across Tetiana Cold + Warm + Clavicular"
+        )
     return _TRACKED_ROLE_CACHE["data"]
+
+
+def is_role_tracked(company, title):
+    """True when this company+role already has a live CRM row, under EITHER dedup algorithm.
+
+    Callers must use this rather than testing `generate_dedup_hash(...) in get_tracked_job_keys()`,
+    which only ever checks one of the two keys the set now holds.
+    """
+    tracked = get_tracked_job_keys()
+    return (
+        generate_dedup_hash(company, title) in tracked
+        or normalize_dedup_key(company, title) in tracked
+    )
 
 
 def get_applied_crm_companies():
@@ -6565,10 +6601,10 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
     # Dedup against roles already TRACKED in a job tab, not against everything /t has ever
     # glanced at - re-pasting a link for a role with no CRM row should still produce a card.
     job_hash = generate_dedup_hash(job["employer_name"], job["job_title"])
-    if job_hash in get_tracked_job_keys():
+    if is_role_tracked(job["employer_name"], job["job_title"]):
         return (False, (
             f"♻️ <b>Already in the pipeline:</b> {html.escape(final_title)} @ {html.escape(final_company)}.\n"
-            "This role already has a Tetiana Cold/Warm row, so no duplicate was written."
+            "This role already has a Tetiana Cold/Warm/Clavicular row, so no duplicate was written."
         ))
 
     log_metric_event("listing_discovered", source="manual_ingest")
@@ -6663,7 +6699,9 @@ def run_job_pipeline(chat_id=None, top_n=2):
         # ever looked at, so a role glanced at during a run that dispatched no card was blocked
         # forever afterwards - 114 of 121 listings on a typical run, with almost nothing dispatched.
         # A rediscovered role Kevin never acted on is exactly the role he wants a card for.
-        if job_hash in tracked_job_keys:
+        # Checked under both dedup algorithms - see get_tracked_job_keys() - so this gate cannot
+        # pass a role that Code.gs's batch_add_rows guard would then refuse to write.
+        if job_hash in tracked_job_keys or normalize_dedup_key(company, title) in tracked_job_keys:
             funnel.note("already_tracked")
             return
 
@@ -6892,7 +6930,7 @@ def run_warm_radar_scan(chat_id=None):
         job_hash = generate_dedup_hash(company, title)
         # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
         # when the role is already tracked in a job tab - never merely because /t once saw it.
-        if job_hash in seen_hashes or job_hash in get_tracked_job_keys():
+        if job_hash in seen_hashes or is_role_tracked(company, title):
             continue
 
         # Tie the posting back to its warm contact by the slug baked into its job_id

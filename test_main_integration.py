@@ -81,6 +81,79 @@ def test_crm_outbox_marks_failed_after_max_retries(monkeypatch):
     assert row == (10, "FAILED")
 
 
+# ---- Tracked-role suppression must match what Sheets will actually accept ----
+
+def _stub_tracked_tabs(monkeypatch, sheet):
+    """Serve get_followups per tab and reset the TTL cache so the fetch actually runs."""
+    asked = []
+
+    class _Resp:
+        status_code = 200
+        def __init__(self, rows):
+            self.rows = rows
+        def json(self):
+            return {"status": "success", "followups": self.rows}
+
+    def _post(payload, timeout=10):
+        tab = payload.get("tab")
+        asked.append(tab)
+        return _Resp(sheet.get(tab, []))
+
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", _post)
+    m._TRACKED_ROLE_CACHE["fetched_at"] = 0
+    m._TRACKED_ROLE_CACHE["data"] = set()
+    return asked
+
+
+def test_tracked_keys_include_clavicular_tab(monkeypatch):
+    """Regression: rows land in Clavicular (target_code CL) but the tracked set read only TC+TW, so
+    a warm-referral role was tracked in the sheet yet invisible to the ingest gate. The card then
+    shipped while Code.gs's dedup guard suppressed the write - a card pointing at a nonexistent row.
+    """
+    role = {"company": "Doeren Mayhew", "title": "Client Onboarding and Operations Specialist"}
+    asked = _stub_tracked_tabs(monkeypatch, {"TC": [], "TW": [], "CL": [role]})
+    m.get_tracked_job_keys()
+    assert asked == ["TC", "TW", "CL"], "every tab dispatch can write to must be read back"
+    assert m.is_role_tracked(role["company"], role["title"])
+
+
+def test_tracked_keys_match_apps_script_dedup_algorithm(monkeypatch):
+    """The local gate must be a superset of Code.gs's batch_add_rows guard. The guard keys on
+    normalizeDedupKey (punctuation and stop tokens stripped); the discovery path keys on
+    generate_dedup_hash. A role only the former would collapse must still read as tracked.
+    """
+    _stub_tracked_tabs(monkeypatch, {
+        "TC": [{"company": "The Blue Chip Co.", "title": "Operations Specialist"}], "TW": [], "CL": [],
+    })
+    m.get_tracked_job_keys()
+    # Same role, punctuation/stop-token variant - normalize_dedup_key collapses these, md5 does not.
+    assert m.is_role_tracked("Blue Chip", "Operations Specialist")
+
+
+def test_tracked_keys_still_admit_a_genuinely_new_role(monkeypatch):
+    """The suppression set must not become a catch-all that starves the pipeline."""
+    _stub_tracked_tabs(monkeypatch, {
+        "TC": [{"company": "Doeren Mayhew", "title": "Client Onboarding and Operations Specialist"}],
+        "TW": [], "CL": [],
+    })
+    m.get_tracked_job_keys()
+    assert not m.is_role_tracked("Rocket Mortgage", "FX Operations Analyst")
+    # Same company, different role - a company must keep surfacing new openings.
+    assert not m.is_role_tracked("Doeren Mayhew", "Senior Tax Associate")
+
+
+def test_tracked_keys_errs_open_when_sheets_is_down(monkeypatch):
+    """A Sheets failure must never populate a suppression set - better a duplicate card than a
+    silently empty pipeline."""
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: None)
+    m._TRACKED_ROLE_CACHE["fetched_at"] = 0
+    m._TRACKED_ROLE_CACHE["data"] = set()
+    assert m.get_tracked_job_keys() == set()
+    assert not m.is_role_tracked("Doeren Mayhew", "Client Onboarding and Operations Specialist")
+
+
 def test_crm_outbox_drops_permanently_rejected_payload(monkeypatch):
     """A write whose row does not exist can never succeed: it must be deleted after ONE pass, not
     requeued for ten more - each of which fired its own health alert (the Telegram alert storm)."""
