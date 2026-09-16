@@ -52,7 +52,7 @@ def teardown_module(module):
 
 def test_crm_outbox_success_deletes_row(monkeypatch):
     m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "abc"})
-    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1: True)
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1, **kw: True)
     m.process_crm_outbox_batch(inter_job_sleep=0)
     with m.get_db_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM crm_outbox").fetchone()[0] == 0
@@ -60,7 +60,7 @@ def test_crm_outbox_success_deletes_row(monkeypatch):
 
 def test_crm_outbox_failure_increments_retry_and_stays_pending(monkeypatch):
     m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "abc"})
-    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1: False)
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1, **kw: False)
     m.process_crm_outbox_batch(inter_job_sleep=0)
     with m.get_db_conn() as conn:
         row = conn.execute("SELECT retry_count, status FROM crm_outbox").fetchone()
@@ -74,11 +74,53 @@ def test_crm_outbox_marks_failed_after_max_retries(monkeypatch):
             ('{"action": "update_status"}',)
         )
         conn.commit()
-    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1: False)
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1, **kw: False)
     m.process_crm_outbox_batch(inter_job_sleep=0)
     with m.get_db_conn() as conn:
         row = conn.execute("SELECT retry_count, status FROM crm_outbox").fetchone()
     assert row == (10, "FAILED")
+
+
+def test_crm_outbox_drops_permanently_rejected_payload(monkeypatch):
+    """A write whose row does not exist can never succeed: it must be deleted after ONE pass, not
+    requeued for ten more - each of which fired its own health alert (the Telegram alert storm)."""
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "missing-uuid"})
+    alerts = []
+    monkeypatch.setattr(m, "send_health_alert", lambda t: alerts.append(t))
+
+    def boom(payload, max_retries=1, **kw):
+        raise m.PermanentCRMRejection("update_status", "No record found for sheet_uuid missing-uuid")
+    monkeypatch.setattr(m, "log_to_sheets_crm", boom)
+
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM crm_outbox").fetchone()[0] == 0
+    assert len(alerts) == 1 and "dropped" in alerts[0]
+
+
+def test_permanent_rejection_classifier_spares_lock_timeout():
+    """Lock timeout is the one Apps Script rejection that IS transient - it must stay retryable."""
+    assert m.is_permanent_crm_rejection("No record found for sheet_uuid abc")
+    assert m.is_permanent_crm_rejection("Unknown target_code: ZZ")
+    assert m.is_permanent_crm_rejection("update_snooze requires sheet_uuid and next_followup")
+    assert not m.is_permanent_crm_rejection("Lock timeout - server busy")
+    assert not m.is_permanent_crm_rejection("")
+
+
+def test_log_to_sheets_crm_returns_false_on_permanent_without_flag(monkeypatch):
+    """Direct callers keep the plain bool contract - only the outbox opts into the exception."""
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"status": "error", "message": "No record found for sheet_uuid abc"}
+
+    calls = []
+    monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: calls.append(p) or _Resp())
+    monkeypatch.setattr(m, "send_health_alert", lambda t: None)
+    assert m.log_to_sheets_crm({"action": "update_status", "sheet_uuid": "abc"}) is False
+    assert len(calls) == 1, "a permanent rejection must not be retried"
 
 
 def test_crm_outbox_batch_ignores_rows_past_max_retries(monkeypatch):
@@ -89,7 +131,7 @@ def test_crm_outbox_batch_ignores_rows_past_max_retries(monkeypatch):
         )
         conn.commit()
     calls = []
-    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1: calls.append(payload) or True)
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1, **kw: calls.append(payload) or True)
     m.process_crm_outbox_batch(inter_job_sleep=0)
     assert calls == []
 

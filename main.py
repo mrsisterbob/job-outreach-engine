@@ -4855,7 +4855,40 @@ def start_morning_digest():
     """Spin up the 8:30 AM daily standup digest as a daemon thread."""
     threading.Thread(target=morning_digest_loop, daemon=True).start()
 
-def log_to_sheets_crm(payload, max_retries=3):
+class PermanentCRMRejection(Exception):
+    """A CRM write Apps Script refused for a reason that cannot change on retry.
+
+    Raised by log_to_sheets_crm so the outbox can tell "the sheet is briefly unreachable" (requeue
+    and try again) apart from "this write is impossible" (drop it). Without the distinction a row
+    whose sheet_uuid does not exist is re-dispatched every 5s until retry_count hits 10, firing a
+    health alert every pass - the Telegram alert storm this class exists to prevent.
+    """
+    def __init__(self, action, message):
+        self.action = action
+        self.message = message
+        super().__init__(f"CRM '{action}' permanently rejected: {message}")
+
+
+# Deterministic Apps Script rejections: a missing row, a malformed payload or an unroutable tab
+# answers identically on every attempt. Matched as substrings against the response's `message`,
+# which is the only failure detail doPost returns. "Lock timeout - server busy" is deliberately
+# absent - it is the one rejection that is genuinely transient and must stay retryable.
+PERMANENT_CRM_REJECTIONS = (
+    "no record found",
+    "invalid action type",
+    "unknown target_code",
+    "unsupported get request",
+    "requires sheet_uuid",
+)
+
+
+def is_permanent_crm_rejection(message):
+    """True when an Apps Script rejection message cannot resolve itself on a retry."""
+    lowered = str(message or "").lower()
+    return any(marker in lowered for marker in PERMANENT_CRM_REJECTIONS)
+
+
+def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False):
     """Log to Google Sheets CRM. Payload may include row UUID and note timestamp.
     Support apps script bottom-to-top search loops via rowOperationOrder: 'DESC'.
 
@@ -4870,6 +4903,12 @@ def log_to_sheets_crm(payload, max_retries=3):
 
     An auth rejection is not retryable - the secret will not fix itself between attempts - so it
     alerts and returns immediately instead of burning the backoff.
+
+    The same is true of any deterministic rejection (see PERMANENT_CRM_REJECTIONS): a missing
+    sheet_uuid or a malformed payload answers identically forever. Those stop retrying at once.
+    Callers that only branch on success get the usual False; the outbox passes
+    raise_on_permanent=True to get a PermanentCRMRejection instead, which is its signal to delete
+    the queued row rather than requeue it for ten more alert-firing passes.
     """
     if not CRM_WEBHOOK_URL:
         return False
@@ -4916,6 +4955,21 @@ def log_to_sheets_crm(payload, max_retries=3):
                             "the web app (Deploy > Manage deployments > New version)."
                         )
                         return False
+                    # A deterministic rejection will answer identically forever, so retrying it
+                    # only burns the backoff and - via the outbox, which re-dispatches every 5s
+                    # until retry_count hits 10 - fires a health alert on every pass. Raising
+                    # PermanentCRMRejection instead of returning False lets the outbox delete the
+                    # row rather than requeue it. "Lock timeout" is the one rejection Apps Script
+                    # emits that IS transient (another execution held the script lock), so it
+                    # alone falls through to the normal retry path.
+                    if is_permanent_crm_rejection(message):
+                        if raise_on_permanent:
+                            raise PermanentCRMRejection(action, message)
+                        # Default bool contract, for the callers that only branch on success:
+                        # still stop retrying, since the answer cannot change.
+                        return False
+        except PermanentCRMRejection:
+            raise  # never retried, and never swallowed by the transient handler below
         except Exception as e:
             logging.error(f"CRM Webhook Attempt {attempt+1} Failed: {e}")
         time.sleep(delay)
@@ -4954,10 +5008,26 @@ def process_crm_outbox_batch(inter_job_sleep=1.0):
 
     for job_id, payload_str, retries in pending_jobs:
         payload = json.loads(payload_str)
-        success = log_to_sheets_crm(payload, max_retries=1)
+        permanent = None
+        try:
+            success = log_to_sheets_crm(payload, max_retries=1, raise_on_permanent=True)
+        except PermanentCRMRejection as e:
+            # Impossible to satisfy by retrying (e.g. the row's sheet_uuid is not in any tab), so
+            # drop it instead of requeueing. Alert ONCE here rather than on all 10 retry passes.
+            success = False
+            permanent = e
+            logging.error(
+                f"CRM Outbox dropping permanently-rejected payload #{job_id} "
+                f"('{e.action}', sheet_uuid={payload.get('sheet_uuid')}): {e.message}"
+            )
+            send_health_alert(
+                f"CRM write '{e.action}' dropped - {e.message}. The row is NOT in the sheet, so this "
+                "write can never land; it was discarded instead of retried. Anything it carried "
+                "(status move, follow-up date, note) must be set by hand."
+            )
 
         with get_db_conn() as conn:
-            if success:
+            if success or permanent:
                 conn.execute("DELETE FROM crm_outbox WHERE id = ?", (job_id,))
             else:
                 conn.execute("""
@@ -7231,6 +7301,74 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, f"⚠️ Unbury failed: {html.escape(str(e))}")
             return
 
+        # Outbox panic button. A payload whose row does not exist in the sheet can never succeed,
+        # but process_crm_outbox_batch treats every failure as transient and re-dispatches it every
+        # 5s until retry_count hits 10 - each pass firing its own "Failed to log payload" health
+        # alert. /crazy is the manual stop: it drains the queue so the alert storm ends immediately,
+        # and reports what it dropped so the underlying rows can be dealt with by hand.
+        crazy_match = re.match(r"^/crazy(?:\s+(\S+))?$", text)
+        if crazy_match:
+            arg = (crazy_match.group(1) or "").strip().lower()
+            try:
+                with get_db_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT id, payload_json, status, retry_count FROM crm_outbox ORDER BY id"
+                    ).fetchall()
+            except Exception as e:
+                send_telegram_message(chat_id, f"⚠️ <b>/crazy failed to read the outbox:</b> {html.escape(str(e))}")
+                return
+
+            if not rows:
+                send_telegram_message(chat_id, "✅ <b>Outbox is already empty.</b> Nothing to stop.")
+                return
+
+            # Summarize by action + sheet_uuid so a storm of identical retries reads as one line.
+            tally = {}
+            for _id, payload_str, _status, retries in rows:
+                try:
+                    payload = json.loads(payload_str)
+                    key = (payload.get("action", "unknown"), str(payload.get("sheet_uuid") or "-")[:8])
+                except Exception:
+                    key = ("unparseable", "-")
+                entry = tally.setdefault(key, {"n": 0, "max_retry": 0})
+                entry["n"] += 1
+                entry["max_retry"] = max(entry["max_retry"], safe_int(retries, 0))
+
+            summary = "\n".join(
+                f"· <code>{html.escape(action)}</code> {html.escape(uuid8)} "
+                f"- {v['n']} queued, {v['max_retry']} retries"
+                for (action, uuid8), v in sorted(tally.items())
+            )
+
+            # Dry run by default: deleting queued CRM writes is not reversible, so the destructive
+            # form is opt-in via an explicit argument, exactly like /unbury go.
+            if arg not in ("go", "force"):
+                send_telegram_message(chat_id, (
+                    f"🛑 <b>/crazy - {len(rows)} payload(s) stuck in the outbox</b>\n\n"
+                    f"{summary}\n\n"
+                    "These are being retried every 5s, and each failed pass fires a health alert.\n"
+                    "Nothing was deleted. Run <code>/crazy go</code> to clear the queue and stop the alerts."
+                ))
+                return
+
+            try:
+                with get_db_conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    deleted = conn.execute("DELETE FROM crm_outbox").rowcount
+                    conn.commit()
+            except Exception as e:
+                send_telegram_message(chat_id, f"⚠️ <b>/crazy could not clear the outbox:</b> {html.escape(str(e))}")
+                return
+
+            logging.warning(f"[/crazy] Operator cleared {deleted} queued CRM payload(s):\n{summary}")
+            send_telegram_message(chat_id, (
+                f"🛑 <b>Outbox cleared - {deleted} payload(s) dropped.</b>\n\n"
+                f"{summary}\n\n"
+                "The retry storm has stopped. These writes did NOT reach the sheet, so any status "
+                "move or follow-up date they carried must be set by hand."
+            ))
+            return
+
         if text == "/health":
             db_check_start = time.time()
             try:
@@ -8039,6 +8177,7 @@ def process_webhook_payload_async(data):
                 "/efficiency - View Input to Interview Golden Ratio\n"
                 "/funnel - View pipeline conversion funnel\n"
                 "/unbury - Preview buried-listing cleanup (add 'go' to clear)\n"
+                "/crazy - Stop a CRM retry/alert storm (add 'go' to clear the outbox)\n"
                 "/queries - Per-query yield: which search phrases earn their slot\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
