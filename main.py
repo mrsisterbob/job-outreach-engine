@@ -74,7 +74,7 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 # any other host, and localhost is the dev default.
 BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL") or "http://localhost:5000").rstrip("/")
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
-JSEARCH_TIMEOUT_SECONDS = 25  # deep pages are slow; 12s dropped whole queries on a 0.5-CPU instance
+JSEARCH_TIMEOUT_SECONDS = 40  # see JSEARCH_SEMAPHORE - queued requests spend most of this waiting
 JSEARCH_MAX_RETRIES = 1  # additional attempts beyond the first, on timeout/429/5xx
 # Every run fetches pages 1..JSEARCH_PAGES_PER_RUN. There is no rolling offset, deliberately.
 #
@@ -89,7 +89,12 @@ JSEARCH_MAX_RETRIES = 1  # additional attempts beyond the first, on timeout/429/
 # never acted on still produces a card. Measured at 2 pages: 149 raw -> 23 passed and 179 raw -> 40
 # passed, 18 cards across two slices.
 JSEARCH_PAGES_PER_RUN = 2
-JSEARCH_SEMAPHORE = threading.Semaphore(4)  # cap concurrent OpenWebNinja requests to avoid rate-limit timeouts
+# 2, not 4. The timeout clock starts when the REQUEST is issued, not when the semaphore admits it,
+# so a queued request burns its window waiting for a slot. Ten queries firing at once against 4
+# slots produced nine timeouts in a single run - including on page 1, the fastest possible request.
+# Less parallelism finishes more requests here, because the bottleneck is the API's tolerance for
+# bursts, not this instance's ability to wait.
+JSEARCH_SEMAPHORE = threading.Semaphore(2)
 # 100-Query Rolling Master Engine: one oddball theme per 10-query slice, used to badge wildcard matches
 ODDBALL_KEYWORDS = ["supply chain", "revenue operations", "healthcare", "implementation", "erp", "logistics", "claims", "manufacturing", "cloud operations", "procurement", "transformation"]
 
@@ -583,75 +588,126 @@ DEFAULT_SEARCH_FILTERS = {
     # abstract nouns, not a title any employer writes) and "Custodial Operations Schwab Fidelity"
     # (four terms ANDed, and "custodial" means janitorial outside finance, so it surfaced building
     # maintenance rather than securities custody). /queries reports lifetime yield per phrase.
+    # Keyword-driven, not city-driven. radius_miles (45) already covers the whole metro from any
+    # anchor, so "Wealth Operations Dearborn MI" and "Wealth Operations Troy MI" search overlapping
+    # circles for the SAME phrase - eleven near-duplicate queries where one would do. The old bank
+    # spent its 110 slots on 8 role phrases x 11 cities, which meant a whole slice could be one
+    # city's worth of near-identical searches and a bad day for that city produced nothing.
+    #
+    # Now: 58 distinct role phrases against Detroit (the metro anchor), with the 27 highest-value
+    # phrases repeated against Farmington Hills and Troy for local density. Every slice mixes roles,
+    # so no single run depends on one geography or one phrasing.
     "target_queries": [
-        "Wealth Operations Farmington MI", "Fintech Operations Farmington MI",
-        "Business Operations Analyst Farmington MI", "Investment Operations Analyst Farmington MI",
-        "Financial Systems Analyst Farmington MI", "Operations Specialist Farmington MI",
-        "Salesforce Administrator Farmington MI", "Business Systems Analyst Farmington MI",
-        "Financial Operations Analyst Birmingham MI", "Supply Chain Operations Analyst Farmington MI",
-
-        "Trade Operations Analyst Detroit MI", "Compliance Operations Specialist Detroit MI",
-        "Risk Operations Analyst Detroit MI", "Client Operations Associate Detroit MI",
-        "Treasury Operations Analyst Detroit MI", "Data Operations Analyst Detroit MI",
-        "Process Improvement Analyst Detroit MI", "Onboarding Specialist Detroit MI",
-        "Data Operations Analyst Warren MI", "Revenue Operations Analyst Detroit MI",
-
-        "Wealth Management Operations Ann Arbor MI", "Business Intelligence Analyst Ann Arbor MI",
-        "Fintech Systems Analyst Ann Arbor MI", "Reconciliation Analyst Ann Arbor MI",
-        "Salesforce Administrator Ann Arbor MI", "Operations Analyst Ann Arbor MI",
-        "Business Systems Analyst Ann Arbor MI", "Financial Analyst Operations Ann Arbor MI",
-        "Business Operations Analyst Plymouth MI", "Healthcare Operations Analyst Ann Arbor MI",
-
-        "Wealth Operations Novi MI", "Fintech Operations Novi MI",
-        "Business Operations Analyst Novi MI", "Reconciliation Analyst Novi MI",
-        "Middle Office Analyst Novi MI", "Operations Specialist Novi MI",
-        "Salesforce Administrator Novi MI", "Business Systems Analyst Novi MI",
-        "Client Success Operations Wixom MI", "Implementation Specialist Novi MI",
-
-        "Wealth Operations Troy MI", "Fintech Operations Troy MI",
-        "Business Operations Analyst Troy MI", "Investment Operations Analyst Troy MI",
-        "Brokerage Operations Analyst Troy MI", "Operations Specialist Troy MI",
-        "Salesforce Administrator Troy MI", "Business Systems Analyst Troy MI",
-        "Process Improvement Analyst Rochester MI", "ERP Systems Analyst Troy MI",
-
-        "Wealth Operations Southfield MI", "Fintech Operations Southfield MI",
-        "Business Operations Analyst Southfield MI", "Reconciliation Analyst Southfield MI",
-        "Financial Systems Analyst Southfield MI", "Operations Specialist Southfield MI",
-        "Salesforce Administrator Southfield MI", "Business Systems Analyst Southfield MI",
-        "Trade Operations Analyst Bloomfield MI", "Logistics Operations Analyst Southfield MI",
-
-        "Wealth Operations Auburn Hills MI", "Fintech Operations Auburn Hills MI",
-        "Business Operations Analyst Auburn Hills MI", "Portfolio Operations Analyst Auburn Hills MI",
-        "Business Process Analyst Auburn Hills MI", "Operations Specialist Auburn Hills MI",
-        "Salesforce Administrator Auburn Hills MI", "Business Systems Analyst Auburn Hills MI",
-        "Compliance Operations Specialist Sterling Heights MI", "Claims Operations Analyst Auburn Hills MI",
-
-        "Wealth Operations Royal Oak MI", "Fintech Operations Royal Oak MI",
-        "Business Operations Analyst Royal Oak MI", "Client Service Associate Royal Oak MI",
-        "Financial Systems Analyst Royal Oak MI", "Operations Specialist Royal Oak MI",
-        "Salesforce Administrator Royal Oak MI", "Business Systems Analyst Royal Oak MI",
-        "Treasury Operations Analyst Madison Heights MI", "Manufacturing Operations Analyst Royal Oak MI",
-
-        "Wealth Operations Livonia MI", "Fintech Operations Livonia MI",
-        "Business Operations Analyst Livonia MI", "Retirement Plan Administrator Livonia MI",
-        "Business Process Analyst Livonia MI", "Operations Specialist Livonia MI",
-        "Salesforce Administrator Livonia MI", "Business Systems Analyst Livonia MI",
-        "Onboarding Specialist Canton MI", "Cloud Operations Analyst Livonia MI",
-
-        "Wealth Operations Dearborn MI", "Fintech Operations Dearborn MI",
-        "Business Operations Analyst Dearborn MI", "Trust Operations Specialist Dearborn MI",
-        "Settlements Analyst Dearborn MI", "Operations Specialist Dearborn MI",
-        "Salesforce Administrator Dearborn MI", "Business Systems Analyst Dearborn MI",
-        "Data Operations Analyst Dearborn MI", "Procurement Operations Analyst Dearborn MI",
-
-        # Macomb County + Downriver + Grosse Pointes: no earlier anchor city reaches these
-        # even at the widened 45mi radius_miles, so they get dedicated query anchors instead
-        # of relying on overlap from the western/central Oakland-Wayne anchors above.
-        "Wealth Operations Clinton Township MI", "Fintech Operations Clinton Township MI",
-        "Business Operations Analyst Clinton Township MI", "Operations Specialist Clinton Township MI",
-        "Salesforce Administrator Clinton Township MI", "Business Systems Analyst Roseville MI",
-        "Fund Administration Analyst Sterling Heights MI", "Client Operations Associate Mount Clemens MI",
-        "Business Operations Analyst Trenton MI", "Operations Specialist Grosse Pointe MI"
+        "Wealth Operations Detroit MI",
+        "Wealth Management Operations Detroit MI",
+        "Investment Operations Analyst Detroit MI",
+        "Middle Office Analyst Detroit MI",
+        "Portfolio Operations Analyst Detroit MI",
+        "Brokerage Operations Analyst Detroit MI",
+        "Trust Operations Specialist Detroit MI",
+        "Settlements Analyst Detroit MI",
+        "Fund Administration Analyst Detroit MI",
+        "Reconciliation Analyst Detroit MI",
+        "Retirement Plan Administrator Detroit MI",
+        "Client Service Associate Detroit MI",
+        "Advisory Operations Specialist Detroit MI",
+        "Custody Operations Analyst Detroit MI",
+        "Securities Operations Analyst Detroit MI",
+        "Financial Operations Analyst Detroit MI",
+        "Treasury Operations Analyst Detroit MI",
+        "Trade Operations Analyst Detroit MI",
+        "Financial Systems Analyst Detroit MI",
+        "Fund Accounting Analyst Detroit MI",
+        "Collateral Operations Analyst Detroit MI",
+        "Business Operations Analyst Detroit MI",
+        "Business Systems Analyst Detroit MI",
+        "Business Process Analyst Detroit MI",
+        "Operations Specialist Detroit MI",
+        "Operations Analyst Detroit MI",
+        "Process Improvement Analyst Detroit MI",
+        "Business Intelligence Analyst Detroit MI",
+        "ERP Systems Analyst Detroit MI",
+        "Systems Analyst Detroit MI",
+        "Salesforce Administrator Detroit MI",
+        "Salesforce Analyst Detroit MI",
+        "CRM Operations Analyst Detroit MI",
+        "Data Operations Analyst Detroit MI",
+        "Reporting Analyst Detroit MI",
+        "Automation Analyst Detroit MI",
+        "Client Operations Associate Detroit MI",
+        "Client Onboarding Specialist Detroit MI",
+        "Onboarding Specialist Detroit MI",
+        "Implementation Specialist Detroit MI",
+        "Client Success Operations Detroit MI",
+        "Compliance Operations Specialist Detroit MI",
+        "Risk Operations Analyst Detroit MI",
+        "Regulatory Operations Analyst Detroit MI",
+        "Fintech Operations Detroit MI",
+        "Fintech Systems Analyst Detroit MI",
+        "Revenue Operations Analyst Detroit MI",
+        "Healthcare Operations Analyst Detroit MI",
+        "Claims Operations Analyst Detroit MI",
+        "Supply Chain Operations Analyst Detroit MI",
+        "Manufacturing Operations Analyst Detroit MI",
+        "Logistics Operations Analyst Detroit MI",
+        "Procurement Operations Analyst Detroit MI",
+        "Cloud Operations Analyst Detroit MI",
+        "Insurance Operations Analyst Detroit MI",
+        "Loan Operations Specialist Detroit MI",
+        "Payment Operations Analyst Detroit MI",
+        "Billing Operations Analyst Detroit MI",
+        "Wealth Operations Farmington Hills MI",
+        "Wealth Management Operations Farmington Hills MI",
+        "Investment Operations Analyst Farmington Hills MI",
+        "Middle Office Analyst Farmington Hills MI",
+        "Portfolio Operations Analyst Farmington Hills MI",
+        "Brokerage Operations Analyst Farmington Hills MI",
+        "Trust Operations Specialist Farmington Hills MI",
+        "Settlements Analyst Farmington Hills MI",
+        "Fund Administration Analyst Farmington Hills MI",
+        "Reconciliation Analyst Farmington Hills MI",
+        "Retirement Plan Administrator Farmington Hills MI",
+        "Client Service Associate Farmington Hills MI",
+        "Advisory Operations Specialist Farmington Hills MI",
+        "Custody Operations Analyst Farmington Hills MI",
+        "Securities Operations Analyst Farmington Hills MI",
+        "Financial Operations Analyst Farmington Hills MI",
+        "Treasury Operations Analyst Farmington Hills MI",
+        "Trade Operations Analyst Farmington Hills MI",
+        "Financial Systems Analyst Farmington Hills MI",
+        "Fund Accounting Analyst Farmington Hills MI",
+        "Collateral Operations Analyst Farmington Hills MI",
+        "Business Operations Analyst Farmington Hills MI",
+        "Business Systems Analyst Farmington Hills MI",
+        "Business Process Analyst Farmington Hills MI",
+        "Operations Specialist Farmington Hills MI",
+        "Operations Analyst Farmington Hills MI",
+        "Process Improvement Analyst Farmington Hills MI",
+        "Wealth Operations Troy MI",
+        "Wealth Management Operations Troy MI",
+        "Investment Operations Analyst Troy MI",
+        "Middle Office Analyst Troy MI",
+        "Portfolio Operations Analyst Troy MI",
+        "Brokerage Operations Analyst Troy MI",
+        "Trust Operations Specialist Troy MI",
+        "Settlements Analyst Troy MI",
+        "Fund Administration Analyst Troy MI",
+        "Reconciliation Analyst Troy MI",
+        "Retirement Plan Administrator Troy MI",
+        "Client Service Associate Troy MI",
+        "Advisory Operations Specialist Troy MI",
+        "Custody Operations Analyst Troy MI",
+        "Securities Operations Analyst Troy MI",
+        "Financial Operations Analyst Troy MI",
+        "Treasury Operations Analyst Troy MI",
+        "Trade Operations Analyst Troy MI",
+        "Financial Systems Analyst Troy MI",
+        "Fund Accounting Analyst Troy MI",
+        "Collateral Operations Analyst Troy MI",
+        "Business Operations Analyst Troy MI",
+        "Business Systems Analyst Troy MI",
+        "Business Process Analyst Troy MI",
+        "Operations Specialist Troy MI"
     ],
     "query_bank_pointer": 0
 }
