@@ -554,6 +554,10 @@ DEFAULT_SEARCH_FILTERS = {
     ],
     "required_keywords": [],
     "ats_company_slugs": [],
+    # Workday tenants as "tenant/wdN/site" triples - see fetch_workday_jobs(). Unlike
+    # ats_company_slugs these cannot be auto-discovered from a company name, so they are
+    # curated by hand and seeded with the Metro Detroit financial employers Workday hosts.
+    "workday_boards": [],
     "target_queries": [
         "Wealth Operations Farmington MI", "Fintech Operations Farmington MI",
         "Business Operations Analyst Farmington MI", "Custodial Operations Schwab Fidelity Farmington MI",
@@ -5448,9 +5452,18 @@ def fetch_single_query_jobs(query_args):
     return all_jobs
 
 def fetch_greenhouse_jobs(slug):
-    """Pull unauthenticated postings from a Greenhouse job board for a company slug."""
+    """Pull unauthenticated postings from a Greenhouse job board for a company slug.
+
+    `content=true` is REQUIRED: without it Greenhouse omits the `content` field entirely, so
+    every posting arrived with job_description="" and the description-driven gates silently
+    stopped working on Greenhouse jobs - passes_strict_filter's hard_ban_keywords check had
+    no text to scan, and the Gemini scorer graded on title and company alone. Costs ~12x the
+    payload (0.7MB -> 9MB on a large board, ~124MB peak across a full 22-slug fan-out), which
+    only became affordable once the get_db_conn() connection leak was fixed and the idle
+    baseline dropped from ~477MB to ~95MB.
+    """
     try:
-        res = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs", timeout=10)
+        res = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true", timeout=10)
         if res.status_code != 200:
             return []
         postings = res.json().get("jobs", [])
@@ -5507,6 +5520,97 @@ def fetch_lever_jobs(slug):
     except Exception as e:
         logging.error(f"Lever Fetch Exception ({slug}): {e}")
         return []
+
+# Workday's CXS endpoints 403 a default python-requests UA; a browser UA is required to read the
+# same public board a candidate sees in their browser.
+WORKDAY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+WORKDAY_SEARCH_TERMS = ("operations analyst", "business operations", "financial analyst", "operations specialist")
+WORKDAY_MAX_PER_TERM = 20
+WORKDAY_DETAIL_FETCH_CAP = 12
+
+
+def fetch_workday_jobs(board):
+    """Pull postings from one Workday tenant's public CXS API.
+
+    Workday is the gap Google-for-Jobs (and therefore JSearch) indexes least reliably, and it is
+    where mid-size banks, credit unions and wealth-management firms post - exactly Kevin's target
+    sector. Greenhouse/Lever/Ashby cover tech; this covers finance.
+
+    `board` is a "tenant/wd-host/site" triple, e.g. "flagstar/wd1/Flagstar_Careers", because a
+    Workday URL needs all three: https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}.
+    A wrong site path returns HTTP 422 (the tenant exists, the board name does not), which is the
+    normal failure for a guessed slug and is logged at DEBUG rather than ERROR.
+
+    Two-stage by necessity: the /jobs list endpoint returns only title/location/postedOn and NO
+    description, so the description-driven gates (hard_ban_keywords, the Gemini scorer) would see
+    empty text - the same bug Greenhouse had. Each posting's detail endpoint is fetched for its
+    jobDescription, capped at WORKDAY_DETAIL_FETCH_CAP per board so one large tenant cannot spend
+    the whole run's request budget. Searches are server-side filtered by WORKDAY_SEARCH_TERMS so
+    the cap is spent on plausible roles rather than the first 12 postings alphabetically.
+    """
+    parts = str(board or "").strip().split("/")
+    if len(parts) != 3 or not all(parts):
+        logging.error(f"Workday board '{board}' is malformed - expected 'tenant/wdN/site'")
+        return []
+    tenant, wd_host, site = parts
+    base = f"https://{tenant}.{wd_host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+    headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": WORKDAY_USER_AGENT}
+
+    seen_paths = {}
+    for term in WORKDAY_SEARCH_TERMS:
+        try:
+            res = requests.post(
+                f"{base}/jobs",
+                json={"appliedFacets": {}, "limit": WORKDAY_MAX_PER_TERM, "offset": 0, "searchText": term},
+                headers=headers,
+                timeout=15,
+            )
+            if res.status_code == 422:
+                logging.debug(f"Workday board not found (422): {board}")
+                return []
+            if res.status_code != 200:
+                logging.error(f"Workday list error {res.status_code} for {board} (term='{term}')")
+                continue
+            for posting in res.json().get("jobPostings", []):
+                path = posting.get("externalPath")
+                if path and path not in seen_paths:
+                    seen_paths[path] = posting
+        except Exception as e:
+            logging.error(f"Workday list exception ({board}, term='{term}'): {e}")
+
+    jobs = []
+    employer = tenant.replace("-", " ").replace("_", " ").title()
+    for path, posting in list(seen_paths.items())[:WORKDAY_DETAIL_FETCH_CAP]:
+        location = posting.get("locationsText", "") or ""
+        description = ""
+        apply_link = f"https://{tenant}.{wd_host}.myworkdayjobs.com/{site}{path}"
+        posted_iso = ""
+        try:
+            detail_res = requests.get(f"{base}{path}", headers=headers, timeout=15)
+            if detail_res.status_code == 200:
+                info = detail_res.json().get("jobPostingInfo", {}) or {}
+                description = strip_html_to_text(info.get("jobDescription") or "")
+                apply_link = info.get("externalUrl") or apply_link
+                posted_iso = info.get("startDate") or ""
+                location = info.get("location") or location
+        except Exception as e:
+            # A failed detail fetch still yields a usable card from the list payload; it just
+            # reaches the filters with no description, so log it rather than dropping the row.
+            logging.error(f"Workday detail exception ({board}, {path}): {e}")
+        jobs.append({
+            "job_id": f"wd_{tenant}_{(posting.get('bulletFields') or [path])[0]}",
+            "employer_name": employer,
+            "job_title": posting.get("title", ""),
+            "job_description": description,
+            "job_apply_link": apply_link,
+            "job_city": location,
+            "job_state": "",
+            "job_is_remote": "remote" in str(location).lower(),
+            "job_posted_at_datetime_utc": posted_iso,
+        })
+    logging.info(f"Workday {board}: {len(seen_paths)} matched search terms, {len(jobs)} enriched")
+    return jobs
+
 
 def fetch_ashby_jobs(slug):
     """Pull unauthenticated postings from an Ashby job board for a company slug."""
@@ -5804,21 +5908,37 @@ def fetch_remote_feed_jobs(limit=100):
 
 
 def fetch_ats_jobs(company_slugs):
-    """Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in parallel."""
-    if not company_slugs:
+    """Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, plus
+    every configured Workday board, in parallel.
+
+    Workday boards come from their own `workday_boards` filter rather than ats_company_slugs: a
+    Workday address needs a tenant/host/site triple ("flagstar/wd1/Flagstar_Careers"), not the
+    single slug the other three boards take, and auto_expand_ats_slug() cannot guess one.
+    """
+    workday_boards = [str(b).strip() for b in get_filter("workday_boards", []) if str(b).strip()]
+    if not company_slugs and not workday_boards:
         return []
     all_jobs = []
-    with ThreadPoolExecutor(max_workers=min(len(company_slugs) * 3, 18) or 1) as executor:
+    worker_count = min(len(company_slugs) * 3 + len(workday_boards), 18) or 1
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = []
         for slug in company_slugs:
             futures.append(executor.submit(fetch_greenhouse_jobs, slug))
             futures.append(executor.submit(fetch_lever_jobs, slug))
             futures.append(executor.submit(fetch_ashby_jobs, slug))
+        # Workday is two-stage (list + a detail fetch per posting), so it needs a longer timeout
+        # than the single-request boards - collected separately rather than raising the shared one.
+        workday_futures = [executor.submit(fetch_workday_jobs, board) for board in workday_boards]
         for future in futures:
             try:
                 all_jobs.extend(future.result(timeout=15))
             except Exception as e:
                 logging.error(f"ATS Fetch Future Error: {e}")
+        for future in workday_futures:
+            try:
+                all_jobs.extend(future.result(timeout=90))
+            except Exception as e:
+                logging.error(f"Workday Fetch Future Error: {e}")
     return all_jobs
 
 def auto_expand_ats_slug(company_name):
