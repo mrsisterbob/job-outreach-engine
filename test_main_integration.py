@@ -4571,6 +4571,24 @@ def test_real_offer_thread_classifies_as_offer():
         assert m.classify_inbound_ats_email(OFFER_SENDER, subject, snippet)[0] == "OFFER_EXTENDED", subject
 
 
+def test_product_welcome_mail_is_not_an_offer():
+    """Regression: "Welcome to Jobright!" was announced as a possible OFFER. A bare
+    "welcome (you )?to \\w+" pattern matched every SaaS signup on earth, and because OFFER grants a
+    Tier 1 bypass it routed marketing mail around the bulk filter that would otherwise have caught
+    it. Product onboarding and job onboarding share most of their vocabulary, so each offer phrase
+    must carry something a marketing blast would never say."""
+    for subject, snippet in (
+        ("Welcome to Jobright!",
+         "Welcome to Jobright. Eric Cheng, CEO. I started Jobright to give job seekers from all "
+         "backgrounds the technology and tools to present your best self to employers."),
+        ("Welcome to LinkedIn Premium", "Get started with your onboarding checklist today."),
+        ("Welcome to Notion", "Welcome to Notion. Here is how to get started with your workspace."),
+        ("Thanks for Applying to RevSpring Inc!",
+         "Thank you for your interest in RevSpring Inc. We have received your application."),
+    ):
+        assert m.classify_inbound_ats_email("x@y.com", subject, snippet)[0] != "OFFER_EXTENDED", subject
+
+
 def test_rejection_still_wins_over_the_offer_patterns():
     """OFFER is matched after REJECTION for the same reason INTERVIEW is: a decline routinely
     contains the word 'offer', and announcing one as an offer is the worst possible error."""

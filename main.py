@@ -4452,9 +4452,16 @@ def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
         r"formal offer", r"offer letter", r"we would like to offer",
         # Acceptance mechanics: the paperwork and start-date mail that follows an accepted offer is
         # every bit as time-critical as the offer itself, and it never repeats the word "offer".
-        r"welcome to the team", r"welcome (?:you )?to \w+", r"officially welcome you",
-        r"your first day", r"start date", r"onboarding", r"docusign",
-        r"\bi-9\b", r"new hire paperwork",
+        #
+        # A bare "welcome (you )?to \w+" used to live here and matched EVERY SaaS signup on earth -
+        # "Welcome to Jobright!" was announced as a possible offer. Product onboarding and job
+        # onboarding share almost all of their vocabulary ("welcome", "onboarding", "get started"),
+        # so each phrase here has to carry something a marketing blast would not say: a team you
+        # are joining, a first day, or hiring paperwork by name.
+        r"welcome to the team", r"officially welcome you",
+        r"welcome (?:you )?aboard", r"excited to have you (?:join|on)",
+        r"your first day", r"first day is", r"start date", r"new hire (?:paperwork|onboarding)",
+        r"docusign", r"\bi-9\b", r"background check", r"offer letter attached",
     ]
     if any(re.search(p, text) for p in offer_patterns):
         return "OFFER_EXTENDED", "update_offer"
