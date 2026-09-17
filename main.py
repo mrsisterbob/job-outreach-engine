@@ -4108,8 +4108,19 @@ def stage_outreach_draft(chat_id, mapping, job, comp, title, is_warm, target, he
 
     The two commands differ only in how `target` is obtained - /e takes a hand-typed address for
     free, /eh burns provider credits through resolve_email_waterfall() - and in the header line
-    above the card. Everything after the address was duplicated line-for-line between them, which
-    is why the cover letter is added here once rather than in each handler.
+    above the card. Everything after the address is identical, which is why it lives here once
+    rather than being duplicated line-for-line in each handler.
+
+    Deliberately does NOT send the cover letter. It used to send two extra Telegram messages here
+    (the letter text and a compiled letter PDF) on the theory that an application needs both at
+    once. In practice that buried the thing /e is for - the draft and its tap-to-copy body - under
+    two messages Kevin had not asked for, on every single use. /letter renders the same letter,
+    from the same resolve_letter_for_job() routing, when he actually wants it.
+
+    The resume PDF is compiled here as an ATTACHMENT on the Gmail draft, and the same bytes are
+    also posted to Telegram after the card. The resume - not the letter - is what Kevin uploads to
+    a portal right after running /e, so it is the one file worth putting in the chat by default;
+    it is sent AFTER the card and on a thread so the tap-to-copy body still lands first.
 
     Returns the created draft_id (or None), so callers can keep their own post-draft CRM writes.
     """
@@ -4139,16 +4150,19 @@ def stage_outreach_draft(chat_id, mapping, job, comp, title, is_warm, target, he
     if ok:
         log_daily_activity("drafts_staged")
 
-    # The letter Kevin used to fetch with a separate /letter call on every application. Sent as its
-    # own message rather than appended: the email body already fills much of the 4096-char cap, and
-    # a letter tipping it over would silently truncate the copy he pastes into the portal.
-    letter, letter_track = resolve_letter_for_job(job, mapping, comp)
-    send_telegram_message(
-        chat_id,
-        f"✉️ <b>Cover Letter - {html.escape(comp)}</b> · Track {html.escape(str(letter_track).upper())}\n\n"
-        f"<code>{html.escape(letter)}</code>"
-    )
-    send_cover_letter_pdf_async(chat_id, letter, comp, letter_track, command_label)
+    # The resume that was just attached to the draft, posted to the chat so it can be uploaded to a
+    # portal without a second command. Threaded for the same reason /letter's PDF is: the card is
+    # already on screen, and the webhook should not be held open for an upload. Reuses the bytes
+    # compiled above rather than recompiling - same file the employer receives, by construction.
+    if pdf_bytes:
+        def _send_resume():
+            send_telegram_document(
+                chat_id, pdf_bytes, pdf_filename,
+                f"📄 <b>Resume: {html.escape(comp)}</b> · Track {html.escape(str(track).upper())}",
+                command_label,
+            )
+        threading.Thread(target=_send_resume, daemon=True).start()
+
     return draft_id
 
 def is_verified_crm_contact(sender_raw):
@@ -4408,7 +4422,7 @@ def extract_calendar_invite(payload):
 
 def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
     """
-    Classifies ATS email into 'interview', 'rejection', or 'general'.
+    Classifies ATS email into 'offer', 'interview', 'rejection', or 'general'.
     Returns (status_label, crm_action)
     """
     text = f"{subject} {snippet}".lower()
@@ -4424,6 +4438,26 @@ def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
     ]
     if any(re.search(p, text) for p in rejection_patterns):
         return "REJECTION", "update_rejected"
+
+    # OFFER is checked before INTERVIEW: the email that extends an offer almost always recaps the
+    # interviews that led to it ("the team was impressed by your interviews"), so an offer letter
+    # matched INTERVIEW_SET and was announced as an interview signal. Offer is the more advanced
+    # stage, and the badge Kevin sees should name the thing that actually happened.
+    #
+    # Placed AFTER rejection for the same reason interview is: "we regret that we cannot offer you
+    # the position" contains "offer", and a decline must never be announced as an offer.
+    offer_patterns = [
+        r"(?:thrilled|pleased|excited|happy|delighted) to (?:extend|offer)",
+        r"extend (?:you )?an offer", r"offer of employment", r"job offer", r"internship offer",
+        r"formal offer", r"offer letter", r"we would like to offer",
+        # Acceptance mechanics: the paperwork and start-date mail that follows an accepted offer is
+        # every bit as time-critical as the offer itself, and it never repeats the word "offer".
+        r"welcome to the team", r"welcome (?:you )?to \w+", r"officially welcome you",
+        r"your first day", r"start date", r"onboarding", r"docusign",
+        r"\bi-9\b", r"new hire paperwork",
+    ]
+    if any(re.search(p, text) for p in offer_patterns):
+        return "OFFER_EXTENDED", "update_offer"
 
     # Two families. The formal ATS phrasings were all this used to match, but Kevin's outreach is
     # peer-to-peer cold email, and a peer agreeing to talk does not write "invitation to
@@ -4719,7 +4753,7 @@ def check_inbound_gmail_replies():
             # that mentions interviewing cannot buy itself a bypass.
             status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
             has_calendar_invite, invite_start = extract_calendar_invite(payload)
-            is_tier1 = has_calendar_invite or status_label == "INTERVIEW_SET"
+            is_tier1 = has_calendar_invite or status_label in ("INTERVIEW_SET", "OFFER_EXTENDED")
 
             # GATE 1: Pre-filter shield. Tier 1 skips it, except for the sender rules - a robot
             # mailbox blasting calendar spam is still a robot, and a blocked domain stays blocked.
@@ -4792,6 +4826,7 @@ def check_inbound_gmail_replies():
             # status_label was already computed above for the Tier 1 decision - reusing it keeps
             # the badge and the bypass from ever disagreeing about the same message.
             status_badges = {
+                "OFFER_EXTENDED": "🏆 <b>OFFER / ONBOARDING — act on this first</b>\n",
                 "INTERVIEW_SET": "🎉 <b>Interview Signal Detected!</b>\n",
                 "REJECTION": "⚠️ <b>Rejection Detected</b>\n"
             }
@@ -4810,6 +4845,11 @@ def check_inbound_gmail_replies():
             # against the wrong row. Kevin gets the alert and decides.
             if is_unverified:
                 logging.info(f"[UNVERIFIED] Skipping CRM writes for {match_reason} sender {sender}")
+            elif status_label == "OFFER_EXTENDED":
+                # "offer" is already in record_application_outcome's vocabulary (see its docstring)
+                # and is what /offer writes by hand, so an inbound offer lands in the same column
+                # the funnel's Interviewing->Offer rate already reads.
+                record_application_outcome(crm_match.get("sheet_uuid"), "offer", company=crm_match.get("company"))
             elif status_label == "INTERVIEW_SET":
                 log_metric_event("interview_set")
                 record_application_outcome(crm_match.get("sheet_uuid"), "interview", company=crm_match.get("company"))
@@ -4830,7 +4870,10 @@ def check_inbound_gmail_replies():
             if not is_unverified:
                 header_line = "📬 <b>New Gmail Reply!</b>"
             elif match_reason == "interview signal":
-                header_line = "🚨 <b>Possible Interview - Unknown Sender</b>"
+                header_line = (
+                    "🚨 <b>Possible OFFER - Unknown Sender</b>" if status_label == "OFFER_EXTENDED"
+                    else "🚨 <b>Possible Interview - Unknown Sender</b>"
+                )
             else:
                 header_line = f"⚠️ <b>Unverified Reply ({html.escape(match_reason)})</b>"
             unverified_notes = {
@@ -4930,7 +4973,7 @@ def sweep_spam_for_interview_signals(request_headers):
 
             status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
             has_calendar_invite, invite_start = extract_calendar_invite(payload)
-            if not (has_calendar_invite or status_label == "INTERVIEW_SET"):
+            if not (has_calendar_invite or status_label in ("INTERVIEW_SET", "OFFER_EXTENDED")):
                 # Left completely untouched - not alerted, not marked read. Gmail put it here and
                 # this sweep has no opinion about anything that is not an interview signal.
                 continue
@@ -4950,10 +4993,12 @@ def sweep_spam_for_interview_signals(request_headers):
                     else "📅 <b>Calendar invite attached</b> <i>(start time not parsed)</i>\n"
                 )
             thread_link = html.escape(f"https://mail.google.com/mail/u/0/#spam/{thread_id}", quote=True)
+            is_offer = status_label == "OFFER_EXTENDED"
             alert_msg = (
-                "🚨 <b>Possible Interview - Found in SPAM</b>\n\n"
+                f"🚨 <b>Possible {'OFFER' if is_offer else 'Interview'} - Found in SPAM</b>\n\n"
                 f"{invite_line}"
-                "<i>Gmail filed this as spam. Surfaced because it looks like an interview - "
+                f"<i>Gmail filed this as spam. Surfaced because it looks like "
+                f"{'an offer' if is_offer else 'an interview'} - "
                 "verify the sender before acting. No CRM changes were made.</i>\n"
                 f"<b>From:</b> {html.escape(sender)} <i>({html.escape(display_name_from_sender(sender))})</i>\n"
                 f"<b>Subject:</b> {html.escape(subject)}\n"
@@ -8839,16 +8884,24 @@ def process_webhook_payload_async(data):
             )
             return
 
-        if text.startswith("/e ") or text.startswith("/email "):
+        if text in ("/e", "/email") or text.startswith("/e ") or text.startswith("/email "):
             raw_email = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
             email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-            if not re.match(email_pattern, raw_email):
-                send_telegram_message(chat_id, "❌ Invalid email format. Use: <code>/e name@company.com</code>")
+            # The address is OPTIONAL. Bare /e resolves one the way /draft does, so the common case
+            # - draft this, I do not have a name - is one keystroke instead of a lookup first. Only
+            # a MALFORMED argument is an error: silently resolving a fallback after Kevin typed an
+            # address would hide his typo behind a plausible-looking draft.
+            typed_email = bool(raw_email)
+            if typed_email and not re.match(email_pattern, raw_email):
+                send_telegram_message(
+                    chat_id,
+                    "❌ Invalid email format. Use <code>/e name@company.com</code>, "
+                    "or bare <code>/e</code> to resolve one automatically."
+                )
                 return
             mapping = resolve_reply_mapping(msg, chat_id, "/e")
             if not mapping:
                 return
-            new_email = raw_email
             job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
             job, from_card = rebuild_job_from_card(job, (msg.get("reply_to_message") or {}).get("text", ""))
             if not _job_data_available(job, mapping):
@@ -8859,18 +8912,26 @@ def process_webhook_payload_async(data):
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in WARM_TONE_TABS
+            # Bare /e resolves the same way /draft does - no provider credits are spent (that is
+            # /eh); resolve_target_email falls back to a role mailbox or a flagged best guess.
+            new_email = raw_email if typed_email else resolve_target_email(
+                comp, title, job.get("employer_website")
+            )
             update_job_target_email(mapping["sheet_uuid"], new_email)
 
-            # Resume PDF, email body, Gmail draft, card and cover letter - shared with /eh
-            stage_outreach_draft(
-                chat_id, mapping, job, comp, title, is_warm, new_email,
-                f"🎯 <b>Apollo Email Locked:</b> <code>{html.escape(new_email)}</code>", "/e"
+            header = (
+                f"🎯 <b>Apollo Email Locked:</b> <code>{html.escape(new_email)}</code>" if typed_email
+                else f"✉️ <b>Drafted to:</b> <code>{html.escape(new_email)}</code> <i>(auto-resolved)</i>"
             )
+            # Resume PDF, email body, Gmail draft and card - shared with /eh
+            stage_outreach_draft(chat_id, mapping, job, comp, title, is_warm, new_email, header, "/e")
             enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
             # Typing the address IS the intent to track this person, so log them to Carmen Cold
             # without the company gate the passive sweep uses - that gate drops agency recruiters
-            # at untracked firms, which is most of who /e gets used on.
-            if log_addressed_contact_to_carmen_cold(
+            # at untracked firms, which is most of who /e gets used on. A RESOLVED address carries
+            # no such intent: it is a guess, often a role mailbox, and writing those into Carmen
+            # Cold would fill the contact list with addresses Kevin never chose.
+            if typed_email and log_addressed_contact_to_carmen_cold(
                 new_email, company=comp, note=f"[{datetime.now().strftime('%Y-%m-%d')}] Emailed: {title}"
             ):
                 send_telegram_message(chat_id, f"👤 Logged <code>{html.escape(new_email)}</code> to Carmen Cold.")

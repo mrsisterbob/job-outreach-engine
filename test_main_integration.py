@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import tempfile
 import time
 import uuid
@@ -4542,6 +4543,160 @@ def test_rejection_still_wins_over_the_new_bare_interview_pattern():
         ("Re: Interview", "The position has been filled, but we will keep your resume on file."),
     ):
         assert m.classify_inbound_ats_email("x@co.com", subject, snippet)[0] == "REJECTION", snippet
+
+
+# ---- OFFER_EXTENDED: the Signal Advisors thread that classified GENERAL ----
+
+# Kevin's real offer thread (Signal Advisors, May 2026). Every message classified GENERAL, so an
+# actual job offer alerted with no badge and looked like any other reply.
+OFFER_SENDER = "Kristina Oberly <kristina@signaladvisors.com>"
+OFFER_THREAD = (
+    ("Internship Offer: Join us this summer at Signal Advisors!",
+     "Dear Kevin, Congratulations! We are thrilled to extend an offer to you to join Signal "
+     "Advisors as an Intern on our Wealth team. The team was impressed by your interviews."),
+    ("Re: Internship Offer: Join us this summer at Signal Advisors!",
+     "That's great news! I'll send over the official DocuSign shortly."),
+    ("Re: Welcome to Signal Advisors",
+     "Hi Kevin, We are so excited to officially welcome you to Signal Advisors! For your first "
+     "day on Thursday, May 28th, you'll be in the office with us in Detroit! Please bring your "
+     "I-9 documentation."),
+)
+
+
+def test_real_offer_thread_classifies_as_offer():
+    """Acceptance criteria: the four messages of a real offer thread, all of which used to be
+    GENERAL. The onboarding mail counts too - 'bring your I-9, arrive 9:30' is as time-critical
+    as the offer itself and never repeats the word 'offer'."""
+    for subject, snippet in OFFER_THREAD:
+        assert m.classify_inbound_ats_email(OFFER_SENDER, subject, snippet)[0] == "OFFER_EXTENDED", subject
+
+
+def test_rejection_still_wins_over_the_offer_patterns():
+    """OFFER is matched after REJECTION for the same reason INTERVIEW is: a decline routinely
+    contains the word 'offer', and announcing one as an offer is the worst possible error."""
+    for subject, snippet in (
+        ("Update", "Unfortunately we regret that we cannot offer you the position at this time."),
+        ("Your application", "Unfortunately the role was filled before we could extend an offer."),
+    ):
+        assert m.classify_inbound_ats_email("x@co.com", subject, snippet)[0] == "REJECTION", snippet
+
+
+def test_offer_outranks_interview_when_both_appear():
+    """An offer letter almost always recaps the interviews that produced it, so it matched
+    INTERVIEW_SET first and was announced as an interview signal. Offer is the later stage."""
+    label, _ = m.classify_inbound_ats_email(
+        OFFER_SENDER,
+        "Internship Offer",
+        "We are thrilled to extend an offer. The team was impressed by your interviews.",
+    )
+    assert label == "OFFER_EXTENDED"
+
+
+def test_interview_classification_is_unchanged_by_the_offer_tier():
+    """The offer patterns sit between rejection and interview - neither neighbour may regress."""
+    assert m.classify_inbound_ats_email(STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET)[0] == "INTERVIEW_SET"
+    assert m.classify_inbound_ats_email("x@co.com", FITTERMAN_SUBJECT, FITTERMAN_SNIPPET)[0] == "INTERVIEW_SET"
+
+
+# ---- /e and /eh: what actually lands in the Telegram chat ----
+
+def _stage_draft_messages(monkeypatch, command_label="/e"):
+    """Run the real stage_outreach_draft() and return every Telegram message it produced."""
+    sent, documents = [], []
+    before = set(threading.enumerate())
+    monkeypatch.setattr(m, "compile_resume_pdf_resilient", lambda *a, **k: b"%PDF-resume")
+    monkeypatch.setattr(m, "create_gmail_draft", lambda **kw: (True, "ok", "draft-123"))
+    monkeypatch.setattr(m, "log_daily_activity", lambda *a, **k: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: sent.append(text))
+    monkeypatch.setattr(
+        m, "send_telegram_document",
+        lambda cid, b, fn, cap, label: documents.append(
+            {"filename": fn, "caption": cap, "bytes": b}) or True)
+    job = {"employer_name": "Atwell", "job_title": "Operations Analyst", "track": "e",
+           "bullet_indices": [0, 1, 2], "tone_mode": "conservative"}
+    mapping = {"sheet_uuid": "uuid-e", "sheet_tab": "Tetiana Cold",
+               "contact_name": "", "contact_company": "Atwell"}
+    draft_id = m.stage_outreach_draft(
+        1, mapping, job, "Atwell", "Operations Analyst", False,
+        "dana@atwell.com", "🎯 <b>Apollo Email Locked:</b>", command_label)
+    # The resume PDF is dispatched on a daemon thread so the card lands first. Join only the
+    # threads THIS call started - joining every daemon would block on main's own background
+    # workers and add ~30s to the suite.
+    for t in set(threading.enumerate()) - before:
+        t.join(timeout=5)
+    return sent, documents, draft_id
+
+
+def test_e_posts_the_draft_and_the_resume_but_never_the_cover_letter(monkeypatch):
+    """/e is for staging the outreach draft. It used to also push the cover letter text AND a
+    compiled letter PDF into the chat on every single use, burying the tap-to-copy body it exists
+    to produce. /letter still renders the same letter on demand.
+
+    The RESUME does belong here: it is what gets uploaded to a portal right after /e runs, and it
+    is the same bytes already attached to the draft."""
+    sent, documents, draft_id = _stage_draft_messages(monkeypatch)
+
+    assert len(sent) == 1
+    assert "Tap-to-Copy Email Body" in sent[0]
+    assert "Open Draft in Gmail" in sent[0]
+    assert draft_id == "draft-123"
+    # Neither the letter text nor a letter PDF may reach the chat from this path.
+    assert not any("Cover Letter" in text for text in sent)
+    assert not any("Cover_Letter" in d["filename"] for d in documents)
+    # Exactly one document, and it is the resume.
+    assert len(documents) == 1
+    assert documents[0]["filename"] == m.resume_pdf_filename("Atwell")
+    assert "Resume" in documents[0]["caption"]
+
+
+def test_eh_shares_the_tail_so_it_posts_the_same_resume(monkeypatch):
+    """/e and /eh differ only in how the address is resolved. A file appearing on one and not the
+    other would be the two commands drifting apart, which the shared tail exists to prevent."""
+    sent, documents, _ = _stage_draft_messages(monkeypatch, command_label="/eh")
+    assert len(sent) == 1
+    assert not any("Cover Letter" in text for text in sent)
+    assert len(documents) == 1
+    assert documents[0]["filename"] == m.resume_pdf_filename("Atwell")
+
+
+def test_e_still_attaches_the_resume_pdf_to_the_gmail_draft(monkeypatch):
+    """The resume PDF is an attachment on the outbound draft, not a chat message - dropping it
+    would change what the employer receives, which is not what was asked for."""
+    captured = {}
+    monkeypatch.setattr(m, "compile_resume_pdf_resilient", lambda *a, **k: b"%PDF-resume")
+    monkeypatch.setattr(m, "log_daily_activity", lambda *a, **k: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: None)
+    monkeypatch.setattr(m, "send_telegram_document", lambda *a, **k: True)
+
+    def fake_draft(**kwargs):
+        captured.update(kwargs)
+        return True, "ok", "draft-123"
+
+    monkeypatch.setattr(m, "create_gmail_draft", fake_draft)
+    job = {"employer_name": "Atwell", "job_title": "Operations Analyst", "track": "e"}
+    m.stage_outreach_draft(1, {"sheet_uuid": "u", "sheet_tab": "Tetiana Cold"}, job, "Atwell",
+                           "Operations Analyst", False, "dana@atwell.com", "hdr", "/e")
+    assert captured["pdf_bytes"] == b"%PDF-resume"
+    assert captured["pdf_filename"] == m.resume_pdf_filename("Atwell")
+
+
+def test_letter_command_still_renders_the_cover_letter(monkeypatch):
+    """Removing the letter from /e must not have removed the way to get one."""
+    sent, documents = [], []
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-letter", "sheet_tab": "Tetiana Cold",
+        "contact_name": "", "contact_company": "Atwell"})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {
+        "employer_name": "Atwell", "job_title": "Operations Analyst", "track": "e"})
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: sent.append(text))
+    monkeypatch.setattr(m, "send_cover_letter_pdf_async",
+                        lambda cid, letter, comp, track, label: documents.append(comp))
+
+    _dispatch("/letter", reply_to_message={"message_id": 42, "text": "Operations Analyst"})
+
+    assert len(sent) == 1
+    assert "Cover Letter - Atwell" in sent[0]
+    assert documents == ["Atwell"]
 
 
 def test_calendar_invite_without_a_parseable_start_says_so_rather_than_guessing():
