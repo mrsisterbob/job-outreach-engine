@@ -2336,12 +2336,41 @@ def get_current_role_blurb():
     sentence = f"I am currently working as a {title} at {company}" + (f" in {location}" if location else "") + "."
     return core_exp, sentence
 
+# Legal-entity tokens stripped off the END of a company name by clean_company_for_copy().
+# Order is irrelevant (the strip loops), but anchoring is not - see the docstring.
+_LEGAL_SUFFIX_PATTERN = re.compile(
+    r'[\s,]*\b(inc|llc|llp|pllc|ltd|limited|corp|corporation|co|plc|gmbh|pty|nv|ag)\b\.?\s*$',
+    re.IGNORECASE
+)
+
 def clean_company_for_copy(company_name):
     """Drops legal-entity suffixes so outreach copy reads 'Atwell', not 'Atwell Group, Inc.'.
-    Falls back to the raw value whenever stripping would leave nothing behind.
+
+    The strip is ANCHORED TO THE END of the name and applied repeatedly. It used to be an
+    unanchored \\b(inc|co|group|...)\\b sweep, which removed those words wherever they appeared:
+    'Group 1 Automotive' became '1 Automotive', 'Co-Diagnostics' became '-Diagnostics', and
+    'The Corporation for Public Broadcasting' became 'The for Public Broadcasting'. A legal suffix
+    is by definition trailing, so anchoring fixes every one of those without weakening the actual
+    suffix removal ('Atwell Group, Inc.' still loops down to 'Atwell').
+
+    'group', 'holdings' and 'companies' are deliberately NOT in the suffix list. They read as
+    legal noise in 'Atwell Group' but they are the actual name in 'Boston Consulting Group',
+    'Rocket Companies' and 'Alliance Group Holdings', and there is no way to tell those apart from
+    the string. Addressing 'Rocket Companies' as 'Rocket' is a worse error than leaving 'Group' on
+    'Atwell Group', because the first one looks like a mail merge that failed.
+
+    Looping matters for stacked suffixes ('Atwell, Inc. Ltd'); the fallback matters because some
+    real firms ARE a bare legal word. Falls back to the raw value whenever stripping empties it.
     """
-    raw = str(company_name or "")
-    clean = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', raw, flags=re.IGNORECASE).strip().rstrip(',')
+    raw = str(company_name or "").strip()
+    clean = raw
+    # Loop so stacked suffixes ("Atwell Group, Inc.") come off one token at a time. Bounded by
+    # the fact that each pass must shorten the string or break.
+    while True:
+        stripped = _LEGAL_SUFFIX_PATTERN.sub('', clean).strip().rstrip(',').strip()
+        if stripped == clean or not stripped:
+            break
+        clean = stripped
     clean = re.sub(r'\s+', ' ', clean).strip()
     return clean or raw or "your team"
 
@@ -2367,10 +2396,9 @@ def resume_pdf_filename(company_name):
     # mid-sentence but not as "Kevin_Miller_Resume_your_team.pdf" - guard before calling it.
     if not raw or is_placeholder_company_name(raw):
         return "Kevin_Miller_Resume.pdf"
+    # LLP/PLLC used to be stripped again here, because the shared suffix list had llc/plc but not
+    # llp. The list now covers both, so the filename and the outreach copy strip identically.
     clean = clean_company_for_copy(raw)
-    # "LLP" outlives clean_company_for_copy()'s suffix list (it has llc/plc, not llp), and it is
-    # as much noise on a filename as "Inc." is.
-    clean = re.sub(r'\bllp\b\.?', '', clean, flags=re.IGNORECASE).strip().rstrip(',')
     # "&" joins words rather than separating them: "AT&T" -> "ATT", not "AT_T".
     clean = clean.replace("&", "")
     # Collapse each remaining run of non-alphanumerics to one underscore, so "A.B. Smith" -> "A_B_Smith".

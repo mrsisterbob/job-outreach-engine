@@ -1253,6 +1253,57 @@ def test_queue_command_previews_without_any_writes(monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
 
 
+# ---- Company name cleaning for recruiter-facing copy ----
+
+def test_clean_company_strips_only_trailing_legal_suffixes():
+    # The suffix strip is anchored to the END. It used to be an unanchored \b(inc|co|group|...)\b
+    # sweep that removed those words wherever they appeared, so real firm names were corrupted in
+    # every email, letter and resume filename the pipeline produced.
+    assert m.clean_company_for_copy("Group 1 Automotive") == "Group 1 Automotive"
+    assert m.clean_company_for_copy("Co-Diagnostics") == "Co-Diagnostics"
+    assert m.clean_company_for_copy("The Corporation for Public Broadcasting") == (
+        "The Corporation for Public Broadcasting"
+    )
+    assert m.clean_company_for_copy("Ltd Commodities") == "Ltd Commodities"
+    assert m.clean_company_for_copy("Inc Magazine") == "Inc Magazine"
+    # Word-boundary survivors that the old sweep already got right - keep them right.
+    assert m.clean_company_for_copy("Incyte") == "Incyte"
+    assert m.clean_company_for_copy("Groupon") == "Groupon"
+    assert m.clean_company_for_copy("Corning") == "Corning"
+
+
+def test_clean_company_still_strips_real_suffixes_including_stacked():
+    assert m.clean_company_for_copy("RevSpring Inc") == "RevSpring"
+    assert m.clean_company_for_copy("Quicken Loans, Inc.") == "Quicken Loans"
+    assert m.clean_company_for_copy("Lear Corporation") == "Lear"
+    assert m.clean_company_for_copy("Penske Corp.") == "Penske"
+    assert m.clean_company_for_copy("Barclays PLC") == "Barclays"
+    assert m.clean_company_for_copy("Aptiv Ltd") == "Aptiv"
+    # LLP/PLLC are in the shared list now, so resume_pdf_filename() no longer re-strips them.
+    assert m.clean_company_for_copy("Plante Moran PLLC") == "Plante Moran"
+    assert m.clean_company_for_copy("Ernst & Young LLP") == "Ernst & Young"
+    # Stacked suffixes come off one token per loop pass.
+    assert m.clean_company_for_copy("Atwell, Inc. Ltd") == "Atwell"
+
+
+def test_clean_company_keeps_group_holdings_and_companies():
+    # These are the firm's actual name at least as often as they are legal noise, and addressing
+    # "Rocket Companies" as "Rocket" reads as a failed mail merge.
+    assert m.clean_company_for_copy("Boston Consulting Group") == "Boston Consulting Group"
+    assert m.clean_company_for_copy("Rocket Companies LLC") == "Rocket Companies"
+    assert m.clean_company_for_copy("Alliance Group Holdings") == "Alliance Group Holdings"
+    assert m.clean_company_for_copy("Atwell Group, Inc.") == "Atwell Group"
+
+
+def test_clean_company_never_returns_empty():
+    # A firm literally named after a legal word must not strip to nothing.
+    assert m.clean_company_for_copy("Inc") == "Inc"
+    assert m.clean_company_for_copy("Ltd.") == "Ltd."
+    assert m.clean_company_for_copy("") == "your team"
+    assert m.clean_company_for_copy(None) == "your team"
+    assert m.clean_company_for_copy("   ") == "your team"
+
+
 # ---- Resume PDF attachment filename ----
 
 def test_resume_pdf_filename_drops_track_code_and_legal_suffix():
@@ -1261,8 +1312,10 @@ def test_resume_pdf_filename_drops_track_code_and_legal_suffix():
     assert m.resume_pdf_filename("Atwell, LLC") == "Kevin_Miller_Resume_Atwell.pdf"
     assert m.resume_pdf_filename("Goldman Sachs") == "Kevin_Miller_Resume_Goldman_Sachs.pdf"
     assert m.resume_pdf_filename("Ernst & Young LLP") == "Kevin_Miller_Resume_Ernst_Young.pdf"
+    # "Holdings" survives: it is part of the firm's name far more often than it is legal noise,
+    # and clean_company_for_copy() no longer strips it. "Corporation" is still a trailing suffix.
     assert m.resume_pdf_filename("Booz Allen Hamilton Holdings Corporation") == (
-        "Kevin_Miller_Resume_Booz_Allen_Hamilton.pdf"
+        "Kevin_Miller_Resume_Booz_Allen_Hamilton_Holdings.pdf"
     )
 
 
@@ -2873,7 +2926,8 @@ def test_cover_letter_every_combo_is_clean_and_well_formed():
                                          track, idx, "Detroit, MI", tone)
         ctx = f"track={track} tone={tone} idx={idx}"
         assert "{" not in letter and "}" not in letter, ctx
-        assert letter.startswith("Dear Acme Hiring Team,"), ctx
+        # "Group" is part of the name, ", Inc." is the legal suffix - see clean_company_for_copy().
+        assert letter.startswith("Dear Acme Group Hiring Team,"), ctx
         assert letter.endswith("\n\nBest regards,\nKevin Miller"), ctx
         assert letter.count("\n\n") == 5, ctx
         assert 110 <= len(letter.split()) <= 200, f"{ctx} words={len(letter.split())}"
