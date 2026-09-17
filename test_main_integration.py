@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes
@@ -4157,6 +4158,419 @@ def test_decoys_report_ranks_the_worst_source_first_and_pairs_the_medians(clean_
     assert msg.index("jsearch") < msg.index("greenhouse")  # worst offender on line one
     assert "5 of 15" in msg
     assert len(msg) < 4096
+
+
+# ---- Inbound Gmail: the two real interview emails that were dropped ----
+#
+# Both reached Kevin's INBOX and both were discarded. Sender addresses and the substance of each
+# message are the real ones; subject and snippet are reconstructed from what each email said,
+# since Gmail's stored copy is not in this repo. They are the acceptance criteria for this change.
+
+STEMLER_SENDER = "Andy Stemler <astemler@nextpathcp.com>"
+STEMLER_SUBJECT = "Raymond James Interview - Monday 9/21 9:00am CST"
+STEMLER_SNIPPET = (
+    "Hi Kevin, confirming your interview with Raymond James for Monday 9/21 at 9:00am CST. "
+    "Let me know if anything changes on your end. Thanks, Andy Stemler, NextPath Career Partners"
+)
+
+FITTERMAN_SENDER = "Chris.Fitterman-Harris@raymondjames.com"
+FITTERMAN_SUBJECT = "Invitation: Interview - Kevin Miller @ Wed Sep 30, 2026 2pm - 3pm (EDT)"
+FITTERMAN_SNIPPET = (
+    "You have been invited to the following event. Interview with Raymond James. "
+    "Join Zoom Meeting https://zoom.us/j/98765432100 Going? Yes - Maybe - No"
+)
+
+FITTERMAN_ICS = (
+    "BEGIN:VCALENDAR\r\n"
+    "PRODID:-//Google Inc//Google Calendar 70.9054//EN\r\n"
+    "VERSION:2.0\r\n"
+    "METHOD:REQUEST\r\n"
+    "BEGIN:VEVENT\r\n"
+    "DTSTART;TZID=America/New_York:20260930T140000\r\n"
+    "DTEND;TZID=America/New_York:20260930T150000\r\n"
+    "SUMMARY:Interview - Kevin Miller\r\n"
+    "END:VEVENT\r\n"
+    "END:VCALENDAR\r\n"
+)
+
+
+def _b64url(text):
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _gmail_message(msg_id, sender, subject, snippet, extra_headers=None, ics=None, age_seconds=7200):
+    """One Gmail messages.get(format=full) response, shaped the way the real API returns it."""
+    headers = [{"name": "From", "value": sender}, {"name": "Subject", "value": subject}]
+    for name, value in (extra_headers or {}).items():
+        headers.append({"name": name, "value": value})
+    payload = {"mimeType": "multipart/alternative", "headers": headers, "parts": [
+        {"mimeType": "text/plain", "filename": "", "body": {"data": _b64url(snippet)}},
+    ]}
+    if ics:
+        payload["mimeType"] = "multipart/mixed"
+        payload["parts"].append(
+            {"mimeType": "text/calendar", "filename": "invite.ics", "body": {"data": _b64url(ics)}})
+    return {
+        "id": msg_id, "threadId": f"thread-{msg_id}", "snippet": snippet, "payload": payload,
+        "internalDate": str(int((time.time() - age_seconds) * 1000)),
+    }
+
+
+def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_started=False,
+                              spam_messages=None):
+    """Drive the real check_inbound_gmail_replies() against a faked Gmail API.
+
+    `messages` answers the label:INBOX query and `spam_messages` the label:SPAM one - the fake
+    routes on the `q` param, because serving the same list to both is how a message gets processed
+    twice and a test quietly asserts against the wrong pass.
+
+    Returns (alerts, marked_read): the Telegram messages actually sent, and the ids whose UNREAD
+    label was removed. Nothing here asserts on a return value - check_inbound_gmail_replies has
+    none; what it does is send alerts and write CRM rows, so that is what gets captured.
+    """
+    for var in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"):
+        monkeypatch.setenv(var, "fake")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: "fake-token")
+    monkeypatch.setattr(m, "is_verified_crm_contact", crm_lookup or (lambda sender: None))
+    monkeypatch.setattr(m, "match_unknown_sender_to_crm_company", lambda sender: None)
+    monkeypatch.setattr(m, "is_thread_kevin_started", lambda tid, token: thread_started)
+
+    inbox_by_id = {msg["id"]: msg for msg in messages}
+    spam_by_id = {msg["id"]: msg for msg in (spam_messages or [])}
+    by_id = {**inbox_by_id, **spam_by_id}
+    alerts, marked_read = [], []
+
+    class _Res:
+        def __init__(self, body):
+            self.status_code = 200
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/messages"):
+            query = (kwargs.get("params") or {}).get("q", "")
+            listed = spam_by_id if "label:SPAM" in query else inbox_by_id
+            return _Res({"messages": [{"id": i} for i in listed]})
+        return _Res(by_id[url.rsplit("/", 1)[-1]])
+
+    def fake_post(url, **kwargs):
+        if url.endswith("/modify"):
+            marked_read.append(url.split("/messages/")[1].split("/")[0])
+        return _Res({})
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    monkeypatch.setattr(m.requests, "post", fake_post)
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: alerts.append(text))
+    m.check_inbound_gmail_replies()
+    return alerts, marked_read
+
+
+def test_the_recruiter_email_kevin_missed_now_reaches_an_alert(monkeypatch):
+    """astemler@nextpathcp.com, confirming a real Raymond James interview. It died three separate
+    ways: 2h old against a 300s age gate, no required keyword in Gmail's snippet, and not a CRM
+    contact. Each assertion below is one of those three, so a regression names its own cause."""
+    two_hours_ago_ms = int((time.time() - 7200) * 1000)
+    passed, reason = m.passes_email_prefilter(
+        STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET, internal_date_ms=two_hours_ago_ms)
+    assert passed, reason
+    assert m.classify_inbound_ats_email(STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET)[0] == "INTERVIEW_SET"
+
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("stemler", STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET, age_seconds=7200)])
+
+    assert len(alerts) == 1
+    assert "astemler@nextpathcp.com" in alerts[0]
+    assert "Interview Signal Detected" in alerts[0]
+    assert "No CRM changes were made" in alerts[0]  # stranger: alert yes, CRM writes no
+    assert marked_read == ["stemler"]
+
+
+def test_the_calendar_invite_kevin_missed_now_reaches_an_alert_with_its_date(monkeypatch):
+    """Chris.Fitterman-Harris@raymondjames.com, a Google Calendar invitation for a real interview.
+    The .ics is only visible at format=full, which is why the fetch changed."""
+    is_invite, start = m.extract_calendar_invite(
+        _gmail_message("f", FITTERMAN_SENDER, FITTERMAN_SUBJECT, FITTERMAN_SNIPPET, ics=FITTERMAN_ICS)["payload"])
+    assert is_invite is True
+    assert start == "Wed Sep 30, 2026 2:00 PM (America/New_York)"
+
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("fitterman", FITTERMAN_SENDER, FITTERMAN_SUBJECT, FITTERMAN_SNIPPET,
+                       ics=FITTERMAN_ICS, age_seconds=86400)])
+
+    assert len(alerts) == 1
+    assert "Calendar invite" in alerts[0]
+    assert "Wed Sep 30, 2026 2:00 PM (America/New_York)" in alerts[0]
+    assert "raymondjames.com" in alerts[0]
+
+
+def test_tier1_interview_signal_survives_every_soft_filter(monkeypatch):
+    """A day-old invite carrying an excluded keyword and no required keyword. Every soft rule says
+    drop it; Tier 1 says an interview signal outranks all of them."""
+    monkeypatch.setattr(m, "EMAIL_REQUIRED_KEYWORDS", "zzz-never-present")
+    monkeypatch.setattr(m, "EMAIL_EXCLUDED_KEYWORDS", "interview")
+    monkeypatch.setattr(m, "EMAIL_MAX_AGE_SECONDS", 300)
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("t1", FITTERMAN_SENDER, FITTERMAN_SUBJECT, FITTERMAN_SNIPPET,
+                       ics=FITTERMAN_ICS, age_seconds=86400)])
+    assert len(alerts) == 1
+
+
+def test_tier1_still_obeys_the_sender_blacklist_and_blocked_domains(monkeypatch):
+    """The bypass is about what the message says, never about who may send it. A robot mailbox
+    blasting calendar invites is still a robot."""
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("robot", "no-reply@calendar-spam.com", FITTERMAN_SUBJECT,
+                       FITTERMAN_SNIPPET, ics=FITTERMAN_ICS),
+        _gmail_message("blocked", "recruiter@quora.com", FITTERMAN_SUBJECT,
+                       FITTERMAN_SNIPPET, ics=FITTERMAN_ICS),
+    ])
+    assert alerts == []
+    assert sorted(marked_read) == ["blocked", "robot"]
+
+
+def test_spam_sweep_rescues_a_calendar_invite_gmail_filed_as_spam(monkeypatch):
+    """Kevin's recruiter warned outright that the Raymond James invite might land in Spam. A false
+    positive there is unrecoverable in practice - nobody reads that folder."""
+    alerts, marked_read = _run_poll_with_fake_gmail(
+        monkeypatch, [],
+        spam_messages=[_gmail_message("spam-invite", FITTERMAN_SENDER, FITTERMAN_SUBJECT,
+                                      FITTERMAN_SNIPPET, ics=FITTERMAN_ICS)])
+    assert len(alerts) == 1
+    assert "Found in SPAM" in alerts[0]
+    assert "Wed Sep 30, 2026 2:00 PM (America/New_York)" in alerts[0]
+    assert "No CRM changes were made" in alerts[0]
+    assert "#spam/" in alerts[0]  # links into Spam, not a nonexistent inbox thread
+    # Marked read so the same invite does not re-alert every cycle - and nothing else.
+    assert marked_read == ["spam-invite"]
+
+
+def test_spam_sweep_surfaces_nothing_that_is_not_an_interview_signal(monkeypatch):
+    """The whole point of the narrow query. Ordinary spam stays where Gmail put it, and is left
+    completely untouched - not alerted, and not even marked read."""
+    alerts, marked_read = _run_poll_with_fake_gmail(
+        monkeypatch, [],
+        spam_messages=[
+            _gmail_message("spam-pills", "deals@pharma-spam.ru", "Cheap meds now",
+                           "Order discount pharmaceuticals today with free worldwide shipping included."),
+            _gmail_message("spam-human", "dana@atwell.com", "Re: Operations Analyst",
+                           "Thanks for reaching out Kevin, let me look into it and get back to you."),
+            _gmail_message("spam-bulk", "deals@leejeans.com", "40% off everything",
+                           "Shop the fall sale now, free shipping on every order over fifty dollars.",
+                           extra_headers={"List-Unsubscribe": "<https://leejeans.com/u/abc>"}),
+        ])
+    assert alerts == []
+    assert marked_read == []
+
+
+def test_spam_sweep_never_touches_the_crm(monkeypatch):
+    """Structural, not incidental: sweep_spam_for_interview_signals calls no CRM function at all.
+    A sender who IS a known contact still gets no writes when the message came from Spam."""
+    for name in ("is_verified_crm_contact", "match_unknown_sender_to_crm_company",
+                 "route_inbound_reply_to_crm", "record_application_outcome",
+                 "log_metric_event", "enqueue_crm_payload"):
+        monkeypatch.setattr(m, name, lambda *a, **k: pytest.fail(f"{name} reached from the Spam sweep"))
+    alerts, _ = _run_poll_with_fake_gmail(
+        monkeypatch, [],
+        spam_messages=[_gmail_message("spam-invite", FITTERMAN_SENDER, FITTERMAN_SUBJECT,
+                                      FITTERMAN_SNIPPET, ics=FITTERMAN_ICS)])
+    assert len(alerts) == 1
+
+
+def test_spam_sweep_still_obeys_the_sender_blacklist_and_blocked_domains(monkeypatch):
+    """Spam is the one folder where a robot blasting calendar invites is actually likely."""
+    alerts, marked_read = _run_poll_with_fake_gmail(
+        monkeypatch, [],
+        spam_messages=[
+            _gmail_message("spam-robot", "no-reply@calendar-spam.com", FITTERMAN_SUBJECT,
+                           FITTERMAN_SNIPPET, ics=FITTERMAN_ICS),
+            _gmail_message("spam-blocked", "recruiter@quora.com", FITTERMAN_SUBJECT,
+                           FITTERMAN_SNIPPET, ics=FITTERMAN_ICS),
+        ])
+    assert alerts == []
+    assert marked_read == []  # blocked, so not even marked read
+
+
+def test_spam_sweep_is_capped_per_cycle(monkeypatch):
+    """Gmail lists newest first, so a fresh invite is at the top; the cap bounds the cost of a
+    folder that is junk by definition. Raising it is a deliberate trade, not a free win."""
+    assert m.SPAM_SWEEP_MAX_RESULTS == 10
+    spam = [_gmail_message(f"s{i}", FITTERMAN_SENDER, FITTERMAN_SUBJECT, FITTERMAN_SNIPPET,
+                           ics=FITTERMAN_ICS) for i in range(25)]
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [], spam_messages=spam)
+    # maxResults is sent to Gmail, but a server that ignores it must not cost 25 alerts - the
+    # slice inside the sweep is what actually holds the line, so that is what this exercises.
+    assert len(alerts) == 10
+    assert len(marked_read) == 10
+
+
+def test_spam_sweep_still_runs_when_the_inbox_query_fails(monkeypatch):
+    """An INBOX list error must not take down the safety net for the mail most likely to be lost."""
+    for var in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"):
+        monkeypatch.setenv(var, "fake")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: "fake-token")
+    invite = _gmail_message("spam-invite", FITTERMAN_SENDER, FITTERMAN_SUBJECT,
+                            FITTERMAN_SNIPPET, ics=FITTERMAN_ICS)
+    alerts = []
+
+    class _Res:
+        def __init__(self, body, status=200):
+            self.status_code = status
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/messages"):
+            if "label:SPAM" in (kwargs.get("params") or {}).get("q", ""):
+                return _Res({"messages": [{"id": "spam-invite"}]})
+            return _Res({}, status=500)  # INBOX list blows up
+        return _Res(invite)
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    monkeypatch.setattr(m.requests, "post", lambda url, **kw: _Res({}))
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: alerts.append(text))
+    m.check_inbound_gmail_replies()
+    assert len(alerts) == 1
+    assert "Found in SPAM" in alerts[0]
+
+
+def test_bulk_mail_is_separated_from_humans_by_the_list_unsubscribe_header(monkeypatch):
+    """The one rule that tells Andy Stemler apart from Lee Jeans. The newsletter below deliberately
+    avoids the word 'unsubscribe' in its body, so only the header can catch it."""
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("bulk", "deals@leejeans.com", "40% off everything this weekend",
+                       "Shop the fall sale now. Free shipping on orders over fifty dollars today.",
+                       extra_headers={"List-Unsubscribe": "<https://leejeans.com/u/abc>"}),
+        _gmail_message("human", "dana@atwell.com", "Re: Operations Analyst",
+                       "Thanks for reaching out Kevin, let me look into it and get back to you."),
+    ])
+    assert len(alerts) == 1
+    assert "dana@atwell.com" in alerts[0]
+
+
+def test_ordinary_human_mail_alerts_without_touching_the_crm(monkeypatch):
+    """Tier 2. The old code dropped this silently for not being an exact CRM match - which is what
+    every first contact from a stranger looks like."""
+    monkeypatch.setattr(m, "route_inbound_reply_to_crm",
+                        lambda *a, **k: pytest.fail("no CRM writes for an unresolved sender"))
+    monkeypatch.setattr(m, "record_application_outcome",
+                        lambda *a, **k: pytest.fail("no outcome rows for an unresolved sender"))
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("human", "dana@atwell.com", "Re: Operations Analyst",
+                       "Thanks for reaching out Kevin, let me look into it and get back to you.")])
+    assert len(alerts) == 1
+    assert "Not a known contact - no CRM changes were made." in alerts[0]
+
+
+def test_verified_contact_still_gets_its_crm_writes(monkeypatch):
+    """The unresolved-sender path must not have cost a real contact its routing."""
+    routed = []
+    monkeypatch.setattr(m, "route_inbound_reply_to_crm", lambda *a, **k: routed.append(a))
+    alerts, _ = _run_poll_with_fake_gmail(
+        monkeypatch,
+        [_gmail_message("known", "dana@atwell.com", "Re: Operations Analyst",
+                        "Thanks for reaching out Kevin, let me look into it and get back to you.")],
+        crm_lookup=lambda sender: {"name": "Dana", "company": "Atwell", "tab": "Carmen Cold",
+                                   "sheet_uuid": "uuid-dana"})
+    assert len(alerts) == 1
+    assert "No CRM changes were made" not in alerts[0]
+    assert len(routed) == 1
+
+
+def test_alert_shows_a_readable_name_for_a_from_header_with_a_display_name(monkeypatch):
+    """name_from_email_local_part() takes a bare address; a From: header is usually not one, and
+    splitting "Andy Stemler <astemler@..." on the @ produced "Andy stemler <astemler" on the CRM
+    Match line. It only ever showed on thread participants before; now it is on every stranger."""
+    assert m.display_name_from_sender("Andy Stemler <astemler@nextpathcp.com>") == "Andy Stemler"
+    assert m.display_name_from_sender("Chris.Fitterman-Harris@raymondjames.com") == "Chris Fitterman Harris"
+    assert m.display_name_from_sender("") == "Unknown"
+
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("named", STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET)])
+    assert "<b>CRM Match:</b> Andy Stemler @ Unknown" in alerts[0]
+
+
+def test_email_max_age_default_is_derived_from_the_poll_cadence(monkeypatch):
+    """300s against a poller running every EMAIL_POLL_HOURS hours is the bug that lost two real
+    interviews. The default now tracks the cadence, with a 24h floor."""
+    assert m.default_email_max_age_seconds(24) == 172800   # 2 daily cycles of headroom
+    assert m.default_email_max_age_seconds(2) == 86400     # short cadence still floors at a day
+    assert m.default_email_max_age_seconds(0.25) == 86400
+    # What the module actually loaded with no EMAIL_MAX_AGE_SECONDS set in the environment.
+    assert m.EMAIL_MAX_AGE_SECONDS == m.default_email_max_age_seconds(m.EMAIL_POLL_HOURS)
+    assert m.EMAIL_MAX_AGE_SECONDS >= 86400
+    # Still overridable from Render, which is where every env value lives.
+    monkeypatch.setenv("EMAIL_MAX_AGE_SECONDS", "600")
+    assert int(os.environ["EMAIL_MAX_AGE_SECONDS"]) == 600
+
+
+def test_stale_backlog_is_still_dropped(monkeypatch):
+    """Widening the window is not removing it: a month-old unread message is still backlog."""
+    passed, reason = m.passes_email_prefilter(
+        "dana@atwell.com", "Re: Operations Analyst",
+        "Thanks for reaching out Kevin, let me look into it and get back to you shortly.",
+        internal_date_ms=int((time.time() - 30 * 86400) * 1000))
+    assert passed is False
+    assert "too old" in reason
+
+
+def test_classifier_catches_the_bare_word_interview_and_meeting_mechanics():
+    """Every interview pattern used to require a phrase, so two emails whose subject line literally
+    read "Interview" both scored GENERAL."""
+    for subject, snippet in (
+        (STEMLER_SUBJECT, STEMLER_SNIPPET),
+        (FITTERMAN_SUBJECT, FITTERMAN_SNIPPET),
+        ("Next steps", "Please RSVP to the meeting request below."),
+        ("Chat", "Join Zoom Meeting https://zoom.us/j/12345678901"),
+        ("Sync", "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc"),
+        ("Meeting invitation", "Invitation to a meeting with our hiring team."),
+    ):
+        assert m.classify_inbound_ats_email("x@co.com", subject, snippet)[0] == "INTERVIEW_SET", subject
+
+
+def test_rejection_still_wins_over_the_new_bare_interview_pattern():
+    """The bare \\binterview\\b pattern is only safe because rejection is matched first. A decline
+    that mentions interviewing must not buy itself a Tier 1 bypass."""
+    for subject, snippet in (
+        ("Your application", "Unfortunately, we will not be moving forward to interview."),
+        ("Interview update", "Unfortunately we have decided to pursue other candidates."),
+        ("Re: Interview", "The position has been filled, but we will keep your resume on file."),
+    ):
+        assert m.classify_inbound_ats_email("x@co.com", subject, snippet)[0] == "REJECTION", snippet
+
+
+def test_calendar_invite_without_a_parseable_start_says_so_rather_than_guessing():
+    """An alert with no time is useful. An alert with an invented time is something Kevin would
+    plan around, so extract_calendar_invite returns None instead of a fallback."""
+    no_dtstart = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nSUMMARY:Interview\r\nEND:VEVENT\r\n"
+    payload = _gmail_message("x", FITTERMAN_SENDER, "Invitation", "Interview", ics=no_dtstart)["payload"]
+    assert m.extract_calendar_invite(payload) == (True, None)
+
+    unparseable = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nDTSTART:whenever-works\r\nEND:VCALENDAR\r\n"
+    payload = _gmail_message("y", FITTERMAN_SENDER, "Invitation", "Interview", ics=unparseable)["payload"]
+    assert m.extract_calendar_invite(payload) == (True, None)
+
+    plain = _gmail_message("z", "dana@atwell.com", "Re: role", "Thanks, will look into it.")["payload"]
+    assert m.extract_calendar_invite(plain) == (False, None)
+
+
+def test_calendar_invite_detected_from_method_request_without_an_ics_part():
+    """RFC 5546: METHOD:REQUEST is the invitation itself. Some senders inline it rather than
+    attaching a .ics, and a REPLY or CANCEL is not a new invitation."""
+    payload = {"mimeType": "multipart/mixed", "headers": [], "parts": [
+        {"mimeType": "text/plain", "filename": "",
+         "body": {"data": _b64url("BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nDTSTART:20260930T180000Z\r\n")}}]}
+    assert m.extract_calendar_invite(payload) == (True, None)  # start lives in the ics part only
+
+    cancelled = {"mimeType": "text/plain", "headers": [], "parts": [
+        {"mimeType": "text/plain", "filename": "",
+         "body": {"data": _b64url("BEGIN:VCALENDAR\r\nMETHOD:CANCEL\r\n")}}]}
+    assert m.extract_calendar_invite(cancelled) == (False, None)
 
 
 def test_decoys_report_does_not_claim_a_decoy_rate_before_any_dead_mark(clean_outcomes):

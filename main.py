@@ -34,7 +34,7 @@ from pipeline_utils import (
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     is_guessed_contact_email, resolve_sent_email_backfill,
-    is_role_mailbox, company_domain_of, name_from_email_local_part,
+    is_role_mailbox, company_domain_of, name_from_email_local_part, parse_email_recipient,
     match_email_to_crm_company,
     plan_carmen_ladder, carmen_reply_anchor, CARMEN_LADDER_DAYS,
     INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, MAX_AUTO_KILLS_PER_RUN,
@@ -57,6 +57,9 @@ APP_START_TIME = time.time()
 API_KEY = os.environ.get("OPENWEBNINJA_KEY") or os.environ.get("RAPIDAPI_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# Telegram's hard sendMessage limit. A message over it is rejected outright, not trimmed, so
+# anything that can grow without bound splits into a second message instead of being truncated.
+TELEGRAM_MAX_MESSAGE_CHARS = 4096
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 CRM_WEBHOOK_URL = os.environ.get("CRM_WEBHOOK_URL")
 CRM_SHARED_SECRET = os.environ.get("CRM_SHARED_SECRET")
@@ -446,18 +449,55 @@ def update_template_entry(file_path, list_key, idx, new_text):
         f"{warning}"
     )
 
-# Inbound Email Anti-Spam Gatekeeper: 10 pre-filter shield parameters (raw CSV/string env values,
+# How often the Gmail poller runs, in hours. Was a hardcoded 15 minutes, which cost more than it
+# returned: each cycle takes SQLite write locks (BEGIN IMMEDIATE, 5s busy_timeout) for inbound
+# replies, sent-mail capture and email back-fill, so a cycle landing mid-/t contends with the
+# pipeline's own writes across 20 concurrently scored jobs. Once a day is the default; set
+# EMAIL_POLL_HOURS to tune it, or EMAIL_POLL_ENABLED=false to turn scheduled polling off
+# entirely. /poll always runs a cycle on demand regardless of either setting.
+#
+# Defined HERE, far above start_gmail_poller(), because EMAIL_MAX_AGE_SECONDS below derives its
+# default from it. Module-level constants are evaluated top to bottom at import, so the cadence
+# has to be known before the age gate that depends on it.
+EMAIL_POLL_HOURS = float(os.environ.get("EMAIL_POLL_HOURS", "24"))
+EMAIL_POLL_ENABLED = os.environ.get("EMAIL_POLL_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+
+
+def default_email_max_age_seconds(poll_hours):
+    """The age gate's default, derived from the poll cadence instead of being a fixed number.
+
+    The gate exists to drop a stale backlog after an outage, not to drop live mail - but the old
+    hardcoded 300s did exactly that: a message had to land inside a 5-minute window that a poller
+    running every EMAIL_POLL_HOURS hours hits almost never, so the poller discarded essentially
+    everything it was built to catch. Two real interview emails were lost this way.
+
+    Two poll intervals of headroom absorbs a skipped cycle, a Render spin-down or a Gmail 5xx, and
+    the 24h floor means a short EMAIL_POLL_HOURS cannot quietly reintroduce a window narrower than
+    a day. Any tie-breaking still happens downstream - Gmail's own is:unread already stops a
+    message being alerted twice, so a wide window costs nothing but a longer catch-up sweep.
+    """
+    return max(int(float(poll_hours) * 3600 * 2), 86400)
+
+
+# Inbound Email Anti-Spam Gatekeeper: pre-filter shield parameters (raw CSV/string env values,
 # parsed lazily in passes_email_prefilter() to avoid depending on helpers defined later in the file)
 EMAIL_ALLOW_DOMAINS = os.environ.get("EMAIL_ALLOW_DOMAINS", "")
 EMAIL_BLOCK_DOMAINS = os.environ.get("EMAIL_BLOCK_DOMAINS", "quora.com,anytimefitness.com")
-EMAIL_REQUIRED_KEYWORDS = os.environ.get("EMAIL_REQUIRED_KEYWORDS", "interview,schedule,offer,opportunity,reply")
+# Empty by default, and deliberately so. This gate demanded one of interview/schedule/offer/
+# opportunity/reply appear in the subject or snippet, which blocked 8 of 10 messages in a real
+# production poll - including a recruiter confirming an interview, because Gmail's snippet had not
+# reached the word yet. It is redundant as spam defence: the poll query is `label:INBOX`, and
+# Gmail files spam under a separate label, so nothing reaching this code was called spam by
+# Google. Bulk-vs-human is now decided by the List-Unsubscribe header instead (gate 5 below).
+# Setting EMAIL_REQUIRED_KEYWORDS in Render re-enables the old behaviour verbatim.
+EMAIL_REQUIRED_KEYWORDS = os.environ.get("EMAIL_REQUIRED_KEYWORDS", "")
 EMAIL_EXCLUDED_KEYWORDS = os.environ.get("EMAIL_EXCLUDED_KEYWORDS", "digest,unsubscribe,newsletter,promo,alert")
 EMAIL_SENDER_BLACKLIST = os.environ.get("EMAIL_SENDER_BLACKLIST", "no-reply@,noreply@")
 EMAIL_SUBJECT_REGEX_FILTER = os.environ.get("EMAIL_SUBJECT_REGEX_FILTER", "")
 try:
-    EMAIL_MAX_AGE_SECONDS = int(os.environ.get("EMAIL_MAX_AGE_SECONDS", "300"))
+    EMAIL_MAX_AGE_SECONDS = int(os.environ.get("EMAIL_MAX_AGE_SECONDS") or default_email_max_age_seconds(EMAIL_POLL_HOURS))
 except (TypeError, ValueError):
-    EMAIL_MAX_AGE_SECONDS = 300
+    EMAIL_MAX_AGE_SECONDS = default_email_max_age_seconds(EMAIL_POLL_HOURS)
 EMAIL_REQUIRE_DIRECT_REPLY = os.environ.get("EMAIL_REQUIRE_DIRECT_REPLY", "False").strip().lower() in ("1", "true", "yes")
 try:
     EMAIL_MIN_BODY_LENGTH = int(os.environ.get("EMAIL_MIN_BODY_LENGTH", "50"))
@@ -4255,6 +4295,117 @@ def is_thread_kevin_started(thread_id, access_token):
         return False
 
 
+def _gmail_header_value(header_list, name, default=""):
+    """One header off a Gmail payload, matched case-insensitively.
+
+    Header names are case-insensitive per RFC 5322 and senders genuinely vary the spelling -
+    List-Unsubscribe in particular shows up as List-unsubscribe often enough that an exact-case
+    lookup would let those newsletters through as human mail.
+    """
+    lowered = str(name).lower()
+    return next(
+        (h.get("value", "") for h in (header_list or []) if str(h.get("name", "")).lower() == lowered),
+        default,
+    )
+
+
+def display_name_from_sender(sender_raw):
+    """A readable human name for a From: header, for the alert's CRM Match line.
+
+    name_from_email_local_part() expects a bare address, and a From: header usually is not one:
+    handed "Andy Stemler <astemler@nextpathcp.com>" it splits on the @ and returns
+    "Andy stemler <astemler". That was survivable while only thread participants reached it, but
+    every unresolved sender now produces an alert, so it is the name Kevin reads on most of them.
+    """
+    display, address = parse_email_recipient(sender_raw)
+    return display or name_from_email_local_part(address or sender_raw) or "Unknown"
+
+
+def _decode_gmail_part_data(data):
+    """Gmail part bodies are base64url with the padding stripped; restore it before decoding."""
+    try:
+        padded = str(data or "") + "=" * (-len(str(data or "")) % 4)
+        return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _format_ics_dtstart(raw_value, tzid=""):
+    """Render an iCalendar DTSTART as readable text, or None if it is not a shape we parse.
+
+    None is a real answer here, not a failure to handle: an alert saying "calendar invite" with no
+    time is useful, and an alert showing a time that was guessed at is worse than useless, because
+    Kevin would plan around it. Named zones are printed as the zone name rather than converted -
+    labelling 2pm as America/New_York is honest, and silently shifting it is how you show up an
+    hour late.
+    """
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+    zone_note = ""
+    if value.endswith("Z"):
+        zone_note = " UTC"
+        value = value[:-1]
+    elif tzid:
+        zone_note = f" ({tzid})"
+    for fmt, out in (("%Y%m%dT%H%M%S", "%a %b %d, %Y %I:%M %p"), ("%Y%m%d", "%a %b %d, %Y")):
+        try:
+            parsed = datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+        rendered = parsed.strftime(out).replace(" 0", " ")
+        return f"{rendered}{zone_note}".strip()
+    return None
+
+
+def extract_calendar_invite(payload):
+    """Find a calendar invitation inside a Gmail message payload. Returns (is_invite, start_text).
+
+    A meeting invite is the least ambiguous interview signal that exists - nobody sends an .ics to
+    a stranger by accident - and it is also the signal the text filters are worst at, because the
+    human-written part of an invite is often empty. Kevin's Raymond James interview arrived exactly
+    this way and was discarded.
+
+    Detection is the MIME part (text/calendar, or a .ics attachment) or METHOD:REQUEST anywhere in
+    a decoded part, per RFC 5546 - a reply or a cancellation carries METHOD:REPLY/CANCEL instead
+    and is not a new invitation. start_text is None whenever DTSTART is missing or unparseable;
+    see _format_ics_dtstart for why that is deliberate.
+
+    Requires the message to have been fetched with format=full - format=metadata returns headers
+    only, with no payload.parts to walk.
+    """
+    is_invite = False
+    ics_text = ""
+    stack = [payload or {}]
+    while stack:
+        part = stack.pop()
+        if not isinstance(part, dict):
+            continue
+        stack.extend(part.get("parts") or [])
+        mime_type = str(part.get("mimeType") or "").lower()
+        filename = str(part.get("filename") or "").lower()
+        is_calendar_part = mime_type.startswith(("text/calendar", "application/ics")) or filename.endswith(".ics")
+        decoded = _decode_gmail_part_data((part.get("body") or {}).get("data"))
+        if "METHOD:REQUEST" in decoded.upper():
+            is_invite = True
+        if is_calendar_part:
+            is_invite = True
+            if decoded:
+                ics_text = decoded
+
+    if not is_invite:
+        return False, None
+
+    # Unfolded first: iCalendar wraps long lines with a CRLF + single space, which can split a
+    # DTSTART across two lines and make the regex below quietly find nothing.
+    unfolded = re.sub(r"\r?\n[ \t]", "", ics_text)
+    match = re.search(r"^DTSTART([^:\r\n]*):([^\r\n]+)", unfolded, re.MULTILINE)
+    if not match:
+        return True, None
+    tzid_match = re.search(r"TZID=([^;:]+)", match.group(1) or "")
+    return True, _format_ics_dtstart(match.group(2), tzid_match.group(1) if tzid_match else "")
+
+
 def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
     """
     Classifies ATS email into 'interview', 'rejection', or 'general'.
@@ -4290,22 +4441,42 @@ def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
         r"(?:are|r) you (?:free|available)", r"do you have (?:a few|some|\d+)\s*(?:minutes|mins)",
         r"send (?:over|me) some times", r"what(?:'s| is) your availability",
         r"works for me", r"let'?s (?:chat|talk|connect|set)", r"grab (?:15|20|30|a few)",
-        r"calendly\.com", r"book a time",
+        r"calendly", r"book a time",
+        # The bare word, which every pattern above managed to miss. Two real interview emails
+        # classified GENERAL while their subject lines literally read "Interview" - the phrases
+        # were all written for formal ATS copy, and a recruiter writing to a human just says
+        # "interview". Safe to add only because rejection is matched first above: "we will not be
+        # moving forward to interview" is already a REJECTION before this line is reached.
+        r"\binterview\b",
+        # Meeting mechanics. A calendar invite's own body is the strongest signal there is, and it
+        # rarely contains any of the phrasing above - it contains an RSVP prompt and a join link.
+        r"\brsvp\b", r"zoom\.us/j/", r"teams\.microsoft\.com/l/meetup",
+        # "Invitation" alone is a newsletter word ("invitation to our webinar"), so it only counts
+        # within a short distance of something that means an actual conversation.
+        r"\binvitation\b.{0,60}?\b(?:interview|meeting|call|chat|conversation|screen)\b",
+        r"\b(?:interview|meeting|call|chat|conversation|screen)\b.{0,60}?\binvitation\b",
     ]
     if any(re.search(p, text) for p in interview_patterns):
         return "INTERVIEW_SET", "update_interview"
 
     return "GENERAL", None
 
-def passes_email_prefilter(sender: str, subject: str, snippet: str, internal_date_ms=None, in_reply_to="", references=""):
-    """Zero-tolerance anti-spam pre-filter shield. Enforces the 10 EMAIL_* environment parameters
-    BEFORE any CRM whitelist check runs. Returns (passed: bool, rejection_reason: str).
+def passes_email_sender_blocks(sender: str):
+    """The sender rules that hold even for a Tier 1 interview signal: the no-reply@ blacklist, the
+    blocked-domain list and the allow-list. Returns (passed: bool, rejection_reason: str).
+
+    Split out of passes_email_prefilter() so the Tier 1 bypass in check_inbound_gmail_replies()
+    can honour exactly these three and nothing else. The line is who the sender is, not what the
+    message says: a calendar invite from a robot mailbox is still a robot, but a calendar invite
+    from a stranger is precisely the case the bypass exists for.
+
+    Note the blacklist matches the ADDRESS, not the domain - "no-reply@" is a substring test
+    against the full address, so a real person at a company whose marketing mail comes from
+    no-reply@ is unaffected. That is intentional and should stay that way.
     """
     email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender or "")
     sender_email = email_match.group(0).lower().strip() if email_match else ""
     sender_domain = sender_email.split("@")[-1] if sender_email else ""
-    subject_l = str(subject or "")
-    combined_text = f"{subject} {snippet}".lower()
 
     # 1. Sender blacklist (substring match, e.g. "no-reply@", "noreply@")
     blacklist = [s.strip().lower() for s in EMAIL_SENDER_BLACKLIST.split(",") if s.strip()]
@@ -4322,12 +4493,41 @@ def passes_email_prefilter(sender: str, subject: str, snippet: str, internal_dat
     if allow_domains and sender_domain not in allow_domains:
         return False, f"domain not in allow-list ({sender_domain})"
 
+    return True, ""
+
+def passes_email_prefilter(sender: str, subject: str, snippet: str, internal_date_ms=None, in_reply_to="", references="", list_unsubscribe=""):
+    """Bulk-vs-human pre-filter shield, enforced BEFORE any CRM whitelist check runs.
+    Returns (passed: bool, rejection_reason: str).
+
+    This layer is no longer a spam filter and should not be read as one. The poll query is
+    `is:unread -from:me label:INBOX`, and Gmail files spam and trash under separate labels, so
+    every message reaching here has already been judged not-spam by Google. Duplicating that
+    judgement with a keyword whitelist is how a DKIM-signed recruiter email that Gmail itself
+    flagged Important got thrown away. What is left for this layer to decide is bulk versus human.
+    """
+    subject_l = str(subject or "")
+    combined_text = f"{subject} {snippet}".lower()
+
+    # 1-3. Sender blacklist, blocked domains, allow-list. Shared with the Tier 1 bypass, which
+    # honours these and skips everything below.
+    passed, reason = passes_email_sender_blocks(sender)
+    if not passed:
+        return False, reason
+
     # 4. Excluded keywords (subject/body)
     excluded_kws = [k.strip().lower() for k in EMAIL_EXCLUDED_KEYWORDS.split(",") if k.strip()]
     if excluded_kws and any(kw in combined_text for kw in excluded_kws):
         return False, "excluded keyword matched"
 
-    # 5. Required keywords (at least one must be present, if configured)
+    # 5. Bulk mail, identified by the header a bulk sender is legally obliged to set rather than by
+    # guessing at vocabulary. This is the single rule that separates Andy Stemler from Lee Jeans,
+    # Venmo and Condado Tacos: a recruiter typing an email by hand does not emit List-Unsubscribe,
+    # and every newsletter does. It replaces the required-keyword whitelist that used to sit here.
+    if str(list_unsubscribe or "").strip():
+        return False, "bulk mail (List-Unsubscribe header present)"
+
+    # 5b. Required keywords, off unless EMAIL_REQUIRED_KEYWORDS is explicitly set in Render. Kept
+    # so the old behaviour is one env var away, not a redeploy away. See the constant's comment.
     required_kws = [k.strip().lower() for k in EMAIL_REQUIRED_KEYWORDS.split(",") if k.strip()]
     if required_kws and not any(kw in combined_text for kw in required_kws):
         return False, "no required keyword present"
@@ -4438,9 +4638,26 @@ def route_inbound_reply_to_crm(crm_match, status_label, subject, snippet):
     return payloads
 
 def check_inbound_gmail_replies():
-    """Poll Gmail for unread inbound replies. Zero-tolerance anti-spam gatekeeper:
-    1) Runs the 10-parameter pre-filter shield, 2) Requires an exact CRM whitelist match.
-    Unverified/spam mail is silently dropped (label removed, no Telegram alert) - never surfaced.
+    """Poll Gmail for unread inbound replies and alert on the ones a human sent.
+
+    Three tiers, in the order they are decided:
+
+      Tier 1 - a calendar invite or an interview signal. Alerts ALWAYS. It clears the bulk rules,
+               the age gate and the CRM whitelist, and respects only the sender blacklist and the
+               blocked/allowed domain lists. Kevin's rule: tell me when something looks like an
+               interview invite, regardless of whether I know the sender. Two real interviews were
+               lost to a filter that outranked this signal, and no filter outranks it now.
+      Tier 2 - ordinary human mail that cleared the pre-filter. Alerts, and writes to the CRM only
+               when the sender resolves to an actual row.
+      Dropped - bulk mail (List-Unsubscribe), blacklisted senders, blocked domains, stale backlog.
+
+    The old behaviour - silently dropping everything without an exact CRM match - is gone. It was
+    built as a spam defence, but the poll query is label:INBOX and Gmail files spam elsewhere, so
+    what it actually dropped was strangers: which is what a recruiter reaching out for the first
+    time is. An unresolved sender never produces a CRM write; it produces an alert that says so.
+
+    Finishes by calling sweep_spam_for_interview_signals(), a second narrow query over label:SPAM
+    that applies the Tier 1 test and nothing else - see that function for why it is separate.
     """
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars or not TELEGRAM_CHAT_ID:
@@ -4449,39 +4666,74 @@ def check_inbound_gmail_replies():
     if not access_token:
         return
     headers = {"Authorization": f"Bearer {access_token}"}
+    # A failure here logs and falls through to the Spam sweep rather than returning. The two
+    # queries are independent, and the sweep is the safety net for the mail most likely to be lost
+    # - letting an INBOX list error suppress it would take the net down exactly when it matters.
+    message_ids = []
     try:
         list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
         params = {"q": f"is:unread -from:me label:{EMAIL_LABEL_TARGET_INBOX}", "maxResults": 10}
         res = requests.get(list_url, headers=headers, params=params, timeout=10)
         if res.status_code != 200:
             logging.error(f"Gmail Poll List Error: {res.status_code}")
-            return
-        message_ids = [m["id"] for m in res.json().get("messages", [])]
-        logging.info(f"[POLL] Gmail list query returned {len(message_ids)} unread message(s) in label:{EMAIL_LABEL_TARGET_INBOX}")
+        else:
+            message_ids = [m["id"] for m in res.json().get("messages", [])]
+            logging.info(f"[POLL] Gmail list query returned {len(message_ids)} unread message(s) in label:{EMAIL_LABEL_TARGET_INBOX}")
     except Exception as e:
         logging.error(f"Gmail Poll List Exception: {e}")
-        return
 
     for msg_id in message_ids:
         try:
             detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
-            detail_params = {"format": "metadata", "metadataHeaders": ["From", "Subject", "In-Reply-To", "References"]}
+            # format=full, not metadata. A calendar invite is only visible in payload.parts, which
+            # metadata does not return, and the invite is the strongest interview signal there is.
+            # The cost: messages.get is 5 quota units at either format, so the daily quota is
+            # unchanged; what grows is the response body, from roughly 1KB of headers to the whole
+            # message - tens of KB. At maxResults=10 per poll and one poll per EMAIL_POLL_HOURS
+            # that is a few hundred KB a day and a little more latency per message, which buys the
+            # one signal the text filters cannot see.
+            # metadataHeaders is ignored by format=full (it returns every header), but is kept
+            # accurate so that flipping back to metadata does not silently lose List-Unsubscribe.
+            detail_params = {
+                "format": "full",
+                "metadataHeaders": ["From", "Subject", "In-Reply-To", "References", "List-Unsubscribe"],
+            }
             detail_res = requests.get(detail_url, headers=headers, params=detail_params, timeout=10)
             if detail_res.status_code != 200:
                 continue
             detail = detail_res.json()
-            header_list = detail.get("payload", {}).get("headers", [])
-            sender = next((h["value"] for h in header_list if h["name"] == "From"), "Unknown Sender")
-            subject = next((h["value"] for h in header_list if h["name"] == "Subject"), "(No Subject)")
-            in_reply_to = next((h["value"] for h in header_list if h["name"] == "In-Reply-To"), "")
-            references = next((h["value"] for h in header_list if h["name"] == "References"), "")
+            payload = detail.get("payload", {}) or {}
+            header_list = payload.get("headers", [])
+            sender = _gmail_header_value(header_list, "From", "Unknown Sender")
+            subject = _gmail_header_value(header_list, "Subject", "(No Subject)")
+            in_reply_to = _gmail_header_value(header_list, "In-Reply-To")
+            references = _gmail_header_value(header_list, "References")
+            list_unsubscribe = _gmail_header_value(header_list, "List-Unsubscribe")
             snippet = detail.get("snippet", "")
             internal_date_ms = detail.get("internalDate")
             thread_id = detail.get("threadId", msg_id)
             modify_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify"
 
-            # GATE 1: Pre-filter shield (10 EMAIL_* parameters)
-            passed, reject_reason = passes_email_prefilter(sender, subject, snippet, internal_date_ms, in_reply_to, references)
+            # TIER 1 detection runs BEFORE any gate, because the whole point is that no gate may
+            # outrank it. classify_inbound_ats_email checks rejection patterns first, so a decline
+            # that mentions interviewing cannot buy itself a bypass.
+            status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
+            has_calendar_invite, invite_start = extract_calendar_invite(payload)
+            is_tier1 = has_calendar_invite or status_label == "INTERVIEW_SET"
+
+            # GATE 1: Pre-filter shield. Tier 1 skips it, except for the sender rules - a robot
+            # mailbox blasting calendar spam is still a robot, and a blocked domain stays blocked.
+            if is_tier1:
+                passed, reject_reason = passes_email_sender_blocks(sender)
+                if passed:
+                    logging.info(
+                        f"[TIER1] Interview signal from {sender} "
+                        f"(calendar_invite={has_calendar_invite}, classifier={status_label}) - pre-filter bypassed"
+                    )
+            else:
+                passed, reject_reason = passes_email_prefilter(
+                    sender, subject, snippet, internal_date_ms, in_reply_to, references, list_unsubscribe
+                )
             if not passed:
                 logging.info(f"[BLOCKED] Pre-filter rejected message from {sender} - reason: {reject_reason}")
                 requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
@@ -4504,7 +4756,7 @@ def check_inbound_gmail_replies():
                 # address. The widest gate and the last one, because it is the only one that
                 # can see a new participant in an existing conversation.
                 crm_match = {
-                    "name": name_from_email_local_part(sender),
+                    "name": display_name_from_sender(sender),
                     "company": "Unknown",
                     "tab": "Thread participant",
                     "sheet_uuid": "",
@@ -4514,9 +4766,20 @@ def check_inbound_gmail_replies():
             elif is_unverified:
                 match_reason = "domain match"
             if not crm_match:
-                logging.info(f"[BLOCKED] Unverified sender (not found in SQLite/Sheets CRM): {sender}")
-                requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
-                continue
+                # No CRM identity at all. This used to be a silent drop, and it is how a recruiter
+                # Kevin had never emailed - confirming a real interview, DKIM-signed, marked
+                # Important by Gmail - was thrown away without a trace. A stranger writing to you
+                # is not a defect; it is the outcome the outreach exists to produce. So it alerts,
+                # and it alerts with an empty sheet_uuid so every CRM branch below skips itself:
+                # guessing which row a stranger belongs to would be worse than the original bug.
+                is_unverified = True
+                match_reason = "interview signal" if is_tier1 else "unknown sender"
+                crm_match = {
+                    "name": display_name_from_sender(sender),
+                    "company": "Unknown",
+                    "tab": "Not in CRM",
+                    "sheet_uuid": "",
+                }
 
             logging.info(f"[ALLOWED] {'Unverified (' + match_reason + ')' if is_unverified else 'Verified CRM'} sender {sender} matched to {crm_match.get('company')} ({crm_match.get('tab')})")
 
@@ -4526,17 +4789,27 @@ def check_inbound_gmail_replies():
             match_tab = html.escape(str(crm_match.get("tab") or "Unknown"))
             crm_line = f"<b>CRM Match:</b> {match_name} @ {match_company} <i>({match_tab})</i>\n"
 
-            status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
+            # status_label was already computed above for the Tier 1 decision - reusing it keeps
+            # the badge and the bypass from ever disagreeing about the same message.
             status_badges = {
                 "INTERVIEW_SET": "🎉 <b>Interview Signal Detected!</b>\n",
                 "REJECTION": "⚠️ <b>Rejection Detected</b>\n"
             }
             status_line = status_badges.get(status_label, "")
-            # Outcome metrics and CRM routing are skipped for a domain-only match: there is no
-            # sheet_uuid to attach them to, and a guess about WHO replied must never move a stage
-            # or book an interview against the wrong row. Kevin gets the alert and decides.
+            # The time is shown only when DTSTART actually parsed. extract_calendar_invite returns
+            # None rather than a guess, and an invented time is the one error Kevin would act on.
+            invite_line = ""
+            if has_calendar_invite:
+                invite_line = (
+                    f"📅 <b>Calendar invite:</b> {html.escape(invite_start)}\n" if invite_start
+                    else "📅 <b>Calendar invite attached</b> <i>(start time not parsed)</i>\n"
+                )
+            # Outcome metrics and CRM routing are skipped for every unresolved sender - domain
+            # match, thread participant or outright stranger. There is no sheet_uuid to attach
+            # them to, and a guess about WHO replied must never move a stage or book an interview
+            # against the wrong row. Kevin gets the alert and decides.
             if is_unverified:
-                logging.info(f"[UNVERIFIED] Skipping CRM writes for domain-match sender {sender}")
+                logging.info(f"[UNVERIFIED] Skipping CRM writes for {match_reason} sender {sender}")
             elif status_label == "INTERVIEW_SET":
                 log_metric_event("interview_set")
                 record_application_outcome(crm_match.get("sheet_uuid"), "interview", company=crm_match.get("company"))
@@ -4552,18 +4825,25 @@ def check_inbound_gmail_replies():
                 except Exception as e:
                     logging.error(f"Inbound Reply CRM Routing Error ({msg_id}): {e}")
 
-            header_line = (
-                "📬 <b>New Gmail Reply!</b>" if not is_unverified
-                else f"⚠️ <b>Unverified Reply ({html.escape(match_reason)})</b>"
-            )
+            # A Tier 1 stranger gets its own header: "Unverified Reply" reads like something to
+            # deal with later, which is the wrong instruction for an interview invitation.
+            if not is_unverified:
+                header_line = "📬 <b>New Gmail Reply!</b>"
+            elif match_reason == "interview signal":
+                header_line = "🚨 <b>Possible Interview - Unknown Sender</b>"
+            else:
+                header_line = f"⚠️ <b>Unverified Reply ({html.escape(match_reason)})</b>"
             unverified_notes = {
                 "domain match": "<i>Not a CRM contact - matched by company domain. No CRM changes were made.</i>\n",
                 "thread participant": "<i>New person in a thread you started - possibly an introduction. No CRM changes were made.</i>\n",
+                "interview signal": "<i>Not a known contact - surfaced because it looks like an interview. No CRM changes were made.</i>\n",
+                "unknown sender": "<i>Not a known contact - no CRM changes were made.</i>\n",
             }
             unverified_note = "" if not is_unverified else unverified_notes.get(match_reason, "")
             alert_msg = (
                 f"{header_line}\n\n"
                 f"{status_line}"
+                f"{invite_line}"
                 f"{unverified_note}"
                 f"<b>From:</b> {html.escape(sender)}\n"
                 f"{crm_line}"
@@ -4571,11 +4851,140 @@ def check_inbound_gmail_replies():
                 f"<b>Preview:</b> <i>{html.escape(snippet)}</i>\n\n"
                 f"<a href='{thread_link}'>Open Thread in Gmail</a>"
             )
-            send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
+            # Telegram hard-rejects over 4096 chars. Everything above the preview is what makes the
+            # alert actionable, so an oversized snippet is split into its own follow-up message
+            # rather than truncating the alert and losing the Gmail link off the end.
+            if len(alert_msg) > TELEGRAM_MAX_MESSAGE_CHARS:
+                send_telegram_message(TELEGRAM_CHAT_ID, (
+                    f"{header_line}\n\n{status_line}{invite_line}{unverified_note}"
+                    f"<b>From:</b> {html.escape(sender)}\n{crm_line}"
+                    f"<b>Subject:</b> {html.escape(subject)}\n\n"
+                    f"<a href='{thread_link}'>Open Thread in Gmail</a>"
+                ))
+                preview = f"<b>Preview:</b> <i>{html.escape(snippet)}</i>"
+                send_telegram_message(TELEGRAM_CHAT_ID, preview[:TELEGRAM_MAX_MESSAGE_CHARS])
+            else:
+                send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
 
             requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
         except Exception as e:
             logging.error(f"Gmail Poll Message Processing Error ({msg_id}): {e}")
+
+    # Second, narrower query. Runs after the INBOX pass and shares its access token.
+    sweep_spam_for_interview_signals(headers)
+
+
+SPAM_SWEEP_MAX_RESULTS = 10
+
+
+def sweep_spam_for_interview_signals(request_headers):
+    """Surface Tier 1 interview signals that Gmail filed as spam. Nothing else from Spam is ever
+    surfaced, and nothing from Spam ever touches the CRM.
+
+    This exists because Gmail's spam classifier is wrong in a specific, costly direction: a
+    calendar invitation from a company Kevin has never corresponded with, sent by a system he has
+    never replied to, looks exactly like bulk mail. His recruiter warned outright that the Raymond
+    James invite might land there. A false positive in Spam is unrecoverable in practice - nobody
+    reads that folder - so the one signal worth paying attention for is checked there too.
+
+    Deliberately a separate function rather than a second label in the main loop, because the
+    guarantee should be structural and not a matter of reading the branches correctly: this
+    function calls no CRM lookup, no CRM write, no outcome recorder and no metric event. It cannot
+    corrupt a row, because it has no code path that reaches one. The only gates it applies are the
+    Tier 1 test and passes_email_sender_blocks - a no-reply@ robot's calendar spam is still spam,
+    and a blocked domain stays blocked whichever folder it lands in.
+
+    Known limit: Gmail returns newest first and this reads at most SPAM_SWEEP_MAX_RESULTS, so an
+    invite sitting behind more than ten newer unread spam messages is not seen. A fresh invite is
+    at the top by construction, and raising the cap trades that edge for a slower cycle on a
+    folder that is mostly junk by definition.
+    """
+    try:
+        list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+        params = {"q": "is:unread -from:me label:SPAM", "maxResults": SPAM_SWEEP_MAX_RESULTS}
+        res = requests.get(list_url, headers=request_headers, params=params, timeout=10)
+        if res.status_code != 200:
+            logging.error(f"Gmail Spam Sweep List Error: {res.status_code}")
+            return
+        spam_ids = [msg["id"] for msg in res.json().get("messages", [])][:SPAM_SWEEP_MAX_RESULTS]
+        logging.info(f"[SPAM SWEEP] {len(spam_ids)} unread message(s) in label:SPAM to test for interview signals")
+    except Exception as e:
+        logging.error(f"Gmail Spam Sweep List Exception: {e}")
+        return
+
+    for msg_id in spam_ids:
+        try:
+            detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
+            detail_res = requests.get(
+                detail_url, headers=request_headers,
+                params={"format": "full", "metadataHeaders": ["From", "Subject"]}, timeout=10)
+            if detail_res.status_code != 200:
+                continue
+            detail = detail_res.json()
+            payload = detail.get("payload", {}) or {}
+            header_list = payload.get("headers", [])
+            sender = _gmail_header_value(header_list, "From", "Unknown Sender")
+            subject = _gmail_header_value(header_list, "Subject", "(No Subject)")
+            snippet = detail.get("snippet", "")
+            thread_id = detail.get("threadId", msg_id)
+
+            status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
+            has_calendar_invite, invite_start = extract_calendar_invite(payload)
+            if not (has_calendar_invite or status_label == "INTERVIEW_SET"):
+                # Left completely untouched - not alerted, not marked read. Gmail put it here and
+                # this sweep has no opinion about anything that is not an interview signal.
+                continue
+            passed, reject_reason = passes_email_sender_blocks(sender)
+            if not passed:
+                logging.info(f"[SPAM SWEEP] Interview-shaped spam from {sender} still blocked - {reject_reason}")
+                continue
+
+            logging.info(
+                f"[SPAM SWEEP] Tier 1 signal rescued from Spam: {sender} "
+                f"(calendar_invite={has_calendar_invite}, classifier={status_label})"
+            )
+            invite_line = ""
+            if has_calendar_invite:
+                invite_line = (
+                    f"📅 <b>Calendar invite:</b> {html.escape(invite_start)}\n" if invite_start
+                    else "📅 <b>Calendar invite attached</b> <i>(start time not parsed)</i>\n"
+                )
+            thread_link = html.escape(f"https://mail.google.com/mail/u/0/#spam/{thread_id}", quote=True)
+            alert_msg = (
+                "🚨 <b>Possible Interview - Found in SPAM</b>\n\n"
+                f"{invite_line}"
+                "<i>Gmail filed this as spam. Surfaced because it looks like an interview - "
+                "verify the sender before acting. No CRM changes were made.</i>\n"
+                f"<b>From:</b> {html.escape(sender)} <i>({html.escape(display_name_from_sender(sender))})</i>\n"
+                f"<b>Subject:</b> {html.escape(subject)}\n"
+                f"<b>Preview:</b> <i>{html.escape(snippet)}</i>\n\n"
+                f"<a href='{thread_link}'>Open in Gmail Spam</a>"
+            )
+            if len(alert_msg) > TELEGRAM_MAX_MESSAGE_CHARS:
+                send_telegram_message(TELEGRAM_CHAT_ID, (
+                    "🚨 <b>Possible Interview - Found in SPAM</b>\n\n"
+                    f"{invite_line}"
+                    "<i>Gmail filed this as spam. Verify the sender before acting. "
+                    "No CRM changes were made.</i>\n"
+                    f"<b>From:</b> {html.escape(sender)}\n"
+                    f"<b>Subject:</b> {html.escape(subject)}\n\n"
+                    f"<a href='{thread_link}'>Open in Gmail Spam</a>"
+                ))
+                send_telegram_message(
+                    TELEGRAM_CHAT_ID,
+                    f"<b>Preview:</b> <i>{html.escape(snippet)}</i>"[:TELEGRAM_MAX_MESSAGE_CHARS])
+            else:
+                send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
+
+            # Marked read, and ONLY marked read - the message stays in Spam. Removing UNREAD is
+            # what stops the same invite alerting on every cycle; moving it out of Spam would be
+            # this code overruling Gmail's classification on the strength of a regex, which is a
+            # judgement that belongs to Kevin after he has looked at it.
+            requests.post(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify",
+                headers=request_headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+        except Exception as e:
+            logging.error(f"Gmail Spam Sweep Processing Error ({msg_id}): {e}")
 
 # Dedicated scheduler instance: Gmail polling runs strictly once every 15 minutes,
 # decoupled from Telegram webhook traffic (never triggered by incoming webhook pings).
@@ -4989,14 +5398,9 @@ def scheduled_email_poll_job():
         logging.error(f"[POLL] Contact-email Back-fill Error: {e}")
     logging.info("[POLL] Email poll cycle completed")
 
-# How often the Gmail poller runs, in hours. Was a hardcoded 15 minutes, which cost more than it
-# returned: each cycle takes SQLite write locks (BEGIN IMMEDIATE, 5s busy_timeout) for inbound
-# replies, sent-mail capture and email back-fill, so a cycle landing mid-/t contends with the
-# pipeline's own writes across 20 concurrently scored jobs. Once a day is the default; set
-# EMAIL_POLL_HOURS to tune it, or EMAIL_POLL_ENABLED=false to turn scheduled polling off
-# entirely. /poll always runs a cycle on demand regardless of either setting.
-EMAIL_POLL_HOURS = float(os.environ.get("EMAIL_POLL_HOURS", "24"))
-EMAIL_POLL_ENABLED = os.environ.get("EMAIL_POLL_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+# EMAIL_POLL_HOURS and EMAIL_POLL_ENABLED are defined with the other EMAIL_* constants near the
+# top of the file, not here: EMAIL_MAX_AGE_SECONDS derives its default from the cadence, and a
+# module-level constant cannot read one defined 4,500 lines further down.
 
 def start_gmail_poller():
     """Register the Gmail reply poller on an EMAIL_POLL_HOURS interval trigger (APScheduler),

@@ -69,6 +69,35 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
   Telegram via `send_health_alert()`. If Telegram itself is misconfigured, check `logging` output.
 - **Secret rotation:** rotate `CRM_SHARED_SECRET` in both the Apps Script Script Properties and
   your environment together (a mismatch fails closed - the webhook returns `Unauthorized`).
+- **Inbound mail alerting (`/poll`, `check_inbound_gmail_replies`):** the poller now decides
+  *bulk vs. human*, not *spam vs. not* - the query is `label:INBOX` and Gmail files spam under a
+  separate label, so nothing reaching this code was called spam by Google. Three defaults changed,
+  all still overridable from the Render dashboard:
+  - `EMAIL_MAX_AGE_SECONDS` is no longer a fixed `300`. It derives from the poll cadence -
+    `max(EMAIL_POLL_HOURS * 3600 * 2, 86400)`, i.e. **48h** at the default daily cadence. A
+    5-minute window against a poller that runs every 24h discarded essentially all inbound mail.
+  - `EMAIL_REQUIRED_KEYWORDS` now defaults to **empty** (the gate is off). It blocked 8 of 10
+    messages in a real production poll, including a recruiter confirming an interview. Set it in
+    Render to restore the old behaviour verbatim.
+  - Bulk mail is identified by the **`List-Unsubscribe`** header instead. A newsletter sets it; a
+    person typing an email does not.
+  - **Tier 1 override:** a calendar invite (`text/calendar` part or `METHOD:REQUEST`) or an
+    interview signal alerts *always* - past the age gate, the bulk rules and the CRM whitelist.
+    It still respects `EMAIL_SENDER_BLACKLIST` and `EMAIL_BLOCK_DOMAINS`. A sender with no CRM row
+    gets the alert and **no CRM writes** - the alert says so on its face.
+  - Gmail `messages.get` is fetched at `format=full` (not `metadata`), because `payload.parts` is
+    the only place an `.ics` is visible. Same 5 quota units per call; the cost is response size,
+    roughly 1KB → tens of KB, at ≤10 messages per poll.
+  - **Spam sweep:** every cycle also runs a second narrow query over `label:SPAM is:unread`
+    (`sweep_spam_for_interview_signals()`, ≤10 messages) and applies **only** the Tier 1 test.
+    Gmail's classifier is wrong in one costly direction - an invite from a company you have never
+    corresponded with looks exactly like bulk mail - and a false positive in Spam is unrecoverable
+    because nobody reads that folder. Nothing else from Spam is ever surfaced, and nothing from
+    Spam ever writes to the CRM: the sweep is a separate function that calls no CRM lookup, write,
+    outcome recorder or metric event, so the guarantee is structural rather than a matter of
+    reading the branches correctly. A surfaced message is marked read (so it does not re-alert
+    every cycle) and otherwise left in Spam - reclassifying it on the strength of a regex is
+    Kevin's call, not the poller's. Non-matching spam is not touched at all.
 - **Editing outreach copy without a redeploy:** use the Telegram `/edit` command, or edit
   `templates/*.json` / `resume_bullets_bank.json` directly - both are hot-reloaded on every use.
 - **Adding a job you found yourself:** `/job <linkedin-url>` pushes one hand-picked posting
