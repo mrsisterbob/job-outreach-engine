@@ -4175,7 +4175,8 @@ def check_inbound_gmail_replies():
 
 # Dedicated scheduler instance: Gmail polling runs strictly once every 15 minutes,
 # decoupled from Telegram webhook traffic (never triggered by incoming webhook pings).
-EMAIL_POLL_SCHEDULER = BackgroundScheduler(daemon=True)
+# Render containers run UTC; pin the zone so cron jobs fire on Michigan time.
+EMAIL_POLL_SCHEDULER = BackgroundScheduler(daemon=True, timezone="America/Detroit")
 
 # Sent mail is rescanned over a rolling window rather than tracked by a stored watermark: the
 # SQLite backing that would hold one is wiped by every Render deploy, which would silently reset
@@ -4696,7 +4697,11 @@ def scheduled_backup_job():
     backup_sqlite_db()
 
 def start_backup_scheduler():
-    """Register the weekly SQLite backup on the existing background scheduler (Sunday 3 AM local)."""
+    """Register the weekly SQLite backup on the existing background scheduler (Sunday 3 AM local).
+
+    "Local" means America/Detroit, pinned on EMAIL_POLL_SCHEDULER. Render runs UTC, so before
+    the pin this fired at 03:00 UTC.
+    """
     EMAIL_POLL_SCHEDULER.add_job(
         scheduled_backup_job,
         trigger="cron",
@@ -5565,6 +5570,9 @@ def scheduled_followup_sequencer_job():
 def start_followup_sequencer():
     """Register the nightly sequencer on the shared background scheduler (07:00 local, ahead of
     the 08:30 morning digest). Bury-to-Died is its only automatic write.
+
+    "Local" means America/Detroit, pinned on EMAIL_POLL_SCHEDULER. Render runs UTC, so before
+    the pin this fired at 07:00 UTC (03:00 Detroit).
     """
     EMAIL_POLL_SCHEDULER.add_job(
         scheduled_followup_sequencer_job,

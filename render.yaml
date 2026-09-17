@@ -68,3 +68,6 @@ services:
 
       - key: PYTHON_VERSION
         value: "3.12"
+
+      - key: TZ
+        value: America/Detroit
