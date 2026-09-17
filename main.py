@@ -21,7 +21,7 @@ from email.message import EmailMessage
 import requests
 from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
-from resume_engine import compile_resume_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
+from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from response_schema import GeminiJobScreenerResponse
 from pipeline_utils import (
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
@@ -3814,6 +3814,124 @@ def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_l
             logging.error(f"{command_label} fallback resume compilation failed for {comp}: {e}")
             send_telegram_message(chat_id, f"⚠️ Resume compilation warning: {e}")
             return None
+
+def send_telegram_document(chat_id, file_bytes, filename, caption, command_label):
+    """Uploads an in-memory PDF to Telegram as a document. Returns True on success.
+
+    Factored out of the /cv handler, which was the only caller that knew how to do this. A failure
+    here is logged and reported but never raised: the tap-to-copy text has already landed on the
+    card by the time this runs, so a failed upload degrades the convenience, not the application.
+    """
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        files = {"document": (filename, io.BytesIO(file_bytes), "application/pdf")}
+        res = requests.post(
+            url,
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files=files, timeout=20
+        )
+        if res.status_code != 200:
+            logging.error(f"{command_label} sendDocument failed ({res.status_code}): {res.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logging.error(f"{command_label} sendDocument raised for {filename}: {e}")
+        return False
+
+def resolve_letter_for_job(job, mapping, comp):
+    """THE cover letter every command renders, so /letter, /e and /eh cannot drift apart.
+
+    Mirrors resolve_outreach_body()'s role for the email body: one function reads the routing off
+    the cached job, so the letter attached to a draft is the same string the /letter card showed.
+    Returns (letter_text, track). Reuses the resume's own track/index routing so the letter and the
+    attached PDF argue one case - the reasoning documented in generate_cover_letter().
+    """
+    job = job or {}
+    job_title = job.get("job_title") or "this role"
+    track = job.get("track", "a")
+    indices = job.get("bullet_indices") or [0]
+    letter_index = indices[0] if isinstance(indices, list) and indices and isinstance(indices[0], int) else 0
+    city = str(job.get("job_city") or "").strip()
+    state = str(job.get("job_state") or "").strip()
+    job_location = ", ".join([p for p in (city, state) if p])
+    letter = generate_cover_letter(
+        comp, job_title, track, letter_index, job_location,
+        job.get("tone_mode", "conservative"),
+    )
+    return letter, track
+
+def cover_letter_pdf_filename(company_name):
+    """"Kevin_Miller_Cover_Letter_Atwell.pdf" - same slug rules as resume_pdf_filename()."""
+    return resume_pdf_filename(company_name).replace("Kevin_Miller_Resume", "Kevin_Miller_Cover_Letter", 1)
+
+def send_cover_letter_pdf_async(chat_id, letter_text, comp, track, command_label):
+    """Compiles and sends the cover letter PDF on a background thread.
+
+    Threaded for the same reason /backfillcontacts is: the Telegram card is already sent by this
+    point, and the webhook handler should not hold the request open for a compile. A compile
+    failure is logged and surfaced, never raised into the handler.
+    """
+    def _compile_and_send():
+        try:
+            pdf_bytes = compile_cover_letter_pdf(letter_text, comp)
+            if not pdf_bytes:
+                raise ValueError("compile_cover_letter_pdf returned empty bytes")
+            caption = f"✉️ <b>Cover Letter: {html.escape(comp)}</b> · Track {html.escape(str(track).upper())}"
+            send_telegram_document(
+                chat_id, pdf_bytes, cover_letter_pdf_filename(comp), caption, command_label
+            )
+        except Exception as e:
+            logging.error(f"{command_label} cover letter PDF failed for {comp}: {e}")
+            send_telegram_message(chat_id, f"⚠️ Cover letter PDF failed: {html.escape(str(e)[:200])}")
+    threading.Thread(target=_compile_and_send, daemon=True).start()
+
+def stage_outreach_draft(chat_id, mapping, job, comp, title, is_warm, target, header_line, command_label):
+    """THE shared tail of /e and /eh: resume PDF -> email body -> Gmail draft -> Telegram card.
+
+    The two commands differ only in how `target` is obtained - /e takes a hand-typed address for
+    free, /eh burns provider credits through resolve_email_waterfall() - and in the header line
+    above the card. Everything after the address was duplicated line-for-line between them, which
+    is why the cover letter is added here once rather than in each handler.
+
+    Returns the created draft_id (or None), so callers can keep their own post-draft CRM writes.
+    """
+    track = job.get("track", "a")
+    bullet_indices = job.get("bullet_indices")
+    tone_mode = job.get("tone_mode", "conservative")
+    pdf_filename = resume_pdf_filename(comp)
+    pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label, tone_mode=tone_mode)
+
+    raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
+    ok, gmail_msg, draft_id = create_gmail_draft(
+        to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
+        custom_body=raw_email_text, pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+    )
+    monospaced_body = format_email_block(raw_email_text)
+    draft_link_line = ""
+    if draft_id:
+        draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
+        draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
+    confirm_msg = (
+        f"{header_line}\n\n"
+        f"{draft_link_line}"
+        f"<b>Tap-to-Copy Email Body:</b>\n{monospaced_body}"
+    )
+    # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+    send_telegram_message(chat_id, confirm_msg)
+    if ok:
+        log_daily_activity("drafts_staged")
+
+    # The letter Kevin used to fetch with a separate /letter call on every application. Sent as its
+    # own message rather than appended: the email body already fills much of the 4096-char cap, and
+    # a letter tipping it over would silently truncate the copy he pastes into the portal.
+    letter, letter_track = resolve_letter_for_job(job, mapping, comp)
+    send_telegram_message(
+        chat_id,
+        f"✉️ <b>Cover Letter - {html.escape(comp)}</b> · Track {html.escape(str(letter_track).upper())}\n\n"
+        f"<code>{html.escape(letter)}</code>"
+    )
+    send_cover_letter_pdf_async(chat_id, letter, comp, letter_track, command_label)
+    return draft_id
 
 def is_verified_crm_contact(sender_raw):
     """Strict, exact-match CRM whitelist check for the inbound email anti-spam gatekeeper.
@@ -8127,33 +8245,12 @@ def process_webhook_payload_async(data):
                 note=f"[{datetime.now().strftime('%Y-%m-%d')}] Emailed: {title}"
             )
 
-            # Compile the same tailored resume PDF /draft and /e attach, so /eh never regresses to a bare-text draft
-            track = job.get("track", "a")
-            bullet_indices = job.get("bullet_indices")
-            tone_mode = job.get("tone_mode", "conservative")
-            pdf_filename = resume_pdf_filename(comp)
-            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/eh", tone_mode=tone_mode)
-
-            raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
-            ok, gmail_msg, draft_id = create_gmail_draft(
-                to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
-                custom_body=raw_email_text, pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
-            )
-            monospaced_body = format_email_block(raw_email_text)
-            draft_link_line = ""
-            if draft_id:
-                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
-                draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
+            # Resume PDF, email body, Gmail draft, card and cover letter - shared with /e
             confidence_badge = "⚠️ Unverified guess" if confidence == "unverified" else "✅ Verified"
-            confirm_msg = (
-                f"🔍 <b>API Lookup Resolved ({confidence_badge}):</b> <code>{html.escape(target)}</code>\n\n"
-                f"{draft_link_line}"
-                f"<b>Tap-to-Copy Email Body:</b>\n{monospaced_body}"
+            stage_outreach_draft(
+                chat_id, mapping, job, comp, title, is_warm, target,
+                f"🔍 <b>API Lookup Resolved ({confidence_badge}):</b> <code>{html.escape(target)}</code>", "/eh"
             )
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-            send_telegram_message(chat_id, confirm_msg)
-            if ok:
-                log_daily_activity("drafts_staged")
             return
 
         if text.startswith("/e ") or text.startswith("/email "):
@@ -8178,32 +8275,11 @@ def process_webhook_payload_async(data):
             is_warm = mapping.get("sheet_tab") in WARM_TONE_TABS
             update_job_target_email(mapping["sheet_uuid"], new_email)
 
-            # Compile the same tailored resume PDF /draft attaches, so /e never regresses to a bare-text draft
-            track = job.get("track", "a")
-            bullet_indices = job.get("bullet_indices")
-            tone_mode = job.get("tone_mode", "conservative")
-            pdf_filename = resume_pdf_filename(comp)
-            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/e", tone_mode=tone_mode)
-
-            raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
-            ok, gmail_msg, draft_id = create_gmail_draft(
-                to_email=new_email, company_name=comp, job_title=title, is_warm=is_warm,
-                custom_body=raw_email_text, pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+            # Resume PDF, email body, Gmail draft, card and cover letter - shared with /eh
+            stage_outreach_draft(
+                chat_id, mapping, job, comp, title, is_warm, new_email,
+                f"🎯 <b>Apollo Email Locked:</b> <code>{html.escape(new_email)}</code>", "/e"
             )
-            monospaced_body = format_email_block(raw_email_text)
-            draft_link_line = ""
-            if draft_id:
-                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{draft_id}", quote=True)
-                draft_link_line = f"📱 <a href='{draft_url}'>Open Draft in Gmail</a>\n\n"
-            confirm_msg = (
-                f"🎯 <b>Apollo Email Locked:</b> <code>{html.escape(new_email)}</code>\n\n"
-                f"{draft_link_line}"
-                f"<b>Tap-to-Copy Email Body:</b>\n{monospaced_body}"
-            )
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-            send_telegram_message(chat_id, confirm_msg)
-            if ok:
-                log_daily_activity("drafts_staged")
             enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
             # Typing the address IS the intent to track this person, so log them to Carmen Cold
             # without the company gate the passive sweep uses - that gate drops agency recruiters
@@ -8380,23 +8456,15 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, STALE_CARD_WARNING)
                 return
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
-            job_title = job.get("job_title") or "this role"
-            # Reuse the resume's own routing so the letter and the attached PDF argue one case.
-            track = job.get("track", "a")
-            indices = job.get("bullet_indices") or [0]
-            letter_index = indices[0] if isinstance(indices, list) and indices and isinstance(indices[0], int) else 0
-            city = str(job.get("job_city") or "").strip()
-            state = str(job.get("job_state") or "").strip()
-            job_location = ", ".join([p for p in (city, state) if p])
-            letter = generate_cover_letter(
-                comp, job_title, track, letter_index, job_location,
-                job.get("tone_mode", "conservative"),
-            )
+            # Shared with /e and /eh so the three commands cannot render different letters.
+            letter, track = resolve_letter_for_job(job, mapping, comp)
             letter_msg = (
                 f"✉️ <b>Cover Letter - {html.escape(comp)}</b> · Track {html.escape(str(track).upper())}\n\n"
                 f"<code>{html.escape(letter)}</code>"
             )
+            # Text lands instantly; the PDF compile follows on a thread so the webhook is not held open.
             send_telegram_message(chat_id, letter_msg)
+            send_cover_letter_pdf_async(chat_id, letter, comp, track, "/letter")
             return
 
         cv_match = re.match(r"^/(cv|resume)(?:\s+([a-eA-E]))?$", text, re.IGNORECASE)
@@ -8421,14 +8489,12 @@ def process_webhook_payload_async(data):
                 pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
                 filename = resume_pdf_filename(comp)
 
-                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-                files = {"document": (filename, io.BytesIO(pdf_bytes), "application/pdf")}
                 caption_text = (
                     f"📄 <b>Tailored Resume ({track.upper()}): {html.escape(comp)}</b>\n\n"
                     f"🖥️ <b>Desktop Staging Link:</b>\n"
                     f"<code>{html.escape(f'{BASE_URL}/stage/{short_id}?track={track}')}</code>"
                 )
-                requests.post(url, data={"chat_id": chat_id, "caption": caption_text, "parse_mode": "HTML"}, files=files, timeout=10)
+                send_telegram_document(chat_id, pdf_bytes, filename, caption_text, "/cv")
             except Exception as e:
                 send_telegram_message(chat_id, f"❌ Resume Compilation Error: <code>{html.escape(str(e))}</code>")
             return

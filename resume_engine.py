@@ -438,3 +438,76 @@ def compile_resume_pdf(company_name: str, track: str = "a", bullet_indices: list
     markup = render_typst_markup(company_name, track, bullet_indices, tone_mode)
     return typst.compile(markup.encode("utf-8"))
 
+def render_cover_letter_markup(letter_text: str, company_name: str = "") -> str:
+    """Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text.
+
+    This module never authors letter prose. `letter_text` arrives fully assembled and sanitized
+    from main.generate_cover_letter(), which resolves it deterministically from
+    templates/cover_letter_templates.json - so the PDF and the tap-to-copy text on the Telegram
+    card are byte-identical by construction, the same guarantee resolve_outreach_body() gives the
+    email body. Rendering from a second source here is what would let the two drift.
+
+    The letterhead deliberately reuses the resume's identity block, fonts and rule styling so a
+    recruiter opening both attachments sees one document set rather than two.
+    """
+    evidence = load_evidence_bank()
+    identity = evidence.get("identity", {})
+
+    name = escape_typst(identity.get("name", "Kevin Miller"))
+    email = escape_typst(identity.get("email", ""))
+    phone = escape_typst(identity.get("phone", ""))
+    location = escape_typst(identity.get("location", ""))
+    website_raw = str(identity.get("website", "") or "")
+    linkedin_raw = str(identity.get("linkedin", "") or "")
+
+    contact_fields = [f for f in (email, phone, location) if f]
+    if website_raw:
+        contact_fields.append(f'#link("https://{website_raw}")[{escape_typst(website_raw)}]')
+    if linkedin_raw:
+        contact_fields.append(f'#link("https://{linkedin_raw}")[LinkedIn]')
+    contact_line = " • ".join(contact_fields)
+
+    # The banked letter is a plain-text block with blank-line paragraph breaks. Typst already
+    # treats a blank line as a paragraph break, so escaping per-paragraph and rejoining preserves
+    # the structure without needing an explicit #par() per chunk.
+    paragraphs = [p.strip() for p in str(letter_text or "").split("\n\n") if p.strip()]
+    # A single newline inside a paragraph (the "Best regards,\nKevin Miller" signoff) is a hard
+    # line break in the source, so it must become one in Typst rather than being reflowed away.
+    body_block = "\n\n".join(
+        " \\\n".join(escape_typst(line) for line in para.split("\n"))
+        for para in paragraphs
+    )
+
+    doc_title = f"Kevin Miller - Cover Letter - {escape_typst(company_name)}" if company_name else "Kevin Miller - Cover Letter"
+
+    markup = f"""
+#set document(
+  title: "{doc_title}",
+  author: "Kevin Miller",
+  date: auto
+)
+
+#set page(paper: "us-letter", margin: (x: 0.9in, top: 0.75in, bottom: 0.75in))
+#set text(font: "Liberation Sans", size: 10.5pt, fill: rgb("#111827"))
+#set par(justify: false, leading: 0.68em, spacing: 1.05em)
+
+// --- LETTERHEAD (mirrors the resume header) ---
+#align(center)[
+  #text(size: 18pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
+  #v(2pt)
+  #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
+]
+
+#v(7pt)
+#line(length: 100%, stroke: 0.7pt + rgb("#CCCCCC"))
+#v(14pt)
+
+{body_block}
+"""
+    return markup.strip()
+
+def compile_cover_letter_pdf(letter_text: str, company_name: str = "") -> bytes:
+    """Compiles already-rendered cover letter text into PDF bytes in memory."""
+    markup = render_cover_letter_markup(letter_text, company_name)
+    return typst.compile(markup.encode("utf-8"))
+
