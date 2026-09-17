@@ -900,9 +900,15 @@ def test_carmen_ladder_walks_every_rung_then_stops():
     action, nxt = pu.plan_carmen_followup(anchor, d2.isoformat(), d2)
     assert (action, nxt) == ("nudge_2", d3)
 
-    # Final rung fires with no next date - the ladder ends rather than nagging forever.
+    # Final rung advances to the triage date (last rung + grace week) rather than writing
+    # nothing - with no date written, the row re-read as rung 3 and nudge #3 fired forever.
+    terminal = anchor_date + timedelta(days=pu.CARMEN_TERMINAL_GAP_DAYS)
     action, nxt = pu.plan_carmen_followup(anchor, d3.isoformat(), d3)
-    assert (action, nxt) == ("nudge_3", None)
+    assert (action, nxt) == ("nudge_3", terminal)
+
+    # Quiet through the grace week, then exhausted - the path that used to be unreachable.
+    assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal - timedelta(days=1)) == ("none", None)
+    assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal) == ("exhausted", None)
 
 
 def test_carmen_ladder_starts_a_manually_moved_row_from_today():
@@ -920,8 +926,138 @@ def test_carmen_ladder_starts_a_manually_moved_row_from_today():
 
 def test_carmen_ladder_is_quiet_until_due_and_after_exhaustion():
     assert pu.plan_carmen_followup("2026-09-12", "2026-09-30", _LADDER_TODAY) == ("none", None)
-    # Past the last rung: stop asking for attention rather than looping.
-    assert pu.plan_carmen_followup("2026-09-12", "2026-10-20", date(2026, 10, 20))[0] == "exhausted"
+    # Past the last rung: the ladder-written triage date reads as exhausted.
+    assert pu.plan_carmen_followup("2026-09-12", "2026-10-10", date(2026, 10, 10))[0] == "exhausted"
+    # Past the ladder entirely (a gap the ladder never writes, on an anchor over 30 days old):
+    # this used to read as exhausted too, and now revives. The staleness rule deliberately
+    # treats a date the ladder did not write as a bench/stalled row, not a finished ghost.
+    plan = pu.plan_carmen_ladder("2026-09-12", "2026-10-20", date(2026, 10, 20))
+    assert (plan.action, plan.revived) == ("schedule", True)
+
+
+def test_carmen_ladder_triages_a_finished_ghost_even_when_the_run_is_late():
+    """A ladder-written triage date is trusted however old the anchor is - otherwise a sequencer
+    run that slipped past day 30 would revive the ghost instead of killing it, and it would loop."""
+    anchor = date(2026, 9, 1)
+    terminal = anchor + timedelta(days=pu.CARMEN_TERMINAL_GAP_DAYS)
+    late = anchor + timedelta(days=pu.CARMEN_STALE_ANCHOR_DAYS + 10)
+    plan = pu.plan_carmen_ladder(anchor.isoformat(), terminal.isoformat(), late)
+    assert (plan.action, plan.revived) == ("exhausted", False)
+
+
+# ---- Stale-anchor revival (CARMEN_STALE_ANCHOR_DAYS) ----
+
+def test_stale_bench_contact_with_a_set_date_starts_at_rung_1_not_exhausted():
+    """The bug this rule prevents: a Carmen Warm contact dragged into Carmen Cold carries a
+    ~210-day-old Last Contact Date, so the old gap read as long past the last rung and the contact
+    was killed on the first pass without a single nudge."""
+    today = date(2026, 9, 12)
+    old = (today - timedelta(days=210)).isoformat()
+    plan = pu.plan_carmen_ladder(old, today.isoformat(), today)
+    assert plan.action == "schedule"
+    assert plan.next_date == today + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
+    assert plan.revived is True
+    assert plan.anchor == today
+    # Two-value wrapper agrees and keeps its contract.
+    assert pu.plan_carmen_followup(old, today.isoformat(), today) == ("schedule", plan.next_date)
+
+
+def test_revived_row_climbs_the_ladder_once_its_restart_note_is_recorded():
+    """Revival is compute-only for Date Added, so the restart has to be persisted as a note -
+    otherwise the next pass revives again and the row never gets past "schedule"."""
+    today = date(2026, 9, 12)
+    old = (today - timedelta(days=210)).isoformat()
+    first = today + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
+    note = f"[2026-01-01] Met at conference\n[{today.isoformat()}] {pu.LADDER_RESTART_NOTE_MARKER} (revived)"
+
+    plan = pu.plan_carmen_ladder(old, first.isoformat(), first, note=note)
+    assert (plan.action, plan.revived, plan.anchor) == ("nudge_1", False, today)
+
+
+def test_old_dates_that_look_ladder_shaped_still_revive():
+    """Bench dates 210 and 200 days back sit 10 days apart - a rung-2 gap. Trusting that as a live
+    ladder position would nudge twice and kill the contact within three days of promotion."""
+    today = date(2026, 9, 12)
+    plan = pu.plan_carmen_ladder((today - timedelta(days=210)).isoformat(),
+                                 (today - timedelta(days=200)).isoformat(), today)
+    assert (plan.action, plan.revived) == ("schedule", True)
+
+
+def test_stale_anchor_waits_for_a_hand_set_future_date():
+    today = date(2026, 9, 12)
+    old = (today - timedelta(days=210)).isoformat()
+    plan = pu.plan_carmen_ladder(old, (today + timedelta(days=60)).isoformat(), today)
+    assert (plan.action, plan.revived) == ("none", False)
+
+
+def test_recent_anchor_is_not_revived():
+    today = date(2026, 9, 12)
+    recent = today - timedelta(days=10)
+    plan = pu.plan_carmen_ladder(recent.isoformat(), (recent + timedelta(days=11)).isoformat(), today)
+    assert plan.revived is False and plan.anchor == recent
+    assert plan.action == "none"  # rung 2 not due until day 11
+
+
+def test_blank_anchor_still_falls_back_to_today():
+    today = date(2026, 9, 12)
+    plan = pu.plan_carmen_ladder("", "", today)
+    assert plan.action == "schedule"
+    assert plan.next_date == today + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
+    assert plan.anchor == today
+    # Flagged as a revival so the caller records the restart: a blank Date Added otherwise
+    # re-anchors on a new "today" every pass and the row never reaches rung 1.
+    assert plan.revived is True
+
+
+# ---- Reply re-anchoring (carmen_reply_anchor) ----
+
+def _reply(day):
+    return f"[{day}] {pu.INBOUND_REPLY_NOTE_MARKER} (they wrote to Kevin, not a send). Subject: hi."
+
+
+def test_reply_anchor_with_no_note_is_none():
+    assert pu.carmen_reply_anchor("") is None
+    assert pu.carmen_reply_anchor(None) is None
+    assert pu.carmen_reply_anchor("[2026-09-01] Promoted to Carmen Hot.") is None
+
+
+def test_reply_anchor_reads_one_reply():
+    assert pu.carmen_reply_anchor(_reply("2026-09-01")) == date(2026, 9, 1)
+
+
+def test_reply_anchor_latest_of_several_wins():
+    note = "\n".join([_reply("2026-09-05"), "[2026-09-06] called", _reply("2026-09-10"), _reply("2026-08-01")])
+    assert pu.carmen_reply_anchor(note) == date(2026, 9, 10)
+
+
+def test_reply_anchor_skips_malformed_dates():
+    assert pu.carmen_reply_anchor(_reply("2026-13-45")) is None
+    assert pu.carmen_reply_anchor(_reply("2026-02-30") + "\n" + _reply("2026-09-02")) == date(2026, 9, 2)
+
+
+def test_reply_older_than_date_added_leaves_the_anchor_alone():
+    today = date(2026, 9, 12)
+    plan = pu.plan_carmen_ladder("2026-09-08", "2026-09-12", today, note=_reply("2026-08-20"))
+    assert plan.anchor == date(2026, 9, 8)
+    assert plan.action == "nudge_1"
+
+
+def test_reply_newer_than_date_added_restarts_the_ladder_from_the_reply():
+    """A live conversation must not die on the same clock as a ghost."""
+    today = date(2026, 9, 12)
+    reply_day = date(2026, 9, 8)
+    # Date Added is 22 days before the reply; the reply handler set Next Followup = reply + 4.
+    plan = pu.plan_carmen_ladder("2026-08-17", (reply_day + timedelta(days=4)).isoformat(), today,
+                                 note=_reply(reply_day.isoformat()))
+    assert plan.anchor == reply_day
+    assert (plan.action, plan.revived) == ("nudge_1", False)
+
+
+def test_stale_reply_anchor_is_revived_too():
+    """The staleness rule applies to whichever anchor wins."""
+    today = date(2026, 9, 12)
+    plan = pu.plan_carmen_ladder("2026-01-01", "", today, note=_reply("2026-06-01"))
+    assert (plan.action, plan.revived, plan.anchor) == ("schedule", True, today)
 
 
 def test_carmen_ladder_tolerates_a_late_sequencer_run():

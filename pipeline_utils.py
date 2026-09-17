@@ -957,6 +957,30 @@ def resolve_sent_email_backfill(to_header, job_rows):
 
 CARMEN_LADDER_DAYS = (4, 11, 21)
 
+# After the last nudge the ladder writes one more date, anchor + CARMEN_LADDER_DAYS[-1] + this,
+# so a silent contact gets a week to answer before triage. That written date is what makes
+# "exhausted" reachable at all: without it the final rung left the row's gap at exactly the last
+# offset, which reads as the final rung again, and nudge #3 re-fired every morning forever.
+CARMEN_KILL_GRACE_DAYS = 7
+CARMEN_TERMINAL_GAP_DAYS = CARMEN_LADDER_DAYS[-1] + CARMEN_KILL_GRACE_DAYS
+
+# A Carmen Cold row traverses the whole ladder (grace included) in under 30 days, so an anchor
+# older than this cannot be mid-ladder. It is a revived bench contact (Carmen Warm rows carry Last
+# Contact Dates months old) or a stalled row, and today is the correct anchor for both. Without
+# this, a contact dragged in from the bench reads as long past the last rung and is killed on the
+# first pass without a single nudge.
+CARMEN_STALE_ANCHOR_DAYS = 30
+
+# Note text the CRM carries, defined once so the writers in main.py and the parsers below can
+# never drift apart. Both are written as "[YYYY-MM-DD] <marker> ..." by main.py.
+INBOUND_REPLY_NOTE_MARKER = "Inbound reply received"   # route_inbound_reply_to_crm, GENERAL replies
+LADDER_RESTART_NOTE_MARKER = "Ladder restarted"        # the sequencer, when it revives a stale row
+
+# Ceiling on automatic moves to Killed per sequencer pass - same reasoning and the same deferral
+# semantics as MAX_AUTO_BURIES_PER_RUN: overflow is reported, not written, and not logged, so it
+# stays eligible and drains on a later run.
+MAX_AUTO_KILLS_PER_RUN = 10
+
 
 def carmen_ladder_rung(anchor, next_followup):
     """Which rung a Carmen Cold row currently sits on, from the gap between its anchor and
@@ -980,9 +1004,10 @@ def carmen_ladder_action(anchor, next_followup, today):
     """Pure: what a Carmen Cold row needs today. Side-effect free.
 
     Returns (action, next_date):
-      ("schedule", d)  - undated row (incl. one just dragged in by hand): start the ladder at +3
-      ("nudge_N", d)   - rung N is due: alert Kevin, advance to the next rung
-      ("exhausted", None) - all three nudges sent; the row stops asking for attention
+      ("schedule", d)  - undated row (incl. one just dragged in by hand): start the ladder at +4
+      ("nudge_N", d)   - rung N is due: alert Kevin, advance to the next rung. The final rung
+                         advances to anchor + CARMEN_TERMINAL_GAP_DAYS, the triage date.
+      ("exhausted", None) - all three nudges sent and the grace week is up: triage the row
       ("none", None)   - scheduled for a future date, nothing to do
     """
     if anchor is None:
@@ -998,22 +1023,101 @@ def carmen_ladder_action(anchor, next_followup, today):
     if rung > len(CARMEN_LADDER_DAYS):
         return "exhausted", None
     if rung == len(CARMEN_LADDER_DAYS):
-        return f"nudge_{rung}", None
+        return f"nudge_{rung}", anchor + timedelta(days=CARMEN_TERMINAL_GAP_DAYS)
     return f"nudge_{rung}", anchor + timedelta(days=CARMEN_LADDER_DAYS[rung])
 
 
-def plan_carmen_followup(date_added, next_followup, today):
-    """String-in wrapper over carmen_ladder_action() for raw CRM row values.
+def _latest_marker_date(note, marker):
+    """Most recent "[YYYY-MM-DD] <marker>" date in a notes cell, or None. Notes accumulate one
+    entry per line, so the last valid match wins; a malformed date is skipped, never raised."""
+    latest = None
+    pattern = r"\[(\d{4}-\d{2}-\d{2})\]\s*" + re.escape(marker)
+    for match in re.finditer(pattern, str(note or "")):
+        try:
+            parsed = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if latest is None or parsed > latest:
+            latest = parsed
+    return latest
+
+
+def carmen_reply_anchor(note):
+    """The date of the most recent inbound reply recorded in a notes cell, or None."""
+    return _latest_marker_date(note, INBOUND_REPLY_NOTE_MARKER)
+
+
+def carmen_restart_anchor(note):
+    """The date the sequencer last restarted this row's ladder, or None."""
+    return _latest_marker_date(note, LADDER_RESTART_NOTE_MARKER)
+
+
+class CarmenPlan(tuple):
+    """(action, next_date, revived, anchor). Unpacks as a 4-tuple; use .action / .next_date /
+    .revived / .anchor for readability. `revived` means the ladder was restarted from today on
+    this pass, and the caller must record LADDER_RESTART_NOTE_MARKER so it sticks."""
+    __slots__ = ()
+
+    def __new__(cls, action, next_date, revived, anchor):
+        return super().__new__(cls, (action, next_date, revived, anchor))
+
+    action = property(lambda self: self[0])
+    next_date = property(lambda self: self[1])
+    revived = property(lambda self: self[2])
+    anchor = property(lambda self: self[3])
+
+
+def plan_carmen_ladder(date_added, next_followup, today, note=""):
+    """String-in planner for a raw Carmen Cold row. Returns a CarmenPlan.
+
+    Anchor = the latest of Date Added, the last inbound reply and the last ladder restart, all
+    read from the row. A reply therefore restarts 4/11/21 from the day they wrote back.
+
+    Revival: a row with no usable anchor, or whose anchor is over CARMEN_STALE_ANCHOR_DAYS old
+    and whose follow-up date is not one the ladder wrote, restarts from today as unscheduled.
+    Date Added is never rewritten - the caller records the restart as a dated note instead, which
+    is what makes the next pass read a fresh anchor rather than reviving again forever.
+
+    A gap of 1..CARMEN_TERMINAL_GAP_DAYS is always trusted as a ladder position, however old the
+    anchor, so a late run still triages a finished ghost instead of reviving it. A hand-set future
+    date is respected: the row waits for it rather than being restarted early.
+    """
+    candidates = [d for d in (_parse_sequencer_date(date_added), carmen_reply_anchor(note),
+                              carmen_restart_anchor(note)) if d is not None]
+    anchor = max(candidates) if candidates else None
+    scheduled = None if is_followup_unscheduled(next_followup) else _parse_sequencer_date(next_followup)
+
+    revived = False
+    if anchor is None:
+        revived = True
+    else:
+        gap = (scheduled - anchor).days if scheduled is not None else None
+        # A live ladder position needs both: a gap the ladder writes, AND a scheduled date the
+        # ladder wrote recently. Old bench dates that happen to sit a few days apart satisfy the
+        # first alone, and trusting them would walk a revived contact straight to Killed.
+        ladder_shaped = (gap is not None and 0 < gap <= CARMEN_TERMINAL_GAP_DAYS
+                         and (today - scheduled).days <= CARMEN_STALE_ANCHOR_DAYS)
+        if (today - anchor).days > CARMEN_STALE_ANCHOR_DAYS and not ladder_shaped:
+            if scheduled is not None and scheduled > today:
+                return CarmenPlan("none", None, False, anchor)
+            revived = True
+    if revived:
+        anchor, scheduled = today, None
+
+    action, next_date = carmen_ladder_action(anchor, scheduled, today)
+    return CarmenPlan(action, next_date, revived, anchor)
+
+
+def plan_carmen_followup(date_added, next_followup, today, note=""):
+    """Two-value form of plan_carmen_ladder(): (action, next_date). Same anchoring and revival
+    rules; use plan_carmen_ladder() when the caller needs to know a revival happened.
 
     An undated row anchors on `today` rather than being skipped - that is the manual-move case:
     a contact dragged into Carmen Cold carries no useful date, so the ladder starts when the
     sequencer first sees them.
     """
-    anchor = _parse_sequencer_date(date_added)
-    scheduled = None if is_followup_unscheduled(next_followup) else _parse_sequencer_date(next_followup)
-    if anchor is None:
-        anchor = today
-    return carmen_ladder_action(anchor, scheduled, today)
+    plan = plan_carmen_ladder(date_added, next_followup, today, note)
+    return plan.action, plan.next_date
 
 
 # Days an untouched "Matched" pipeline row may sit in Tetiana Cold before the sequencer retires

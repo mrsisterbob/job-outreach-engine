@@ -378,8 +378,10 @@ def test_sequencer_stale_nudge_and_top_matched_do_not_write(monkeypatch):
     assert [r["sheet_uuid"] for r in result["top_matched"]] == ["seq-m1", "seq-m2"]
     assert result["top_matched"][0]["fit_score"] == 88.0
     assert all(p["sheet_uuid"] not in ("seq-m1", "seq-m2") for p in enqueued)
-    assert result["counts"] == {"followups_ready": 0, "applications_quiet": 1, "going_cold": 1, "buried": 1,
-                                "top_matched": 2, "buries_suppressed": 0, "drafts_suppressed": 0}
+    assert result["counts"] == {"followups_ready": 0, "ready_to_promote": 0, "revived": 0,
+                                "applications_quiet": 1, "going_cold": 1, "buried": 1, "killed": 0,
+                                "top_matched": 2, "buries_suppressed": 0, "drafts_suppressed": 0,
+                                "kills_suppressed": 0}
 
 
 def test_sequencer_is_idempotent_across_two_consecutive_runs(monkeypatch):
@@ -400,8 +402,10 @@ def test_sequencer_dry_run_performs_zero_writes(monkeypatch):
     enqueued = _mock_sequencer_crm(monkeypatch)
     result = m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True)
 
-    assert result["counts"] == {"followups_ready": 0, "applications_quiet": 1, "going_cold": 1, "buried": 1,
-                                "top_matched": 2, "buries_suppressed": 0, "drafts_suppressed": 0}
+    assert result["counts"] == {"followups_ready": 0, "ready_to_promote": 0, "revived": 0,
+                                "applications_quiet": 1, "going_cold": 1, "buried": 1, "killed": 0,
+                                "top_matched": 2, "buries_suppressed": 0, "drafts_suppressed": 0,
+                                "kills_suppressed": 0}
     assert enqueued == []
     with m.get_db_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
@@ -509,12 +513,12 @@ def _mock_followup_rows(monkeypatch, cc_rows=(), jobs_rows=(), jobs_code="TW"):
     return enqueued, drafts
 
 
-def _due_person(i, email="pat@acme.com"):
-    """A Carmen Cold contact sitting on its first rung's due date (nudge #1 due today)."""
+def _due_person(i, email="pat@acme.com", today=_SEQ_TODAY):
+    """A Carmen Cold contact sitting on its first rung's due date (nudge #1 due `today`)."""
     return {"sheet_uuid": f"cc-{i}", "company": f"Co{i}", "title": "", "name": f"Pat{i}",
             "email": email, "status": "Cold Lead",
-            "date_added": (_SEQ_TODAY - timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d"),
-            "next_followup": _SEQ_TODAY.strftime("%Y-%m-%d"), "raw_priority": "High"}
+            "date_added": (today - timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d"),
+            "next_followup": today.strftime("%Y-%m-%d"), "raw_priority": "High"}
 
 
 def _due_application(i, email="kjmiller406@gmail.com"):
@@ -669,11 +673,12 @@ def test_followups_page_without_todays_snapshot_says_so_and_never_recomputes(mon
 def test_followups_page_renders_the_saved_run_read_only(monkeypatch):
     """The job saves its result; the page shows the FULL draft, Open Draft only when a draft_id
     exists, and the applications table with /stage links - without running the sequencer."""
-    # The job runs on the real clock, so the application is dated relative to real today.
+    # The job runs on the real clock, so every row is dated relative to real today.
     real_now = m.datetime.now()
     application = {**_due_application(0),
                    "date_added": (real_now.date() - timedelta(days=m.FOLLOWUP_1_DAYS)).strftime("%Y-%m-%d")}
-    _, drafts = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0), _due_person(1, email="")],
+    _, drafts = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0, today=real_now.date()),
+                                             _due_person(1, email="", today=real_now.date())],
                                     jobs_rows=[application])
     long_text = "Hello <b>there</b> " + "y" * 1200
     monkeypatch.setattr(m, "build_followup_bump_draft", lambda rec, attempt: long_text)
@@ -763,8 +768,9 @@ def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeyp
 
 def test_carmen_cold_undated_row_joins_the_ladder_instead_of_drafting(monkeypatch):
     """A contact dragged into Carmen Cold by hand has no follow-up date. The sequencer starts the
-    ladder at +3 rather than firing a nudge immediately - that is the manual-move path working
-    with no Apps Script trigger involved."""
+    ladder at +4 rather than firing a nudge immediately - that is the manual-move path working
+    with no Apps Script trigger involved. Its Date Added is months old, so the start is a revival:
+    a dated restart note is written first so the next pass anchors on today, not on January."""
     cc_row = {"sheet_uuid": "cc-manual", "company": "Affirm", "title": "", "name": "Sahjar",
               "status": "Cold Lead", "date_added": "2026-01-04", "next_followup": "1970-01-01",
               "raw_priority": "Medium"}
@@ -777,13 +783,16 @@ def test_carmen_cold_undated_row_joins_the_ladder_instead_of_drafting(monkeypatc
 
     assert result["followups_ready"] == []
     expected = (_SEQ_TODAY + timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d")
-    assert [(p["action"], p["next_followup"]) for p in enqueued] == [("update_snooze", expected)]
+    assert [p["action"] for p in enqueued] == ["append_note", "update_snooze"]
+    assert enqueued[0]["note"].startswith(f"[{_SEQ_TODAY.isoformat()}] {m.LADDER_RESTART_NOTE_MARKER}")
+    assert enqueued[1]["next_followup"] == expected
+    assert [(r["sheet_uuid"], r["first_nudge"]) for r in result["revived"]] == [("cc-manual", expected)]
 
 
 def test_carmen_cold_row_is_never_auto_buried_to_died(monkeypatch):
-    """A networking contact is not a job application. A CC row that has exhausted the
-    ladder is surfaced as 'going cold' for a human call - never an append_note/update_status->Died
-    write, and no further nudges."""
+    """A networking contact is not a job application: a CC row is never moved to Died. This row's
+    follow-up date is a 60-day gap the ladder never writes, on a 61-day-old anchor, so it is read
+    as a stalled row and revived - it used to be surfaced as 'going cold' instead."""
     exhausted_nf = (_SEQ_TODAY - timedelta(days=1)).strftime("%Y-%m-%d")
     cc_row = {"sheet_uuid": "cc-old", "company": "Nliven", "title": "", "name": "Sam",
               "status": "Applied", "date_added": "2026-04-01", "next_followup": exhausted_nf,
@@ -796,8 +805,10 @@ def test_carmen_cold_row_is_never_auto_buried_to_died(monkeypatch):
     result = m.run_followup_sequencer(today=_SEQ_TODAY)
 
     assert [r["sheet_uuid"] for r in result["buried"]] == []
-    assert [r["sheet_uuid"] for r in result["going_cold"]] == ["cc-old"]
-    assert enqueued == []  # zero writes for a would-be bury on a PEOPLE row
+    assert [r["sheet_uuid"] for r in result["killed"]] == []
+    assert [r["sheet_uuid"] for r in result["revived"]] == ["cc-old"]
+    assert not any(p.get("new_tab") for p in enqueued)  # no tab move of any kind
+    assert [p["action"] for p in enqueued] == ["append_note", "update_snooze"]
 
 
 def test_overdue_scan_includes_carmen_cold(monkeypatch):
@@ -833,6 +844,226 @@ def test_generate_bump_email_routes_to_roleless_copy_when_title_is_blank():
     assert "this role" not in blank and "{" not in blank
     titled = m.generate_bump_email(contact_name="Dana", job_title="Ops Analyst", company_name="Nliven")
     assert "Ops Analyst role at Nliven" in titled
+
+
+# ---- Carmen contact lifecycle: revival, reply re-anchoring, promote, auto-kill ----
+
+class _FakeCarmenSheet:
+    """In-memory Carmen Cold/Hot tabs that apply the sequencer's queued writes the way Code.gs
+    would, so a row can be walked through the ladder across real day-by-day runs."""
+
+    def __init__(self, monkeypatch, rows, hot_rows=()):
+        self.tabs = {"CC": [dict(r) for r in rows], "CH": [dict(r) for r in hot_rows]}
+        self.moves, self.payloads = [], []
+        monkeypatch.setattr(m, "fetch_networking_cards",
+                            lambda code, qty=None: [dict(r) for r in self.tabs.get(code, [])])
+        monkeypatch.setattr(m, "enqueue_crm_payload", self.apply)
+        monkeypatch.setattr(m, "create_gmail_draft", lambda **kw: (True, "Success", "d"))
+
+    def row(self, sheet_uuid):
+        return next((r for rows in self.tabs.values() for r in rows if r["sheet_uuid"] == sheet_uuid), None)
+
+    def apply(self, payload):
+        self.payloads.append(payload)
+        row = self.row(payload["sheet_uuid"])
+        if payload["action"] == "update_snooze":
+            row["next_followup"] = payload["next_followup"]
+        elif payload["action"] == "append_note":
+            row["note"] = f"{row.get('note') or ''}\n{payload['note']}".strip()
+        elif payload["action"] == "update_status":
+            for rows in self.tabs.values():
+                if row in rows:
+                    rows.remove(row)
+            self.moves.append((payload["sheet_uuid"], payload["new_tab"]))
+        return True
+
+
+def _person(uuid, date_added, next_followup="1970-01-01", note="", email="p@x.com"):
+    return {"sheet_uuid": uuid, "company": f"Co-{uuid}", "title": "", "name": f"Name-{uuid}",
+            "email": email, "status": "Cold Lead", "date_added": date_added,
+            "next_followup": next_followup, "raw_priority": "Medium", "note": note}
+
+
+def _run_days(sheet, start, days):
+    """Run the sequencer once per day and return {day_offset: result}."""
+    return {n: m.run_followup_sequencer(today=start + timedelta(days=n)) for n in range(days)}
+
+
+def test_ghost_walks_the_whole_ladder_and_is_killed(monkeypatch):
+    """Regression for the unreachable path: nudge #3 used to write no date, so the row re-read as
+    rung 3 and nudged forever. It must now get exactly three nudges, a grace week, then Killed."""
+    start = _SEQ_TODAY
+    sheet = _FakeCarmenSheet(monkeypatch, [_person("ghost", start.isoformat())])
+    results = _run_days(sheet, start, 40)
+
+    nudge_days = {n: e["attempt"] for n, r in results.items() for e in r["followups_ready"]}
+    assert nudge_days == {d: i + 1 for i, d in enumerate(m.CARMEN_LADDER_DAYS)}
+    kill_days = [n for n, r in results.items() if r["killed"]]
+    assert kill_days == [m.CARMEN_LADDER_DAYS[-1] + 7]
+    assert sheet.moves == [("ghost", "Killed")]
+    assert sheet.row("ghost") is None
+    kill_note = [p for p in sheet.payloads if p["action"] == "append_note" and "reason" in p["note"]]
+    assert [p["note"] for p in kill_note] == ["[reason: no reply after 3 nudges]"]
+    # The final nudge's card line says when the kill check happens.
+    card = m.render_followup_needs_card(results[m.CARMEN_LADDER_DAYS[-1]])
+    terminal = (start + timedelta(days=m.CARMEN_LADDER_DAYS[-1] + 7)).isoformat()
+    assert f"→ killed {terminal} if silent" in card
+
+
+def test_promoted_bench_contact_with_ancient_dates_is_nudged_not_killed(monkeypatch):
+    """The bug CHANGE 1 prevents: a Carmen Warm contact dragged into Carmen Cold with a 210-day-old
+    Last Contact Date and an old follow-up date must be restarted, not killed on the first pass."""
+    start = _SEQ_TODAY
+    old = (start - timedelta(days=210)).isoformat()
+    sheet = _FakeCarmenSheet(monkeypatch, [_person("bench", old, next_followup=(start - timedelta(days=200)).isoformat())])
+    results = _run_days(sheet, start, 5)
+
+    assert results[0]["killed"] == [] and sheet.moves == []
+    assert [r["sheet_uuid"] for r in results[0]["revived"]] == ["bench"]
+    restart_notes = [p for p in sheet.payloads if m.LADDER_RESTART_NOTE_MARKER in p.get("note", "")]
+    assert len(restart_notes) == 1  # recorded once, then the ladder climbs normally
+    assert [e["attempt"] for e in results[4]["followups_ready"]] == [1]
+    assert sheet.row("bench")["date_added"] == old  # real history is never rewritten
+    card = m.render_followup_needs_card(results[0])
+    assert "Back on the ladder (1)" in card and "revived — ladder restarted today" in card
+
+
+def test_same_day_rerun_does_not_record_a_second_restart(monkeypatch):
+    old = (_SEQ_TODAY - timedelta(days=90)).isoformat()
+    sheet = _FakeCarmenSheet(monkeypatch, [_person("bench", old)])
+    # Notes are async in production: simulate the outbox not having flushed yet.
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: sheet.payloads.append(p) or True)
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert len([p for p in sheet.payloads if p["action"] == "append_note"]) == 1
+
+
+def test_responder_reaches_ready_to_promote_and_is_never_moved(monkeypatch):
+    start = _SEQ_TODAY
+    reply = f"[{start.isoformat()}] {m.INBOUND_REPLY_NOTE_MARKER} (they wrote to Kevin, not a send)."
+    sheet = _FakeCarmenSheet(monkeypatch, [_person("talker", (start - timedelta(days=20)).isoformat(),
+                                                   next_followup=(start + timedelta(days=4)).isoformat(),
+                                                   note=reply)])
+    results = _run_days(sheet, start, 45)
+
+    # The reply restarted the ladder from its own date: nudges at 4/11/21 after the reply.
+    nudge_days = sorted(n for n, r in results.items() if r["followups_ready"])
+    assert nudge_days == list(m.CARMEN_LADDER_DAYS)
+    promote_days = [n for n, r in results.items() if r["ready_to_promote"]]
+    assert promote_days == list(range(m.CARMEN_LADDER_DAYS[-1] + 7, 45))  # every morning until acted on
+    assert sheet.moves == []
+    entry = results[44]["ready_to_promote"][0]
+    assert entry["replied_on"] == start.isoformat()
+    card = m.render_followup_needs_card(results[44])
+    assert "Ready to promote (1)" in card
+    assert "<code>/promote talker</code>" in card
+
+
+def test_exhausted_triage_writes_nothing_under_dry_run(monkeypatch):
+    anchor = _SEQ_TODAY - timedelta(days=28)
+    terminal = anchor + timedelta(days=28)
+    ghost = _person("g", anchor.isoformat(), next_followup=terminal.isoformat())
+    bench = _person("b", "2025-01-01")
+    sheet = _FakeCarmenSheet(monkeypatch, [ghost, bench])
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True)
+
+    assert [r["sheet_uuid"] for r in result["killed"]] == ["g"]
+    assert [r["sheet_uuid"] for r in result["revived"]] == ["b"]
+    assert sheet.payloads == []
+    assert _logged_uuids() == set()
+
+
+def test_kill_cap_withholds_the_overflow_and_drains_on_rerun(monkeypatch):
+    over = m.MAX_AUTO_KILLS_PER_RUN + 3
+    anchor = _SEQ_TODAY - timedelta(days=28)
+    rows = [_person(f"g{i}", anchor.isoformat(), next_followup=_SEQ_TODAY.isoformat()) for i in range(over)]
+    sheet = _FakeCarmenSheet(monkeypatch, rows)
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert len(result["killed"]) == over
+    assert result["counts"]["kills_suppressed"] == 3
+    assert len(sheet.moves) == m.MAX_AUTO_KILLS_PER_RUN
+    assert len(_logged_uuids()) == m.MAX_AUTO_KILLS_PER_RUN
+    card = m.render_followup_needs_card(result)
+    assert f"Killed overnight ({over})" in card
+    assert "3 of these were withheld by the safety cap" in card and "3 kills capped" in card
+
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert len(sheet.moves) == over
+
+
+def test_reply_router_note_is_what_the_ladder_parses(reply_routing):
+    """Writer and parser share INBOUND_REPLY_NOTE_MARKER; this pins them together."""
+    m.route_inbound_reply_to_crm(_match("Carmen Cold"), "GENERAL", "Re: hi", "Sure, let's talk")
+    note = [p for p in reply_routing() if p["action"] == "append_note"][0]["note"]
+    assert m.carmen_reply_anchor(note) == date.today()
+
+
+# ---- /promote and /demote ----
+
+_PROMOTE_UUID = "abcdef12-3456-7890-abcd-ef1234567890"
+
+
+def _promote_env(monkeypatch, cold=(), hot=(), short_ids=None):
+    sent, enqueued = [], []
+    tabs = {"CC": list(cold), "CH": list(hot)}
+    monkeypatch.setattr(m, "fetch_networking_cards", lambda code, qty=None: [dict(r) for r in tabs.get(code, [])])
+    monkeypatch.setattr(m, "get_sheet_uuid_by_short_id", lambda sid: (short_ids or {}).get(sid))
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    return sent, enqueued
+
+
+def test_promote_by_the_cards_uuid_stub_moves_to_carmen_hot_with_a_note(monkeypatch):
+    sent, enqueued = _promote_env(monkeypatch, cold=[_person(_PROMOTE_UUID, "2026-05-01")])
+    _dispatch(f"/promote {_PROMOTE_UUID[:8]}")
+
+    assert [p["action"] for p in enqueued] == ["update_status", "append_note"]
+    assert enqueued[0] == {**enqueued[0], "sheet_uuid": _PROMOTE_UUID, "new_tab": "Carmen Hot"}
+    assert re.match(r"^\[\d{4}-\d{2}-\d{2}\] Promoted from Carmen Cold to Carmen Hot", enqueued[1]["note"])
+    assert "Promoted" in sent[0]
+
+
+def test_promote_by_short_id(monkeypatch):
+    _, enqueued = _promote_env(monkeypatch, cold=[_person(_PROMOTE_UUID, "2026-05-01")],
+                               short_ids={"sid1": _PROMOTE_UUID})
+    _dispatch("/promote sid1")
+    assert enqueued[0]["new_tab"] == "Carmen Hot"
+
+
+def test_demote_moves_a_hot_contact_back_to_the_bench(monkeypatch):
+    _, enqueued = _promote_env(monkeypatch, hot=[_person(_PROMOTE_UUID, "2026-05-01")])
+    _dispatch(f"/demote {_PROMOTE_UUID}")
+    assert enqueued[0]["new_tab"] == "Carmen Warm"
+    assert "Demoted from Carmen Hot to Carmen Warm" in enqueued[1]["note"]
+
+
+def test_promote_refuses_unknown_ambiguous_and_already_hot(monkeypatch):
+    twin = "abcdef12-0000-0000-0000-000000000000"
+    sent, enqueued = _promote_env(monkeypatch, cold=[_person(_PROMOTE_UUID, "2026-05-01"), _person(twin, "2026-05-01")],
+                                  short_ids={"jobsid": "job-row-uuid"})
+    _dispatch("/promote")
+    _dispatch("/promote jobsid")           # a JOBS row's short_id never moves into a PEOPLE tab
+    _dispatch("/promote abcdef12")         # prefix matches two contacts
+    _dispatch("/promote abc")              # too short to be a uuid prefix
+    assert enqueued == []
+    assert "Usage" in sent[0]
+    assert "not a Carmen Cold or Carmen Hot contact" in sent[1]
+    assert "matches more than one contact" in sent[2]
+    assert "not a Carmen Cold or Carmen Hot contact" in sent[3]
+
+    sent2, enqueued2 = _promote_env(monkeypatch, hot=[_person(_PROMOTE_UUID, "2026-05-01")])
+    _dispatch(f"/promote {_PROMOTE_UUID}")
+    assert enqueued2 == [] and "already in Carmen Hot" in sent2[0]
+
+
+def test_help_lists_promote_and_demote(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    _dispatch("/help")
+    assert "/promote &lt;id&gt;" in "".join(sent) and "/demote &lt;id&gt;" in "".join(sent)
 
 
 # ---- Daily "needs you today" card (render_followup_needs_card) ----

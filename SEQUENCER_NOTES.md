@@ -78,6 +78,9 @@ ahead of the 08:30 standup digest):
 | `bury_ghosted` | `append_note` `[reason: ghosted]` **then** `update_status` → `Died` (via the durable CRM outbox) | **YES — the only automatic Sheet write.** Surfaced in the card's "Buried overnight" section so it is never silent. |
 | due follow-up — **PEOPLE row** (Carmen Cold, 4/11/21 ladder) | Bump text is built from the template bank and listed under the card's "Nudge these people". When the row has a real email, the same text is staged as a **Gmail draft** (max `MAX_AUTO_DRAFTS_PER_RUN` per run, overflow left unsnoozed so it drafts on a later pass). Next Followup Date advances via `update_snooze`. **No email is ever sent.** | Draft + snooze are automatic (never under `/queue`); **the send itself is approval-gated** — open the draft from `/followups` and send it. |
 | `send_followup_1` / `send_followup_2` — **JOBS row** (Tetiana Cold/Warm, Clavicular) | Listed under the card's "Applications going quiet" as status only: applied date, days silent, severity dot, buries-on date, 📋 link to `/stage`. **No bump text, no Gmail draft.** Next Followup Date still advances via `update_snooze`. | Snooze is automatic — it must be, or the +16 bury is never reached. |
+| Carmen ladder **revival** (stale or blank anchor, see §3a) | `append_note` `[date] Ladder restarted …` **then** `update_snooze` → today + 4. Listed under "Back on the ladder", labelled "revived — ladder restarted today". | Automatic. Date Added is never rewritten. |
+| Carmen ladder **exhausted**, notes carry a reply | Listed under "Ready to promote" with a `/promote <id>` hint. | **No write** — reappears every morning until Kevin runs `/promote` or `/demote`. |
+| Carmen ladder **exhausted**, no reply | `append_note` `[reason: no reply after 3 nudges]` **then** `update_status` → `Killed` (`CARMEN_GHOST_TAB`). Listed under "Killed overnight". | **YES**, capped at `MAX_AUTO_KILLS_PER_RUN` (10); overflow is reported, not written, not logged, and drains on a later run. |
 | `stale_nudge` | Listed in the card's "Going cold" section. | No write at all. |
 | top-3 `Matched` by Fit Score | Listed in the card's "Top 3 untouched matches" section. | No write at all. |
 
@@ -100,8 +103,49 @@ listed row's Next Followup Date into the future, so a later scan finds nothing d
 queue for today yet" rather than showing a misleading recompute.
 
 `/queue` runs the identical scan with `dry_run=True`: **zero** enqueues, **zero** bury,
-**zero** snooze advancement, **zero** `followup_sequencer_log` writes — it only renders the
-"what would happen" card.
+**zero** kill, **zero** revival note, **zero** snooze advancement, **zero**
+`followup_sequencer_log` writes — it only renders the "what would happen" card.
+
+### 3a. Carmen contact lifecycle
+
+```
+Carmen Warm  --(Kevin drags a row when ready)-->  Carmen Cold
+Carmen Cold  --(4/11/21 ladder + 7-day grace)-->  replied?  --> Carmen Hot   (/promote, by hand)
+                                                  silent?   --> Killed       (automatic, capped)
+Carmen Cold / Carmen Hot  --(/demote)-->  Carmen Warm   (the only route back to the bench)
+```
+
+Carmen Warm is the reserve bench (~291 older contacts), not an archive: nothing is cleaned or
+migrated there, and only `/demote` routes into it. It stays in `get_overdue_followups()`'s scan
+for its own reasons (see that docstring).
+
+**Ladder.** Nudges at anchor + 4 / 11 / 21 days (`CARMEN_LADDER_DAYS`). The third nudge writes
+one more date, anchor + 28 (`CARMEN_TERMINAL_GAP_DAYS` = 21 + `CARMEN_KILL_GRACE_DAYS`); when it
+arrives the row is **exhausted** and triaged. Before this, nudge #3 wrote no date, the row
+re-read as rung 3, and it nudged every morning forever — "exhausted" was unreachable.
+
+**Anchor** (`plan_carmen_ladder`) = the latest of Date Added (Col A), the last
+`[date] Inbound reply received` note (`INBOUND_REPLY_NOTE_MARKER`, written by
+`route_inbound_reply_to_crm`) and the last `[date] Ladder restarted` note
+(`LADDER_RESTART_NOTE_MARKER`, written by the sequencer). Both markers are module constants in
+`pipeline_utils.py`, shared by writer and parser. A reply therefore restarts 4/11/21 from the day
+they wrote back, so a live conversation does not die on a ghost's clock.
+
+**Revival** (`CARMEN_STALE_ANCHOR_DAYS` = 30). A whole ladder takes 28 days, so an anchor older
+than 30 cannot be mid-ladder: it is a promoted bench contact (Last Contact Dates months old) or a
+stalled row. Such a row restarts from today as unscheduled — unless its follow-up date is one the
+ladder plausibly wrote (gap 1–28 **and** that date is itself within 30 days, so a late run still
+kills a finished ghost), or is a hand-set future date (respected; the row waits for it). A blank
+Date Added revives too. The restart is persisted as a dated note, never by rewriting Date Added —
+without a persisted anchor the next pass would revive again and the row would never reach rung 1.
+Revival is guarded by `followup_sequencer_log`, so a same-day re-run writes one note, not two.
+
+**Ghost destination** is `CARMEN_GHOST_TAB = "Killed"` in `main.py`: the existing PEOPLE archive,
+reversible (the row still exists) and skipped by `quick_add`'s duplicate check so the person can
+be re-added. Change it to `"Carmen Warm"` to return ghosts to the bench instead.
+
+**Triage is by note, not by `application_outcomes`.** That table records interview / rejection /
+offer only, so it misses plain replies — the reply note is the only complete responder signal.
 
 Follow-up drafts: `build_followup_bump_draft()` → `load_outreach_templates()["followup_bumps"]`
 → `resolve_template_text(pool, idx)` → `interpolate_template(...)`. `idx = 0` for attempt #1,
@@ -185,6 +229,13 @@ list (one-line change, called out here).
    the new `Code.gs`, **Deploy → Manage deployments → Edit → New version → Deploy**. The Web
    App URL is unchanged. Until this is live the sequencer sees blank Status/Date Added on
    every row and takes no action (fails safe).
+   **Carmen Hot (lifecycle change): deploy the Apps Script FIRST, Render second.** The
+   `Code.gs` commit adds `"Carmen Hot": "PEOPLE"` to `TAB_MAP` and a `CH` code to every
+   resolver. With it live, the first `/promote` creates the tab via `getOrCreateSheet` with the
+   PEOPLE header row — no hand-made tab needed. Against the OLD script, the same move creates
+   the tab with JOBS headers (`TAB_MAP[name] || "JOBS"`), transposes the contact into JOBS
+   columns, and leaves the row invisible to every `ALL_TABS` lookup — silent corruption, not a
+   rejected write.
 2. **Python app** — deploy `main.py` / `pipeline_utils.py` as usual. `init_db()` creates
    `followup_sequencer_log` on boot (`CREATE TABLE IF NOT EXISTS`). The 07:30 job registers
    on the existing `EMAIL_POLL_SCHEDULER` via `start_followup_sequencer()`.
@@ -194,6 +245,8 @@ list (one-line change, called out here).
 
 | Command | What |
 |---------|------|
+| `/promote <id>` | Moves a Carmen Cold contact to Carmen Hot and appends a dated note. `<id>` is the card's 🆔: a short_id, or the 8+ character sheet_uuid prefix most contacts show. Only Carmen Cold/Hot rows match, so a JOBS short_id can never be moved into a PEOPLE tab. |
+| `/demote <id>` | Parks a Carmen Cold or Carmen Hot contact on the Carmen Warm bench, with a dated note. |
 | `/queue` | **New.** Read-only preview of what the nightly sequencer would do — no writes, no bury, no snooze advancement. Same card as the 07:30 message, labelled "Queue Preview · read-only". Added to the `/`-help TELEMETRY list. |
 
 ## 8. Tests

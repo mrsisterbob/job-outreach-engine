@@ -36,7 +36,8 @@ from pipeline_utils import (
     is_guessed_contact_email, resolve_sent_email_backfill,
     is_role_mailbox, company_domain_of, name_from_email_local_part,
     match_email_to_crm_company,
-    plan_carmen_followup, CARMEN_LADDER_DAYS,
+    plan_carmen_ladder, carmen_reply_anchor, CARMEN_LADDER_DAYS,
+    INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
     parse_job_command, parse_job_page_html, build_ingest_job_dict,
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
@@ -4122,7 +4123,9 @@ def route_inbound_reply_to_crm(crm_match, status_label, subject, snippet):
         clean_snippet = " ".join(str(snippet or "").split())[:200]
         move_clause = "" if is_carmen else f" Auto-moved to Carmen Cold from {source_tab or 'Unknown'}."
         note = (
-            f"[{today_str}] Inbound reply received (they wrote to Kevin, not a send). "
+            # The marker is parsed back by pipeline_utils.carmen_reply_anchor() to restart the
+            # Carmen ladder and to tell a responder from a ghost - keep it in the shared constant.
+            f"[{today_str}] {INBOUND_REPLY_NOTE_MARKER} (they wrote to Kevin, not a send). "
             f"Subject: {clean_subject}. Preview: {clean_snippet}"
             f"{move_clause} Next follow-up {next_followup}."
         )
@@ -5308,6 +5311,12 @@ SEQUENCER_SCAN_TABS = (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "C
 # a PEOPLE row is surfaced on the card as "going cold" for a human call, never written.
 SEQUENCER_PEOPLE_SCHEMA_TABS = frozenset({"Carmen Cold"})
 
+# Where a Carmen Cold contact goes after three nudges and a grace week with no reply. Kevin's call:
+# Killed, the existing PEOPLE archive - it is reversible (the row still exists) and skipped by
+# quick_add's duplicate check, so the person can be re-added later. Set to "Carmen Warm" to return
+# ghosts to the bench instead. A contact who DID reply is never moved automatically.
+CARMEN_GHOST_TAB = "Killed"
+
 def _sequencer_already_actioned(sheet_uuid, run_date):
     """True if this row was already actioned by the sequencer earlier today (same-day idempotency
     guard - a re-run, or /queue's sibling, must not double-queue or double-bury)."""
@@ -5346,6 +5355,27 @@ def _parse_fit_score(value):
         return float(re.sub(r"[^0-9.\-]", "", str(value or "")) or 0)
     except (ValueError, TypeError):
         return 0.0
+
+def find_carmen_contacts(token):
+    """Resolve a /promote or /demote id to [(sheet_uuid, tab, record)] among Carmen Cold and
+    Carmen Hot rows. Accepts what the morning card prints as 🆔: a jobs-cache short_id, or - for
+    the many contacts with no cached job - the first 8+ characters of the sheet_uuid, which
+    get_sheet_uuid_by_short_id() alone cannot resolve. Matching only these two tabs also keeps a
+    short_id that belongs to a JOBS row from being moved into a PEOPLE tab.
+    """
+    token = str(token or "").strip()
+    if not token:
+        return []
+    exact = str(get_sheet_uuid_by_short_id(token) or "").lower()
+    prefix = token.lower() if len(token) >= 8 else ""
+    hits = {}
+    for code, tab_name in (("CC", "Carmen Cold"), ("CH", "Carmen Hot")):
+        for rec in fetch_networking_cards(code, qty=None) or []:
+            uuid_val = str(rec.get("sheet_uuid") or "")
+            low = uuid_val.lower()
+            if uuid_val and ((exact and low == exact) or (prefix and low.startswith(prefix))):
+                hits[uuid_val] = (uuid_val, tab_name, rec)
+    return list(hits.values())
 
 def build_followup_bump_draft(record, attempt):
     """Draft the follow-up text from the followup_bumps template bank via the existing
@@ -5428,6 +5458,12 @@ def run_followup_sequencer(today=None, dry_run=False):
 
     Buries are capped at MAX_AUTO_BURIES_PER_RUN per pass (see counts["buries_suppressed"]).
 
+    Carmen Cold runs its own 4/11/21 ladder (plan_carmen_ladder). A stale row is revived - a dated
+    restart note plus a fresh first nudge, listed in `revived`. When the ladder is exhausted, a
+    contact whose notes carry a reply goes to `ready_to_promote` (nothing written); a silent one
+    is moved to CARMEN_GHOST_TAB and listed in `killed`, capped at MAX_AUTO_KILLS_PER_RUN
+    (see counts["kills_suppressed"]).
+
     Unless dry_run, each PEOPLE follow-up with a real email is also staged as a Gmail draft (never sent)
     and its id stored as entry["draft_id"] (None otherwise). Drafts are capped at
     MAX_AUTO_DRAFTS_PER_RUN; a row over the cap is neither snoozed nor logged, so it stays due and
@@ -5449,12 +5485,15 @@ def run_followup_sequencer(today=None, dry_run=False):
                 seen_uuids.add(uuid_val)
             records.append({**rec, "sheet_tab": tab_name})
 
-    result = {"run_date": run_date, "followups_ready": [], "applications_quiet": [], "going_cold": [],
-              "buried": [], "top_matched": [], "counts": {}}
+    result = {"run_date": run_date, "followups_ready": [], "ready_to_promote": [], "revived": [],
+              "applications_quiet": [], "going_cold": [], "buried": [], "killed": [],
+              "top_matched": [], "counts": {}}
     buries_written = 0
     buries_suppressed = 0
     drafts_created = 0
     drafts_suppressed = 0
+    kills_written = 0
+    kills_suppressed = 0
 
     for rec in records:
         # Carmen Cold runs the 4/11/21 people ladder instead of the JOBS +4/+9/+16 windows: these
@@ -5462,32 +5501,66 @@ def run_followup_sequencer(today=None, dry_run=False):
         # than burying. Rung is read from the row's own dates, so a contact dragged in by hand
         # joins the ladder on this pass with nothing to configure.
         if rec.get("sheet_tab") in SEQUENCER_PEOPLE_SCHEMA_TABS:
-            ladder_action, ladder_next = plan_carmen_followup(
-                rec.get("date_added"), rec.get("next_followup"), today
-            )
+            note_text = rec.get("note") or ""
+            plan = plan_carmen_ladder(rec.get("date_added"), rec.get("next_followup"), today, note=note_text)
+            ladder_action, ladder_next = plan.action, plan.next_date
             if ladder_action == "none":
                 continue
             sheet_uuid = rec.get("sheet_uuid")
+            person = {
+                "company": rec.get("company") or "N/A",
+                "role": rec.get("title") or "",
+                "name": rec.get("name") or "",
+                "short_id": get_short_id_by_sheet_uuid(sheet_uuid) if sheet_uuid else None,
+                "sheet_uuid": sheet_uuid,
+                "sheet_tab": rec.get("sheet_tab"),
+            }
             if ladder_action == "exhausted":
-                # All three nudges sent and still nothing back. Surface it once for a human call
-                # rather than burying - a networking contact is not a job application - and write
-                # nothing, so the row stops appearing after Kevin acts on it.
-                ladder_anchor = followup_anchor(rec.get("date_added"), rec.get("next_followup"))
-                result["going_cold"].append({
-                    "company": rec.get("company") or "N/A",
-                    "role": rec.get("title") or "",
-                    "short_id": get_short_id_by_sheet_uuid(sheet_uuid) if sheet_uuid else None,
-                    "sheet_uuid": sheet_uuid,
-                    "status": rec.get("status") or "",
-                    "days": (today - ladder_anchor).days if ladder_anchor else None,
-                })
+                # Three nudges and a grace week are done. Triage on the reply marker the inbound
+                # router writes: a person who talked to Kevin is never moved automatically.
+                replied_on = carmen_reply_anchor(note_text)
+                if replied_on is not None:
+                    # Nothing written, so the row reappears every morning until Kevin runs
+                    # /promote or /demote - that daily reminder is intended.
+                    result["ready_to_promote"].append({**person, "replied_on": replied_on.strftime("%Y-%m-%d")})
+                    continue
+                result["killed"].append(person)
+                if dry_run or not sheet_uuid or _sequencer_already_actioned(sheet_uuid, run_date):
+                    continue
+                if kills_written >= MAX_AUTO_KILLS_PER_RUN:
+                    # Same deferral as a capped bury: reported, not written, not logged, so the
+                    # row stays eligible and drains on a later run.
+                    kills_suppressed += 1
+                    continue
+                enqueue_crm_payload(build_crm_payload(
+                    "append_note", sheet_uuid=sheet_uuid, note="[reason: no reply after 3 nudges]",
+                ))
+                enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=CARMEN_GHOST_TAB))
+                _record_sequencer_action(sheet_uuid, run_date, "kill_ghosted")
+                kills_written += 1
                 continue
             if ladder_action == "schedule":
-                if not (dry_run or not sheet_uuid):
+                first_nudge = ladder_next.strftime("%Y-%m-%d")
+                if plan.revived:
+                    result["revived"].append({**person, "first_nudge": first_nudge})
+                if dry_run or not sheet_uuid:
+                    continue
+                if plan.revived:
+                    if _sequencer_already_actioned(sheet_uuid, run_date):
+                        continue
+                    # Date Added is real history and is never rewritten, so the restart is recorded
+                    # as a dated note - plan_carmen_ladder() reads it back as the new anchor.
+                    # Without it the next pass would revive again and the row would never climb.
                     enqueue_crm_payload(build_crm_payload(
-                        "update_snooze", sheet_uuid=sheet_uuid,
-                        next_followup=ladder_next.strftime("%Y-%m-%d"),
+                        "append_note", sheet_uuid=sheet_uuid,
+                        note=f"[{run_date}] {LADDER_RESTART_NOTE_MARKER} - stale anchor, 4/11/21 restarted "
+                             f"from today. First nudge {first_nudge}.",
                     ))
+                enqueue_crm_payload(build_crm_payload(
+                    "update_snooze", sheet_uuid=sheet_uuid, next_followup=first_nudge,
+                ))
+                if plan.revived:
+                    _record_sequencer_action(sheet_uuid, run_date, "revive")
                 continue
 
             attempt = int(ladder_action.rsplit("_", 1)[1])
@@ -5500,6 +5573,7 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "draft_text": build_followup_bump_draft(rec, attempt),
                 "sheet_tab": rec.get("sheet_tab"),
                 "ladder_day": CARMEN_LADDER_DAYS[attempt - 1],
+                "final_rung": attempt == len(CARMEN_LADDER_DAYS),
                 "draft_id": None,
                 "name": rec.get("name") or "",
                 "next_followup": rec.get("next_followup") or "",
@@ -5646,14 +5720,17 @@ def run_followup_sequencer(today=None, dry_run=False):
             "sheet_uuid": su, "fit_score": _parse_fit_score(r.get("raw_priority")),
         })
 
-    result["counts"] = {k: len(result[k]) for k in ("followups_ready", "applications_quiet", "going_cold",
-                                                     "buried", "top_matched")}
+    result["counts"] = {k: len(result[k]) for k in ("followups_ready", "ready_to_promote", "revived",
+                                                     "applications_quiet", "going_cold", "buried",
+                                                     "killed", "top_matched")}
     # Not a section length like the four above: how many of result["buried"] were reported but
     # left unwritten by the cap. Never nonzero on its own (it implies buried > 0), so the card's
     # all-empty early return stays correct.
     result["counts"]["buries_suppressed"] = buries_suppressed
     # Likewise a subset of followups_ready: rows listed but not drafted (or snoozed) by the cap.
     result["counts"]["drafts_suppressed"] = drafts_suppressed
+    # And a subset of killed: ghosts listed but left in Carmen Cold by MAX_AUTO_KILLS_PER_RUN.
+    result["counts"]["kills_suppressed"] = kills_suppressed
     return result
 
 def _seq_id_tag(entry):
@@ -5664,6 +5741,14 @@ def _followup_date_label(value, blank="—"):
     """A CRM date for display: the 1970-01-01 "unscheduled" sentinel and blanks read as `blank`."""
     text = str(value or "").strip()
     return blank if (not text or is_followup_unscheduled(text)) else text
+
+def _next_step_label(entry):
+    """What follows this nudge: the next rung's date, or - after the last rung - the triage date
+    on which a still-silent contact is moved to CARMEN_GHOST_TAB."""
+    nxt = _followup_date_label(entry.get("new_next_followup"), blank="last nudge")
+    if entry.get("final_rung") and entry.get("new_next_followup"):
+        return f"{CARMEN_GHOST_TAB.lower()} {nxt} if silent"
+    return f"next {nxt}"
 
 def _silence_dot(days):
     """Severity dot for an application's silence, on the job card's fit-dot idiom. The bands
@@ -5700,9 +5785,9 @@ def render_followup_needs_card(result, on_demand=False):
             who = html.escape(str(e.get("role") or e.get("name") or "—"))
             company = html.escape(str(e.get("company") or "—"))
             due = html.escape(_followup_date_label(e.get("next_followup")))
-            nxt = html.escape(_followup_date_label(e.get("new_next_followup"), blank="last nudge"))
+            step = html.escape(_next_step_label(e))
             lines.append(
-                f"💼 <b>{who}</b> — {company} · #{html.escape(str(e.get('attempt', 1)))} · due {due} → next {nxt}"
+                f"💼 <b>{who}</b> — {company} · #{html.escape(str(e.get('attempt', 1)))} · due {due} → {step}"
                 f" · 🆔 <code>{html.escape(_seq_id_tag(e))}</code>"
             )
         # Draft text and Gmail links live on /followups, not here - this card stays a scannable list.
@@ -5719,6 +5804,30 @@ def render_followup_needs_card(result, on_demand=False):
             lines.append(
                 f"🛑 <i>{drafts_suppressed} of these were withheld by the draft cap "
                 f"(max {MAX_AUTO_DRAFTS_PER_RUN}/run): no Gmail draft and not snoozed — re-run to process the rest.</i>"
+            )
+
+    promote = result.get("ready_to_promote", [])
+    if promote:
+        lines.append(f"\n▶ <b>Ready to promote ({len(promote)})</b> <i>— replied, ladder finished</i>")
+        for e in promote:
+            company = html.escape(str(e.get("company") or "—"))
+            who = html.escape(str(e.get("name") or e.get("role") or "—"))
+            tag = html.escape(_seq_id_tag(e))
+            lines.append(
+                f"• <b>{company}</b> — {who} · replied {html.escape(_followup_date_label(e.get('replied_on')))}"
+                f" · 🆔 <code>{tag}</code> · <code>/promote {tag}</code>"
+            )
+
+    revived = result.get("revived", [])
+    if revived:
+        lines.append(f"\n▶ <b>Back on the ladder ({len(revived)})</b> <i>— stale date, restarted from today</i>")
+        for e in revived:
+            company = html.escape(str(e.get("company") or "—"))
+            who = html.escape(str(e.get("name") or e.get("role") or "—"))
+            lines.append(
+                f"• <b>{company}</b> — {who} · revived — ladder restarted today"
+                f" · first nudge {html.escape(_followup_date_label(e.get('first_nudge')))}"
+                f" · 🆔 <code>{html.escape(_seq_id_tag(e))}</code>"
             )
 
     quiet = result.get("applications_quiet", [])
@@ -5766,6 +5875,24 @@ def render_followup_needs_card(result, on_demand=False):
                 f"(max {MAX_AUTO_BURIES_PER_RUN}/run) and not written — re-run to process the rest.</i>"
             )
 
+    killed = result.get("killed", [])
+    if killed:
+        lines.append(
+            f"\n▶ <b>Killed overnight ({len(killed)})</b> "
+            f"<i>— no reply after 3 nudges, moved to {html.escape(CARMEN_GHOST_TAB)}</i>"
+        )
+        for e in killed:
+            company = html.escape(str(e.get("company") or "—"))
+            who = html.escape(str(e.get("name") or e.get("role") or "—"))
+            lines.append(f"• <b>{company}</b> — {who} · <code>{html.escape(_seq_id_tag(e))}</code>")
+        kills_capped = counts.get("kills_suppressed", 0)
+        if kills_capped:
+            # Same honesty rule as the bury cap: the list mixes moved and withheld rows.
+            lines.append(
+                f"🛑 <i>{kills_capped} of these were withheld by the safety cap "
+                f"(max {MAX_AUTO_KILLS_PER_RUN}/run) and not moved — re-run to process the rest.</i>"
+            )
+
     top = result.get("top_matched", [])
     if top:
         lines.append("\n▶ <b>Top 3 untouched matches</b> <i>— highest Fit Score, still Matched</i>")
@@ -5785,6 +5912,11 @@ def render_followup_needs_card(result, on_demand=False):
         summary += f" · {counts['buries_suppressed']} buries capped"
     if counts.get("drafts_suppressed", 0):
         summary += f" · {counts['drafts_suppressed']} drafts capped"
+    for key, label in (("ready_to_promote", "to promote"), ("revived", "revived"), ("killed", "killed")):
+        if counts.get(key, 0):
+            summary += f" · {counts[key]} {label}"
+    if counts.get("kills_suppressed", 0):
+        summary += f" · {counts['kills_suppressed']} kills capped"
     lines.append(summary)
     return "\n".join(lines)
 
@@ -8430,6 +8562,42 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status=new_status))
             return
 
+        # Carmen contact lifecycle (no reply context): /promote <id> moves a contact who replied from
+        # Carmen Cold to Carmen Hot; /demote <id> parks a Cold or Hot contact on the Carmen Warm bench.
+        people_cmd_match = re.match(r"^/(promote|demote)(?:\s+(\S+))?$", text)
+        if people_cmd_match:
+            cmd, token = people_cmd_match.group(1), (people_cmd_match.group(2) or "").strip()
+            if not token:
+                send_telegram_message(chat_id, f"⚠️ <b>Usage:</b> <code>/{cmd} &lt;id&gt;</code> - the 🆔 from the morning card")
+                return
+            matches = find_carmen_contacts(token)
+            if len(matches) != 1:
+                problem = "matches more than one contact" if matches else "is not a Carmen Cold or Carmen Hot contact"
+                send_telegram_message(
+                    chat_id, f"⚠️ <b>Not moved:</b> <code>{html.escape(token)}</code> {problem}. "
+                             f"Use the 🆔 exactly as the morning card shows it."
+                )
+                return
+            sheet_uuid, source_tab, record = matches[0]
+            target_tab, allowed = (("Carmen Hot", ("Carmen Cold",)) if cmd == "promote"
+                                   else ("Carmen Warm", ("Carmen Cold", "Carmen Hot")))
+            who = html.escape(str(record.get("name") or record.get("company") or token))
+            if source_tab == target_tab:
+                send_telegram_message(chat_id, f"ℹ️ {who} is already in {target_tab}.")
+                return
+            if source_tab not in allowed:
+                send_telegram_message(chat_id, f"⚠️ <b>Not moved:</b> /{cmd} works on {' or '.join(allowed)} contacts; {who} is in {html.escape(source_tab)}.")
+                return
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            verb = "Promoted" if cmd == "promote" else "Demoted"
+            send_telegram_message(chat_id, f"{'🔥' if cmd == 'promote' else '🪑'} {verb} {who} to {target_tab}.")
+            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=target_tab))
+            enqueue_crm_payload(build_crm_payload(
+                "append_note", sheet_uuid=sheet_uuid,
+                note=f"[{today_str}] {verb} from {source_tab} to {target_tab} via /{cmd}.",
+            ))
+            return
+
         # Deterministic Template Bank Editor (/edit ID New Text) - no reply context required
         if text.startswith("/edit"):
             body = text[5:].strip()
@@ -8490,6 +8658,8 @@ def process_webhook_payload_async(data):
                 "/apply - Mark Applied (Status only, no tab move)\n"
                 "/replied &lt;id&gt; - Set Status to Replied\n"
                 "/interview &lt;id&gt; - Set Status to Interviewing\n"
+                "/promote &lt;id&gt; - Move a contact who replied to Carmen Hot\n"
+                "/demote &lt;id&gt; - Park a Carmen Cold/Hot contact on the Warm bench\n"
                 "/offer - Log an offer for this record\n"
                 "/withdraw - Log a withdrawn application\n"
                 "/warm - Smart-route lead to its Warm tab\n"
@@ -8745,7 +8915,7 @@ def followup_queue_view():
             who = str(e.get("role") or e.get("name") or "—")
             company = str(e.get("company") or "—")
             due = _followup_date_label(e.get("next_followup"))
-            nxt = _followup_date_label(e.get("new_next_followup"), blank="last nudge")
+            step = _next_step_label(e)
             field_id = f"draft-{i}"
             links = (
                 f'<button class="btn btn-secondary" onclick="copyField(\'{field_id}\')" '
@@ -8757,7 +8927,7 @@ def followup_queue_view():
             parts.append(
                 f"<h3 style='margin-top: 24px;'>{html.escape(who)} — {html.escape(company)}</h3>"
                 f"<p class='meta'>Follow-up #{html.escape(str(e.get('attempt', 1)))} · "
-                f"due {html.escape(due)} → next {html.escape(nxt)} · "
+                f"due {html.escape(due)} → {html.escape(step)} · "
                 f"🆔 <code>{html.escape(_seq_id_tag(e))}</code></p>"
                 f'<textarea id="{field_id}" rows="10" style="width: 100%;" readonly>'
                 f"{html.escape(str(e.get('draft_text') or ''))}</textarea>"
