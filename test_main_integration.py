@@ -619,6 +619,31 @@ def test_needs_card_on_demand_is_labelled_read_only():
                 "counts": {"followups_ready": 1, "going_cold": 0, "buried": 0, "top_matched": 0}}
     card = m.render_followup_needs_card(populated, on_demand=True)
     assert "Queue Preview" in card and "read-only" in card
+    assert f"<a href='{m.BASE_URL}/stage/abc123'>Full Card</a>" in card
+
+
+def test_needs_card_followup_entries_link_full_card_but_never_expose_a_swipeable_uuid():
+    """Several follow-ups share one message, and swipe-reply recovery takes the FIRST 🆔 UUID it
+    finds - so the card must carry no full sheet_uuid, or /x would hit entry #1 whichever was meant."""
+    uuid_a, uuid_b = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+    long_draft = "x" * 950
+    ready = [
+        {"company": "Acme & Co", "role": "Ops", "attempt": 1, "draft_text": long_draft,
+         "short_id": "abc123", "sheet_uuid": uuid_a, "sheet_tab": "Tetiana Cold"},
+        {"company": "Beta", "role": "Lead", "attempt": 2, "draft_text": "hi",
+         "short_id": None, "sheet_uuid": uuid_b, "sheet_tab": "Tetiana Warm"},
+    ]
+    result = {"followups_ready": ready, "going_cold": [], "buried": [], "top_matched": [],
+              "counts": {"followups_ready": 2, "going_cold": 0, "buried": 0, "top_matched": 0}}
+    card = m.render_followup_needs_card(result)
+
+    assert card.count("Full Card</a>") == 1  # no short_id -> no link line at all
+    assert "/stage/None" not in card
+    assert "Acme &amp; Co" in card
+    assert f"<code>{'x' * 900}</code>" in card and "x" * 901 not in card
+    assert uuid_a not in card and uuid_b not in card
+    assert m._parse_sheet_uuid_from_card_text(card) == (None, None)
+    assert "/apply" not in card and "Swipe-replies don't work on this card" in card
 
 
 # ---- /queue command (read-only sequencer preview) ----

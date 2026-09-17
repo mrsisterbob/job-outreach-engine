@@ -5485,11 +5485,19 @@ def render_followup_needs_card(result, on_demand=False):
         for e in ready:
             role = html.escape(str(e.get("role") or "—"))
             company = html.escape(str(e.get("company") or "—"))
-            draft = html.escape(str(e.get("draft_text") or "")[:600])
+            draft = html.escape(str(e.get("draft_text") or "")[:900])
             ladder_day = e.get("ladder_day")
             attempt_tag = f"#{e.get('attempt', 1)}" + (f" · day {ladder_day}" if ladder_day else "")
             lines.append(f"💼 <b>{role}</b> — {company}  ·  {attempt_tag}  ·  🆔 <code>{html.escape(_seq_id_tag(e))}</code>")
+            if e.get("short_id"):
+                stage_url = html.escape(f"{BASE_URL}/stage/{e['short_id']}", quote=True)
+                lines.append(f"📋 <a href='{stage_url}'>Full Card</a>")
             lines.append(f"<code>{draft}</code>")
+        # No full-sheet_uuid 🆔 line and no swipe legend: this card holds N entries in one message,
+        # and _parse_sheet_uuid_from_card_text takes the first UUID it finds, so a swipe-reply would
+        # silently act on entry #1. Swipes here fail cleanly instead; actions carry their own id.
+        lines.append("<i>Swipe-replies don't work on this card - act via 📋 Full Card, or "
+                     "<code>/replied &lt;id&gt;</code> · <code>/interview &lt;id&gt;</code> with the 🆔 above.</i>")
 
     cold = result.get("going_cold", [])
     if cold:
