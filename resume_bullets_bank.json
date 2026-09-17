@@ -9,7 +9,7 @@
     "Trained new operations analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
     "Audited advisor billing and fee schedules across Salesforce to eliminate recurring monthly invoicing errors.",
     "Checked training records across 20 insurance carriers to verify licensing for 600+ partner RIAs.",
-    "Tracked custodial transfer hold-ups across clearing feeds to resolve documentation exceptions on active accounts."
+    "Worked ACAT transfer exceptions across Schwab and Fidelity, clearing documentation holds before they aged past SLA."
   ],
   "track_b_engineering": [
     "Built a Python and Flask backend with SQLite in WAL mode to handle live Telegram webhook updates without dropped records.",
@@ -18,7 +18,7 @@
     "Created two-way webhook synchronization between HubSpot CRM tables and local SQLite databases.",
     "Cleaned and reformatted 1,500+ legacy account records across internal databases to match updated database schemas.",
     "Wrote strict JSON schema validation models in Python to block invalid payloads on REST API endpoints.",
-    "Tested Salesforce and Orion Eclipse data connections alongside software teams to keep trading feeds stable.",
+    "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
     "Wrote automated Python data scrapers using pandas, saving 15 hours of manual lookup time each week.",
     "Set up recurring reporting pipelines linking REST APIs to internal database tables for daily metrics.",
     "Built automated DocuSign API scripts that check account packages and trigger follow-up alerts for missing signatures."
@@ -32,7 +32,7 @@
     "Handled urgent ticket escalations to prevent 10 critical SLA breaches and avoid client penalty payouts.",
     "Checked advisor commission splits to keep internal accounting aligned with RIA compliance controls.",
     "Set up compliance checkpoints in Salesforce for advisor onboarding and account opening workflows.",
-    "Converted complex financial regulations into clear onboarding checklists for institutional accounts.",
+    "Turned SEC and FinCEN identity requirements into a step-by-step onboarding checklist and documented it for future analysts.",
     "Reviewed identity verification and suitability forms for incoming client accounts prior to trade execution."
   ],
   "track_d_business_intelligence": [
@@ -44,7 +44,7 @@
     "Monitored Salesforce service queues to catch routing errors and eliminate miscategorized tickets.",
     "Ran SQL variance checks on 500+ ledger accounts to prepare recurring internal financial reports.",
     "Pulled unstructured API data into relational database tables to track historical volume trends.",
-    "Built Excel reporting templates with lookups and macros to reduce manual data entry time.",
+    "Built Excel lookup and macro templates for recurring 401(k) and healthcare deduction reconciliation across 500+ accounts.",
     "Reconciled carrier funding promises and cashiering payouts against internal banking records."
   ],
   "track_e_bizops": [
@@ -54,11 +54,9 @@
     "Built a custom contact pipeline in Python connected to SQLite and Telegram to manage 500+ records end to end.",
     "Set up standardized escalation paths for custodial account transfers, cutting turnaround time by 25%.",
     "Cleaned multi-source CRM records into a single pipeline view to remove duplicate contact entries.",
-    "Automated routine data entry and compliance checks to clear weekly administrative backlogs.",
+    "Automated the recurring compliance checks on advisor account packages so the weekly backlog cleared without manual review.",
     "Built two-way webhook integrations to connect external form submissions with internal CRM databases.",
     "Documented end-to-end service desk workflows to standardize how operations analysts handle ticket queues.",
     "Designed schema validation rules on REST API intake forms to maintain data integrity across client records."
   ]
 }
-
-
