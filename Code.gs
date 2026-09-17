@@ -443,7 +443,9 @@ function doGet(e) {
     if (action === "get_priority") {
       const priorityLevel = parseInt(e.parameter.level || "5", 10);
       const results = [];
-      const tabs = ["Carmen Cold", "Carmen Warm"];
+      // Carmen Hot included: promoted contacts are the ones Kevin most wants surfaced by /p.
+      // Killed is excluded - it is the PEOPLE archive, same reason it is skipped on other reads.
+      const tabs = ["Carmen Cold", "Carmen Hot", "Carmen Warm"];
 
       tabs.forEach(tabName => {
         const sheet = ss.getSheetByName(tabName);

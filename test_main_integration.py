@@ -3819,3 +3819,30 @@ def test_market_supply_message_distinguishes_empty_window_from_dry_market():
         conn.commit()
     empty = m.format_market_supply_message(m.get_market_supply(days=7))
     assert "run /t a few times" in empty
+
+
+# ---- PEOPLE tab membership (contact-capture gate) ----
+
+def test_people_tabs_covers_every_carmen_tab_plus_killed():
+    # A PEOPLE tab missing from this tuple silently duplicates a real contact: the sent-mail
+    # capture gate would not find them and would write a second row into Carmen Cold.
+    assert set(m.PEOPLE_TABS) == {"Carmen Cold", "Carmen Hot", "Carmen Warm", "Killed"}
+
+
+def test_carmen_hot_contact_is_not_recaptured(monkeypatch):
+    # The bug this guards: promote someone to Carmen Hot, email them, and the sent-mail scanner
+    # re-adds them to Carmen Cold - restarting the ladder on a contact already graduated.
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: pytest.fail("should not reach the live CRM"))
+    with m.get_db_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO sheet_row_map (sheet_uuid, sheet_tab, contact_email) "
+            "VALUES ('uuid-hot', 'Carmen Hot', 'promoted@example.com')"
+        )
+        conn.commit()
+    assert m.is_logged_person_contact("promoted@example.com") is True
+
+
+def test_warm_tone_tabs_excludes_the_archive():
+    # Killed is archived - a contact parked there should not pull warm copy if ever re-touched.
+    assert "Killed" not in m.WARM_TONE_TABS
+    assert "Carmen Hot" in m.WARM_TONE_TABS

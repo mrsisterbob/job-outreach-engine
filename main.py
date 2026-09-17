@@ -4317,8 +4317,19 @@ def get_all_crm_job_companies():
     return companies
 
 
+# Every PEOPLE-schema tab a contact can already live in. One list, because "is this person already
+# logged?" is asked in several places and a tab missing from any one of them silently duplicates a
+# real contact - adding Carmen Hot without updating the capture gate below would have written a
+# freshly promoted contact back into Carmen Cold on the next sent-mail scan, restarting the ladder
+# on someone already graduated. Mirrors the PEOPLE entries in Code.gs's TAB_MAP.
+PEOPLE_TABS = ("Carmen Cold", "Carmen Hot", "Carmen Warm", "Killed")
+
+# The subset that means "Kevin has an active or established relationship here", used to pick warm
+# copy over cold. Killed is excluded (archived) and so is the bench, which /demote parks people on.
+WARM_TONE_TABS = ("Carmen Cold", "Carmen Hot", "Carmen Warm")
+
 def is_logged_person_contact(email):
-    """True when this address is already a row in a PEOPLE tab (Carmen Cold / Carmen Warm / Killed).
+    """True when this address is already a row in a PEOPLE tab (see PEOPLE_TABS).
 
     The sent-mail capture gate. Deliberately NOT is_verified_crm_contact(), which searches every
     tab: an address on a JOBS row is the pipeline's outreach TARGET for that job, not a logged
@@ -4338,9 +4349,11 @@ def is_logged_person_contact(email):
     try:
         with get_db_conn() as conn:
             cursor = conn.cursor()
+            placeholders = ",".join("?" for _ in PEOPLE_TABS)
             cursor.execute(
-                "SELECT 1 FROM sheet_row_map WHERE LOWER(contact_email) = ? AND sheet_tab IN ('Carmen Cold','Carmen Warm','Killed') LIMIT 1",
-                (clean,)
+                f"SELECT 1 FROM sheet_row_map WHERE LOWER(contact_email) = ? "
+                f"AND sheet_tab IN ({placeholders}) LIMIT 1",
+                (clean, *PEOPLE_TABS)
             )
             if cursor.fetchone():
                 return True
@@ -8052,7 +8065,7 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, CARD_RECOVERED_NOTICE)
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
-            is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
+            is_warm = mapping.get("sheet_tab") in WARM_TONE_TABS
             domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
             if mapping.get("contact_name"):
                 # Named CRM contact (not a generic job-alert row) - resolve a real person's email via the waterfall
@@ -8113,7 +8126,7 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, CARD_RECOVERED_NOTICE)
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
-            is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
+            is_warm = mapping.get("sheet_tab") in WARM_TONE_TABS
             domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
             contact_name = custom_name or "Operations Lead"
 
@@ -8178,7 +8191,7 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, CARD_RECOVERED_NOTICE)
             comp = job.get("employer_name") or mapping.get("contact_company") or "Target Firm"
             title = job.get("job_title") or "Operations Specialist"
-            is_warm = mapping.get("sheet_tab") in ("Carmen Warm", "Carmen Cold")
+            is_warm = mapping.get("sheet_tab") in WARM_TONE_TABS
             update_job_target_email(mapping["sheet_uuid"], new_email)
 
             # Compile the same tailored resume PDF /draft attaches, so /e never regresses to a bare-text draft
