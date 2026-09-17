@@ -34,7 +34,7 @@ def clean_tables():
         # ingests a posting makes every later test using the same company/title silently take the
         # "already in the pipeline" branch instead of the path it meant to exercise.
         for table in ("crm_outbox", "sheet_row_map", "company_cooldown", "company_identities",
-                      "jobs", "followup_sequencer_log", "followup_queue_snapshot", "seen_jobs",
+                      "jobs", "followup_sequencer_log", "followup_queue_snapshot", "gmail_drafts", "seen_jobs",
                       "seen_content_hashes"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
@@ -380,8 +380,7 @@ def test_sequencer_stale_nudge_and_top_matched_do_not_write(monkeypatch):
     assert all(p["sheet_uuid"] not in ("seq-m1", "seq-m2") for p in enqueued)
     assert result["counts"] == {"followups_ready": 0, "ready_to_promote": 0, "revived": 0,
                                 "applications_quiet": 1, "going_cold": 1, "buried": 1, "killed": 0,
-                                "top_matched": 2, "buries_suppressed": 0, "drafts_suppressed": 0,
-                                "kills_suppressed": 0}
+                                "top_matched": 2, "buries_suppressed": 0, "kills_suppressed": 0}
 
 
 def test_sequencer_is_idempotent_across_two_consecutive_runs(monkeypatch):
@@ -404,8 +403,7 @@ def test_sequencer_dry_run_performs_zero_writes(monkeypatch):
 
     assert result["counts"] == {"followups_ready": 0, "ready_to_promote": 0, "revived": 0,
                                 "applications_quiet": 1, "going_cold": 1, "buried": 1, "killed": 0,
-                                "top_matched": 2, "buries_suppressed": 0, "drafts_suppressed": 0,
-                                "kills_suppressed": 0}
+                                "top_matched": 2, "buries_suppressed": 0, "kills_suppressed": 0}
     assert enqueued == []
     with m.get_db_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
@@ -494,22 +492,19 @@ def test_needs_card_flags_withheld_buries_in_the_buried_section_and_summary(monk
     assert "5 buries capped" in card
 
 
-# ---- Gmail drafts staged by the sequencer (MAX_AUTO_DRAFTS_PER_RUN) ----
-# Only PEOPLE rows (Carmen Cold) draft; JOBS rows are watch-only (applications_quiet).
+# ---- Follow-up drafts: none at 7:30, created on demand from /followups ----
+# Only PEOPLE rows (Carmen Cold) get draft text; JOBS rows are watch-only (applications_quiet).
 
 def _mock_followup_rows(monkeypatch, cc_rows=(), jobs_rows=(), jobs_code="TW"):
-    """Due Carmen Cold rows (plus optional JOBS rows on `jobs_code`), with the CRM outbox and
-    create_gmail_draft both recorded instead of hitting the network."""
+    """Due Carmen Cold rows (plus optional JOBS rows on `jobs_code`), with the CRM outbox recorded
+    and every Gmail draft path wired to fail the test if the sequencer touches it."""
     by_code = {"CC": list(cc_rows), jobs_code: list(jobs_rows)}
     monkeypatch.setattr(m, "fetch_networking_cards",
                         lambda code, qty=None: [dict(r) for r in by_code.get(code, [])])
     enqueued, drafts = [], []
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
-
-    def fake_draft(**kwargs):
-        drafts.append(kwargs)
-        return True, "Success", f"draft-{len(drafts)}"
-    monkeypatch.setattr(m, "create_gmail_draft", fake_draft)
+    monkeypatch.setattr(m, "_stage_sequencer_draft", lambda *a, **k: drafts.append(a) or ("d", True, ""))
+    monkeypatch.setattr(m, "create_gmail_draft", lambda **kw: drafts.append(kw) or (True, "Success", "d"))
     return enqueued, drafts
 
 
@@ -528,8 +523,27 @@ def _due_application(i, email="kjmiller406@gmail.com"):
             "next_followup": "1970-01-01", "raw_priority": "70"}
 
 
+def test_sequencer_creates_no_gmail_drafts(monkeypatch):
+    """7:30 drafts nothing - not for people with real addresses, not for applications - and with
+    no draft cap every due person is snoozed and logged the same day."""
+    people = [_due_person(i) for i in range(13)]
+    enqueued, drafts = _mock_followup_rows(monkeypatch, cc_rows=people, jobs_rows=[_due_application(0)])
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert drafts == []
+    assert "drafts_suppressed" not in result["counts"]
+    assert len(result["followups_ready"]) == 13
+    entry = result["followups_ready"][0]
+    assert "draft_id" not in entry
+    assert entry["draft_text"] and entry["sheet_uuid"] == "cc-0"
+    assert entry["email"] == "pat@acme.com" and entry["company_raw"] == "Co0"
+    assert len([p for p in enqueued if p["action"] == "update_snooze"]) == 14
+    assert len(_logged_uuids()) == 14
+
+
 def test_sequencer_dry_run_creates_no_gmail_drafts(monkeypatch):
-    """/queue is read-only: not one draft, even for rows with a real address."""
+    """/queue is read-only."""
     enqueued, drafts = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0)],
                                            jobs_rows=[_due_application(0)])
 
@@ -538,22 +552,20 @@ def test_sequencer_dry_run_creates_no_gmail_drafts(monkeypatch):
     assert len(result["followups_ready"]) == 1 and len(result["applications_quiet"]) == 1
     assert drafts == []
     assert enqueued == []
-    assert all(e["draft_id"] is None for e in result["followups_ready"])
 
 
 def test_sequencer_jobs_rows_are_watched_not_drafted(monkeypatch):
-    """A Tetiana Warm application never gets bump text or a Gmail draft, but its clock still
-    advances (snooze + log) so the +16 bury is reached."""
+    """A Tetiana Warm application never gets bump text, but its clock still advances (snooze +
+    log) so the +16 bury is reached."""
     _mock_followup_rows(monkeypatch, jobs_rows=[_due_application(0)])
-    staged, bumped = [], []
-    monkeypatch.setattr(m, "_stage_sequencer_draft", lambda *a, **k: staged.append(a) or ("d", True))
+    bumped = []
     monkeypatch.setattr(m, "build_followup_bump_draft", lambda *a, **k: bumped.append(a) or "text")
     enqueued = []
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
 
     result = m.run_followup_sequencer(today=_SEQ_TODAY)
 
-    assert staged == [] and bumped == []
+    assert bumped == []
     assert result["followups_ready"] == []
     assert result["counts"]["applications_quiet"] == 1
     app = result["applications_quiet"][0]
@@ -570,83 +582,11 @@ def test_sequencer_jobs_rows_are_watched_not_drafted(monkeypatch):
     assert _logged_uuids() == {"app-0"}
 
 
-def test_sequencer_stages_the_card_text_as_a_gmail_draft(monkeypatch):
-    rows = [_due_person(0), _due_person(1, email=""), _due_person(2, email="x@y.com [⚠️ Fallback Email]")]
-    enqueued, drafts = _mock_followup_rows(monkeypatch, cc_rows=rows)
-
-    result = m.run_followup_sequencer(today=_SEQ_TODAY)
-    by_uuid = {e["sheet_uuid"]: e for e in result["followups_ready"]}
-
-    assert len(drafts) == 1  # blank and bracketed addresses are skipped
-    assert drafts[0]["to_email"] == "pat@acme.com"
-    assert drafts[0]["custom_body"] == by_uuid["cc-0"]["draft_text"]
-    assert drafts[0]["custom_subject"] == "Re: Co0"  # roleless PEOPLE row
-    assert by_uuid["cc-0"]["draft_id"] == "draft-1"
-    assert by_uuid["cc-1"]["draft_id"] is None and by_uuid["cc-2"]["draft_id"] is None
-    assert by_uuid["cc-0"]["next_followup"] == _SEQ_TODAY.strftime("%Y-%m-%d")
-    assert by_uuid["cc-0"]["new_next_followup"] == "2026-06-08"  # anchor + CARMEN_LADDER_DAYS[1]
-    # Rows skipped for a missing address are still snoozed, exactly as before drafts existed.
-    assert {p["sheet_uuid"] for p in enqueued if p["action"] == "update_snooze"} == {"cc-0", "cc-1", "cc-2"}
-
-
-def test_sequencer_same_day_rerun_does_not_draft_twice(monkeypatch):
-    _, drafts = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0)])
+def test_sequencer_same_day_rerun_does_not_snooze_twice(monkeypatch):
+    enqueued, _ = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0)])
     m.run_followup_sequencer(today=_SEQ_TODAY)
-    assert len(drafts) == 1
-
     m.run_followup_sequencer(today=_SEQ_TODAY)
-    assert len(drafts) == 1
-
-
-def test_sequencer_over_the_draft_cap_defers_the_rest(monkeypatch):
-    over = m.MAX_AUTO_DRAFTS_PER_RUN + 3
-    enqueued, drafts = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(i) for i in range(over)])
-
-    result = m.run_followup_sequencer(today=_SEQ_TODAY)
-
-    assert len(drafts) == m.MAX_AUTO_DRAFTS_PER_RUN
-    assert result["counts"]["drafts_suppressed"] == 3
-    assert len(result["followups_ready"]) == over
-    assert sum(1 for e in result["followups_ready"] if e["draft_id"]) == m.MAX_AUTO_DRAFTS_PER_RUN
-    # Capped rows are neither snoozed nor logged, so they stay due for the next pass.
-    assert len([p for p in enqueued if p["action"] == "update_snooze"]) == m.MAX_AUTO_DRAFTS_PER_RUN
-    assert len(_logged_uuids()) == m.MAX_AUTO_DRAFTS_PER_RUN
-
-    card = m.render_followup_needs_card(result)
-    assert "3 of these were withheld by the draft cap" in card
-    assert "3 drafts capped" in card
-
-    m.run_followup_sequencer(today=_SEQ_TODAY)
-    assert len(drafts) == over  # the re-run drains the deferred rows
-
-
-def test_sequencer_existing_draft_is_linked_but_not_counted_against_the_cap(monkeypatch):
-    _mock_followup_rows(monkeypatch, cc_rows=[_due_person(i) for i in range(m.MAX_AUTO_DRAFTS_PER_RUN + 1)])
-    monkeypatch.setattr(m, "create_gmail_draft",
-                        lambda **kw: (False, "Draft already exists in Gmail", "existing-1"))
-
-    result = m.run_followup_sequencer(today=_SEQ_TODAY)
-
-    assert result["counts"]["drafts_suppressed"] == 0
-    assert all(e["draft_id"] == "existing-1" for e in result["followups_ready"])
-
-
-def test_sequencer_gmail_failure_never_aborts_the_run_or_claims_a_draft(monkeypatch):
-    enqueued, _ = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0), _due_person(1)])
-    calls = []
-
-    def flaky(**kwargs):
-        calls.append(kwargs)
-        if len(calls) == 1:
-            raise m.requests.exceptions.Timeout("gmail timed out")
-        return False, "Gmail Error 500", None
-    monkeypatch.setattr(m, "create_gmail_draft", flaky)
-
-    result = m.run_followup_sequencer(today=_SEQ_TODAY)
-
-    assert len(calls) == 2
-    assert all(e["draft_id"] is None for e in result["followups_ready"])
-    assert len([p for p in enqueued if p["action"] == "update_snooze"]) == 2
+    assert len([p for p in enqueued if p["action"] == "update_snooze"]) == 1
 
 
 # ---- /followups page (today's saved sequencer result) ----
@@ -663,6 +603,23 @@ def _no_recompute(monkeypatch):
     monkeypatch.setattr(m, "run_followup_sequencer", boom)
 
 
+def _ready_entry(uuid, email="pat@acme.com", company="Nliven", role="", name="Pat",
+                 text="Hi Pat, just following up."):
+    return {"company": company or "N/A", "company_raw": company, "role": role, "name": name,
+            "short_id": None, "sheet_uuid": uuid, "attempt": 1, "draft_text": text,
+            "sheet_tab": "Carmen Cold", "email": email,
+            "next_followup": "2026-06-01", "new_next_followup": "2026-06-08"}
+
+
+def _save_today(ready=(), quiet=()):
+    today = m.datetime.now().strftime("%Y-%m-%d")
+    assert m.save_followup_queue_snapshot(today, {
+        "run_date": today, "followups_ready": list(ready), "applications_quiet": list(quiet),
+        "counts": {"followups_ready": len(ready), "applications_quiet": len(quiet)},
+    })
+    return today
+
+
 def test_followups_page_without_todays_snapshot_says_so_and_never_recomputes(monkeypatch):
     _no_recompute(monkeypatch)
     status, page = _get_followups_page()
@@ -671,41 +628,41 @@ def test_followups_page_without_todays_snapshot_says_so_and_never_recomputes(mon
 
 
 def test_followups_page_renders_the_saved_run_read_only(monkeypatch):
-    """The job saves its result; the page shows the FULL draft, Open Draft only when a draft_id
-    exists, and the applications table with /stage links - without running the sequencer."""
+    """The job saves its result; the page shows the FULL draft, an Open in Gmail link only for a
+    usable address, and the applications table with /stage links - creating nothing."""
     # The job runs on the real clock, so every row is dated relative to real today.
     real_now = m.datetime.now()
     application = {**_due_application(0),
                    "date_added": (real_now.date() - timedelta(days=m.FOLLOWUP_1_DAYS)).strftime("%Y-%m-%d")}
-    _, drafts = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0, today=real_now.date()),
-                                             _due_person(1, email="", today=real_now.date())],
-                                    jobs_rows=[application])
+    _, drafts = _mock_followup_rows(monkeypatch, cc_rows=[
+        _due_person(0, today=real_now.date()),
+        _due_person(1, email="", today=real_now.date()),
+        _due_person(2, email="x@y.com [⚠️ Fallback Email]", today=real_now.date()),
+    ], jobs_rows=[application])
     long_text = "Hello <b>there</b> " + "y" * 1200
     monkeypatch.setattr(m, "build_followup_bump_draft", lambda rec, attempt: long_text)
     monkeypatch.setattr(m, "get_short_id_by_sheet_uuid", lambda su: "sid-app0" if su == "app-0" else None)
     monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "")
     m.scheduled_followup_sequencer_job()
-    assert len(drafts) == 1
 
-    enqueued_before = len(drafts)
     _no_recompute(monkeypatch)
     status, page = _get_followups_page()
 
     assert status == 200
     assert f"Follow-up Queue · {real_now.strftime('%Y-%m-%d')}" in page
     assert "Hello &lt;b&gt;there&lt;/b&gt; " + "y" * 1200 in page  # full text, escaped, untruncated
-    assert page.count("📋 Copy Draft") == 2
-    assert page.count("✉️ Open Draft") == 1
-    assert "https://mail.google.com/mail/u/0/#drafts/draft-1" in page
+    assert page.count("📋 Copy Draft") == 3
+    assert page.count("✉️ Open in Gmail") == 1
+    assert 'href="/followups/draft/cc-0"' in page
+    assert page.count("No verified address on file") == 2
+    assert "mail.google.com" not in page  # no draft exists until a link is clicked
     assert "Applications Going Quiet (1)" in page and "Acme0" in page
     assert 'href="/stage/sid-app0"' in page
-    assert len(drafts) == enqueued_before  # rendering created nothing
+    assert drafts == []
 
 
 def test_followups_page_with_an_empty_snapshot_is_a_clear_queue(monkeypatch):
-    today = m.datetime.now().strftime("%Y-%m-%d")
-    assert m.save_followup_queue_snapshot(today, {"followups_ready": [], "applications_quiet": [],
-                                                  "counts": {}})
+    _save_today()
     _no_recompute(monkeypatch)
     status, page = _get_followups_page()
     assert status == 200 and "Queue is clear" in page
@@ -736,6 +693,133 @@ def test_sequencer_job_saves_the_snapshot_before_sending_the_card(monkeypatch):
     m.scheduled_followup_sequencer_job()
 
     assert order == [("save", "2026-06-01"), ("send", "123")]
+
+
+# ---- GET /followups/draft/<sheet_uuid> (on-demand Gmail draft) ----
+
+def _click(uuid):
+    with m.app.test_client() as client:
+        res = client.get(f"/followups/draft/{uuid}")
+        return res.status_code, res.headers.get("Location"), res.get_data(as_text=True)
+
+
+def _gmail_calls(monkeypatch, result=(True, "Success", "draft-1")):
+    calls = []
+    monkeypatch.setattr(m, "create_gmail_draft", lambda **kw: calls.append(kw) or result)
+    return calls
+
+
+def test_draft_link_creates_the_draft_from_the_snapshot_and_redirects(monkeypatch):
+    _save_today([_ready_entry("cc-0", text="Exact card text."),
+                 _ready_entry("cc-1", company="Acme", role="Ops Analyst")])
+    calls = _gmail_calls(monkeypatch)
+    _no_recompute(monkeypatch)
+
+    status, location, _ = _click("cc-0")
+
+    assert status == 302
+    assert location == "https://mail.google.com/mail/u/0/#drafts/draft-1"
+    assert calls == [{"to_email": "pat@acme.com", "company_name": "Nliven", "job_title": "",
+                      "custom_body": "Exact card text.", "custom_subject": "Re: Nliven"}]
+    _click("cc-1")
+    assert calls[1]["custom_subject"] == "Re: Ops Analyst @ Acme"
+
+
+def test_draft_link_for_an_unknown_uuid_404s_without_recomputing(monkeypatch):
+    calls = _gmail_calls(monkeypatch)
+    _no_recompute(monkeypatch)
+
+    status, _, page = _click("cc-0")  # no snapshot at all
+    assert status == 404 and "not in today's queue" in page
+
+    _save_today([_ready_entry("cc-0")])
+    status, _, page = _click("nope")
+    assert status == 404 and "not in today's queue" in page
+    assert calls == []
+
+
+@pytest.mark.parametrize("email", ["", "   ", "x@y.com [⚠️ Fallback Email]", None])
+def test_draft_link_without_a_usable_address_shows_the_copy_page(monkeypatch, email):
+    entry = _ready_entry("cc-0", email=email, text="Copy <me> by hand")
+    if email is None:
+        entry.pop("email")  # a snapshot saved before entries carried the address
+    _save_today([entry])
+    calls = _gmail_calls(monkeypatch)
+    monkeypatch.setattr(m, "check_existing_gmail_draft",
+                        lambda *a: pytest.fail("no Gmail lookup for an unusable address"))
+
+    status, location, page = _click("cc-0")
+
+    assert status == 200 and location is None
+    assert calls == []
+    assert "No verified address on file" in page
+    assert "Copy &lt;me&gt; by hand</textarea>" in page and "📋 Copy Draft" in page
+
+
+def test_second_click_redirects_to_the_same_draft_without_a_telegram_ping(monkeypatch):
+    """Runs the real create_gmail_draft + 24h dedup: the first click creates, the second finds it."""
+    for var, val in (("GMAIL_CLIENT_ID", "cid"), ("GMAIL_CLIENT_SECRET", "cs"),
+                     ("GMAIL_REFRESH_TOKEN", "rt"), ("GMAIL_USER", "me@example.com")):
+        monkeypatch.setenv(var, val)
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: "token")
+    posts, pings = [], []
+
+    class Created:
+        status_code = 200
+        def json(self):
+            return {"id": "draft-42"}
+    monkeypatch.setattr(m.requests, "post", lambda url, **kw: posts.append(url) or Created())
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: pings.append(a) or 1)
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
+    _save_today([_ready_entry("cc-0")])
+
+    first = _click("cc-0")
+    second = _click("cc-0")
+
+    assert first[:2] == (302, "https://mail.google.com/mail/u/0/#drafts/draft-42")
+    assert second[:2] == first[:2]
+    assert len(posts) == 1
+    assert pings == []
+
+
+def test_duplicate_return_with_ok_false_still_redirects(monkeypatch):
+    """create_gmail_draft answers a duplicate with ok=False and the real id - that is success."""
+    _save_today([_ready_entry("cc-0")])
+    _gmail_calls(monkeypatch, result=(False, "Draft already exists in Gmail", "draft-7"))
+    status, location, _ = _click("cc-0")
+    assert (status, location) == (302, "https://mail.google.com/mail/u/0/#drafts/draft-7")
+
+
+@pytest.mark.parametrize("failure", ["error", "raise"])
+def test_gmail_failure_renders_the_reason_and_the_text(monkeypatch, failure):
+    _save_today([_ready_entry("cc-0", text="Fallback text")])
+    if failure == "raise":
+        def boom(**kw):
+            raise m.requests.exceptions.Timeout("gmail timed out")
+        monkeypatch.setattr(m, "create_gmail_draft", boom)
+        reason = "gmail timed out"
+    else:
+        _gmail_calls(monkeypatch, result=(False, "OAuth Token Unavailable", None))
+        reason = "OAuth Token Unavailable"
+
+    status, location, page = _click("cc-0")
+
+    assert status == 502 and location is None
+    assert reason in page
+    assert "Fallback text</textarea>" in page and "📋 Copy Draft" in page
+
+
+def test_blank_company_is_blocked_by_the_placeholder_guard(monkeypatch):
+    """The entry keeps the raw company, so a blank one reaches create_gmail_draft as "Target Firm"
+    and is refused, exactly as the old 7:30 path was - not drafted as "Re: N/A"."""
+    for var in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"):
+        monkeypatch.setenv(var, "x")
+    monkeypatch.setattr(m.requests, "post", lambda *a, **k: pytest.fail("must not reach Gmail"))
+    _save_today([_ready_entry("cc-0", company="")])
+
+    status, _, page = _click("cc-0")
+
+    assert status == 502 and "placeholder company name" in page
 
 
 # ---- Carmen Cold in the follow-up cadence (sequencer scan + overdue + roleless bumps) ----

@@ -210,11 +210,6 @@ REPLY_FOLLOWUP_DAYS = 4   # Any verified inbound reply -> Next Followup Date = t
 # the overflow stays unlogged and eligible, so re-running drains the rest a batch at a time.
 MAX_AUTO_BURIES_PER_RUN = 10
 
-# Same idea for the Gmail drafts the sequencer stages each morning: the inbox already holds a large
-# unsent backlog, and a stale CRM would otherwise drop every due follow-up into Drafts at once. The
-# overflow is left unsnoozed and unlogged, so it stays due and drafts on a later pass.
-MAX_AUTO_DRAFTS_PER_RUN = 10
-
 # Every value followup_action() can return.
 FOLLOWUP_ACTIONS = ("none", "send_followup_1", "send_followup_2", "bury_ghosted", "stale_nudge")
 

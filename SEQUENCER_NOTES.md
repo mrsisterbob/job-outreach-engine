@@ -76,7 +76,7 @@ ahead of the 08:30 standup digest):
 | Sequencer decision | What the job does | Automatic? |
 |--------------------|-------------------|------------|
 | `bury_ghosted` | `append_note` `[reason: ghosted]` **then** `update_status` → `Died` (via the durable CRM outbox) | **YES — the only automatic Sheet write.** Surfaced in the card's "Buried overnight" section so it is never silent. |
-| due follow-up — **PEOPLE row** (Carmen Cold, 4/11/21 ladder) | Bump text is built from the template bank and listed under the card's "Nudge these people". When the row has a real email, the same text is staged as a **Gmail draft** (max `MAX_AUTO_DRAFTS_PER_RUN` per run, overflow left unsnoozed so it drafts on a later pass). Next Followup Date advances via `update_snooze`. **No email is ever sent.** | Draft + snooze are automatic (never under `/queue`); **the send itself is approval-gated** — open the draft from `/followups` and send it. |
+| due follow-up — **PEOPLE row** (Carmen Cold, 4/11/21 ladder) | Bump text is built from the template bank and listed under the card's "Nudge these people". **No Gmail draft is created at 7:30** — the text is saved in the day's snapshot, and the draft is made only when Kevin clicks ✉️ Open in Gmail on `/followups`. No draft cap. Next Followup Date advances via `update_snooze`. **No email is ever sent.** | Snooze is automatic (never under `/queue`); **the draft and the send are both on demand.** |
 | `send_followup_1` / `send_followup_2` — **JOBS row** (Tetiana Cold/Warm, Clavicular) | Listed under the card's "Applications going quiet" as status only: applied date, days silent, severity dot, buries-on date, 📋 link to `/stage`. **No bump text, no Gmail draft.** Next Followup Date still advances via `update_snooze`. | Snooze is automatic — it must be, or the +16 bury is never reached. |
 | Carmen ladder **revival** (stale or blank anchor, see §3a) | `append_note` `[date] Ladder restarted …` **then** `update_snooze` → today + 4. Listed under "Back on the ladder", labelled "revived — ladder restarted today". | Automatic. Date Added is never rewritten. |
 | Carmen ladder **exhausted**, notes carry a reply | Listed under "Ready to promote" with a `/promote <id>` hint. | **No write** — reappears every morning until Kevin runs `/promote` or `/demote`. |
@@ -92,15 +92,29 @@ are for watching; people are for messaging.
 **The card and `/followups`.** The 07:30 card is a scannable list: one line per person
 (role or name — company · #attempt · due → next · 🆔 short_id) and one per application. It
 carries no draft text and no Gmail links. A single 📋 link opens `GET /followups`, which shows
-each person's full draft in a readonly textarea with a Copy button and, when a draft was
-staged, an ✉️ Open Draft link, followed by the applications table.
+each person's full draft in a readonly textarea with a Copy button and, when the row has a
+usable address, an ✉️ Open in Gmail link, followed by the applications table. A row with a blank
+or bracketed (unverified) address shows the text and Copy button with a "no verified address"
+note instead.
 
 `/followups` renders **the 07:30 run's saved result** (`followup_queue_snapshot`, one row per
 `run_date`, pruned after 14 days; it lives in `jobs_cache.db` on the mounted disk, so it
 survives deploys). It never recomputes: within seconds of the run, its own snoozes push every
-listed row's Next Followup Date into the future, so a later scan finds nothing due, and
-`draft_id` exists only in that run's result. With no snapshot for today the page says "no
-queue for today yet" rather than showing a misleading recompute.
+listed row's Next Followup Date into the future, so a later scan finds nothing due. With no
+snapshot for today the page says "no queue for today yet" rather than showing a misleading
+recompute.
+
+**Drafts are on demand.** ✉️ Open in Gmail links to `GET /followups/draft/<sheet_uuid>`, which
+finds that entry in **today's** snapshot (404 page otherwise — it never recomputes), creates the
+draft with the saved `draft_text` as its body and the same `Re:` subject `/sendall` uses, and
+302-redirects to the draft in Gmail. It is a GET that writes, deliberately, so it works as a plain
+link, and it is bounded: a blank or bracketed address never reaches Gmail (copy-by-hand page
+instead); a repeat click finds the draft through the 24h `(to_email, subject)` dedup and redirects
+to the same one, checked before `create_gmail_draft()` so its "Draft Already Exists" Telegram
+ping does not fire from a browser click; and a Gmail failure renders the reason plus the text to
+copy. There is no draft cap: the old `MAX_AUTO_DRAFTS_PER_RUN` only bounded speculative drafting
+and silently deferred real follow-ups. `/sendall` still drafts eagerly — it is a separate,
+explicit command.
 
 `/queue` runs the identical scan with `dry_run=True`: **zero** enqueues, **zero** bury,
 **zero** kill, **zero** revival note, **zero** snooze advancement, **zero**

@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 import requests
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 from resume_engine import compile_resume_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from response_schema import GeminiJobScreenerResponse
@@ -43,7 +43,7 @@ from pipeline_utils import (
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
     strip_tracking_params, strip_html_to_text,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
-    REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN, MAX_AUTO_DRAFTS_PER_RUN,
+    REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -5422,13 +5422,22 @@ def _sequencer_draft_recipient(record):
     email = str(record.get("email") or "").strip()
     return "" if (not email or "[" in email) else email
 
-def _stage_sequencer_draft(record, draft_text):
-    """Stage one follow-up as a Gmail draft - never sends. Returns (draft_id, created).
+def _sequencer_draft_subject(record):
+    """The follow-up bump's subject, mirroring process_overdue_batch()'s sendall bump: "Re:" so it
+    threads, with the company-only form for a roleless PEOPLE row. create_gmail_draft() dedups on
+    this, so it must be computed identically everywhere it is checked."""
+    company = record.get("company") or "Target Firm"
+    if str(record.get("title") or "").strip():
+        return f"Re: {record.get('title')} @ {company}"
+    return f"Re: {company}"
 
-    draft_text is passed verbatim so Gmail holds exactly what the card shows. The subject mirrors
-    process_overdue_batch()'s sendall bump. draft_id is also returned for a same-subject draft
-    already in Gmail (it does exist), but only a fresh one counts as created. Never raises: a
-    Gmail failure must not abort the run or keep the card from being sent.
+def _stage_sequencer_draft(record, draft_text):
+    """Stage one follow-up as a Gmail draft - never sends. Returns (draft_id, created, message).
+
+    draft_text is passed verbatim so Gmail holds exactly what the /followups page shows. draft_id
+    is also returned for a same-subject draft already in Gmail (create_gmail_draft answers that
+    with ok=False and the real id), so callers must branch on draft_id, not on `created`. Never
+    raises; on failure draft_id is None and message says why.
     """
     email = _sequencer_draft_recipient(record)
     try:
@@ -5437,19 +5446,15 @@ def _stage_sequencer_draft(record, draft_text):
             company_name=record.get("company") or "Target Firm",
             job_title=record.get("title") or "",
             custom_body=draft_text,
-            custom_subject=(
-                f"Re: {record.get('title')} @ {record.get('company') or 'Target Firm'}"
-                if str(record.get("title") or "").strip()
-                else f"Re: {record.get('company') or 'Target Firm'}"
-            ),
+            custom_subject=_sequencer_draft_subject(record),
         )
     except Exception as e:
-        logging.error(f"[SEQUENCER] Gmail draft error ({record.get('sheet_uuid')}): {e}")
-        return None, False
+        logging.error(f"[FOLLOWUPS] Gmail draft error ({record.get('sheet_uuid')}): {e}")
+        return None, False, f"Gmail request failed: {e}"
     if not ok and not draft_id:
-        logging.error(f"[SEQUENCER] Gmail draft not created ({record.get('sheet_uuid')}): {message}")
-        return None, False
-    return (draft_id or None), bool(ok)
+        logging.error(f"[FOLLOWUPS] Gmail draft not created ({record.get('sheet_uuid')}): {message}")
+        return None, False, str(message or "Gmail did not create the draft")
+    return (draft_id or None), bool(ok), str(message or "")
 
 def run_followup_sequencer(today=None, dry_run=False):
     """Scan Tetiana Cold/Warm + Clavicular via get_followups, run followup_action() on every row,
@@ -5477,10 +5482,9 @@ def run_followup_sequencer(today=None, dry_run=False):
     is moved to CARMEN_GHOST_TAB and listed in `killed`, capped at MAX_AUTO_KILLS_PER_RUN
     (see counts["kills_suppressed"]).
 
-    Unless dry_run, each PEOPLE follow-up with a real email is also staged as a Gmail draft (never sent)
-    and its id stored as entry["draft_id"] (None otherwise). Drafts are capped at
-    MAX_AUTO_DRAFTS_PER_RUN; a row over the cap is neither snoozed nor logged, so it stays due and
-    drafts on a later pass (see counts["drafts_suppressed"]).
+    No Gmail drafts are created here. Each followups_ready entry carries its draft_text and the
+    recipient fields, and GET /followups/draft/<sheet_uuid> creates the draft from the saved
+    snapshot only when Kevin clicks it.
     """
     if isinstance(today, datetime):
         today = today.date()
@@ -5503,8 +5507,6 @@ def run_followup_sequencer(today=None, dry_run=False):
               "top_matched": [], "counts": {}}
     buries_written = 0
     buries_suppressed = 0
-    drafts_created = 0
-    drafts_suppressed = 0
     kills_written = 0
     kills_suppressed = 0
 
@@ -5587,21 +5589,16 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "sheet_tab": rec.get("sheet_tab"),
                 "ladder_day": CARMEN_LADDER_DAYS[attempt - 1],
                 "final_rung": attempt == len(CARMEN_LADDER_DAYS),
-                "draft_id": None,
                 "name": rec.get("name") or "",
+                # Recipient fields for the on-demand draft route (raw company, not the "N/A" label).
+                "email": rec.get("email") or "",
+                "company_raw": rec.get("company") or "",
                 "next_followup": rec.get("next_followup") or "",
                 "new_next_followup": ladder_next.strftime("%Y-%m-%d") if ladder_next else None,
             }
             result["followups_ready"].append(entry)
             if dry_run or not sheet_uuid or _sequencer_already_actioned(sheet_uuid, run_date):
                 continue
-            if _sequencer_draft_recipient(rec):
-                if drafts_created >= MAX_AUTO_DRAFTS_PER_RUN:
-                    # Over the cap: no snooze, no log - same deferral as a capped bury.
-                    drafts_suppressed += 1
-                    continue
-                entry["draft_id"], created = _stage_sequencer_draft(rec, entry["draft_text"])
-                drafts_created += created
             if ladder_next is not None:
                 enqueue_crm_payload(build_crm_payload(
                     "update_snooze", sheet_uuid=sheet_uuid,
@@ -5672,20 +5669,14 @@ def run_followup_sequencer(today=None, dry_run=False):
             entry = {
                 "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
                 "attempt": attempt, "draft_text": build_followup_bump_draft(rec, attempt),
-                "sheet_tab": rec.get("sheet_tab"), "draft_id": None,
+                "sheet_tab": rec.get("sheet_tab"),
                 "name": rec.get("name") or "",
                 "next_followup": rec.get("next_followup") or "", "new_next_followup": new_nf,
+                "email": rec.get("email") or "", "company_raw": rec.get("company") or "",
             }
             result["followups_ready"].append(entry)
             if dry_run or already or not sheet_uuid:
                 continue
-            if _sequencer_draft_recipient(rec):
-                if drafts_created >= MAX_AUTO_DRAFTS_PER_RUN:
-                    # Over the cap: no snooze, no log - same deferral as a capped bury.
-                    drafts_suppressed += 1
-                    continue
-                entry["draft_id"], created = _stage_sequencer_draft(rec, entry["draft_text"])
-                drafts_created += created
             enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=new_nf))
             _record_sequencer_action(sheet_uuid, run_date, action)
 
@@ -5740,8 +5731,6 @@ def run_followup_sequencer(today=None, dry_run=False):
     # left unwritten by the cap. Never nonzero on its own (it implies buried > 0), so the card's
     # all-empty early return stays correct.
     result["counts"]["buries_suppressed"] = buries_suppressed
-    # Likewise a subset of followups_ready: rows listed but not drafted (or snoozed) by the cap.
-    result["counts"]["drafts_suppressed"] = drafts_suppressed
     # And a subset of killed: ghosts listed but left in Carmen Cold by MAX_AUTO_KILLS_PER_RUN.
     result["counts"]["kills_suppressed"] = kills_suppressed
     return result
@@ -5803,7 +5792,8 @@ def render_followup_needs_card(result, on_demand=False):
                 f"💼 <b>{who}</b> — {company} · #{html.escape(str(e.get('attempt', 1)))} · due {due} → {step}"
                 f" · 🆔 <code>{html.escape(_seq_id_tag(e))}</code>"
             )
-        # Draft text and Gmail links live on /followups, not here - this card stays a scannable list.
+        # Draft text and the on-demand Gmail links live on /followups, not here - this card stays a
+        # scannable list, and no draft exists until Kevin clicks one there.
         queue_url = html.escape(f"{BASE_URL}/followups", quote=True)
         lines.append(f"📋 <a href='{queue_url}'>Open Follow-up Queue</a>")
         # No full-sheet_uuid 🆔 line and no swipe legend: this card holds N entries in one message,
@@ -5811,13 +5801,6 @@ def render_followup_needs_card(result, on_demand=False):
         # silently act on entry #1. Swipes here fail cleanly instead; actions carry their own id.
         lines.append("<i>Swipe-replies don't work on this card - act via the 📋 links, or "
                      "<code>/replied &lt;id&gt;</code> · <code>/interview &lt;id&gt;</code> with the 🆔 above.</i>")
-        drafts_suppressed = counts.get("drafts_suppressed", 0)
-        if drafts_suppressed:
-            # Rows without an ✉️ link are a mix of no-email rows and capped ones - say which.
-            lines.append(
-                f"🛑 <i>{drafts_suppressed} of these were withheld by the draft cap "
-                f"(max {MAX_AUTO_DRAFTS_PER_RUN}/run): no Gmail draft and not snoozed — re-run to process the rest.</i>"
-            )
 
     promote = result.get("ready_to_promote", [])
     if promote:
@@ -5923,8 +5906,6 @@ def render_followup_needs_card(result, on_demand=False):
     )
     if counts.get("buries_suppressed", 0):
         summary += f" · {counts['buries_suppressed']} buries capped"
-    if counts.get("drafts_suppressed", 0):
-        summary += f" · {counts['drafts_suppressed']} drafts capped"
     for key, label in (("ready_to_promote", "to promote"), ("revived", "revived"), ("killed", "killed")):
         if counts.get(key, 0):
             summary += f" · {counts[key]} {label}"
@@ -5951,8 +5932,9 @@ def save_followup_queue_snapshot(run_date, result):
     older than FOLLOWUP_SNAPSHOT_RETENTION_DAYS so the table stays bounded.
 
     The page cannot recompute: this run's own snoozes push every listed row's Next Followup Date
-    into the future within seconds, so a later dry_run finds nothing due - and draft_id exists only
-    in this result. Never raises; a failed save must not block the card.
+    into the future within seconds, so a later dry_run finds nothing due. The saved entries are
+    also what GET /followups/draft/<sheet_uuid> drafts from. Never raises; a failed save must not
+    block the card.
     """
     try:
         cutoff = (datetime.strptime(run_date, "%Y-%m-%d")
@@ -8900,9 +8882,9 @@ def followup_queue_view():
     """The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail
     links for each person to nudge, plus the applications going quiet.
 
-    Renders today's saved sequencer result and never recomputes. A GET must not write, and a
-    dry_run recompute would be wrong anyway: the 7:30 run's snoozes have already pushed these rows
-    into the future, and draft_id exists only in that run's result.
+    Renders today's saved sequencer result and never recomputes: the 7:30 run's snoozes have
+    already pushed these rows into the future, so a recompute would find nothing due. This page
+    writes nothing; its "Open in Gmail" links go to followup_draft_on_demand(), which does.
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
     title = f"Follow-up Queue · {today_str}"
@@ -8934,9 +8916,12 @@ def followup_queue_view():
                 f'<button class="btn btn-secondary" onclick="copyField(\'{field_id}\')" '
                 f'style="border: none; cursor: pointer;">📋 Copy Draft</button>'
             )
-            if e.get("draft_id"):
-                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{e['draft_id']}", quote=True)
-                links += f'<a class="btn btn-primary" href="{draft_url}" target="_blank">✉️ Open Draft</a>'
+            no_address_note = ""
+            if e.get("sheet_uuid") and _sequencer_draft_recipient(e):
+                open_url = html.escape(f"/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}", quote=True)
+                links += f'<a class="btn btn-primary" href="{open_url}" target="_blank">✉️ Open in Gmail</a>'
+            else:
+                no_address_note = "<p class='meta'><i>No verified address on file - copy the draft and send it by hand.</i></p>"
             parts.append(
                 f"<h3 style='margin-top: 24px;'>{html.escape(who)} — {html.escape(company)}</h3>"
                 f"<p class='meta'>Follow-up #{html.escape(str(e.get('attempt', 1)))} · "
@@ -8945,6 +8930,7 @@ def followup_queue_view():
                 f'<textarea id="{field_id}" rows="10" style="width: 100%;" readonly>'
                 f"{html.escape(str(e.get('draft_text') or ''))}</textarea>"
                 f'<div style="margin-top: 10px;">{links}</div>'
+                f"{no_address_note}"
             )
 
     if quiet:
@@ -8974,6 +8960,67 @@ def followup_queue_view():
             + "".join(rows_html) + "</table>"
         )
     return _followups_page(title, "".join(parts)), 200
+
+def _followup_copy_page(title, reason, draft_text, status):
+    """The fallback for an on-demand draft that could not be created: the reason, and the text to
+    copy by hand. Always a real page, never a bare error."""
+    return _followups_page(title, (
+        f"<h2>{html.escape(title)}</h2>"
+        f"<p class='meta'>⚠️ {html.escape(reason)}</p>"
+        f'<textarea id="draft-0" rows="12" style="width: 100%;" readonly>{html.escape(draft_text)}</textarea>'
+        '<div style="margin-top: 10px;"><button class="btn btn-secondary" onclick="copyField(\'draft-0\')" '
+        'style="border: none; cursor: pointer;">📋 Copy Draft</button>'
+        '<a class="btn btn-secondary" href="/followups">← Back to queue</a></div>'
+    )), status
+
+@app.route("/followups/draft/<sheet_uuid>", methods=["GET"])
+def followup_draft_on_demand(sheet_uuid):
+    """Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it.
+
+    A GET that writes, deliberately, so it works as a plain link. It is bounded three ways: it only
+    drafts an entry in TODAY's saved snapshot (never recomputes), a blank or bracketed address is
+    refused before anything reaches Gmail, and a repeat click finds the draft the first click made
+    and redirects to it rather than creating another. It never sends.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    result = load_followup_queue_snapshot(today_str) or {}
+    entry = next((e for e in result.get("followups_ready") or []
+                  if e.get("sheet_uuid") and e.get("sheet_uuid") == sheet_uuid), None)
+    if entry is None:
+        return _followups_page("Follow-up not found", (
+            "<h2>Follow-up not found</h2>"
+            "<p class='meta'>That follow-up is not in today's queue. Links only work on the day "
+            "the 7:30 sequencer listed them.</p>"
+            '<a class="btn btn-secondary" href="/followups">← Back to queue</a>'
+        )), 404
+
+    who = str(entry.get("name") or entry.get("role") or entry.get("company") or "this follow-up")
+    title = f"Follow-up draft · {who}"
+    draft_text = str(entry.get("draft_text") or "")
+    record = {
+        "sheet_uuid": sheet_uuid,
+        "email": entry.get("email"),
+        "company": entry.get("company_raw", entry.get("company")),
+        "title": entry.get("role") or "",
+    }
+    email = _sequencer_draft_recipient(record)
+    if not email:
+        return _followup_copy_page(title, "No verified address on file - copy the draft and send it by hand.",
+                                   draft_text, 200)
+
+    # A repeat click is answered here, before create_gmail_draft(): its own duplicate path would
+    # also return the id, but it pings Telegram with "Draft Already Exists", which is noise from a
+    # browser click.
+    existing = check_existing_gmail_draft(email, _sequencer_draft_subject(record))
+    draft_id = existing["draft_id"] if existing and existing.get("draft_id") else None
+    reason = ""
+    if not draft_id:
+        # Branch on draft_id, not on success: a duplicate comes back as ok=False with a real id.
+        draft_id, _created, reason = _stage_sequencer_draft(record, draft_text)
+    if draft_id:
+        return redirect(f"https://mail.google.com/mail/u/0/#drafts/{urllib.parse.quote(str(draft_id), safe='')}", 302)
+    return _followup_copy_page(title, f"Gmail draft not created: {reason}. Copy the text below instead.",
+                               draft_text, 502)
 
 @app.route("/stage/<short_id>", methods=["GET"])
 def desktop_stage_view(short_id):
