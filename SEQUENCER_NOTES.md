@@ -76,9 +76,28 @@ ahead of the 08:30 standup digest):
 | Sequencer decision | What the job does | Automatic? |
 |--------------------|-------------------|------------|
 | `bury_ghosted` | `append_note` `[reason: ghosted]` **then** `update_status` → `Died` (via the durable CRM outbox) | **YES — the only automatic Sheet write.** Surfaced in the card's "Buried overnight" section so it is never silent. |
-| `send_followup_1` / `send_followup_2` | Draft is built from the `followup_bumps` template bank and **queued onto the morning card** (tap-to-copy). When the row has a real email, the same text is staged as a **Gmail draft** (✉️ Open Draft link on the card; max `MAX_AUTO_DRAFTS_PER_RUN` per run, overflow left unsnoozed so it drafts on a later pass). Next Followup Date is advanced via `update_snooze` so the row can't re-fire. **No email is ever sent.** | Draft + snooze are automatic (never under `/queue`); **the send itself is approval-gated** — you open the draft and send it. |
+| due follow-up — **PEOPLE row** (Carmen Cold, 4/11/21 ladder) | Bump text is built from the template bank and listed under the card's "Nudge these people". When the row has a real email, the same text is staged as a **Gmail draft** (max `MAX_AUTO_DRAFTS_PER_RUN` per run, overflow left unsnoozed so it drafts on a later pass). Next Followup Date advances via `update_snooze`. **No email is ever sent.** | Draft + snooze are automatic (never under `/queue`); **the send itself is approval-gated** — open the draft from `/followups` and send it. |
+| `send_followup_1` / `send_followup_2` — **JOBS row** (Tetiana Cold/Warm, Clavicular) | Listed under the card's "Applications going quiet" as status only: applied date, days silent, severity dot, buries-on date, 📋 link to `/stage`. **No bump text, no Gmail draft.** Next Followup Date still advances via `update_snooze`. | Snooze is automatic — it must be, or the +16 bury is never reached. |
 | `stale_nudge` | Listed in the card's "Going cold" section. | No write at all. |
 | top-3 `Matched` by Fit Score | Listed in the card's "Top 3 untouched matches" section. | No write at all. |
+
+**Why applications don't draft.** Carmen Cold holds real people with real addresses. A JOBS
+row's Contact Email is often Kevin's own address (no human was resolved) or a contact already
+tracked in Carmen Cold, so a bump drafted from it is undeliverable or a duplicate. Applications
+are for watching; people are for messaging.
+
+**The card and `/followups`.** The 07:30 card is a scannable list: one line per person
+(role or name — company · #attempt · due → next · 🆔 short_id) and one per application. It
+carries no draft text and no Gmail links. A single 📋 link opens `GET /followups`, which shows
+each person's full draft in a readonly textarea with a Copy button and, when a draft was
+staged, an ✉️ Open Draft link, followed by the applications table.
+
+`/followups` renders **the 07:30 run's saved result** (`followup_queue_snapshot`, one row per
+`run_date`, pruned after 14 days; it lives in `jobs_cache.db` on the mounted disk, so it
+survives deploys). It never recomputes: within seconds of the run, its own snoozes push every
+listed row's Next Followup Date into the future, so a later scan finds nothing due, and
+`draft_id` exists only in that run's result. With no snapshot for today the page says "no
+queue for today yet" rather than showing a misleading recompute.
 
 `/queue` runs the identical scan with `dry_run=True`: **zero** enqueues, **zero** bury,
 **zero** snooze advancement, **zero** `followup_sequencer_log` writes — it only renders the
@@ -139,9 +158,11 @@ list (one-line change, called out here).
 - **The morning card is one message, not per-row swipe cards.** The spec asks for the "swipe-
   reply card format … approve/send with the commands that already exist" *and* "a single
   Telegram message". Per-row reply-mappable cards would be several messages. Resolution: one
-  message, each follow-up rendered card-style (💼 role — company · #attempt · 🆔 short_id) with
-  the draft in a tap-to-copy `<code>` block, and each row carries its `short_id` so `/replied
-  <id>` / `/interview <id>` (which need no reply context) work directly. `bury_ghosted` and
+  message, one line per row (drafts live on `/followups`), and each row carries its `short_id`
+  so `/replied <id>` / `/interview <id>` (which need no reply context) work directly. The card
+  deliberately carries **no full `sheet_uuid`**: swipe-reply recovery takes the first UUID in a
+  message, so a swipe on a multi-row card would silently act on row #1. Swipes fail cleanly
+  instead. `bury_ghosted` and
   the Died move are still done automatically; the card only *reports* them.
 - **`short_id`** comes from a new `get_short_id_by_sheet_uuid()` (reverse of the existing
   `get_sheet_uuid_by_short_id`). Rows with no local `jobs`-cache entry fall back to an

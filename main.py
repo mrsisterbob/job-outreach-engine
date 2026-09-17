@@ -861,6 +861,14 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (sheet_uuid, run_date)
         )""")
+        # One row per sequencer run: the full result GET /followups renders. See
+        # save_followup_queue_snapshot for why the page reads this instead of recomputing.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS followup_queue_snapshot (
+            run_date TEXT PRIMARY KEY,
+            payload_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
 
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -5305,7 +5313,12 @@ def _stage_sequencer_draft(record, draft_text):
 
 def run_followup_sequencer(today=None, dry_run=False):
     """Scan Tetiana Cold/Warm + Clavicular via get_followups, run followup_action() on every row,
-    and return a structured plan: followups_ready / going_cold / buried / top_matched / counts.
+    and return a structured plan: followups_ready / applications_quiet / going_cold / buried /
+    top_matched / counts.
+
+    Due follow-ups split by tab: PEOPLE rows (Carmen Cold) land in followups_ready with bump text
+    and a Gmail draft; JOBS rows land in applications_quiet as status only - no text, no draft -
+    but are still snoozed and logged so the +4/+9/+16 clock (and the +16 bury) keeps advancing.
 
     Unless dry_run: queues a +window snooze via update_snooze for each drafted follow-up, buries
     each ghosted row (append_note '[reason: ghosted]' + update_status -> Died), and records each
@@ -5318,7 +5331,7 @@ def run_followup_sequencer(today=None, dry_run=False):
 
     Buries are capped at MAX_AUTO_BURIES_PER_RUN per pass (see counts["buries_suppressed"]).
 
-    Unless dry_run, each follow-up with a real email is also staged as a Gmail draft (never sent)
+    Unless dry_run, each PEOPLE follow-up with a real email is also staged as a Gmail draft (never sent)
     and its id stored as entry["draft_id"] (None otherwise). Drafts are capped at
     MAX_AUTO_DRAFTS_PER_RUN; a row over the cap is neither snoozed nor logged, so it stays due and
     drafts on a later pass (see counts["drafts_suppressed"]).
@@ -5339,7 +5352,8 @@ def run_followup_sequencer(today=None, dry_run=False):
                 seen_uuids.add(uuid_val)
             records.append({**rec, "sheet_tab": tab_name})
 
-    result = {"followups_ready": [], "going_cold": [], "buried": [], "top_matched": [], "counts": {}}
+    result = {"run_date": run_date, "followups_ready": [], "applications_quiet": [], "going_cold": [],
+              "buried": [], "top_matched": [], "counts": {}}
     buries_written = 0
     buries_suppressed = 0
     drafts_created = 0
@@ -5390,6 +5404,9 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "sheet_tab": rec.get("sheet_tab"),
                 "ladder_day": CARMEN_LADDER_DAYS[attempt - 1],
                 "draft_id": None,
+                "name": rec.get("name") or "",
+                "next_followup": rec.get("next_followup") or "",
+                "new_next_followup": ladder_next.strftime("%Y-%m-%d") if ladder_next else None,
             }
             result["followups_ready"].append(entry)
             if dry_run or not sheet_uuid or _sequencer_already_actioned(sheet_uuid, run_date):
@@ -5447,10 +5464,33 @@ def run_followup_sequencer(today=None, dry_run=False):
 
         if action in ("send_followup_1", "send_followup_2"):
             attempt = 1 if action == "send_followup_1" else 2
+            base = anchor or today
+            push_days = FOLLOWUP_2_DAYS if attempt == 1 else FOLLOWUP_BURY_DAYS
+            new_nf = (base + timedelta(days=push_days)).strftime("%Y-%m-%d")
+            if rec.get("sheet_tab") not in SEQUENCER_PEOPLE_SCHEMA_TABS:
+                # A job application is watched, not messaged: its Contact Email is often Kevin's own
+                # address or a contact already tracked in Carmen Cold, so no bump text and no Gmail
+                # draft. The snooze still advances, or the +16 bury would never be reached.
+                result["applications_quiet"].append({
+                    "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
+                    "sheet_tab": rec.get("sheet_tab"), "attempt": attempt,
+                    "date_added": rec.get("date_added") or "",
+                    "next_followup": rec.get("next_followup") or "",
+                    "new_next_followup": new_nf,
+                    "days_silent": days_since,
+                    "buries_on": (anchor + timedelta(days=FOLLOWUP_BURY_DAYS)).strftime("%Y-%m-%d") if anchor else None,
+                })
+                if dry_run or already or not sheet_uuid:
+                    continue
+                enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=new_nf))
+                _record_sequencer_action(sheet_uuid, run_date, action)
+                continue
             entry = {
                 "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
                 "attempt": attempt, "draft_text": build_followup_bump_draft(rec, attempt),
                 "sheet_tab": rec.get("sheet_tab"), "draft_id": None,
+                "name": rec.get("name") or "",
+                "next_followup": rec.get("next_followup") or "", "new_next_followup": new_nf,
             }
             result["followups_ready"].append(entry)
             if dry_run or already or not sheet_uuid:
@@ -5462,9 +5502,6 @@ def run_followup_sequencer(today=None, dry_run=False):
                     continue
                 entry["draft_id"], created = _stage_sequencer_draft(rec, entry["draft_text"])
                 drafts_created += created
-            base = anchor or today
-            push_days = FOLLOWUP_2_DAYS if attempt == 1 else FOLLOWUP_BURY_DAYS
-            new_nf = (base + timedelta(days=push_days)).strftime("%Y-%m-%d")
             enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=new_nf))
             _record_sequencer_action(sheet_uuid, run_date, action)
 
@@ -5512,7 +5549,8 @@ def run_followup_sequencer(today=None, dry_run=False):
             "sheet_uuid": su, "fit_score": _parse_fit_score(r.get("raw_priority")),
         })
 
-    result["counts"] = {k: len(result[k]) for k in ("followups_ready", "going_cold", "buried", "top_matched")}
+    result["counts"] = {k: len(result[k]) for k in ("followups_ready", "applications_quiet", "going_cold",
+                                                     "buried", "top_matched")}
     # Not a section length like the four above: how many of result["buried"] were reported but
     # left unwritten by the cap. Never nonzero on its own (it implies buried > 0), so the card's
     # all-empty early return stays correct.
@@ -5524,6 +5562,24 @@ def run_followup_sequencer(today=None, dry_run=False):
 def _seq_id_tag(entry):
     """short_id for /replied /interview, falling back to a sheet_uuid stub, or an em dash."""
     return entry.get("short_id") or (str(entry.get("sheet_uuid") or "")[:8]) or "—"
+
+def _followup_date_label(value, blank="—"):
+    """A CRM date for display: the 1970-01-01 "unscheduled" sentinel and blanks read as `blank`."""
+    text = str(value or "").strip()
+    return blank if (not text or is_followup_unscheduled(text)) else text
+
+def _silence_dot(days):
+    """Severity dot for an application's silence, on the job card's fit-dot idiom. The bands
+    track the 4/9/16 JOBS ladder: red means the +16 bury is at most a day away."""
+    if not isinstance(days, int):
+        return "⚪"
+    if days <= 4:
+        return "🟢"
+    if days <= 9:
+        return "🟡"
+    if days <= 14:
+        return "🟠"
+    return "🔴"
 
 def render_followup_needs_card(result, on_demand=False):
     """Render the single 'needs you today' Telegram message from a run_followup_sequencer() result.
@@ -5542,25 +5598,23 @@ def render_followup_needs_card(result, on_demand=False):
 
     ready = result.get("followups_ready", [])
     if ready:
-        lines.append(f"\n▶ <b>Follow-ups ready ({len(ready)})</b>")
+        lines.append(f"\n▶ <b>Nudge these people ({len(ready)})</b>")
         for e in ready:
-            role = html.escape(str(e.get("role") or "—"))
+            who = html.escape(str(e.get("role") or e.get("name") or "—"))
             company = html.escape(str(e.get("company") or "—"))
-            draft = html.escape(str(e.get("draft_text") or "")[:900])
-            ladder_day = e.get("ladder_day")
-            attempt_tag = f"#{e.get('attempt', 1)}" + (f" · day {ladder_day}" if ladder_day else "")
-            lines.append(f"💼 <b>{role}</b> — {company}  ·  {attempt_tag}  ·  🆔 <code>{html.escape(_seq_id_tag(e))}</code>")
-            if e.get("short_id"):
-                stage_url = html.escape(f"{BASE_URL}/stage/{e['short_id']}", quote=True)
-                lines.append(f"📋 <a href='{stage_url}'>Full Card</a>")
-            if e.get("draft_id"):
-                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{e['draft_id']}", quote=True)
-                lines.append(f"✉️ <a href='{draft_url}'>Open Draft</a>")
-            lines.append(f"<code>{draft}</code>")
+            due = html.escape(_followup_date_label(e.get("next_followup")))
+            nxt = html.escape(_followup_date_label(e.get("new_next_followup"), blank="last nudge"))
+            lines.append(
+                f"💼 <b>{who}</b> — {company} · #{html.escape(str(e.get('attempt', 1)))} · due {due} → next {nxt}"
+                f" · 🆔 <code>{html.escape(_seq_id_tag(e))}</code>"
+            )
+        # Draft text and Gmail links live on /followups, not here - this card stays a scannable list.
+        queue_url = html.escape(f"{BASE_URL}/followups", quote=True)
+        lines.append(f"📋 <a href='{queue_url}'>Open Follow-up Queue</a>")
         # No full-sheet_uuid 🆔 line and no swipe legend: this card holds N entries in one message,
         # and _parse_sheet_uuid_from_card_text takes the first UUID it finds, so a swipe-reply would
         # silently act on entry #1. Swipes here fail cleanly instead; actions carry their own id.
-        lines.append("<i>Swipe-replies don't work on this card - act via 📋 Full Card, or "
+        lines.append("<i>Swipe-replies don't work on this card - act via the 📋 links, or "
                      "<code>/replied &lt;id&gt;</code> · <code>/interview &lt;id&gt;</code> with the 🆔 above.</i>")
         drafts_suppressed = counts.get("drafts_suppressed", 0)
         if drafts_suppressed:
@@ -5569,6 +5623,24 @@ def render_followup_needs_card(result, on_demand=False):
                 f"🛑 <i>{drafts_suppressed} of these were withheld by the draft cap "
                 f"(max {MAX_AUTO_DRAFTS_PER_RUN}/run): no Gmail draft and not snoozed — re-run to process the rest.</i>"
             )
+
+    quiet = result.get("applications_quiet", [])
+    if quiet:
+        lines.append(f"\n▶ <b>Applications going quiet ({len(quiet)})</b> <i>— watch only, no drafts</i>")
+        for e in quiet:
+            company = html.escape(str(e.get("company") or "—"))
+            role = html.escape(str(e.get("role") or "—"))
+            days = e.get("days_silent")
+            days_str = f"{days}d silent" if isinstance(days, int) else "? silent"
+            line = (
+                f"{_silence_dot(days)} <b>{company}</b> — {role}"
+                f" · applied {html.escape(_followup_date_label(e.get('date_added')))} · {days_str}"
+                f" · buries {html.escape(_followup_date_label(e.get('buries_on')))}"
+            )
+            if e.get("short_id"):
+                stage_url = html.escape(f"{BASE_URL}/stage/{e['short_id']}", quote=True)
+                line += f" · 📋 <a href='{stage_url}'>Full Card</a>"
+            lines.append(line)
 
     cold = result.get("going_cold", [])
     if cold:
@@ -5608,6 +5680,7 @@ def render_followup_needs_card(result, on_demand=False):
 
     summary = (
         f"\n<b>Summary:</b> {counts.get('followups_ready', 0)} follow-ups · "
+        f"{counts.get('applications_quiet', 0)} applications quiet · "
         f"{counts.get('going_cold', 0)} going cold · {counts.get('buried', 0)} buried · "
         f"{counts.get('top_matched', 0)} top matches"
     )
@@ -5629,17 +5702,58 @@ def _send_telegram_card_chunked(chat_id, text, limit=3900):
     if chunk:
         send_telegram_message(chat_id, chunk)
 
+FOLLOWUP_SNAPSHOT_RETENTION_DAYS = 14
+
+def save_followup_queue_snapshot(run_date, result):
+    """Persist one run's full result under its run_date for GET /followups, and prune snapshots
+    older than FOLLOWUP_SNAPSHOT_RETENTION_DAYS so the table stays bounded.
+
+    The page cannot recompute: this run's own snoozes push every listed row's Next Followup Date
+    into the future within seconds, so a later dry_run finds nothing due - and draft_id exists only
+    in this result. Never raises; a failed save must not block the card.
+    """
+    try:
+        cutoff = (datetime.strptime(run_date, "%Y-%m-%d")
+                  - timedelta(days=FOLLOWUP_SNAPSHOT_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        with get_db_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO followup_queue_snapshot (run_date, payload_json, created_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (run_date, json.dumps(result, default=str))
+            )
+            conn.execute("DELETE FROM followup_queue_snapshot WHERE run_date < ?", (cutoff,))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"[SEQUENCER] Snapshot save failed ({run_date}): {e}")
+        return False
+
+def load_followup_queue_snapshot(run_date):
+    """The saved result for run_date, or None when there is none (or it cannot be read)."""
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM followup_queue_snapshot WHERE run_date = ?", (run_date,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+    except Exception as e:
+        logging.error(f"[SEQUENCER] Snapshot load failed ({run_date}): {e}")
+        return None
+
 def scheduled_followup_sequencer_job():
-    """APScheduler target: nightly follow-up sequencer pass (07:00 local, before the digest).
-    Applies the automatic bury, queues follow-up drafts, and posts the single 'needs you today'
-    card. This is the only morning message at this hour - the standup digest posts at 08:30.
+    """APScheduler target: nightly follow-up sequencer pass (07:30 local, before the digest).
+    Applies the automatic bury, queues follow-up drafts, saves the result for GET /followups,
+    and posts the single 'needs you today' card. This is the only morning message at this hour -
+    the standup digest posts at 08:30.
     """
     logging.info("[SEQUENCER] Nightly follow-up sequencer cycle triggered")
     try:
         result = run_followup_sequencer()
+        save_followup_queue_snapshot(result["run_date"], result)
         c = result["counts"]
         logging.info(
-            f"[SEQUENCER] followups_ready={c['followups_ready']} going_cold={c['going_cold']} "
+            f"[SEQUENCER] followups_ready={c['followups_ready']} "
+            f"applications_quiet={c['applications_quiet']} going_cold={c['going_cold']} "
             f"buried={c['buried']} top_matched={c['top_matched']}"
         )
         if TELEGRAM_CHAT_ID:
@@ -8461,6 +8575,122 @@ def format_ats_plaintext(job, track="a"):
         lines.append(f"- {b}")
 
     return "\n".join(lines).strip()
+
+def _followups_page(title, body_html):
+    """Wrap /followups content in the /stage page's shell: same CSS, same copyField() script."""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{html.escape(title)}</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 40px; background: #f8f9fa; color: #212529; }}
+            .card {{ background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); max-width: 750px; margin: auto; }}
+            h2 {{ color: #1B2A4A; margin-top: 0; }}
+            .btn {{ display: inline-block; padding: 10px 18px; margin-right: 10px; border-radius: 6px; text-decoration: none; font-weight: bold; }}
+            .btn-primary {{ background: #1B2A4A; color: white; }}
+            .btn-secondary {{ background: #e9ecef; color: #333; margin-bottom: 8px; }}
+            .meta {{ color: #444; line-height: 1.5; }}
+            textarea {{ box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; padding: 10px; margin-top: 8px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
+            th, td {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid #e9ecef; vertical-align: top; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            {body_html}
+        </div>
+        <script>
+            function copyField(elementId) {{
+                const textarea = document.getElementById(elementId);
+                textarea.select();
+                textarea.setSelectionRange(0, 99999);
+                navigator.clipboard.writeText(textarea.value);
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+@app.route("/followups", methods=["GET"])
+def followup_queue_view():
+    """The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail
+    links for each person to nudge, plus the applications going quiet.
+
+    Renders today's saved sequencer result and never recomputes. A GET must not write, and a
+    dry_run recompute would be wrong anyway: the 7:30 run's snoozes have already pushed these rows
+    into the future, and draft_id exists only in that run's result.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    title = f"Follow-up Queue · {today_str}"
+    result = load_followup_queue_snapshot(today_str)
+    if result is None:
+        return _followups_page(title, (
+            f"<h2>{html.escape(title)}</h2>"
+            "<p class='meta'>No queue for today yet — the sequencer runs at 7:30.</p>"
+        )), 200
+
+    ready = result.get("followups_ready") or []
+    quiet = result.get("applications_quiet") or []
+    if not ready and not quiet:
+        return _followups_page(title, (
+            f"<h2>{html.escape(title)}</h2>"
+            "<p class='meta'>✅ Queue is clear — nobody to nudge and no applications going quiet.</p>"
+        )), 200
+
+    parts = [f"<h2>{html.escape(title)}</h2>"]
+    if ready:
+        parts.append(f"<h3 style='margin-top: 24px;'>✉️ Nudge These People ({len(ready)})</h3>")
+        for i, e in enumerate(ready):
+            who = str(e.get("role") or e.get("name") or "—")
+            company = str(e.get("company") or "—")
+            due = _followup_date_label(e.get("next_followup"))
+            nxt = _followup_date_label(e.get("new_next_followup"), blank="last nudge")
+            field_id = f"draft-{i}"
+            links = (
+                f'<button class="btn btn-secondary" onclick="copyField(\'{field_id}\')" '
+                f'style="border: none; cursor: pointer;">📋 Copy Draft</button>'
+            )
+            if e.get("draft_id"):
+                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{e['draft_id']}", quote=True)
+                links += f'<a class="btn btn-primary" href="{draft_url}" target="_blank">✉️ Open Draft</a>'
+            parts.append(
+                f"<h3 style='margin-top: 24px;'>{html.escape(who)} — {html.escape(company)}</h3>"
+                f"<p class='meta'>Follow-up #{html.escape(str(e.get('attempt', 1)))} · "
+                f"due {html.escape(due)} → next {html.escape(nxt)} · "
+                f"🆔 <code>{html.escape(_seq_id_tag(e))}</code></p>"
+                f'<textarea id="{field_id}" rows="10" style="width: 100%;" readonly>'
+                f"{html.escape(str(e.get('draft_text') or ''))}</textarea>"
+                f'<div style="margin-top: 10px;">{links}</div>'
+            )
+
+    if quiet:
+        rows_html = []
+        for e in quiet:
+            days = e.get("days_silent")
+            stage = ""
+            if e.get("short_id"):
+                stage_url = html.escape(f"/stage/{e['short_id']}", quote=True)
+                stage = f'<a href="{stage_url}" target="_blank">📋 Full Card</a>'
+            rows_html.append(
+                "<tr>"
+                f"<td>{html.escape(str(e.get('company') or '—'))}</td>"
+                f"<td>{html.escape(str(e.get('role') or '—'))}</td>"
+                f"<td>{html.escape(_followup_date_label(e.get('date_added')))}</td>"
+                f"<td>{_silence_dot(days)} {html.escape(str(days) if isinstance(days, int) else '?')}d</td>"
+                f"<td>{html.escape(_followup_date_label(e.get('buries_on')))}</td>"
+                f"<td>{stage}</td>"
+                "</tr>"
+            )
+        parts.append(
+            f"<h3 style='margin-top: 32px;'>👀 Applications Going Quiet ({len(quiet)})</h3>"
+            "<p class='meta'>Watch only - no drafts. Each is auto-buried to Died on its buries-on date "
+            "unless its status moves.</p>"
+            "<table><tr><th>Company</th><th>Role</th><th>Applied</th><th>Silent</th>"
+            "<th>Buries on</th><th></th></tr>"
+            + "".join(rows_html) + "</table>"
+        )
+    return _followups_page(title, "".join(parts)), 200
 
 @app.route("/stage/<short_id>", methods=["GET"])
 def desktop_stage_view(short_id):
