@@ -16,6 +16,7 @@ const TAB_MAP = {
   "Died": "JOBS",
   "Carmen Cold": "PEOPLE",
   "Carmen Warm": "PEOPLE",
+  "Carmen Hot": "PEOPLE",   // replied contacts promoted by /promote; ALL_TABS derives from this map
   "Killed": "PEOPLE"
 };
 
@@ -144,6 +145,7 @@ function doPost(e) {
     // Accepts payload.row_data as either a structured array or a named object
     if (action === "add_row") {
       const targetTab = payload.target_code === "CW" ? "Carmen Warm" :
+                        payload.target_code === "CH" ? "Carmen Hot" :
                         payload.target_code === "TC" ? "Tetiana Cold" : "Tetiana Cold";
       const sheet = getOrCreateSheet(ss, targetTab);
       const schemaType = TAB_MAP[targetTab] || "JOBS";
@@ -170,6 +172,7 @@ function doPost(e) {
     // Processes multiple Tier-1/Tier-2 pipeline matches under a single lock/execution
     if (action === "batch_add_rows") {
       const targetTab = payload.target_code === "CW" ? "Carmen Warm" :
+                        payload.target_code === "CH" ? "Carmen Hot" :
                         payload.target_code === "CL" ? "Clavicular" : "Tetiana Cold";
       const sheet = getOrCreateSheet(ss, targetTab);
       const schemaType = TAB_MAP[targetTab] || "JOBS";
@@ -221,6 +224,7 @@ function doPost(e) {
     if (action === "quick_add") {
       const targetTab = payload.target_code === "TC" ? "Tetiana Cold" :
                         payload.target_code === "CC" ? "Carmen Cold" :
+                        payload.target_code === "CH" ? "Carmen Hot" :
                         payload.target_code === "CW" ? "Carmen Warm" : "Carmen Warm";
       const sheet = getOrCreateSheet(ss, targetTab);
       const rowData = [
@@ -345,6 +349,7 @@ function doPost(e) {
     if (action === "get_followups") {
       const tabName = payload.tab === "CW" ? "Carmen Warm" :
                       payload.tab === "CC" ? "Carmen Cold" :
+                      payload.tab === "CH" ? "Carmen Hot" :
                       payload.tab === "TC" ? "Tetiana Cold" :
                       payload.tab === "TW" ? "Tetiana Warm" :
                       payload.tab === "CL" ? "Clavicular" : null;
