@@ -5649,8 +5649,8 @@ def scheduled_followup_sequencer_job():
     logging.info("[SEQUENCER] Nightly follow-up sequencer cycle completed")
 
 def start_followup_sequencer():
-    """Register the nightly sequencer on the shared background scheduler (07:00 local, ahead of
-    the 08:30 morning digest). Bury-to-Died is its only automatic write.
+    """Register the nightly sequencer on the shared background scheduler (07:30 local, one hour
+    ahead of the 08:30 morning digest). Bury-to-Died is its only automatic write.
 
     "Local" means America/Detroit, pinned on EMAIL_POLL_SCHEDULER. Render runs UTC, so before
     the pin this fired at 07:00 UTC (03:00 Detroit).
@@ -5659,12 +5659,12 @@ def start_followup_sequencer():
         scheduled_followup_sequencer_job,
         trigger="cron",
         hour=7,
-        minute=0,
+        minute=30,
         id="followup_sequencer",
         max_instances=1,
         coalesce=True,
     )
-    logging.info("[SEQUENCER] Nightly follow-up sequencer scheduled: 07:00 local")
+    logging.info("[SEQUENCER] Nightly follow-up sequencer scheduled: 07:30 local")
 
 def edit_telegram_message(chat_id, message_id, text):
     """Edit an existing Telegram message in-place instead of sending a redundant new one."""

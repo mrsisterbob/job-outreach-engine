@@ -70,7 +70,7 @@ Followup Date to the *next* boundary, so out-of-order values would skip or repea
 
 ## 3. Automatic vs. approval-gated writes
 
-Per nightly run of `run_followup_sequencer()` (07:00 local, `EMAIL_POLL_SCHEDULER` cron job,
+Per nightly run of `run_followup_sequencer()` (07:30 local, `EMAIL_POLL_SCHEDULER` cron job,
 ahead of the 08:30 standup digest):
 
 | Sequencer decision | What the job does | Automatic? |
@@ -165,7 +165,7 @@ list (one-line change, called out here).
    App URL is unchanged. Until this is live the sequencer sees blank Status/Date Added on
    every row and takes no action (fails safe).
 2. **Python app** — deploy `main.py` / `pipeline_utils.py` as usual. `init_db()` creates
-   `followup_sequencer_log` on boot (`CREATE TABLE IF NOT EXISTS`). The 07:00 job registers
+   `followup_sequencer_log` on boot (`CREATE TABLE IF NOT EXISTS`). The 07:30 job registers
    on the existing `EMAIL_POLL_SCHEDULER` via `start_followup_sequencer()`.
 3. **Env / config** — nothing new.
 
@@ -173,7 +173,7 @@ list (one-line change, called out here).
 
 | Command | What |
 |---------|------|
-| `/queue` | **New.** Read-only preview of what the nightly sequencer would do — no writes, no bury, no snooze advancement. Same card as the 07:00 message, labelled "Queue Preview · read-only". Added to the `/`-help TELEMETRY list. |
+| `/queue` | **New.** Read-only preview of what the nightly sequencer would do — no writes, no bury, no snooze advancement. Same card as the 07:30 message, labelled "Queue Preview · read-only". Added to the `/`-help TELEMETRY list. |
 
 ## 8. Tests
 
