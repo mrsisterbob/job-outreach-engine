@@ -811,6 +811,13 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_application_outcomes_sheet_uuid ON application_outcomes(sheet_uuid)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_application_outcomes_status ON application_outcomes(status)")
+        # posted_hours arrived after application_outcomes was already carrying rows in production,
+        # so it has to be an ALTER, not a widened CREATE TABLE - Render's DB is never recreated and
+        # CREATE TABLE IF NOT EXISTS is a no-op against an existing table. PRAGMA-guarded because
+        # SQLite has no ADD COLUMN IF NOT EXISTS and init_db runs on every boot.
+        outcome_columns = {row[1] for row in conn.execute("PRAGMA table_info(application_outcomes)")}
+        if "posted_hours" not in outcome_columns:
+            conn.execute("ALTER TABLE application_outcomes ADD COLUMN posted_hours INTEGER")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS email_enrichment_attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1252,10 +1259,15 @@ def get_metric_count(event_type):
         logging.error(f"DB Metric Count Error ({event_type}): {e}")
         return 0
 
-def record_application_outcome(sheet_uuid, status, company=None, role=None, source=None, outreach_path=None):
+def record_application_outcome(sheet_uuid, status, company=None, role=None, source=None, outreach_path=None, posted_hours=None):
     """Append an application_outcomes row (event-sourced, one row per transition) so /outcomes and
     the Tuesday hub can compute evidence-based reply/interview rates and time-to-response, instead
-    of relying on gut-feel. status is one of: applied, interview, rejection, offer, withdrawn.
+    of relying on gut-feel. status is one of: applied, interview, rejection, offer, withdrawn,
+    dead_link.
+
+    posted_hours is the posting's age when it was carded (see get_posted_hours_at_card), stored on
+    the row rather than recomputed at read time: the listing keeps aging after the swipe, and
+    /decoys needs the age Kevin actually acted on, not the age today.
     """
     if not sheet_uuid:
         return False
@@ -1263,15 +1275,150 @@ def record_application_outcome(sheet_uuid, status, company=None, role=None, sour
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "INSERT INTO application_outcomes (sheet_uuid, company, role, source, outreach_path, status) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (sheet_uuid, company, role, source, outreach_path, status)
+                "INSERT INTO application_outcomes (sheet_uuid, company, role, source, outreach_path, status, posted_hours) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sheet_uuid, company, role, source, outreach_path, status, posted_hours)
             )
             conn.commit()
         return True
     except Exception as e:
         logging.error(f"Application Outcome Record Error ({sheet_uuid}, {status}): {e}")
         return False
+
+def get_posted_hours_at_card(sheet_uuid):
+    """The posting's age in hours at the moment its card was sent, or None if it cannot be derived.
+
+    Reconstructed from the cached row - jobs.created_at IS the carding timestamp - rather than read
+    off a field stamped at card-send time, so it works retroactively against every job already in
+    the cache instead of only cards sent after this shipped.
+
+    Two deliberate Nones: a job carrying no job_posted_at_datetime_utc, and a job no longer in the
+    cache. Either could be filled with parse_posted_hours' fail-open 48, and either would then put
+    a number nothing measured into the /decoys median. An absent age is honest; an invented one
+    would make the report confidently wrong.
+    """
+    if not sheet_uuid:
+        return None
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT job_json, created_at FROM jobs WHERE sheet_uuid = ?", (sheet_uuid,))
+            row = cursor.fetchone()
+    except Exception as e:
+        logging.error(f"DB Read Error (posted hours at card, {sheet_uuid}): {e}")
+        return None
+    if not row:
+        return None
+    try:
+        job = json.loads(row[0]) if row[0] else {}
+        posted_raw = job.get("job_posted_at_datetime_utc")
+        if not posted_raw:
+            return None
+        posted_dt = datetime.fromisoformat(str(posted_raw).replace("Z", "+00:00"))
+        # SQLite's CURRENT_TIMESTAMP is UTC but writes no offset, so it parses naive - attach UTC
+        # explicitly rather than letting the subtraction blow up on mixed awareness.
+        carded_dt = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+        if carded_dt.tzinfo is None:
+            carded_dt = carded_dt.replace(tzinfo=timezone.utc)
+        # Clamped at 0: a board that stamps a posting slightly in the future should read "brand
+        # new", not as a negative age dragging the median below anything that can exist.
+        return max(0, int((carded_dt - posted_dt).total_seconds() / 3600))
+    except Exception as e:
+        logging.error(f"Posted-hours-at-card parse error ({sheet_uuid}): {e}")
+        return None
+
+def _median_or_none(values):
+    """Median of a numeric list, or None when it is empty - no data is not a median of zero."""
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    mid = len(ordered) // 2
+    return float(ordered[mid]) if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+def get_decoy_metrics():
+    """Aggregate application_outcomes into per-source decoy rates for /decoys.
+
+    A decoy is a posting that was already dead when Kevin opened the card - aggregators resell
+    expired inventory, and the only way to learn which feed does it worst (and so which one to drop
+    from the Sheet config) is to count. The rate is dead_link rows over ALL rows carrying that
+    source, so 1-of-2 is not ranked beside 1-of-40 as though they were the same evidence.
+
+    The paired medians answer the follow-on question: if dead cards are consistently far older at
+    carding than surviving ones, the fix is an age gate, not dropping a source.
+    """
+    by_source = {}
+    dead_ages, live_ages = [], []
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT source, status, posted_hours FROM application_outcomes")
+            rows = cursor.fetchall()
+    except Exception as e:
+        logging.error(f"Decoy Metrics Read Error: {e}")
+        rows = []
+
+    for source, status, posted_hours in rows:
+        source = source or "unknown"
+        is_dead = status == "dead_link"
+        stats = by_source.setdefault(source, {"total": 0, "dead": 0, "decoy_rate": 0.0})
+        stats["total"] += 1
+        if is_dead:
+            stats["dead"] += 1
+        if posted_hours is not None:
+            (dead_ages if is_dead else live_ages).append(posted_hours)
+
+    for stats in by_source.values():
+        stats["decoy_rate"] = (stats["dead"] / stats["total"]) * 100 if stats["total"] else 0.0
+
+    return {
+        "total_rows": sum(s["total"] for s in by_source.values()),
+        "total_dead": sum(s["dead"] for s in by_source.values()),
+        "by_source": by_source,
+        "median_dead_posted_hours": _median_or_none(dead_ages),
+        "median_live_posted_hours": _median_or_none(live_ages),
+    }
+
+def format_decoy_metrics_message():
+    """Render get_decoy_metrics() into one HTML Telegram message for /decoys.
+
+    Deliberately reads as instructions on an empty table, because that is the first thing Kevin
+    will see: a report printing 0.0% everywhere before a single /dead exists looks like a measured
+    result, and not mistaking an absent measurement for a good one is the whole point of the
+    command.
+    """
+    metrics = get_decoy_metrics()
+    lines = ["💀 <b>Decoy Rate by Source</b>\n"]
+
+    if not metrics["total_rows"]:
+        lines.append("No outcome rows recorded yet - nothing to measure.")
+        lines.append("")
+        lines.append("Swipe-reply <code>/dead</code> on any card whose posting has already expired. "
+                     "Each one records its source and how old the posting was when it was carded; "
+                     "come back once a handful have landed.")
+        return "\n".join(lines)
+
+    lines.append(f"🧮 <b>Dead links:</b> {metrics['total_dead']} of {metrics['total_rows']} outcome rows")
+    lines.append("")
+
+    if metrics["total_dead"]:
+        # Worst offender first: this list exists to pick a source to drop, so the answer belongs on
+        # line one. Ties break on volume, since the larger sample is the more actionable one.
+        lines.append("<b>By Source (dead / total):</b>")
+        ranked = sorted(metrics["by_source"].items(), key=lambda kv: (-kv[1]["decoy_rate"], -kv[1]["total"], kv[0]))
+        for source, stats in ranked:
+            lines.append(f"• {html.escape(source)}: {stats['dead']}/{stats['total']} ({stats['decoy_rate']:.1f}%)")
+    else:
+        lines.append("<b>By Source:</b> no <code>/dead</code> marks yet across "
+                     f"{len(metrics['by_source'])} source(s) - nothing has been reported as a decoy.")
+
+    lines.append("")
+    lines.append("<b>Posting age when carded (median):</b>")
+    dead_median = metrics["median_dead_posted_hours"]
+    live_median = metrics["median_live_posted_hours"]
+    lines.append(f"• Dead: {dead_median:.0f}h" if dead_median is not None else "• Dead: no aged rows yet")
+    lines.append(f"• Not dead: {live_median:.0f}h" if live_median is not None else "• Not dead: no aged rows yet")
+
+    return "\n".join(lines)
 
 def get_outcome_metrics():
     """Aggregate application_outcomes into evidence-based conversion metrics:
@@ -2646,7 +2793,10 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     # Posting freshness. get_age_badge() already computes this for the card; feeding it into the
     # score too means a role posted yesterday outranks an identical one going stale, which is the
     # closest cheap proxy for "winnable" the pipeline has.
-    posted_hours = parse_posted_hours(job)
+    # Pass the timestamp FIELD, not the job dict: parse_posted_hours fails open to 48 on anything
+    # it cannot parse, so handing it the dict silently scored every listing as exactly 48h old -
+    # the +8 bonus fired on all of them and the >=720h penalty never once fired.
+    posted_hours = parse_posted_hours(job.get("job_posted_at_datetime_utc"))
     if posted_hours is not None:
         if posted_hours <= 72:
             bonus += 8
@@ -6281,7 +6431,7 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
         f"📋 <a href='{stage_url}'>Full Card</a> - bullets, LinkedIn note, draft, links, PDF\n"
         f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>{html.escape(sheet_tab)}</code> · 🧭 <code>{routing_tag}</code>\n\n"
         f"⚡ <code>/apply</code> <code>/draft</code> <code>/warm</code> <code>/cold</code> "
-        f"<code>/x</code> <code>/f</code> <code>/n</code> <code>/e</code> <code>/eh</code> · <code>/help</code>"
+        f"<code>/x</code> <code>/dead</code> <code>/f</code> <code>/n</code> <code>/e</code> <code>/eh</code> · <code>/help</code>"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -6309,7 +6459,7 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
 
 def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid):
     """Lean /w warm-radar card: no AI fit score, no fit reason, no tailored outreach copy - just
-    the role, the warm contact it maps to, and Apply. Swipe-replies (/apply, /x, /n, /f) resolve
+    the role, the warm contact it maps to, and Apply. Swipe-replies (/apply, /dead, /x, /n, /f) resolve
     against the Clavicular tab via the embedded 🆔 marker, exactly like a Clavicular pipeline card.
     """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -6325,7 +6475,7 @@ def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid):
         f"🔗 <a href='{apply_link}'>Apply</a>\n"
         f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>Clavicular</code>\n\n"
         f"⚡ <code>/apply</code> <code>/draft</code> <code>/warm</code> <code>/cold</code> "
-        f"<code>/x</code> <code>/f</code> <code>/n</code> <code>/e</code> <code>/eh</code> · <code>/help</code>"
+        f"<code>/x</code> <code>/dead</code> <code>/f</code> <code>/n</code> <code>/e</code> <code>/eh</code> · <code>/help</code>"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -8082,6 +8232,10 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, format_outcome_metrics_message())
             return
 
+        if text == "/decoys":
+            send_telegram_message(chat_id, format_decoy_metrics_message())
+            return
+
         if text in ("/treplies", "/templatereplies"):
             send_telegram_message(chat_id, format_template_reply_rates_message())
             return
@@ -8154,7 +8308,7 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, update_res)
                 return
 
-        # 9. Swipe-Reply CRM Actions (/f, /n, /apply, /warm, /cold, /x, /e) - require reply context
+        # 9. Swipe-Reply CRM Actions (/f, /n, /apply, /dead, /warm, /cold, /x, /e) - require reply context
         if text.startswith("/f ") or text == "/f":
             mapping = resolve_reply_mapping(msg, chat_id, "/f")
             if not mapping:
@@ -8560,6 +8714,41 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status="Applied"))
             return
 
+        if text == "/dead":
+            # Decoy report: the posting was already gone when Kevin opened the card. Aggregators
+            # resell expired inventory, so this exists to MEASURE which source does it (see
+            # /decoys) - live URL-checking was tried and rejected, since Indeed answers 403 for a
+            # dead posting and for its own home page alike and cannot tell them apart.
+            mapping = resolve_reply_mapping(msg, chat_id, "/dead")
+            if not mapping:
+                return
+            sheet_uuid = mapping["sheet_uuid"]
+            job = get_job_by_sheet_uuid(sheet_uuid)
+            company = mapping.get("contact_company") or job.get("employer_name")
+            # Resolved before the write so a cache miss shows up as a missing age on the row rather
+            # than as a silently absent column later.
+            posted_hours = get_posted_hours_at_card(sheet_uuid)
+            marked_date = datetime.now().strftime("%Y-%m-%d")
+            reply_card = msg.get("reply_to_message") or {}
+            if reply_card.get("message_id"):
+                original_text = html.escape(reply_card.get("text", ""))
+                edit_telegram_message(chat_id, reply_card["message_id"], f"{original_text}\n\n💀 <b>Dead link - {marked_date}</b>")
+            # derive_job_source() defaults to "jsearch" for any id it does not recognise, which is
+            # correct for a real jsearch posting and wrong for a card whose cache entry a Render
+            # restart wiped - that would quietly inflate jsearch's decoy count with rows nothing
+            # measured. No job_id, no source: the report buckets those as "unknown" instead.
+            source = derive_job_source(job.get("job_id")) if job.get("job_id") else None
+            age_note = f" · {posted_hours}h old when carded" if posted_hours is not None else " · age unknown"
+            # Measurement only - no CRM write. /dead answers "was this listing real", which is a
+            # different question from what Kevin wants the row to become; /x still kills it.
+            send_telegram_message(chat_id, f"💀 <b>Marked dead</b> - {marked_date}{html.escape(age_note)}")
+            record_application_outcome(
+                sheet_uuid, "dead_link",
+                company=company, role=job.get("job_title"),
+                source=source, posted_hours=posted_hours
+            )
+            return
+
         if text in ("/offer", "/withdraw"):
             mapping = resolve_reply_mapping(msg, chat_id, text)
             if not mapping:
@@ -8756,6 +8945,7 @@ def process_webhook_payload_async(data):
                 "/warm - Smart-route lead to its Warm tab\n"
                 "/cold - Smart-route lead to its Cold tab\n"
                 "/x - Archive lead to Died/Killed tab\n"
+                "/dead - Mark the posting itself expired (decoy) - feeds /decoys\n"
                 "/n - Append timestamped note\n"
                 "/f - Snooze follow-up by [days]\n"
                 "/e <email> - Lock Apollo email override & re-draft\n"
@@ -8783,6 +8973,7 @@ def process_webhook_payload_async(data):
                 "/queries - Per-query yield: which search phrases earn their slot\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
+                "/decoys - Dead-link (expired posting) rate per source\n"
                 "/treplies - View reply rate grouped by outreach & LinkedIn template id (read-only)\n"
                 "/streak, /daily - View daily outreach scorecard\n"
                 "/help - Show this reference"

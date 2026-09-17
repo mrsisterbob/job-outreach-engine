@@ -14,7 +14,7 @@ import re
 import sqlite3
 import tempfile
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes
 
 import pytest
@@ -3984,3 +3984,183 @@ def test_warm_tone_tabs_excludes_the_archive():
     # Killed is archived - a contact parked there should not pull warm copy if ever re-touched.
     assert "Killed" not in m.WARM_TONE_TABS
     assert "Carmen Hot" in m.WARM_TONE_TABS
+
+
+# ---- Posting-freshness scoring (regression: the whole-dict call) ----
+
+_FRESHNESS_BASE_JOB = {
+    "job_title": "Operations Analyst",
+    "job_description": "reconciliation and reporting",
+    "job_city": "troy",
+}
+
+
+def test_freshness_scoring_separates_a_fresh_posting_from_a_stale_one():
+    """parse_posted_hours() takes an ISO string and fails open to 48 on anything else, so handing
+    it the whole job dict scored every listing as exactly 48h old: the +8 bonus fired on all of
+    them and the >=720h -8 penalty could never fire at all.
+
+    Timestamps are built off now() so they cannot rot. Note the 26-day case lands at ~624h, which
+    is past every bonus but short of the 720h penalty line - the -8 branch needs a 31-day posting.
+    """
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    stale = (datetime.now(timezone.utc) - timedelta(days=26)).isoformat()
+    ancient = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+
+    assert m.parse_posted_hours(fresh) != m.parse_posted_hours(stale)
+    assert m.parse_posted_hours(fresh) <= 72        # +8 branch
+    assert 168 < m.parse_posted_hours(stale) < 720  # no freshness modifier at all
+    assert m.parse_posted_hours(ancient) >= 720     # -8 branch
+
+    def bonus_for(posted):
+        _, layer1_bonus = m.calculate_hybrid_score_modifier(
+            dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=posted), 70)
+        return layer1_bonus
+
+    # Freshness is the only thing differing between these jobs, so the gaps are the branch deltas.
+    assert bonus_for(fresh) - bonus_for(stale) == 8       # +8 against nothing
+    assert bonus_for(fresh) - bonus_for(ancient) == 16    # +8 against -8
+
+
+def test_freshness_scoring_fails_open_to_48_hours_without_a_timestamp():
+    """Fail-open is deliberate and stays: ATS feeds routinely omit the posted date, and scoring
+    those as stale would bury exactly the direct-from-employer listings worth the most.
+    """
+    assert m.parse_posted_hours("") == 48
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+
+    def bonus_for(job):
+        _, layer1_bonus = m.calculate_hybrid_score_modifier(job, 70)
+        return layer1_bonus
+
+    fresh_bonus = bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=fresh))
+    # 48 lands in the <=72 bucket, so a dateless posting keeps the same +8 a fresh one earns.
+    assert bonus_for(dict(_FRESHNESS_BASE_JOB)) == fresh_bonus                                 # key absent
+    assert bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc="")) == fresh_bonus  # blank
+    assert bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=None)) == fresh_bonus
+
+
+# ---- /dead decoy marking + /decoys report ----
+
+def test_posted_hours_migration_is_idempotent(monkeypatch, clean_outcomes):
+    """Render's application_outcomes already carries rows, so the column can only arrive by ALTER -
+    and init_db() runs on every boot while SQLite has no ADD COLUMN IF NOT EXISTS."""
+    monkeypatch.setattr(m, "hydrate_filters_from_sheets", lambda: None)
+    monkeypatch.setattr(m, "restore_core_sourcing_filters", lambda: None)
+    m.record_application_outcome("uuid-premigration", "applied", company="Atwell")
+
+    m.init_db()
+    m.init_db()
+
+    with m.get_db_conn() as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(application_outcomes)")]
+        surviving = conn.execute(
+            "SELECT COUNT(*) FROM application_outcomes WHERE sheet_uuid = 'uuid-premigration'").fetchone()[0]
+    assert columns.count("posted_hours") == 1
+    assert surviving == 1  # the pre-existing row was migrated, not recreated away
+
+
+def test_dead_swipe_persists_status_source_and_posted_hours(monkeypatch, clean_outcomes):
+    """Reads the row back out of SQLite rather than trusting the handler's return: the failure mode
+    this guards is a command that reports success to Telegram and persists nothing."""
+    posted = (datetime.now(timezone.utc) - timedelta(hours=300)).isoformat()
+    m.save_job_to_cache("short-dead", {
+        "job_id": "lever_abc123", "employer_name": "Acme Corp", "job_title": "Ops Analyst",
+        "job_posted_at_datetime_utc": posted,
+    }, sheet_uuid="uuid-dead")
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-dead", "sheet_tab": "Tetiana Cold", "contact_name": "", "contact_company": ""})
+    sent, edited = [], []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t: sent.append(t))
+    monkeypatch.setattr(m, "edit_telegram_message", lambda cid, mid, t: edited.append(t) or True)
+    # /dead is measurement, not a CRM transition - it must not move or restatus the row.
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: pytest.fail("/dead must not write to the CRM"))
+
+    _dispatch("/dead", reply_to_message={"message_id": 77, "text": "Ops Analyst"})
+
+    with m.get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT status, source, company, role, posted_hours FROM application_outcomes "
+            "WHERE sheet_uuid = ?", ("uuid-dead",)).fetchone()
+    assert row[0] == "dead_link"
+    assert row[1] == "lever"
+    assert (row[2], row[3]) == ("Acme Corp", "Ops Analyst")
+    assert 299 <= row[4] <= 300  # second-resolution created_at can truncate one hour off
+    assert "Dead link" in edited[0]
+
+
+def test_dead_swipe_records_a_null_age_when_the_posting_carries_no_date(monkeypatch, clean_outcomes):
+    """None, not 48: parse_posted_hours' fail-open default is right for scoring and wrong here,
+    because a fabricated age would silently move the /decoys median."""
+    m.save_job_to_cache("short-undated", {
+        "job_id": "gh_undated", "employer_name": "Undated Inc", "job_title": "Ops Analyst",
+    }, sheet_uuid="uuid-undated")
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-undated", "sheet_tab": "Tetiana Cold", "contact_name": "", "contact_company": ""})
+    for name in ("send_telegram_message", "edit_telegram_message"):
+        monkeypatch.setattr(m, name, lambda *a, **k: True)
+
+    _dispatch("/dead", reply_to_message={"message_id": 78, "text": "Ops Analyst"})
+
+    with m.get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT status, source, posted_hours FROM application_outcomes WHERE sheet_uuid = ?",
+            ("uuid-undated",)).fetchone()
+    assert row == ("dead_link", "greenhouse", None)
+
+
+def test_dead_swipe_on_an_uncached_job_records_no_source_rather_than_guessing(monkeypatch, clean_outcomes):
+    """derive_job_source() defaults to jsearch for an unrecognised id, so a card whose cache entry
+    a restart wiped would silently pad jsearch's decoy count. NULL source -> 'unknown' in /decoys."""
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-uncached", "sheet_tab": "Tetiana Cold",
+        "contact_name": "", "contact_company": "Ghost Co"})
+    for name in ("send_telegram_message", "edit_telegram_message"):
+        monkeypatch.setattr(m, name, lambda *a, **k: True)
+
+    _dispatch("/dead", reply_to_message={"message_id": 79, "text": "Ops Analyst"})
+
+    with m.get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT status, source, company, posted_hours FROM application_outcomes WHERE sheet_uuid = ?",
+            ("uuid-uncached",)).fetchone()
+    assert row == ("dead_link", None, "Ghost Co", None)
+    assert "unknown" in m.get_decoy_metrics()["by_source"]
+
+
+def test_decoys_report_reads_cleanly_with_zero_rows(clean_outcomes):
+    msg = m.format_decoy_metrics_message()
+    assert "No outcome rows recorded yet" in msg
+    # No fabricated 0.0% anywhere: an absent measurement must not look like a measured result.
+    assert "%" not in msg
+    assert len(msg) < 4096
+
+
+def test_decoys_report_ranks_the_worst_source_first_and_pairs_the_medians(clean_outcomes):
+    for i in range(4):
+        m.record_application_outcome(f"u-js-dead-{i}", "dead_link", source="jsearch", posted_hours=600 + i)
+    m.record_application_outcome("u-js-live", "applied", source="jsearch", posted_hours=10)
+    m.record_application_outcome("u-gh-dead", "dead_link", source="greenhouse", posted_hours=100)
+    for i in range(9):
+        m.record_application_outcome(f"u-gh-live-{i}", "applied", source="greenhouse", posted_hours=20)
+
+    metrics = m.get_decoy_metrics()
+    assert metrics["total_dead"] == 5
+    assert metrics["total_rows"] == 15
+    # Rate is dead over ALL rows for that source, so volume is not mistaken for quality.
+    assert metrics["by_source"]["jsearch"]["decoy_rate"] == pytest.approx(80.0)
+    assert metrics["by_source"]["greenhouse"]["decoy_rate"] == pytest.approx(10.0)
+    assert metrics["median_dead_posted_hours"] == 601
+    assert metrics["median_live_posted_hours"] == 20
+
+    msg = m.format_decoy_metrics_message()
+    assert msg.index("jsearch") < msg.index("greenhouse")  # worst offender on line one
+    assert "5 of 15" in msg
+    assert len(msg) < 4096
+
+
+def test_decoys_report_does_not_claim_a_decoy_rate_before_any_dead_mark(clean_outcomes):
+    m.record_application_outcome("u-applied-only", "applied", source="greenhouse", posted_hours=12)
+    msg = m.format_decoy_metrics_message()
+    assert "no <code>/dead</code> marks yet" in msg
+    assert "0 of 1" in msg
