@@ -4324,8 +4324,10 @@ def get_all_crm_job_companies():
 # on someone already graduated. Mirrors the PEOPLE entries in Code.gs's TAB_MAP.
 PEOPLE_TABS = ("Carmen Cold", "Carmen Hot", "Carmen Warm", "Killed")
 
-# The subset that means "Kevin has an active or established relationship here", used to pick warm
-# copy over cold. Killed is excluded (archived) and so is the bench, which /demote parks people on.
+# The subset that means "Kevin knows this person", used to pick warm copy over cold. The bench
+# (Carmen Warm) counts: those are real contacts he has met, so a cold-stranger template would be
+# wrong even before they re-enter the ladder. Only Killed is excluded - a contact archived after
+# three unanswered nudges has no established relationship to write to.
 WARM_TONE_TABS = ("Carmen Cold", "Carmen Hot", "Carmen Warm")
 
 def is_logged_person_contact(email):
