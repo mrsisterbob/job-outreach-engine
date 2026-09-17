@@ -1377,6 +1377,103 @@ def get_rolling_metric_counts(days=7):
     return counts
 
 # ==============================================================================
+# MARKET SUPPLY REPORT (READ-ONLY)
+# ==============================================================================
+# How many roles worth applying to the market actually produces, measured instead of guessed.
+# Two independent sources, deliberately: pipeline_metrics.listing_discovered counts every posting
+# the query bank surfaced (an event log, never pruned), while the jobs table counts the ones that
+# survived Gemini scoring. A job only reaches the jobs table if it passed, so `qualified` is the
+# real supply line - the number of genuinely good roles that opened in the window.
+#
+# The ratio matters more than either count: at a consumption rate above the replenishment rate,
+# the funnel is being drained faster than the market refills it, and the weekly application count
+# will fall for reasons that have nothing to do with how fast Kevin works.
+SUPPLY_QUALIFIED_SCORE = 80  # fit_score at or above this counts as a role worth applying to
+
+def get_market_supply(days=30, min_score=SUPPLY_QUALIFIED_SCORE):
+    """READ-ONLY. Market supply over the trailing `days` window. Never writes.
+
+    Returns {"days", "discovered", "qualified", "per_week", "consumed", "weeks_of_supply"}:
+      discovered      - listings the query bank surfaced (pipeline_metrics event count)
+      qualified       - cached jobs scoring >= min_score, i.e. roles worth applying to
+      per_week        - qualified normalized to a 7-day rate, the replenishment number
+      consumed        - 'applied' events in the same window, normalized to a weekly rate
+      weeks_of_supply - per_week / consumed, or None when nothing was consumed (no rate to
+                        compare against - reporting a division-by-zero as "infinite supply"
+                        would read as good news when it actually means no applications went out)
+
+    A job whose cached JSON predates fit_score persistence has json_extract -> NULL, which fails
+    the >= comparison rather than counting as qualified. Undercounting old rows is the safe
+    direction: this number is used to decide whether the market is running dry.
+    """
+    result = {"days": days, "discovered": 0, "qualified": 0, "per_week": 0.0,
+              "consumed": 0.0, "weeks_of_supply": None}
+    window = f"-{days} days"
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM pipeline_metrics "
+                "WHERE event_type = 'listing_discovered' AND timestamp >= datetime('now', ?)",
+                (window,)
+            )
+            result["discovered"] = cursor.fetchone()[0] or 0
+            cursor.execute(
+                "SELECT COUNT(*) FROM jobs "
+                "WHERE created_at >= datetime('now', ?) "
+                "  AND CAST(json_extract(job_json, '$.fit_score') AS REAL) >= ?",
+                (window, min_score)
+            )
+            result["qualified"] = cursor.fetchone()[0] or 0
+            cursor.execute(
+                "SELECT COUNT(*) FROM pipeline_metrics "
+                "WHERE event_type = 'applied' AND timestamp >= datetime('now', ?)",
+                (window,)
+            )
+            applied = cursor.fetchone()[0] or 0
+    except Exception as e:
+        logging.error(f"Market Supply Read Error ({days}d): {e}")
+        return result
+
+    weeks = max(days / 7.0, 1e-9)
+    result["per_week"] = result["qualified"] / weeks
+    result["consumed"] = applied / weeks
+    if result["consumed"] > 0:
+        result["weeks_of_supply"] = result["per_week"] / result["consumed"]
+    return result
+
+def format_market_supply_message(supply):
+    """Render get_market_supply() as the /funnel card's supply section. Pure - no I/O."""
+    days = supply.get("days", 30)
+    discovered = supply.get("discovered", 0)
+    qualified = supply.get("qualified", 0)
+    per_week = supply.get("per_week", 0.0)
+    consumed = supply.get("consumed", 0.0)
+    ratio = supply.get("weeks_of_supply")
+
+    lines = [
+        f"\n🛒 <b>MARKET SUPPLY</b> <i>(trailing {days}d)</i>",
+        f"Discovered {discovered} · Scored {SUPPLY_QUALIFIED_SCORE}+ <b>{qualified}</b>",
+        f"<b>≈ {per_week:.1f} good roles/week</b> · applying {consumed:.1f}/week",
+    ]
+    if not qualified:
+        # Distinguish "the market is dry" from "the pipeline has not run here yet" - on a fresh
+        # DB both read as zero, and only one of them is a market signal.
+        lines.append("<i>No scored roles in this window yet — run /t a few times before reading this.</i>")
+    elif ratio is None:
+        lines.append("<i>Nothing applied to in this window, so there's no consumption rate to compare.</i>")
+    elif ratio >= 1.5:
+        lines.append("🟢 <i>Supply outpaces you — room to raise volume.</i>")
+    elif ratio >= 1.0:
+        lines.append("🟡 <i>Roughly balanced with what the market opens.</i>")
+    else:
+        lines.append(
+            f"🔴 <i>Consuming {1 / ratio:.1f}x faster than the market refills. "
+            f"Expect the weekly count to fall — widen the query bank or the geography.</i>"
+        )
+    return "\n".join(lines)
+
+# ==============================================================================
 # TEMPLATE REPLY-RATE REPORT (READ-ONLY)
 # ==============================================================================
 # Join path, no schema change: application_outcomes.sheet_uuid -> jobs.sheet_uuid
@@ -7687,6 +7784,9 @@ def process_webhook_payload_async(data):
             for persona, buckets in (payload.get("by_persona") or {}).items():
                 funnel_lines.append(f"\n<b>{html.escape(str(persona)).upper()}</b>")
                 funnel_lines.append(_fmt_buckets(buckets))
+            # Supply comes from the local SQLite metrics, not the CRM payload above, so it renders
+            # even when Sheets is the thing that is slow.
+            funnel_lines.append(format_market_supply_message(get_market_supply()))
             send_telegram_message(chat_id, "\n".join(funnel_lines))
             return
 

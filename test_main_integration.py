@@ -3523,3 +3523,68 @@ def test_jsearch_requests_are_scoped_to_the_us(monkeypatch):
     m.fetch_single_query_jobs(("Operations Analyst Troy MI", "http://x", {}))
 
     assert seen.get("country") == "us"
+
+
+# ---- Market supply report (/funnel) ----
+
+def _seed_supply(jobs, applied=0, discovered=0):
+    """Insert scored jobs plus raw discovery/applied events for the supply window.
+
+    pipeline_metrics is deliberately NOT in the autouse clean_tables fixture (it is the durable
+    metrics ledger other tests assert survives), so this clears it locally instead - otherwise
+    events from an earlier test leak into these counts.
+    """
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM pipeline_metrics")
+        for i, score in enumerate(jobs):
+            conn.execute(
+                "INSERT INTO jobs (short_id, sheet_uuid, job_json) VALUES (?, ?, ?)",
+                (f"sup{i}", f"uuid-sup-{i}", json.dumps({"fit_score": score})),
+            )
+        for _ in range(discovered):
+            conn.execute("INSERT INTO pipeline_metrics (event_type) VALUES ('listing_discovered')")
+        for _ in range(applied):
+            conn.execute("INSERT INTO pipeline_metrics (event_type) VALUES ('applied')")
+        conn.commit()
+
+
+def test_market_supply_counts_only_qualified_scores():
+    # 95/80 qualify, 79 does not - the threshold is inclusive at SUPPLY_QUALIFIED_SCORE.
+    _seed_supply([95, 80, 79], discovered=10)
+    supply = m.get_market_supply(days=7)
+    assert supply["qualified"] == 2
+    assert supply["discovered"] == 10
+    assert supply["per_week"] == pytest.approx(2.0)
+
+
+def test_market_supply_ignores_jobs_cached_before_fit_score_existed():
+    # json_extract -> NULL must fail the comparison rather than counting as qualified.
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM pipeline_metrics")
+        conn.execute(
+            "INSERT INTO jobs (short_id, sheet_uuid, job_json) VALUES (?, ?, ?)",
+            ("legacy", "uuid-legacy", json.dumps({"employer_name": "X"})),
+        )
+        conn.commit()
+    assert m.get_market_supply(days=7)["qualified"] == 0
+
+
+def test_market_supply_reports_no_ratio_when_nothing_applied():
+    # No consumption rate to divide by: None, never a division-by-zero "infinite supply".
+    _seed_supply([90, 90], applied=0)
+    assert m.get_market_supply(days=7)["weeks_of_supply"] is None
+
+
+def test_market_supply_ratio_flags_draining_faster_than_refill():
+    _seed_supply([90, 90], applied=6)
+    supply = m.get_market_supply(days=7)
+    assert supply["weeks_of_supply"] == pytest.approx(2 / 6)
+    assert "faster than the market refills" in m.format_market_supply_message(supply)
+
+
+def test_market_supply_message_distinguishes_empty_window_from_dry_market():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM pipeline_metrics")
+        conn.commit()
+    empty = m.format_market_supply_message(m.get_market_supply(days=7))
+    assert "run /t a few times" in empty
