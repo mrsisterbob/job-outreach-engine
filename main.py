@@ -42,7 +42,7 @@ from pipeline_utils import (
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
     strip_tracking_params, strip_html_to_text,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
-    REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
+    REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN, MAX_AUTO_DRAFTS_PER_RUN,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -5268,6 +5268,41 @@ def build_followup_bump_draft(record, attempt):
         job_title=title,
     )
 
+def _sequencer_draft_recipient(record):
+    """The row's real address, or "" when there is nothing safe to draft to. Same guard as the
+    /sendall path: a bracketed value is a UI confidence tag, not an address."""
+    email = str(record.get("email") or "").strip()
+    return "" if (not email or "[" in email) else email
+
+def _stage_sequencer_draft(record, draft_text):
+    """Stage one follow-up as a Gmail draft - never sends. Returns (draft_id, created).
+
+    draft_text is passed verbatim so Gmail holds exactly what the card shows. The subject mirrors
+    process_overdue_batch()'s sendall bump. draft_id is also returned for a same-subject draft
+    already in Gmail (it does exist), but only a fresh one counts as created. Never raises: a
+    Gmail failure must not abort the run or keep the card from being sent.
+    """
+    email = _sequencer_draft_recipient(record)
+    try:
+        ok, message, draft_id = create_gmail_draft(
+            to_email=email,
+            company_name=record.get("company") or "Target Firm",
+            job_title=record.get("title") or "",
+            custom_body=draft_text,
+            custom_subject=(
+                f"Re: {record.get('title')} @ {record.get('company') or 'Target Firm'}"
+                if str(record.get("title") or "").strip()
+                else f"Re: {record.get('company') or 'Target Firm'}"
+            ),
+        )
+    except Exception as e:
+        logging.error(f"[SEQUENCER] Gmail draft error ({record.get('sheet_uuid')}): {e}")
+        return None, False
+    if not ok and not draft_id:
+        logging.error(f"[SEQUENCER] Gmail draft not created ({record.get('sheet_uuid')}): {message}")
+        return None, False
+    return (draft_id or None), bool(ok)
+
 def run_followup_sequencer(today=None, dry_run=False):
     """Scan Tetiana Cold/Warm + Clavicular via get_followups, run followup_action() on every row,
     and return a structured plan: followups_ready / going_cold / buried / top_matched / counts.
@@ -5282,6 +5317,11 @@ def run_followup_sequencer(today=None, dry_run=False):
     the scanned tabs entirely.
 
     Buries are capped at MAX_AUTO_BURIES_PER_RUN per pass (see counts["buries_suppressed"]).
+
+    Unless dry_run, each follow-up with a real email is also staged as a Gmail draft (never sent)
+    and its id stored as entry["draft_id"] (None otherwise). Drafts are capped at
+    MAX_AUTO_DRAFTS_PER_RUN; a row over the cap is neither snoozed nor logged, so it stays due and
+    drafts on a later pass (see counts["drafts_suppressed"]).
     """
     if isinstance(today, datetime):
         today = today.date()
@@ -5302,6 +5342,8 @@ def run_followup_sequencer(today=None, dry_run=False):
     result = {"followups_ready": [], "going_cold": [], "buried": [], "top_matched": [], "counts": {}}
     buries_written = 0
     buries_suppressed = 0
+    drafts_created = 0
+    drafts_suppressed = 0
 
     for rec in records:
         # Carmen Cold runs the 4/11/21 people ladder instead of the JOBS +4/+9/+16 windows: these
@@ -5338,7 +5380,7 @@ def run_followup_sequencer(today=None, dry_run=False):
                 continue
 
             attempt = int(ladder_action.rsplit("_", 1)[1])
-            result["followups_ready"].append({
+            entry = {
                 "company": rec.get("company") or "N/A",
                 "role": rec.get("title") or "",
                 "short_id": get_short_id_by_sheet_uuid(sheet_uuid) if sheet_uuid else None,
@@ -5347,9 +5389,18 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "draft_text": build_followup_bump_draft(rec, attempt),
                 "sheet_tab": rec.get("sheet_tab"),
                 "ladder_day": CARMEN_LADDER_DAYS[attempt - 1],
-            })
+                "draft_id": None,
+            }
+            result["followups_ready"].append(entry)
             if dry_run or not sheet_uuid or _sequencer_already_actioned(sheet_uuid, run_date):
                 continue
+            if _sequencer_draft_recipient(rec):
+                if drafts_created >= MAX_AUTO_DRAFTS_PER_RUN:
+                    # Over the cap: no snooze, no log - same deferral as a capped bury.
+                    drafts_suppressed += 1
+                    continue
+                entry["draft_id"], created = _stage_sequencer_draft(rec, entry["draft_text"])
+                drafts_created += created
             if ladder_next is not None:
                 enqueue_crm_payload(build_crm_payload(
                     "update_snooze", sheet_uuid=sheet_uuid,
@@ -5396,13 +5447,21 @@ def run_followup_sequencer(today=None, dry_run=False):
 
         if action in ("send_followup_1", "send_followup_2"):
             attempt = 1 if action == "send_followup_1" else 2
-            result["followups_ready"].append({
+            entry = {
                 "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
                 "attempt": attempt, "draft_text": build_followup_bump_draft(rec, attempt),
-                "sheet_tab": rec.get("sheet_tab"),
-            })
+                "sheet_tab": rec.get("sheet_tab"), "draft_id": None,
+            }
+            result["followups_ready"].append(entry)
             if dry_run or already or not sheet_uuid:
                 continue
+            if _sequencer_draft_recipient(rec):
+                if drafts_created >= MAX_AUTO_DRAFTS_PER_RUN:
+                    # Over the cap: no snooze, no log - same deferral as a capped bury.
+                    drafts_suppressed += 1
+                    continue
+                entry["draft_id"], created = _stage_sequencer_draft(rec, entry["draft_text"])
+                drafts_created += created
             base = anchor or today
             push_days = FOLLOWUP_2_DAYS if attempt == 1 else FOLLOWUP_BURY_DAYS
             new_nf = (base + timedelta(days=push_days)).strftime("%Y-%m-%d")
@@ -5458,6 +5517,8 @@ def run_followup_sequencer(today=None, dry_run=False):
     # left unwritten by the cap. Never nonzero on its own (it implies buried > 0), so the card's
     # all-empty early return stays correct.
     result["counts"]["buries_suppressed"] = buries_suppressed
+    # Likewise a subset of followups_ready: rows listed but not drafted (or snoozed) by the cap.
+    result["counts"]["drafts_suppressed"] = drafts_suppressed
     return result
 
 def _seq_id_tag(entry):
@@ -5492,12 +5553,22 @@ def render_followup_needs_card(result, on_demand=False):
             if e.get("short_id"):
                 stage_url = html.escape(f"{BASE_URL}/stage/{e['short_id']}", quote=True)
                 lines.append(f"📋 <a href='{stage_url}'>Full Card</a>")
+            if e.get("draft_id"):
+                draft_url = html.escape(f"https://mail.google.com/mail/u/0/#drafts/{e['draft_id']}", quote=True)
+                lines.append(f"✉️ <a href='{draft_url}'>Open Draft</a>")
             lines.append(f"<code>{draft}</code>")
         # No full-sheet_uuid 🆔 line and no swipe legend: this card holds N entries in one message,
         # and _parse_sheet_uuid_from_card_text takes the first UUID it finds, so a swipe-reply would
         # silently act on entry #1. Swipes here fail cleanly instead; actions carry their own id.
         lines.append("<i>Swipe-replies don't work on this card - act via 📋 Full Card, or "
                      "<code>/replied &lt;id&gt;</code> · <code>/interview &lt;id&gt;</code> with the 🆔 above.</i>")
+        drafts_suppressed = counts.get("drafts_suppressed", 0)
+        if drafts_suppressed:
+            # Rows without an ✉️ link are a mix of no-email rows and capped ones - say which.
+            lines.append(
+                f"🛑 <i>{drafts_suppressed} of these were withheld by the draft cap "
+                f"(max {MAX_AUTO_DRAFTS_PER_RUN}/run): no Gmail draft and not snoozed — re-run to process the rest.</i>"
+            )
 
     cold = result.get("going_cold", [])
     if cold:
@@ -5542,6 +5613,8 @@ def render_followup_needs_card(result, on_demand=False):
     )
     if counts.get("buries_suppressed", 0):
         summary += f" · {counts['buries_suppressed']} buries capped"
+    if counts.get("drafts_suppressed", 0):
+        summary += f" · {counts['drafts_suppressed']} drafts capped"
     lines.append(summary)
     return "\n".join(lines)
 

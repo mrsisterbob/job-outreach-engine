@@ -76,7 +76,7 @@ ahead of the 08:30 standup digest):
 | Sequencer decision | What the job does | Automatic? |
 |--------------------|-------------------|------------|
 | `bury_ghosted` | `append_note` `[reason: ghosted]` **then** `update_status` → `Died` (via the durable CRM outbox) | **YES — the only automatic Sheet write.** Surfaced in the card's "Buried overnight" section so it is never silent. |
-| `send_followup_1` / `send_followup_2` | Draft is built from the `followup_bumps` template bank and **queued onto the morning card** (tap-to-copy). Next Followup Date is advanced via `update_snooze` so the row can't re-fire. **No email is sent, no draft is created.** | Snooze write is automatic; **the follow-up itself is approval-gated** — you copy/send it. |
+| `send_followup_1` / `send_followup_2` | Draft is built from the `followup_bumps` template bank and **queued onto the morning card** (tap-to-copy). When the row has a real email, the same text is staged as a **Gmail draft** (✉️ Open Draft link on the card; max `MAX_AUTO_DRAFTS_PER_RUN` per run, overflow left unsnoozed so it drafts on a later pass). Next Followup Date is advanced via `update_snooze` so the row can't re-fire. **No email is ever sent.** | Draft + snooze are automatic (never under `/queue`); **the send itself is approval-gated** — you open the draft and send it. |
 | `stale_nudge` | Listed in the card's "Going cold" section. | No write at all. |
 | top-3 `Matched` by Fit Score | Listed in the card's "Top 3 untouched matches" section. | No write at all. |
 

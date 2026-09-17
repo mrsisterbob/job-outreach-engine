@@ -376,7 +376,7 @@ def test_sequencer_stale_nudge_and_top_matched_do_not_write(monkeypatch):
     assert result["top_matched"][0]["fit_score"] == 88.0
     assert all(p["sheet_uuid"] not in ("seq-m1", "seq-m2") for p in enqueued)
     assert result["counts"] == {"followups_ready": 1, "going_cold": 1, "buried": 1,
-                                "top_matched": 2, "buries_suppressed": 0}
+                                "top_matched": 2, "buries_suppressed": 0, "drafts_suppressed": 0}
 
 
 def test_sequencer_is_idempotent_across_two_consecutive_runs(monkeypatch):
@@ -398,7 +398,7 @@ def test_sequencer_dry_run_performs_zero_writes(monkeypatch):
     result = m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True)
 
     assert result["counts"] == {"followups_ready": 1, "going_cold": 1, "buried": 1,
-                                "top_matched": 2, "buries_suppressed": 0}
+                                "top_matched": 2, "buries_suppressed": 0, "drafts_suppressed": 0}
     assert enqueued == []
     with m.get_db_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
@@ -485,6 +485,134 @@ def test_needs_card_flags_withheld_buries_in_the_buried_section_and_summary(monk
     assert "5 of these were withheld by the safety cap" in card
     assert "re-run" in card.lower()
     assert "5 buries capped" in card
+
+
+# ---- Gmail drafts staged by the sequencer (MAX_AUTO_DRAFTS_PER_RUN) ----
+
+def _mock_followup_rows(monkeypatch, rows, cc_rows=()):
+    """Due follow-up #1 rows on Tetiana Cold (plus optional Carmen Cold rows), with the CRM outbox
+    and create_gmail_draft both recorded instead of hitting the network."""
+    monkeypatch.setattr(m, "fetch_networking_cards", lambda code, qty=None: (
+        [dict(r) for r in rows] if code == "TC" else [dict(r) for r in cc_rows] if code == "CC" else []))
+    enqueued, drafts = [], []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+
+    def fake_draft(**kwargs):
+        drafts.append(kwargs)
+        return True, "Success", f"draft-{len(drafts)}"
+    monkeypatch.setattr(m, "create_gmail_draft", fake_draft)
+    return enqueued, drafts
+
+
+def _due_row(i, email="hm@acme.com", title="Ops Analyst"):
+    return {"sheet_uuid": f"fu-{i}", "company": f"Acme{i}", "title": title, "name": "",
+            "email": email, "status": "Applied", "date_added": "2026-05-28",
+            "next_followup": "1970-01-01", "raw_priority": "70"}
+
+
+def _due_carmen_row():
+    return {"sheet_uuid": "cc-1", "company": "Nliven", "title": "", "name": "Dana",
+            "email": "dana@nliven.com", "status": "Applied",
+            "date_added": (_SEQ_TODAY - timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d"),
+            "next_followup": _SEQ_TODAY.strftime("%Y-%m-%d"), "raw_priority": "High"}
+
+
+def test_sequencer_dry_run_creates_no_gmail_drafts(monkeypatch):
+    """/queue is read-only: not one draft, even for rows with a real address."""
+    enqueued, drafts = _mock_followup_rows(monkeypatch, [_due_row(0)], cc_rows=[_due_carmen_row()])
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True)
+
+    assert len(result["followups_ready"]) == 2
+    assert drafts == []
+    assert enqueued == []
+    assert all(e["draft_id"] is None for e in result["followups_ready"])
+    assert "Open Draft" not in m.render_followup_needs_card(result, on_demand=True)
+
+
+def test_sequencer_stages_the_card_text_as_a_gmail_draft(monkeypatch):
+    rows = [_due_row(0), _due_row(1, email=""), _due_row(2, email="x@y.com [⚠️ Fallback Email]")]
+    enqueued, drafts = _mock_followup_rows(monkeypatch, rows, cc_rows=[_due_carmen_row()])
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+    by_uuid = {e["sheet_uuid"]: e for e in result["followups_ready"]}
+
+    assert len(drafts) == 2  # blank and bracketed addresses are skipped
+    job_call = next(d for d in drafts if d["to_email"] == "hm@acme.com")
+    assert job_call["custom_body"] == by_uuid["fu-0"]["draft_text"]
+    assert job_call["custom_subject"] == "Re: Ops Analyst @ Acme0"
+    cc_call = next(d for d in drafts if d["to_email"] == "dana@nliven.com")
+    assert cc_call["custom_body"] == by_uuid["cc-1"]["draft_text"]
+    assert cc_call["custom_subject"] == "Re: Nliven"  # roleless PEOPLE row
+    assert by_uuid["fu-0"]["draft_id"] and by_uuid["cc-1"]["draft_id"]
+    assert by_uuid["fu-1"]["draft_id"] is None and by_uuid["fu-2"]["draft_id"] is None
+    # Rows skipped for a missing address are still snoozed, exactly as before drafts existed.
+    assert {p["sheet_uuid"] for p in enqueued if p["action"] == "update_snooze"} == {"fu-0", "fu-1", "fu-2", "cc-1"}
+
+    card = m.render_followup_needs_card(result)
+    assert card.count("Open Draft</a>") == 2
+    assert f"https://mail.google.com/mail/u/0/#drafts/{by_uuid['fu-0']['draft_id']}" in card
+
+
+def test_sequencer_same_day_rerun_does_not_draft_twice(monkeypatch):
+    _, drafts = _mock_followup_rows(monkeypatch, [_due_row(0)])
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert len(drafts) == 1
+
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert len(drafts) == 1
+
+
+def test_sequencer_over_the_draft_cap_defers_the_rest(monkeypatch):
+    over = m.MAX_AUTO_DRAFTS_PER_RUN + 3
+    enqueued, drafts = _mock_followup_rows(monkeypatch, [_due_row(i) for i in range(over)])
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert len(drafts) == m.MAX_AUTO_DRAFTS_PER_RUN
+    assert result["counts"]["drafts_suppressed"] == 3
+    assert len(result["followups_ready"]) == over
+    assert sum(1 for e in result["followups_ready"] if e["draft_id"]) == m.MAX_AUTO_DRAFTS_PER_RUN
+    # Capped rows are neither snoozed nor logged, so they stay due for the next pass.
+    assert len([p for p in enqueued if p["action"] == "update_snooze"]) == m.MAX_AUTO_DRAFTS_PER_RUN
+    assert len(_logged_uuids()) == m.MAX_AUTO_DRAFTS_PER_RUN
+
+    card = m.render_followup_needs_card(result)
+    assert "3 of these were withheld by the draft cap" in card
+    assert "3 drafts capped" in card
+
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert len(drafts) == over  # the re-run drains the deferred rows
+
+
+def test_sequencer_existing_draft_is_linked_but_not_counted_against_the_cap(monkeypatch):
+    _mock_followup_rows(monkeypatch, [_due_row(i) for i in range(m.MAX_AUTO_DRAFTS_PER_RUN + 1)])
+    monkeypatch.setattr(m, "create_gmail_draft",
+                        lambda **kw: (False, "Draft already exists in Gmail", "existing-1"))
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert result["counts"]["drafts_suppressed"] == 0
+    assert all(e["draft_id"] == "existing-1" for e in result["followups_ready"])
+
+
+def test_sequencer_gmail_failure_never_aborts_the_run_or_claims_a_draft(monkeypatch):
+    enqueued, _ = _mock_followup_rows(monkeypatch, [_due_row(0), _due_row(1)])
+    calls = []
+
+    def flaky(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise m.requests.exceptions.Timeout("gmail timed out")
+        return False, "Gmail Error 500", None
+    monkeypatch.setattr(m, "create_gmail_draft", flaky)
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert len(calls) == 2
+    assert all(e["draft_id"] is None for e in result["followups_ready"])
+    assert "Open Draft" not in m.render_followup_needs_card(result)
+    assert len([p for p in enqueued if p["action"] == "update_snooze"]) == 2
 
 
 # ---- Carmen Cold in the follow-up cadence (sequencer scan + overdue + roleless bumps) ----
