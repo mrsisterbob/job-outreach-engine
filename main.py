@@ -472,11 +472,19 @@ def default_email_max_age_seconds(poll_hours):
     everything it was built to catch. Two real interview emails were lost this way.
 
     Two poll intervals of headroom absorbs a skipped cycle, a Render spin-down or a Gmail 5xx, and
-    the 24h floor means a short EMAIL_POLL_HOURS cannot quietly reintroduce a window narrower than
-    a day. Any tie-breaking still happens downstream - Gmail's own is:unread already stops a
-    message being alerted twice, so a wide window costs nothing but a longer catch-up sweep.
+    the floor means a short EMAIL_POLL_HOURS cannot quietly reintroduce a narrow window. Any
+    tie-breaking still happens downstream - Gmail's own is:unread already stops a message being
+    alerted twice, so a wide window costs nothing but a longer catch-up sweep.
+
+    The floor is 96h, not 24h, because the derived value moves the WRONG WAY when the cadence is
+    tightened: going to EMAIL_POLL_HOURS=1 for fresher alerts silently shrank the window from 48h
+    to the old 24h floor. A recruiter replying Friday evening, against a weekend Render spin-down
+    or a deploy gap, is 62h old by Monday - dropped, and marked read, with no alert. Tier 1 skips
+    this gate so interviews were safe, but "every real person who replies" is the actual goal and
+    an ordinary human reply is exactly what was being lost. Four days covers a long weekend plus a
+    holiday Monday, which is the realistic worst case for an unattended container.
     """
-    return max(int(float(poll_hours) * 3600 * 2), 86400)
+    return max(int(float(poll_hours) * 3600 * 2), 345600)
 
 
 # Inbound Email Anti-Spam Gatekeeper: pre-filter shield parameters (raw CSV/string env values,

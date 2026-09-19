@@ -74,8 +74,13 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
   separate label, so nothing reaching this code was called spam by Google. Three defaults changed,
   all still overridable from the Render dashboard:
   - `EMAIL_MAX_AGE_SECONDS` is no longer a fixed `300`. It derives from the poll cadence -
-    `max(EMAIL_POLL_HOURS * 3600 * 2, 86400)`, i.e. **48h** at the default daily cadence. A
-    5-minute window against a poller that runs every 24h discarded essentially all inbound mail.
+    `max(EMAIL_POLL_HOURS * 3600 * 2, 345600)`, i.e. a **96h floor**. A 5-minute window against a
+    poller that runs every 24h discarded essentially all inbound mail. The floor is 96h rather
+    than 24h because the derived value moves the **wrong way** when the cadence is tightened:
+    switching to `EMAIL_POLL_HOURS=1` for fresher alerts silently shrank the window from 48h to
+    24h. A recruiter replying Friday evening is 62h old by Monday if the container spun down over
+    the weekend - Tier 1 skips this gate so interviews were safe, but an ordinary human reply was
+    dropped and marked read. Four days covers a long weekend plus a holiday Monday.
   - `EMAIL_REQUIRED_KEYWORDS` now defaults to **empty** (the gate is off). It blocked 8 of 10
     messages in a real production poll, including a recruiter confirming an interview. Set it in
     Render to restore the old behaviour verbatim.

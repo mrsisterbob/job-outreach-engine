@@ -5029,16 +5029,33 @@ def test_alert_shows_a_readable_name_for_a_from_header_with_a_display_name(monke
 
 def test_email_max_age_default_is_derived_from_the_poll_cadence(monkeypatch):
     """300s against a poller running every EMAIL_POLL_HOURS hours is the bug that lost two real
-    interviews. The default now tracks the cadence, with a 24h floor."""
-    assert m.default_email_max_age_seconds(24) == 172800   # 2 daily cycles of headroom
-    assert m.default_email_max_age_seconds(2) == 86400     # short cadence still floors at a day
-    assert m.default_email_max_age_seconds(0.25) == 86400
+    interviews. The default now tracks the cadence, with a 96h floor.
+
+    The floor matters because the derived value moves the WRONG WAY when the cadence is tightened:
+    at EMAIL_POLL_HOURS=1 the derived window is 2h, so the floor is the only thing standing between
+    a faster poll and a narrower catch-up window than the slow one had."""
+    assert m.default_email_max_age_seconds(96) == 691200   # 2 cycles of headroom dominates
+    assert m.default_email_max_age_seconds(24) == 345600   # daily cadence floors at 4 days
+    assert m.default_email_max_age_seconds(1) == 345600    # hourly must NOT shrink the window
+    assert m.default_email_max_age_seconds(0.25) == 345600
     # What the module actually loaded with no EMAIL_MAX_AGE_SECONDS set in the environment.
     assert m.EMAIL_MAX_AGE_SECONDS == m.default_email_max_age_seconds(m.EMAIL_POLL_HOURS)
-    assert m.EMAIL_MAX_AGE_SECONDS >= 86400
+    assert m.EMAIL_MAX_AGE_SECONDS >= 345600
     # Still overridable from Render, which is where every env value lives.
     monkeypatch.setenv("EMAIL_MAX_AGE_SECONDS", "600")
     assert int(os.environ["EMAIL_MAX_AGE_SECONDS"]) == 600
+
+
+def test_a_weekend_reply_survives_an_unattended_container(monkeypatch):
+    """A recruiter replies Friday evening; Render spins down or a deploy gap swallows the weekend.
+    By Monday the message is 62h old. Tier 1 skips the age gate so interviews were always safe -
+    but the goal is every real person who replies, and an ordinary human reply was being dropped
+    AND marked read, with no alert and no trace."""
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("wk", "Dana <dana@atwell.com>", "Re: Operations Analyst",
+                       "Hi Kevin, thanks for following up - I'd love to keep talking about this.",
+                       age_seconds=62 * 3600)])
+    assert len(alerts) == 1
 
 
 def test_stale_backlog_is_still_dropped(monkeypatch):
