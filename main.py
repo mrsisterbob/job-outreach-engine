@@ -491,7 +491,17 @@ EMAIL_BLOCK_DOMAINS = os.environ.get("EMAIL_BLOCK_DOMAINS", "quora.com,anytimefi
 # Google. Bulk-vs-human is now decided by the List-Unsubscribe header instead (gate 5 below).
 # Setting EMAIL_REQUIRED_KEYWORDS in Render re-enables the old behaviour verbatim.
 EMAIL_REQUIRED_KEYWORDS = os.environ.get("EMAIL_REQUIRED_KEYWORDS", "")
-EMAIL_EXCLUDED_KEYWORDS = os.environ.get("EMAIL_EXCLUDED_KEYWORDS", "digest,unsubscribe,newsletter,promo,alert")
+# Empty by default, and for the same reason EMAIL_REQUIRED_KEYWORDS is: vocabulary is the wrong
+# tool for bulk-vs-human, and this list was actively hostile to the system's actual goal - every
+# real person who replies should alert.
+#
+# It was a substring test over subject+snippet, so "just a quick alert that the role is still open"
+# died on "alert", and a recruiter writing "I'll unsubscribe you from the list but wanted to reply
+# personally" died on "unsubscribe". Meanwhile it blocked no junk that survives the other gates:
+# newsletters carry List-Unsubscribe (gate 5) and robot mailboxes are caught by the sender
+# blacklist, both of which are structural rather than guesses about wording. Set it in Render to
+# restore the old behaviour.
+EMAIL_EXCLUDED_KEYWORDS = os.environ.get("EMAIL_EXCLUDED_KEYWORDS", "")
 # Robot mailboxes, matched as a substring of the ADDRESS (not the domain), so a real person at a
 # company whose marketing goes out from no-reply@ is unaffected.
 #
@@ -522,10 +532,14 @@ try:
 except (TypeError, ValueError):
     EMAIL_MAX_AGE_SECONDS = default_email_max_age_seconds(EMAIL_POLL_HOURS)
 EMAIL_REQUIRE_DIRECT_REPLY = os.environ.get("EMAIL_REQUIRE_DIRECT_REPLY", "False").strip().lower() in ("1", "true", "yes")
+# 50 chars dropped "Hi Kevin, got a sec?" and "Can we talk tomorrow at 2?" - the shortest replies
+# are often the warmest, because a busy human writing back types one line. The gate exists to skip
+# empty auto-acknowledgements, not brevity, and bulk is already handled structurally by the sender
+# blacklist and List-Unsubscribe. 12 still drops a truly empty body while keeping a one-line reply.
 try:
-    EMAIL_MIN_BODY_LENGTH = int(os.environ.get("EMAIL_MIN_BODY_LENGTH", "50"))
+    EMAIL_MIN_BODY_LENGTH = int(os.environ.get("EMAIL_MIN_BODY_LENGTH", "12"))
 except (TypeError, ValueError):
-    EMAIL_MIN_BODY_LENGTH = 50
+    EMAIL_MIN_BODY_LENGTH = 12
 EMAIL_LABEL_TARGET_INBOX = os.environ.get("EMAIL_LABEL_TARGET_INBOX", "INBOX")
 
 # Gmail-side exclusions, applied in the list query itself rather than in Python. This is the only
@@ -4416,6 +4430,62 @@ def _decode_gmail_part_data(data):
         return ""
 
 
+CLASSIFIER_BODY_CHARS = 2000
+
+
+def extract_plain_body(payload, limit=CLASSIFIER_BODY_CHARS):
+    """Pull readable text out of a Gmail payload for the classifier. Returns "" when there is none.
+
+    Gmail's `snippet` is capped around 200 characters and cuts mid-sentence, so a recruiter who
+    opens with two lines of pleasantries and puts the ask in paragraph three was being classified
+    on the pleasantries alone. The message body is already in memory - the fetch is format=full so
+    that extract_calendar_invite() can see .ics parts - it was simply being discarded.
+
+    Prefers text/plain over text/html, because the HTML alternative of the same message is mostly
+    markup and a tag-stripped version of it is noisier than the plain part. Falls back to stripped
+    HTML when a sender provides no plain part at all.
+
+    The quoted tail is cut: a reply to a long thread repeats the whole history, and the classifier
+    matching "interview" inside Kevin's OWN earlier message would turn every reply into a false
+    interview signal. Truncated to `limit` because only the top of a message carries the intent,
+    and an unbounded body makes the vocabulary match slower and noisier, not better.
+    """
+    plain_parts, html_parts = [], []
+    stack = [payload or {}]
+    while stack:
+        part = stack.pop()
+        if not isinstance(part, dict):
+            continue
+        stack.extend(part.get("parts") or [])
+        mime = str(part.get("mimeType") or "").lower()
+        # An attachment has a filename; its bytes are not body text (and a .pdf decodes to noise).
+        if str(part.get("filename") or "").strip():
+            continue
+        if mime.startswith("text/plain"):
+            plain_parts.append(_decode_gmail_part_data((part.get("body") or {}).get("data")))
+        elif mime.startswith("text/html"):
+            html_parts.append(_decode_gmail_part_data((part.get("body") or {}).get("data")))
+
+    text = "\n".join(p for p in plain_parts if p).strip()
+    if not text and html_parts:
+        raw = "\n".join(p for p in html_parts if p)
+        raw = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+        raw = re.sub(r"(?is)<br\s*/?>|</p>", "\n", raw)
+        text = html.unescape(re.sub(r"(?s)<[^>]+>", " ", raw))
+
+    # Quoted-reply markers, in the order they appear in the wild. Everything from the first one on
+    # is thread history, not what this person just wrote.
+    for marker in (r"\r?\n\s*On .{0,120}? wrote:", r"\r?\n\s*-{2,}\s*Original Message",
+                   r"\r?\n\s*_{5,}", r"\r?\n\s*From:\s.{0,80}?\r?\nSent:",
+                   r"\r?\n\s*>{1,}\s"):
+        cut = re.search(marker, text)
+        if cut:
+            text = text[:cut.start()]
+    text = re.sub(r"[ \t ]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:limit]
+
+
 def _format_ics_dtstart(raw_value, tzid=""):
     """Render an iCalendar DTSTART as readable text, or None if it is not a shape we parse.
 
@@ -4995,7 +5065,13 @@ def check_inbound_gmail_replies():
             # TIER 1 detection runs BEFORE any gate, because the whole point is that no gate may
             # outrank it. classify_inbound_ats_email checks rejection patterns first, so a decline
             # that mentions interviewing cannot buy itself a bypass.
-            status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
+            # Classify on the real body, not on Gmail's ~200-char snippet. The alert still SHOWS
+            # the snippet - the short preview is deliberate and Kevin likes it - but what the
+            # classifier reads is up to CLASSIFIER_BODY_CHARS of the actual message, so an ask that
+            # sits in paragraph three is no longer invisible. Falls back to the snippet when there
+            # is no decodable body.
+            body_text = extract_plain_body(payload) or snippet
+            status_label, _crm_action = classify_inbound_ats_email(sender, subject, body_text)
             has_calendar_invite, invite_start = extract_calendar_invite(payload)
             is_tier1 = has_calendar_invite or status_label in ("INTERVIEW_SET", "OFFER_EXTENDED")
 
@@ -5021,8 +5097,10 @@ def check_inbound_gmail_replies():
                         f"(calendar_invite={has_calendar_invite}, classifier={status_label}) - pre-filter bypassed"
                     )
             else:
+                # body_text, not snippet: the length gate should judge what the person actually
+                # wrote, and a short snippet on a long message was never a reason to drop it.
                 passed, reject_reason = passes_email_prefilter(
-                    sender, subject, snippet, internal_date_ms, in_reply_to, references, list_unsubscribe
+                    sender, subject, body_text, internal_date_ms, in_reply_to, references, list_unsubscribe
                 )
             if not passed:
                 logging.info(f"[BLOCKED] Pre-filter rejected message from {sender} - reason: {reject_reason}")
@@ -5278,7 +5356,8 @@ def sweep_spam_for_interview_signals(request_headers):
             if str(list_unsubscribe or "").strip():
                 continue
 
-            status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
+            status_label, _crm_action = classify_inbound_ats_email(
+                sender, subject, extract_plain_body(payload) or snippet)
             has_calendar_invite, invite_start = extract_calendar_invite(payload)
             if not (has_calendar_invite or status_label in ("INTERVIEW_SET", "OFFER_EXTENDED")):
                 # Left completely untouched - not alerted, not marked read. Gmail put it here and

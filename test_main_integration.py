@@ -4663,6 +4663,88 @@ def test_a_real_person_at_a_robot_domain_still_gets_through(monkeypatch):
     assert "jane.recruiter@paypal.com" in alerts[0]
 
 
+def test_the_classifier_reads_past_gmails_200_char_snippet(monkeypatch):
+    """Gmail's snippet caps around 200 chars and cuts mid-sentence, so a recruiter who opens with
+    pleasantries and puts the ask in paragraph three was classified on the pleasantries alone."""
+    body = (
+        "Hi Kevin,\n\n"
+        "I hope you're having a great week so far. I wanted to circle back after reviewing your "
+        "application and say how much the team enjoyed reading about your background in operations "
+        "and analytics. It's a strong fit for what we've been looking for over the last few months.\n\n"
+        "Are you free Thursday for an interview with the hiring manager?\n\n"
+        "Best,\nSarah")
+    short_snippet = body[:200]
+    # The ask is past the cutoff, so the snippet alone cannot see it.
+    assert m.classify_inbound_ats_email("s@firm.com", "Following up", short_snippet)[0] == "GENERAL"
+    assert m.classify_inbound_ats_email("s@firm.com", "Following up", body)[0] == "INTERVIEW_SET"
+
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("deep", "Sarah <sarah@firm.com>", "Following up", body)])
+    assert len(alerts) == 1
+    assert "Interview Signal Detected" in alerts[0]
+
+
+def test_the_body_reader_ignores_quoted_thread_history():
+    """A reply repeats the whole thread. Matching "interview" inside Kevin's OWN earlier message
+    would turn every ordinary reply into a false interview signal."""
+    payload = _gmail_message("q", "a@b.com", "Re: hello", "x")["payload"]
+    payload["parts"][0]["body"]["data"] = _b64url(
+        "Thanks Kevin, I'll take a look and get back to you.\n\n"
+        "On Tue, Sep 15, 2026 at 3:09 PM Kevin Miller wrote:\n"
+        "> Hi Sarah, following up about the interview we discussed and the offer timeline.\n")
+    text = m.extract_plain_body(payload)
+    assert "I'll take a look" in text
+    assert "interview" not in text.lower(), "quoted history must be cut"
+    assert m.classify_inbound_ats_email("a@b.com", "Re: hello", text)[0] == "GENERAL"
+
+
+def test_the_body_reader_falls_back_to_html_and_skips_attachments():
+    """Senders that ship HTML only still have to be readable, and a PDF's bytes are not body text -
+    many application confirmations carry an attachment list at the bottom."""
+    payload = {"mimeType": "multipart/mixed", "headers": [], "parts": [
+        {"mimeType": "text/html", "filename": "",
+         "body": {"data": _b64url("<html><body><p>Hi Kevin,</p><p>Are you free Thursday?</p>"
+                                  "<style>p{color:red}</style></body></html>")}},
+        {"mimeType": "application/pdf", "filename": "resume.pdf",
+         "body": {"data": _b64url("%PDF-1.4 binary garbage interview offer")}},
+    ]}
+    text = m.extract_plain_body(payload)
+    assert "Are you free Thursday?" in text
+    assert "color:red" not in text, "style blocks must be stripped"
+    assert "PDF-1.4" not in text, "attachment bytes must never reach the classifier"
+
+
+def test_a_short_human_reply_is_no_longer_dropped(monkeypatch):
+    """The shortest replies are often the warmest - a busy human writing back types one line."""
+    assert m.EMAIL_MIN_BODY_LENGTH <= 20
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("short", "Dana <dana@atwell.com>", "Re: Operations Analyst",
+                       "Hi Kevin, got a sec?")])
+    assert len(alerts) == 1
+
+
+def test_a_human_reply_using_a_bulk_sounding_word_still_alerts(monkeypatch):
+    """EMAIL_EXCLUDED_KEYWORDS was a substring test over subject+snippet, so a real person writing
+    'just a quick alert that the role is still open' was dropped on the word 'alert'. Bulk is
+    decided structurally now - List-Unsubscribe and the sender blacklist - not by vocabulary."""
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("kw", "Dana <dana@atwell.com>", "Re: Operations Analyst",
+                       "Hi Kevin, just a quick alert that the role is still open - free this week?")])
+    assert len(alerts) == 1
+
+
+def test_removing_the_keyword_list_does_not_let_bulk_back_in(monkeypatch):
+    """The keyword list blocked no junk that the structural gates miss."""
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("news", "news@economist.com", "The World in Brief",
+                       "Also: Resilient revelry at Oktoberfest and more stories from this week.",
+                       extra_headers={"List-Unsubscribe": "<https://economist.com/u>"}),
+        _gmail_message("board", "noreply@jobleads.com", "Your daily job digest",
+                       "Here are 5 new jobs matching your saved search for today. Apply now."),
+    ])
+    assert alerts == []
+
+
 def test_an_ats_robot_mailbox_can_still_deliver_a_real_interview():
     """Workday, Greenhouse and Criteria send REAL interview invites and scheduling links from
     noreply@ addresses. The blacklist is a substring test on the address and outranks the Tier 1

@@ -102,9 +102,20 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
     category exclusions touch it. `noreply-location-sharing@google.com` is the shape that exposed
     it: it contains `noreply-`, never `noreply@`. Entries match the **address**, not the domain,
     so `jane@paypal.com` still reaches you while `service@paypal.com` does not.
-  - **Reading depth:** the classifier sees `From`, `Subject` and Gmail's **~200-char `snippet`** -
-    not the full body, which is fetched but only walked for `.ics` parts. An interview detail past
-    that cutoff is invisible to classification; the alert links to the thread for the rest.
+  - **Reading depth:** the classifier reads the real message body (`extract_plain_body`, up to
+    `CLASSIFIER_BODY_CHARS`=2000), not Gmail's ~200-char `snippet`. The body was already in memory
+    - the fetch is `format=full` so `.ics` parts are visible - and was being discarded, so an ask
+    sitting in paragraph three was classified on the opening pleasantries. Prefers `text/plain`,
+    falls back to stripped HTML, skips attachments (a PDF's bytes are not body text), and cuts the
+    quoted thread tail so `interview` inside Kevin's *own* earlier message cannot fake a signal.
+    The alert still **shows** the short snippet - the compact card is deliberate.
+  - **`EMAIL_EXCLUDED_KEYWORDS` now defaults to empty.** It was a substring test over
+    subject+snippet, so a real person writing *"just a quick alert that the role is still open"*
+    died on `alert`, and *"I'll unsubscribe you from the list but wanted to reply personally"* died
+    on `unsubscribe`. It blocked no junk the structural gates miss: newsletters carry
+    `List-Unsubscribe` and robot mailboxes are caught by the sender blacklist.
+  - **`EMAIL_MIN_BODY_LENGTH` 50 -> 12.** The shortest replies are often the warmest - a busy human
+    types one line. 50 dropped *"Hi Kevin, got a sec?"*; 12 still drops an empty auto-ack.
   - **Delivery is confirmed before a message is marked read.** `send_telegram_message` returns the
     message_id on success and `None` on failure (it never raises), and the mark-read POST used to
     run unconditionally right after it - so a 5s timeout or a second 429 meant the alert was never
