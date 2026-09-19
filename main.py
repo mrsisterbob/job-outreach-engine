@@ -9742,6 +9742,8 @@ def process_webhook_payload_async(data):
                 "/ats - Company board watchlist (on/off/add/remove)\n"
                 "/remote - Keyless remote feeds (on/off)\n"
                 "/poll - Run the email poll cycle now (scheduled: daily)\n"
+                "/inbox - Open conversations that still need a reply\n"
+                "/done &lt;id&gt; - Mark a conversation dealt with (id is printed on /inbox)\n"
                 "/backfillcontacts - Preview a full Sent-history contact sweep (add 'go' to write)\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
