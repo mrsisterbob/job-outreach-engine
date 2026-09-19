@@ -4721,7 +4721,21 @@ def passes_email_prefilter(sender: str, subject: str, snippet: str, internal_dat
     # Venmo and Condado Tacos: a recruiter typing an email by hand does not emit List-Unsubscribe,
     # and every newsletter does. It replaces the required-keyword whitelist that used to sit here.
     if str(list_unsubscribe or "").strip():
-        return False, "bulk mail (List-Unsubscribe header present)"
+        # ...unless Kevin already knows this person. A recruiter at a firm that routes ALL outbound
+        # mail through a bulk platform (Mailchimp, HubSpot, an ATS marketing suite) emits
+        # List-Unsubscribe on a hand-written note, and dropping that is exactly the silent loss
+        # this system exists to prevent - it never alerts and never reaches the Spam sweep, which
+        # also refuses bulk.
+        #
+        # The whitelist is the discriminator, not the wording: an exact CRM address match means
+        # this is someone Kevin is actually corresponding with. Lee Jeans and Venmo are not in the
+        # CRM, so nothing else gets in. Checked here rather than earlier because it costs a lookup,
+        # and only bulk-flagged mail needs to pay it.
+        if is_verified_crm_contact(sender):
+            logging.info(f"[BULK OVERRIDE] {sender} sets List-Unsubscribe but is a known CRM "
+                         f"contact - treated as a real reply")
+        else:
+            return False, "bulk mail (List-Unsubscribe header present)"
 
     # 5b. Required keywords, off unless EMAIL_REQUIRED_KEYWORDS is explicitly set in Render. Kept
     # so the old behaviour is one env var away, not a redeploy away. See the constant's comment.

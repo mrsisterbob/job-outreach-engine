@@ -4663,6 +4663,35 @@ def test_a_real_person_at_a_robot_domain_still_gets_through(monkeypatch):
     assert "jane.recruiter@paypal.com" in alerts[0]
 
 
+def test_a_known_contact_still_reaches_kevin_through_a_bulk_platform(monkeypatch):
+    """Some firms route ALL outbound mail through Mailchimp/HubSpot, so a recruiter's hand-written
+    note carries List-Unsubscribe. That was dropped at the bulk gate AND refused by the Spam sweep,
+    which is total silent loss - the exact failure this system exists to prevent.
+
+    The CRM whitelist is the discriminator: an exact address match means Kevin is already
+    corresponding with this person."""
+    known = lambda sender: {"name": "Sarah Chen", "company": "TalentFirm",
+                            "tab": "Carmen Cold", "sheet_uuid": "uuid-1"}
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("mc", "Sarah Chen <sarah@talentfirm.com>", "Interview availability?",
+                       "Hi Kevin, we'd love to set up an interview. Are you free Thursday?",
+                       extra_headers={"List-Unsubscribe": "<https://mailchimp/u>"})],
+        crm_lookup=known)
+    assert len(alerts) == 1
+    assert "Interview" in alerts[0]
+
+
+def test_the_bulk_override_does_not_let_newsletters_in(monkeypatch):
+    """The override keys on an exact CRM address match, so nothing Kevin does not already know
+    gains anything from it."""
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("news", "deals@leejeans.com", "40% off everything",
+                       "Shop the fall sale now, free shipping on orders over fifty dollars.",
+                       extra_headers={"List-Unsubscribe": "<https://leejeans/u>"}),
+    ])
+    assert alerts == []
+
+
 def test_the_classifier_reads_past_gmails_200_char_snippet(monkeypatch):
     """Gmail's snippet caps around 200 chars and cuts mid-sentence, so a recruiter who opens with
     pleasantries and puts the ask in paragraph three was classified on the pleasantries alone."""

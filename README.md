@@ -80,7 +80,10 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
     messages in a real production poll, including a recruiter confirming an interview. Set it in
     Render to restore the old behaviour verbatim.
   - Bulk mail is identified by the **`List-Unsubscribe`** header instead. A newsletter sets it; a
-    person typing an email does not.
+    person typing an email does not. **Exception:** a sender that resolves to an exact CRM contact
+    is let through anyway - some firms route all outbound mail through Mailchimp/HubSpot, so a
+    recruiter's hand-written note carries the header, and dropping it was total silent loss (the
+    Spam sweep refuses bulk too). The whitelist is the discriminator, not the wording.
   - **Tier 1 override:** a calendar invite (`text/calendar` part or `METHOD:REQUEST`) or an
     interview signal alerts *always* - past the age gate, the bulk rules and the CRM whitelist.
     It still respects `EMAIL_SENDER_BLACKLIST` and `EMAIL_BLOCK_DOMAINS`. A sender with no CRM row
