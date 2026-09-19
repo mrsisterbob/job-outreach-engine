@@ -179,6 +179,31 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
     bookmarklet (`POST /ingest`) scrapes inside your own session, so it always has the full
     description - prefer it when you are at a desk and the page is JS-only.
 
+## Public aggregate endpoint
+
+`GET /public/stats` - unauthenticated, read-only, **counts only**. It exists so the portfolio
+site can cite pipeline numbers that a stranger can verify instead of taking them on faith.
+
+```json
+{"status":"ok","applications_logged":51,"replies":12,"interviews":6,"rejections":9,
+ "still_sourcing":40,"days_running":50,"start_date":"2026-07-31","as_of":"2026-09-19"}
+```
+
+- **Source** is the Sheets CRM `funnel_stats` action, not local SQLite - the Sheet is where a
+  status actually changes, and SQLite can trail it after a host restart.
+- **No PII.** Every value but `status`/`start_date`/`as_of` is an integer. No row, company,
+  role, person or address is reachable through it.
+- **Bucket roll-up.** `funnel_stats` reports each row's *current* status, so a row in
+  Interviewing was necessarily applied to and replied to. Each count includes every stage past
+  it. `Rejected` counts as an application but **not** as a reply: the bucket cannot tell an
+  auto-reject from a post-interview no, and folding it in would inflate the reply rate in the
+  direction that flatters.
+- **Failure mode is 503, never zero.** Zeros from a failed fetch are indistinguishable from
+  invented numbers once they are printed on a page. A stale cache is served (flagged
+  `"stale": true`) ahead of an outage; with no cache at all the endpoint refuses to answer.
+- Cached `PUBLIC_STATS_TTL_SECONDS` (default 900) so a page refresh doesn't spend an Apps
+  Script call.
+
 ## Tests
 
 ```

@@ -10410,6 +10410,123 @@ def desktop_ingest():
         logging.error(f"Ingest Endpoint Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# ==============================================================================
+# 11. PUBLIC AGGREGATE STATS (read-only, counts only)
+# ==============================================================================
+# The portfolio site cites real pipeline numbers; this endpoint is what makes them
+# checkable by a stranger. It serves aggregate integers only - no row, no company, no
+# role, no person, no email address - so it is safe to leave unauthenticated.
+#
+# Source of truth is the Sheets CRM (the funnel_stats GET action), not local SQLite:
+# the Sheet is where a status actually changes, and on a host restart SQLite can be
+# behind it. Results are cached for PUBLIC_STATS_TTL_SECONDS so a page refresh does not
+# spend an Apps Script call.
+#
+# It never invents a number. If the CRM is unreachable and nothing is cached it returns
+# 503, not zeros: a page rendering "0 applications" from a failed fetch is
+# indistinguishable from one that made the number up, which is the failure this whole
+# endpoint exists to prevent.
+
+# The day the engine started logging outreach (first commit). days_running counts from here.
+PUBLIC_STATS_START_DATE = "2026-07-31"
+PUBLIC_STATS_TTL_SECONDS = int(os.environ.get("PUBLIC_STATS_TTL_SECONDS", "900"))
+_public_stats_cache = {"fetched_at": 0.0, "payload": None}
+_public_stats_lock = threading.Lock()
+
+
+def _public_stats_days_running(now=None):
+    """Whole days from PUBLIC_STATS_START_DATE to today, floored at 0."""
+    now = now or datetime.now(timezone.utc)
+    start = datetime.strptime(PUBLIC_STATS_START_DATE, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return max(0, (now - start).days)
+
+
+def build_public_stats(now=None):
+    """Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable.
+
+    Bucket semantics matter here, because funnel_stats reports each row's CURRENT status, not
+    its history. A row sitting in Interviewing was necessarily applied to and necessarily
+    replied to, so each count rolls up every stage at or past it:
+
+      applications_logged - every row past Matched (Matched means sourced but not yet applied)
+      replies             - rows that drew a human response that moved them forward
+      interviews          - Screening, Interviewing and Offer (a recruiter screen is an interview)
+
+    Rejected is reported on its own line rather than folded into replies. A rejection is
+    terminal, and the bucket cannot tell an auto-reject from a post-interview no - counting
+    those as "replies" would inflate the reply rate in exactly the direction that flatters.
+    """
+    res = crm_get({"action": "funnel_stats"}, timeout=15)
+    if res is None or res.status_code != 200:
+        return None
+    try:
+        data = res.json()
+    except Exception as e:
+        logging.error(f"Public stats: funnel_stats returned non-JSON: {e}")
+        return None
+    if data.get("status") != "success":
+        logging.error(f"Public stats: funnel_stats error: {data.get('message')}")
+        return None
+
+    overall = data.get("overall") or {}
+    if not isinstance(overall, dict) or not overall:
+        return None
+
+    def n(key):
+        try:
+            return int(overall.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    matched = n("Matched")
+    applied = n("Applied")
+    replied = n("Replied")
+    screening = n("Screening")
+    interviewing = n("Interviewing")
+    offer = n("Offer")
+    rejected = n("Rejected")
+
+    interviews = screening + interviewing + offer
+    replies = replied + interviews
+    applications_logged = applied + replies + rejected
+
+    return {
+        "applications_logged": applications_logged,
+        "replies": replies,
+        "interviews": interviews,
+        "rejections": rejected,
+        "still_sourcing": matched,
+        "days_running": _public_stats_days_running(now),
+        "start_date": PUBLIC_STATS_START_DATE,
+        "as_of": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d"),
+    }
+
+
+@app.route("/public/stats", methods=["GET"])
+def public_stats():
+    """Public, unauthenticated, counts-only pipeline aggregate. See section 11's header."""
+    now = time.time()
+    with _public_stats_lock:
+        cached = _public_stats_cache["payload"]
+        fresh = cached is not None and (now - _public_stats_cache["fetched_at"]) < PUBLIC_STATS_TTL_SECONDS
+    if fresh:
+        return jsonify(dict(cached, status="ok", cached=True)), 200
+
+    payload = build_public_stats()
+    if payload is None:
+        # Serve a stale cache before serving nothing, but say that it is stale.
+        with _public_stats_lock:
+            cached = _public_stats_cache["payload"]
+        if cached is not None:
+            return jsonify(dict(cached, status="ok", cached=True, stale=True)), 200
+        return jsonify({"status": "unavailable", "message": "CRM unreachable; no counts to report"}), 503
+
+    with _public_stats_lock:
+        _public_stats_cache["payload"] = payload
+        _public_stats_cache["fetched_at"] = now
+    return jsonify(dict(payload, status="ok", cached=False)), 200
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Job outreach engine: Flask server, or a one-shot batch pipeline run.")
     parser.add_argument(

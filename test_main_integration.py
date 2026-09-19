@@ -5299,3 +5299,81 @@ def test_decoys_report_does_not_claim_a_decoy_rate_before_any_dead_mark(clean_ou
     msg = m.format_decoy_metrics_message()
     assert "no <code>/dead</code> marks yet" in msg
     assert "0 of 1" in msg
+
+
+# ---- /public/stats (counts-only aggregate for the portfolio site) ----
+
+def _funnel_response(overall, status="success"):
+    class _Res:
+        status_code = 200
+        def json(self):
+            return {"status": status, "overall": overall}
+    return _Res()
+
+
+_FUNNEL = {"Matched": 40, "Applied": 30, "Replied": 6, "Screening": 2,
+           "Interviewing": 3, "Offer": 1, "Rejected": 9}
+
+
+@pytest.fixture(autouse=True)
+def _clear_public_stats_cache():
+    m._public_stats_cache["payload"] = None
+    m._public_stats_cache["fetched_at"] = 0.0
+    yield
+    m._public_stats_cache["payload"] = None
+    m._public_stats_cache["fetched_at"] = 0.0
+
+
+def test_public_stats_rolls_current_status_buckets_forward(monkeypatch):
+    """A row in Interviewing was applied to and replied to, so every count includes the
+    stages past it. Rejected counts as an application but never as a reply."""
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL))
+    with m.app.test_client() as client:
+        res = client.get("/public/stats")
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["interviews"] == 6           # Screening + Interviewing + Offer
+    assert body["replies"] == 12             # Replied + the 6 interviews
+    assert body["applications_logged"] == 51  # Applied + replies + Rejected, never Matched
+    assert body["rejections"] == 9
+    assert body["still_sourcing"] == 40
+
+
+def test_public_stats_exposes_counts_only_and_no_pii(monkeypatch):
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL))
+    with m.app.test_client() as client:
+        body = client.get("/public/stats").get_json()
+    non_counts = {"status", "start_date", "as_of", "cached", "stale"}
+    for key, value in body.items():
+        if key in non_counts:
+            continue
+        assert isinstance(value, int), f"{key} is not an aggregate count: {value!r}"
+
+
+def test_public_stats_returns_503_rather_than_zeros_when_the_crm_is_down(monkeypatch):
+    """Zeros from a failed fetch look exactly like invented numbers on the page. The site
+    must be able to tell the difference, so an outage is a 503, not a count of 0."""
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: None)
+    with m.app.test_client() as client:
+        res = client.get("/public/stats")
+    assert res.status_code == 503
+    assert res.get_json()["status"] == "unavailable"
+
+
+def test_public_stats_serves_a_stale_cache_before_serving_nothing(monkeypatch):
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL))
+    with m.app.test_client() as client:
+        client.get("/public/stats")
+        m._public_stats_cache["fetched_at"] = 0.0  # expire it
+        monkeypatch.setattr(m, "crm_get", lambda *a, **k: None)
+        res = client.get("/public/stats")
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["stale"] is True
+    assert body["applications_logged"] == 51
+
+
+def test_public_stats_days_running_counts_from_the_first_commit():
+    now = m.datetime(2026, 9, 19, tzinfo=m.timezone.utc)
+    assert m._public_stats_days_running(now) == 50  # 2026-07-31 -> 2026-09-19
+    assert m._public_stats_days_running(m.datetime(2026, 7, 30, tzinfo=m.timezone.utc)) == 0
