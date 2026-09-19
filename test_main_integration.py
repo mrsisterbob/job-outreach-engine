@@ -4217,8 +4217,28 @@ def _gmail_message(msg_id, sender, subject, snippet, extra_headers=None, ics=Non
     }
 
 
+def _fake_tray_recorder(tray_state):
+    """An in-memory stand-in for record_inbound_thread with the same upsert contract:
+    returns (is_new_thread, message_count)."""
+    def _record(thread_id, sender_email, sender_name, company, subject, snippet,
+                status_label, match_reason, sheet_uuid, is_tier1):
+        row = tray_state.get(thread_id)
+        if row:
+            row["message_count"] += 1
+            row["state"] = "open"
+            return False, row["message_count"]
+        tray_state[thread_id] = {
+            "thread_id": thread_id, "sender_email": sender_email, "sender_name": sender_name,
+            "company": company, "subject": subject, "status_label": status_label,
+            "match_reason": match_reason, "sheet_uuid": sheet_uuid,
+            "is_tier1": 1 if is_tier1 else 0, "alerted": 0, "state": "open", "message_count": 1,
+        }
+        return True, 1
+    return _record
+
+
 def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_started=False,
-                              spam_messages=None):
+                              spam_messages=None, tray_state=None, delivery_fails=False):
     """Drive the real check_inbound_gmail_replies() against a faked Gmail API.
 
     `messages` answers the label:INBOX query and `spam_messages` the label:SPAM one - the fake
@@ -4228,7 +4248,17 @@ def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_sta
     Returns (alerts, marked_read): the Telegram messages actually sent, and the ids whose UNREAD
     label was removed. Nothing here asserts on a return value - check_inbound_gmail_replies has
     none; what it does is send alerts and write CRM rows, so that is what gets captured.
+
+    The inbound tray starts EMPTY for every test unless a case opts in with `tray_state`. Thread
+    dedup is keyed on thread_id and the tray is durable by design, so a shared tray would make one
+    test's conversation silence the next test's alert - which is real behaviour, but it belongs in
+    the dedup tests that assert it deliberately, not as a hidden coupling between unrelated cases.
     """
+    if tray_state is None:
+        tray_state = {}
+    monkeypatch.setattr(m, "record_inbound_thread", _fake_tray_recorder(tray_state))
+    monkeypatch.setattr(m, "mark_inbound_thread_alerted", lambda tid: tray_state.get(tid, {}).update(alerted=1))
+
     for var in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"):
         monkeypatch.setenv(var, "fake")
     monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
@@ -4264,7 +4294,12 @@ def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_sta
 
     monkeypatch.setattr(m.requests, "get", fake_get)
     monkeypatch.setattr(m.requests, "post", fake_post)
-    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: alerts.append(text))
+    # The real send_telegram_message returns the sent message_id on success and None on failure -
+    # it never raises. delivery_fails=True reproduces the failure return, which is what the
+    # mark-read decision now hinges on.
+    monkeypatch.setattr(m, "send_telegram_message",
+                        lambda cid, text: (alerts.append(text),
+                                           None if delivery_fails else 12345)[1])
     m.check_inbound_gmail_replies()
     return alerts, marked_read
 
@@ -4434,10 +4469,15 @@ def test_spam_sweep_still_runs_when_the_inbox_query_fails(monkeypatch):
 
     monkeypatch.setattr(m.requests, "get", fake_get)
     monkeypatch.setattr(m.requests, "post", lambda url, **kw: _Res({}))
-    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: alerts.append(text))
+    monkeypatch.setattr(m, "send_telegram_message",
+                        lambda cid, text: (alerts.append(text), 12345)[1])
     m.check_inbound_gmail_replies()
-    assert len(alerts) == 1
-    assert "Found in SPAM" in alerts[0]
+    # Two messages now: the rescued invite, plus the failure notice that the INBOX query broke.
+    # The failure notice is the point - a silent INBOX outage is how Kevin finds out days later.
+    rescued = [a for a in alerts if "Found in SPAM" in a]
+    failures = [a for a in alerts if "Email poller failure" in a]
+    assert len(rescued) == 1
+    assert len(failures) == 1 and "INBOX list" in failures[0]
 
 
 def test_bulk_mail_is_separated_from_humans_by_the_list_unsubscribe_header(monkeypatch):
@@ -4452,6 +4492,352 @@ def test_bulk_mail_is_separated_from_humans_by_the_list_unsubscribe_header(monke
     ])
     assert len(alerts) == 1
     assert "dana@atwell.com" in alerts[0]
+
+
+def test_job_board_blast_cannot_buy_a_tier1_bypass_with_the_word_interview(monkeypatch):
+    """A real subject line from Kevin's inbox: "Application status update - YOUR INTERVIEW REQUEST
+    AWAITING YOUR CONFIRMATION". It matches \\binterview\\b, so it scored Tier 1 and skipped the
+    bulk gate, the age gate and the CRM whitelist - the exact path a genuine invite uses.
+
+    Job-board volume makes this the highest-frequency false positive there is, and the bypass is
+    the one route with no downstream filter behind it. List-Unsubscribe is what tells the two
+    apart: the blast sets it, a recruiter typing by hand does not."""
+    blast_subject = "Application status update - YOUR INTERVIEW REQUEST AWAITING YOUR CONFIRMATION"
+    # The classifier still calls it an interview; the demotion is deliberately a poll-loop decision
+    # so the Spam sweep and the CRM badge keep reading the same classifier.
+    assert m.classify_inbound_ats_email("jobs@job-matches.example", blast_subject, "")[0] == "INTERVIEW_SET"
+
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("blast", "alerts@job-matches.example", blast_subject,
+                       "Your interview request is awaiting confirmation. View details and apply now.",
+                       extra_headers={"List-Unsubscribe": "<https://job-matches.example/u/1>"}),
+        _gmail_message("real", STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET),
+    ])
+
+    assert len(alerts) == 1, "the bulk blast must not alert"
+    assert "astemler@nextpathcp.com" in alerts[0], "the real interview must still get through"
+    assert sorted(marked_read) == ["blast", "real"]
+
+
+def test_spam_sweep_does_not_resurrect_bulk_mail_gmail_correctly_caught(monkeypatch):
+    """The sweep exists because Gmail is wrong in ONE direction - a real invite that looks bulk.
+    A message that sets List-Unsubscribe is the case where Gmail was right, and rescuing it turns
+    the safety net into a junk firehose aimed at Telegram."""
+    alerts, marked_read = _run_poll_with_fake_gmail(
+        monkeypatch, [],
+        spam_messages=[
+            _gmail_message("spam-blast", "alerts@job-matches.example",
+                           "YOUR INTERVIEW REQUEST AWAITING CONFIRMATION",
+                           "Confirm your interview request now.",
+                           extra_headers={"List-Unsubscribe": "<https://x.example/u>"}),
+            _gmail_message("spam-invite", FITTERMAN_SENDER, FITTERMAN_SUBJECT,
+                           FITTERMAN_SNIPPET, ics=FITTERMAN_ICS),
+        ])
+
+    assert len(alerts) == 1
+    assert "raymondjames.com" in alerts[0]
+    # The blast is left entirely alone - not alerted, and not marked read.
+    assert marked_read == ["spam-invite"]
+
+
+def test_inbox_query_excludes_gmail_categories_before_spending_the_budget(monkeypatch):
+    """The filter has to run on GMAIL'S side. Every Python gate rejects a message only after it has
+    already consumed one of the per-cycle slots, so a burst of job-board mail can starve a real
+    interview out of the window entirely. This asserts the exclusions reach the actual query."""
+    captured = {}
+
+    def _capture(monkeypatch_target, **kwargs):
+        pass
+
+    for var in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"):
+        monkeypatch.setenv(var, "fake")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: "fake-token")
+
+    class _Res:
+        status_code = 200
+
+        def json(self):
+            return {"messages": []}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/messages"):
+            params = kwargs.get("params") or {}
+            q = params.get("q", "")
+            if "label:SPAM" not in q:
+                captured["q"] = q
+                captured["maxResults"] = params.get("maxResults")
+        return _Res()
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    monkeypatch.setattr(m.requests, "post", lambda url, **kw: _Res())
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: None)
+    m.check_inbound_gmail_replies()
+
+    assert "-category:promotions" in captured["q"]
+    assert "-category:social" in captured["q"]
+    assert "is:unread" in captured["q"] and "-from:me" in captured["q"]
+    # 10 was far below one day's real inbound volume at any sane cadence.
+    assert captured["maxResults"] == 50
+
+
+def test_a_dead_refresh_token_tells_kevin_instead_of_going_quiet(monkeypatch):
+    """The worst failure mode in the system: auth dies, every inbound alert stops, and silence is
+    indistinguishable from a quiet inbox. Kevin finds out from a missed interview."""
+    for var in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"):
+        monkeypatch.setenv(var, "fake")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: None)
+    monkeypatch.setattr(m, "should_send_alert", lambda key, hours=6: True)
+    alerts = []
+    monkeypatch.setattr(m, "send_telegram_message",
+                        lambda cid, text: (alerts.append(text), 12345)[1])
+
+    m.check_inbound_gmail_replies()
+
+    assert len(alerts) == 1
+    assert "Email poller failure" in alerts[0]
+    assert "Gmail auth" in alerts[0]
+
+
+def test_poller_failure_alert_is_debounced_across_restarts(monkeypatch):
+    """Render restarts on every deploy, so the cooldown must be the DB-backed one - an in-memory
+    dict would reset with the container and re-alert on each boot."""
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
+    seen = []
+    monkeypatch.setattr(m, "should_send_alert", lambda key, hours=6: seen.append((key, hours)) or False)
+    alerts = []
+    monkeypatch.setattr(m, "send_telegram_message",
+                        lambda cid, text: (alerts.append(text), 12345)[1])
+
+    m.report_poller_failure("Gmail auth", "boom")
+
+    assert alerts == []
+    assert seen == [("poller_failure:Gmail auth", m.POLLER_FAILURE_ALERT_COOLDOWN_HOURS)]
+
+
+def test_transactional_robot_mail_from_kevins_telegram_never_alerts(monkeypatch):
+    """The three alerts filling Kevin's Telegram on 2026-09-19, by name.
+
+    None were reachable by the other two defences, which is why they needed a third:
+      - they set no List-Unsubscribe (transactional mail is not bulk mail), so the bulk gate misses
+      - Gmail files them Updates, not Promotions, so -category: exclusions miss them
+    noreply-location-sharing@google.com is the specific shape the old blacklist could not see: it
+    contains "noreply-", never "noreply@", so the substring test returned no match."""
+    for sender in ("service@paypal.com",
+                   "noreply-location-sharing@google.com",
+                   "notifications@linkedin.com",
+                   "do-not-reply@indeed.com"):
+        passed, reason = m.passes_email_sender_blocks(sender)
+        assert not passed, f"{sender} should be blocked as a robot mailbox"
+        assert "blacklisted" in reason
+
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("paypal", '"service@paypal.com" <service@paypal.com>',
+                       "You sent a $302.00 USD payment",
+                       "Kevin Miller, here's your receipt. You sent $302.00 USD to Sandra Miller."),
+        _gmail_message("gloc", "Google Location Sharing <noreply-location-sharing@google.com>",
+                       "You're sharing your real-time location with Kevin Miller",
+                       "Kevin, To protect your privacy, this is a reminder that you're sharing."),
+        _gmail_message("human", "dana@atwell.com", "Re: Operations Analyst",
+                       "Thanks for reaching out Kevin, let me look into it and get back to you."),
+    ])
+
+    assert len(alerts) == 1, "only the human should reach Telegram"
+    assert "dana@atwell.com" in alerts[0]
+    assert sorted(marked_read) == ["gloc", "human", "paypal"]
+
+
+def test_a_real_person_at_a_robot_domain_still_gets_through(monkeypatch):
+    """The blacklist matches the ADDRESS, never the domain. Blocking service@paypal.com must not
+    block a recruiter who happens to work at PayPal - that is the whole reason these are substring
+    entries on the local part rather than domain bans."""
+    passed, _ = m.passes_email_sender_blocks("jane.recruiter@paypal.com")
+    assert passed
+
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("real", "Jane Recruiter <jane.recruiter@paypal.com>",
+                       "Re: Operations Analyst role",
+                       "Hi Kevin, thanks for applying - do you have time to chat this week?")])
+    assert len(alerts) == 1
+    assert "jane.recruiter@paypal.com" in alerts[0]
+
+
+def _clear_tray():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_threads")
+        conn.commit()
+
+
+def test_the_real_tray_upserts_on_thread_id_and_survives_a_restart():
+    """Exercises the actual SQLite path, not the in-memory fake the poll tests use. The tray is the
+    ledger the notification path never had, so it has to be durable: a Render deploy restarts the
+    container, and an in-memory tray would come back empty with every conversation forgotten."""
+    _clear_tray()
+    args = ("T1", "dana@atwell.com", "Dana", "Atwell", "Re: Operations Analyst",
+            "preview text", "GENERAL", "unknown sender", "", False)
+    assert m.record_inbound_thread(*args) == (True, 1)
+    assert m.record_inbound_thread(*args) == (False, 2)
+    assert m.record_inbound_thread(*args) == (False, 3)
+
+    open_threads = m.get_open_inbound_threads()
+    assert len(open_threads) == 1
+    assert open_threads[0]["message_count"] == 3
+
+    # A fresh connection is what a restarted container gets.
+    with m.get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT message_count, state FROM inbound_threads WHERE thread_id = 'T1'").fetchone()
+    assert row == (3, "open")
+    _clear_tray()
+
+
+def test_closing_a_thread_removes_it_from_the_tray_and_a_new_reply_reopens_it():
+    """'done' has to mean 'dealt with for now', not 'ignore forever' - when they write back, the
+    conversation is open again."""
+    _clear_tray()
+    args = ("T2", "dana@atwell.com", "Dana", "Atwell", "Re: Role", "x", "GENERAL", "", "", False)
+    m.record_inbound_thread(*args)
+    assert m.close_inbound_thread("T2") is True
+    assert m.get_open_inbound_threads() == []
+    # Closing twice is a no-op, so a duplicate /done does not report a false success.
+    assert m.close_inbound_thread("T2") is False
+
+    m.record_inbound_thread(*args)
+    assert len(m.get_open_inbound_threads()) == 1, "a new reply reopens the conversation"
+    _clear_tray()
+
+
+def test_tier1_conversations_sort_above_everything_else_in_the_tray():
+    """The tray is read top-down under time pressure; an offer must never sit below a newsletter
+    reply just because the reply arrived later."""
+    _clear_tray()
+    m.record_inbound_thread("T-general", "a@b.com", "A", "B", "Re: hello", "x", "GENERAL", "", "", False)
+    m.record_inbound_thread("T-offer", "c@d.com", "C", "D", "Offer", "x", "OFFER_EXTENDED", "", "", True)
+    assert [t["thread_id"] for t in m.get_open_inbound_threads()][0] == "T-offer"
+    _clear_tray()
+
+
+def test_the_tray_message_renders_ids_and_an_empty_state():
+    """The rendered card is what Kevin actually reads, and the id under each entry is the handle
+    /done takes. A multi-entry card must carry its own ids - swipe recovery takes the first one on
+    the card, which would close the wrong conversation."""
+    assert "Nothing open" in m.format_inbound_tray_message([])
+    rendered = m.format_inbound_tray_message([
+        {"thread_id": "abc123", "sender_name": "Andy Stemler", "company": "NextPath",
+         "subject": "Raymond James Interview", "status_label": "INTERVIEW_SET",
+         "message_count": 2, "is_tier1": 1},
+    ])
+    assert "abc123" in rendered
+    assert "Andy Stemler" in rendered
+    assert "2 msgs" in rendered
+    assert "/done" in rendered
+
+
+def test_tray_helpers_never_raise_when_the_database_is_unavailable(monkeypatch):
+    """The tray is an enhancement to the alert path. If SQLite is unreachable, the alert still has
+    to go out - a broken ledger must not become a broken notification."""
+    def _boom(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(m, "get_db_conn", _boom)
+
+    # Falls back to 'treat it as a new thread', which is exactly the pre-tray behaviour.
+    assert m.record_inbound_thread("T", "a@b.com", "A", "B", "s", "x", "GENERAL", "", "", False) == (True, 1)
+    assert m.get_open_inbound_threads() == []
+    assert m.close_inbound_thread("T") is False
+    m.mark_inbound_thread_alerted("T")  # must not raise
+
+
+def test_a_failed_telegram_send_leaves_the_mail_unread_to_retry(monkeypatch):
+    """The bug that made every other fix untrustworthy.
+
+    send_telegram_message returns None on failure and never raises, and the mark-read POST used to
+    run unconditionally straight after it. So a 5s timeout or a second 429 meant: the alert was
+    never seen, the message was no longer unread, and the next poll's is:unread query could never
+    find it again. A real interview confirmation could vanish with one ERROR line in a log.
+
+    Leaving it UNREAD *is* the retry - no queue, no backoff, just the next cycle."""
+    monkeypatch.setattr(m, "report_poller_failure", lambda *a, **k: None)
+    attempted, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("stemler", STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET)],
+        delivery_fails=True)
+
+    assert len(attempted) == 1, "the alert was attempted"
+    assert marked_read == [], "but an undelivered alert must NOT be marked read"
+
+
+def test_a_delivered_alert_is_marked_read_exactly_once(monkeypatch):
+    """The other half: a successful send must still clear UNREAD, or every cycle re-alerts."""
+    _alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("stemler", STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET)])
+    assert marked_read == ["stemler"]
+
+
+def test_a_failed_send_in_the_spam_sweep_also_retries(monkeypatch):
+    """Worth its own test because Spam is the one folder nobody browses: an undelivered alert that
+    was marked read leaves the invite unreachable by every path at once."""
+    monkeypatch.setattr(m, "report_poller_failure", lambda *a, **k: None)
+    attempted, marked_read = _run_poll_with_fake_gmail(
+        monkeypatch, [],
+        spam_messages=[_gmail_message("spam-invite", FITTERMAN_SENDER, FITTERMAN_SUBJECT,
+                                      FITTERMAN_SNIPPET, ics=FITTERMAN_ICS)],
+        delivery_fails=True)
+    assert len(attempted) == 1
+    assert marked_read == []
+
+
+def test_a_second_reply_on_one_thread_updates_the_tray_without_a_new_alert(monkeypatch):
+    """Three replies on one conversation used to cost three notifications. The conversation is the
+    unit Kevin acts on, so the tray row is what gets updated."""
+    tray = {}
+    msgs = []
+    for i in range(3):
+        msg = _gmail_message(f"r{i}", "dana@atwell.com", "Re: Operations Analyst",
+                             "Thanks Kevin, following up again with more detail on the role.")
+        msg["threadId"] = "SAME-THREAD"
+        msgs.append(msg)
+
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, msgs, tray_state=tray)
+
+    assert len(alerts) == 1, "one conversation, one notification"
+    assert tray["SAME-THREAD"]["message_count"] == 3, "but all three messages are recorded"
+    # Every message still gets marked read - the later ones simply did not warrant an interrupt.
+    assert sorted(marked_read) == ["r0", "r1", "r2"]
+
+
+def test_an_interview_on_an_existing_thread_still_interrupts(monkeypatch):
+    """Tier 1 is exempt from dedup. A conversation that has been running for a week and NOW
+    contains an interview invitation is exactly the development worth interrupting for."""
+    tray = {}
+    first = _gmail_message("m1", "dana@atwell.com", "Re: Operations Analyst",
+                           "Thanks Kevin, let me take a look and get back to you shortly.")
+    first["threadId"] = "T"
+    alerts_1, _ = _run_poll_with_fake_gmail(monkeypatch, [first], tray_state=tray)
+
+    second = _gmail_message("m2", "dana@atwell.com", "Re: Operations Analyst",
+                            "Good news - are you free Thursday for an interview with the team?")
+    second["threadId"] = "T"
+    alerts_2, _ = _run_poll_with_fake_gmail(monkeypatch, [second], tray_state=tray)
+
+    assert len(alerts_1) == 1
+    assert len(alerts_2) == 1, "the interview must break through thread dedup"
+    assert "Interview Signal Detected" in alerts_2[0]
+
+
+def test_the_tray_records_strangers_the_crm_path_structurally_cannot_hold(monkeypatch):
+    """The organizer gap. A recruiter's first email is a stranger by definition, so it resolves to
+    no sheet row - and the whole CRM path is keyed on sheet_uuid. Before the tray it got one alert
+    and then fell out of the system entirely."""
+    tray = {}
+    _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("stemler", STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET)],
+        tray_state=tray)
+
+    row = tray["thread-stemler"]
+    assert row["sender_email"] == "astemler@nextpathcp.com"
+    assert row["sheet_uuid"] == "", "a stranger has no CRM row, and the tray holds it anyway"
+    assert row["status_label"] == "INTERVIEW_SET"
+    assert row["state"] == "open"
 
 
 def test_ordinary_human_mail_alerts_without_touching_the_crm(monkeypatch):

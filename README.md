@@ -85,6 +85,46 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
     interview signal alerts *always* - past the age gate, the bulk rules and the CRM whitelist.
     It still respects `EMAIL_SENDER_BLACKLIST` and `EMAIL_BLOCK_DOMAINS`. A sender with no CRM row
     gets the alert and **no CRM writes** - the alert says so on its face.
+    **Exception:** a message carrying `List-Unsubscribe` cannot take the bypass. Job-board blasts
+    like `"Application status update - YOUR INTERVIEW REQUEST AWAITING YOUR CONFIRMATION"` match
+    `\binterview\b` and were skipping every gate behind it. The same rule applies in the Spam
+    sweep, which now refuses to resurrect bulk mail Gmail filed correctly.
+  - `EMAIL_QUERY_EXCLUSIONS` (default `-category:promotions -category:social -category:forums`)
+    is applied **in the Gmail query itself**. This is the only filter layer that runs *before* the
+    per-cycle message budget is spent - every Python gate rejects a message that has already taken
+    a slot, so a burst of job-board mail could starve a real interview out of the window.
+  - `EMAIL_POLL_MAX_RESULTS` (default **50**, was a hardcoded 10). `messages.list` costs 5 quota
+    units regardless of the value and `messages.get` 5 units each, against a 1.2M/day ceiling, so
+    50 is not meaningfully more expensive - and 10/cycle was far below one day's inbound volume.
+  - `EMAIL_SENDER_BLACKLIST` now covers the **robot-mailbox** families the other two gates
+    structurally cannot see. Transactional mail (PayPal receipts, Google location notices) sets no
+    `List-Unsubscribe` and is filed *Updates*, not *Promotions* - so neither the bulk gate nor the
+    category exclusions touch it. `noreply-location-sharing@google.com` is the shape that exposed
+    it: it contains `noreply-`, never `noreply@`. Entries match the **address**, not the domain,
+    so `jane@paypal.com` still reaches you while `service@paypal.com` does not.
+  - **Reading depth:** the classifier sees `From`, `Subject` and Gmail's **~200-char `snippet`** -
+    not the full body, which is fetched but only walked for `.ics` parts. An interview detail past
+    that cutoff is invisible to classification; the alert links to the thread for the rest.
+  - **Delivery is confirmed before a message is marked read.** `send_telegram_message` returns the
+    message_id on success and `None` on failure (it never raises), and the mark-read POST used to
+    run unconditionally right after it - so a 5s timeout or a second 429 meant the alert was never
+    seen, the message was no longer unread, and the next `is:unread` query could never find it
+    again. An undelivered alert now leaves the mail **UNREAD**, which *is* the retry: the next
+    cycle re-lists it. A duplicate alert costs a glance; a dropped one costs the interview.
+  - **Inbound tray (`inbound_threads`, `/inbox`, `/done <id>`):** one durable row per Gmail
+    *thread* - the unit Kevin actually acts on. This is the ledger the notification path never had:
+    - A second reply on an open thread updates the row instead of firing a duplicate alert.
+      **Tier 1 is exempt** - an interview or offer landing on an existing thread still interrupts.
+    - Strangers are recorded too (`sheet_uuid` blank). The CRM path is keyed on a sheet row, so a
+      recruiter's first email - a stranger by definition - previously got one alert and then fell
+      out of the system entirely.
+    - `state` is `open` until `/done <id>`; a new reply reopens a closed thread.
+    - Every helper is failure-tolerant: if SQLite is unreachable the alert still goes out, since
+      a broken ledger must not become a broken notification.
+  - **Poller failure alerts:** a dead `GMAIL_REFRESH_TOKEN` or a failing list query now sends a
+    Telegram notice (`report_poller_failure`, debounced 6h per stage via the DB-backed
+    `should_send_alert`). Previously these logged and continued, so notifications stopped silently
+    and the failure surfaced as a missed interview.
   - Gmail `messages.get` is fetched at `format=full` (not `metadata`), because `payload.parts` is
     the only place an `.ics` is visible. Same 5 quota units per call; the cost is response size,
     roughly 1KB → tens of KB, at ≤10 messages per poll.

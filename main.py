@@ -492,7 +492,20 @@ EMAIL_BLOCK_DOMAINS = os.environ.get("EMAIL_BLOCK_DOMAINS", "quora.com,anytimefi
 # Setting EMAIL_REQUIRED_KEYWORDS in Render re-enables the old behaviour verbatim.
 EMAIL_REQUIRED_KEYWORDS = os.environ.get("EMAIL_REQUIRED_KEYWORDS", "")
 EMAIL_EXCLUDED_KEYWORDS = os.environ.get("EMAIL_EXCLUDED_KEYWORDS", "digest,unsubscribe,newsletter,promo,alert")
-EMAIL_SENDER_BLACKLIST = os.environ.get("EMAIL_SENDER_BLACKLIST", "no-reply@,noreply@")
+# Robot mailboxes, matched as a substring of the ADDRESS (not the domain), so a real person at a
+# company whose marketing goes out from no-reply@ is unaffected.
+#
+# "noreply@" and "no-reply@" alone missed the whole hyphenated-suffix family:
+# noreply-location-sharing@google.com contains "noreply-", never "noreply@", so Google's location
+# notices alerted Kevin as an Unverified Reply. The bare-prefix entries below close that, and the
+# transactional senders (service@paypal.com, notifications@, receipts@) are the other half of the
+# same problem: they carry no List-Unsubscribe and are filed Updates rather than Promotions, so
+# neither the bulk gate nor the category exclusions ever see them.
+EMAIL_SENDER_BLACKLIST = os.environ.get(
+    "EMAIL_SENDER_BLACKLIST",
+    "no-reply@,noreply@,noreply-,no-reply-,donotreply@,do-not-reply@,"
+    "service@paypal.com,notifications@,notification@,receipts@,receipt@,billing@,"
+    "mailer-daemon@,postmaster@,bounce@,bounces@")
 EMAIL_SUBJECT_REGEX_FILTER = os.environ.get("EMAIL_SUBJECT_REGEX_FILTER", "")
 try:
     EMAIL_MAX_AGE_SECONDS = int(os.environ.get("EMAIL_MAX_AGE_SECONDS") or default_email_max_age_seconds(EMAIL_POLL_HOURS))
@@ -504,6 +517,26 @@ try:
 except (TypeError, ValueError):
     EMAIL_MIN_BODY_LENGTH = 50
 EMAIL_LABEL_TARGET_INBOX = os.environ.get("EMAIL_LABEL_TARGET_INBOX", "INBOX")
+
+# Gmail-side exclusions, applied in the list query itself rather than in Python. This is the only
+# filter layer that runs BEFORE the per-cycle message budget is spent, which is what makes it
+# different in kind from every gate in passes_email_prefilter(): those gates reject a message that
+# has already consumed one of EMAIL_POLL_MAX_RESULTS slots, so a burst of newsletters can starve a
+# real interview email out of the window entirely. Gmail's own category classifier is very good at
+# exactly the mail Kevin gets most of - job-board blasts, retail, social - and costs nothing.
+#
+# Deliberately NOT a spam filter: spam is a separate label Gmail already diverts, and Promotions is
+# not spam. A recruiter using Mailchimp can land in Promotions, which is why the Spam sweep's Tier 1
+# net exists and why this is one env var away from being switched off.
+EMAIL_QUERY_EXCLUSIONS = os.environ.get(
+    "EMAIL_QUERY_EXCLUSIONS", "-category:promotions -category:social -category:forums")
+# Messages examined per cycle. Gmail bills messages.list at 5 quota units regardless of maxResults,
+# and messages.get at 5 units each, against a 1.2M unit/day ceiling - so 50 is not meaningfully more
+# expensive than 10, and 10 was far below one day's real inbound volume.
+try:
+    EMAIL_POLL_MAX_RESULTS = int(os.environ.get("EMAIL_POLL_MAX_RESULTS", "50"))
+except (TypeError, ValueError):
+    EMAIL_POLL_MAX_RESULTS = 50
 
 # Mobile Short Key Alias Map
 ALIAS_MAP = {
@@ -917,6 +950,35 @@ def init_db():
             payload_json TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        # The inbound tray: one row per Gmail THREAD, not per message.
+        #
+        # This is the ledger the notification path never had. Before it, Gmail's own UNREAD flag
+        # was the only state, which made three things impossible: a failed Telegram send was
+        # unrecoverable, reading mail on a phone silently cancelled the alert, and five replies on
+        # one thread produced five alerts. A durable row per thread fixes all three, and turns
+        # "did I get a notification?" into a question with an answer that survives a restart.
+        #
+        # Keyed on thread_id because a conversation is the unit Kevin acts on - he replies to a
+        # person, not to a message. state: 'open' (needs a look) | 'done' (dealt with).
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS inbound_threads (
+            thread_id TEXT PRIMARY KEY,
+            sender_email TEXT,
+            sender_name TEXT,
+            company TEXT,
+            subject TEXT,
+            snippet TEXT,
+            status_label TEXT,
+            match_reason TEXT,
+            sheet_uuid TEXT,
+            is_tier1 INTEGER DEFAULT 0,
+            alerted INTEGER DEFAULT 0,
+            state TEXT DEFAULT 'open',
+            message_count INTEGER DEFAULT 1,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_threads_state ON inbound_threads(state, last_seen)")
 
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -4678,6 +4740,149 @@ def route_inbound_reply_to_crm(crm_match, status_label, subject, snippet):
     )
     return payloads
 
+def record_inbound_thread(thread_id, sender_email, sender_name, company, subject, snippet,
+                          status_label, match_reason, sheet_uuid, is_tier1):
+    """Upsert one conversation into the inbound tray. Returns (is_new_thread, message_count).
+
+    The upsert is what makes a thread the unit instead of a message: a second reply on a thread
+    already in the tray bumps last_seen and message_count rather than creating a row, which is how
+    one conversation stops costing five notifications.
+
+    Deliberately records EVERY thread that clears the filters, verified or not. The CRM path can
+    only hold a sender who resolves to a sheet row, so a recruiter's first email - a stranger by
+    definition - had nowhere to live and fell out of the system after its single alert. Here it
+    persists with sheet_uuid blank, and stays visible until Kevin marks it done.
+
+    Never raises: the tray is an enhancement to the alert path, and a DB error must not cost an
+    alert. On failure it returns (True, 1), which makes the caller treat it as a fresh thread -
+    the behaviour the system had before the tray existed.
+    """
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT message_count FROM inbound_threads WHERE thread_id = ?", (thread_id,))
+            row = cursor.fetchone()
+            if row:
+                new_count = int(row[0] or 1) + 1
+                # A new message on a settled thread reopens it: the conversation moved again, and
+                # a thread marked done last week is not done when they write back.
+                conn.execute(
+                    "UPDATE inbound_threads SET last_seen = CURRENT_TIMESTAMP, message_count = ?, "
+                    "subject = ?, snippet = ?, status_label = ?, is_tier1 = ?, state = 'open' "
+                    "WHERE thread_id = ?",
+                    (new_count, subject, snippet, status_label, 1 if is_tier1 else 0, thread_id))
+                conn.commit()
+                return False, new_count
+            conn.execute(
+                "INSERT INTO inbound_threads (thread_id, sender_email, sender_name, company, subject, "
+                "snippet, status_label, match_reason, sheet_uuid, is_tier1) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (thread_id, sender_email, sender_name, company, subject, snippet,
+                 status_label, match_reason, sheet_uuid, 1 if is_tier1 else 0))
+            conn.commit()
+            return True, 1
+    except Exception as e:
+        logging.error(f"Inbound tray write error ({thread_id}): {e}")
+        return True, 1
+
+
+def mark_inbound_thread_alerted(thread_id):
+    """Record that Telegram accepted an alert for this thread. Never raises."""
+    try:
+        with get_db_conn() as conn:
+            conn.execute("UPDATE inbound_threads SET alerted = 1 WHERE thread_id = ?", (thread_id,))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Inbound tray alerted-flag error ({thread_id}): {e}")
+
+
+def close_inbound_thread(thread_id):
+    """Mark a conversation dealt with. Returns True if a row was actually updated."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE inbound_threads SET state = 'done' WHERE thread_id = ? AND state != 'done'",
+                (thread_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"Inbound tray close error ({thread_id}): {e}")
+        return False
+
+
+def get_open_inbound_threads(limit=25):
+    """Open conversations, most recently active first. Returns a list of dicts; [] on error."""
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT thread_id, sender_email, sender_name, company, subject, status_label, "
+                "match_reason, message_count, last_seen, is_tier1 FROM inbound_threads "
+                "WHERE state = 'open' ORDER BY is_tier1 DESC, last_seen DESC LIMIT ?", (limit,))
+            cols = ("thread_id", "sender_email", "sender_name", "company", "subject",
+                    "status_label", "match_reason", "message_count", "last_seen", "is_tier1")
+            return [dict(zip(cols, r)) for r in cursor.fetchall()]
+    except Exception as e:
+        logging.error(f"Inbound tray read error: {e}")
+        return []
+
+
+def format_inbound_tray_message(threads):
+    """Render the tray for Telegram. Mirrors the Needs You Today card's shape so /inbox reads like
+    the rest of the system rather than like a database dump."""
+    if not threads:
+        return "📭 <b>Inbox Tray</b>\n\n<i>Nothing open - every conversation is dealt with.</i>"
+    lines = [f"📬 <b>Inbox Tray</b> - {len(threads)} open\n"]
+    for t in threads:
+        badge = {"OFFER_EXTENDED": "🏆", "INTERVIEW_SET": "🎉", "REJECTION": "⚠️"}.get(
+            t.get("status_label"), "🟢")
+        who = html.escape(str(t.get("sender_name") or t.get("sender_email") or "Unknown"))
+        company = html.escape(str(t.get("company") or "Unknown"))
+        subject = html.escape(str(t.get("subject") or "(No Subject)")[:70])
+        count = int(t.get("message_count") or 1)
+        count_str = f" · {count} msgs" if count > 1 else ""
+        # The thread_id is the handle /done takes, shown the way every other card shows an ID.
+        lines.append(
+            f"{badge} <b>{who}</b> @ {company}{count_str}\n"
+            f"    <i>{subject}</i>\n"
+            f"    🆔 <code>{html.escape(str(t.get('thread_id')))}</code>")
+    lines.append("\n<i>Mark one dealt with: /done &lt;id&gt;</i>")
+    return "\n".join(lines)
+
+
+POLLER_FAILURE_ALERT_COOLDOWN_HOURS = 6
+
+
+def report_poller_failure(stage, detail):
+    """Tell Kevin in Telegram when the poller itself breaks, not just the log file.
+
+    Every failure path here used to log and continue. That is correct for one bad message, but the
+    failures that matter are total: a dead GMAIL_REFRESH_TOKEN, a revoked scope, a Gmail outage.
+    In those cases notifications simply stop, and silence is indistinguishable from a quiet inbox -
+    the failure mode is finding out from a missed interview days later.
+
+    Rate-limited per stage so a persistent outage costs one message every six hours rather than one
+    per cycle. Uses the DB-backed should_send_alert() rather than a module-level dict: Render
+    restarts the container on every deploy, and an in-memory cooldown would reset with it and
+    re-alert on each boot. Never raises: a broken alerter must not also break the poll.
+    """
+    try:
+        if not TELEGRAM_CHAT_ID:
+            return
+        if not should_send_alert(f"poller_failure:{stage}", POLLER_FAILURE_ALERT_COOLDOWN_HOURS):
+            return
+        send_telegram_message(TELEGRAM_CHAT_ID, (
+            "🛑 <b>Email poller failure</b>\n\n"
+            f"<b>Stage:</b> {html.escape(str(stage))}\n"
+            f"<b>Detail:</b> {html.escape(str(detail))}\n\n"
+            "<i>Inbound alerts may be stopped. Check Gmail credentials on Render, "
+            "then run /poll to retry.</i>"
+        ))
+    except Exception as e:
+        logging.error(f"Poller failure alert could not be sent: {e}")
+
+
 def check_inbound_gmail_replies():
     """Poll Gmail for unread inbound replies and alert on the ones a human sent.
 
@@ -4705,6 +4910,9 @@ def check_inbound_gmail_replies():
         return
     access_token = get_gmail_access_token()
     if not access_token:
+        # The single most dangerous failure: an expired or revoked refresh token stops every
+        # inbound alert indefinitely, and nothing downstream ever runs to notice.
+        report_poller_failure("Gmail auth", "could not obtain an access token")
         return
     headers = {"Authorization": f"Bearer {access_token}"}
     # A failure here logs and falls through to the Spam sweep rather than returning. The two
@@ -4713,15 +4921,20 @@ def check_inbound_gmail_replies():
     message_ids = []
     try:
         list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
-        params = {"q": f"is:unread -from:me label:{EMAIL_LABEL_TARGET_INBOX}", "maxResults": 10}
+        query = f"is:unread -from:me label:{EMAIL_LABEL_TARGET_INBOX} {EMAIL_QUERY_EXCLUSIONS}".strip()
+        params = {"q": query, "maxResults": EMAIL_POLL_MAX_RESULTS}
         res = requests.get(list_url, headers=headers, params=params, timeout=10)
         if res.status_code != 200:
             logging.error(f"Gmail Poll List Error: {res.status_code}")
+            report_poller_failure("INBOX list", f"HTTP {res.status_code}")
         else:
-            message_ids = [m["id"] for m in res.json().get("messages", [])]
+            # Sliced defensively: maxResults is a request, and a cycle that alerted on hundreds of
+            # messages because a server ignored it would be worse than one that ran short.
+            message_ids = [m["id"] for m in res.json().get("messages", [])][:EMAIL_POLL_MAX_RESULTS]
             logging.info(f"[POLL] Gmail list query returned {len(message_ids)} unread message(s) in label:{EMAIL_LABEL_TARGET_INBOX}")
     except Exception as e:
         logging.error(f"Gmail Poll List Exception: {e}")
+        report_poller_failure("INBOX list", str(e))
 
     for msg_id in message_ids:
         try:
@@ -4761,6 +4974,18 @@ def check_inbound_gmail_replies():
             status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
             has_calendar_invite, invite_start = extract_calendar_invite(payload)
             is_tier1 = has_calendar_invite or status_label in ("INTERVIEW_SET", "OFFER_EXTENDED")
+
+            # A bulk sender cannot buy a Tier 1 bypass. "Application status update - YOUR INTERVIEW
+            # REQUEST AWAITING YOUR CONFIRMATION" is a real job-board blast from Kevin's inbox, and
+            # it matches \binterview\b, so it used to clear every gate the bypass skips. The header
+            # is the same structural bulk test gate 5 applies, and a recruiter typing by hand never
+            # sets it - so honouring it here costs no real interview while closing the hole that
+            # job-board volume would otherwise drive straight through.
+            if is_tier1 and str(list_unsubscribe or "").strip():
+                is_tier1 = False
+                logging.info(
+                    f"[TIER1 DENIED] Interview-shaped bulk mail from {sender} "
+                    f"(List-Unsubscribe present) - demoted to the normal pre-filter")
 
             # GATE 1: Pre-filter shield. Tier 1 skips it, except for the sender rules - a robot
             # mailbox blasting calendar spam is still a robot, and a blocked domain stays blocked.
@@ -4890,6 +5115,27 @@ def check_inbound_gmail_replies():
                 "unknown sender": "<i>Not a known contact - no CRM changes were made.</i>\n",
             }
             unverified_note = "" if not is_unverified else unverified_notes.get(match_reason, "")
+            # The tray is written BEFORE the alert, so a conversation is durably recorded even if
+            # Telegram never accepts the message. This is what makes a failed send recoverable:
+            # the row is open, and /inbox and the daily card will both still show it.
+            sender_address = (re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender or "") or [None])
+            sender_address = sender_address.group(0).lower() if hasattr(sender_address, "group") else ""
+            is_new_thread, thread_msg_count = record_inbound_thread(
+                thread_id, sender_address, display_name_from_sender(sender),
+                str(crm_match.get("company") or "Unknown"), subject, snippet,
+                status_label, match_reason, str(crm_match.get("sheet_uuid") or ""), is_tier1)
+
+            # Thread-level dedup. A follow-up message on a conversation already in the tray does
+            # not earn its own notification - it updates the row, and the tray shows the new count.
+            # Tier 1 is exempt: an interview or offer landing on an existing thread is exactly the
+            # development worth interrupting for, whatever came before it.
+            if not is_new_thread and not is_tier1:
+                logging.info(
+                    f"[TRAY] Thread {thread_id} already open ({thread_msg_count} msgs) - "
+                    f"updated without a duplicate alert")
+                requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+                continue
+
             alert_msg = (
                 f"{header_line}\n\n"
                 f"{status_line}"
@@ -4905,7 +5151,10 @@ def check_inbound_gmail_replies():
             # alert actionable, so an oversized snippet is split into its own follow-up message
             # rather than truncating the alert and losing the Gmail link off the end.
             if len(alert_msg) > TELEGRAM_MAX_MESSAGE_CHARS:
-                send_telegram_message(TELEGRAM_CHAT_ID, (
+                # The header message is the one that carries the link and the verdict, so IT is
+                # what delivery is judged on. A dropped preview is a cosmetic loss; a dropped
+                # header is the whole alert.
+                delivered = send_telegram_message(TELEGRAM_CHAT_ID, (
                     f"{header_line}\n\n{status_line}{invite_line}{unverified_note}"
                     f"<b>From:</b> {html.escape(sender)}\n{crm_line}"
                     f"<b>Subject:</b> {html.escape(subject)}\n\n"
@@ -4914,9 +5163,26 @@ def check_inbound_gmail_replies():
                 preview = f"<b>Preview:</b> <i>{html.escape(snippet)}</i>"
                 send_telegram_message(TELEGRAM_CHAT_ID, preview[:TELEGRAM_MAX_MESSAGE_CHARS])
             else:
-                send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
+                delivered = send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
 
-            requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+            # Mark read ONLY on confirmed delivery. send_telegram_message returns the message_id on
+            # success and None on failure - it never raises - so the old unconditional mark-read
+            # turned every Telegram failure into permanent silent loss: the alert was never seen,
+            # the message was no longer unread, and the next poll's is:unread query could never
+            # find it again. A 5s timeout or a second 429 was enough to lose an interview.
+            #
+            # Leaving it UNREAD is the entire retry mechanism: the next cycle re-lists it and tries
+            # again. Duplicate alerts are possible if Telegram delivered but the response was lost,
+            # and that is the correct trade - a duplicate interview alert costs a glance, a dropped
+            # one costs the interview.
+            if delivered:
+                mark_inbound_thread_alerted(thread_id)
+                requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+            else:
+                logging.error(
+                    f"[DELIVERY FAILED] Alert for {sender} was not delivered - leaving UNREAD to "
+                    f"retry on the next cycle (msg_id={msg_id})")
+                report_poller_failure("Telegram delivery", f"alert for {sender} not delivered")
         except Exception as e:
             logging.error(f"Gmail Poll Message Processing Error ({msg_id}): {e}")
 
@@ -4967,7 +5233,8 @@ def sweep_spam_for_interview_signals(request_headers):
             detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
             detail_res = requests.get(
                 detail_url, headers=request_headers,
-                params={"format": "full", "metadataHeaders": ["From", "Subject"]}, timeout=10)
+                params={"format": "full",
+                        "metadataHeaders": ["From", "Subject", "List-Unsubscribe"]}, timeout=10)
             if detail_res.status_code != 200:
                 continue
             detail = detail_res.json()
@@ -4975,8 +5242,17 @@ def sweep_spam_for_interview_signals(request_headers):
             header_list = payload.get("headers", [])
             sender = _gmail_header_value(header_list, "From", "Unknown Sender")
             subject = _gmail_header_value(header_list, "Subject", "(No Subject)")
+            list_unsubscribe = _gmail_header_value(header_list, "List-Unsubscribe")
             snippet = detail.get("snippet", "")
             thread_id = detail.get("threadId", msg_id)
+
+            # Bulk mail gets no rescue from Spam. This sweep's whole justification is that Gmail is
+            # wrong in one costly direction - a real invite from an unknown company looking like
+            # bulk - and a message that SETS List-Unsubscribe is the case where Gmail was right.
+            # Without this, every "YOUR INTERVIEW REQUEST" blast Gmail correctly caught gets
+            # resurrected into Telegram, which is the opposite of what the sweep is for.
+            if str(list_unsubscribe or "").strip():
+                continue
 
             status_label, _crm_action = classify_inbound_ats_email(sender, subject, snippet)
             has_calendar_invite, invite_start = extract_calendar_invite(payload)
@@ -5013,7 +5289,7 @@ def sweep_spam_for_interview_signals(request_headers):
                 f"<a href='{thread_link}'>Open in Gmail Spam</a>"
             )
             if len(alert_msg) > TELEGRAM_MAX_MESSAGE_CHARS:
-                send_telegram_message(TELEGRAM_CHAT_ID, (
+                delivered = send_telegram_message(TELEGRAM_CHAT_ID, (
                     "🚨 <b>Possible Interview - Found in SPAM</b>\n\n"
                     f"{invite_line}"
                     "<i>Gmail filed this as spam. Verify the sender before acting. "
@@ -5026,15 +5302,23 @@ def sweep_spam_for_interview_signals(request_headers):
                     TELEGRAM_CHAT_ID,
                     f"<b>Preview:</b> <i>{html.escape(snippet)}</i>"[:TELEGRAM_MAX_MESSAGE_CHARS])
             else:
-                send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
+                delivered = send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
 
             # Marked read, and ONLY marked read - the message stays in Spam. Removing UNREAD is
             # what stops the same invite alerting on every cycle; moving it out of Spam would be
             # this code overruling Gmail's classification on the strength of a regex, which is a
             # judgement that belongs to Kevin after he has looked at it.
-            requests.post(
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify",
-                headers=request_headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+            #
+            # Conditional on delivery for the same reason the INBOX loop is, and it matters more
+            # here: nobody browses the Spam folder, so an undelivered alert that was marked read is
+            # the one case where the message is unreachable by every path at once.
+            if delivered:
+                requests.post(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify",
+                    headers=request_headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+            else:
+                logging.error(
+                    f"[SPAM SWEEP] Delivery failed for {sender} - leaving UNREAD to retry")
         except Exception as e:
             logging.error(f"Gmail Spam Sweep Processing Error ({msg_id}): {e}")
 
@@ -8986,6 +9270,33 @@ def process_webhook_payload_async(data):
                     logging.error(f"/poll Error: {e}")
                     send_telegram_message(chat_id, f"❌ Poll error: {html.escape(str(e)[:200])}")
             threading.Thread(target=_poll_and_notify, daemon=True).start()
+            return
+
+        if text == "/inbox":
+            # The tray on demand. The counterpart to the daily card: the card tells Kevin what
+            # changed, /inbox tells him what is still open.
+            send_telegram_message(chat_id, format_inbound_tray_message(get_open_inbound_threads()))
+            return
+
+        if text.startswith("/done"):
+            # Takes the thread id printed on the tray. Deliberately NOT a swipe-reply command:
+            # the tray is a multi-entry list card, and swipe recovery takes the first id on the
+            # card, which would close the wrong conversation.
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                send_telegram_message(chat_id, (
+                    "Usage: <code>/done &lt;thread id&gt;</code>\n"
+                    "<i>The id is printed under each entry on /inbox.</i>"))
+                return
+            thread_id = parts[1].strip()
+            if close_inbound_thread(thread_id):
+                remaining = len(get_open_inbound_threads())
+                send_telegram_message(chat_id, (
+                    f"✅ Marked dealt with.\n<i>{remaining} conversation(s) still open.</i>"))
+            else:
+                send_telegram_message(chat_id, (
+                    "🤷 <i>No open conversation with that id.</i>\n"
+                    "Run /inbox for the current list."))
             return
 
         if text == "/prep":
