@@ -4663,6 +4663,40 @@ def test_a_real_person_at_a_robot_domain_still_gets_through(monkeypatch):
     assert "jane.recruiter@paypal.com" in alerts[0]
 
 
+def test_an_ats_robot_mailbox_can_still_deliver_a_real_interview():
+    """Workday, Greenhouse and Criteria send REAL interview invites and scheduling links from
+    noreply@ addresses. The blacklist is a substring test on the address and outranks the Tier 1
+    bypass, so those were blocked and marked read before anything could look at them.
+
+    Kevin's two real interviews came from named humans, which is why this never surfaced - it would
+    have the moment an employer ran scheduling through their ATS."""
+    for addr in ("noreply@myworkday.com", "no-reply@greenhouse.io",
+                 "noreply@us.greenhouse-mail.io", "noreply@criteriacorp.com",
+                 "noreply@hirevue.com"):
+        passed, reason = m.passes_email_sender_blocks(addr)
+        assert passed, f"{addr} is a real interview channel: {reason}"
+
+
+def test_the_ats_carve_out_does_not_reopen_the_robot_mailbox_hole():
+    """The carve-out keys on the DOMAIN, so it must not rescue a robot mailbox anywhere else -
+    including at an employer's own domain, which is an application receipt, not an invitation."""
+    for addr in ("service@paypal.com", "noreply-location-sharing@google.com",
+                 "noreply@creditkarma.com", "noreply@jobleads.com",
+                 "noreply@thyssenkrupp.com", "notifications@linkedin.com"):
+        passed, _ = m.passes_email_sender_blocks(addr)
+        assert not passed, f"{addr} must stay blocked"
+
+
+def test_an_ats_interview_invite_reaches_telegram_end_to_end(monkeypatch):
+    """The carve-out only declines to block - the message still has to earn its alert."""
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("wd", "Workday <noreply@myworkday.com>",
+                       "Interview Confirmation - Operations Analyst",
+                       "Your interview is scheduled for Thursday at 2pm. Please confirm.")])
+    assert len(alerts) == 1
+    assert "Interview" in alerts[0]
+
+
 def _clear_tray():
     with m.get_db_conn() as conn:
         conn.execute("DELETE FROM inbound_threads")

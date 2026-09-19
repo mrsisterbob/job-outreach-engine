@@ -506,6 +506,16 @@ EMAIL_SENDER_BLACKLIST = os.environ.get(
     "no-reply@,noreply@,noreply-,no-reply-,donotreply@,do-not-reply@,"
     "service@paypal.com,notifications@,notification@,receipts@,receipt@,billing@,"
     "mailer-daemon@,postmaster@,bounce@,bounces@")
+# Applicant tracking systems that send real interview invitations and scheduling links from
+# noreply@ mailboxes. Matched against the sender's DOMAIN (exact or subdomain) to exempt it from
+# the blacklist above - see passes_email_sender_blocks(). Everything else about the message is
+# still judged normally; this only stops the mailbox NAME being fatal on its own.
+ATS_ROBOT_DOMAINS = tuple(d.strip().lower() for d in os.environ.get(
+    "EMAIL_ATS_DOMAINS",
+    "myworkday.com,workday.com,greenhouse.io,greenhouse-mail.io,lever.co,hire.lever.co,"
+    "icims.com,taleo.net,successfactors.com,smartrecruiters.com,jobvite.com,ashbyhq.com,"
+    "bamboohr.com,criteriacorp.com,hirevue.com,calendly.com"
+).split(",") if d.strip())
 EMAIL_SUBJECT_REGEX_FILTER = os.environ.get("EMAIL_SUBJECT_REGEX_FILTER", "")
 try:
     EMAIL_MAX_AGE_SECONDS = int(os.environ.get("EMAIL_MAX_AGE_SECONDS") or default_email_max_age_seconds(EMAIL_POLL_HOURS))
@@ -4584,7 +4594,21 @@ def passes_email_sender_blocks(sender: str):
     # 1. Sender blacklist (substring match, e.g. "no-reply@", "noreply@")
     blacklist = [s.strip().lower() for s in EMAIL_SENDER_BLACKLIST.split(",") if s.strip()]
     if blacklist and any(b in sender_email for b in blacklist):
-        return False, f"sender blacklisted ({sender_email})"
+        # ATS carve-out. Workday, Greenhouse, Lever and iCIMS send REAL interview invitations and
+        # scheduling links from noreply@ mailboxes, and the blacklist is a substring test on the
+        # address - so "noreply@myworkday.com" was blocked, ahead of the Tier 1 bypass, and marked
+        # read. Kevin's two real interviews came from named humans, which is why this never showed
+        # up; the moment an employer runs scheduling through their ATS, it would have.
+        #
+        # Narrow on purpose: it keys on the DOMAIN, not on the message text, so a robot mailbox at
+        # a random domain gains nothing. Blocked domains and the allow-list below still apply, and
+        # the caller decides what to do with the result - this only declines to block.
+        if sender_domain and any(sender_domain == d or sender_domain.endswith("." + d)
+                                 for d in ATS_ROBOT_DOMAINS):
+            logging.info(f"[ATS CARVE-OUT] {sender_email} is a blacklisted mailbox at a known ATS "
+                         f"domain - allowed through the sender blacklist")
+        else:
+            return False, f"sender blacklisted ({sender_email})"
 
     # 2. Blocked domains
     block_domains = [d.strip().lower() for d in EMAIL_BLOCK_DOMAINS.split(",") if d.strip()]
