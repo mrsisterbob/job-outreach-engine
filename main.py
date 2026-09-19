@@ -2579,6 +2579,157 @@ def get_warm_crm_contacts():
         logging.error(f"get_warm_crm_contacts Error: {e}")
     return _WARM_CRM_CACHE["data"]
 
+
+def backfill_job_contacts_from_carmen_cold(dry_run=True):
+    """Fill a job row's Contact Email from the real person already emailed at that company.
+
+    A job row lands in Tetiana Warm carrying whatever resolve_target_email() guessed, which is
+    often Kevin's own address or a role mailbox - useless as a record of who was actually
+    contacted. Meanwhile Carmen Cold holds the real human (awarner@crain.com) captured from Sent
+    mail or typed into /e. Both tabs are keyed by company, so the join already exists; nothing
+    was reading across it.
+
+    Matching is on normalize_company_for_match(), the same key the warm/Clavicular routing uses,
+    so "Intact Services USA LLC" on the job row meets "Intact Services USA" on the contact row.
+    That normalizer strips only trailing legal suffixes, so "Crain" and "Crain Communications"
+    stay DISTINCT - deliberately. They are different Carmen Cold rows with different people, and
+    collapsing them would write one company's contact onto another company's job.
+
+    Three guards, each of which exists because of a row in the current sheet:
+      - company_domain_of() rejects consumer mail, so the Slate Auto row whose "contact" is
+        kjmiller406@gmail.com is never copied onto a job. Kevin's own address is not a contact.
+      - is_role_mailbox() rejects operations@/careers@, which carry no more information than the
+        guess already sitting in the cell.
+      - A job row whose existing email is already a real person's is left alone. Only a blank,
+        a role mailbox or a consumer address gets overwritten.
+
+    When several people share a company, the FIRST by Carmen Cold row order wins and the rest are
+    reported, so a two-contact company like Crain is visible rather than silently truncated.
+
+    Returns (updates, skipped) where updates is a list of dicts describing each write. dry_run
+    leaves the sheet untouched, which is how /fillcontacts previews before committing.
+    """
+    res = crm_post({"action": "get_followups", "tab": "CC"})
+    if not res or res.status_code != 200:
+        logging.warning("[FILLCONTACTS] Carmen Cold unavailable")
+        return [], []
+    try:
+        cold_rows = res.json().get("followups", []) or []
+    except Exception as e:
+        logging.error(f"[FILLCONTACTS] Carmen Cold parse error: {e}")
+        return [], []
+
+    # company -> [contacts]. get_followups re-sorts by next-followup date, and every fresh Carmen
+    # Cold row is stamped with the same first-rung interval, so several people messaged at one
+    # company on the same day arrive TIED and in no meaningful order. Sorting by date_added
+    # (Column A, Last Contact Date) makes the pick deterministic: the first person contacted at a
+    # company is the one promoted onto the job row, and it stays that way across re-runs instead
+    # of flipping between contacts as the sheet is re-read. Blank dates sort last, not first, so a
+    # row missing Column A can never displace a real dated contact.
+    by_company = {}
+    for row in cold_rows:
+        email = str(row.get("email") or "").strip().lower()
+        company = str(row.get("company") or "").strip()
+        if not email or not company:
+            continue
+        if is_role_mailbox(email) or not company_domain_of(email):
+            continue
+        by_company.setdefault(normalize_company_for_match(company), []).append({
+            "email": email,
+            "name": str(row.get("name") or "").strip() or name_from_email_local_part(email),
+            "raw_company": company,
+            "date_added": str(row.get("date_added") or "").strip(),
+        })
+    for contacts in by_company.values():
+        contacts.sort(key=lambda c: (c["date_added"] == "", c["date_added"], c["email"]))
+
+    updates, skipped = [], []
+    for tab_code in ("TW", "TC"):
+        jres = crm_post({"action": "get_followups", "tab": tab_code})
+        if not jres or jres.status_code != 200:
+            continue
+        try:
+            job_rows = jres.json().get("followups", []) or []
+        except Exception:
+            continue
+        for job_row in job_rows:
+            sheet_uuid = str(job_row.get("sheet_uuid") or "").strip()
+            company = str(job_row.get("company") or "").strip()
+            current = str(job_row.get("email") or "").strip().lower()
+            if not sheet_uuid or not company:
+                continue
+            # An address that is already a real person at a real company is the best record there
+            # is. Never overwrite it with a different contact at the same firm.
+            if current and not is_role_mailbox(current) and company_domain_of(current):
+                continue
+            candidates = by_company.get(normalize_company_for_match(company))
+            if not candidates:
+                continue
+            chosen = candidates[0]
+            if chosen["email"] == current:
+                continue
+            updates.append({
+                "sheet_uuid": sheet_uuid,
+                "company": company,
+                "title": str(job_row.get("title") or "").strip(),
+                "old_email": current,
+                "new_email": chosen["email"],
+                "contact_name": chosen["name"],
+                "tab": tab_code,
+                "alternates": [c["email"] for c in candidates[1:]],
+            })
+            if len(candidates) > 1:
+                skipped.append({"company": company, "alternates": [c["email"] for c in candidates[1:]]})
+
+    if not dry_run:
+        for u in updates:
+            enqueue_crm_payload(build_crm_payload(
+                "update_contact_email", sheet_uuid=u["sheet_uuid"], email=u["new_email"]
+            ))
+            update_job_target_email(u["sheet_uuid"], u["new_email"])
+            enqueue_crm_payload(build_crm_payload(
+                "append_note", sheet_uuid=u["sheet_uuid"],
+                note=f"Contact filled from Carmen Cold: {u['contact_name']} <{u['new_email']}>"
+            ))
+        logging.info(f"[FILLCONTACTS] Wrote {len(updates)} job contact email(s)")
+
+    return updates, skipped
+
+
+def auto_fill_job_contacts_from_carmen_cold():
+    """Scheduled wrapper: commit the Carmen Cold -> job row contact fill and report what changed.
+
+    Runs unattended on the email poll cadence, so unlike /fillcontacts there is no preview step.
+    That is safe because the underlying function only ever overwrites a blank, a role mailbox or
+    a consumer address, and never replaces one real person with another - the destructive case
+    does not exist. Kevin still gets a Telegram summary, because a silent write to a sheet he
+    curates by hand is how a wrong address survives unnoticed for a week.
+
+    Idempotent by construction: once a row carries a real contact it no longer qualifies, so a
+    re-run is a no-op rather than a repeated write. Returns the number of rows updated.
+    """
+    updates, _ = backfill_job_contacts_from_carmen_cold(dry_run=False)
+    if not updates:
+        return 0
+
+    logging.info(f"[FILLCONTACTS] Auto-filled {len(updates)} job contact email(s)")
+    if TELEGRAM_CHAT_ID:
+        lines = [
+            f"• <b>{html.escape(u['company'])}</b>"
+            + (f" - {html.escape(u['title'])}" if u["title"] else "")
+            + f"\n   <code>{html.escape(u['old_email'] or '(blank)')}</code> → "
+            f"<code>{html.escape(u['new_email'])}</code>"
+            for u in updates[:10]
+        ]
+        more = f"\n\n<i>+{len(updates) - 10} more</i>" if len(updates) > 10 else ""
+        send_telegram_message(
+            TELEGRAM_CHAT_ID,
+            f"🔗 <b>Job Contacts Auto-Filled ({len(updates)})</b>\n"
+            f"<i>matched from Carmen Cold</i>\n\n" + "\n".join(lines) + more
+        )
+    return len(updates)
+
+
 def sanitize_text(text):
     """Strip corporate fluff/AI clichés while preserving apostrophes, hyphens, and paragraph breaks.
     Buzzword list is hot-reloaded from evidence_bank.json's banned_words on every call.
@@ -2910,6 +3061,14 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
         bonus -= 30
     elif re.search(r'\b(junior|jr\.?|associate|entry[ -]?level|analyst i|i{1,2}\b|coordinator|specialist)\b', title):
         bonus += 6
+    # Plain job-family titles, no seniority marker either way. "Operations Analyst", "EHR Clinical
+    # Analyst" and "Business Administrator" are the roles actually being targeted, but none of them
+    # carry a junior/entry word, and the branch above only matches "analyst i" - so a bare "Analyst"
+    # scored the same as a title the filter had never heard of. Smaller than the +6 above because
+    # the word alone is weaker evidence than an explicit entry-level marker; the seniority and
+    # wrong-family branches still win outright, since this is the last elif in the chain.
+    elif re.search(r'\b(analyst|operations|administrator|assistant)\b', title):
+        bonus += 4
 
     # Years-of-experience demand: a 0-2yr candidate is a real match at 0-3 and a stretch past 5.
     exp_match = re.search(r'(\d+)\+?\s*(?:-\s*\d+\s*)?year', desc)
@@ -5857,6 +6016,20 @@ def scheduled_email_poll_job():
         backfill_contact_emails_from_sent_mail()
     except Exception as e:
         logging.error(f"[POLL] Contact-email Back-fill Error: {e}")
+    # Runs LAST, and deliberately after capture_contacts_from_sent_mail(): that step files the
+    # newly-emailed person into Carmen Cold, and this one reads Carmen Cold. Same cycle, so a
+    # person emailed today lands on their job row today rather than waiting a full extra poll.
+    #
+    # This does NOT duplicate backfill_contact_emails_from_sent_mail() above. That one reads
+    # Gmail Sent directly and only within SENT_CAPTURE_LOOKBACK_HOURS (72h), so a contact emailed
+    # last week is permanently out of its reach; it also treats any non-role address as real, so
+    # a job row carrying Kevin's own kjmiller406@gmail.com is invisible to it. This one reads
+    # Carmen Cold, which has no expiry, and rejects consumer addresses - which is what actually
+    # repairs the Affirm-style row. Together they cover recent mail and the standing contact list.
+    try:
+        auto_fill_job_contacts_from_carmen_cold()
+    except Exception as e:
+        logging.error(f"[POLL] Carmen Cold contact fill Error: {e}")
     logging.info("[POLL] Email poll cycle completed")
 
 # EMAIL_POLL_HOURS and EMAIL_POLL_ENABLED are defined with the other EMAIL_* constants near the
@@ -9351,6 +9524,49 @@ def process_webhook_payload_async(data):
                 new_email, company=comp, note=f"[{datetime.now().strftime('%Y-%m-%d')}] Emailed: {title}"
             ):
                 send_telegram_message(chat_id, f"👤 Logged <code>{html.escape(new_email)}</code> to Carmen Cold.")
+            return
+
+        if text == "/fillcontacts" or text == "/fillcontacts go":
+            # Join Carmen Cold's real people onto the job rows that still carry a resolved guess.
+            # Previews by default for the same reason /backfillcontacts does: it writes to tabs
+            # Kevin curates by hand, so the exact changes are shown before anything is committed.
+            commit = text.endswith(" go")
+            send_telegram_message(chat_id, "🔗 Matching Carmen Cold contacts to job rows...")
+
+            def _fill_and_notify():
+                try:
+                    updates, skipped = backfill_job_contacts_from_carmen_cold(dry_run=not commit)
+                    if not updates:
+                        send_telegram_message(
+                            chat_id,
+                            "✅ <b>Nothing to fill.</b> Every job row either already has a real "
+                            "contact or has no matching person in Carmen Cold."
+                        )
+                        return
+                    lines = []
+                    for u in updates[:20]:
+                        old = u["old_email"] or "(blank)"
+                        lines.append(
+                            f"• <b>{html.escape(u['company'])}</b>"
+                            + (f" - {html.escape(u['title'])}" if u["title"] else "")
+                            + f"\n   <code>{html.escape(old)}</code> → "
+                            f"<code>{html.escape(u['new_email'])}</code>"
+                        )
+                    alt_note = ""
+                    multi = [u for u in updates if u["alternates"]]
+                    if multi:
+                        alt_note = "\n\n<i>Multiple contacts at: " + ", ".join(
+                            html.escape(u["company"]) for u in multi[:5]
+                        ) + " - took the first, the rest stay in Carmen Cold.</i>"
+                    hdr = (f"✅ <b>Filled {len(updates)} job contact(s).</b>" if commit
+                           else f"🔍 <b>Preview: {len(updates)} row(s) would change.</b>")
+                    footer = "" if commit else "\n\nReply <code>/fillcontacts go</code> to write them."
+                    send_telegram_message(chat_id, f"{hdr}\n\n" + "\n".join(lines) + alt_note + footer)
+                except Exception as e:
+                    logging.error(f"/fillcontacts Error: {e}")
+                    send_telegram_message(chat_id, f"❌ Fill failed: {html.escape(str(e))}")
+
+            threading.Thread(target=_fill_and_notify, daemon=True).start()
             return
 
         if text == "/backfillcontacts" or text == "/backfillcontacts go":

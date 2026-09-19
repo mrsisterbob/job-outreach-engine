@@ -2255,12 +2255,42 @@ def test_hybrid_score_modifier_returns_the_signed_layer1_shift(monkeypatch):
     }
     final_score, layer1_bonus = m.calculate_hybrid_score_modifier(job, 60)
     # Keyword bonuses scale with DISTINCT matches: 2 domain terms (fintech, payments) -> +12 at
-    # the cap, 2 tools (python, sql) -> +8, +8 salary in the 90k band, +6 "Analyst" entry-level
-    # title, +6 no years-of-experience demand. A flat +10/+15 per category fired on any single
-    # hit, which nearly every ops posting clears.
-    assert layer1_bonus == 36
-    # 96 raw, compressed by soft_cap_score() rather than flattened at the 100 clamp.
+    # the cap, 2 tools (python, sql) -> +8, +8 salary in the 90k band, +6 no years-of-experience
+    # demand. A flat +10/+15 per category fired on any single hit, which nearly every ops posting
+    # clears. Plus +4 for the plain job-family title: "Operations Analyst" carries no junior/entry
+    # word, so it earns the smaller family bonus rather than the +6 entry-level one. It previously
+    # scored 0 here - this test's old comment credited a "+6 Analyst entry-level title" that never
+    # fired, since the entry-level branch matches "analyst i" and not a bare "analyst".
+    assert layer1_bonus == 40
+    # 100 raw, compressed by soft_cap_score() rather than flattened at the 100 clamp.
     assert final_score == 91
+
+
+def test_plain_job_family_titles_earn_the_small_title_bonus(monkeypatch):
+    """A bare "Operations Analyst" or "EHR Clinical Analyst" is the role actually being targeted,
+    but carries no junior/entry-level word, and the entry-level branch matches "analyst i" rather
+    than a bare "analyst". Those titles scored 0 from the title rules, which is part of why good
+    postings were landing in the 60s and missing the 80-point Tier-1 gate."""
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: default if default is not None else [])
+    base = {"employer_name": "Acme", "job_description": "Operations role.", "job_city": "Detroit"}
+
+    def shift(title):
+        """The title rules' contribution alone. The description carries its own bonuses (no
+        years-of-experience demand, etc.), so measure against a title matching no branch."""
+        _, bonus = m.calculate_hybrid_score_modifier(dict(base, job_title=title), 60)
+        _, neutral = m.calculate_hybrid_score_modifier(dict(base, job_title="Widget Handler"), 60)
+        return bonus - neutral
+
+    for title in ("Operations Analyst", "EHR Clinical Analyst", "Business Administrator", "Office Assistant"):
+        assert shift(title) == 4, f"{title} should earn the plain job-family bonus, got {shift(title)}"
+
+    # The explicit entry-level marker still outranks the generic family word.
+    assert shift("Junior Operations Analyst") == 6
+
+    # Seniority and wrong-family branches come first in the chain, so a family word never
+    # rescues a title the filter is meant to reject.
+    assert shift("Senior Operations Analyst") == -18
+    assert shift("Data Engineer") == -30
 
 
 def test_keyword_bonuses_separate_a_tool_rich_posting_from_a_passing_mention(monkeypatch):
@@ -5377,3 +5407,218 @@ def test_public_stats_days_running_counts_from_the_first_commit():
     now = m.datetime(2026, 9, 19, tzinfo=m.timezone.utc)
     assert m._public_stats_days_running(now) == 50  # 2026-07-31 -> 2026-09-19
     assert m._public_stats_days_running(m.datetime(2026, 7, 30, tzinfo=m.timezone.utc)) == 0
+
+
+# ==============================================================================
+# CARMEN COLD -> JOB ROW CONTACT BACKFILL (/fillcontacts)
+# ==============================================================================
+
+
+class _FollowupResp:
+    """crm_post's contract here is status_code + .json(), which _FakeResp does not carry."""
+    status_code = 200
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def json(self):
+        return {"status": "success", "followups": self._rows}
+
+
+def _fillcontacts_crm(cold, jobs):
+    """crm_post stub serving a Carmen Cold roster and a Tetiana Warm job list."""
+    def _post(payload, *a, **k):
+        tab = payload.get("tab")
+        return _FollowupResp(cold if tab == "CC" else (jobs if tab == "TW" else []))
+    return _post
+
+
+def test_fillcontacts_copies_the_real_person_onto_a_job_row(monkeypatch):
+    """A job row carries whatever resolve_target_email() guessed, while Carmen Cold holds the
+    human actually emailed at that company. Both are keyed by company, so the join exists."""
+    cold = [{"name": "Eina Assali", "company": "Affirm", "email": "eina.assali@affirm.com"}]
+    jobs = [{"sheet_uuid": "u1", "company": "Affirm", "title": "Analyst", "email": "kjmiller406@gmail.com"}]
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+
+    updates, _ = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert len(updates) == 1
+    assert updates[0]["new_email"] == "eina.assali@affirm.com"
+    assert updates[0]["old_email"] == "kjmiller406@gmail.com"
+
+
+def test_fillcontacts_never_copies_kevins_own_address_onto_a_job(monkeypatch):
+    """The Slate Auto row in the live sheet has kjmiller406@gmail.com as its "contact" - that is
+    Kevin, not a lead. company_domain_of() rejects consumer mail, so it can never propagate."""
+    cold = [{"name": "Kjmiller", "company": "Slate Auto", "email": "kjmiller406@gmail.com"}]
+    jobs = [{"sheet_uuid": "u1", "company": "Slate Auto", "title": "Ops", "email": ""}]
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+
+    updates, _ = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert updates == []
+
+
+def test_fillcontacts_keeps_similar_company_names_distinct(monkeypatch):
+    """normalize_company_for_match() strips trailing legal suffixes only, so "Crain" and "Crain
+    Communications" stay separate rows with separate people. Collapsing them would write one
+    company's contact onto another company's job."""
+    cold = [
+        {"name": "Awarner", "company": "Crain", "email": "awarner@crain.com"},
+        {"name": "Lvezzetti", "company": "Crain Communications", "email": "lvezzetti@crain.com"},
+    ]
+    jobs = [{"sheet_uuid": "u1", "company": "Crain Communications", "title": "Financial Analyst", "email": ""}]
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+
+    updates, _ = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert len(updates) == 1
+    assert updates[0]["new_email"] == "lvezzetti@crain.com"
+
+
+def test_fillcontacts_leaves_an_existing_real_contact_alone(monkeypatch):
+    """An address that is already a real person at a real company is the best record there is."""
+    cold = [
+        {"name": "Awarner", "company": "Crain", "email": "awarner@crain.com"},
+        {"name": "Lvezzetti", "company": "Crain", "email": "lvezzetti@crain.com"},
+    ]
+    jobs = [{"sheet_uuid": "u1", "company": "Crain", "title": "Billing Ops", "email": "awarner@crain.com"}]
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+
+    updates, _ = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert updates == []
+
+
+def test_fillcontacts_replaces_a_role_mailbox_and_reports_alternates(monkeypatch):
+    """operations@ carries no more information than the guess already in the cell, so it is
+    overwritable. Where a company has several contacts the first wins and the rest are reported
+    rather than silently dropped."""
+    cold = [
+        {"name": "Awarner", "company": "Crain", "email": "awarner@crain.com"},
+        {"name": "Lvezzetti", "company": "Crain", "email": "lvezzetti@crain.com"},
+    ]
+    jobs = [{"sheet_uuid": "u1", "company": "Crain", "title": "Billing Ops", "email": "operations@crain.com"}]
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+
+    updates, skipped = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert len(updates) == 1
+    assert updates[0]["new_email"] == "awarner@crain.com"
+    assert updates[0]["alternates"] == ["lvezzetti@crain.com"]
+    assert skipped and skipped[0]["company"] == "Crain"
+
+
+def test_fillcontacts_picks_the_first_contacted_person_deterministically(monkeypatch):
+    """Kevin messages 1-3 people per company, so ties are the normal case rather than the edge.
+    get_followups re-sorts by next-followup date and every fresh Carmen Cold row carries the same
+    first-rung interval, so same-day contacts arrive in no meaningful order. Sorting on date_added
+    means the job row shows the first person contacted and keeps showing them across re-runs."""
+    dana = {"name": "Dana", "company": "Acme Group", "email": "dana@acme.com", "date_added": "2026-09-10"}
+    sam = {"name": "Sam", "company": "Acme Group", "email": "sam@acme.com", "date_added": "2026-09-14"}
+    uma = {"name": "Uma", "company": "Acme Group", "email": "uma@acme.com", "date_added": "2026-09-19"}
+    jobs = [{"sheet_uuid": "j1", "company": "Acme Group", "title": "Ops Analyst", "email": ""}]
+
+    for order in ([dana, sam, uma], [uma, sam, dana], [sam, uma, dana]):
+        monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(order, jobs))
+        updates, _ = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+        assert updates[0]["new_email"] == "dana@acme.com", order
+        assert updates[0]["alternates"] == ["sam@acme.com", "uma@acme.com"]
+
+    # A row missing Column A must never displace a real dated contact.
+    ghost = {"name": "Ghost", "company": "Acme Group", "email": "ghost@acme.com", "date_added": ""}
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm([ghost, sam], jobs))
+    updates, _ = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert updates[0]["new_email"] == "sam@acme.com"
+
+
+def test_fillcontacts_does_not_churn_as_more_people_are_messaged(monkeypatch):
+    """Messaging a second and third person at a company must not rewrite the job row each time.
+    The first real contact is the record; the rest stay in Carmen Cold."""
+    jobs = [{"sheet_uuid": "j1", "company": "Acme Group", "title": "Ops Analyst", "email": ""}]
+    cold = [{"name": "Dana", "company": "Acme Group", "email": "dana@acme.com", "date_added": "2026-09-10"}]
+
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+    updates, _ = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert updates[0]["new_email"] == "dana@acme.com"
+
+    # Sheet now reflects that write; two more people get messaged at the same company.
+    jobs[0]["email"] = "dana@acme.com"
+    cold.append({"name": "Sam", "company": "Acme Group", "email": "sam@acme.com", "date_added": "2026-09-14"})
+    cold.append({"name": "Uma", "company": "Acme Group", "email": "uma@acme.com", "date_added": "2026-09-19"})
+
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+    updates, _ = m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert updates == []
+
+
+def test_auto_fill_commits_and_notifies(monkeypatch):
+    """The scheduled wrapper has no preview step, so it must actually write and must tell Kevin.
+    A silent write to a hand-curated sheet is how a wrong address survives unnoticed."""
+    cold = [{"name": "Eina Assali", "company": "Affirm", "email": "eina.assali@affirm.com"}]
+    jobs = [{"sheet_uuid": "u1", "company": "Affirm", "title": "Analyst", "email": "kjmiller406@gmail.com"}]
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+    enqueued, sent = [], []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p))
+    monkeypatch.setattr(m, "update_job_target_email", lambda *a, **k: True)
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text, *a, **k: sent.append(text) or 1)
+
+    assert m.auto_fill_job_contacts_from_carmen_cold() == 1
+    assert any(p.get("action") == "update_contact_email" for p in enqueued)
+    assert sent and "eina.assali@affirm.com" in sent[0]
+
+
+def test_auto_fill_is_quiet_and_idempotent_when_nothing_matches(monkeypatch):
+    """Once a row carries a real contact it no longer qualifies, so the next cycle is a no-op.
+    A 24h job that re-notified every run would train Kevin to ignore the alert."""
+    cold = [{"name": "Eina Assali", "company": "Affirm", "email": "eina.assali@affirm.com"}]
+    jobs = [{"sheet_uuid": "u1", "company": "Affirm", "title": "Analyst", "email": "eina.assali@affirm.com"}]
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+    sent = []
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text, *a, **k: sent.append(text) or 1)
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: None)
+
+    assert m.auto_fill_job_contacts_from_carmen_cold() == 0
+    assert sent == []
+
+
+def test_poll_cycle_runs_the_carmen_cold_fill_after_sent_capture(monkeypatch):
+    """Ordering is load-bearing: capture_contacts_from_sent_mail() files today's person INTO
+    Carmen Cold, and the fill reads Carmen Cold. Reversed, a contact waits a full extra cycle."""
+    order = []
+    monkeypatch.setattr(m, "check_inbound_gmail_replies", lambda *a, **k: order.append("replies"))
+    monkeypatch.setattr(m, "capture_contacts_from_sent_mail", lambda *a, **k: order.append("capture"))
+    monkeypatch.setattr(m, "backfill_contact_emails_from_sent_mail", lambda *a, **k: order.append("sent_backfill"))
+    monkeypatch.setattr(m, "auto_fill_job_contacts_from_carmen_cold", lambda *a, **k: order.append("cold_fill"))
+
+    m.scheduled_email_poll_job()
+    assert order.index("capture") < order.index("cold_fill")
+    assert order[-1] == "cold_fill"
+
+
+def test_poll_cycle_survives_a_failing_carmen_cold_fill(monkeypatch):
+    """One broken step must not take the whole nightly cycle down with it."""
+    monkeypatch.setattr(m, "check_inbound_gmail_replies", lambda *a, **k: None)
+    monkeypatch.setattr(m, "capture_contacts_from_sent_mail", lambda *a, **k: None)
+    monkeypatch.setattr(m, "backfill_contact_emails_from_sent_mail", lambda *a, **k: None)
+
+    def _boom():
+        raise RuntimeError("CRM down")
+    monkeypatch.setattr(m, "auto_fill_job_contacts_from_carmen_cold", _boom)
+
+    m.scheduled_email_poll_job()  # must not raise
+
+
+def test_fillcontacts_dry_run_writes_nothing(monkeypatch):
+    """The preview must not touch Sheets - it reports against tabs Kevin curates by hand."""
+    cold = [{"name": "Eina Assali", "company": "Affirm", "email": "eina.assali@affirm.com"}]
+    jobs = [{"sheet_uuid": "u1", "company": "Affirm", "title": "Analyst", "email": ""}]
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p))
+    monkeypatch.setattr(m, "update_job_target_email", lambda *a, **k: True)
+
+    m.backfill_job_contacts_from_carmen_cold(dry_run=True)
+    assert enqueued == []
+
+    m.backfill_job_contacts_from_carmen_cold(dry_run=False)
+    actions = [p.get("action") for p in enqueued]
+    assert "update_contact_email" in actions
+    assert "append_note" in actions
