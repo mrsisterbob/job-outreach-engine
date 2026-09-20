@@ -34,7 +34,7 @@ from pipeline_utils import (
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     is_guessed_contact_email, resolve_sent_email_backfill,
-    is_role_mailbox, company_domain_of, name_from_email_local_part, parse_email_recipient,
+    is_role_mailbox, is_automated_sender, company_domain_of, name_from_email_local_part, parse_email_recipient,
     match_email_to_crm_company,
     plan_carmen_ladder, carmen_reply_anchor, CARMEN_LADDER_DAYS,
     CARMEN_LADDER_DAYS_COLD, CARMEN_LADDER_DAYS_ENGAGED,
@@ -485,6 +485,22 @@ EMAIL_POLL_HOURS = float(os.environ.get("EMAIL_POLL_HOURS", "1"))
 # Set RESUME_ATTACH_TO_EMAIL=true to restore the attachment - the genuine cold case, a recruiter
 # at a firm where no application exists yet, is the one where the resume is new information.
 RESUME_ATTACH_TO_EMAIL = os.environ.get("RESUME_ATTACH_TO_EMAIL", "false").strip().lower() in ("true", "1", "yes", "on")
+
+# Hard ceiling on how old an inbound message may be and still produce a Telegram alert. Nothing
+# outranks it - not a calendar invite, not an offer, not Tier 1.
+#
+# Everything that alerts is already in Telegram, which stores it indefinitely, so re-sending
+# something older than this cannot recover anything: it is either already on Kevin's phone or was
+# deliberately skipped. Old mail arriving as a fresh notification is pure noise.
+#
+# Safe at 24h ONLY because the poller runs hourly (EMAIL_POLL_HOURS=1): the ceiling is 24x the
+# cadence, so a message gets ~24 chances to be seen. Raising EMAIL_POLL_HOURS without raising this
+# narrows that margin - at a 24h cadence a message could arrive minutes after a poll and be 24h
+# old at the next one. The max() below enforces that relationship rather than trusting it.
+INBOUND_ALERT_MAX_AGE_SECONDS = max(
+    int(float(os.environ.get("INBOUND_ALERT_MAX_AGE_HOURS", "24")) * 3600),
+    int(EMAIL_POLL_HOURS * 3600 * 2),
+)
 EMAIL_POLL_ENABLED = os.environ.get("EMAIL_POLL_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
 
 
@@ -4820,9 +4836,17 @@ def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
     interview_patterns = [
         # formal / ATS
         r"invit(?:ation|e you|ing you) to (?:an? )?interview", r"interview request",
-        r"schedule a (?:call|time|screen|chat|meeting)",
+        # "schedule a call" is also every SaaS sales CTA ("Schedule a call, an expert will handle
+        # your taxes"), so it now needs a word that means THIS conversation - with you, with the
+        # team, about the role - rather than standing alone.
+        r"schedule a (?:call|time|screen|chat|meeting)\b.{0,40}?\b(?:with you|with our|with the|about the (?:role|position)|to discuss)",
+        r"(?:like|love|want) to schedule a (?:call|time|screen|chat|meeting)",
         r"selected for an interview", r"next steps with", r"speaking with our team",
-        r"move forward with your application", r"set (?:up|something up)",
+        r"move forward with your application",
+        # "set up" alone matched "your account is set up!" and "Set up advanced security" - it is
+        # in practically every onboarding email written. Bind it to the thing being set up.
+        r"set (?:up|something up)\b.{0,30}?\b(?:call|time|chat|meeting|interview|conversation|screen)",
+        r"(?:let'?s|can we|could we|happy to) set (?:up|something up)",
         # peer-to-peer acceptance
         r"happy to (?:chat|talk|connect|hop on)", r"(?:would|i'?d) love to (?:chat|talk|connect)",
         r"(?:are|r) you (?:free|available)", r"do you have (?:a few|some|\d+)\s*(?:minutes|mins)",
@@ -4837,7 +4861,15 @@ def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
         r"\binterview\b",
         # Meeting mechanics. A calendar invite's own body is the strongest signal there is, and it
         # rarely contains any of the phrasing above - it contains an RSVP prompt and a join link.
-        r"\brsvp\b", r"zoom\.us/j/", r"teams\.microsoft\.com/l/meetup",
+        # A bare "RSVP" is every event-marketing blast ("Last chance to RSVP and meet the team
+        # at Bloomberg"), so it counts only near something that means an actual conversation.
+        # The join links stay unqualified - a Zoom/Teams meeting link is not newsletter content.
+        # "meeting request"/"meeting invite" is included because that is what a calendar RSVP
+        # actually says; a bare "meet the team at <brand>" event blast still misses, because it
+        # carries no "meeting" noun.
+        r"\brsvp\b.{0,60}?\b(?:interview|screen|conversation|meeting|your (?:call|time|slot))",
+        r"\b(?:interview|screen|conversation|meeting)\b.{0,60}?\brsvp\b",
+        r"zoom\.us/j/", r"teams\.microsoft\.com/l/meetup",
         # "Invitation" alone is a newsletter word ("invitation to our webinar"), so it only counts
         # within a short distance of something that means an actual conversation.
         r"\binvitation\b.{0,60}?\b(?:interview|meeting|call|chat|conversation|screen)\b",
@@ -5280,6 +5312,48 @@ def check_inbound_gmail_replies():
             thread_id = detail.get("threadId", msg_id)
             modify_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}/modify"
 
+            # HARD AGE CEILING. Placed above Tier 1 on purpose: this is the ONE gate Tier 1 may
+            # not outrank. Everything that alerts is already stored in Telegram, so a message
+            # older than the ceiling is either already on Kevin's phone or was deliberately
+            # skipped - re-sending it is noise, never recovery.
+            #
+            # This is a different thing from EMAIL_MAX_AGE_SECONDS inside passes_email_prefilter.
+            # That one is a stale-BACKLOG guard with a 96h floor, and it lives behind the Tier 1
+            # bypass, so an interview-shaped message from last month still alerted. This ceiling
+            # is unconditional.
+            #
+            # THE TRADE, stated plainly because it reverses an earlier decision: this DOES drop the
+            # weekend-reply case that default_email_max_age_seconds()'s 96h floor was added to
+            # protect (a Friday reply, a Render spin-down, 62h old by Monday). That floor still
+            # governs the prefilter; this ceiling sits above it and wins.
+            #
+            # Kevin's call, made with the loss understood: every alert now carries the message's
+            # own date, so anything that does arrive is findable, and re-notifying about old mail
+            # is noise he will not read. A notification does not need to come through twice.
+            # Revert by setting INBOUND_ALERT_MAX_AGE_HOURS higher - 96 restores the old behavior.
+            if internal_date_ms is not None:
+                try:
+                    inbound_age_s = time.time() - (int(internal_date_ms) / 1000.0)
+                    # +60s grace so the boundary is inclusive: a message that is exactly 24h old
+                    # is inside a 24h window, and without this the seconds spent fetching it push
+                    # it over. The grace is far smaller than the poll interval, so it cannot let
+                    # a second day's mail through.
+                    if inbound_age_s > INBOUND_ALERT_MAX_AGE_SECONDS + 60:
+                        logging.info(
+                            f"[AGE CEILING] Skipping {sender} - message is "
+                            f"{inbound_age_s / 3600:.1f}h old (> {INBOUND_ALERT_MAX_AGE_SECONDS / 3600:.0f}h)"
+                        )
+                        # Marked read so the next poll does not re-examine it forever. Safe
+                        # because nothing was alerted and nothing was written.
+                        try:
+                            requests.post(modify_url, headers=headers,
+                                          json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+                        except Exception:
+                            pass
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
             # TIER 1 detection runs BEFORE any gate, because the whole point is that no gate may
             # outrank it. classify_inbound_ats_email checks rejection patterns first, so a decline
             # that mentions interviewing cannot buy itself a bypass.
@@ -5304,6 +5378,21 @@ def check_inbound_gmail_replies():
                 logging.info(
                     f"[TIER1 DENIED] Interview-shaped bulk mail from {sender} "
                     f"(List-Unsubscribe present) - demoted to the normal pre-filter")
+
+            # ...and neither can an automated sender. List-Unsubscribe only covers marketing mail:
+            # TRANSACTIONAL blasts (account setup, security notices, terms updates) are not
+            # obliged to set it and frequently do not, so they cleared the gate above and arrived
+            # as "Interview Signal Detected". Real examples off Kevin's phone: Experian "your
+            # account is set up!", Azure "Set up advanced security", TurboTax "Schedule a call".
+            #
+            # The check is on the SENDER, not the wording, which is why it closes the whole class
+            # rather than one phrase at a time. careers@/recruiting@/talent@ are excluded from
+            # is_automated_sender() precisely so a real invitation keeps its bypass.
+            if is_tier1 and is_automated_sender(sender):
+                is_tier1 = False
+                logging.info(
+                    f"[TIER1 DENIED] Interview-shaped automated mail from {sender} "
+                    f"- demoted to the normal pre-filter")
 
             # GATE 1: Pre-filter shield. Tier 1 skips it, except for the sender rules - a robot
             # mailbox blasting calendar spam is still a robot, and a blocked domain stays blocked.
@@ -5428,6 +5517,19 @@ def check_inbound_gmail_replies():
                 )
             else:
                 header_line = f"⚠️ <b>Unverified Reply ({html.escape(match_reason)})</b>"
+
+            # Day stamp on every alert. Telegram stores these indefinitely, so the alert IS the
+            # archive - and an archive with no date is hard to search months later. The date is the
+            # MESSAGE's own (internalDate), not now(): a message that sat unread for 20 hours
+            # should be findable under the day it was sent, not the day the poller happened to see
+            # it. Falls back to today only when internalDate is missing or unparseable.
+            alert_day = datetime.now()
+            if internal_date_ms is not None:
+                try:
+                    alert_day = datetime.fromtimestamp(int(internal_date_ms) / 1000.0)
+                except (TypeError, ValueError, OSError):
+                    pass
+            header_line = f"{header_line}\n🗓 <i>{alert_day.strftime('%a %b %d, %Y · %I:%M %p').replace(' 0', ' ')}</i>"
             unverified_notes = {
                 "domain match": "<i>Not a CRM contact - matched by company domain. No CRM changes were made.</i>\n",
                 "thread participant": "<i>New person in a thread you started - possibly an introduction. No CRM changes were made.</i>\n",
@@ -5572,6 +5674,22 @@ def sweep_spam_for_interview_signals(request_headers):
             # Without this, every "YOUR INTERVIEW REQUEST" blast Gmail correctly caught gets
             # resurrected into Telegram, which is the opposite of what the sweep is for.
             if str(list_unsubscribe or "").strip():
+                continue
+
+            # Same hard age ceiling as the inbox path, and for the same reason: a month-old
+            # interview-shaped message in Spam is not a rescue, it is noise. Left untouched
+            # (not marked read) - Gmail owns this folder and the sweep has no opinion on old mail.
+            spam_internal_date = detail.get("internalDate")
+            if spam_internal_date is not None:
+                try:
+                    if (time.time() - int(spam_internal_date) / 1000.0) > INBOUND_ALERT_MAX_AGE_SECONDS:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
+            # And an automated sender gets no rescue either - see is_automated_sender(). Transactional
+            # blasts do not set List-Unsubscribe, so the gate above misses them entirely.
+            if is_automated_sender(sender):
                 continue
 
             status_label, _crm_action = classify_inbound_ats_email(

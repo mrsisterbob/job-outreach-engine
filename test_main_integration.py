@@ -5133,16 +5133,26 @@ def test_email_max_age_default_is_derived_from_the_poll_cadence(monkeypatch):
     assert int(os.environ["EMAIL_MAX_AGE_SECONDS"]) == 600
 
 
-def test_a_weekend_reply_survives_an_unattended_container(monkeypatch):
-    """A recruiter replies Friday evening; Render spins down or a deploy gap swallows the weekend.
-    By Monday the message is 62h old. Tier 1 skips the age gate so interviews were always safe -
-    but the goal is every real person who replies, and an ordinary human reply was being dropped
-    AND marked read, with no alert and no trace."""
+def test_a_weekend_reply_is_dropped_by_the_24h_ceiling(monkeypatch):
+    """REVERSAL, deliberate. This used to assert the opposite: a Friday reply that is 62h old by
+    Monday used to alert, protected by default_email_max_age_seconds()'s 96h floor.
+
+    INBOUND_ALERT_MAX_AGE_SECONDS now sits ABOVE the Tier 1 bypass and drops it. Kevin chose this
+    with the loss understood - every alert carries the message's own date, so what does arrive is
+    findable, and a notification does not need to come through twice. Set
+    INBOUND_ALERT_MAX_AGE_HOURS=96 to restore the old behavior."""
     alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
         _gmail_message("wk", "Dana <dana@atwell.com>", "Re: Operations Analyst",
                        "Hi Kevin, thanks for following up - I'd love to keep talking about this.",
                        age_seconds=62 * 3600)])
-    assert len(alerts) == 1
+    assert alerts == []
+
+    # ...and the same message inside the window still alerts, so the ceiling is the only reason.
+    fresh, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("wk2", "Dana <dana@atwell.com>", "Re: Operations Analyst",
+                       "Hi Kevin, thanks for following up - I'd love to keep talking about this.",
+                       age_seconds=6 * 3600)])
+    assert len(fresh) == 1
 
 
 def test_stale_backlog_is_still_dropped(monkeypatch):
@@ -5731,3 +5741,99 @@ def test_quick_add_still_parses_real_company_names():
     assert m.parse_quick_command("/cold Ann@1Password") == ("Ann", "1Password", 5, "")
     assert m.parse_quick_command("/cold Lee@7-Eleven") == ("Lee", "7-Eleven", 5, "")
     assert m.parse_quick_command("/cold Kim@Ford Motor Company") == ("Kim", "Ford Motor Company", 5, "")
+
+
+# ---- Tier 1 interview-bypass false positives (real mail off Kevin's phone, 2026-09-20) ----
+
+# Each of these arrived as "🎉 Interview Signal Detected!" on Kevin's phone in one morning. They
+# are kept verbatim as the regression set: the next greedy pattern has to get past all of them.
+_REAL_TIER1_FALSE_POSITIVES = [
+    ("welcome@notify.chime.com", "Get paid up to 2 days early? Learn how with Chime.",
+     "fee-free overdraft, early payday, set up qualifying direct deposit"),
+    ("no-reply@usa.experian.com", "Kevin, your account is set up!",
+     "Now it is time to take your credit to the next level. Sign in to explore new features."),
+    ("support@turbotax.intuit.com", "TurboTax: A dedicated expert who will handle your taxes",
+     "Schedule a call, an expert will handle the rest."),
+    ("azure@promomail.microsoft.com", "Set up advanced security for your new Azure SQL database",
+     "Learn how to protect your data using built-in tools in this tutorial"),
+    ("noreply@send.calendly.com", "Updates to our Terms of Use",
+     "Learn about updates to our Terms of Use, effective March 8."),
+    ("recruiter@bloomberg.com", "Leo from Bloomberg just sent you a message on WayUp",
+     "Last chance to RSVP and meet the team at Bloomberg"),
+    ("support@urbansitter.com", "Welcome to UrbanSitter!",
+     "Hi Kevin, I am part of the UrbanSitter Support Team"),
+]
+
+# The other half of the trade. Tightening patterns is only safe if these still clear Tier 1 -
+# a lost interview is far more expensive than a spam alert.
+_REAL_INTERVIEW_SIGNALS = [
+    ("careers@plantemoran.com", "Interview Request - Trust Operations Analyst",
+     "We would like to invite you to an interview next week."),
+    ("dana.reed@signaladvisors.com", "Re: Operations Analyst",
+     "Happy to chat! Do you have 30 minutes Thursday?"),
+    ("recruiting@affirm.com", "Next steps with Affirm",
+     "We would love to schedule a call with you about the role."),
+    ("sarah@huntington.com", "Following up", "Can we set something up for Tuesday?"),
+    ("talent@crain.com", "Your application", "You have been selected for an interview."),
+    ("hr@ford.com", "Interview", "Please RSVP for your interview slot on Monday."),
+    ("j.smith@oppenheimer.com", "quick question",
+     "Let us grab 15 minutes this week - here is my calendly"),
+]
+
+
+def _reaches_tier1(sender, subject, body):
+    """The real bypass decision: classifier says interview/offer AND the sender is not automated.
+    Mirrors the two checks in check_inbound_gmail_replies()."""
+    label, _ = m.classify_inbound_ats_email(sender, subject, body)
+    if label not in ("INTERVIEW_SET", "OFFER_EXTENDED"):
+        return False
+    return not m.is_automated_sender(sender)
+
+
+@pytest.mark.parametrize("sender,subject,body", _REAL_TIER1_FALSE_POSITIVES)
+def test_marketing_mail_never_reaches_tier1(sender, subject, body):
+    assert _reaches_tier1(sender, subject, body) is False
+
+
+@pytest.mark.parametrize("sender,subject,body", _REAL_INTERVIEW_SIGNALS)
+def test_real_interview_signals_still_reach_tier1(sender, subject, body):
+    assert _reaches_tier1(sender, subject, body) is True
+
+
+def test_hiring_role_mailboxes_are_not_treated_as_automated():
+    """The whole reason is_automated_sender() has its own list instead of reusing
+    _ROLE_MAILBOX_LOCALPARTS: careers@/recruiting@/talent@/hr@ are where real invitations come
+    from, and denying them would recreate the silent loss the bypass exists to prevent."""
+    for addr in ("careers@plantemoran.com", "recruiting@affirm.com",
+                 "talent@crain.com", "hr@ford.com", "jobs@huntington.com"):
+        assert m.is_automated_sender(addr) is False, addr
+
+
+def test_automated_senders_are_detected_by_localpart_and_subdomain():
+    for addr in ("no-reply@usa.experian.com", "welcome@notify.chime.com",
+                 "notifications@x.com", "azure@promomail.microsoft.com",
+                 "noreply@send.calendly.com", "Chime <welcome@notify.chime.com>"):
+        assert m.is_automated_sender(addr) is True, addr
+    # A human at a normal domain is never automated.
+    for addr in ("dana.reed@signaladvisors.com", "j.smith@oppenheimer.com", "sarah@huntington.com"):
+        assert m.is_automated_sender(addr) is False, addr
+
+
+# ---- Hard age ceiling on inbound alerts ----
+
+def test_age_ceiling_is_24h_and_outranks_the_prefilter_window():
+    """Telegram stores every alert, so re-sending old mail cannot recover anything - it is either
+    already on Kevin's phone or was deliberately skipped. This ceiling is unconditional; the
+    prefilter's own EMAIL_MAX_AGE_SECONDS sits behind the Tier 1 bypass and is much wider."""
+    assert m.INBOUND_ALERT_MAX_AGE_SECONDS == 24 * 3600
+    assert m.INBOUND_ALERT_MAX_AGE_SECONDS < m.EMAIL_MAX_AGE_SECONDS
+
+
+def test_age_ceiling_never_drops_below_two_poll_intervals(monkeypatch):
+    """The 24h ceiling is only safe because the poller runs hourly. The max() guard means raising
+    EMAIL_POLL_HOURS cannot silently create a window narrower than the cadence - the bug
+    default_email_max_age_seconds() was written to document."""
+    for poll_hours, floor in ((1.0, 24 * 3600), (24.0, 48 * 3600), (48.0, 96 * 3600)):
+        computed = max(int(24 * 3600), int(poll_hours * 3600 * 2))
+        assert computed >= floor
+        assert computed >= poll_hours * 3600 * 2

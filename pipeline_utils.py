@@ -747,6 +747,57 @@ _ROLE_MAILBOX_LOCALPARTS = frozenset({
     "admin", "help", "sales", "team", "noreply", "no-reply", "donotreply",
 })
 
+# Local parts that mean "a machine sent this", used ONLY to deny the Tier 1 interview bypass.
+# Deliberately NOT _ROLE_MAILBOX_LOCALPARTS: that set contains careers@, recruiting@, talent@ and
+# hr@, which are exactly the addresses a real interview invitation arrives from, and denying those
+# would re-create the silent loss the bypass exists to prevent.
+#
+# Every entry here is a sender that announces automated bulk/transactional mail. The ones that
+# actually reached Kevin's phone as "Interview Signal Detected": welcome@notify.chime.com,
+# no-reply@usa.experian.com, azure@promomail.microsoft.com, support@turbotax.intuit.com.
+_AUTOMATED_SENDER_LOCALPARTS = frozenset({
+    "noreply", "no-reply", "donotreply", "do-not-reply", "notify", "notifications",
+    "welcome", "alerts", "alert", "updates", "news", "newsletter", "marketing", "promo",
+    "promomail", "mailer", "mailer-daemon", "bounce", "bounces", "automated", "auto",
+    "system", "notification", "account", "accounts", "billing", "receipts", "invoice",
+    "security", "service", "services", "member", "members", "offers", "deals",
+})
+
+# Subdomains that mark a bulk/transactional mail stream even when the local part looks human:
+# "azure@promomail.microsoft.com" is Microsoft, but promomail. is the marketing relay.
+_AUTOMATED_MAIL_SUBDOMAINS = frozenset({
+    "notify", "notifications", "promomail", "promo", "mailer", "email", "mail",
+    "send", "sendgrid", "mailgun", "bounce", "bounces", "marketing", "news", "alerts",
+})
+
+
+def is_automated_sender(email):
+    """True when an address announces machine-generated bulk/transactional mail.
+
+    Used to deny the Tier 1 interview bypass, NOT to drop mail: a message from one of these
+    still goes through the ordinary pre-filter and can still alert. A human recruiter scheduling
+    an interview does not write from welcome@notify.chime.com, so honouring this costs no real
+    interview while closing the class of false Tier 1 that keyword tightening alone cannot.
+
+    careers@/recruiting@/talent@/hr@ are deliberately NOT automated - see the set above.
+    """
+    raw = str(email or "")
+    # A display-name form ("Chime <welcome@notify.chime.com>") must be reduced to the address.
+    match = re.search(r'<\s*([^<>@\s]+@[^<>@\s]+)\s*>', raw)
+    addr = (match.group(1) if match else raw).strip().lower()
+    if "@" not in addr:
+        return False
+    local, _, domain = addr.partition("@")
+    local = re.sub(r'[._-]?\d+$', '', local.strip())
+    if local in _AUTOMATED_SENDER_LOCALPARTS:
+        return True
+    # Leading segment of a multi-part local part: "welcome-team@", "no.reply@".
+    lead = re.split(r'[._-]', local)[0] if local else ""
+    if lead in ("noreply", "donotreply", "notify", "welcome", "alerts", "promo"):
+        return True
+    labels = domain.strip(".").split(".")
+    return len(labels) >= 3 and labels[0] in _AUTOMATED_MAIL_SUBDOMAINS
+
 # Mail providers and ATS/job-board senders: the domain says nothing about an employer,
 # so company matching would be meaningless even when the local part is a real person.
 _NON_COMPANY_EMAIL_DOMAINS = frozenset({
