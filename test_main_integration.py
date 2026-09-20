@@ -5679,3 +5679,27 @@ def test_fillcontacts_dry_run_writes_nothing(monkeypatch):
     actions = [p.get("action") for p in enqueued]
     assert "update_contact_email" in actions
     assert "append_note" in actions
+
+
+# ---- /cold, /warm, /quick contact quick-add parsing ----
+
+def test_quick_add_rejects_a_pasted_email_address():
+    """The real misfire: "/cold kjmiller406@gmail.com" parsed as name="kjmiller406",
+    company="gmail.com" and silently created two junk Carmen Cold rows. These commands take a
+    company NAME; an address belongs to /e, which drafts and logs in one step."""
+    assert m.parse_quick_command("/cold kjmiller406@gmail.com") is None
+    assert m.parse_quick_command("/cold dana@signaladvisors.com") is None
+    assert m.parse_quick_command("/warm bob@crain.com") is None
+    assert m.parse_quick_command("/quick x@ncms.org") is None
+
+
+def test_quick_add_still_parses_real_company_names():
+    """The guard keys on a bare-domain shape, so company names with digits, hyphens and multiple
+    words - the cases the parser was written for - must be untouched."""
+    assert m.parse_quick_command("/cold Dana Reed@Signal Advisors 7 ops lead") == (
+        "Dana Reed", "Signal Advisors", 7, "ops lead")
+    assert m.parse_quick_command("/cold Sam@3M") == ("Sam", "3M", 5, "")
+    assert m.parse_quick_command("/cold Jo@Web3 Labs 8 note here") == ("Jo", "Web3 Labs", 8, "note here")
+    assert m.parse_quick_command("/cold Ann@1Password") == ("Ann", "1Password", 5, "")
+    assert m.parse_quick_command("/cold Lee@7-Eleven") == ("Lee", "7-Eleven", 5, "")
+    assert m.parse_quick_command("/cold Kim@Ford Motor Company") == ("Kim", "Ford Motor Company", 5, "")

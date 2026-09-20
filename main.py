@@ -3388,6 +3388,14 @@ def parse_quick_command(text_input):
     if not name or not rest:
         return None
 
+    # A pasted EMAIL ADDRESS is the most likely way to misuse this: "/cold kev@gmail.com" parses
+    # cleanly as name="kev", company="gmail.com" and silently creates a contact at a company that
+    # does not exist. These commands take a COMPANY NAME, never an address, so a first company
+    # token that looks like a bare domain is rejected and the caller shows the real format.
+    first_company_token = rest.split()[0] if rest.split() else ""
+    if re.fullmatch(r'[a-z0-9-]+\.[a-z]{2,}', first_company_token.lower()):
+        return None
+
     # Extract priority if present as standalone integer
     tokens = rest.split()
     priority = 5
@@ -9014,11 +9022,21 @@ def process_webhook_payload_async(data):
             cmd_token = "/warm" if is_warm_quickadd else "/cold"
             result = parse_quick_command(text)
             if result is None:
-                send_telegram_message(chat_id, f"❌ Invalid {cmd_token} format. Use: <code>{cmd_token} Name@Company [Priority 1-10] [Note]</code>")
+                send_telegram_message(
+                    chat_id,
+                    f"❌ Invalid {cmd_token} format. Use: <code>{cmd_token} Name@Company [Priority 1-10] [Note]</code>\n"
+                    f"<i>Company NAME, not an email address</i> - e.g. "
+                    f"<code>{cmd_token} Dana Reed@Signal Advisors 7 ops lead</code>.\n"
+                    f"To log someone you are emailing, use <code>/e</code> instead."
+                )
                 return
             name, company, priority, note = result
             sheet_uuid = str(uuid.uuid4())
-            next_followup = (datetime.now() + timedelta(days=calculate_followup_interval(priority))).strftime("%Y-%m-%d")
+            # Carmen tabs run the 4/11 (cold) or 4/11/21 (engaged) ladder, whose first rung is +4
+            # days. calculate_followup_interval() is the JOBS priority-decayed model and waits 19
+            # days at the default priority - a gap the ladder never writes, so plan_carmen_ladder()
+            # reads the row as stalled and revives it instead of treating it as rung 1.
+            next_followup = (datetime.now() + timedelta(days=CARMEN_LADDER_DAYS_COLD[0])).strftime("%Y-%m-%d")
             payload = build_crm_payload(
                 "quick_add",
                 target_code="CW" if is_warm_quickadd else "CC",
