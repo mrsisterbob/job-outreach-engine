@@ -298,9 +298,20 @@ def resolve_template_text(pool, idx, fallback_text=""):
         idx = 0
     return pool[idx]
 
-def interpolate_template(template, name="", company="", job_title=""):
-    """Deterministically fills {name}/{company}/{job_title} placeholders via str.format() - the
-    only place candidate-facing outreach/LinkedIn copy is ever assembled. Never calls Gemini.
+def interpolate_template(template, name="", company="", job_title="", their_desk=""):
+    """Deterministically fills {name}/{company}/{job_title}/{their_desk} placeholders via
+    str.format() - the only place candidate-facing outreach/LinkedIn copy is ever assembled.
+    Never calls Gemini.
+
+    {their_desk} is the one concrete detail about the RECIPIENT's desk, read off their LinkedIn
+    About/Experience during the manual pass-2 screen (see memory/outreach-screener.md). It renders
+    as a leading subordinate clause with no trailing comma - the template supplies that - so a
+    caller passes "Since employee care runs on third-party administrators and HRIS records" and
+    gets that clause in front of the ask. Callers that have not done pass 2 pass nothing, and it
+    degrades to the generic "Given how much of this sits under you", which is what every cold_ops
+    template said before the slot existed. Never leave it unfilled without that fallback: format()
+    raises KeyError on an unknown key and the except below returns the RAW template, which would
+    put literal braces in a candidate-facing email.
 
     {name} renders WITH a leading space when a contact name is known and as an empty string when
     it is not, so a template written "Hi{name}," yields "Hi Dana," or a bare "Hi," - never the old
@@ -322,6 +333,7 @@ def interpolate_template(template, name="", company="", job_title=""):
             name=f" {clean_name}" if clean_name else "",
             company=company or "your team",
             job_title=job_title or "this role",
+            their_desk=str(their_desk or "").strip().rstrip(",") or "Given how much of this sits under you",
         )
     except Exception as e:
         logging.error(f"Template interpolation failed: {e}")
@@ -2881,7 +2893,7 @@ def resume_pdf_filename(company_name):
     slug = slug[:64].rstrip('_')
     return f"Kevin_Miller_Resume_{slug}.pdf" if slug else "Kevin_Miller_Resume.pdf"
 
-def render_outreach_email(pool_key, template_id=0, name="", company="", job_title=""):
+def render_outreach_email(pool_key, template_id=0, name="", company="", job_title="", their_desk=""):
     """THE single rendering path for every candidate-facing email body, cold or warm or bump.
 
     Both consumers go through here - the Telegram card (process_single_candidate) and the Gmail
@@ -2898,14 +2910,19 @@ def render_outreach_email(pool_key, template_id=0, name="", company="", job_titl
     fallback_text = fallback_pool[template_id] if isinstance(template_id, int) and 0 <= template_id < len(fallback_pool) else fallback_pool[0]
     template = resolve_template_text(pool, template_id, fallback_text)
     return sanitize_text(interpolate_template(
-        template, name=name, company=clean_company_for_copy(company), job_title=job_title
+        template, name=name, company=clean_company_for_copy(company), job_title=job_title,
+        their_desk=their_desk,
     ))
 
-def generate_cold_email(job_title, company_name, template_id=0, contact_name=""):
+def generate_cold_email(job_title, company_name, template_id=0, contact_name="", their_desk=""):
     """Cold email body from the cold_ops bank. `template_id` is the Gemini-routed
     outreach_template_id persisted on the cached job, so /draft re-renders the same entry the
-    card showed instead of always falling back to cold_ops[0]."""
-    return render_outreach_email("cold_ops", template_id, name=contact_name, company=company_name, job_title=job_title)
+    card showed instead of always falling back to cold_ops[0].
+
+    `their_desk` is optional and empty on the automated path; it is filled only when Kevin has
+    done the manual pass-2 profile read. Unfilled, interpolate_template() supplies the generic
+    clause, so every existing caller renders exactly as it did before the slot existed."""
+    return render_outreach_email("cold_ops", template_id, name=contact_name, company=company_name, job_title=job_title, their_desk=their_desk)
 
 def resolve_outreach_body(job, mapping, job_title, company_name, is_warm):
     """THE body every Telegram command (/draft, /eh, /e) shows AND drafts into Gmail.

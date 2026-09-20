@@ -332,7 +332,10 @@ _OUTREACH_BANNED_PATTERNS = [
     (r"\b(?:truly|deeply|highly|significantly)\b", "filler adverb (truly/deeply/highly/significantly)"),
     (r"\b(?:furthermore|additionally|moreover)\b", "essay transition (Furthermore/Additionally/Moreover)"),
     (r"proven track record", "self-praise ('proven track record')"),
-    (r"my (?:experience|background) (?:centers|is in|lies)", "abstract capability claim - use past-tense proof"),
+    # Narrowed 2026-09-20 at Kevin's explicit direction. "my background is in" is now the shipped
+    # cold_ops[1] opener; he chose it over the linter's objection after being shown the conflict.
+    # "my experience centers/lies" and "my background centers/lies" stay banned.
+    (r"my experience (?:centers|is in|lies)|my background (?:centers|lies)", "abstract capability claim - use past-tense proof"),
     (r"what you(?:'re| are) looking for", "self-deprecating hedge"),
     (r"if you think I", "self-deprecating hedge"),
     (r"\b(?:excited|thrilled|exciting|admire|impressive)\b", "performed enthusiasm / company praise"),
