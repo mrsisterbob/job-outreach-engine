@@ -807,6 +807,12 @@ _GENERIC_BRAND_TOKENS = frozenset({
     "capital", "financial", "insurance", "services", "solutions", "systems", "partners", "group",
 })
 
+# Words no one carries into an acronym: "National Center FOR Manufacturing Sciences" is NCMS,
+# not NCFMS. Only used to build the acronym candidate in domain_matches_company().
+_ACRONYM_STOPWORDS = frozenset({
+    "for", "of", "and", "the", "in", "on", "at", "to", "a", "an",
+})
+
 
 def domain_matches_company(email, company_name):
     """True if an address's domain plausibly belongs to `company_name`.
@@ -843,6 +849,29 @@ def domain_matches_company(email, company_name):
     if words:
         brand = words[0]
         if len(brand) >= 5 and brand not in _GENERIC_BRAND_TOKENS and label.startswith(brand):
+            return True
+
+    # SHORT BRAND. The tests above all have a >= 5 char floor, which drops a real class of
+    # match: "Ford Motor Company" sends from ford.com, where the brand is only 4 characters.
+    # The floor exists to stop a short generic token carrying a match on its own ("aa.com" vs
+    # "AAA-The Auto Club"), so this relaxes it only where the token cannot be generic: the
+    # domain label must EQUAL the company's first word exactly, and that word must be a real
+    # brand rather than a descriptor. An exact label==word match is much stricter than the
+    # prefix/substring tests, so "aa" still fails against "aaatheautoclub" (first word "aaa").
+    if words:
+        brand = words[0]
+        if 3 <= len(brand) < 5 and brand not in _GENERIC_BRAND_TOKENS and label == brand:
+            return True
+
+    # ACRONYM. A long institutional name almost always mails from its initials: "National
+    # Center for Manufacturing Sciences" sends from ncms.org. Built from the significant words
+    # only - stopwords like "for"/"of"/"and" are not carried into an acronym by anyone - and
+    # requires the company to be genuinely long-form (>= 3 significant words), so a two-word
+    # company cannot acronym its way into a 2-letter collision.
+    significant = [w for w in words if w not in _ACRONYM_STOPWORDS]
+    if len(significant) >= 3:
+        acronym = "".join(w[0] for w in significant)
+        if len(acronym) >= 3 and label == acronym:
             return True
     return False
 

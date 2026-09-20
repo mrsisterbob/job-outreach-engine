@@ -5832,6 +5832,16 @@ def capture_contacts_from_sent_mail(lookback_hours=None, max_messages=25, dry_ru
 
             contact = build_sent_contact(to_header, crm_companies)
             if not contact:
+                # A near-miss is worth a log line: a real person at a company the matcher did not
+                # recognize is exactly the ford.com / ncms.org class of silent drop, and without
+                # this the only symptom is a contact that never appears in Carmen Cold. Role
+                # mailboxes and consumer domains are deliberate skips and stay quiet.
+                _name, _addr = parse_email_recipient(to_header)
+                if _addr and not is_role_mailbox(_addr) and company_domain_of(_addr):
+                    logging.info(
+                        f"[SENT] no CRM company matched {_addr} (domain "
+                        f"{company_domain_of(_addr)}) - not captured"
+                    )
                 continue
             email_key = str(contact["email"]).strip().lower()
             if email_key in seen_emails:

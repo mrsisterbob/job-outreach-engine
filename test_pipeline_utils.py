@@ -874,8 +874,39 @@ def test_brand_token_matches_a_company_whose_domain_differs_from_its_legal_name(
     assert pu.domain_matches_company("a@unitedairlines.com", "United Wholesale Mortgage") is False
     assert pu.domain_matches_company("a@contactcenter.com", "Intact Services USA LLC") is False
     assert pu.domain_matches_company("a@mainstreetbank.com", "Main Financial Group") is False
-    # The short-token floor still holds: a 4-char brand cannot match on its own.
+    # A short brand cannot match as a PREFIX - autozone.com is not "Auto Club". (An EXACT
+    # short-brand match is allowed; see test_short_brand_matches_only_on_an_exact_label.)
     assert pu.domain_matches_company("a@autozone.com", "Auto Club") is False
+
+
+def test_short_brand_matches_only_on_an_exact_label():
+    """'Ford Motor Company' sends from ford.com, but the brand is 4 chars and every other test
+    here has a >= 5 char floor, so a real contact was dropped silently. The relaxation is exact
+    label == first word, which is far stricter than the prefix/substring tests it sits beside."""
+    assert pu.domain_matches_company("jsmith@ford.com", "Ford Motor Company") is True
+
+    # The floor's original job still holds. "aa" is not "AAA-The Auto Club" (first word "aaa"),
+    # and a short word may not match as a prefix the way a long brand can.
+    assert pu.domain_matches_company("bob@aa.com", "AAA-The Auto Club") is False
+    assert pu.domain_matches_company("a@autozone.com", "Auto Club") is False
+    # A different company that merely STARTS with the same letters must not be claimed.
+    assert pu.domain_matches_company("a@ford.com", "Forward Financial Group") is False
+
+
+def test_acronym_domain_matches_a_long_institutional_name():
+    """'National Center for Manufacturing Sciences' mails from ncms.org. Its first word is a
+    generic token and the acronym appears nowhere in the string, so every other test missed -
+    and NCMS is a live company in the pipeline, so this was dropping real contacts."""
+    assert pu.domain_matches_company("a@ncms.org", "National Center for Manufacturing Sciences") is True
+    assert pu.domain_matches_company("a@ibm.com", "International Business Machines") is True
+
+    # Stopwords are not carried into an acronym: the candidate is NCMS, never NCFMS.
+    assert pu.domain_matches_company("a@ncfms.org", "National Center for Manufacturing Sciences") is False
+    # A short name cannot acronym its way into a collision - "General Motors" is 2 words, so gm.com
+    # is not accepted on initials alone.
+    assert pu.domain_matches_company("a@gm.com", "General Motors") is False
+    # And the acronym must be the WHOLE label, not a prefix of a longer unrelated domain.
+    assert pu.domain_matches_company("a@ncmsystems.com", "National Center for Manufacturing Sciences") is False
 
 
 # ---- Carmen Cold follow-up ladder ----
