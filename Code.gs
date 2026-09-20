@@ -234,7 +234,12 @@ function doPost(e) {
         payload.name || "N/A",
         payload.company || "N/A",
         payload.email || "",
-        payload.priority ? `Priority ${payload.priority}` : "Priority 5",
+        // Column E is the sequencer's rung marker ("NEW · unsent", "COLD · 1 of 3", "COLD · spent",
+        // "HOLD · dated" - see carmen_status_marker() in pipeline_utils.py). The nightly 07:30 run
+        // overwrites this, so a fresh row only wears this value until then; "Priority 5" was a
+        // meaningless placeholder that told Kevin nothing during that window. An explicit priority
+        // from the payload still wins and is preserved after the separator by carmen_marker_cell().
+        payload.priority ? `Priority ${payload.priority}` : "NEW · unsent",
         payload.status || "Cold Lead", // e.g. "Warm Alum" from main.py's JIT Hope Alumni Discovery auto-log
         payload.next_followup || getFollowupStr(14),
         payload.source || "Telegram /quick",
