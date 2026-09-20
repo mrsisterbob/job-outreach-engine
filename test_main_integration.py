@@ -5312,14 +5312,16 @@ def test_eh_shares_the_tail_so_it_posts_the_same_resume(monkeypatch):
     assert documents[0]["filename"] == m.resume_pdf_filename("Atwell")
 
 
-def test_e_still_attaches_the_resume_pdf_to_the_gmail_draft(monkeypatch):
-    """The resume PDF is an attachment on the outbound draft, not a chat message - dropping it
-    would change what the employer receives, which is not what was asked for."""
-    captured = {}
+def _run_stage_outreach_draft(monkeypatch):
+    """Drive stage_outreach_draft() with everything outbound stubbed. Returns
+    (create_gmail_draft kwargs, telegram document filenames)."""
+    captured, documents = {}, []
     monkeypatch.setattr(m, "compile_resume_pdf_resilient", lambda *a, **k: b"%PDF-resume")
     monkeypatch.setattr(m, "log_daily_activity", lambda *a, **k: None)
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: None)
-    monkeypatch.setattr(m, "send_telegram_document", lambda *a, **k: True)
+    monkeypatch.setattr(m, "send_telegram_document",
+                        lambda cid, b, filename, caption=None, command_label=None, **k:
+                        documents.append(filename) or True)
 
     def fake_draft(**kwargs):
         captured.update(kwargs)
@@ -5329,6 +5331,32 @@ def test_e_still_attaches_the_resume_pdf_to_the_gmail_draft(monkeypatch):
     job = {"employer_name": "Atwell", "job_title": "Operations Analyst", "track": "e"}
     m.stage_outreach_draft(1, {"sheet_uuid": "u", "sheet_tab": "Tetiana Cold"}, job, "Atwell",
                            "Operations Analyst", False, "dana@atwell.com", "hdr", "/e")
+    return captured, documents
+
+
+def test_e_does_not_attach_the_resume_to_the_outbound_email(monkeypatch):
+    """The resume is NOT attached to the draft by default. For a recruiter it duplicates the copy
+    already in their ATS (Kevin applies before he emails); for a peer the screener rules say a
+    discovery email carries no resume at all. Either way it spends sender trust - on a SPF
+    SOFTFAIL domain - for nothing."""
+    monkeypatch.setattr(m, "RESUME_ATTACH_TO_EMAIL", False)
+    captured, _ = _run_stage_outreach_draft(monkeypatch)
+    assert captured["pdf_bytes"] is None
+
+
+def test_the_resume_still_reaches_telegram_when_the_email_has_none(monkeypatch):
+    """The gate is on the OUTBOUND attachment only. The Telegram copy is the file Kevin uploads
+    to the ATS portal right after drafting, so removing it would break the actual workflow."""
+    monkeypatch.setattr(m, "RESUME_ATTACH_TO_EMAIL", False)
+    _, documents = _run_stage_outreach_draft(monkeypatch)
+    assert documents == [m.resume_pdf_filename("Atwell")]
+
+
+def test_resume_attachment_can_be_switched_back_on(monkeypatch):
+    """RESUME_ATTACH_TO_EMAIL=true restores it, for the genuine cold case: a recruiter at a firm
+    where no application exists yet, where the resume is new information."""
+    monkeypatch.setattr(m, "RESUME_ATTACH_TO_EMAIL", True)
+    captured, _ = _run_stage_outreach_draft(monkeypatch)
     assert captured["pdf_bytes"] == b"%PDF-resume"
     assert captured["pdf_filename"] == m.resume_pdf_filename("Atwell")
 

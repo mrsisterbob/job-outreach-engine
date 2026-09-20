@@ -461,7 +461,30 @@ def update_template_entry(file_path, list_key, idx, new_text):
 # Defined HERE, far above start_gmail_poller(), because EMAIL_MAX_AGE_SECONDS below derives its
 # default from it. Module-level constants are evaluated top to bottom at import, so the cadence
 # has to be known before the age gate that depends on it.
-EMAIL_POLL_HOURS = float(os.environ.get("EMAIL_POLL_HOURS", "24"))
+EMAIL_POLL_HOURS = float(os.environ.get("EMAIL_POLL_HOURS", "1"))
+
+# Attach the resume PDF to the OUTBOUND Gmail draft. Off by default, for two reasons that both
+# point the same way:
+#
+#   RECRUITER - Kevin has already applied by the time he emails one, so his resume is already in
+#   their ATS against that req. The attachment duplicates a file they can pull up, and buys
+#   nothing for it.
+#   PEER - the screener rules say a peer discovery email carries NO resume. A CV attached to
+#   "how does your desk actually work?" reads as an application in disguise, which is the thing
+#   most likely to stop a peer replying.
+#
+# The cost side is small but real and lands hardest here: ~85% of malicious mail carries a
+# PDF/DOC/ZIP, filters weight that, and this sender is on a SPF SOFTFAIL domain with less trust
+# margin than most. Measured, the size argument does NOT apply - the resume is 45.8 KB raw /
+# 61.1 KB base64, well under the ~110 KB where deliverability starts to degrade - so size is not
+# the reason; provenance is.
+#
+# The Telegram copy is UNAFFECTED and still posted on every /e: that is the file Kevin uploads to
+# the ATS portal right after drafting, which is its actual job.
+#
+# Set RESUME_ATTACH_TO_EMAIL=true to restore the attachment - the genuine cold case, a recruiter
+# at a firm where no application exists yet, is the one where the resume is new information.
+RESUME_ATTACH_TO_EMAIL = os.environ.get("RESUME_ATTACH_TO_EMAIL", "false").strip().lower() in ("true", "1", "yes", "on")
 EMAIL_POLL_ENABLED = os.environ.get("EMAIL_POLL_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
 
 
@@ -4394,9 +4417,13 @@ def stage_outreach_draft(chat_id, mapping, job, comp, title, is_warm, target, he
     pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label, tone_mode=tone_mode)
 
     raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
+    # pdf_bytes is still compiled above and still posted to Telegram below - only the OUTBOUND
+    # attachment is gated. See RESUME_ATTACH_TO_EMAIL.
     ok, gmail_msg, draft_id = create_gmail_draft(
         to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
-        custom_body=raw_email_text, pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+        custom_body=raw_email_text,
+        pdf_bytes=pdf_bytes if RESUME_ATTACH_TO_EMAIL else None,
+        pdf_filename=pdf_filename
     )
     monospaced_body = format_email_block(raw_email_text)
     draft_link_line = ""
@@ -9479,9 +9506,12 @@ def process_webhook_payload_async(data):
             pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft", tone_mode=tone_mode)
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
             raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
+            # Same gate as stage_outreach_draft: the PDF still reaches Telegram, not the email.
             ok, gmail_msg, draft_id = create_gmail_draft(
                 to_email=target, company_name=comp, job_title=title, is_warm=is_warm,
-                custom_body=raw_email_text, pdf_bytes=pdf_bytes, pdf_filename=pdf_filename
+                custom_body=raw_email_text,
+                pdf_bytes=pdf_bytes if RESUME_ATTACH_TO_EMAIL else None,
+                pdf_filename=pdf_filename
             )
             monospaced_body = format_email_block(raw_email_text)
             draft_link_line = ""
