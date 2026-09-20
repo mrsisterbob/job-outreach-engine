@@ -884,31 +884,116 @@ _LADDER_TODAY = date(2026, 9, 12)
 
 
 def test_carmen_ladder_walks_every_rung_then_stops():
-    """The whole point: three nudges at CARMEN_LADDER_DAYS offsets from the day the contact
-    landed. Dates are derived from the constant rather than hardcoded, so retuning the cadence
-    is a one-line change instead of a test rewrite."""
+    """The whole point: three nudges at CARMEN_LADDER_DAYS_ENGAGED offsets from the day the
+    contact landed. Dates are derived from the constant rather than hardcoded, so retuning the
+    cadence is a one-line change instead of a test rewrite.
+
+    The row carries a reply note, which is what puts it on the engaged ladder: since the
+    cold/engaged split a contact who has never written back walks the shorter (4, 11) ladder.
+    The anchor stays Date Added because the reply predates it here.
+    """
     anchor_date = date(2026, 9, 12)
     anchor = anchor_date.isoformat()
-    d1, d2, d3 = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS)
+    note = f"[{(anchor_date - timedelta(days=1)).isoformat()}] {pu.INBOUND_REPLY_NOTE_MARKER} - said to circle back"
+    d1, d2, d3 = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS_ENGAGED)
 
-    action, nxt = pu.plan_carmen_followup(anchor, "", _LADDER_TODAY)
+    action, nxt = pu.plan_carmen_followup(anchor, "", _LADDER_TODAY, note)
     assert (action, nxt) == ("schedule", d1)
 
-    action, nxt = pu.plan_carmen_followup(anchor, d1.isoformat(), d1)
+    action, nxt = pu.plan_carmen_followup(anchor, d1.isoformat(), d1, note)
     assert (action, nxt) == ("nudge_1", d2)
 
-    action, nxt = pu.plan_carmen_followup(anchor, d2.isoformat(), d2)
+    action, nxt = pu.plan_carmen_followup(anchor, d2.isoformat(), d2, note)
     assert (action, nxt) == ("nudge_2", d3)
 
     # Final rung advances to the triage date (last rung + grace week) rather than writing
     # nothing - with no date written, the row re-read as rung 3 and nudge #3 fired forever.
     terminal = anchor_date + timedelta(days=pu.CARMEN_TERMINAL_GAP_DAYS)
-    action, nxt = pu.plan_carmen_followup(anchor, d3.isoformat(), d3)
+    action, nxt = pu.plan_carmen_followup(anchor, d3.isoformat(), d3, note)
     assert (action, nxt) == ("nudge_3", terminal)
 
     # Quiet through the grace week, then exhausted - the path that used to be unreachable.
-    assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal - timedelta(days=1)) == ("none", None)
+    assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal - timedelta(days=1), note) == ("none", None)
+    assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal, note) == ("exhausted", None)
+
+
+def test_cold_ladder_stops_one_nudge_earlier_than_engaged():
+    """A contact who has never replied gets three TOTAL contacts (day 0 + two nudges), not four.
+    The day-21 nudge to someone who ignored three emails is the rung the split removes."""
+    anchor_date = date(2026, 9, 12)
+    anchor = anchor_date.isoformat()
+    d1, d2 = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS_COLD)
+
+    assert pu.plan_carmen_followup(anchor, d1.isoformat(), d1) == ("nudge_1", d2)
+
+    terminal = anchor_date + timedelta(days=pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_COLD))
+    assert pu.plan_carmen_followup(anchor, d2.isoformat(), d2) == ("nudge_2", terminal)
+
+    # No third nudge: the grace week runs, then the row is spent.
     assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal) == ("exhausted", None)
+
+
+def test_a_reply_promotes_a_cold_row_to_the_engaged_ladder():
+    """The promotion is automatic and needs nothing set by hand: once a reply note exists the row
+    switches ladders, and the anchor moves to the reply date."""
+    added = date(2026, 9, 1)
+    replied = date(2026, 9, 6)
+    note = f"[{replied.isoformat()}] {pu.INBOUND_REPLY_NOTE_MARKER} - asked for a call"
+
+    plan = pu.plan_carmen_ladder(added.isoformat(), "", replied, note)
+    assert plan.replied is True
+    assert plan.ladder == pu.CARMEN_LADDER_DAYS_ENGAGED
+    assert plan.anchor == replied
+    assert plan.next_date == replied + timedelta(days=pu.CARMEN_LADDER_DAYS_ENGAGED[0])
+
+    # Same row without the note stays cold.
+    cold = pu.plan_carmen_ladder(added.isoformat(), "", replied)
+    assert cold.replied is False
+    assert cold.ladder == pu.CARMEN_LADDER_DAYS_COLD
+
+
+def test_legacy_mid_ladder_cold_row_gets_its_last_nudge_not_a_kill():
+    """MIGRATION. A cold row already scheduled at the old ladder's day-21 nudge must not read as
+    exhausted against the shorter cold ladder and be killed on the first pass after deploy."""
+    anchor = date(2026, 9, 1)
+    legacy = anchor + timedelta(days=pu.CARMEN_LADDER_DAYS_ENGAGED[-1])
+    cold_terminal = anchor + timedelta(days=pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_COLD))
+
+    action, nxt = pu.plan_carmen_followup(anchor.isoformat(), legacy.isoformat(), legacy)
+    assert (action, nxt) == ("nudge_2", cold_terminal)
+
+    # And it still terminates rather than looping.
+    assert pu.plan_carmen_followup(anchor.isoformat(), cold_terminal.isoformat(), cold_terminal) == ("exhausted", None)
+
+    # The OLD TERMINAL gap is a finished ghost, not a row owed a nudge: it must stay exhausted,
+    # or dead rows resurrect on every pass and never reach Killed.
+    old_terminal = anchor + timedelta(days=pu.CARMEN_TERMINAL_GAP_DAYS)
+    assert pu.plan_carmen_followup(anchor.isoformat(), old_terminal.isoformat(), old_terminal) == ("exhausted", None)
+
+
+def test_carmen_status_marker_counts_total_contacts_not_rungs():
+    """Day 0 is the original email, so the cold ladder's two nudges read '1 of 3' and '2 of 3'."""
+    cold, engaged = pu.CARMEN_LADDER_DAYS_COLD, pu.CARMEN_LADDER_DAYS_ENGAGED
+    assert pu.carmen_status_marker("nudge_1", False, cold) == "COLD · 1 of 3"
+    assert pu.carmen_status_marker("nudge_2", False, cold) == "COLD · 2 of 3"
+    assert pu.carmen_status_marker("nudge_3", True, engaged) == "WARM · 3 of 4"
+    assert pu.carmen_status_marker("schedule", False, cold) == "NEW · unsent"
+    assert pu.carmen_status_marker("exhausted", False, cold) == "COLD · spent"
+    assert pu.carmen_status_marker("exhausted", True, engaged) == "WARM · spent"
+    assert pu.carmen_status_marker("none", False, cold) is None
+
+
+def test_carmen_marker_cell_preserves_hand_typed_context():
+    """Column E is Kevin's 'Context / Priority'. The marker is prepended, never destructive, and
+    a previous marker is replaced rather than stacked."""
+    assert pu.carmen_marker_cell("", "COLD · 1 of 3") == "COLD · 1 of 3"
+    assert pu.carmen_marker_cell("referred by Dana", "COLD · 1 of 3") == "COLD · 1 of 3 | referred by Dana"
+    assert pu.carmen_marker_cell("COLD · 1 of 3", "COLD · 2 of 3") == "COLD · 2 of 3"
+    assert pu.carmen_marker_cell("COLD · 1 of 3 | referred by Dana", "COLD · 2 of 3") == "COLD · 2 of 3 | referred by Dana"
+    # A bare priority integer is context, not a marker, and survives.
+    assert pu.carmen_marker_cell("8", "COLD · 1 of 3") == "COLD · 1 of 3 | 8"
+    # Nothing to write leaves the cell alone.
+    assert pu.carmen_marker_cell("referred by Dana", None) == "referred by Dana"
 
 
 def test_carmen_ladder_starts_a_manually_moved_row_from_today():
@@ -984,10 +1069,15 @@ def test_old_dates_that_look_ladder_shaped_still_revive():
 
 
 def test_stale_anchor_waits_for_a_hand_set_future_date():
+    """"hold", not "none": both are no-ops, but a hand-dated row the ladder is not driving is
+    worth marking on the sheet, where it would otherwise look like a row the sequencer forgot.
+    The ordinary quiet between rungs stays "none" (see test_recent_anchor_is_not_revived) so it
+    does not re-stamp Column E every morning and bury the real rung."""
     today = date(2026, 9, 12)
     old = (today - timedelta(days=210)).isoformat()
     plan = pu.plan_carmen_ladder(old, (today + timedelta(days=60)).isoformat(), today)
-    assert (plan.action, plan.revived) == ("none", False)
+    assert (plan.action, plan.revived) == ("hold", False)
+    assert pu.carmen_status_marker(plan.action, plan.replied, plan.ladder) == "HOLD · dated"
 
 
 def test_recent_anchor_is_not_revived():

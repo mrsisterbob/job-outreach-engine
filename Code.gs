@@ -58,6 +58,8 @@ const UUID_COL = 10;    // Column J - the only field ever used to identify/move/
 const NOTES_COL = 9;
 const FOLLOWUP_COL = 7;
 const STATUS_COL = 6;   // Column F - Status (shared JOBS/PEOPLE schema position)
+const CONTEXT_COL = 5;  // Column E - "Context / Priority" (PEOPLE) / Fit Score (JOBS). Carries the
+                        // Carmen ladder marker; see set_context for why it is not Status.
 const PEOPLE_EMAIL_COL = 4; // Column D - Contact Email (PEOPLE only; JOBS col D is Role)
 
 // Canonical Status vocabulary, ordered least- to most-advanced. Mirrors
@@ -325,6 +327,29 @@ function doPost(e) {
       }
       found.sheet.getRange(found.rowNum, 4).setValue(newEmail); // Column D - Contact Email (JOBS + PEOPLE)
       return respondJSON({ status: "success", message: "Email updated" });
+    }
+
+    // 4b. Set Column E verbatim (the Carmen ladder marker -> build_crm_payload("set_context", ...))
+    //
+    // Column E and NOT Status (Column F): statusRank() matches STATUS_VOCAB as whole strings, so a
+    // decorated Status reads as rank -1, which makes the Python sequencer's followup_action()
+    // return "none" and silently stops driving the row. Column E is free text no ranking path
+    // reads, so a marker here sorts the board without touching the state machine.
+    //
+    // The value is written verbatim: the caller (pipeline_utils.carmen_marker_cell) has already
+    // merged the marker with whatever text was in the cell, so any hand-typed context survives.
+    // An empty string is a legal value here (it clears the cell), so only sheet_uuid is required.
+    if (action === "set_context") {
+      const sheetUuid = payload.sheet_uuid;
+      if (!sheetUuid || payload.context === undefined || payload.context === null) {
+        return respondJSON({ status: "error", message: "set_context requires sheet_uuid and context" });
+      }
+      const found = findRecordBySheetUuid(ss, sheetUuid);
+      if (!found) {
+        return respondJSON({ status: "error", message: `No record found for sheet_uuid ${sheetUuid}` });
+      }
+      found.sheet.getRange(found.rowNum, CONTEXT_COL).setValue(payload.context);
+      return respondJSON({ status: "success", message: "Context updated" });
     }
 
     // 5. Append Timestamped Note (/n -> build_crm_payload("append_note", ...))

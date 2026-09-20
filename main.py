@@ -37,6 +37,8 @@ from pipeline_utils import (
     is_role_mailbox, company_domain_of, name_from_email_local_part, parse_email_recipient,
     match_email_to_crm_company,
     plan_carmen_ladder, carmen_reply_anchor, CARMEN_LADDER_DAYS,
+    CARMEN_LADDER_DAYS_COLD, CARMEN_LADDER_DAYS_ENGAGED,
+    carmen_status_marker, carmen_marker_cell,
     INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
     parse_job_command, parse_job_page_html, build_ingest_job_dict,
@@ -6855,9 +6857,37 @@ def run_followup_sequencer(today=None, dry_run=False):
             note_text = rec.get("note") or ""
             plan = plan_carmen_ladder(rec.get("date_added"), rec.get("next_followup"), today, note=note_text)
             ladder_action, ladder_next = plan.action, plan.next_date
-            if ladder_action == "none":
-                continue
             sheet_uuid = rec.get("sheet_uuid")
+
+            def _write_marker(action_name):
+                """Stamp the Carmen ladder marker into Column E. Column E, not Status: a decorated
+                Status reads as status_rank() == -1, which makes followup_action() return "none"
+                and silently stops sequencing the row.
+
+                Skipped on dry_run (the /queue path performs zero writes) and when the cell is
+                already correct, so a re-run does not churn the sheet."""
+                if dry_run or not sheet_uuid:
+                    return
+                marker = carmen_status_marker(action_name, plan.replied, plan.ladder)
+                if not marker:
+                    return
+                current = rec.get("raw_priority") or ""
+                merged = carmen_marker_cell(current, marker)
+                if merged == str(current).strip():
+                    return
+                enqueue_crm_payload(build_crm_payload(
+                    "set_context", sheet_uuid=sheet_uuid, context=merged,
+                ))
+
+            if ladder_action in ("none", "hold"):
+                # "hold" is a hand-set future date the sequencer is deliberately respecting rather
+                # than laddering. Mark it so the sheet distinguishes "waiting on purpose" from "the
+                # sequencer forgot this row". Plain "none" is the ordinary quiet between rungs and
+                # must NOT be marked: it fires on every day a row is simply waiting, and would
+                # overwrite the real rung marker the next morning.
+                if ladder_action == "hold":
+                    _write_marker(ladder_action)
+                continue
             person = {
                 "company": rec.get("company") or "N/A",
                 "role": rec.get("title") or "",
@@ -6872,7 +6902,9 @@ def run_followup_sequencer(today=None, dry_run=False):
                 replied_on = carmen_reply_anchor(note_text)
                 if replied_on is not None:
                     # Nothing written, so the row reappears every morning until Kevin runs
-                    # /promote or /demote - that daily reminder is intended.
+                    # /promote or /demote - that daily reminder is intended. The marker is the one
+                    # exception: it makes the waiting row findable by sorting Column E.
+                    _write_marker(ladder_action)
                     result["ready_to_promote"].append({**person, "replied_on": replied_on.strftime("%Y-%m-%d")})
                     continue
                 result["killed"].append(person)
@@ -6884,7 +6916,8 @@ def run_followup_sequencer(today=None, dry_run=False):
                     kills_suppressed += 1
                     continue
                 enqueue_crm_payload(build_crm_payload(
-                    "append_note", sheet_uuid=sheet_uuid, note="[reason: no reply after 3 nudges]",
+                    "append_note", sheet_uuid=sheet_uuid,
+                    note=f"[reason: no reply after {len(plan.ladder)} nudges]",
                 ))
                 enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=CARMEN_GHOST_TAB))
                 _record_sequencer_action(sheet_uuid, run_date, "kill_ghosted")
@@ -6902,14 +6935,16 @@ def run_followup_sequencer(today=None, dry_run=False):
                     # Date Added is real history and is never rewritten, so the restart is recorded
                     # as a dated note - plan_carmen_ladder() reads it back as the new anchor.
                     # Without it the next pass would revive again and the row would never climb.
+                    cadence = "/".join(str(d) for d in plan.ladder)
                     enqueue_crm_payload(build_crm_payload(
                         "append_note", sheet_uuid=sheet_uuid,
-                        note=f"[{run_date}] {LADDER_RESTART_NOTE_MARKER} - stale anchor, 4/11/21 restarted "
+                        note=f"[{run_date}] {LADDER_RESTART_NOTE_MARKER} - stale anchor, {cadence} restarted "
                              f"from today. First nudge {first_nudge}.",
                     ))
                 enqueue_crm_payload(build_crm_payload(
                     "update_snooze", sheet_uuid=sheet_uuid, next_followup=first_nudge,
                 ))
+                _write_marker(ladder_action)
                 if plan.revived:
                     _record_sequencer_action(sheet_uuid, run_date, "revive")
                 continue
@@ -6923,8 +6958,12 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "attempt": attempt,
                 "draft_text": build_followup_bump_draft(rec, attempt),
                 "sheet_tab": rec.get("sheet_tab"),
-                "ladder_day": CARMEN_LADDER_DAYS[attempt - 1],
-                "final_rung": attempt == len(CARMEN_LADDER_DAYS),
+                # Read from the row's OWN ladder, not the module constant: a cold row walks
+                # (4, 11), so indexing the engaged tuple would report the wrong day and never
+                # flag its real final rung.
+                "ladder_day": plan.ladder[attempt - 1] if attempt <= len(plan.ladder) else plan.ladder[-1],
+                "final_rung": attempt == len(plan.ladder),
+                "track": "engaged" if plan.replied else "cold",
                 "name": rec.get("name") or "",
                 # Recipient fields for the on-demand draft route (raw company, not the "N/A" label).
                 "email": rec.get("email") or "",
@@ -6940,6 +6979,7 @@ def run_followup_sequencer(today=None, dry_run=False):
                     "update_snooze", sheet_uuid=sheet_uuid,
                     next_followup=ladder_next.strftime("%Y-%m-%d"),
                 ))
+            _write_marker(ladder_action)
             _record_sequencer_action(sheet_uuid, run_date, ladder_action)
             continue
 

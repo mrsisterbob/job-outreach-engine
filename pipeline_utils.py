@@ -950,14 +950,55 @@ def resolve_sent_email_backfill(to_header, job_rows):
 # the next nightly pass with no trigger, no stamp, and nothing to configure.
 # ==============================================================================
 
-CARMEN_LADDER_DAYS = (4, 11, 21)
+# Two ladders, picked per row by whether the contact has EVER replied (carmen_reply_anchor).
+#
+# COLD - a stranger who has never written back. Day 0 is the original email, so (4, 11) is three
+# total contacts, ending at day 18 with the grace week. The fourth contact the old single ladder
+# sent (day 21, to someone who had ignored three emails) is the one rung with no case for it: a
+# cold contact silent for eleven days has decided, and the third unanswered touch is where spam
+# complaints concentrate - which this sender cannot afford on a SPF SOFTFAIL domain.
+#
+# ENGAGED - has replied at least once, so this is a live conversation, not a push against silence.
+# Keeps the original 4/11/21. An ask that needs a call before much moves needs the long runway.
+#
+# A cold row is PROMOTED automatically the moment a reply lands: carmen_reply_anchor() starts
+# returning a date, the row switches to the engaged ladder, and the anchor resets to the reply
+# date. Nothing to set by hand.
+CARMEN_LADDER_DAYS_COLD = (4, 11)
+CARMEN_LADDER_DAYS_ENGAGED = (4, 11, 21)
 
-# After the last nudge the ladder writes one more date, anchor + CARMEN_LADDER_DAYS[-1] + this,
-# so a silent contact gets a week to answer before triage. That written date is what makes
-# "exhausted" reachable at all: without it the final rung left the row's gap at exactly the last
-# offset, which reads as the final rung again, and nudge #3 re-fired every morning forever.
+# Back-compat alias. Callers that predate the split (and the migration guard below) still read
+# the engaged ladder, which is the old single ladder unchanged.
+CARMEN_LADDER_DAYS = CARMEN_LADDER_DAYS_ENGAGED
+
+# After the last nudge the ladder writes one more date, anchor + ladder[-1] + this, so a silent
+# contact gets a week to answer before triage. That written date is what makes "exhausted"
+# reachable at all: without it the final rung left the row's gap at exactly the last offset, which
+# reads as the final rung again, and the last nudge re-fired every morning forever.
 CARMEN_KILL_GRACE_DAYS = 7
-CARMEN_TERMINAL_GAP_DAYS = CARMEN_LADDER_DAYS[-1] + CARMEN_KILL_GRACE_DAYS
+
+
+def carmen_ladder_for(replied):
+    """The ladder tuple a row walks: engaged when the contact has ever replied, else cold.
+
+    `replied` is truthy for a reply date (carmen_reply_anchor), falsy for None.
+    """
+    return CARMEN_LADDER_DAYS_ENGAGED if replied else CARMEN_LADDER_DAYS_COLD
+
+
+def carmen_terminal_gap(ladder):
+    """The gap the final rung writes for `ladder`: last offset + the grace week.
+
+    Per-ladder, not a module constant: a cold row given the engaged ladder's terminal gap would
+    sit 7 days past its own last rung before triage, and the rung math would read it as engaged.
+    """
+    return ladder[-1] + CARMEN_KILL_GRACE_DAYS
+
+
+# The engaged ladder's terminal gap, kept as a module constant because plan_carmen_ladder() uses
+# it as the widest gap any ladder can legitimately write - the bound on "this row is mid-ladder"
+# when deciding whether a stale anchor is a revival. Must stay the MAX across both ladders.
+CARMEN_TERMINAL_GAP_DAYS = carmen_terminal_gap(CARMEN_LADDER_DAYS_ENGAGED)
 
 # A Carmen Cold row traverses the whole ladder (grace included) in under 30 days, so an anchor
 # older than this cannot be mid-ladder. It is a revived bench contact (Carmen Warm rows carry Last
@@ -977,9 +1018,9 @@ LADDER_RESTART_NOTE_MARKER = "Ladder restarted"        # the sequencer, when it 
 MAX_AUTO_KILLS_PER_RUN = 10
 
 
-def carmen_ladder_rung(anchor, next_followup):
+def carmen_ladder_rung(anchor, next_followup, ladder=CARMEN_LADDER_DAYS_ENGAGED):
     """Which rung a Carmen Cold row currently sits on, from the gap between its anchor and
-    its scheduled date. 0 = not yet scheduled, 1/2/3 = the 4/11/21-day nudges, 4 = ladder done.
+    its scheduled date. 0 = not yet scheduled, 1..len(ladder) = the nudges, len+1 = ladder done.
 
     Tolerates drift: the sequencer can only advance a row on a day it actually runs, so a
     date a day or two past its nominal rung still reads as that rung rather than falling off.
@@ -989,37 +1030,53 @@ def carmen_ladder_rung(anchor, next_followup):
     gap = (next_followup - anchor).days
     if gap <= 0:
         return 0
-    for rung, offset in enumerate(CARMEN_LADDER_DAYS, start=1):
+    for rung, offset in enumerate(ladder, start=1):
         if gap <= offset:
             return rung
-    return len(CARMEN_LADDER_DAYS) + 1
+    return len(ladder) + 1
 
 
-def carmen_ladder_action(anchor, next_followup, today):
+def carmen_ladder_action(anchor, next_followup, today, ladder=CARMEN_LADDER_DAYS_ENGAGED):
     """Pure: what a Carmen Cold row needs today. Side-effect free.
 
     Returns (action, next_date):
       ("schedule", d)  - undated row (incl. one just dragged in by hand): start the ladder at +4
       ("nudge_N", d)   - rung N is due: alert Kevin, advance to the next rung. The final rung
-                         advances to anchor + CARMEN_TERMINAL_GAP_DAYS, the triage date.
-      ("exhausted", None) - all three nudges sent and the grace week is up: triage the row
+                         advances to anchor + carmen_terminal_gap(ladder), the triage date.
+      ("exhausted", None) - every nudge sent and the grace week is up: triage the row
       ("none", None)   - scheduled for a future date, nothing to do
+
+    MIGRATION: a cold row that was mid-ladder when the cold/engaged split shipped carries a gap
+    the old single ladder wrote. Read against the shorter cold ladder those gaps are rung >
+    len(), i.e. "exhausted", so the first pass after deploy would move a contact who is still
+    owed a nudge straight to Killed. A gap matching one of the old ladder's PENDING-NUDGE offsets
+    is therefore treated as the cold ladder's final rung - one last nudge, then the normal grace
+    week - rather than as spent.
+
+    The old TERMINAL gap is deliberately excluded from that rescue: it means the old ladder
+    already sent everything and the row is a finished ghost, which must still read "exhausted".
+    Rescuing it would resurrect dead rows on every pass and they would never reach Killed.
     """
     if anchor is None:
         return "none", None
     if next_followup is None:
-        return "schedule", today + timedelta(days=CARMEN_LADDER_DAYS[0])
+        return "schedule", today + timedelta(days=ladder[0])
     if next_followup > today:
         return "none", None
 
-    rung = carmen_ladder_rung(anchor, next_followup)
+    rung = carmen_ladder_rung(anchor, next_followup, ladder)
     if rung == 0:
-        return "schedule", today + timedelta(days=CARMEN_LADDER_DAYS[0])
-    if rung > len(CARMEN_LADDER_DAYS):
+        return "schedule", today + timedelta(days=ladder[0])
+    if rung > len(ladder):
+        gap = (next_followup - anchor).days
+        legacy_pending = [d for d in CARMEN_LADDER_DAYS_ENGAGED if d > ladder[-1]]
+        if gap in legacy_pending:
+            final = len(ladder)
+            return f"nudge_{final}", anchor + timedelta(days=carmen_terminal_gap(ladder))
         return "exhausted", None
-    if rung == len(CARMEN_LADDER_DAYS):
-        return f"nudge_{rung}", anchor + timedelta(days=CARMEN_TERMINAL_GAP_DAYS)
-    return f"nudge_{rung}", anchor + timedelta(days=CARMEN_LADDER_DAYS[rung])
+    if rung == len(ladder):
+        return f"nudge_{rung}", anchor + timedelta(days=carmen_terminal_gap(ladder))
+    return f"nudge_{rung}", anchor + timedelta(days=ladder[rung])
 
 
 def _latest_marker_date(note, marker):
@@ -1050,11 +1107,18 @@ def carmen_restart_anchor(note):
 class CarmenPlan(tuple):
     """(action, next_date, revived, anchor). Unpacks as a 4-tuple; use .action / .next_date /
     .revived / .anchor for readability. `revived` means the ladder was restarted from today on
-    this pass, and the caller must record LADDER_RESTART_NOTE_MARKER so it sticks."""
-    __slots__ = ()
+    this pass, and the caller must record LADDER_RESTART_NOTE_MARKER so it sticks.
 
-    def __new__(cls, action, next_date, revived, anchor):
-        return super().__new__(cls, (action, next_date, revived, anchor))
+    .replied / .ladder carry which track the row is on. They are set on the instance rather than
+    added as tuple slots, so existing 4-tuple unpacking keeps working unchanged. (A tuple subclass
+    cannot declare a non-empty __slots__, so these live in the instance dict.)"""
+
+    def __new__(cls, action, next_date, revived, anchor, replied=False,
+                ladder=CARMEN_LADDER_DAYS_COLD):
+        plan = super().__new__(cls, (action, next_date, revived, anchor))
+        plan.replied = replied
+        plan.ladder = ladder
+        return plan
 
     action = property(lambda self: self[0])
     next_date = property(lambda self: self[1])
@@ -1077,7 +1141,9 @@ def plan_carmen_ladder(date_added, next_followup, today, note=""):
     anchor, so a late run still triages a finished ghost instead of reviving it. A hand-set future
     date is respected: the row waits for it rather than being restarted early.
     """
-    candidates = [d for d in (_parse_sequencer_date(date_added), carmen_reply_anchor(note),
+    replied_on = carmen_reply_anchor(note)
+    ladder = carmen_ladder_for(replied_on)
+    candidates = [d for d in (_parse_sequencer_date(date_added), replied_on,
                               carmen_restart_anchor(note)) if d is not None]
     anchor = max(candidates) if candidates else None
     scheduled = None if is_followup_unscheduled(next_followup) else _parse_sequencer_date(next_followup)
@@ -1094,13 +1160,84 @@ def plan_carmen_ladder(date_added, next_followup, today, note=""):
                          and (today - scheduled).days <= CARMEN_STALE_ANCHOR_DAYS)
         if (today - anchor).days > CARMEN_STALE_ANCHOR_DAYS and not ladder_shaped:
             if scheduled is not None and scheduled > today:
-                return CarmenPlan("none", None, False, anchor)
+                # A hand-set future date on a row the ladder is not driving. Distinct from the
+                # ordinary "waiting between rungs" quiet below, which also returns "none": this
+                # one is worth surfacing on the sheet, because it is otherwise indistinguishable
+                # from a row the sequencer forgot.
+                return CarmenPlan("hold", None, False, anchor, bool(replied_on), ladder)
             revived = True
     if revived:
         anchor, scheduled = today, None
 
-    action, next_date = carmen_ladder_action(anchor, scheduled, today)
-    return CarmenPlan(action, next_date, revived, anchor)
+    action, next_date = carmen_ladder_action(anchor, scheduled, today, ladder)
+    return CarmenPlan(action, next_date, revived, anchor, bool(replied_on), ladder)
+
+
+# ------------------------------------------------------------------------------
+# CARMEN COLD STATUS MARKER (Column E, "Context / Priority")
+#
+# Column E and NOT Status (Column F): statusRank()/status_rank() match the canonical vocabulary
+# as whole strings, so any decorated Status reads as rank -1 - which makes followup_action()
+# return "none" and silently stops sequencing the row. Column E is free text that no ranking
+# path reads, so sorting on it groups the board without touching the state machine.
+#
+# Counts are TOTAL CONTACTS, not rungs: day 0 is the original email, so the cold ladder's two
+# nudges are "1 of 3" and "2 of 3". Reading the cell tells Kevin how many touches remain without
+# doing the arithmetic.
+CARMEN_MARKER_SEP = " | "
+
+# Any cell this pattern matches is a marker the sequencer wrote and may overwrite. Anything else
+# in Column E is Kevin's own text and is preserved after the separator.
+CARMEN_MARKER_RE = re.compile(
+    r"^\s*(?:COLD|WARM|NEW|HOLD)\s*·\s*(?:\d+\s+of\s+\d+|spent|unsent|dated)\s*"
+    r"(?:\|\s*)?", re.IGNORECASE)
+
+
+def carmen_status_marker(action, replied, ladder):
+    """The Column E marker for a row the sequencer just planned, or None when it has nothing to
+    say (a row it is not driving).
+
+      NEW · unsent    - in Carmen Cold, ladder not started yet
+      COLD · 2 of 3   - never replied, second of three total contacts sent
+      WARM · 3 of 4   - has replied, third of four sent
+      COLD · spent    - ladder exhausted, awaiting triage
+      HOLD · dated    - hand-set future date the sequencer is respecting, not laddering
+
+    HOLD is the one that surfaces something otherwise invisible: plan_carmen_ladder returns
+    "hold" for a hand-dated row it is not driving, which on the sheet would otherwise look
+    identical to a row the sequencer forgot about. Plain "none" - the ordinary quiet between
+    rungs - returns None here on purpose: it fires every day a row is merely waiting, and
+    marking it would overwrite the real rung marker the next morning.
+    """
+    track = "WARM" if replied else "COLD"
+    total = len(ladder) + 1  # + the original day-0 email
+
+    if action == "schedule":
+        return "NEW · unsent"
+    if action == "exhausted":
+        return f"{track} · spent"
+    if action == "hold":
+        return "HOLD · dated"
+    if str(action or "").startswith("nudge_"):
+        try:
+            rung = int(str(action).split("_", 1)[1])
+        except (IndexError, ValueError):
+            return None
+        return f"{track} · {rung} of {total}"
+    return None
+
+
+def carmen_marker_cell(existing, marker):
+    """Column E's new value: `marker`, with any text Kevin typed preserved after it.
+
+    A previous marker is replaced, never stacked. A blank cell gets the marker alone. Returns
+    `existing` unchanged when there is no marker to write, so a caller can always assign.
+    """
+    current = str(existing or "").strip()
+    if not marker:
+        return current
+    tail = CARMEN_MARKER_RE.sub("", current, count=1).strip() if current else ""
+    return f"{marker}{CARMEN_MARKER_SEP}{tail}" if tail else marker
 
 
 def plan_carmen_followup(date_added, next_followup, today, note=""):

@@ -869,9 +869,11 @@ def test_carmen_cold_undated_row_joins_the_ladder_instead_of_drafting(monkeypatc
 
     assert result["followups_ready"] == []
     expected = (_SEQ_TODAY + timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d")
-    assert [p["action"] for p in enqueued] == ["append_note", "update_snooze"]
+    assert [p["action"] for p in enqueued] == ["append_note", "update_snooze", "set_context"]
     assert enqueued[0]["note"].startswith(f"[{_SEQ_TODAY.isoformat()}] {m.LADDER_RESTART_NOTE_MARKER}")
     assert enqueued[1]["next_followup"] == expected
+    # The Column E marker is prepended to the existing "Medium", which is Kevin's own text.
+    assert enqueued[2]["context"] == "NEW · unsent | Medium"
     assert [(r["sheet_uuid"], r["first_nudge"]) for r in result["revived"]] == [("cc-manual", expected)]
 
 
@@ -894,7 +896,7 @@ def test_carmen_cold_row_is_never_auto_buried_to_died(monkeypatch):
     assert [r["sheet_uuid"] for r in result["killed"]] == []
     assert [r["sheet_uuid"] for r in result["revived"]] == ["cc-old"]
     assert not any(p.get("new_tab") for p in enqueued)  # no tab move of any kind
-    assert [p["action"] for p in enqueued] == ["append_note", "update_snooze"]
+    assert [p["action"] for p in enqueued] == ["append_note", "update_snooze", "set_context"]
 
 
 def test_overdue_scan_includes_carmen_cold(monkeypatch):
@@ -956,6 +958,11 @@ class _FakeCarmenSheet:
             row["next_followup"] = payload["next_followup"]
         elif payload["action"] == "append_note":
             row["note"] = f"{row.get('note') or ''}\n{payload['note']}".strip()
+        elif payload["action"] == "set_context":
+            # Column E round-trips as raw_priority, so a later pass reads back what the marker
+            # wrote. Without this the fake sheet would re-read the original cell forever and the
+            # "already correct, skip the write" guard would never be exercised.
+            row["raw_priority"] = payload["context"]
         elif payload["action"] == "update_status":
             for rows in self.tabs.values():
                 if row in rows:
@@ -976,24 +983,74 @@ def _run_days(sheet, start, days):
 
 
 def test_ghost_walks_the_whole_ladder_and_is_killed(monkeypatch):
-    """Regression for the unreachable path: nudge #3 used to write no date, so the row re-read as
-    rung 3 and nudged forever. It must now get exactly three nudges, a grace week, then Killed."""
+    """Regression for the unreachable path: the final nudge used to write no date, so the row
+    re-read as its last rung and nudged forever. It must get exactly the ladder's nudges, a grace
+    week, then Killed.
+
+    This contact never replies, so since the cold/engaged split it walks the COLD (4, 11) ladder:
+    two nudges, killed at day 18."""
     start = _SEQ_TODAY
+    cold = m.CARMEN_LADDER_DAYS_COLD
     sheet = _FakeCarmenSheet(monkeypatch, [_person("ghost", start.isoformat())])
     results = _run_days(sheet, start, 40)
 
     nudge_days = {n: e["attempt"] for n, r in results.items() for e in r["followups_ready"]}
-    assert nudge_days == {d: i + 1 for i, d in enumerate(m.CARMEN_LADDER_DAYS)}
+    assert nudge_days == {d: i + 1 for i, d in enumerate(cold)}
     kill_days = [n for n, r in results.items() if r["killed"]]
-    assert kill_days == [m.CARMEN_LADDER_DAYS[-1] + 7]
+    assert kill_days == [cold[-1] + 7]
     assert sheet.moves == [("ghost", "Killed")]
     assert sheet.row("ghost") is None
     kill_note = [p for p in sheet.payloads if p["action"] == "append_note" and "reason" in p["note"]]
-    assert [p["note"] for p in kill_note] == ["[reason: no reply after 3 nudges]"]
+    assert [p["note"] for p in kill_note] == [f"[reason: no reply after {len(cold)} nudges]"]
     # The final nudge's card line says when the kill check happens.
-    card = m.render_followup_needs_card(results[m.CARMEN_LADDER_DAYS[-1]])
-    terminal = (start + timedelta(days=m.CARMEN_LADDER_DAYS[-1] + 7)).isoformat()
+    card = m.render_followup_needs_card(results[cold[-1]])
+    terminal = (start + timedelta(days=cold[-1] + 7)).isoformat()
     assert f"→ killed {terminal} if silent" in card
+
+
+def test_a_contact_who_replied_walks_the_longer_engaged_ladder(monkeypatch):
+    """The other side of the split: a row carrying a reply note gets all three nudges and the
+    day-28 triage, because it is a live conversation rather than a push against silence."""
+    start = _SEQ_TODAY
+    engaged = m.CARMEN_LADDER_DAYS_ENGAGED
+    note = f"[{start.isoformat()}] {m.INBOUND_REPLY_NOTE_MARKER} - said to circle back next month"
+    sheet = _FakeCarmenSheet(monkeypatch, [_person("talker", start.isoformat(), note=note)])
+    results = _run_days(sheet, start, 40)
+
+    nudge_days = {n: e["attempt"] for n, r in results.items() for e in r["followups_ready"]}
+    assert nudge_days == {d: i + 1 for i, d in enumerate(engaged)}
+    # A contact who has talked to Kevin is never auto-killed: it waits for /promote or /demote.
+    assert sheet.moves == []
+    assert [r["sheet_uuid"] for r in results[engaged[-1] + 7]["ready_to_promote"]] == ["talker"]
+    # This is the row "spent" exists for: nothing is moved, so Column E is the only readout that
+    # it is done laddering and waiting on Kevin.
+    markers = [p["context"] for p in sheet.payloads if p["action"] == "set_context"]
+    assert markers[-1] == "WARM · spent | Medium"
+    assert "WARM · 3 of 4 | Medium" in markers
+
+
+def test_ladder_marker_tracks_the_row_through_column_e(monkeypatch):
+    """The sheet-side readout: Column E carries the track and how many contacts have been spent,
+    so sorting on it groups the board. Counts are TOTAL contacts (day 0 + the nudges)."""
+    start = _SEQ_TODAY
+    cold = m.CARMEN_LADDER_DAYS_COLD
+    sheet = _FakeCarmenSheet(monkeypatch, [_person("ghost", start.isoformat())])
+    results = _run_days(sheet, start, 40)
+
+    markers = [p["context"] for p in sheet.payloads if p["action"] == "set_context"]
+    # "Medium" is Kevin's own Column E text and survives every rewrite. No "spent" marker here:
+    # a silent contact is moved to Killed on the same pass, so the tab move is the readout and a
+    # Column E write would be redundant. "spent" is for a row that REPLIED and is waiting on
+    # /promote - see test_a_contact_who_replied_walks_the_longer_engaged_ladder.
+    assert markers == [
+        "NEW · unsent | Medium",
+        "COLD · 1 of 3 | Medium",
+        "COLD · 2 of 3 | Medium",
+    ]
+    # One write per state change, not one per day: the quiet between rungs must not re-stamp the
+    # cell, or the marker would never show the rung the row is actually on.
+    assert len(markers) == len(set(markers))
+    assert results is not None
 
 
 def test_promoted_bench_contact_with_ancient_dates_is_nudged_not_killed(monkeypatch):
