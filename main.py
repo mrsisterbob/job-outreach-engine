@@ -475,27 +475,37 @@ def update_template_entry(file_path, list_key, idx, new_text):
 # has to be known before the age gate that depends on it.
 EMAIL_POLL_HOURS = float(os.environ.get("EMAIL_POLL_HOURS", "1"))
 
-# Attach the resume PDF to the OUTBOUND Gmail draft. Off by default, for two reasons that both
-# point the same way:
+# Attach the resume PDF to the OUTBOUND Gmail draft.
+#
+# KEVIN SET THIS TO true IN RENDER ON 2026-09-20 AND THAT IS DELIBERATE. Attach on every draft;
+# he deletes the attachment by hand on the peer sends. His reasoning, which is sound: it is
+# easier to delete an attachment than to add one, and adding by hand is a tax he pays on every
+# recruiter email. On 2026-09-20 three recruiter drafts (Albers at thyssenkrupp, Edmonds and
+# Ahumada at Ford) shipped with the sentence "my resume is attached" while this flag was false
+# and nothing was attached. An email that breaks its own promise to the one person most likely
+# to act on it is a worse failure than the filter risk below, which is unmeasured.
+#
+# The arguments for the old off-by-default, kept because they still govern WHICH sends Kevin
+# strips the attachment from:
 #
 #   RECRUITER - Kevin has already applied by the time he emails one, so his resume is already in
-#   their ATS against that req. The attachment duplicates a file they can pull up, and buys
-#   nothing for it.
+#   their ATS against that req. The attachment duplicates a file they can pull up. It is still
+#   worth attaching: it removes a step, and the recruiter-track copy references it directly.
 #   PEER - the screener rules say a peer discovery email carries NO resume. A CV attached to
 #   "how does your desk actually work?" reads as an application in disguise, which is the thing
-#   most likely to stop a peer replying.
+#   most likely to stop a peer replying. THIS IS THE SEND TO STRIP.
 #
 # The cost side is small but real and lands hardest here: ~85% of malicious mail carries a
 # PDF/DOC/ZIP, filters weight that, and this sender is on a SPF SOFTFAIL domain with less trust
 # margin than most. Measured, the size argument does NOT apply - the resume is 45.8 KB raw /
 # 61.1 KB base64, well under the ~110 KB where deliverability starts to degrade - so size is not
-# the reason; provenance is.
+# the reason; provenance is. Note that figure is a measurement; the filter penalty is not, and
+# nothing here has been tested against reply data.
 #
 # The Telegram copy is UNAFFECTED and still posted on every /e: that is the file Kevin uploads to
 # the ATS portal right after drafting, which is its actual job.
 #
-# Set RESUME_ATTACH_TO_EMAIL=true to restore the attachment - the genuine cold case, a recruiter
-# at a firm where no application exists yet, is the one where the resume is new information.
+# Set RESUME_ATTACH_TO_EMAIL=false to go back to text-only drafts.
 RESUME_ATTACH_TO_EMAIL = os.environ.get("RESUME_ATTACH_TO_EMAIL", "false").strip().lower() in ("true", "1", "yes", "on")
 
 # Hard ceiling on how old an inbound message may be and still produce a Telegram alert. Nothing
