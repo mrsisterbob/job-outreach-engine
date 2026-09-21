@@ -6706,3 +6706,69 @@ def test_every_dispatched_command_is_counted(monkeypatch):
     m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/health"}})
     counts = {c: n for c, n, _ in m.get_command_usage(days=30)}
     assert counts.get("/health", 0) >= 1
+
+
+# ---- A rejected CRM read must not look like an empty sheet ----
+
+def _crm_read(monkeypatch, body, status_code=200):
+    class _R:
+        def __init__(self):
+            self.status_code = status_code
+        def json(self):
+            return body
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _R())
+    m._CRM_READ_REJECTION_ALERTED.clear()
+    alerts = []
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    return alerts
+
+
+def test_unauthorized_read_returns_empty_and_alerts(monkeypatch):
+    """THE BUG: Apps Script answers 200 with {"status":"error"} when CRM_SHARED_SECRET does not
+    match. Reading .get("followups", []) off that body gave [], indistinguishable from an empty
+    tab - so /links reported "Checked 0 links" against a sheet full of rows."""
+    alerts = _crm_read(monkeypatch, {"status": "error", "message": "Unauthorized"})
+
+    assert m.fetch_networking_cards("TC", qty=None) == []
+    assert any("rejected" in a.lower() for a in alerts), "a rejected read must alert"
+    assert any("CRM_SHARED_SECRET" in a for a in alerts), "and must name the actual fix"
+
+
+def test_rejected_read_alerts_only_once_per_process(monkeypatch):
+    """The sweep reads three tabs per pass; three identical alerts would be noise."""
+    alerts = _crm_read(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    for _ in range(5):
+        m.fetch_networking_cards("TC", qty=None)
+    assert len(alerts) == 1
+
+
+def test_a_genuinely_empty_tab_does_not_alert(monkeypatch):
+    """An empty tab is a normal state - only a REJECTION is newsworthy."""
+    alerts = _crm_read(monkeypatch, {"status": "success", "followups": []})
+    assert m.fetch_networking_cards("TC", qty=None) == []
+    assert alerts == []
+
+
+def test_a_successful_read_still_returns_rows(monkeypatch):
+    _crm_read(monkeypatch, {"status": "success", "followups": [{"company": "Acme"}]})
+    rows = m.fetch_networking_cards("TC", qty=None)
+    assert len(rows) == 1 and rows[0]["company"] == "Acme"
+
+
+def test_non_200_read_returns_empty_without_crashing(monkeypatch):
+    _crm_read(monkeypatch, {}, status_code=500)
+    assert m.fetch_networking_cards("TC", qty=None) == []
+
+
+def test_sweep_over_a_rejected_crm_checks_nothing(monkeypatch):
+    """The downstream symptom Kevin saw: 0 links checked, and nothing written."""
+    _crm_read(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    queued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: queued.append(p))
+    monkeypatch.setattr(m, "fetch_job_link_state",
+                        lambda url: pytest.fail("must not fetch when the CRM read failed"))
+
+    result = m.check_job_links(sleep_between=0)
+
+    assert result["checked"] == 0 and result["dead"] == [] and queued == []

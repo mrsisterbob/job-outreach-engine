@@ -7371,16 +7371,63 @@ def start_crm_outbox_worker():
     threading.Thread(target=crm_outbox_worker_loop, daemon=True).start()
 
 def fetch_networking_cards(target_code="CW", qty=2):
+    """Rows from one CRM tab, or [] when the read failed.
+
+    HTTP 200 IS NOT SUCCESS. An Apps Script web app answers 200 for everything it handles,
+    including its own {"status":"error"} bodies - an unset or mismatched CRM_SHARED_SECRET makes
+    doPost reject every request as "Unauthorized" behind a 200. Reading .get("followups", [])
+    off that body yields [], which is indistinguishable from a genuinely empty tab. On
+    2026-09-21 that made /links check report "Checked 0 links" against a sheet holding dozens of
+    rows, reading as a clean result when the CRM was entirely unreachable.
+
+    So a rejection is logged loudly and, once per process, alerted - silence here means callers
+    (the link sweep, the sequencer, the tracked-role gate) quietly act on an empty world.
+    """
     res = crm_post({"action": "get_followups", "tab": target_code})
     if not res:
+        logging.error(f"[CRM] get_followups({target_code}): no response from the webhook")
         return []
     try:
-        if res.status_code == 200:
-            leads = res.json().get("followups", [])
-            return leads if qty is None else leads[:qty]
+        if res.status_code != 200:
+            logging.error(f"[CRM] get_followups({target_code}): HTTP {res.status_code}")
+            return []
+        body = res.json()
+        if not isinstance(body, dict):
+            logging.error(f"[CRM] get_followups({target_code}): non-dict body")
+            return []
+        status = str(body.get("status", "")).lower()
+        if status and status != "success":
+            message = str(body.get("message", ""))
+            logging.error(f"[CRM] get_followups({target_code}) REJECTED: {message}")
+            _alert_crm_read_rejection(message)
+            return []
+        leads = body.get("followups", [])
+        return leads if qty is None else leads[:qty]
     except Exception as e:
         logging.error(f"Error fetching networking cards: {e}")
     return []
+
+
+# One alert per process for a rejected CRM read. Every caller of fetch_networking_cards would
+# otherwise fire its own, and the sweep alone calls it three times per pass.
+_CRM_READ_REJECTION_ALERTED = threading.Event()
+
+
+def _alert_crm_read_rejection(message):
+    if _CRM_READ_REJECTION_ALERTED.is_set():
+        return
+    _CRM_READ_REJECTION_ALERTED.set()
+    hint = ""
+    if "unauthorized" in str(message).lower():
+        hint = (
+            " Set the CRM_SHARED_SECRET Script Property in the Apps Script project to match "
+            "Render's CRM_SHARED_SECRET, then redeploy the web app "
+            "(Deploy > Manage deployments > New version)."
+        )
+    send_health_alert(
+        f"CRM READS are being rejected - every tab is coming back EMPTY, so the link sweep, the "
+        f"sequencer and the duplicate gate are all seeing a blank sheet. {message}{hint}"
+    )
 
 def get_overdue_followups():
     """Return every overdue Carmen Cold, Carmen Warm and Tetiana Cold record sorted by
@@ -10214,6 +10261,18 @@ def process_webhook_payload_async(data):
                 )
                 result = check_job_links(auto_retire=commit)
                 would = [d for d in result["dead"] if may_auto_retire(d.get("status"))]
+                if result["checked"] == 0:
+                    # Zero checked is almost never "no jobs" - it means the CRM read came back
+                    # empty, which a rejected webhook does silently. Say so instead of
+                    # reporting it as a clean sweep.
+                    send_telegram_message(
+                        chat_id,
+                        "⚠️ <b>Checked 0 links.</b> No rows came back from Tetiana Cold, Tetiana "
+                        "Warm or Clavicular.\n\nIf those tabs have rows, the CRM read is being "
+                        "rejected - most likely <code>CRM_SHARED_SECRET</code> not matching "
+                        "between Render and the Apps Script project. Run <code>/health</code>."
+                    )
+                    return
                 summary = (
                     f"🔗 Checked {result['checked']} links: <b>{len(result['dead'])}</b> dead, "
                     f"{result['unknown']} unknown.\n"
