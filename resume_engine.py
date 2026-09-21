@@ -47,7 +47,7 @@ RESUME_BULLETS_BANK_PATH = os.path.join(BASE_DIR, "resume_bullets_bank.json")
 # Minimal safe fallback if evidence_bank.json is ever missing/corrupt - keeps PDF compilation alive.
 _FALLBACK_EVIDENCE_BANK = {
     "identity": {
-        "name": "Kevin Miller", "email": "kjmiller406@gmail.com", "phone": "248-709-6326",
+        "name": "Kevin Miller", "email": "kevin.miller@montelattice.com", "phone": "248-709-6326",
         "location": "Detroit, MI", "website": "montelattice.com", "linkedin": "linkedin.com/in/kevinmiller"
     },
     "experience": [], "education": [], "technical_skills": [], "banned_words": []
