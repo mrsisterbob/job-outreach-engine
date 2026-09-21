@@ -1723,3 +1723,105 @@ def extract_jd_terms(job_description, max_terms=60):
             _add(f"{left} {right}")
 
     return found[:max_terms]
+
+
+# ==============================================================================
+# DEAD JOB LINK DETECTION (pure classification - the fetch lives in main.py)
+# ==============================================================================
+
+# Phrases an ATS or careers page puts on a retired posting. Matched against the page's
+# tag-stripped text, lowercased. Measured 2026-09-21 against live hosts in Kevin's sheet:
+# huntington-careers.com (Paradox) serves 404 + "Job No Longer Available"; Greenhouse serves
+# 404 + "no longer active"; Lever serves a bare 404 with no phrase.
+DEAD_JOB_PHRASES = (
+    "no longer available",
+    "no longer accepting applications",
+    "no longer accepting",
+    "no longer active",
+    "position has been filled",
+    "this position is closed",
+    "this job is closed",
+    "posting has expired",
+    "job posting has expired",
+    "this job has expired",
+    "job not found",
+    "requisition is closed",
+)
+
+# Hosts that answer a server-side GET with an auth wall or a JS shell, so a 200 from them says
+# nothing about whether the posting is live. These are reported "unknown", never "dead" - a
+# false dead would retire a row Kevin is actively working.
+OPAQUE_JOB_HOSTS = (
+    "linkedin.com",
+    "indeed.com",
+    "ziprecruiter.com",
+    "glassdoor.com",
+    "bebee.com",
+    "jooble.org",
+    "talent.com",
+    "myworkdayjobs.com",  # Workday renders client-side; a 200 is not evidence of life
+)
+
+
+def is_opaque_job_host(url):
+    """True when a plain GET on this host cannot distinguish a live posting from a dead one."""
+    lowered = str(url or "").lower()
+    return any(host in lowered for host in OPAQUE_JOB_HOSTS)
+
+
+def classify_job_link(url, status_code, final_url, page_text, fetch_error=None):
+    """Classify one job link as 'dead', 'alive' or 'unknown'.
+
+    Returns (verdict, reason). Deliberately conservative: only an unambiguous signal yields
+    'dead', because the caller retires rows on that verdict and a false positive buries a job
+    Kevin applied to.
+
+    - A network error is 'unknown', never 'dead'. A site being briefly unreachable is not a
+      retired posting, and treating it as one would kill rows during any outage.
+    - An opaque host (LinkedIn, Workday, aggregators) is always 'unknown' on a 200, because its
+      200 carries no information either way.
+    - 404/410 is 'dead' on any host: even an opaque one returns those honestly.
+    - A redirect away from the posting toward a careers root is 'dead' - the standard ATS
+      behavior for a pulled req.
+    """
+    if fetch_error:
+        return ("unknown", f"fetch failed: {str(fetch_error)[:120]}")
+
+    code = int(status_code or 0)
+    if code in (404, 410):
+        return ("dead", f"HTTP {code}")
+
+    text = re.sub(r"<[^>]+>", " ", str(page_text or ""))
+    text = re.sub(r"\s+", " ", text).lower()
+    for phrase in DEAD_JOB_PHRASES:
+        if phrase in text:
+            return ("dead", f'page says "{phrase}"')
+
+    if code >= 500:
+        return ("unknown", f"HTTP {code} (server error, not a retired posting)")
+    if code != 200:
+        return ("unknown", f"HTTP {code}")
+
+    if is_opaque_job_host(url):
+        return ("unknown", "host does not expose posting state to a server-side fetch")
+
+    # A posting that redirects to the careers root or a search page has been pulled.
+    src = str(url or "").rstrip("/").lower()
+    dest = str(final_url or "").rstrip("/").lower()
+    if dest and dest != src:
+        tail = dest.split("?")[0].rstrip("/")
+        if re.search(r"/(careers|jobs|search|job-search|opportunities)$", tail) or tail.count("/") <= 2:
+            return ("dead", f"redirected to {final_url[:80]}")
+
+    return ("alive", f"HTTP {code}")
+
+
+# Only a row at this Status may be retired automatically on a dead link. An APPLIED row is a live
+# thread with a human: the posting coming down means they stopped sourcing, not that Kevin was
+# rejected, and auto-burying it would lose the follow-up. Those are reported for him to decide.
+AUTO_RETIRE_STATUSES = ("matched",)
+
+
+def may_auto_retire(status):
+    """True when a dead link is sufficient grounds to move this row to Died without asking."""
+    return str(status or "").strip().lower() in AUTO_RETIRE_STATUSES

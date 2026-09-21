@@ -1639,3 +1639,59 @@ def test_extract_jd_terms_keeps_phrases_built_from_stopworded_halves():
     assert "process improvement" in terms
     assert "process automation" in terms
     assert "policy administration" in terms
+
+
+# ---- Dead job link detection ----
+
+def test_classify_404_is_dead():
+    """Huntington (Paradox) serves 404 on a pulled req - measured live 2026-09-21."""
+    assert pu.classify_job_link("https://huntington-careers.com/x", 404, None, "")[0] == "dead"
+    assert pu.classify_job_link("https://x.com/j", 410, None, "")[0] == "dead"
+
+
+def test_classify_reads_the_page_text_when_the_code_is_200():
+    """Some hosts serve the retirement notice behind a 200."""
+    verdict, reason = pu.classify_job_link(
+        "https://co.com/careers/job/5", 200, "https://co.com/careers/job/5",
+        "<h1>This job is no longer available.</h1>")
+    assert verdict == "dead" and "no longer available" in reason
+
+
+def test_classify_never_calls_a_fetch_failure_dead():
+    """A site being briefly unreachable is not a retired posting - calling it dead would bury
+    rows during any outage."""
+    assert pu.classify_job_link("https://x.com/j", None, None, "", fetch_error=TimeoutError())[0] == "unknown"
+    assert pu.classify_job_link("https://x.com/j", 503, None, "")[0] == "unknown"
+
+
+def test_classify_treats_opaque_hosts_as_unknown():
+    """LinkedIn answers a server-side GET with an auth wall, so its 200 carries no information."""
+    assert pu.classify_job_link("https://www.linkedin.com/jobs/view/1", 200, None, "<div/>")[0] == "unknown"
+    assert pu.classify_job_link("https://x.myworkdayjobs.com/j/1", 200, None, "<div/>")[0] == "unknown"
+
+
+def test_classify_still_trusts_a_404_from_an_opaque_host():
+    """Opaque means its 200 is meaningless, not that it lies about 404."""
+    assert pu.classify_job_link("https://www.linkedin.com/jobs/view/1", 404, None, "")[0] == "dead"
+
+
+def test_classify_redirect_to_careers_root_is_dead():
+    verdict, _ = pu.classify_job_link(
+        "https://co.com/careers/job/5", 200, "https://co.com/careers", "<html>ok</html>")
+    assert verdict == "dead"
+
+
+def test_classify_live_posting_is_alive():
+    verdict, _ = pu.classify_job_link(
+        "https://co.com/careers/job/5", 200, "https://co.com/careers/job/5",
+        "<p>Apply now. Responsibilities include reconciliation.</p>")
+    assert verdict == "alive"
+
+
+def test_only_matched_rows_may_auto_retire():
+    """An APPLIED row is a live thread - the posting coming down is not a rejection."""
+    assert pu.may_auto_retire("Matched") is True
+    assert pu.may_auto_retire("matched") is True
+    assert pu.may_auto_retire("Applied") is False
+    assert pu.may_auto_retire("Interviewing") is False
+    assert pu.may_auto_retire("") is False

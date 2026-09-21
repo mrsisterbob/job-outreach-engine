@@ -41,6 +41,7 @@ from pipeline_utils import (
     carmen_status_marker, carmen_marker_cell,
     INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
+    classify_job_link, may_auto_retire, is_opaque_job_host,
     parse_job_command, parse_job_page_html, build_ingest_job_dict, extract_jd_terms,
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
     strip_tracking_params, strip_html_to_text,
@@ -1123,6 +1124,35 @@ def init_db():
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jd_term_yield_docs ON jd_term_yield(hi_fit_docs DESC, docs DESC)")
+        # Result of the nightly job-link liveness check, one row per sheet_uuid. Kept in SQLite
+        # rather than a file because Render's disk is ephemeral - a container restart would lose a
+        # file, and this has to survive to be read by the morning digest and /dead.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS job_link_status (
+            sheet_uuid TEXT PRIMARY KEY,
+            company TEXT,
+            role TEXT,
+            job_link TEXT,
+            status TEXT,
+            verdict TEXT,
+            reason TEXT,
+            retired INTEGER DEFAULT 0,
+            notified INTEGER DEFAULT 0,
+            first_dead_at TIMESTAMP,
+            checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_job_link_status_verdict ON job_link_status(verdict, notified)")
+        # One row per command invocation. Stored as individual events rather than a running
+        # counter so any window (week, month, since-a-date) can be asked for after the fact -
+        # a counter would fix the window at write time and could never answer "last 7 days".
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS command_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            command TEXT NOT NULL,
+            used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_command_usage_cmd ON command_usage(command, used_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_command_usage_time ON command_usage(used_at)")
 
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -2551,6 +2581,81 @@ def _record_query_yield(per_query):
             conn.commit()
     except Exception as e:
         logging.error(f"Query yield persist error: {e}")
+
+
+def normalize_command_name(text):
+    """The bare command from a raw Telegram message, or "" when it is not a command.
+
+    Arguments are stripped so "/f 7" and "/f 14" aggregate as /f - the question is which
+    commands Kevin reaches for, not which values he passes. A trailing "!" is kept, because
+    /job! is a genuinely different action from /job and counting them together would hide how
+    often the AI screener gets overridden.
+    """
+    raw = str(text or "").strip()
+    if not raw.startswith("/"):
+        return ""
+    token = raw.split()[0].lower()
+    token = re.sub(r"@\w+$", "", token)          # /help@mybot -> /help
+    if not re.fullmatch(r"/[a-z0-9_]+!?", token):
+        return ""
+    return token
+
+
+def record_command_usage(text):
+    """Log one command invocation. Telemetry only - never raises, never blocks the command."""
+    cmd = normalize_command_name(text)
+    if not cmd:
+        return ""
+    try:
+        with get_db_conn() as conn:
+            conn.execute("INSERT INTO command_usage (command) VALUES (?)", (cmd,))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Command usage record error: {e}")
+    return cmd
+
+
+def get_command_usage(days=30, limit=60):
+    """(command, count, last_used) over the last `days`, most used first.
+
+    days=None counts all of history.
+    """
+    try:
+        with get_db_conn() as conn:
+            if days is None:
+                return conn.execute("""
+                    SELECT command, COUNT(*) AS n, MAX(used_at)
+                    FROM command_usage
+                    GROUP BY command ORDER BY n DESC, command ASC LIMIT ?
+                """, (limit,)).fetchall()
+            return conn.execute("""
+                SELECT command, COUNT(*) AS n, MAX(used_at)
+                FROM command_usage
+                WHERE used_at >= datetime('now', ?)
+                GROUP BY command ORDER BY n DESC, command ASC LIMIT ?
+            """, (f"-{int(days)} days", limit)).fetchall()
+    except Exception as e:
+        logging.error(f"Command usage read error: {e}")
+        return []
+
+
+def get_command_usage_totals(days=30):
+    """(total_invocations, distinct_commands, first_seen) for the window."""
+    try:
+        with get_db_conn() as conn:
+            if days is None:
+                row = conn.execute(
+                    "SELECT COUNT(*), COUNT(DISTINCT command), MIN(used_at) FROM command_usage"
+                ).fetchone()
+            else:
+                row = conn.execute("""
+                    SELECT COUNT(*), COUNT(DISTINCT command), MIN(used_at) FROM command_usage
+                    WHERE used_at >= datetime('now', ?)
+                """, (f"-{int(days)} days",)).fetchone()
+        return row or (0, 0, None)
+    except Exception as e:
+        logging.error(f"Command usage totals error: {e}")
+        return (0, 0, None)
 
 
 def get_query_yield_rows(limit=25):
@@ -6881,6 +6986,17 @@ def send_daily_standup(chat_id):
         f"⚠️ <b>Overdue Actions:</b> {overdue_count}\n\n"
         f"Run <code>/s</code> to review overdue contacts or <code>/t</code> to trigger the search pipeline."
     )
+    # Job links that died since the last digest. Reported once each (notified flag), so a posting
+    # that stays dead does not repeat every morning.
+    fresh_dead = get_dead_job_links(include_notified=False, limit=10)
+    if fresh_dead:
+        digest += f"\n\n🔗 <b>Job links gone dead ({len(fresh_dead)}):</b>"
+        for uuid_v, company, role, _link, status, _reason, retired, _first in fresh_dead:
+            tag = "⚰️ retired" if retired else f"⚠️ {html.escape(str(status or '?'))}"
+            digest += f"\n• {html.escape(str(company or '?'))} - {html.escape(str(role or '?'))} ({tag})"
+        digest += "\n<i>⚰️ auto-moved to Died. ⚠️ you applied, so it was left alone.</i> <code>/links</code>"
+        mark_dead_links_notified([r[0] for r in fresh_dead])
+
     health_warnings = check_system_health()
     if health_warnings:
         digest += "\n\n🚨 <b>Config Health Warnings:</b>\n" + "\n".join(f"• {html.escape(w)}" for w in health_warnings)
@@ -8040,6 +8156,161 @@ def load_followup_queue_snapshot(run_date):
         logging.error(f"[SEQUENCER] Snapshot load failed ({run_date}): {e}")
         return None
 
+# Pacing for the nightly link sweep. The sequencer and the digest share this window, so the
+# sweep is capped rather than allowed to run until it finishes - a slow host must never delay
+# the 08:30 digest.
+LINK_CHECK_MAX_ROWS = 40
+LINK_CHECK_TIMEOUT = 12
+LINK_CHECK_SLEEP = 0.8
+# A dead link may retire at most this many rows per pass, matching MAX_AUTO_KILLS_PER_RUN's
+# reasoning: overflow is reported, not written, and drains on the next run.
+MAX_AUTO_RETIRE_PER_RUN = 10
+
+
+def fetch_job_link_state(url):
+    """GET a job posting and return (status_code, final_url, text, error). Never raises."""
+    try:
+        res = requests.get(
+            url, headers=_JOB_SCRAPE_HEADERS, timeout=LINK_CHECK_TIMEOUT, allow_redirects=True
+        )
+        return (res.status_code, res.url, res.text[:400000], None)
+    except Exception as e:
+        return (None, None, "", e)
+
+
+def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=LINK_CHECK_SLEEP):
+    """Sweep live JOBS rows, classify each Job Link, record the verdict and retire the safe ones.
+
+    Only a 'dead' verdict on a row whose Status permits it (see may_auto_retire) is moved to Died.
+    An APPLIED row with a dead posting is recorded and surfaced instead: the posting coming down
+    means the employer stopped sourcing, not that Kevin was rejected, and burying it would lose a
+    live thread.
+
+    Returns a dict the digest and /dead render.
+    """
+    checked, dead, retired, unknown = 0, [], [], 0
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    for code, tab_name in (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "Clavicular")):
+        for rec in fetch_networking_cards(code, qty=None) or []:
+            if checked >= limit:
+                break
+            link = str(rec.get("job_link") or "").strip()
+            sheet_uuid = str(rec.get("sheet_uuid") or "").strip()
+            if not (link.startswith("http") and sheet_uuid):
+                continue
+
+            checked += 1
+            status_code, final_url, text, err = fetch_job_link_state(link)
+            verdict, reason = classify_job_link(link, status_code, final_url, text, fetch_error=err)
+            row_status = rec.get("status")
+            company = rec.get("company") or ""
+            role = rec.get("job_title") or rec.get("title") or ""
+
+            if verdict == "unknown":
+                unknown += 1
+
+            try:
+                with get_db_conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("""
+                        INSERT INTO job_link_status
+                            (sheet_uuid, company, role, job_link, status, verdict, reason,
+                             first_dead_at, checked_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'dead' THEN CURRENT_TIMESTAMP END,
+                                CURRENT_TIMESTAMP)
+                        ON CONFLICT(sheet_uuid) DO UPDATE SET
+                            company = excluded.company, role = excluded.role,
+                            job_link = excluded.job_link, status = excluded.status,
+                            verdict = excluded.verdict, reason = excluded.reason,
+                            checked_at = CURRENT_TIMESTAMP,
+                            -- keep the ORIGINAL first_dead_at so "dead since" stays true
+                            first_dead_at = CASE
+                                WHEN excluded.verdict = 'dead'
+                                THEN COALESCE(job_link_status.first_dead_at, CURRENT_TIMESTAMP)
+                                ELSE NULL END,
+                            -- a link that came back alive is newly notifiable if it dies again
+                            notified = CASE WHEN excluded.verdict = 'dead' THEN job_link_status.notified ELSE 0 END
+                    """, (sheet_uuid, company, role, link, row_status, verdict, reason, verdict))
+                    conn.commit()
+            except Exception as e:
+                logging.error(f"[LINKCHECK] record error ({sheet_uuid}): {e}")
+
+            if verdict == "dead":
+                item = {"sheet_uuid": sheet_uuid, "company": company, "role": role,
+                        "status": row_status, "tab": tab_name, "reason": reason, "link": link}
+                dead.append(item)
+                if auto_retire and may_auto_retire(row_status) and len(retired) < MAX_AUTO_RETIRE_PER_RUN:
+                    # Same two-step the sequencer's bury uses: note the reason on the row while it
+                    # is still in its source tab, then move it.
+                    enqueue_crm_payload(build_crm_payload(
+                        "append_note", sheet_uuid=sheet_uuid,
+                        note=f"[{today_str}] Auto-retired: job link dead ({reason})"
+                    ))
+                    enqueue_crm_payload(build_crm_payload(
+                        "update_status", sheet_uuid=sheet_uuid, new_tab="Died"
+                    ))
+                    try:
+                        with get_db_conn() as conn:
+                            conn.execute("UPDATE job_link_status SET retired = 1 WHERE sheet_uuid = ?", (sheet_uuid,))
+                            conn.commit()
+                    except Exception as e:
+                        logging.error(f"[LINKCHECK] retire flag error: {e}")
+                    item["retired"] = True
+                    retired.append(item)
+
+            if sleep_between:
+                time.sleep(sleep_between)
+
+    logging.info(
+        f"[LINKCHECK] checked={checked} dead={len(dead)} retired={len(retired)} unknown={unknown}"
+    )
+    return {"checked": checked, "dead": dead, "retired": retired, "unknown": unknown}
+
+
+def get_dead_job_links(include_notified=True, limit=40):
+    """Dead links recorded by the sweep, newest first."""
+    try:
+        with get_db_conn() as conn:
+            sql = """SELECT sheet_uuid, company, role, job_link, status, reason, retired,
+                            first_dead_at
+                     FROM job_link_status WHERE verdict = 'dead'"""
+            if not include_notified:
+                sql += " AND notified = 0"
+            sql += " ORDER BY first_dead_at DESC LIMIT ?"
+            return conn.execute(sql, (limit,)).fetchall()
+    except Exception as e:
+        logging.error(f"[LINKCHECK] read error: {e}")
+        return []
+
+
+def mark_dead_links_notified(uuids):
+    """Flag these as already surfaced so the digest reports each death once."""
+    if not uuids:
+        return 0
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany(
+                "UPDATE job_link_status SET notified = 1 WHERE sheet_uuid = ?",
+                [(u,) for u in uuids]
+            )
+            conn.commit()
+        return len(uuids)
+    except Exception as e:
+        logging.error(f"[LINKCHECK] notify flag error: {e}")
+        return 0
+
+
+def scheduled_job_link_check():
+    """APScheduler target: nightly link sweep, after the sequencer and before the digest."""
+    logging.info("[LINKCHECK] Nightly job-link sweep triggered")
+    try:
+        check_job_links()
+    except Exception as e:
+        logging.error(f"[LINKCHECK] sweep error: {e}", exc_info=True)
+
+
 def scheduled_followup_sequencer_job():
     """APScheduler target: nightly follow-up sequencer pass (07:30 local, before the digest).
     Applies the automatic bury, queues follow-up drafts, saves the result for GET /followups,
@@ -8079,6 +8350,23 @@ def start_followup_sequencer():
         coalesce=True,
     )
     logging.info("[SEQUENCER] Nightly follow-up sequencer scheduled: 07:30 local")
+
+
+def start_job_link_checker():
+    """Register the nightly job-link sweep at 07:45 local - after the sequencer's 07:30 pass so
+    the two never overlap on the CRM, and before the 08:30 digest so its results are ready to
+    report. Same America/Detroit pin as the rest of the schedule.
+    """
+    EMAIL_POLL_SCHEDULER.add_job(
+        scheduled_job_link_check,
+        trigger="cron",
+        hour=7,
+        minute=45,
+        id="job_link_check",
+        max_instances=1,
+        coalesce=True,
+    )
+    logging.info("[LINKCHECK] Nightly job-link sweep scheduled: 07:45 local")
 
 def edit_telegram_message(chat_id, message_id, text):
     """Edit an existing Telegram message in-place instead of sending a redundant new one."""
@@ -9569,6 +9857,9 @@ def process_webhook_payload_async(data):
         text = re.sub(r"@\w+bot", "", raw_text, flags=re.IGNORECASE).strip()
         today_str = datetime.now().strftime("%Y-%m-%d")
         logging.info(f"Telegram command received: '{text}' (chat_id={chat_id})")
+        # Every command passes through here, so this is the one place usage can be counted
+        # without touching 70 handlers. Pure telemetry - see record_command_usage().
+        record_command_usage(text)
 
         # 1b. Tuesday Batch Hub Commands (/sendall, /snoozeall)
         if text == "/sendall":
@@ -9873,6 +10164,97 @@ def process_webhook_payload_async(data):
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
             send_telegram_message(chat_id, "\n".join(lines))
             return
+        # NOT "/dead" - that is the swipe-reply that kills the replied-to row (see below).
+        if text == "/usage" or text.startswith("/usage "):
+            arg = text[len("/usage"):].strip().lower()
+            windows = {"week": 7, "7": 7, "month": 30, "30": 30, "90": 90,
+                       "quarter": 90, "all": None, "": 30}
+            if arg not in windows:
+                send_telegram_message(
+                    chat_id,
+                    "📊 <b>Command Usage</b>\n\nUsage: <code>/usage</code> (30d), "
+                    "<code>/usage week</code>, <code>/usage 90</code>, <code>/usage all</code>"
+                )
+                return
+            days = windows[arg]
+            rows = get_command_usage(days=days)
+            total, distinct, first_seen = get_command_usage_totals(days=days)
+            label = "all time" if days is None else f"last {days} days"
+            if not rows:
+                send_telegram_message(
+                    chat_id,
+                    f"📊 <b>Command Usage</b> ({label})\n\nNothing recorded yet. Counting starts "
+                    "from the deploy that added this, so history before then is not here."
+                )
+                return
+            peak = rows[0][1] or 1
+            lines = [f"📊 <b>Command Usage</b> ({label})\n",
+                     f"<b>{total}</b> commands · <b>{distinct}</b> distinct\n"]
+            for cmd, n, _last in rows:
+                # Bar is proportional to the most-used command, so the shape reads at a glance.
+                bar = "█" * max(1, round((n / peak) * 12))
+                lines.append(f"<code>{n:>4}</code> {bar} {html.escape(cmd)}")
+            if first_seen:
+                lines.append(f"\n<i>Counting since {html.escape(str(first_seen)[:10])}.</i>")
+            send_telegram_message(chat_id, "\n".join(lines))
+            return
+
+        if text == "/links" or text.startswith("/links "):
+            # Same commit semantics as /unbury: "check" is a DRY RUN that writes nothing, "go"
+            # is the one that actually moves rows. A sweep that retires rows the moment Kevin
+            # types it gives him no way to see what it would do first.
+            arg = text[len("/links"):].strip().lower()
+            if arg in ("check", "dry", "preview", "go"):
+                commit = (arg == "go")
+                send_telegram_message(
+                    chat_id,
+                    ("🔗 Checking job links and RETIRING dead Matched rows..."
+                     if commit else
+                     "🔗 <b>Dry run</b> - checking job links, writing nothing...")
+                )
+                result = check_job_links(auto_retire=commit)
+                would = [d for d in result["dead"] if may_auto_retire(d.get("status"))]
+                summary = (
+                    f"🔗 Checked {result['checked']} links: <b>{len(result['dead'])}</b> dead, "
+                    f"{result['unknown']} unknown.\n"
+                )
+                if commit:
+                    summary += f"⚰️ Retired {len(result['retired'])} row(s) to Died."
+                else:
+                    summary += (
+                        f"<b>Nothing was written.</b> A real run would retire "
+                        f"<b>{len(would)}</b> row(s):\n"
+                        + ("\n".join(
+                            f"  • {html.escape(str(d['company']))} - {html.escape(str(d['role']))}"
+                            for d in would[:10]) or "  (none)")
+                        + "\n\nRun <code>/links go</code> to apply."
+                    )
+                send_telegram_message(chat_id, summary)
+            rows = get_dead_job_links()
+            if not rows:
+                send_telegram_message(
+                    chat_id,
+                    "🔗 <b>Dead Job Links</b>\n\nNone recorded. The sweep runs nightly at 07:45; "
+                    "preview one now with <code>/links check</code> (writes nothing)."
+                )
+                return
+            lines = ["🔗 <b>Dead Job Links</b>\n"]
+            for uuid_v, company, role, link, status, reason, retired, first_dead in rows:
+                mark = "⚰️ retired" if retired else f"⚠️ still in {html.escape(str(status or '?'))}"
+                lines.append(
+                    f"<b>{html.escape(str(company or '?'))}</b> - {html.escape(str(role or '?'))}\n"
+                    f"  {mark} · <i>{html.escape(str(reason or ''))}</i>\n"
+                    f"  🆔 <code>{html.escape(str(uuid_v))}</code>"
+                )
+            lines.append(
+                "\n⚰️ = auto-moved to Died (was still 'Matched').\n"
+                "⚠️ = you applied, so nothing was moved. The posting is down, which means they "
+                "stopped sourcing - not that you were rejected. Reply <code>/dead</code> to that "
+                "job's card if you want it retired."
+            )
+            send_telegram_message(chat_id, "\n".join(lines))
+            return
+
         if text == "/resync":
             invalidate_tracked_role_cache()
             keys = get_tracked_job_keys()
@@ -11045,6 +11427,8 @@ def process_webhook_payload_async(data):
                 "/unbury - Preview buried-listing cleanup (add 'go' to clear)\n"
                 "/crazy - Stop a CRM retry/alert storm (add 'go' to clear the outbox)\n"
                 "/queries - Per-query yield: which search phrases earn their slot\n"
+                "/links - Dead job postings · <code>/links check</code> dry run · <code>/links go</code> retires\n"
+                "/usage - How often you use each command (week/month/90/all)\n"
                 "/resync - Re-read the job tabs after deleting rows by hand\n"
                 "/job! &lt;url&gt; - Force a card: skips the duplicate check AND the AI screener\n"
                 "/gaps - Vocabulary high-fit postings use that your resume doesn't\n"
@@ -11080,6 +11464,7 @@ if not os.environ.get("PYTEST_CURRENT_TEST") and not _is_oneshot_invocation():
     start_morning_digest()
     start_backup_scheduler()
     start_followup_sequencer()
+    start_job_link_checker()
 
 # ==============================================================================
 # 10. FLASK SERVER & STACKED WEBHOOK ROUTER

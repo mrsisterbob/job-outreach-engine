@@ -37,7 +37,8 @@ def clean_tables():
         # "already in the pipeline" branch instead of the path it meant to exercise.
         for table in ("crm_outbox", "sheet_row_map", "company_cooldown", "company_identities",
                       "jobs", "followup_sequencer_log", "followup_queue_snapshot", "gmail_drafts", "seen_jobs",
-                      "seen_content_hashes", "jd_term_yield"):
+                      "seen_content_hashes", "jd_term_yield", "job_link_status",
+                      "command_usage"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
     yield
@@ -6480,3 +6481,228 @@ def test_typed_address_always_persists(monkeypatch):
 
     assert saved["local"] == ["dana@weird-domain.io"]
     assert len(saved["crm"]) == 1
+
+
+# ---- Job-link sweep: what it retires and what it refuses to ----
+
+def _linkcheck_env(monkeypatch, rows, fetches):
+    """rows: list of CRM records per tab call. fetches: {url: (code, final, text, err)}"""
+    class _R:
+        status_code = 200
+        def __init__(self, rows): self.rows = rows
+        def json(self): return {"status": "success", "followups": self.rows}
+
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post",
+                        lambda payload, **kw: _R(rows if payload.get("tab") == "TC" else []))
+    monkeypatch.setattr(m, "fetch_job_link_state",
+                        lambda url: fetches.get(url, (200, url, "<p>Apply now</p>", None)))
+    queued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: queued.append(p))
+    monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+    return queued
+
+
+def _job_row(uuid_v, status, link, company="Acme", role="Ops Analyst"):
+    return {"sheet_uuid": uuid_v, "status": status, "job_link": link,
+            "company": company, "job_title": role}
+
+
+def test_sweep_retires_a_matched_row_with_a_dead_link(monkeypatch):
+    queued = _linkcheck_env(
+        monkeypatch,
+        [_job_row("u-matched", "Matched", "https://co.com/j/1")],
+        {"https://co.com/j/1": (404, "https://co.com/j/1", "", None)},
+    )
+    result = m.check_job_links(sleep_between=0)
+
+    assert len(result["dead"]) == 1
+    assert len(result["retired"]) == 1
+    actions = [p.get("action") for p in queued]
+    assert "append_note" in actions and "update_status" in actions
+    move = [p for p in queued if p.get("action") == "update_status"][0]
+    assert move["new_tab"] == "Died"
+
+
+def test_sweep_never_retires_an_applied_row(monkeypatch):
+    """THE SAFETY RULE: a dead posting after Kevin applied means they stopped sourcing, not that
+    he was rejected. Auto-burying it would lose a live thread."""
+    queued = _linkcheck_env(
+        monkeypatch,
+        [_job_row("u-applied", "Applied", "https://co.com/j/2")],
+        {"https://co.com/j/2": (404, "https://co.com/j/2", "", None)},
+    )
+    result = m.check_job_links(sleep_between=0)
+
+    assert len(result["dead"]) == 1, "it must still be REPORTED as dead"
+    assert result["retired"] == [], "but nothing may be written"
+    assert queued == [], "no CRM payload at all for an applied row"
+
+
+def test_sweep_leaves_a_live_link_alone(monkeypatch):
+    queued = _linkcheck_env(
+        monkeypatch,
+        [_job_row("u-live", "Matched", "https://co.com/j/3")],
+        {"https://co.com/j/3": (200, "https://co.com/j/3", "<p>Apply now</p>", None)},
+    )
+    result = m.check_job_links(sleep_between=0)
+    assert result["dead"] == [] and queued == []
+
+
+def test_sweep_treats_an_unreachable_host_as_unknown(monkeypatch):
+    """An outage must never retire rows."""
+    queued = _linkcheck_env(
+        monkeypatch,
+        [_job_row("u-err", "Matched", "https://co.com/j/4")],
+        {"https://co.com/j/4": (None, None, "", TimeoutError("boom"))},
+    )
+    result = m.check_job_links(sleep_between=0)
+    assert result["unknown"] == 1 and result["dead"] == [] and queued == []
+
+
+def test_sweep_caps_auto_retirement(monkeypatch):
+    """Same reasoning as MAX_AUTO_KILLS_PER_RUN: overflow is reported, not written."""
+    over = m.MAX_AUTO_RETIRE_PER_RUN + 3
+    rows = [_job_row(f"u{i}", "Matched", f"https://co.com/j/{i}") for i in range(over)]
+    fetches = {f"https://co.com/j/{i}": (404, f"https://co.com/j/{i}", "", None) for i in range(over)}
+    _linkcheck_env(monkeypatch, rows, fetches)
+
+    result = m.check_job_links(sleep_between=0)
+
+    assert len(result["dead"]) == over
+    assert len(result["retired"]) == m.MAX_AUTO_RETIRE_PER_RUN
+
+
+def test_dead_links_are_recorded_and_readable(monkeypatch):
+    _linkcheck_env(
+        monkeypatch,
+        [_job_row("u-rec", "Applied", "https://co.com/j/9", company="Huntington", role="FX Ops")],
+        {"https://co.com/j/9": (404, "https://co.com/j/9", "", None)},
+    )
+    m.check_job_links(sleep_between=0)
+
+    rows = m.get_dead_job_links()
+    assert len(rows) == 1
+    assert rows[0][1] == "Huntington" and rows[0][2] == "FX Ops"
+
+
+def test_each_death_is_reported_only_once(monkeypatch):
+    """The digest must not repeat the same dead posting every morning."""
+    _linkcheck_env(
+        monkeypatch,
+        [_job_row("u-once", "Applied", "https://co.com/j/10")],
+        {"https://co.com/j/10": (404, "https://co.com/j/10", "", None)},
+    )
+    m.check_job_links(sleep_between=0)
+
+    fresh = m.get_dead_job_links(include_notified=False)
+    assert len(fresh) == 1
+    m.mark_dead_links_notified([r[0] for r in fresh])
+    assert m.get_dead_job_links(include_notified=False) == []
+    assert len(m.get_dead_job_links(include_notified=True)) == 1
+
+
+def test_dry_run_writes_nothing_but_still_reports(monkeypatch):
+    """/links check must be a true preview - it reports what WOULD be retired and touches nothing."""
+    queued = _linkcheck_env(
+        monkeypatch,
+        [_job_row("u-dry", "Matched", "https://co.com/j/20")],
+        {"https://co.com/j/20": (404, "https://co.com/j/20", "", None)},
+    )
+    result = m.check_job_links(auto_retire=False, sleep_between=0)
+
+    assert len(result["dead"]) == 1, "a dry run still reports the dead link"
+    assert result["retired"] == [], "a dry run retires nothing"
+    assert queued == [], "a dry run queues no CRM write"
+
+
+def test_dry_run_then_commit_actually_retires(monkeypatch):
+    """The commit path still works after a dry run - the dry run must not mark anything done."""
+    rows = [_job_row("u-two", "Matched", "https://co.com/j/21")]
+    fetches = {"https://co.com/j/21": (404, "https://co.com/j/21", "", None)}
+    queued = _linkcheck_env(monkeypatch, rows, fetches)
+
+    m.check_job_links(auto_retire=False, sleep_between=0)
+    assert queued == []
+
+    result = m.check_job_links(auto_retire=True, sleep_between=0)
+    assert len(result["retired"]) == 1
+    assert [p.get("action") for p in queued] == ["append_note", "update_status"]
+
+
+# ---- Command usage tracking ----
+
+def test_normalize_strips_arguments():
+    """'/f 7' and '/f 14' are the same command - the question is which ones Kevin reaches for."""
+    assert m.normalize_command_name("/f 7") == "/f"
+    assert m.normalize_command_name("/f 14") == "/f"
+    assert m.normalize_command_name("/quick Dana @ Acme 5 note") == "/quick"
+
+
+def test_normalize_keeps_the_force_bang():
+    """/job! overrides the AI screener - counting it as /job would hide how often that happens."""
+    assert m.normalize_command_name("/job! https://x.com/1") == "/job!"
+    assert m.normalize_command_name("/job https://x.com/1") == "/job"
+
+
+def test_normalize_handles_bot_suffix_and_case():
+    assert m.normalize_command_name("/Help@MyBot") == "/help"
+
+
+def test_normalize_rejects_non_commands():
+    for junk in ("", None, "hello", "not /a command", "//", "/"):
+        assert m.normalize_command_name(junk) == ""
+
+
+def test_record_and_read_back_usage():
+    for cmd in ("/t", "/t", "/t", "/e dana@x.com", "/links check"):
+        m.record_command_usage(cmd)
+    rows = m.get_command_usage(days=30)
+    counts = {c: n for c, n, _ in rows}
+    assert counts["/t"] == 3
+    assert counts["/e"] == 1 and counts["/links"] == 1
+
+
+def test_usage_is_sorted_most_used_first():
+    for _ in range(5):
+        m.record_command_usage("/t")
+    m.record_command_usage("/health")
+    rows = m.get_command_usage(days=30)
+    assert rows[0][0] == "/t" and rows[0][1] == 5
+
+
+def test_usage_window_excludes_older_events():
+    """A 7-day window must not count a command used a month ago."""
+    m.record_command_usage("/old")
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE command_usage SET used_at = datetime('now','-40 days') WHERE command = '/old'")
+        conn.commit()
+    m.record_command_usage("/new")
+
+    week = {c for c, _n, _l in m.get_command_usage(days=7)}
+    assert "/new" in week and "/old" not in week
+
+    everything = {c for c, _n, _l in m.get_command_usage(days=None)}
+    assert "/old" in everything and "/new" in everything
+
+
+def test_usage_totals_match_the_window():
+    m.record_command_usage("/t")
+    m.record_command_usage("/t")
+    m.record_command_usage("/health")
+    total, distinct, _first = m.get_command_usage_totals(days=30)
+    assert total == 3 and distinct == 2
+
+
+def test_recording_never_raises_on_junk():
+    """Telemetry must never break a command."""
+    for junk in (None, "", "not a command", 12345):
+        assert m.record_command_usage(junk) == ""
+
+
+def test_every_dispatched_command_is_counted(monkeypatch):
+    """The recorder sits at the single choke point, so a real dispatch must land in the table."""
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: None)
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/health"}})
+    counts = {c: n for c, n, _ in m.get_command_usage(days=30)}
+    assert counts.get("/health", 0) >= 1
