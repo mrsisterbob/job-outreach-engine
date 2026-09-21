@@ -582,11 +582,42 @@ EMAIL_EXCLUDED_KEYWORDS = os.environ.get("EMAIL_EXCLUDED_KEYWORDS", "")
 # transactional senders (service@paypal.com, notifications@, receipts@) are the other half of the
 # same problem: they carry no List-Unsubscribe and are filed Updates rather than Promotions, so
 # neither the bulk gate nor the category exclusions ever see them.
+#
+# Added 2026-09-21 after five consumer notifications alerted as Unverified Replies overnight
+# (Venmo, CVS, Jooble, Hevy, Lensa). Each one slipped a different way, which is why the list grows
+# by prefix rather than by domain:
+#   venmo@venmo.com          - brand name as the mailbox; no robot word anywhere
+#   cvs@mynotifications...   - "notifications" is in the SUBDOMAIN, and matching is on the address
+#   subscribe@jooble.org     - subscription mail, not a reply
+#   mail@update.hevyapp.com  - generic "mail@" from a product update domain
+#   benjamin.gardner@lensa.com - a job board using a HUMAN NAME, which no prefix rule can catch
+# The last one is the real lesson: a fake-human sender is unblockable by mailbox name, so the
+# domain list below carries it instead.
 EMAIL_SENDER_BLACKLIST = os.environ.get(
     "EMAIL_SENDER_BLACKLIST",
     "no-reply@,noreply@,noreply-,no-reply-,donotreply@,do-not-reply@,"
     "service@paypal.com,notifications@,notification@,receipts@,receipt@,billing@,"
-    "mailer-daemon@,postmaster@,bounce@,bounces@")
+    "mailer-daemon@,postmaster@,bounce@,bounces@,"
+    "subscribe@,unsubscribe@,newsletter@,marketing@,updates@,update@,alerts@,alert@,"
+    "mail@,email@,hello@,news@,digest@,noreply.,venmo@")
+
+# Domains that only ever send Kevin consumer or job-board bulk mail. Matched like ATS_ROBOT_DOMAINS
+# (exact or subdomain) but with the opposite effect: nothing from here is ever a reply worth an
+# alert, whatever the mailbox is called. This is the only gate that stops a sender using a
+# plausible human name, such as Lensa's "benjamin.gardner@lensa.com".
+#
+# Job boards go here and NOT in the ATS list above: Workday or Greenhouse carries a real interview
+# invitation for a job Kevin applied to, while Lensa, Jooble and ZipRecruiter send alerts about
+# jobs he has not. Keep that distinction when adding to either list.
+# Keep this list SHORT and only for domains where no human would ever write to Kevin. A domain ban
+# is a blunt instrument: test_a_real_person_at_a_robot_domain_still_gets_through() exists because
+# banning paypal.com would block a recruiter who happens to work at PayPal, and the same is true of
+# indeed.com, ziprecruiter.com and every other large employer. Those belong in the prefix list
+# above, never here. Only notification subdomains and scraper job boards qualify.
+EMAIL_BULK_SENDER_DOMAINS = tuple(d.strip().lower() for d in os.environ.get(
+    "EMAIL_BULK_DOMAINS",
+    "mynotifications.cvs.com,update.hevyapp.com,lensa.com,jooble.org"
+).split(",") if d.strip())
 # Applicant tracking systems that send real interview invitations and scheduling links from
 # noreply@ mailboxes. Matched against the sender's DOMAIN (exact or subdomain) to exempt it from
 # the blacklist above - see passes_email_sender_blocks(). Everything else about the message is
@@ -4942,6 +4973,14 @@ def passes_email_sender_blocks(sender: str):
                          f"domain - allowed through the sender blacklist")
         else:
             return False, f"sender blacklisted ({sender_email})"
+
+    # 1b. Bulk sender domains. Runs AFTER the ATS carve-out on purpose: criteriacorp.com sends
+    # pre-hire assessments from DO-NOT-REPLY@ and must survive, while lensa.com sends job alerts
+    # from a human-looking name and must not. Subdomain-aware, because CVS sends from
+    # mynotifications.cvs.com and Hevy from update.hevyapp.com.
+    if sender_domain and any(sender_domain == d or sender_domain.endswith("." + d)
+                             for d in EMAIL_BULK_SENDER_DOMAINS):
+        return False, f"bulk sender domain ({sender_domain})"
 
     # 2. Blocked domains
     block_domains = [d.strip().lower() for d in EMAIL_BLOCK_DOMAINS.split(",") if d.strip()]
