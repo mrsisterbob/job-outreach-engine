@@ -4306,10 +4306,44 @@ def resolve_outreach_copy(job):
     outreach_email = sanitize_text(interpolate_template(cold_template, name=greeting_name, company=company_name, job_title=job_title))
     return linkedin_note, outreach_email
 
-def process_single_candidate(job):
+# Fallbacks for a forced card whose AI rejection left the routing keys unset. Track A is the
+# wealth-ops bank, the closest thing to a neutral default for the roles Kevin pastes by hand;
+# the indices are bounds-checked by filter_ats_bullets() regardless.
+DEFAULT_FORCED_TRACK = "a"
+DEFAULT_FORCED_BULLET_INDICES = [1, 4, 7]
+
+
+def process_single_candidate(job, force=False):
     log_metric_event("ai_screened", source=derive_job_source(job.get("job_id")))
     ai_pass, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id, layer1_bonus, gemini_base = evaluate_job_with_gemini(job)
-    if ai_pass:
+
+    # force=True (from /job!) makes the AI verdict ADVISORY instead of a gate. Kevin pasted this
+    # link deliberately, so his judgment outranks the screener's - the score and reason still ride
+    # on the card, they just stop deciding whether it exists. Everything downstream needs a track
+    # and template ids to resolve copy, and a rejection can leave those unset or out of range, so
+    # they fall back to defaults that filter_ats_bullets/resolve_template_text bounds-check anyway.
+    forced_override = bool(force) and not ai_pass
+    if forced_override:
+        logging.warning(
+            f"Forced card (/job!) overriding AI rejection for "
+            f"{job.get('employer_name')} - {job.get('job_title')} (score {score}): {reason}"
+        )
+        track = track or DEFAULT_FORCED_TRACK
+        tone_mode = tone_mode or "conservative"
+        if not bullet_indices:
+            bullet_indices = DEFAULT_FORCED_BULLET_INDICES
+        # A rejection often carries score 0; a card needs a number that sorts sanely against the
+        # rest of the pipeline without pretending this was a strong match.
+        score = max(safe_int(score, 0), 1)
+        # Mark it on the card. A forced card that looks identical to a scored one is a trap: weeks
+        # later the sheet row gives no hint that the screener said no and Kevin overrode it.
+        job["forced_override"] = True
+        job["forced_override_reason"] = str(reason or "")
+        # Carried into the sheet's Notes column by dispatch_tier1_matches, so the row itself records
+        # that this was an override and what the screener objected to.
+        reason = f"FORCED via /job! (screener said: {reason or 'no reason given'})"
+
+    if ai_pass or forced_override:
         raw_id = job.get("job_id") or f"{job.get('employer_name')}_{job.get('job_title')}"
         short_id = generate_short_key(raw_id, fallback=time.time())
         job_title = job.get("job_title") or "this role"
@@ -4358,6 +4392,10 @@ def process_single_candidate(job):
         oddball_text = f"{job_title.lower()} {str(job.get('job_description') or '')[:300].lower()}"
         if any(kw in oddball_text for kw in ODDBALL_KEYWORDS):
             age_badge = f"{age_badge} 🎲 [WILDCARD ROLE]"
+
+        # Forced cards are Kevin's call over the screener's, and the card must say so.
+        if forced_override:
+            age_badge = f"{age_badge} 🚩 [FORCED - AI SAID NO]"
 
         # Running total of the Layer 2 points added/subtracted below (ghost penalty, alumni, warm/
         # Clavicular). Consumed two ways after the walk: (1) folded into the BONUS_STACK_CAP check
@@ -9137,16 +9175,25 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
         ))
 
     log_metric_event("listing_discovered", source="manual_ingest")
-    result = process_single_candidate(job)
+    result = process_single_candidate(job, force=force)
     if not result:
-        # AI screening rejected it. The row is still Kevin's call, but process_single_candidate
-        # returns nothing to write - no score, no sheet_uuid, no resolved copy - so there is no
-        # row to land. Report the rejection rather than fabricating a partial record.
+        # Screening rejected it AND this was not a forced ingest, so there is no score, sheet_uuid
+        # or resolved copy to write. Report the rejection rather than fabricating a partial record.
+        # A forced ingest overrides the verdict inside process_single_candidate, so reaching here
+        # with force=True means the evaluator itself failed (no Gemini key, API down), not that the
+        # role was judged a poor fit.
         save_seen_job_db(job_hash)
+        if force:
+            return (False, (
+                f"❌ <b>Could not score</b> {html.escape(final_title)} @ {html.escape(final_company)}.\n"
+                "The forced ingest bypassed the fit check, but the evaluator itself failed "
+                "(Gemini unreachable or no API key), so there is no card to build. Try again, or "
+                f"add it with <code>/quick</code>."
+            ))
         return (False, (
             f"⚠️ <b>Did not pass AI screening:</b> {html.escape(final_title)} @ {html.escape(final_company)}.\n"
-            "No row written. If you still want it tracked, add it with "
-            f"<code>/quick</code> or re-check the posting text."
+            "No row written. Force a card anyway with <code>/job!</code> + the link, or add it "
+            f"with <code>/quick</code>."
         ))
 
     save_seen_job_db(job_hash)
@@ -9590,7 +9637,8 @@ def process_webhook_payload_async(data):
             ing_force = bool(re.match(r"^/(job|j)!", text, re.IGNORECASE))
             send_telegram_message(
                 chat_id,
-                ("⏳ <b>Ingesting job (forced)...</b> skipping the duplicate check."
+                ("⏳ <b>Ingesting job (forced)...</b> skipping the duplicate check and the AI "
+                 "screener - you get a card either way."
                  if ing_force else
                  "⏳ <b>Ingesting job...</b> scoring it through the same pipeline as /t "
                  "(Gemini fit, alumni lookup, warm routing).")
@@ -10979,7 +11027,7 @@ def process_webhook_payload_async(data):
                 "/crazy - Stop a CRM retry/alert storm (add 'go' to clear the outbox)\n"
                 "/queries - Per-query yield: which search phrases earn their slot\n"
                 "/resync - Re-read the job tabs after deleting rows by hand\n"
-                "/job! &lt;url&gt; - Ingest even if it looks like a duplicate\n"
+                "/job! &lt;url&gt; - Force a card: skips the duplicate check AND the AI screener\n"
                 "/gaps - Vocabulary high-fit postings use that your resume doesn't\n"
                 "/bullets &lt;track&gt; - Draft resume bullets from those gaps (saves nothing)\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"

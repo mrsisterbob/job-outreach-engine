@@ -3651,7 +3651,7 @@ def test_ingest_manual_job_lands_a_row_and_a_card(monkeypatch):
         captured[p["target_code"]] = p
         return True
 
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match())
     monkeypatch.setattr(m, "log_to_sheets_crm", _write)
     monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
     monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
@@ -3673,7 +3673,7 @@ def test_ingest_manual_job_has_no_score_gate(monkeypatch):
         captured[p["target_code"]] = p
         return True
 
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match(score=61))
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match(score=61))
     monkeypatch.setattr(m, "log_to_sheets_crm", _write)
     monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
     monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
@@ -3726,7 +3726,7 @@ def test_ingest_manual_job_still_scores_a_seen_but_untracked_posting(monkeypatch
     but that never became a CRM row must still produce a card. Blocking on seen_jobs is what made
     repeat runs reject 114 of 121 listings while dispatching almost nothing."""
     scored = []
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: scored.append(job) or None)
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: scored.append(job) or None)
     monkeypatch.setattr(m, "get_tracked_job_keys", lambda: set())
     # Seen before by /t, but never tracked - must NOT suppress.
     m.save_seen_job_db(m.generate_dedup_hash("Huntington", "FX Ops Analyst"))
@@ -3741,7 +3741,7 @@ def test_ingest_manual_job_reports_an_ai_rejection_without_writing(monkeypatch):
     def _no_write(p, **kw):
         pytest.fail("no row without a score")
 
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: None)
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: None)
     monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
     monkeypatch.setattr(m, "log_to_sheets_crm", _no_write)
 
@@ -3763,7 +3763,7 @@ def test_ingest_manual_job_scrapes_when_only_a_url_is_given(monkeypatch):
         m, "scrape_job_page",
         lambda url, timeout=8: ("FX Ops Analyst 2", "Huntington National Bank", "Settle trades."),
     )
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match())
     monkeypatch.setattr(m, "log_to_sheets_crm", _write)
     monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
     monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
@@ -3784,7 +3784,7 @@ def test_ingest_manual_job_skips_the_scrape_when_details_are_typed(monkeypatch):
         pytest.fail("scrape should be skipped when title and company are supplied")
 
     monkeypatch.setattr(m, "scrape_job_page", _no_scrape)
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match())
     monkeypatch.setattr(m, "log_to_sheets_crm", lambda p, **kw: True)
     monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
     monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
@@ -3815,7 +3815,7 @@ def test_ingest_scrapes_non_linkedin_careers_pages(monkeypatch):
         return ("Foreign Exchange Ops Analyst 2", "Huntington", "Settle FX trades.")
 
     monkeypatch.setattr(m, "scrape_job_page", _scrape)
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: _fake_match())
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match())
     monkeypatch.setattr(m, "log_to_sheets_crm", _write)
     monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
     monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
@@ -6276,7 +6276,7 @@ def test_ingest_message_flags_a_stale_block(monkeypatch):
     company, title = _AAA
     monkeypatch.setattr(m, "is_role_tracked", lambda c, t: True)
     monkeypatch.setattr(m, "locate_tracked_role", lambda c, t: None)
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: pytest.fail("must not score"))
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: pytest.fail("must not score"))
 
     ok, message = m.ingest_manual_job(title=title, company=company)
 
@@ -6290,7 +6290,7 @@ def test_ingest_message_names_the_row_for_a_real_duplicate(monkeypatch):
     monkeypatch.setattr(m, "is_role_tracked", lambda c, t: True)
     monkeypatch.setattr(m, "locate_tracked_role", lambda c, t: {
         "tab": "Tetiana Cold", "row_label": "#3", "status": "Matched", "sheet_uuid": "U1"})
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: pytest.fail("must not score"))
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: pytest.fail("must not score"))
 
     ok, message = m.ingest_manual_job(title=title, company=company)
 
@@ -6302,9 +6302,104 @@ def test_forced_ingest_bypasses_the_tracked_gate(monkeypatch):
     company, title = _AAA
     monkeypatch.setattr(m, "is_role_tracked", lambda c, t: pytest.fail("gate must be skipped"))
     scored = []
-    monkeypatch.setattr(m, "process_single_candidate", lambda job: scored.append(job) or None)
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: scored.append(job) or None)
     monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
 
     m.ingest_manual_job(title=title, company=company, force=True)
 
     assert scored, "a forced ingest must reach scoring"
+
+
+# ---- /job! must force a card even when AI screening rejects ----
+
+def _reject_env(monkeypatch, reason="Insurance sales role, not operations",
+                track="", indices=None, score=0):
+    monkeypatch.setattr(m, "evaluate_job_with_gemini",
+                        lambda job: (False, score, reason, track, "", indices or [], 0, 0, 0, 0))
+    for name, fn in (("record_jd_terms", lambda *a, **k: 0),
+                     ("resolve_live_alumni_at_company", lambda c: None),
+                     ("get_warm_crm_contacts", lambda: {}),
+                     ("get_ghost_listing_penalty", lambda h: (0, "")),
+                     ("log_metric_event", lambda *a, **k: None),
+                     ("resolve_target_email", lambda *a, **k: "ops@example.com")):
+        monkeypatch.setattr(m, name, fn)
+
+
+_REJECTED_JOB = {
+    "job_id": "ingest_x", "employer_name": "AAA-The Auto Club Group",
+    "job_title": "Life Insurance Specialist - Michigan",
+    "job_description": "Sell life insurance.", "job_apply_link": "https://x",
+    "job_posted_at_datetime_utc": "2026-09-21T15:11:49Z",
+}
+
+
+def test_ai_rejection_still_blocks_an_unforced_candidate(monkeypatch):
+    """The screener must keep working for /t and a plain /job."""
+    _reject_env(monkeypatch)
+    assert m.process_single_candidate(dict(_REJECTED_JOB)) is None
+
+
+def test_forced_candidate_builds_a_card_despite_the_rejection(monkeypatch):
+    """THE ASK: /job! means Kevin's judgment outranks the screener's."""
+    _reject_env(monkeypatch)
+    result = m.process_single_candidate(dict(_REJECTED_JOB), force=True)
+    assert result, "a forced ingest must produce a dispatchable card"
+    assert result["sheet_uuid"], "the card needs a real row id or every swipe fails"
+    assert result["score"] >= 1, "score 0 would sort below every real match"
+
+
+def test_forced_card_resolves_copy_when_the_rejection_left_routing_unset(monkeypatch):
+    """A rejection can return an empty track and no bullet indices; the card still needs bullets."""
+    _reject_env(monkeypatch, track="", indices=[])
+    result = m.process_single_candidate(dict(_REJECTED_JOB), force=True)
+    job = result["job"]
+    assert job.get("track"), "a forced card must fall back to a real track"
+    bullets = m.filter_ats_bullets(job.get("track"), job.get("bullet_indices"), job.get("tone_mode"))
+    assert len(bullets) >= 3, "the resume block must not come out empty"
+
+
+def test_forced_card_is_flagged_on_the_card_and_in_the_note(monkeypatch):
+    """A forced card that looks identical to a scored one is a trap weeks later."""
+    _reject_env(monkeypatch, reason="Insurance sales role, not operations")
+    result = m.process_single_candidate(dict(_REJECTED_JOB), force=True)
+    assert "FORCED" in result["age_badge"]
+    assert "FORCED via /job!" in result["reason"]
+    assert "Insurance sales role" in result["reason"], "the screener's objection must survive"
+    assert result["job"].get("forced_override") is True
+
+
+def test_forced_card_keeps_a_genuine_pass_untouched(monkeypatch):
+    """force must not rewrite the routing or note of a role that actually passed."""
+    monkeypatch.setattr(m, "evaluate_job_with_gemini",
+                        lambda job: (True, 92, "Strong ops fit", "b", "conservative", [2, 3, 4], 0, 0, 0, 92))
+    _reject_env(monkeypatch)
+    monkeypatch.setattr(m, "evaluate_job_with_gemini",
+                        lambda job: (True, 92, "Strong ops fit", "b", "conservative", [2, 3, 4], 0, 0, 0, 92))
+    result = m.process_single_candidate(dict(_REJECTED_JOB), force=True)
+    assert result["score"] == 92
+    assert "FORCED" not in result["age_badge"]
+    assert result["reason"] == "Strong ops fit"
+    assert result["job"].get("forced_override") is None
+
+
+def test_ingest_rejection_message_points_at_the_force_flag(monkeypatch):
+    monkeypatch.setattr(m, "is_role_tracked", lambda c, t: False)
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+
+    ok, message = m.ingest_manual_job(title="Life Insurance Specialist", company="AAA")
+
+    assert ok is False
+    assert "/job!" in message, "the rejection must tell Kevin how to override it"
+
+
+def test_ingest_passes_force_through_to_scoring(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(m, "is_role_tracked", lambda c, t: False)
+    monkeypatch.setattr(m, "process_single_candidate",
+                        lambda job, force=False: seen.update(force=force) or None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+
+    m.ingest_manual_job(title="Life Insurance Specialist", company="AAA", force=True)
+
+    assert seen.get("force") is True, "/job! must reach the screener as an override"
