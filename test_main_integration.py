@@ -6772,3 +6772,43 @@ def test_sweep_over_a_rejected_crm_checks_nothing(monkeypatch):
     result = m.check_job_links(sleep_between=0)
 
     assert result["checked"] == 0 and result["dead"] == [] and queued == []
+
+
+def test_probe_reports_a_rejection_verbatim(monkeypatch):
+    """The probe must report what the CRM SAID, not a guess at why."""
+    _crm_read(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    monkeypatch.setattr(m, "CRM_SHARED_SECRET", "abc123")
+    out = m.probe_crm_read()
+    assert "HTTP 200" in out and "status: error" in out and "Unauthorized" in out
+    assert "abc123" not in out, "the secret itself must never be printed"
+
+
+def test_probe_flags_a_missing_secret_on_our_side(monkeypatch):
+    """If CRM_SHARED_SECRET is unset on Render the bot sends NO secret - a distinct cause from
+    a mismatch, and the one a 'go check the secret matches' message never surfaces."""
+    _crm_read(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    monkeypatch.setattr(m, "CRM_SHARED_SECRET", None)
+    assert "secret sent: NO" in m.probe_crm_read()
+
+
+def test_probe_reports_a_healthy_read(monkeypatch):
+    _crm_read(monkeypatch, {"status": "success", "followups": [{"company": "Acme"}]})
+    monkeypatch.setattr(m, "CRM_SHARED_SECRET", "abc")
+    out = m.probe_crm_read()
+    assert "status: success" in out and "rows returned: 1" in out
+
+
+def test_probe_survives_a_non_json_body(monkeypatch):
+    class _R:
+        status_code = 200
+        text = "<html>Google sign-in</html>"
+        def json(self): raise ValueError("not json")
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://fake")
+    monkeypatch.setattr(m, "crm_post", lambda p, **k: _R())
+    assert "non-JSON body" in m.probe_crm_read()
+
+
+def test_probe_handles_no_response(monkeypatch):
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://fake")
+    monkeypatch.setattr(m, "crm_post", lambda p, **k: None)
+    assert "No response at all" in m.probe_crm_read()

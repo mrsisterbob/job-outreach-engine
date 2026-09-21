@@ -2583,6 +2583,43 @@ def _record_query_yield(per_query):
         logging.error(f"Query yield persist error: {e}")
 
 
+def probe_crm_read():
+    """One-line diagnosis of what the CRM webhook actually answers on a read.
+
+    Exists because a rejected read and an empty tab look identical downstream, and guessing at
+    the cause sent Kevin to check a shared secret that was already correct. This reports the real
+    response - status code, body status, message, row count - so the next step follows from
+    evidence rather than from the most likely story.
+
+    The secret itself is never printed, only whether one was attached.
+    """
+    if not CRM_WEBHOOK_URL:
+        return "CRM_WEBHOOK_URL is unset - the bot has no CRM to read."
+    res = crm_post({"action": "get_followups", "tab": "TC"})
+    if not res:
+        return "No response at all (network error or timeout reaching the webhook URL)."
+    bits = [f"HTTP {res.status_code}"]
+    bits.append("secret sent: yes" if CRM_SHARED_SECRET else "secret sent: NO (env var unset)")
+    try:
+        body = res.json()
+    except Exception:
+        snippet = re.sub(r"\s+", " ", res.text or "")[:160]
+        bits.append(f"non-JSON body: {snippet}")
+        return " | ".join(bits)
+    if isinstance(body, dict):
+        status = str(body.get("status", "?"))
+        bits.append(f"status: {status}")
+        msg = str(body.get("message", "")).strip()
+        if msg:
+            bits.append(f"message: {msg[:120]}")
+        rows = body.get("followups")
+        if isinstance(rows, list):
+            bits.append(f"rows returned: {len(rows)}")
+    else:
+        bits.append(f"unexpected body type: {type(body).__name__}")
+    return " | ".join(bits)
+
+
 def normalize_command_name(text):
     """The bare command from a raw Telegram message, or "" when it is not a command.
 
@@ -7419,10 +7456,18 @@ def _alert_crm_read_rejection(message):
     _CRM_READ_REJECTION_ALERTED.set()
     hint = ""
     if "unauthorized" in str(message).lower():
+        # Apps Script returns a bare "Unauthorized" for several distinct causes and does not say
+        # which: a mismatched secret, a BLANK Script Property (isRequestAuthorized fails closed on
+        # an unset one), a CRM_SHARED_SECRET missing from Render so no secret is sent at all, or a
+        # deployment serving an older version of the script. Naming only the first sent Kevin to
+        # re-check a secret that already matched, so list what it actually could be.
         hint = (
-            " Set the CRM_SHARED_SECRET Script Property in the Apps Script project to match "
-            "Render's CRM_SHARED_SECRET, then redeploy the web app "
-            "(Deploy > Manage deployments > New version)."
+            " 'Unauthorized' means the secret Apps Script received did not equal the one in its "
+            "Script Properties. Check, in order: (1) CRM_SHARED_SECRET is set on RENDER - if it is "
+            "missing the bot sends no secret at all; (2) the Script Property exists and is not "
+            "blank; (3) both sides have no trailing whitespace; (4) the deployment was republished "
+            "after the property was set (Deploy > Manage deployments > New version) - an edited "
+            "property does not reach the live web app until then."
         )
     send_health_alert(
         f"CRM READS are being rejected - every tab is coming back EMPTY, so the link sweep, the "
@@ -10265,12 +10310,12 @@ def process_webhook_payload_async(data):
                     # Zero checked is almost never "no jobs" - it means the CRM read came back
                     # empty, which a rejected webhook does silently. Say so instead of
                     # reporting it as a clean sweep.
+                    probe = probe_crm_read()
                     send_telegram_message(
                         chat_id,
                         "⚠️ <b>Checked 0 links.</b> No rows came back from Tetiana Cold, Tetiana "
-                        "Warm or Clavicular.\n\nIf those tabs have rows, the CRM read is being "
-                        "rejected - most likely <code>CRM_SHARED_SECRET</code> not matching "
-                        "between Render and the Apps Script project. Run <code>/health</code>."
+                        "Warm or Clavicular.\n\n<b>What the CRM actually answered:</b>\n"
+                        f"<code>{html.escape(probe)}</code>"
                     )
                     return
                 summary = (
