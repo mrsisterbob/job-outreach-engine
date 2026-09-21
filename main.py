@@ -2473,6 +2473,14 @@ _APPLIED_CRM_CACHE_TTL_SECONDS = 300
 # worth surfacing, so the two must not share a store.
 _TRACKED_ROLE_CACHE = {"data": set(), "fetched_at": 0.0}
 _TRACKED_ROLE_CACHE_TTL_SECONDS = 300
+# How long a cached suppression set may keep blocking after its last SUCCESSFUL refresh.
+#
+# The TTL above only decides when to re-fetch. When that re-fetch fails, fetched_at is left
+# untouched and the stale set keeps answering - so a warm cache plus an unreachable Sheets
+# permanently suppressed roles whose rows Kevin had already deleted, with /job insisting the role
+# was "already in the pipeline" against an empty tab. Past this bound the set is discarded and the
+# gate errs OPEN (a duplicate card is recoverable; an un-ingestable role is not).
+_TRACKED_ROLE_CACHE_MAX_STALE_SECONDS = 900
 
 def normalize_company_for_match(company_name):
     """Lowercase and strip legal suffixes so CRM and scraped company-name variants compare reliably."""
@@ -2572,8 +2580,15 @@ def get_tracked_job_keys():
     Keyed on the same generate_dedup_hash(company, title) the discovery path uses, so a company can
     keep surfacing new roles while the specific role already in a tab stays out.
 
-    Errs OPEN: a Sheets failure returns the stale cache (usually empty), so listings flow through
-    and the worst case is a duplicate card - never a silently empty pipeline.
+    Errs OPEN, but only within a bound. A Sheets failure returns the last good set rather than an
+    empty one, so a transient blip does not re-card everything already tracked. That was described
+    here as erring open because a COLD process has an empty cache - but a WARM one does the
+    opposite: fetched_any stays False on failure, fetched_at is never advanced, and the stale set
+    answers forever. A role whose row Kevin had deleted stayed suppressed indefinitely, with /job
+    reporting "already in the pipeline" against a tab that no longer held it.
+
+    _TRACKED_ROLE_CACHE_MAX_STALE_SECONDS caps that: past it the set is dropped and suppression
+    stops until Sheets answers again.
 
     Reads every tab dispatch_tier1_matches can WRITE to. It previously read only TC+TW while rows
     also land in Clavicular (target_code "CL"), so a warm-referral role was tracked in the sheet but
@@ -2625,7 +2640,73 @@ def get_tracked_job_keys():
             f"Tracked-role suppression set refreshed: {len(tracked)} keys "
             f"across Tetiana Cold + Warm + Clavicular"
         )
+    elif _TRACKED_ROLE_CACHE["data"]:
+        # The refresh failed. Keep serving the last good set only while it is plausibly still
+        # true; beyond that, suppressing against data this old blocks roles Kevin has since
+        # deleted, and he cannot ingest them at all.
+        age = now - _TRACKED_ROLE_CACHE["fetched_at"]
+        if age > _TRACKED_ROLE_CACHE_MAX_STALE_SECONDS:
+            logging.error(
+                f"Tracked-role suppression set is {int(age)}s stale and Sheets is not answering - "
+                f"dropping {len(_TRACKED_ROLE_CACHE['data'])} keys and erring open so ingest works"
+            )
+            send_health_alert(
+                "Tracked-role suppression is running blind: Sheets has not answered for "
+                f"{int(age // 60)} minutes, so duplicate-role checking is OFF until it recovers. "
+                "Cards may repeat for roles already in a tab."
+            )
+            _TRACKED_ROLE_CACHE["data"] = set()
     return _TRACKED_ROLE_CACHE["data"]
+
+
+def locate_tracked_role(company, title):
+    """Find the LIVE sheet row that makes this role count as tracked, or None.
+
+    Deliberately bypasses _TRACKED_ROLE_CACHE and re-reads the tabs, because the whole point is to
+    tell a genuine duplicate apart from a cached ghost. None here means the suppression set is
+    stale - the role is blocked by data that is no longer in the sheet.
+
+    Returns {tab, row_label, status, sheet_uuid} for the first match, newest tab first.
+    """
+    want_hash = generate_dedup_hash(company, title)
+    want_key = normalize_dedup_key(company, title)
+    for target_code, tab_name in (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "Clavicular")):
+        try:
+            res = crm_post({"action": "get_followups", "tab": target_code})
+            if not res or res.status_code != 200:
+                continue
+            data = res.json()
+            if data.get("status") != "success":
+                continue
+            for idx, row in enumerate(data.get("followups", [])):
+                row_company = str(row.get("company") or "").strip()
+                row_title = str(row.get("job_title") or row.get("title") or "").strip()
+                if not (row_company and row_title):
+                    continue
+                if (generate_dedup_hash(row_company, row_title) == want_hash
+                        or normalize_dedup_key(row_company, row_title) == want_key):
+                    return {
+                        "tab": tab_name,
+                        # get_followups walks the sheet bottom-up, so this is a position within the
+                        # returned list, not a spreadsheet row number - labelled loosely on purpose.
+                        "row_label": f"#{idx + 1}",
+                        "status": str(row.get("status") or ""),
+                        "sheet_uuid": str(row.get("sheet_uuid") or ""),
+                    }
+        except Exception as e:
+            logging.error(f"locate_tracked_role error ({target_code}): {e}")
+    return None
+
+
+def invalidate_tracked_role_cache():
+    """Force the next tracked-role check to re-read Sheets.
+
+    Deleting a row by hand is invisible to this process, so without a way to clear the cache the
+    gate keeps blocking a role for up to the TTL after Kevin has removed it.
+    """
+    _TRACKED_ROLE_CACHE["data"] = set()
+    _TRACKED_ROLE_CACHE["fetched_at"] = 0.0
+    return True
 
 
 def is_role_tracked(company, title):
@@ -8986,7 +9067,7 @@ def scrape_job_page(url, timeout=12):
     return ("", "", "")
 
 
-def ingest_manual_job(url="", title="", company="", description="", chat_id=None, source_label="/job"):
+def ingest_manual_job(url="", title="", company="", description="", chat_id=None, source_label="/job", force=False):
     """Run one hand-picked posting through the exact Stage 2 path /t uses, then land it in the CRM.
 
     This is the shared core behind the Telegram /job command and the desktop bookmarklet's
@@ -9027,10 +9108,32 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
     # Dedup against roles already TRACKED in a job tab, not against everything /t has ever
     # glanced at - re-pasting a link for a role with no CRM row should still produce a card.
     job_hash = generate_dedup_hash(job["employer_name"], job["job_title"])
-    if is_role_tracked(job["employer_name"], job["job_title"]):
+    if force:
+        logging.warning(
+            f"Forced ingest (/job!) bypassing the tracked-role gate for "
+            f"{job['employer_name']} - {job['job_title']}"
+        )
+    if not force and is_role_tracked(job["employer_name"], job["job_title"]):
+        # Name the tab and row that caused the block. "Already in the pipeline" with nothing to
+        # open is a dead end when the row has been deleted by hand: the suppression set is cached,
+        # so it keeps answering from data that no longer matches the sheet, and Kevin has no way to
+        # tell a real duplicate from a stale one.
+        where = locate_tracked_role(job["employer_name"], job["job_title"])
+        if where:
+            detail = f"It is row {where['row_label']} of <b>{html.escape(where['tab'])}</b>"
+            if where.get("status"):
+                detail += f" (Status: {html.escape(where['status'])})"
+            detail += "."
+        else:
+            detail = (
+                "⚠️ But no matching row is in the sheet right now - the suppression list is stale "
+                "(deleted by hand, or Sheets was unreachable at the last refresh)."
+            )
         return (False, (
             f"♻️ <b>Already in the pipeline:</b> {html.escape(final_title)} @ {html.escape(final_company)}.\n"
-            "This role already has a Tetiana Cold/Warm/Clavicular row, so no duplicate was written."
+            f"{detail}\n\n"
+            "Re-ingest it anyway with <code>/job!</code> + the link, or refresh the list with "
+            "<code>/resync</code>."
         ))
 
     log_metric_event("listing_discovered", source="manual_ingest")
@@ -9482,15 +9585,20 @@ def process_webhook_payload_async(data):
                 )
                 return
             ing_title, ing_company, ing_url = parsed
+            # "/job!" overrides the tracked-role gate, for the case the gate gets wrong: the row was
+            # deleted by hand, or Sheets was unreachable when the suppression set was last built.
+            ing_force = bool(re.match(r"^/(job|j)!", text, re.IGNORECASE))
             send_telegram_message(
                 chat_id,
-                "⏳ <b>Ingesting job...</b> scoring it through the same pipeline as /t "
-                "(Gemini fit, alumni lookup, warm routing)."
+                ("⏳ <b>Ingesting job (forced)...</b> skipping the duplicate check."
+                 if ing_force else
+                 "⏳ <b>Ingesting job...</b> scoring it through the same pipeline as /t "
+                 "(Gemini fit, alumni lookup, warm routing).")
             )
 
-            def _ingest_and_report(u=ing_url, t=ing_title, c=ing_company, cid=chat_id):
+            def _ingest_and_report(u=ing_url, t=ing_title, c=ing_company, cid=chat_id, force=ing_force):
                 try:
-                    ok, message = ingest_manual_job(url=u, title=t or "", company=c or "", chat_id=cid, source_label="/job")
+                    ok, message = ingest_manual_job(url=u, title=t or "", company=c or "", chat_id=cid, source_label="/job", force=force)
                     if not ok and message:
                         send_telegram_message(cid, message)
                 except Exception as e:
@@ -9717,6 +9825,26 @@ def process_webhook_payload_async(data):
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
             send_telegram_message(chat_id, "\n".join(lines))
             return
+        if text == "/resync":
+            invalidate_tracked_role_cache()
+            keys = get_tracked_job_keys()
+            if keys:
+                send_telegram_message(
+                    chat_id,
+                    "🔄 <b>Suppression list refreshed</b>\n\n"
+                    f"Re-read Tetiana Cold + Warm + Clavicular: <b>{len(keys) // 2}</b> role(s) "
+                    "are currently tracked.\n\nA role you deleted by hand will now ingest normally."
+                )
+            else:
+                send_telegram_message(
+                    chat_id,
+                    "🔄 <b>Suppression list cleared</b>\n\n"
+                    "No tracked roles came back. Either the job tabs are empty, or Sheets did not "
+                    "answer - either way nothing is being suppressed right now, so "
+                    "<code>/job</code> will accept anything."
+                )
+            return
+
         if text == "/gaps" or text.startswith("/gaps "):
             gaps = get_jd_term_gaps(limit=20)
             if not gaps:
@@ -10850,6 +10978,8 @@ def process_webhook_payload_async(data):
                 "/unbury - Preview buried-listing cleanup (add 'go' to clear)\n"
                 "/crazy - Stop a CRM retry/alert storm (add 'go' to clear the outbox)\n"
                 "/queries - Per-query yield: which search phrases earn their slot\n"
+                "/resync - Re-read the job tabs after deleting rows by hand\n"
+                "/job! &lt;url&gt; - Ingest even if it looks like a duplicate\n"
                 "/gaps - Vocabulary high-fit postings use that your resume doesn't\n"
                 "/bullets &lt;track&gt; - Draft resume bullets from those gaps (saves nothing)\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"

@@ -6187,3 +6187,124 @@ def test_batch_dispositions_do_not_leak_between_batches(monkeypatch):
 def test_remap_cached_job_uuid_is_a_noop_on_missing_args():
     assert m.remap_cached_job_uuid("", "abc") is False
     assert m.remap_cached_job_uuid("s1", "") is False
+
+
+# ---- Stale suppression: a deleted row must not block ingest forever ----
+
+_AAA = ("AAA Life Insurance Company", "Annuity Processing Specialist")
+
+
+def _tracked_env(monkeypatch, rows_by_tab):
+    """Serve get_followups from a mutable dict so a test can 'delete' a row mid-flight."""
+    class _R:
+        status_code = 200
+        def __init__(self, rows):
+            self.rows = rows
+        def json(self):
+            return {"status": "success", "followups": self.rows}
+
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post",
+                        lambda payload, **kw: _R(rows_by_tab.get(payload.get("tab"), [])))
+    m.invalidate_tracked_role_cache()
+
+
+def test_deleted_row_stops_blocking_once_the_cache_refreshes(monkeypatch):
+    company, title = _AAA
+    sheet = {"TC": [{"company": company, "job_title": title}], "TW": [], "CL": []}
+    _tracked_env(monkeypatch, sheet)
+    assert m.is_role_tracked(company, title)
+
+    sheet["TC"] = []                      # Kevin deletes the row by hand
+    m.invalidate_tracked_role_cache()     # what /resync does
+    assert not m.is_role_tracked(company, title)
+
+
+def test_stale_cache_errs_open_when_sheets_stays_unreachable(monkeypatch):
+    """THE BUG: on a failed refresh fetched_at is never advanced, so the stale set answered
+    forever - /job insisted a role was 'already in the pipeline' against an empty tab."""
+    company, title = _AAA
+    _tracked_env(monkeypatch, {"TC": [{"company": company, "job_title": title}], "TW": [], "CL": []})
+    assert m.is_role_tracked(company, title)
+
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: None)  # Sheets unreachable
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+
+    # Within the stale bound the last good set still answers.
+    m._TRACKED_ROLE_CACHE["fetched_at"] = time.time() - 400
+    assert m.is_role_tracked(company, title), "a brief blip must not re-card everything"
+
+    # Past it, suppression must give up rather than block a role Kevin cannot ingest.
+    m._TRACKED_ROLE_CACHE["fetched_at"] = time.time() - (m._TRACKED_ROLE_CACHE_MAX_STALE_SECONDS + 60)
+    assert not m.is_role_tracked(company, title), "stale suppression must err OPEN, not closed"
+
+
+def test_stale_cache_expiry_alerts_that_dedup_is_off(monkeypatch):
+    company, title = _AAA
+    _tracked_env(monkeypatch, {"TC": [{"company": company, "job_title": title}], "TW": [], "CL": []})
+    m.is_role_tracked(company, title)
+    alerts = []
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: None)
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    m._TRACKED_ROLE_CACHE["fetched_at"] = time.time() - (m._TRACKED_ROLE_CACHE_MAX_STALE_SECONDS + 60)
+
+    m.is_role_tracked(company, title)
+
+    assert any("running blind" in a for a in alerts), "Kevin must know dedup stopped"
+
+
+def test_locate_tracked_role_finds_the_live_row(monkeypatch):
+    company, title = _AAA
+    _tracked_env(monkeypatch, {
+        "TC": [], "TW": [{"company": company, "job_title": title, "status": "Applied",
+                          "sheet_uuid": "U-LIVE"}], "CL": [],
+    })
+    where = m.locate_tracked_role(company, title)
+    assert where and where["tab"] == "Tetiana Warm"
+    assert where["status"] == "Applied" and where["sheet_uuid"] == "U-LIVE"
+
+
+def test_locate_tracked_role_returns_none_for_a_cached_ghost(monkeypatch):
+    """This is what distinguishes a real duplicate from a stale block, so the message can say so."""
+    company, title = _AAA
+    _tracked_env(monkeypatch, {"TC": [], "TW": [], "CL": []})
+    assert m.locate_tracked_role(company, title) is None
+
+
+def test_ingest_message_flags_a_stale_block(monkeypatch):
+    """'Already in the pipeline' with nothing to open is a dead end when the row is gone."""
+    company, title = _AAA
+    monkeypatch.setattr(m, "is_role_tracked", lambda c, t: True)
+    monkeypatch.setattr(m, "locate_tracked_role", lambda c, t: None)
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: pytest.fail("must not score"))
+
+    ok, message = m.ingest_manual_job(title=title, company=company)
+
+    assert ok is False
+    assert "stale" in message.lower()
+    assert "/job!" in message and "/resync" in message
+
+
+def test_ingest_message_names_the_row_for_a_real_duplicate(monkeypatch):
+    company, title = _AAA
+    monkeypatch.setattr(m, "is_role_tracked", lambda c, t: True)
+    monkeypatch.setattr(m, "locate_tracked_role", lambda c, t: {
+        "tab": "Tetiana Cold", "row_label": "#3", "status": "Matched", "sheet_uuid": "U1"})
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: pytest.fail("must not score"))
+
+    ok, message = m.ingest_manual_job(title=title, company=company)
+
+    assert "Tetiana Cold" in message and "#3" in message and "Matched" in message
+
+
+def test_forced_ingest_bypasses_the_tracked_gate(monkeypatch):
+    """/job! is the escape hatch for when the gate is wrong."""
+    company, title = _AAA
+    monkeypatch.setattr(m, "is_role_tracked", lambda c, t: pytest.fail("gate must be skipped"))
+    scored = []
+    monkeypatch.setattr(m, "process_single_candidate", lambda job: scored.append(job) or None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+
+    m.ingest_manual_job(title=title, company=company, force=True)
+
+    assert scored, "a forced ingest must reach scoring"
