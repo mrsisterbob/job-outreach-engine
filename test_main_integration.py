@@ -37,7 +37,7 @@ def clean_tables():
         # "already in the pipeline" branch instead of the path it meant to exercise.
         for table in ("crm_outbox", "sheet_row_map", "company_cooldown", "company_identities",
                       "jobs", "followup_sequencer_log", "followup_queue_snapshot", "gmail_drafts", "seen_jobs",
-                      "seen_content_hashes"):
+                      "seen_content_hashes", "jd_term_yield"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
     yield
@@ -82,6 +82,89 @@ def test_crm_outbox_marks_failed_after_max_retries(monkeypatch):
     with m.get_db_conn() as conn:
         row = conn.execute("SELECT retry_count, status FROM crm_outbox").fetchone()
     assert row == (10, "FAILED")
+
+
+# ---- Outbox alert timing: back-off is not news, abandonment is ----
+
+def _capture_alerts(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    return alerts
+
+
+def _fail_crm(monkeypatch, status=500):
+    """Point the REAL log_to_sheets_crm at a webhook that always fails."""
+    class _Resp:
+        status_code = status
+        text = "boom"
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _Resp())
+    monkeypatch.setattr(m.time, "sleep", lambda *_a, **_k: None)
+
+
+def test_outbox_retry_pass_does_not_alert(monkeypatch):
+    """Regression: the outbox IS the retry mechanism, so a failed attempt is a back-off step, not a
+    delivery failure. It used to fire 'Failed to log payload after 1 attempts' on every 5s pass -
+    one stuck /warm write produced four identical Telegram warnings inside two minutes.
+    """
+    _fail_crm(monkeypatch)
+    alerts = _capture_alerts(monkeypatch)
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "abc"})
+
+    for _ in range(3):  # three worker passes
+        m.process_crm_outbox_batch(inter_job_sleep=0)
+
+    assert alerts == [], f"back-off passes must stay silent, got {alerts}"
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT retry_count FROM crm_outbox").fetchone()[0] == 3
+
+
+def test_outbox_alerts_once_when_it_gives_up(monkeypatch):
+    """The real exhaustion event is retry_count hitting 10 - that one must still reach Telegram."""
+    _fail_crm(monkeypatch)
+    alerts = _capture_alerts(monkeypatch)
+    with m.get_db_conn() as conn:
+        conn.execute(
+            "INSERT INTO crm_outbox (payload_json, status, retry_count) VALUES (?, 'PENDING', 9)",
+            (json.dumps({"action": "update_status", "sheet_uuid": "abc-123"}),)
+        )
+        conn.commit()
+
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+
+    assert len(alerts) == 1, f"expected exactly one abandonment alert, got {alerts}"
+    assert "abc-123" in alerts[0], "the alert must identify WHICH write was lost"
+    assert "update_status" in alerts[0]
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT status FROM crm_outbox").fetchone()[0] == "FAILED"
+
+    # ...and having gone FAILED, it is no longer selected, so it cannot alert again.
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+    assert len(alerts) == 1
+
+
+def test_direct_caller_still_alerts_on_exhaustion(monkeypatch):
+    """Callers that are NOT backed by the outbox keep their alert - for them the attempts really
+    were the last word."""
+    _fail_crm(monkeypatch)
+    alerts = _capture_alerts(monkeypatch)
+
+    assert m.log_to_sheets_crm({"action": "update_status", "sheet_uuid": "zz"}, max_retries=2) is False
+
+    assert len(alerts) == 1
+    assert "zz" in alerts[0] and "HTTP 500" in alerts[0]
+
+
+def test_alert_text_names_the_failure_reason():
+    """Four identical alerts were indistinguishable; the Apps Script message only hit the logs."""
+    text = m.crm_failure_alert_text(
+        {"action": "batch_add_rows", "tab": "TC", "rows": [1, 2, 3]}, 3, "Lock timeout - server busy"
+    )
+    assert "batch_add_rows" in text and "tab=TC" in text and "rows=3" in text
+    assert "Lock timeout" in text
 
 
 # ---- Tracked-role suppression must match what Sheets will actually accept ----
@@ -5874,3 +5957,114 @@ def test_age_ceiling_never_drops_below_two_poll_intervals(monkeypatch):
         computed = max(int(24 * 3600), int(poll_hours * 3600 * 2))
         assert computed >= floor
         assert computed >= poll_hours * 3600 * 2
+
+
+# ---- JD vocabulary tracking: /gaps and /bullets ----
+
+_SURETY_JD_M = """Hybrid Operations Analytics Associate - Surety. Reconcile bordereaux and premium
+bookings, build reporting in Power BI, maintain the policy administration system, partner with
+brokers and drive process improvement across the surety portfolio."""
+
+
+def test_record_jd_terms_banks_vocabulary(monkeypatch):
+    assert m.record_jd_terms(_SURETY_JD_M, 98) > 0
+    with m.get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT docs, fit_sum, hi_fit_docs FROM jd_term_yield WHERE term = 'surety'"
+        ).fetchone()
+    assert row == (1, 98, 1), "a 98-scoring JD must bank as one hi-fit doc"
+
+
+def test_record_jd_terms_accumulates_across_postings():
+    m.record_jd_terms(_SURETY_JD_M, 90)
+    m.record_jd_terms(_SURETY_JD_M, 70)
+    with m.get_db_conn() as conn:
+        docs, fit_sum, hi = conn.execute(
+            "SELECT docs, fit_sum, hi_fit_docs FROM jd_term_yield WHERE term = 'surety'"
+        ).fetchone()
+    assert (docs, fit_sum) == (2, 160)
+    assert hi == 1, "only the 90 clears HI_FIT_THRESHOLD, not the 70"
+
+
+def test_record_jd_terms_never_raises_on_bad_input():
+    """Telemetry must never cost Kevin a card."""
+    assert m.record_jd_terms(None, 50) == 0
+    assert m.record_jd_terms("", None) == 0
+
+
+def test_gaps_surface_market_terms_the_resume_lacks(monkeypatch):
+    """The Skills 0% case: the JD says bordereaux, the bank says reconciliation."""
+    monkeypatch.setattr(m, "get_filter", lambda k, d=None: ["reconciliation"] if k == "core_skills" else d)
+    monkeypatch.setattr(m, "load_resume_bullet_tracks", lambda: {})
+    monkeypatch.setattr(m, "get_resume_vocabulary", lambda: {"reconciliation"})
+    for _ in range(3):
+        m.record_jd_terms(_SURETY_JD_M, 95)
+    terms = [g["term"] for g in m.get_jd_term_gaps(limit=40)]
+    assert "surety" in terms
+    assert "bordereaux" in terms
+
+
+def test_gaps_exclude_terms_already_in_resume_copy(monkeypatch):
+    monkeypatch.setattr(m, "get_resume_vocabulary", lambda: {"surety", "bordereaux"})
+    for _ in range(3):
+        m.record_jd_terms(_SURETY_JD_M, 95)
+    terms = [g["term"] for g in m.get_jd_term_gaps(limit=40)]
+    assert "surety" not in terms and "bordereaux" not in terms
+
+
+def test_gaps_ignore_one_off_vocabulary(monkeypatch):
+    """min_docs guards against rewriting a resume around a single weird listing."""
+    monkeypatch.setattr(m, "get_resume_vocabulary", lambda: set())
+    m.record_jd_terms("Unicorn wrangling and dragon taming specialist.", 99)
+    terms = [g["term"] for g in m.get_jd_term_gaps(limit=40)]
+    assert "unicorn" not in terms
+
+
+def test_gaps_rank_high_fit_terms_first(monkeypatch):
+    monkeypatch.setattr(m, "get_resume_vocabulary", lambda: set())
+    for _ in range(2):
+        m.record_jd_terms("Surety underwriting operations.", 95)
+    for _ in range(2):
+        m.record_jd_terms("Switchboard greeting duties.", 20)
+    gaps = m.get_jd_term_gaps(limit=40)
+    assert gaps[0]["hi_fit_docs"] >= gaps[-1]["hi_fit_docs"]
+    top = [g["term"] for g in gaps[:6]]
+    assert "surety" in top, "high-fit vocabulary must outrank low-fit vocabulary"
+
+
+def test_resolve_bullet_track_key_accepts_shorthand():
+    tracks = {"track_a_wealth_ops": [], "track_e_bizops": []}
+    assert m.resolve_bullet_track_key("e", tracks) == "track_e_bizops"
+    assert m.resolve_bullet_track_key("bizops", tracks) == "track_e_bizops"
+    assert m.resolve_bullet_track_key("track_a_wealth_ops", tracks) == "track_a_wealth_ops"
+    assert m.resolve_bullet_track_key("zzz", tracks) is None
+
+
+def test_draft_bullets_passes_existing_bullets_as_ground_truth(monkeypatch):
+    """The anti-fabrication gate: the real bullets must reach the prompt, and the system prompt
+    must forbid inventing experience."""
+    seen = {}
+
+    def _fake(prompt, system_prompt=None, **kw):
+        seen["prompt"] = prompt
+        seen["system"] = system_prompt
+        return json.dumps({"bullets": [{"bullet": "Reconciled custodial ledgers daily.",
+                                        "covers": ["reconciliation"], "based_on": "x"}]})
+
+    monkeypatch.setattr(m, "call_gemini_api", _fake)
+    out = m.draft_bullets_for_gaps("track_a", ["Wrote nightly reconciliation scripts."],
+                                   [{"term": "bordereaux"}])
+    assert out and out[0]["bullet"].startswith("Reconciled")
+    assert "Wrote nightly reconciliation scripts." in seen["prompt"]
+    assert "forbidden from inventing" in seen["system"]
+
+
+def test_draft_bullets_returns_nothing_without_ground_truth(monkeypatch):
+    """No existing bullets means nothing to rephrase - it must NOT free-write a history."""
+    monkeypatch.setattr(m, "call_gemini_api", lambda *a, **k: pytest.fail("must not call Gemini"))
+    assert m.draft_bullets_for_gaps("track_a", [], [{"term": "surety"}]) == []
+
+
+def test_draft_bullets_survives_garbage_model_output(monkeypatch):
+    monkeypatch.setattr(m, "call_gemini_api", lambda *a, **k: "not json at all")
+    assert m.draft_bullets_for_gaps("track_a", ["Did a thing."], [{"term": "surety"}]) == []

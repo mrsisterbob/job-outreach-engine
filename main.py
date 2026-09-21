@@ -41,7 +41,7 @@ from pipeline_utils import (
     carmen_status_marker, carmen_marker_cell,
     INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
-    parse_job_command, parse_job_page_html, build_ingest_job_dict,
+    parse_job_command, parse_job_page_html, build_ingest_job_dict, extract_jd_terms,
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
     strip_tracking_params, strip_html_to_text,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
@@ -1105,6 +1105,24 @@ def init_db():
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_threads_state ON inbound_threads(state, last_seen)")
+        # Rolling vocabulary of every JD the pipeline has scored. calculate_keyword_overlap() only
+        # ever asked "do Kevin's 10 words appear here", so the language the market actually uses
+        # was computed and thrown away on every run - a 98/100 surety role read "Skills 0%" because
+        # the posting says "bordereaux" and the bank says "reconciliation".
+        #
+        # docs/fit_sum (not an average column) so a term's mean fit stays correct under concurrent
+        # upserts: two workers incrementing a stored average would race, whereas summing is
+        # associative and SQLite's UPSERT makes each += atomic.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS jd_term_yield (
+            term TEXT PRIMARY KEY,
+            docs INTEGER DEFAULT 0,
+            fit_sum INTEGER DEFAULT 0,
+            hi_fit_docs INTEGER DEFAULT 0,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jd_term_yield_docs ON jd_term_yield(hi_fit_docs DESC, docs DESC)")
 
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -3091,6 +3109,187 @@ def calculate_keyword_overlap(job_desc):
     overlap_pct = int((len(matches) / len(core_skills)) * 100) if core_skills else 0
     return overlap_pct, matches
 
+
+# A JD scoring at/above this is one Kevin would take, so its vocabulary is what he should be
+# writing. Terms below it still get counted (they are the contrast set that stops /gaps from
+# recommending language common to EVERY posting), but only hi_fit_docs drives the ranking.
+HI_FIT_THRESHOLD = 85
+
+
+def record_jd_terms(job_desc, fit_score):
+    """Fold one scored JD's vocabulary into jd_term_yield. Observation only - never changes how a
+    job is scored, filtered or carded, so it is safe to call on every evaluated posting.
+
+    Silent on failure by design: this is telemetry, and a locked DB must never cost Kevin a card.
+    """
+    try:
+        score = safe_int(fit_score, 0)
+        terms = extract_jd_terms(job_desc)
+        if not terms:
+            return 0
+        hi = 1 if score >= HI_FIT_THRESHOLD else 0
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany("""
+                INSERT INTO jd_term_yield (term, docs, fit_sum, hi_fit_docs)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(term) DO UPDATE SET
+                    docs = docs + 1,
+                    fit_sum = fit_sum + excluded.fit_sum,
+                    hi_fit_docs = hi_fit_docs + excluded.hi_fit_docs,
+                    last_seen = CURRENT_TIMESTAMP
+            """, [(t, score, hi) for t in terms])
+            conn.commit()
+        return len(terms)
+    except Exception as e:
+        logging.error(f"JD term record error: {e}")
+        return 0
+
+
+def get_resume_vocabulary():
+    """Every term Kevin's resume/outreach copy already claims, normalized for comparison.
+
+    Union of core_skills and the bullet bank. A gap term is one the MARKET uses that this set does
+    not, so the bank has to be read as live text rather than assumed - editing a bullet changes
+    what counts as a gap.
+    """
+    vocab = set()
+
+    def _fold(text):
+        for term in extract_jd_terms(text, max_terms=400):
+            vocab.add(term)
+
+    for skill in get_filter("core_skills", []) or []:
+        s = str(skill).strip().lower()
+        if s:
+            vocab.add(s)
+            _fold(s)
+    try:
+        with open(RESUME_BULLETS_BANK_PATH, "r", encoding="utf-8") as f:
+            bank = json.load(f)
+        for bullets in (bank or {}).values():
+            for bullet in bullets or []:
+                _fold(bullet)
+    except Exception as e:
+        logging.error(f"Resume vocabulary read error: {e}")
+    return vocab
+
+
+def load_resume_bullet_tracks():
+    """The bullet bank as {track_key: [bullet, ...]}. Empty dict if unreadable."""
+    try:
+        with open(RESUME_BULLETS_BANK_PATH, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception as e:
+        logging.error(f"Resume bullet bank read error: {e}")
+        return {}
+
+
+def resolve_bullet_track_key(arg, tracks):
+    """Accept 'e', 'track_e', 'bizops' or the full key for track_e_bizops."""
+    want = str(arg or "").strip().lower().replace("-", "_")
+    if not want:
+        return None
+    if want in tracks:
+        return want
+    for key in tracks:
+        tail = key[len("track_"):] if key.startswith("track_") else key
+        letter = tail.split("_", 1)[0]
+        name = tail.split("_", 1)[1] if "_" in tail else ""
+        if want in (letter, f"track_{letter}", name, tail):
+            return key
+    return None
+
+
+def draft_bullets_for_gaps(track_key, existing_bullets, gaps, max_bullets=5):
+    """Ask Gemini to phrase resume bullets that use the market's vocabulary.
+
+    NOTHING IS WRITTEN. The output is printed for Kevin to accept, edit or bin, and the caller
+    labels it unverified. That gate is the whole design: a bullet is a factual claim about his
+    work history, and a model optimizing for keyword coverage will happily assert experience he
+    does not have - which is a claim he then has to defend in an interview. So the prompt is
+    framed as rephrasing what he already did, the existing bank is passed as the ground truth,
+    and the model is told to leave a term alone when his history does not support it.
+    """
+    terms = [g["term"] for g in (gaps or [])][:12]
+    if not terms or not existing_bullets:
+        return []
+    system_prompt = (
+        "You rephrase EXISTING resume bullets to use the vocabulary a job market actually uses. "
+        "You are strictly forbidden from inventing experience. Every bullet you return must be a "
+        "rewording of a bullet you were given, describing the SAME work, the same systems and the "
+        "same metrics. If a target term does not honestly fit any existing bullet, omit that term "
+        "- an omitted term is a correct answer, a fabricated one is a failure. Never invent "
+        "numbers, employers, tools or dates, and never inflate a metric you were given."
+    )
+    prompt = (
+        "EXISTING BULLETS (the only work history that is true):\n"
+        + "\n".join(f"- {b}" for b in existing_bullets)
+        + "\n\nTARGET VOCABULARY (terms from high-fit job postings):\n"
+        + ", ".join(terms)
+        + f"\n\nReturn JSON: {{\"bullets\":[{{\"bullet\":\"...\",\"covers\":[\"term\"],"
+          "\"based_on\":\"the existing bullet you rewrote\"}}]}}\n"
+        f"At most {max_bullets} bullets. Each under 200 characters, starting with a past-tense "
+        "verb. Only include a bullet if it genuinely reflects the source bullet's work."
+    )
+    raw = call_gemini_api(prompt, system_prompt=system_prompt)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        logging.error(f"Bullet draft parse error: {e}")
+        return []
+    out = []
+    for item in (data or {}).get("bullets", [])[:max_bullets]:
+        if isinstance(item, dict) and str(item.get("bullet", "")).strip():
+            out.append({
+                "bullet": str(item["bullet"]).strip()[:300],
+                "covers": [str(c) for c in (item.get("covers") or [])][:6],
+                "based_on": str(item.get("based_on", ""))[:300],
+            })
+    return out
+
+
+def get_jd_term_gaps(limit=25, min_docs=2):
+    """Terms the market uses in high-fit roles that Kevin's resume copy never says.
+
+    Ranked by hi_fit_docs: a term in ten 90-scoring postings matters more than one in fifty
+    postings that averaged 40. min_docs drops one-off vocabulary from a single weird listing.
+    """
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute("""
+                SELECT term, docs, fit_sum, hi_fit_docs
+                FROM jd_term_yield
+                WHERE docs >= ?
+                ORDER BY hi_fit_docs DESC, docs DESC
+                LIMIT 400
+            """, (min_docs,)).fetchall()
+    except Exception as e:
+        logging.error(f"JD term gap read error: {e}")
+        return []
+
+    owned = get_resume_vocabulary()
+    gaps = []
+    for term, docs, fit_sum, hi_fit_docs in rows:
+        if term in owned:
+            continue
+        # A bigram whose halves Kevin already claims is not a gap - "process automation" when the
+        # bank says both "process" and "automation" adds nothing to go rewrite bullets over.
+        parts = term.split()
+        if len(parts) > 1 and all(p in owned for p in parts):
+            continue
+        gaps.append({
+            "term": term,
+            "docs": docs,
+            "hi_fit_docs": hi_fit_docs,
+            "avg_fit": int(fit_sum / docs) if docs else 0,
+        })
+        if len(gaps) >= limit:
+            break
+    return gaps
+
 SOFT_CAP_KNEE = 90
 
 
@@ -4049,6 +4248,10 @@ def process_single_candidate(job):
         salary_str, _ = extract_salary(job)
         work_style = extract_work_style(job)
         overlap_pct, matched_skills = calculate_keyword_overlap(job.get("job_description"))
+        # Bank this JD's vocabulary against its fit score. Pure telemetry - see record_jd_terms().
+        # This is the data /gaps and /bullets read; without it every posting's language is
+        # computed for the Skills % and then discarded.
+        record_jd_terms(job.get("job_description"), score)
 
         # Oddball Wildcard Badge: flags roles matching the rolling query bank's oddball keyword themes
         oddball_text = f"{job_title.lower()} {str(job.get('job_description') or '')[:300].lower()}"
@@ -6617,7 +6820,31 @@ def is_permanent_crm_rejection(message):
     return any(marker in lowered for marker in PERMANENT_CRM_REJECTIONS)
 
 
-def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False):
+def crm_failure_alert_text(payload, attempts, reason=""):
+    """One line identifying WHICH write failed and why.
+
+    The old text was a bare attempt count, so several failing payloads produced several identical
+    Telegram warnings that could not be told apart - and the Apps Script `message` explaining the
+    failure only ever reached logging.error, which is not visible from the phone this alert lands on.
+    """
+    payload = payload or {}
+    action = payload.get("action", "unknown")
+    bits = [f"CRM write '{action}' failed after {attempts} attempt(s)."]
+    uuid = payload.get("sheet_uuid")
+    if uuid:
+        bits.append(f"uuid={uuid}")
+    tab = payload.get("tab") or payload.get("target_code")
+    if tab:
+        bits.append(f"tab={tab}")
+    rows = payload.get("rows")
+    if rows:
+        bits.append(f"rows={len(rows)}")
+    if reason:
+        bits.append(f"Last error: {str(reason)[:200]}")
+    return " ".join(bits)
+
+
+def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on_exhaustion=True):
     """Log to Google Sheets CRM. Payload may include row UUID and note timestamp.
     Support apps script bottom-to-top search loops via rowOperationOrder: 'DESC'.
 
@@ -6638,6 +6865,14 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False):
     Callers that only branch on success get the usual False; the outbox passes
     raise_on_permanent=True to get a PermanentCRMRejection instead, which is its signal to delete
     the queued row rather than requeue it for ten more alert-firing passes.
+
+    alert_on_exhaustion is for callers that are themselves the retry mechanism. Exhausting the
+    attempts here is only newsworthy when this call was the last word on the payload. The outbox
+    passes max_retries=1 and re-dispatches every 5s until retry_count hits 10, so a failed attempt
+    is an ordinary step in its backoff, not a delivery failure - alerting per attempt turned one
+    stuck /warm write into four identical "Failed to log payload after 1 attempts" warnings inside
+    two minutes, with no action, uuid or reason to tell them apart. The outbox alerts once, on its
+    own terms, when the row is actually abandoned.
     """
     if not CRM_WEBHOOK_URL:
         return False
@@ -6646,16 +6881,22 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False):
         payload["rowOperationOrder"] = "DESC"
     action = payload.get("action", "unknown")
     expected_rows = len(payload.get("rows") or []) if action == "batch_add_rows" else None
+    last_failure = ""
     delay = 1.0
     for attempt in range(max_retries):
         try:
             res = crm_post(payload)
+            if not res:
+                last_failure = "no response from the CRM webhook"
+            elif res.status_code != 200:
+                last_failure = f"HTTP {res.status_code}"
             if res and res.status_code == 200:
                 try:
                     body = res.json()
                 except Exception:
                     # A non-JSON 200 is the Apps Script HTML error/login page, not a written row.
                     logging.error(f"CRM '{action}': non-JSON 200 response: {res.text[:200]}")
+                    last_failure = "non-JSON 200 (Apps Script error or login page)"
                     body = None
 
                 if isinstance(body, dict):
@@ -6697,6 +6938,7 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False):
                         return True
 
                     logging.error(f"CRM '{action}' rejected by Apps Script: {message}")
+                    last_failure = message or "rejected with no message"
                     if "unauthorized" in message.lower():
                         send_health_alert(
                             "CRM webhook is rejecting every write as Unauthorized - rows are NOT "
@@ -6722,9 +6964,11 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False):
             raise  # never retried, and never swallowed by the transient handler below
         except Exception as e:
             logging.error(f"CRM Webhook Attempt {attempt+1} Failed: {e}")
+            last_failure = f"{type(e).__name__}: {e}"
         time.sleep(delay)
         delay *= 2.0
-    send_health_alert(f"Failed to log payload to Google Sheets after {max_retries} attempts.")
+    if alert_on_exhaustion:
+        send_health_alert(crm_failure_alert_text(payload, max_retries, last_failure))
     return False
 
 def enqueue_crm_payload(payload):
@@ -6760,7 +7004,9 @@ def process_crm_outbox_batch(inter_job_sleep=1.0):
         payload = json.loads(payload_str)
         permanent = None
         try:
-            success = log_to_sheets_crm(payload, max_retries=1, raise_on_permanent=True)
+            success = log_to_sheets_crm(
+                payload, max_retries=1, raise_on_permanent=True, alert_on_exhaustion=False
+            )
         except PermanentCRMRejection as e:
             # Impossible to satisfy by retrying (e.g. the row's sheet_uuid is not in any tab), so
             # drop it instead of requeueing. Alert ONCE here rather than on all 10 retry passes.
@@ -6781,13 +7027,23 @@ def process_crm_outbox_batch(inter_job_sleep=1.0):
                 conn.execute("DELETE FROM crm_outbox WHERE id = ?", (job_id,))
             else:
                 conn.execute("""
-                    UPDATE crm_outbox 
-                    SET retry_count = retry_count + 1, 
+                    UPDATE crm_outbox
+                    SET retry_count = retry_count + 1,
                         last_attempt = CURRENT_TIMESTAMP,
                         status = CASE WHEN retry_count + 1 >= 10 THEN 'FAILED' ELSE 'PENDING' END
                     WHERE id = ?
                 """, (job_id,))
             conn.commit()
+
+        # The outbox owns the retry budget, so it also owns the "this will never land" alert - fired
+        # once, at the pass that gives up, instead of on every pass that merely backs off.
+        if not (success or permanent) and retries + 1 >= 10:
+            logging.error(f"CRM Outbox abandoning payload #{job_id} after 10 attempts")
+            send_health_alert(
+                crm_failure_alert_text(payload, 10)
+                + " Giving up after 10 retries - it is NOT in the sheet. "
+                "Anything it carried (status move, follow-up date, note) must be set by hand."
+            )
         if inter_job_sleep:
             time.sleep(inter_job_sleep)
 
@@ -9351,6 +9607,83 @@ def process_webhook_payload_async(data):
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
             send_telegram_message(chat_id, "\n".join(lines))
             return
+        if text == "/gaps" or text.startswith("/gaps "):
+            gaps = get_jd_term_gaps(limit=20)
+            if not gaps:
+                with get_db_conn() as _c:
+                    banked = _c.execute("SELECT COUNT(*) FROM jd_term_yield").fetchone()[0]
+                send_telegram_message(
+                    chat_id,
+                    "🕳️ <b>Vocabulary Gaps</b>\n\n"
+                    f"Nothing to report yet ({banked} terms banked). Every scored job adds its "
+                    "vocabulary; a term needs to appear in 2+ postings before it shows here, so "
+                    "this fills up over the next few <code>/t</code> runs."
+                )
+                return
+            lines = ["🕳️ <b>Vocabulary Gaps</b>\n",
+                     "Language high-fit postings use that your resume copy never says:\n"]
+            for g in gaps:
+                flag = " 🔥" if g["hi_fit_docs"] >= 3 else ""
+                lines.append(
+                    f"<code>{g['docs']:>3} JDs · {g['hi_fit_docs']:>2} hi-fit · avg {g['avg_fit']:>3}</code>{flag}\n"
+                    f"  {html.escape(str(g['term']))}"
+                )
+            lines.append(
+                f"\n🔥 = in 3+ postings scoring {HI_FIT_THRESHOLD}+.\n"
+                "<code>/bullets &lt;track&gt;</code> drafts resume bullets from these."
+            )
+            send_telegram_message(chat_id, "\n".join(lines))
+            return
+
+        if text == "/bullets" or text.startswith("/bullets "):
+            arg = text[len("/bullets"):].strip().lower()
+            tracks = load_resume_bullet_tracks()
+            if not arg:
+                send_telegram_message(
+                    chat_id,
+                    "✍️ <b>Draft Resume Bullets</b>\n\nUsage: <code>/bullets &lt;track&gt;</code>\n\n"
+                    "Tracks: " + ", ".join(f"<code>{t}</code>" for t in sorted(tracks)) +
+                    "\n\nDrafts candidate bullets from the vocabulary gaps in <code>/gaps</code>. "
+                    "Nothing is saved - you copy what is true and edit the rest."
+                )
+                return
+            track_key = resolve_bullet_track_key(arg, tracks)
+            if not track_key:
+                send_telegram_message(
+                    chat_id,
+                    f"❌ Unknown track <code>{html.escape(arg)}</code>.\n\nTracks: "
+                    + ", ".join(f"<code>{t}</code>" for t in sorted(tracks))
+                )
+                return
+            gaps = get_jd_term_gaps(limit=12)
+            if not gaps:
+                send_telegram_message(
+                    chat_id,
+                    "🕳️ No vocabulary gaps banked yet - run a few <code>/t</code> cycles first, "
+                    "then <code>/gaps</code> to see what the market is asking for."
+                )
+                return
+            send_telegram_message(chat_id, f"✍️ Drafting bullets for <code>{track_key}</code>...")
+            drafted = draft_bullets_for_gaps(track_key, tracks.get(track_key, []), gaps)
+            if not drafted:
+                send_telegram_message(
+                    chat_id,
+                    "❌ Draft failed (Gemini unavailable or returned nothing usable). "
+                    "The gap list from <code>/gaps</code> is still the useful part - write from it by hand."
+                )
+                return
+            lines = [f"✍️ <b>Draft Bullets - {html.escape(track_key)}</b>\n",
+                     "⚠️ <b>Unverified.</b> These are phrasing suggestions built from market "
+                     "vocabulary, NOT claims about your history. Keep only what you actually did.\n"]
+            for i, b in enumerate(drafted, 1):
+                lines.append(f"<b>{i}.</b> {html.escape(str(b.get('bullet', '')))}")
+                covers = b.get("covers") or []
+                if covers:
+                    lines.append(f"   <i>covers: {html.escape(', '.join(str(c) for c in covers))}</i>")
+            lines.append("\nNothing was saved. Edit what is true into <code>resume_bullets_bank.json</code>.")
+            send_telegram_message(chat_id, "\n".join(lines))
+            return
+
         if text == "/queries":
             rows = get_query_yield_rows(limit=25)
             if not rows:
@@ -10407,6 +10740,8 @@ def process_webhook_payload_async(data):
                 "/unbury - Preview buried-listing cleanup (add 'go' to clear)\n"
                 "/crazy - Stop a CRM retry/alert storm (add 'go' to clear the outbox)\n"
                 "/queries - Per-query yield: which search phrases earn their slot\n"
+                "/gaps - Vocabulary high-fit postings use that your resume doesn't\n"
+                "/bullets &lt;track&gt; - Draft resume bullets from those gaps (saves nothing)\n"
                 "/queue - Preview what the nightly follow-up sequencer would do (read-only)\n"
                 "/outcomes - View evidence-based reply/interview rates by source & path\n"
                 "/decoys - Dead-link (expired posting) rate per source\n"

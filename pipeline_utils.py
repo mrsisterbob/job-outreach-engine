@@ -1607,3 +1607,119 @@ def build_ingest_job_dict(title, company, description, url, now=None):
         "job_is_remote": False,
         "job_posted_at_datetime_utc": stamp.isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# JD vocabulary extraction (feeds the jd_term_yield table and /gaps)
+# ---------------------------------------------------------------------------
+
+# Words that carry no signal about what a ROLE actually does. This is deliberately aggressive:
+# the output is meant to be read by a human deciding what to put on a resume, so a list padded
+# with "opportunity" and "candidate" is worse than a short list of real domain nouns.
+_JD_STOPWORDS = frozenset("""
+a an the and or but if then than that this these those with without within of in on at to for
+from by as is are was were be been being have has had do does did will would shall should can
+could may might must not no nor so such own same too very just only own about into over under
+you your we our they their he she it its his her them us me my i who whom whose which what when
+where why how all any both each few more most other some any one two three first second new
+role position job candidate applicant opportunity opportunities company team teams work working
+works experience experienced year years month months day days time full part time hybrid remote
+onsite office location locations apply application applications please required require requires
+requirement requirements preferred prefer strong excellent ability able skills skill knowledge
+understanding familiarity proficiency proficient demonstrated proven track record plus bonus
+responsibilities responsibility duties duty include includes including etc via per across
+support supporting help helping ensure ensuring provide providing maintain maintaining
+join looking seeking hiring welcome equal employer opportunity diversity inclusive benefits
+salary compensation range pay paid insurance health dental vision 401k pto vacation holiday
+degree bachelor bachelors master masters education graduate university college school
+environment culture fast paced growth growing career development training mentorship
+communication interpersonal written verbal detail oriented organized organizational
+self starter motivated passionate driven collaborative independently independent
+please note applicants will receive consideration without regard race color religion sex
+national origin disability veteran status sexual orientation gender identity
+build builds building drive drives driving manage manages managing handle handles handling
+perform performs performing produce produces producing own owns support supports
+improve improves improvement improvements system systems process processes
+partner partners partnering deliver delivers delivering execute executes
+lead leads leading own owned create creates creating develop develops developing
+use uses using need needs needed want wants make makes made take takes
+new existing various multiple key core strong daily weekly monthly
+""".split())
+
+# Phrases the extractor would otherwise split into meaningless halves. Checked as whole strings
+# before the n-gram walk so "power bi" survives instead of becoming "power" + "bi".
+_JD_PROTECTED_PHRASES = (
+    "power bi", "accounts payable", "accounts receivable", "general ledger",
+    "month end close", "year end close", "policy administration", "claims handling",
+    "data entry", "data quality", "data governance", "project management",
+    "process improvement", "process automation", "continuous improvement",
+    "risk management", "internal controls", "due diligence", "know your customer",
+    "anti money laundering", "business intelligence", "root cause analysis",
+    "standard operating procedure", "service level agreement", "key performance indicator",
+    "customer relationship management", "enterprise resource planning",
+)
+
+_JD_TOKEN_RE = re.compile(r"[a-z][a-z0-9+#./-]{1,}")
+
+
+def _jd_singularize(token):
+    """Crude, deliberate stemmer: collapse plurals so 'reconciliations' and 'reconciliation'
+    aggregate as one term. Only handles the endings that actually show up in job posts - a real
+    stemmer would also fold 'reconcile', which is a different part of speech and worth counting
+    separately when deciding resume wording.
+    """
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 4 and token.endswith("sses"):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        return token[:-1]
+    return token
+
+
+def extract_jd_terms(job_description, max_terms=60):
+    """Domain vocabulary from one job description, as a list of normalized terms.
+
+    Returns unigrams and bigrams with stopwords stripped, plus any protected phrase found intact.
+    Deduplicated per document: this answers "which terms does this JD use", not "how often", so a
+    posting that says 'reconciliation' nine times counts once and cannot outvote nine other
+    postings. Frequency across DOCUMENTS is the signal worth having.
+    """
+    text = str(job_description or "").lower()
+    if not text.strip():
+        return []
+
+    found = []
+    seen = set()
+
+    def _add(term):
+        if term and term not in seen:
+            seen.add(term)
+            found.append(term)
+
+    for phrase in _JD_PROTECTED_PHRASES:
+        if phrase in text:
+            _add(phrase)
+
+    raw = _JD_TOKEN_RE.findall(text)
+    tokens = []
+    for tok in raw:
+        tok = tok.strip("-./")
+        if not tok or tok in _JD_STOPWORDS:
+            tokens.append(None)  # a gap, so bigrams never span a dropped stopword
+            continue
+        stem = _jd_singularize(tok)
+        if stem in _JD_STOPWORDS or len(stem) < 3 or stem.isdigit():
+            tokens.append(None)
+            continue
+        tokens.append(stem)
+
+    for tok in tokens:
+        if tok:
+            _add(tok)
+
+    for left, right in zip(tokens, tokens[1:]):
+        if left and right:
+            _add(f"{left} {right}")
+
+    return found[:max_terms]

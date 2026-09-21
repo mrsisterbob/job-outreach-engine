@@ -1563,3 +1563,79 @@ def test_domain_search_prefers_a_generic_mailbox_over_a_personal_one(monkeypatch
     monkeypatch.setattr(pu.requests, "get", _get)
 
     assert pu._hunter_domain_search("ups.com") == "careers@ups.com"
+
+
+# ---- JD vocabulary extraction ----
+
+_SURETY_JD = """Hybrid Operations & Analytics Associate - Surety. You will reconcile bordereaux
+and premium bookings, build reporting in Power BI, maintain the policy administration system,
+partner with brokers and drive process improvement across the surety portfolio. Requirements:
+strong analytical skills, 2+ years of experience, bachelors degree preferred. We are an equal
+opportunity employer and all applicants will receive consideration without regard to race."""
+
+
+def test_extract_jd_terms_surfaces_domain_vocabulary():
+    """The whole point: terms Kevin's 10-word core_skills bank cannot see."""
+    terms = pu.extract_jd_terms(_SURETY_JD)
+    assert "surety" in terms
+    assert "bordereaux" in terms
+    assert "premium booking" in terms, "phrasal ops vocabulary must survive as a bigram"
+
+
+def test_extract_jd_terms_keeps_protected_phrases_intact():
+    terms = pu.extract_jd_terms(_SURETY_JD)
+    assert "power bi" in terms, "'power bi' must not degrade into 'power' + 'bi'"
+    assert "policy administration" in terms
+
+
+def test_extract_jd_terms_drops_boilerplate():
+    """A list padded with EEO and benefits language is useless for resume decisions."""
+    terms = pu.extract_jd_terms(_SURETY_JD)
+    for junk in ("experience", "requirement", "opportunity", "employer", "degree",
+                 "applicant", "skill", "year", "strong", "preferred"):
+        assert junk not in terms, f"boilerplate term {junk!r} leaked into the vocabulary"
+
+
+def test_extract_jd_terms_bigrams_never_span_a_dropped_stopword():
+    """'reporting in Power BI' must not yield the phantom bigram 'reporting power'."""
+    terms = pu.extract_jd_terms("Build reporting in Power BI dashboards.")
+    assert "reporting power" not in terms
+
+
+def test_extract_jd_terms_counts_each_term_once_per_document():
+    """Document frequency is the signal; one shouty JD must not outvote nine others."""
+    terms = pu.extract_jd_terms("Reconciliation reconciliation RECONCILIATION reconciliations.")
+    assert terms.count("reconciliation") == 1
+
+
+def test_extract_jd_terms_singularizes_plurals():
+    """'reconciliations' and 'reconciliation' must aggregate as one term."""
+    assert "reconciliation" in pu.extract_jd_terms("Owns daily reconciliations for the desk.")
+    assert "policy" in pu.extract_jd_terms("Reviews policies before binding.")
+
+
+def test_extract_jd_terms_handles_empty_input():
+    assert pu.extract_jd_terms("") == []
+    assert pu.extract_jd_terms(None) == []
+
+
+def test_extract_jd_terms_drops_generic_action_verbs():
+    """Regression: 'build', 'drive', 'system' and 'improvement' appear in nearly every posting, so
+    they outranked the domain nouns in /gaps and told Kevin nothing about what to write.
+    """
+    terms = pu.extract_jd_terms(
+        "Build reporting, drive process improvement, manage the system, support the team."
+    )
+    for generic in ("build", "drive", "system", "improvement", "manage", "support"):
+        assert generic not in terms, f"generic verb {generic!r} must not rank as vocabulary"
+
+
+def test_extract_jd_terms_keeps_phrases_built_from_stopworded_halves():
+    """'process' and 'system' are stopwords, but 'process improvement' and 'policy administration'
+    are real vocabulary - the protected-phrase pass must run before tokenization."""
+    terms = pu.extract_jd_terms(
+        "Drive process improvement and process automation in the policy administration system."
+    )
+    assert "process improvement" in terms
+    assert "process automation" in terms
+    assert "policy administration" in terms
