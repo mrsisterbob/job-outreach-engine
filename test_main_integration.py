@@ -6403,3 +6403,80 @@ def test_ingest_passes_force_through_to_scoring(monkeypatch):
     m.ingest_manual_job(title="Life Insurance Specialist", company="AAA", force=True)
 
     assert seen.get("force") is True, "/job! must reach the screener as an override"
+
+
+# ---- bare /e must not fill Contact Email with a guessed address ----
+
+def test_fallback_addresses_are_flagged_unverified():
+    """The guard /e relies on: a company-name guess must be distinguishable from a real address."""
+    guess = m.resolve_target_email("AAA Life Insurance Company", "Annuity Specialist", None)
+    assert m.is_unverified_email(guess), "a name-mangled guess must carry the fallback tag"
+    real = m.resolve_target_email("Real Co", "Ops Analyst", "https://realco.com")
+    assert not m.is_unverified_email(real), "an address off the real domain must NOT be flagged"
+
+
+def _e_env(monkeypatch, employer_website=None, company="AAA Life Insurance Company"):
+    """Drive the real /e handler with everything outbound stubbed. Returns what it tried to save."""
+    saved = {"local": [], "crm": [], "headers": []}
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-e", "sheet_tab": "Tetiana Cold",
+        "contact_name": "", "contact_company": company})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {
+        "job_title": "Annuity Processing Specialist", "employer_name": company,
+        "employer_website": employer_website, "job_id": "ingest_x"})
+    monkeypatch.setattr(m, "rebuild_job_from_card", lambda job, txt: (job, False))
+    monkeypatch.setattr(m, "_job_data_available", lambda job, mapping: True)
+    monkeypatch.setattr(m, "update_job_target_email",
+                        lambda uuid, email: saved["local"].append(email))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: saved["crm"].append(p))
+    monkeypatch.setattr(m, "log_addressed_contact_to_carmen_cold", lambda *a, **k: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: None)
+
+    def _stage(chat_id, mapping, job, comp, title, is_warm, email, header, label):
+        saved["headers"].append(header)
+        saved["drafted_to"] = email
+    monkeypatch.setattr(m, "stage_outreach_draft", _stage)
+    return saved
+
+
+def test_bare_e_leaves_contact_email_blank_when_it_only_has_a_guess(monkeypatch):
+    """THE ASK: bare /e with no real domain must not write operations@<mangled-name>.com into the
+    Contact Email column - that filled the sheet with addresses nobody had verified."""
+    saved = _e_env(monkeypatch, employer_website=None)
+
+    _dispatch("/e", reply_to_message={"text": "card"})
+
+    assert saved["local"] == [], "a guessed address must never reach the local cache"
+    assert saved["crm"] == [], "a guessed address must never reach the sheet"
+    assert m.is_unverified_email(saved["drafted_to"]), "sanity: this run WAS a guess"
+
+
+def test_bare_e_still_drafts_to_the_guess(monkeypatch):
+    """Not persisting it must not mean not drafting - a draft needs a recipient, and Kevin reads
+    it before sending."""
+    saved = _e_env(monkeypatch, employer_website=None)
+
+    _dispatch("/e", reply_to_message={"text": "card"})
+
+    assert saved.get("drafted_to"), "the draft must still be addressed"
+    assert "NOT saved" in saved["headers"][0], "the header must say it was not saved"
+
+
+def test_bare_e_persists_an_address_off_the_real_domain(monkeypatch):
+    """An address built from the employer's actual website is evidence, not a guess."""
+    saved = _e_env(monkeypatch, employer_website="https://realco.com", company="Real Co")
+
+    _dispatch("/e", reply_to_message={"text": "card"})
+
+    assert saved["local"] == ["operations@realco.com"]
+    assert len(saved["crm"]) == 1, "a resolved real-domain address still syncs to the sheet"
+
+
+def test_typed_address_always_persists(monkeypatch):
+    """Typing the address IS the confirmation - it saves regardless of what resolution would say."""
+    saved = _e_env(monkeypatch, employer_website=None)
+
+    _dispatch("/e dana@weird-domain.io", reply_to_message={"text": "card"})
+
+    assert saved["local"] == ["dana@weird-domain.io"]
+    assert len(saved["crm"]) == 1

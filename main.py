@@ -10388,7 +10388,10 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=target))
             # Same reasoning as /e: an address resolved and drafted to here is one Kevin is
             # actively working, so it belongs in Carmen Cold regardless of company tracking.
-            # Unverified waterfall guesses never reach this line - that branch returns above.
+            #
+            # NOTE: unlike bare /e, this DOES persist an unverified waterfall guess - /eh spends
+            # provider credits on a real lookup, so even a low-confidence hit is evidence rather
+            # than a name-mangled guess, and the [⚠️ Unverified] tag rides along with it.
             log_addressed_contact_to_carmen_cold(
                 target, company=comp, name=mapping.get("contact_name", ""),
                 note=f"[{datetime.now().strftime('%Y-%m-%d')}] Emailed: {title}"
@@ -10435,15 +10438,31 @@ def process_webhook_payload_async(data):
             new_email = raw_email if typed_email else resolve_target_email(
                 comp, title, job.get("employer_website")
             )
-            update_job_target_email(mapping["sheet_uuid"], new_email)
+            # A GUESSED address is not a contact. resolve_target_email() always returns something -
+            # when it has no real domain it invents one from the company name and tags it
+            # [⚠️ Fallback Email] - and writing that to the sheet filled the Contact Email column
+            # with addresses nobody had verified, indistinguishable at a glance from ones Kevin
+            # actually confirmed. A bare /e that resolves a guess now leaves the column BLANK; the
+            # draft still goes out to the guess, because a draft needs a recipient and Kevin reads
+            # it before sending.
+            persist_email = typed_email or not is_unverified_email(new_email)
+            if persist_email:
+                update_job_target_email(mapping["sheet_uuid"], new_email)
 
-            header = (
-                f"🎯 <b>Apollo Email Locked:</b> <code>{html.escape(new_email)}</code>" if typed_email
-                else f"✉️ <b>Drafted to:</b> <code>{html.escape(new_email)}</code> <i>(auto-resolved)</i>"
-            )
+            if typed_email:
+                header = f"🎯 <b>Apollo Email Locked:</b> <code>{html.escape(new_email)}</code>"
+            elif persist_email:
+                header = f"✉️ <b>Drafted to:</b> <code>{html.escape(new_email)}</code> <i>(auto-resolved)</i>"
+            else:
+                header = (
+                    f"✉️ <b>Drafted to:</b> <code>{html.escape(new_email)}</code>\n"
+                    "<i>Guessed from the company name - NOT saved to the CRM. Send "
+                    "<code>/e name@company.com</code> once you have a real address.</i>"
+                )
             # Resume PDF, email body, Gmail draft and card - shared with /eh
             stage_outreach_draft(chat_id, mapping, job, comp, title, is_warm, new_email, header, "/e")
-            enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
+            if persist_email:
+                enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=new_email))
             # Typing the address IS the intent to track this person, so log them to Carmen Cold
             # without the company gate the passive sweep uses - that gate drops agency recruiters
             # at untracked firms, which is most of who /e gets used on. A RESOLVED address carries
