@@ -431,13 +431,23 @@ function doPost(e) {
           name: name,
           company: company,
           title: title,
+          // Column C again under the key the job-side callers read. `title` is "" for PEOPLE
+          // tabs by design (see above), so a JOBS consumer cannot rely on it.
+          job_title: schemaType === "JOBS" ? (row[2] || "") : "",
           email: row[3] || "",
           priority: rowPriority,
           raw_priority: row[4] || "",
           status: row[5] || "",          // Column F, verbatim - the follow-up sequencer buckets it
           date_added: formatDate(row[0]), // Column A - the sequencer's stable +4/+9/+16 anchor
           note: row[8],
-          next_followup: formatFollowupDate(row[6])
+          next_followup: formatFollowupDate(row[6]),
+          // Column H. On a JOBS tab this is the posting URL, which the nightly link sweep needs
+          // to tell a live req from a pulled one; on a PEOPLE tab the same column is
+          // "LinkedIn / Source", so it is only emitted as job_link for JOBS. Without this the
+          // sweep read every row and checked none of them - get_followups simply never returned
+          // the URL, so rec.get("job_link") was always None.
+          job_link: schemaType === "JOBS" ? (row[7] || "") : "",
+          source_link: schemaType === "JOBS" ? "" : (row[7] || "")
         });
       }
       // Overdue Follow-Up Sort: Next Followup Date ASC, Priority DESC

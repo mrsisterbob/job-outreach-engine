@@ -6812,3 +6812,52 @@ def test_probe_handles_no_response(monkeypatch):
     monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://fake")
     monkeypatch.setattr(m, "crm_post", lambda p, **k: None)
     assert "No response at all" in m.probe_crm_read()
+
+
+def test_get_followups_contract_covers_what_the_sweep_reads():
+    """THE BUG: get_followups never returned the Job Link, so check_job_links read every row and
+    checked none - "Checked 0 links" against a sheet full of postings, which read as a clean
+    sweep. Code.gs and main.py are separate files with no shared type, so the only thing keeping
+    this contract honest is a test that reads both.
+    """
+    import re, pathlib
+    root = pathlib.Path(m.__file__).parent
+    gs = (root / "Code.gs").read_text(encoding="utf-8")
+    py = (root / "main.py").read_text(encoding="utf-8")
+
+    block = gs[gs.index('if (action === "get_followups")'):]
+    push = block[block.index("results.push({"):]
+    push = push[:push.index("});")]
+    returned = set(re.findall(r"^\s*([a-z_]+):", push, re.M))
+
+    sweep = py[py.index("def check_job_links"):][:3000]
+    read = set(re.findall(r'rec\.get\("([a-z_]+)"', sweep))
+
+    missing = read - returned
+    assert not missing, f"check_job_links reads fields get_followups never returns: {sorted(missing)}"
+    assert "job_link" in returned, "the sweep cannot work without the posting URL"
+
+
+def test_sweep_skips_rows_without_a_usable_link(monkeypatch):
+    """A row with no Job Link is not an error - it is just not checkable."""
+    _linkcheck_env(
+        monkeypatch,
+        [{"sheet_uuid": "u1", "status": "Matched", "job_link": "", "company": "A", "job_title": "R"},
+         {"sheet_uuid": "", "status": "Matched", "job_link": "https://x.com/1", "company": "B", "job_title": "R"},
+         {"sheet_uuid": "u3", "status": "Matched", "job_link": "not-a-url", "company": "C", "job_title": "R"}],
+        {},
+    )
+    result = m.check_job_links(sleep_between=0)
+    assert result["checked"] == 0, "none of these three are checkable"
+
+
+def test_sweep_checks_a_row_that_has_both_uuid_and_link(monkeypatch):
+    """The positive control for the bug above - a well-formed row MUST be checked."""
+    _linkcheck_env(
+        monkeypatch,
+        [{"sheet_uuid": "u1", "status": "Matched", "job_link": "https://co.com/j/1",
+          "company": "Acme", "job_title": "Ops Analyst"}],
+        {"https://co.com/j/1": (200, "https://co.com/j/1", "<p>Apply now</p>", None)},
+    )
+    result = m.check_job_links(sleep_between=0)
+    assert result["checked"] == 1
