@@ -6068,3 +6068,122 @@ def test_draft_bullets_returns_nothing_without_ground_truth(monkeypatch):
 def test_draft_bullets_survives_garbage_model_output(monkeypatch):
     monkeypatch.setattr(m, "call_gemini_api", lambda *a, **k: "not json at all")
     assert m.draft_bullets_for_gaps("track_a", ["Did a thing."], [{"term": "surety"}]) == []
+
+
+# ---- Orphaned sheet_uuid: a card must never point at a row that was never written ----
+
+def _batch_resp(count, dispositions=None, msg="Batch inserted rows"):
+    body = {"status": "success", "message": msg, "count": count}
+    if dispositions is not None:
+        body["dispositions"] = dispositions
+
+    class _R:
+        status_code = 200
+        def json(self):
+            return body
+    return _R()
+
+
+def _dispatch_env(monkeypatch, resp):
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: resp)
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+    cards = []
+    monkeypatch.setattr(m, "send_telegram_card",
+                        lambda *a, **kw: cards.append(kw.get("sheet_uuid")))
+    return cards
+
+
+def _tier1_match(company, title, short_id, sent_uuid, score=90):
+    return {
+        "job": {"employer_name": company, "job_title": title, "job_apply_link": ""},
+        "score": score, "reason": "r", "target_email": "a@b.c", "age_badge": "",
+        "salary_str": "", "work_style": "", "overlap_pct": 0,
+        "short_id": short_id, "sheet_uuid": sent_uuid, "is_clavicular": False,
+    }
+
+
+def test_suppressed_row_card_is_repointed_at_the_live_row(monkeypatch):
+    """THE BUG: Code.gs drops a duplicate row from the batch but reports overall success, so the
+    card shipped carrying a uuid that was never written to any tab. Every later /warm, /apply and
+    /n on it failed with 'No record found' forever.
+    """
+    cards = _dispatch_env(monkeypatch, _batch_resp(1, [
+        {"sent_uuid": "SENT-DEAD", "status": "duplicate_suppressed", "existing_uuid": "LIVE-ROW"},
+        {"sent_uuid": "SENT-OK", "status": "written", "existing_uuid": "SENT-OK"},
+    ]))
+    m.save_job_to_cache("s1", {"employer_name": "TEKsystems"}, "SENT-DEAD")
+
+    m.dispatch_tier1_matches([
+        _tier1_match("TEKsystems", "Operations Support Analyst", "s1", "SENT-DEAD"),
+        _tier1_match("Other Co", "Ops Analyst", "s2", "SENT-OK"),
+    ])
+
+    assert "SENT-DEAD" not in cards, "a card must never carry a uuid with no row behind it"
+    assert cards[0] == "LIVE-ROW", "the suppressed card must target the row that actually exists"
+    assert cards[1] == "SENT-OK", "a written row's card is untouched"
+
+
+def test_repointed_card_updates_the_local_cache(monkeypatch):
+    """/stage and swipe recovery read the cache, so it must follow the card or they resolve the
+    dead uuid."""
+    _dispatch_env(monkeypatch, _batch_resp(0, [
+        {"sent_uuid": "SENT-DEAD", "status": "duplicate_suppressed", "existing_uuid": "LIVE-ROW"},
+    ]))
+    m.save_job_to_cache("s1", {"employer_name": "TEKsystems"}, "SENT-DEAD")
+
+    m.dispatch_tier1_matches([_tier1_match("TEKsystems", "Ops Analyst", "s1", "SENT-DEAD")])
+
+    assert m.get_sheet_uuid_by_short_id("s1") == "LIVE-ROW"
+
+
+def test_card_withheld_when_the_live_row_has_no_uuid(monkeypatch):
+    """A hand-added sheet row with an empty column J gives nothing to resolve against - shipping a
+    card whose every swipe fails is worse than shipping none."""
+    alerts = []
+    cards = _dispatch_env(monkeypatch, _batch_resp(0, [
+        {"sent_uuid": "SENT-DEAD", "status": "duplicate_suppressed", "existing_uuid": ""},
+    ]))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+
+    sent = m.dispatch_tier1_matches([_tier1_match("TEKsystems", "Ops Analyst", "s1", "SENT-DEAD")])
+
+    assert sent == 0 and cards == []
+    assert any("no UUID" in a for a in alerts), "Kevin must be told why the card never arrived"
+
+
+def test_dispatch_falls_back_cleanly_on_an_old_apps_script(monkeypatch):
+    """A Code.gs deployment predating the dispositions field reports no per-row detail. Silence
+    must NOT be read as 'suppressed' - the old behavior (card everything in a written batch) is
+    the correct fallback until the script is redeployed."""
+    cards = _dispatch_env(monkeypatch, _batch_resp(2, None))
+
+    sent = m.dispatch_tier1_matches([
+        _tier1_match("A Co", "Ops Analyst", "s1", "U1"),
+        _tier1_match("B Co", "Ops Analyst", "s2", "U2"),
+    ])
+
+    assert sent == 2
+    assert cards == ["U1", "U2"]
+
+
+def test_batch_dispositions_do_not_leak_between_batches(monkeypatch):
+    """Stale per-row state would re-point a later card at an unrelated row."""
+    _dispatch_env(monkeypatch, _batch_resp(1, [
+        {"sent_uuid": "OLD", "status": "duplicate_suppressed", "existing_uuid": "OLD-LIVE"},
+    ]))
+    m.dispatch_tier1_matches([_tier1_match("A Co", "Ops", "s1", "OLD")])
+    assert m.get_batch_disposition("OLD") is not None
+
+    # A second batch that reports nothing for the old uuid must clear it.
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _batch_resp(1, [
+        {"sent_uuid": "NEW", "status": "written", "existing_uuid": "NEW"},
+    ]))
+    m.dispatch_tier1_matches([_tier1_match("B Co", "Ops", "s2", "NEW")])
+    assert m.get_batch_disposition("OLD") is None, "stale disposition leaked into a later batch"
+
+
+def test_remap_cached_job_uuid_is_a_noop_on_missing_args():
+    assert m.remap_cached_job_uuid("", "abc") is False
+    assert m.remap_cached_job_uuid("s1", "") is False

@@ -1326,6 +1326,26 @@ def save_job_to_cache(short_id, job_dict, sheet_uuid=None):
         logging.error(f"DB Save Error: {e}")
     return sheet_uuid
 
+def remap_cached_job_uuid(short_id, new_sheet_uuid):
+    """Re-point a cached job at a different sheet row.
+
+    Used when Code.gs suppressed a row as a duplicate: the card is re-pointed at the live row, and
+    the local cache has to follow or /stage and swipe recovery keep resolving the dead uuid that
+    was generated for the suppressed write.
+    """
+    if not (short_id and new_sheet_uuid):
+        return False
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE jobs SET sheet_uuid = ? WHERE short_id = ?", (new_sheet_uuid, short_id))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"UUID remap error ({short_id}): {e}")
+        return False
+
+
 def get_job_from_cache(short_id):
     try:
         with get_db_conn() as conn:
@@ -6801,6 +6821,37 @@ class PermanentCRMRejection(Exception):
         super().__init__(f"CRM '{action}' permanently rejected: {message}")
 
 
+# Per-row outcomes from the most recent batch_add_rows, keyed by the uuid that was SENT.
+#
+# log_to_sheets_crm() returns a single bool for a whole batch, and nine callers depend on that
+# contract, so the per-row detail rides alongside it here instead of changing the return type.
+# Thread-local because run_job_pipeline dispatches concurrently: a shared dict would let one
+# thread's batch overwrite another's and re-point a card at an unrelated row.
+_BATCH_DISPOSITIONS = threading.local()
+
+
+def _stash_batch_dispositions(payload, dispositions):
+    """Record Code.gs's per-row verdict for the batch just sent."""
+    table = {}
+    for d in (dispositions or []):
+        if isinstance(d, dict) and d.get("sent_uuid"):
+            table[str(d["sent_uuid"])] = {
+                "status": str(d.get("status") or ""),
+                "existing_uuid": str(d.get("existing_uuid") or ""),
+            }
+    _BATCH_DISPOSITIONS.table = table
+
+
+def get_batch_disposition(sent_uuid):
+    """The verdict for one sent uuid, or None when Apps Script reported nothing.
+
+    None means an OLD Code.gs deployment that predates the dispositions field - callers must fall
+    back to their previous behavior rather than treating silence as "suppressed".
+    """
+    table = getattr(_BATCH_DISPOSITIONS, "table", None) or {}
+    return table.get(str(sent_uuid))
+
+
 # Deterministic Apps Script rejections: a missing row, a malformed payload or an unroutable tab
 # answers identically on every attempt. Matched as substrings against the response's `message`,
 # which is the only failure detail doPost returns. "Lock timeout - server busy" is deliberately
@@ -6905,6 +6956,12 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on
                     if status == "success":
                         if expected_rows is not None:
                             written = safe_int(body.get("count"), 0)
+                            # [] when an older Code.gs deployment reports no per-row detail, which
+                            # must never be read as "every row was a duplicate".
+                            dispositions_reported = [
+                                d for d in (body.get("dispositions") or []) if isinstance(d, dict)
+                            ]
+                            _stash_batch_dispositions(payload, dispositions_reported)
                             if written < expected_rows:
                                 # A SHORT COUNT IS NOT A FAILED WRITE. Code.gs's in-append dedup
                                 # guard (findLiveJobsDuplicate) skips a row whose normalized
@@ -6922,14 +6979,32 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on
                                 # Zero written is different: nothing landed, and the caller must
                                 # still withhold rather than dispatch cards for rows that do not
                                 # exist.
+                                #
+                                # UNLESS every row was dropped as a duplicate, which the
+                                # dispositions now make visible. An all-duplicate batch is not a
+                                # failure - each of those jobs IS tracked, on a live row whose uuid
+                                # Code.gs just reported - so returning False here withheld cards for
+                                # rows that exist, and did it on exactly the re-paste and rerun
+                                # cases where a batch is most likely to be entirely duplicates.
+                                # dispatch_tier1_matches re-points each card at its live row.
                                 if written <= 0:
-                                    logging.error(
-                                        f"CRM batch_add_rows wrote 0/{expected_rows} rows: {message}"
+                                    all_dupes = bool(dispositions_reported) and all(
+                                        d.get("status") == "duplicate_suppressed"
+                                        for d in dispositions_reported
                                     )
-                                    send_health_alert(
-                                        f"CRM batch wrote NO rows of {expected_rows} sent. {message}"
+                                    if not all_dupes:
+                                        logging.error(
+                                            f"CRM batch_add_rows wrote 0/{expected_rows} rows: {message}"
+                                        )
+                                        send_health_alert(
+                                            f"CRM batch wrote NO rows of {expected_rows} sent. {message}"
+                                        )
+                                        return False
+                                    logging.warning(
+                                        f"CRM batch_add_rows wrote 0/{expected_rows} rows - every row "
+                                        f"was already tracked on a live row; cards will be re-pointed "
+                                        f"at the existing rows: {message}"
                                     )
-                                    return False
                                 logging.warning(
                                     f"CRM batch_add_rows wrote {written}/{expected_rows} rows; "
                                     f"{expected_rows - written} suppressed as duplicate(s) by the "
@@ -8803,11 +8878,46 @@ def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
         is_clavicular = item.get("is_clavicular", False)
         if not written[is_clavicular]:
             continue
+
+        # A batch can succeed overall while THIS row was dropped as a duplicate. The batch-level
+        # bool cannot express that, so the card used to ship carrying the uuid this run generated -
+        # a uuid Code.gs never wrote to any tab. Every later /warm, /apply and /n on that card then
+        # failed with "No record found" forever, because the row it points at does not exist.
+        #
+        # Code.gs now reports each row's fate, so a suppressed row's card is re-pointed at the
+        # LIVE row that caused the suppression - the job really is tracked, and the card should
+        # drive the row that is actually there.
+        card_uuid = item.get("sheet_uuid")
+        disposition = get_batch_disposition(card_uuid)
+        if disposition and disposition["status"] == "duplicate_suppressed":
+            existing = disposition.get("existing_uuid") or ""
+            if existing:
+                logging.warning(
+                    f"Re-pointing card for {job.get('employer_name')} - {job.get('job_title')}: "
+                    f"row was suppressed as a duplicate, card now targets the live row {existing}"
+                )
+                card_uuid = existing
+                remap_cached_job_uuid(item.get("short_id"), existing)
+            else:
+                # Suppressed by a live row that itself has no uuid (a hand-added sheet row). There
+                # is nothing for a swipe command to resolve against, so withhold rather than ship a
+                # card whose every action will fail.
+                logging.error(
+                    f"Withholding card for {job.get('employer_name')} - {job.get('job_title')}: "
+                    "suppressed as a duplicate and the existing row carries no uuid"
+                )
+                send_health_alert(
+                    f"Card withheld for {job.get('employer_name')} - {job.get('job_title')}: the "
+                    "role is already in a job tab but that row has no UUID, so swipe commands "
+                    "could never resolve it. Add the row's UUID in column J to make it actionable."
+                )
+                continue
+
         send_telegram_card(
             job, item["score"], item["target_email"],
             item["age_badge"], item["salary_str"], item["work_style"],
             item["overlap_pct"], item["short_id"],
-            sheet_uuid=item.get("sheet_uuid"),
+            sheet_uuid=card_uuid,
             alumni_line=item.get("alumni_line", ""),
             sheet_tab="Clavicular" if is_clavicular else "Pipeline_Candidates",
             score_boost=item.get("score_boost", 0)

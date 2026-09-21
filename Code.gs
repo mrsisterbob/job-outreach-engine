@@ -183,25 +183,45 @@ function doPost(e) {
       // In-append dedup guard (JOBS only): seed the set of live Company+Role keys already in
       // the tab, then skip any batch row that collides with it or with an earlier row in this
       // same batch. Terminal rows (Rejected / the Died tab) never count as a live duplicate.
+      // Maps the dedup key to the uuid of the LIVE row already holding it, not just a boolean.
+      // The uuid is what main.py needs to recover: a suppressed row's card would otherwise carry
+      // the uuid this batch generated, which was never written to any tab, so every later
+      // /warm, /apply and /n on that card resolved to "No record found" forever.
       const liveKeys = {};
       if (schemaType === "JOBS" && sheet.getName() !== "Died" && sheet.getLastRow() >= 2) {
         const existing = sheet.getRange(2, 1, sheet.getLastRow() - 1, SCHEMAS.JOBS.length).getValues();
         for (let e = 0; e < existing.length; e++) {
           if (statusRank(existing[e][STATUS_COL - 1]) === statusRank("Rejected")) continue;
-          liveKeys[normalizeDedupKey(existing[e][1], existing[e][2])] = true;
+          liveKeys[normalizeDedupKey(existing[e][1], existing[e][2])] = existing[e][UUID_COL - 1] || "";
         }
       }
 
       let suppressed = 0;
+      // Per-row disposition, parallel to the rows the caller sent. main.py reads this to re-point a
+      // suppressed row's card at the row that actually exists.
+      const dispositions = [];
       const batchValues = [];
       for (let i = 0; i < rows.length; i++) {
         const item = rows[i];
         const normalized = normalizeRowData(item.row_data, schemaType);
         if (schemaType === "JOBS") {
           const key = normalizeDedupKey(normalized[1], normalized[2]);
-          if (key !== "|" && liveKeys[key]) { suppressed++; continue; }
-          if (key !== "|") liveKeys[key] = true;
+          if (key !== "|" && liveKeys.hasOwnProperty(key)) {
+            suppressed++;
+            dispositions.push({
+              sent_uuid: item.sheet_uuid || "",
+              status: "duplicate_suppressed",
+              existing_uuid: liveKeys[key] || ""
+            });
+            continue;
+          }
+          if (key !== "|") liveKeys[key] = item.sheet_uuid || "";
         }
+        dispositions.push({
+          sent_uuid: item.sheet_uuid || "",
+          status: "written",
+          existing_uuid: item.sheet_uuid || ""
+        });
         while (normalized.length < UUID_COL - 1) {
           normalized.push("");
         }
@@ -218,7 +238,8 @@ function doPost(e) {
       return respondJSON({
         status: "success",
         message: `Batch inserted ${batchValues.length} rows` + (suppressed ? ` (${suppressed} duplicate(s) suppressed)` : ""),
-        count: batchValues.length
+        count: batchValues.length,
+        dispositions: dispositions
       });
     }
 
