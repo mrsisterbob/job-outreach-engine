@@ -6665,14 +6665,35 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False):
                         if expected_rows is not None:
                             written = safe_int(body.get("count"), 0)
                             if written < expected_rows:
-                                logging.error(
-                                    f"CRM batch_add_rows wrote {written}/{expected_rows} rows: {message}"
+                                # A SHORT COUNT IS NOT A FAILED WRITE. Code.gs's in-append dedup
+                                # guard (findLiveJobsDuplicate) skips a row whose normalized
+                                # Company+Role already exists as a live row, and reports
+                                # status:"success" with the smaller count. That is the guard doing
+                                # its job, and the rows that were not duplicates DID reach the
+                                # sheet.
+                                #
+                                # Returning False here told run_job_pipeline() the whole batch had
+                                # failed, so it withheld EVERY card - on 2026-09-21 one duplicate
+                                # out of five suppressed all five Tier-1 cards, including a
+                                # 100-score role, and the alert claimed none of the rows were in
+                                # the sheet when four of them were.
+                                #
+                                # Zero written is different: nothing landed, and the caller must
+                                # still withhold rather than dispatch cards for rows that do not
+                                # exist.
+                                if written <= 0:
+                                    logging.error(
+                                        f"CRM batch_add_rows wrote 0/{expected_rows} rows: {message}"
+                                    )
+                                    send_health_alert(
+                                        f"CRM batch wrote NO rows of {expected_rows} sent. {message}"
+                                    )
+                                    return False
+                                logging.warning(
+                                    f"CRM batch_add_rows wrote {written}/{expected_rows} rows; "
+                                    f"{expected_rows - written} suppressed as duplicate(s) by the "
+                                    f"Apps Script dedup guard: {message}"
                                 )
-                                send_health_alert(
-                                    f"CRM batch wrote only {written} of {expected_rows} row(s) - "
-                                    f"{expected_rows - written} suppressed as duplicate(s). {message}"
-                                )
-                                return False
                         return True
 
                     logging.error(f"CRM '{action}' rejected by Apps Script: {message}")
@@ -8458,6 +8479,13 @@ def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
     load-bearing: the CRM write happens FIRST and a card is withheld when its write failed, so a
     card can never point at a sheet_uuid with no row behind it - which would leave /apply, /n, /f
     and the follow-up sequencer resolving against nothing.
+
+    Withholding is per BATCH, not per row, and that is safe for the one case where a batch is
+    partially written: Code.gs suppresses a row only when a LIVE row with the same normalized
+    Company+Role already exists, so the job is already tracked and the card still resolves. Any
+    other short write would need per-row withholding, which this cannot do - log_to_sheets_crm()
+    returns a single bool for the batch. A batch that writes NOTHING still returns False and
+    withholds everything.
 
     Rows route by the Clavicular flag (CL vs TC), matching what the caller already computed in
     process_single_candidate. `note_prefix` distinguishes a hand-pasted row from a sourced one in

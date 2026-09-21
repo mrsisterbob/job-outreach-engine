@@ -199,6 +199,43 @@ def test_log_to_sheets_crm_returns_false_on_permanent_without_flag(monkeypatch):
     assert len(calls) == 1, "a permanent rejection must not be retried"
 
 
+def _crm_batch_result(monkeypatch, sent, written, message=""):
+    """Run log_to_sheets_crm() for a batch_add_rows whose Apps Script reply reports `written`."""
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "send_health_alert", lambda t: None)
+    monkeypatch.setattr(m.time, "sleep", lambda *a: None)
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"status": "success", "count": written, "message": message}
+
+    monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: _Resp())
+    return m.log_to_sheets_crm({"action": "batch_add_rows", "rows": [{}] * sent})
+
+
+def test_duplicate_suppressed_batch_is_not_a_failed_write(monkeypatch):
+    """A short count from the Apps Script dedup guard must NOT read as a failed batch.
+
+    On 2026-09-21 one duplicate out of five rows made log_to_sheets_crm() return False, which made
+    dispatch_tier1_matches() withhold all five Tier-1 cards - including a 100-score role - and
+    alert that none of the rows were in the sheet when four of them were. The suppressed row is a
+    live Company+Role that is already tracked, so the batch is a success.
+    """
+    assert _crm_batch_result(
+        monkeypatch, sent=5, written=4,
+        message="Batch inserted 4 rows (1 duplicate(s) suppressed)") is True
+
+
+def test_batch_that_writes_nothing_still_fails(monkeypatch):
+    """Zero written is the case the withholding gate exists for: no row, so no card."""
+    assert _crm_batch_result(monkeypatch, sent=5, written=0) is False
+
+
+def test_fully_written_batch_succeeds(monkeypatch):
+    assert _crm_batch_result(monkeypatch, sent=5, written=5) is True
+
+
 def test_crm_outbox_batch_ignores_rows_past_max_retries(monkeypatch):
     with m.get_db_conn() as conn:
         conn.execute(
