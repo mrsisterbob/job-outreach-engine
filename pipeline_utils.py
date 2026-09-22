@@ -708,9 +708,18 @@ def resolve_email_waterfall(full_name, company_name, domain_hint=None, on_provid
     return f"operations@{domain} [⚠️ Fallback]"
 
 
-def derive_job_source(job_id):
-    """Classify a job's origin from its job_id prefix for source-level outcome attribution.
-    Returns one of: greenhouse, lever, ashby, manual_ingest, jsearch (default, no known prefix).
+def derive_job_source(job_id, apply_link=None):
+    """Classify a job's origin for source-level outcome attribution.
+    Returns greenhouse, lever, ashby, manual_ingest, or - for anything else - the PUBLISHER behind
+    the JSearch result ("jsearch:learn4good.com"), falling back to bare "jsearch".
+
+    The publisher suffix exists because "jsearch" was one undifferentiated bucket holding every
+    aggregator JSearch syndicates. /decoys could therefore only ever report a single blended dead-
+    link rate for the whole feed, while the actual question - WHICH publisher is serving expired
+    inventory - was unanswerable. learn4good and jobleads both landed in that bucket alongside
+    every real employer board.
+
+    `apply_link` is optional so every existing caller keeps its current behaviour unchanged.
     """
     job_id = str(job_id or "")
     if job_id.startswith("gh_"):
@@ -721,7 +730,17 @@ def derive_job_source(job_id):
         return "ashby"
     if job_id.startswith("ingest_"):
         return "manual_ingest"
-    return "jsearch"
+    host = job_link_host(apply_link)
+    return f"jsearch:{host}" if host else "jsearch"
+
+
+def job_link_host(url):
+    """The registrable host of a job link, lowercased, with a leading 'www.' stripped, or ''."""
+    link = str(url or "").strip().lower()
+    if not link:
+        return ""
+    host = re.sub(r"^https?://", "", link).split("/")[0].split("?")[0].split(":")[0]
+    return host[4:] if host.startswith("www.") else host
 
 
 def is_unverified_email(email_str):

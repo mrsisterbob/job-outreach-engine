@@ -4256,11 +4256,45 @@ def _passes_remote_filter(job):
 # covers long-horizon counts. Kept deliberately dumb - a dict, a note() call per gate, and one
 # formatted summary - so adding a gate is a one-line change and can never raise into the pipeline.
 
+# Job boards that RESELL listings they do not own. A posting reaches these sites by being scraped
+# from somewhere else, so the apply link outlives the req: learn4good served Kevin a card whose
+# link already read "The job you may have viewed online is no longer listed on this site."
+#
+# Distinct from EMAIL_BULK_SENDER_DOMAINS, which blocks who may write TO him. This blocks where a
+# posting may come FROM, and it is matched on the APPLY LINK's domain rather than the employer
+# name - the employer on an aggregator row is usually the real company, which is exactly why the
+# card looks legitimate right up until the link 404s.
+#
+# Deliberately short. A board that hosts its own reqs (Greenhouse, Lever, Workday) belongs
+# nowhere near this list, and neither does a large employer that happens to syndicate.
+AGGREGATOR_RELIST_DOMAINS = tuple(d.strip().lower() for d in os.environ.get(
+    "AGGREGATOR_RELIST_DOMAINS",
+    "learn4good.com,jobrapido.com,jobs2careers.com,neuvoo.com,talent.com,"
+    "trabajo.org,whatjobs.com,jobsora.com,jobilize.com,careerjet.com"
+).split(",") if d.strip())
+
+
+def is_aggregator_relist(apply_link):
+    """True when a job's apply link points at a reseller that scrapes listings it does not own.
+
+    Matched on the registrable domain (exact or subdomain) so "www.learn4good.com" and
+    "jobs.learn4good.com" both hit while an unrelated "notlearn4good.com" does not.
+    """
+    link = str(apply_link or "").strip().lower()
+    if not link:
+        return False
+    host = re.sub(r"^https?://", "", link).split("/")[0].split("?")[0].split(":")[0]
+    if not host:
+        return False
+    return any(host == d or host.endswith("." + d) for d in AGGREGATOR_RELIST_DOMAINS)
+
+
 FUNNEL_REJECTION_LABELS = {
     "dedup_title": "Duplicate within this run",
     "dedup_content": "Duplicate description this run",
     "already_tracked": "Already in Tetiana Cold/Warm",
     "board_id_employer": "Employer looks like a board ID",
+    "aggregator_link": "Aggregator relist (dead-link factory)",
     "company_cooldown": "Company on 14-day cooldown",
     "already_applied": "Already applied (Tetiana Warm)",
     "salary_floor": "Below minimum salary",
@@ -4350,6 +4384,15 @@ def passes_strict_filter(job, trace=None):
     if raw_employer and " " not in raw_employer and raw_employer == raw_employer.upper() and any(c.isdigit() for c in raw_employer):
         logging.info(f"[EXCLUDED] employer_name '{raw_employer}' looks like a job-board ID, not a real company.")
         return reject("board_id_employer")
+
+    # Aggregator relists. Checked here, beside the board-ID test, because both answer "is this
+    # posting real" rather than "is this job a fit" - and a dead link wastes the AI screen, the
+    # card, and the minute Kevin spends clicking it. /decoys already MEASURED this class; this
+    # stops it at the gate instead of counting it afterwards.
+    if is_aggregator_relist(job.get("job_apply_link")):
+        logging.info(f"[EXCLUDED] {company or 'unknown'} - aggregator relist link "
+                     f"({str(job.get('job_apply_link') or '')[:60]})")
+        return reject("aggregator_link")
 
     if is_company_on_cooldown(company):
         return reject("company_cooldown")
@@ -4456,7 +4499,7 @@ DEFAULT_FORCED_BULLET_INDICES = [1, 4, 7]
 
 
 def process_single_candidate(job, force=False):
-    log_metric_event("ai_screened", source=derive_job_source(job.get("job_id")))
+    log_metric_event("ai_screened", source=derive_job_source(job.get("job_id"), job.get("job_apply_link")))
     ai_pass, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id, layer1_bonus, gemini_base = evaluate_job_with_gemini(job)
 
     # force=True (from /job!) makes the AI verdict ADVISORY instead of a gate. Kevin pasted this
@@ -10054,7 +10097,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
         if content_hash:
             seen_content_hashes_this_run.add(content_hash)
 
-        log_metric_event("listing_discovered", source=derive_job_source(job.get("job_id")))
+        log_metric_event("listing_discovered", source=derive_job_source(job.get("job_id"), job.get("job_apply_link")))
         if not passes_strict_filter(job, trace=funnel):
             # Deliberately NOT marked seen. A rejected job is not a job Kevin has considered - it
             # failed today's filters, in today's posted state. Recording it here is what buried
@@ -11647,7 +11690,7 @@ def process_webhook_payload_async(data):
             record_application_outcome(
                 sheet_uuid, "applied",
                 company=company, role=job.get("job_title"),
-                source=derive_job_source(job.get("job_id")),
+                source=derive_job_source(job.get("job_id"), job.get("job_apply_link")),
                 outreach_path="warm" if mapping.get("contact_name") else "ats"
             )
             # Canonical Status write on the row in place - no tab move (see set_status in Code.gs).
@@ -11677,7 +11720,7 @@ def process_webhook_payload_async(data):
             # correct for a real jsearch posting and wrong for a card whose cache entry a Render
             # restart wiped - that would quietly inflate jsearch's decoy count with rows nothing
             # measured. No job_id, no source: the report buckets those as "unknown" instead.
-            source = derive_job_source(job.get("job_id")) if job.get("job_id") else None
+            source = derive_job_source(job.get("job_id"), job.get("job_apply_link")) if job.get("job_id") else None
             age_note = f" · {posted_hours}h old when carded" if posted_hours is not None else " · age unknown"
             # Measurement only - no CRM write. /dead answers "was this listing real", which is a
             # different question from what Kevin wants the row to become; /x still kills it.

@@ -4395,6 +4395,52 @@ def test_passes_strict_filter_records_the_gate_that_rejected(monkeypatch):
     assert trace.reasons.get("out_of_state") == 1
 
 
+def test_aggregator_relist_matches_the_domain_not_the_employer():
+    """The employer on an aggregator row is usually the REAL company, which is why the card looks
+    legitimate right up until the link 404s. Matching has to be on the apply link."""
+    # The exact URL that served a dead listing on 2026-09-22.
+    assert m.is_aggregator_relist(
+        "https://www.learn4good.com/jobs/farmington-hills/michigan/info_technology/5451227774/e/")
+    assert m.is_aggregator_relist("https://jobs.learn4good.com/x")      # subdomain
+    assert m.is_aggregator_relist("https://www.talent.com/view?id=9")
+    # A board that hosts its OWN reqs must never match.
+    for ok in ("https://boards.greenhouse.io/acme/jobs/123",
+               "https://jobs.lever.co/acme/abc",
+               "https://altarum.wd1.myworkdayjobs.com/x",
+               "https://www.notlearn4good.com/jobs/x"):
+        assert not m.is_aggregator_relist(ok), ok
+    assert not m.is_aggregator_relist("") and not m.is_aggregator_relist(None)
+
+
+def test_strict_filter_rejects_an_aggregator_relist_at_the_gate(monkeypatch):
+    """A dead link wastes the AI screen, the card and the click. /decoys measured this class
+    after the fact; the gate stops it before the screen runs."""
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000,
+        "valid_cities": ["farmington", "detroit"],
+        "title_exclusions": [], "company_exclusions": [],
+        "hard_ban_keywords": [], "seniority_exclusions": [],
+    }.get(key, default if default is not None else []))
+
+    job = {
+        "employer_name": "Acme Corp", "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL and reporting.",
+        "job_city": "Farmington Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://www.learn4good.com/jobs/farmington-hills/michigan/x/1/e/",
+    }
+    trace = m.FunnelTrace()
+    assert m.passes_strict_filter(job, trace=trace) is False
+    assert trace.reasons.get("aggregator_link") == 1
+    # The SAME job on a real ATS link is unaffected by this gate.
+    trace2 = m.FunnelTrace()
+    m.passes_strict_filter({**job, "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1"},
+                           trace=trace2)
+    assert trace2.reasons.get("aggregator_link") is None
+
+
 def test_hard_ban_keywords_reject_commission_pay_not_commission_reporting(monkeypatch):
     """Bare "commission" used to reject ops roles that merely report on commissions. Uses the shipped
     defaults so a regression in DEFAULT_SEARCH_FILTERS itself is caught."""

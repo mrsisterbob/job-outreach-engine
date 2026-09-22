@@ -516,6 +516,26 @@ def test_derive_job_source_recognizes_ats_prefixes():
 def test_derive_job_source_defaults_to_jsearch():
     assert pu.derive_job_source("some-random-jsearch-id") == "jsearch"
     assert pu.derive_job_source(None) == "jsearch"
+
+
+def test_jsearch_source_carries_the_publisher_so_decoys_can_name_it():
+    """"jsearch" was one bucket holding every aggregator JSearch syndicates, so /decoys could only
+    report a blended rate for the whole feed - the actual question (WHICH publisher serves dead
+    inventory) was unanswerable."""
+    assert pu.derive_job_source("x", "https://www.learn4good.com/jobs/a/1/e/") == "jsearch:learn4good.com"
+    assert pu.derive_job_source("x", "https://www.jobleads.com/us/job/abc") == "jsearch:jobleads.com"
+    # www. is stripped so one publisher is not split across two buckets.
+    assert pu.derive_job_source("x", "https://learn4good.com/a") == "jsearch:learn4good.com"
+    # An ATS prefix still wins - those are not JSearch results at all.
+    assert pu.derive_job_source("gh_acme", "https://www.learn4good.com/a") == "greenhouse"
+    # No link is still the bare bucket, so nothing regresses.
+    assert pu.derive_job_source("x", "") == "jsearch"
+
+
+def test_job_link_host_normalizes_and_survives_junk():
+    assert pu.job_link_host("https://WWW.Learn4Good.com/jobs/x?a=1") == "learn4good.com"
+    assert pu.job_link_host("http://jobs.learn4good.com:443/x") == "jobs.learn4good.com"
+    assert pu.job_link_host("") == "" and pu.job_link_host(None) == ""
     assert pu.derive_job_source("") == "jsearch"
 
 
