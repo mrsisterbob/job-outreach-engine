@@ -1323,6 +1323,137 @@ def test_promote_refuses_unknown_ambiguous_and_already_hot(monkeypatch):
     assert enqueued2 == [] and "already in Carmen Hot" in sent2[0]
 
 
+# ---- Inbound rejection -> Died, with a pick card when the company holds several live roles ----
+
+# Verbatim from the IHA/Trinity Workday rejection that prompted this path.
+_REAL_REJECTION_BODY = (
+    "Dear Kevin , Thank you for your interest in the EHR Clinical Analyst - Onsite in Southeast "
+    "Michigan position at IHA Medical Group . After careful consideration, your application will "
+    "not be moving forward to the next phase of our recruiting process due to the skillset we are "
+    "seeking to fill this role."
+)
+
+
+def _reject_job_row(uuid_val, company, title):
+    """Distinct name: _job_row is redefined later in this file for the link-sweep tests, and the
+    later definition wins for the whole module."""
+    return {"sheet_uuid": uuid_val, "company": company, "job_title": title, "status": "Applied"}
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_kills():
+    """PENDING_REJECTION_KILLS is module-global, so a card parked by one test would otherwise be
+    visible to the next one under random ordering."""
+    m.PENDING_REJECTION_KILLS.clear()
+    yield
+    m.PENDING_REJECTION_KILLS.clear()
+
+
+def _rejection_env(monkeypatch, rows_by_code=None):
+    enqueued, outcomes = [], []
+    rows_by_code = rows_by_code or {}
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(r) for r in rows_by_code.get(code, [])])
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    monkeypatch.setattr(m, "record_application_outcome",
+                        lambda uuid_val, status, **kw: outcomes.append((uuid_val, status)) or True)
+    return enqueued, outcomes
+
+
+def test_company_is_read_from_the_rejection_body_not_the_sender():
+    """trinityhealth@myworkday.com resolves to no company at all - company_domain_of() returns ""
+    for an ATS domain - so the employer has to come from the text."""
+    assert m.extract_company_from_rejection(
+        "Update on your application for 00681317 - EHR Clinical Analyst",
+        _REAL_REJECTION_BODY) == "IHA Medical Group"
+    # No recognisable phrasing -> "" , never a guess.
+    assert m.extract_company_from_rejection("Re: your application", "We are moving on. Best of luck.") == ""
+
+
+def test_a_single_live_row_is_archived_without_asking(monkeypatch):
+    enqueued, outcomes = _rejection_env(monkeypatch, {
+        "TW": [_reject_job_row("uuid-iha", "IHA Medical Group", "EHR Clinical Analyst")]})
+
+    line = m.route_rejection_to_died("IHA Medical Group")
+
+    assert [p["action"] for p in enqueued] == ["update_status", "append_note"]
+    assert enqueued[0] == {**enqueued[0], "sheet_uuid": "uuid-iha", "new_tab": "Died"}
+    assert outcomes == [("uuid-iha", "rejection")]
+    assert "Auto-archived to Died" in line and "EHR Clinical Analyst" in line
+    assert m.PENDING_REJECTION_KILLS == {}
+
+
+def test_two_live_rows_write_nothing_and_raise_a_pick_card(monkeypatch):
+    """The ATS names ONE req. Auto-killing every Trinity row would archive live applications."""
+    enqueued, outcomes = _rejection_env(monkeypatch, {
+        "TC": [_reject_job_row("uuid-a", "Trinity Health MI", "EHR Clinical Analyst")],
+        "TW": [_reject_job_row("uuid-b", "Trinity Health MI", "Data Analyst")],
+    })
+
+    line = m.route_rejection_to_died("Trinity Health MI")
+
+    assert enqueued == [] and outcomes == []            # nothing written
+    assert "2 live roles" in line
+    assert "<b>1.</b> EHR Clinical Analyst" in line and "<b>2.</b> Data Analyst" in line
+    assert "/kill Trinity Health MI 1" in line
+    # The pick card must carry no 🆔: swipe recovery takes the first uuid it finds.
+    assert "🆔" not in line
+
+
+def test_kill_picks_one_row_from_the_pending_card(monkeypatch):
+    enqueued, outcomes = _rejection_env(monkeypatch, {
+        "TC": [_reject_job_row("uuid-a", "Trinity Health MI", "EHR Clinical Analyst")],
+        "TW": [_reject_job_row("uuid-b", "Trinity Health MI", "Data Analyst")],
+    })
+    m.route_rejection_to_died("Trinity Health MI")
+    enqueued.clear()
+
+    reply = m.resolve_pending_kill("Trinity Health MI", "2")
+
+    assert [p["sheet_uuid"] for p in enqueued if p["action"] == "update_status"] == ["uuid-b"]
+    assert outcomes == [("uuid-b", "rejection")]
+    assert "Data Analyst" in reply
+    # Cleared, so a second /kill cannot re-archive rows already moved.
+    assert m.PENDING_REJECTION_KILLS == {}
+    assert "Nothing pending" in m.resolve_pending_kill("Trinity Health MI", "1")
+
+
+def test_kill_all_archives_every_row_and_rejects_bad_picks(monkeypatch):
+    rows = {"TC": [_reject_job_row("uuid-a", "Trinity Health MI", "Role A")],
+            "TW": [_reject_job_row("uuid-b", "Trinity Health MI", "Role B")]}
+    enqueued, outcomes = _rejection_env(monkeypatch, rows)
+    m.route_rejection_to_died("Trinity Health MI")
+    assert "Out of range" in m.resolve_pending_kill("Trinity Health MI", "9")
+    assert "Pick a number" in m.resolve_pending_kill("Trinity Health MI", "second")
+    assert m.PENDING_REJECTION_KILLS                      # a bad pick must NOT discard the card
+
+    enqueued.clear()
+    reply = m.resolve_pending_kill("Trinity Health MI", "all")
+    assert sorted(p["sheet_uuid"] for p in enqueued if p["action"] == "update_status") == ["uuid-a", "uuid-b"]
+    assert "Archived 2 role(s)" in reply
+
+
+def test_rejection_never_touches_carmen_contacts(monkeypatch):
+    """A recruiter who rejected one req is still a live contact for the next one - Killed is for
+    contacts archived after three unanswered nudges, not for anyone who said no once."""
+    enqueued, _ = _rejection_env(monkeypatch, {
+        "TW": [_reject_job_row("uuid-iha", "IHA Medical Group", "EHR Clinical Analyst")],
+        "CC": [{"sheet_uuid": "uuid-person", "name": "A Recruiter", "company": "IHA Medical Group",
+                "email": "r@iha.org"}],
+    })
+    m.route_rejection_to_died("IHA Medical Group")
+    assert [p["sheet_uuid"] for p in enqueued if p["action"] == "update_status"] == ["uuid-iha"]
+    assert all(p.get("new_tab") != "Killed" for p in enqueued)
+
+
+def test_an_unmatched_company_archives_nothing(monkeypatch):
+    enqueued, outcomes = _rejection_env(monkeypatch, {"TW": [
+        _reject_job_row("uuid-other", "Some Other Co", "Analyst")]})
+    assert m.route_rejection_to_died("IHA Medical Group") == ""
+    assert enqueued == [] and outcomes == []
+    assert m.route_rejection_to_died("") == ""
+
+
 def _beth(uuid_val="beth-uuid-0000-0000", name="Beth Young", email="beth.young@altarum.org"):
     """A Carmen Cold row as /e's capture path writes it - no cached job, so no short_id."""
     return {"sheet_uuid": uuid_val, "name": name, "email": email,

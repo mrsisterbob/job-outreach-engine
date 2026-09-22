@@ -6108,6 +6108,23 @@ def check_inbound_gmail_replies():
                 requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
                 continue
 
+            # A REJECTION archives the job row it refers to. Runs for UNVERIFIED senders too, which
+            # is the whole point: an ATS decline arrives from trinityhealth@myworkday.com, whose
+            # domain resolves to no company at all, so it can never be a CRM contact and every
+            # CRM branch above skips it. The company is read from the message instead, and the
+            # ROW is matched on that - one live row is archived, several raise a pick card.
+            rejection_line = ""
+            if status_label == "REJECTION":
+                try:
+                    reject_company = (
+                        str(crm_match.get("company") or "").strip()
+                        if str(crm_match.get("company") or "").strip() not in ("", "Unknown")
+                        else extract_company_from_rejection(subject, body_text)
+                    )
+                    rejection_line = route_rejection_to_died(reject_company, subject, snippet)
+                except Exception as e:
+                    logging.error(f"[REJECTION ROUTING] Failed for {sender}: {e}")
+
             alert_msg = (
                 f"{header_line}\n\n"
                 f"{status_line}"
@@ -6116,7 +6133,8 @@ def check_inbound_gmail_replies():
                 f"<b>From:</b> {html.escape(sender)}\n"
                 f"{crm_line}"
                 f"<b>Subject:</b> {html.escape(subject)}\n"
-                f"<b>Preview:</b> <i>{html.escape(snippet)}</i>\n\n"
+                f"<b>Preview:</b> <i>{html.escape(snippet)}</i>\n"
+                f"{rejection_line}\n"
                 f"<a href='{thread_link}'>Open Thread in Gmail</a>"
             )
             # Telegram hard-rejects over 4096 chars. Everything above the preview is what makes the
@@ -7647,6 +7665,165 @@ def find_carmen_contacts(token):
             if matched and uuid_val:
                 hits[uuid_val] = (uuid_val, tab_name, rec)
     return list(hits.values())
+
+# Rejections resolved to exactly one live job row are archived without asking; 2+ raise a pick
+# card instead. A rejection names ONE req, so killing every row at that company would archive
+# roles Kevin is still live on - Trinity Health alone carries several.
+PENDING_REJECTION_KILLS = {}
+_PENDING_KILL_LOCK = threading.Lock()
+
+
+def extract_company_from_rejection(subject, body_text):
+    """The employer named inside an ATS rejection, or "".
+
+    Needed because the SENDER cannot answer it. trinityhealth@myworkday.com is a role mailbox on
+    an ATS domain, so company_domain_of() returns "" and no CRM match is possible - the alert
+    shows "@ Unknown (Not in CRM)". But the body says it plainly: "your interest in the EHR
+    Clinical Analyst - Onsite in Southeast Michigan position at IHA Medical Group".
+
+    Patterns only, no LLM: a rejection is a form letter, and the phrasings are fixed. Returns ""
+    rather than a guess when nothing matches - route_rejection_to_died() then does nothing, which
+    is the correct outcome for an employer this cannot identify.
+    """
+    text = " ".join(str(body_text or "")[:2000].split())
+    patterns = (
+        r"position at\s+([A-Z][\w&.,'\- ]{2,60}?)\s*[.\n]",
+        r"role at\s+([A-Z][\w&.,'\- ]{2,60}?)\s*[.\n]",
+        r"opportunity at\s+([A-Z][\w&.,'\- ]{2,60}?)\s*[.\n]",
+        r"application (?:to|with)\s+([A-Z][\w&.,'\- ]{2,60}?)\s*[.\n]",
+        r"interest in\s+(?:joining\s+)?([A-Z][\w&.,'\- ]{2,60}?)\s*[.\n]",
+        r"careers? at\s+([A-Z][\w&.,'\- ]{2,60}?)\s*[.\n]",
+    )
+    for pat in patterns:
+        found = re.search(pat, text)
+        if found:
+            company = found.group(1).strip(" .,")
+            # "the next phase of our recruiting process" style tails are not company names.
+            if company and len(company) >= 3 and not company.lower().startswith(("our ", "the ", "your ")):
+                return company
+    return ""
+
+
+def find_live_job_rows_for_company(company):
+    """Live JOB rows at `company`, newest tab first: [{sheet_uuid, tab, title, status}].
+
+    Reads the same three tabs locate_tracked_role() does. Died is deliberately excluded - a row
+    already archived is not a row to archive again - and the Carmen PEOPLE tabs are excluded
+    because a rejection is a JOB outcome; the recruiter who sent it stays a live contact.
+    """
+    want = normalize_company_for_match(company)
+    if not want:
+        return []
+    rows = []
+    for target_code, tab_name in (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "Clavicular")):
+        for rec in fetch_networking_cards(target_code, qty=None) or []:
+            if normalize_company_for_match(rec.get("company")) != want:
+                continue
+            sheet_uuid = str(rec.get("sheet_uuid") or "").strip()
+            if not sheet_uuid:
+                continue
+            rows.append({
+                "sheet_uuid": sheet_uuid,
+                "tab": tab_name,
+                "title": str(rec.get("job_title") or rec.get("title") or "").strip() or "(untitled role)",
+                "status": str(rec.get("status") or "").strip(),
+            })
+    return rows
+
+
+def route_rejection_to_died(company, subject="", snippet=""):
+    """A classified REJECTION -> archive the job row it refers to. Returns a Telegram-ready
+    summary line, or "" when there is nothing to say.
+
+    One live row at the company: archived to Died immediately, because there is no ambiguity to
+    resolve and a rejection Kevin has to hand-file is a rejection that sits in the tray for a week.
+
+    Two or more: NOTHING is written. The rows are parked in PENDING_REJECTION_KILLS and listed as
+    a numbered pick card - "/kill 2" - because the ATS names one req and the company may hold
+    several. Auto-killing all of them would archive live applications silently, which is the one
+    outcome worse than filing by hand.
+
+    The pick card carries NO 🆔 marker on purpose: _parse_sheet_uuid_from_card_text() takes the
+    FIRST uuid in a message, so a swipe-reply on a multi-entry card would always act on entry #1.
+    """
+    company = str(company or "").strip()
+    if not company:
+        return ""
+    try:
+        rows = find_live_job_rows_for_company(company)
+    except Exception as e:
+        logging.error(f"[REJECTION ROUTING] Row lookup failed for {company}: {e}")
+        return ""
+    if not rows:
+        logging.info(f"[REJECTION ROUTING] No live job row at '{company}' - nothing to archive")
+        return ""
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if len(rows) == 1:
+        row = rows[0]
+        new_tab = resolve_smart_target_tab(row["tab"], "kill")
+        enqueue_crm_payload(build_crm_payload(
+            "update_status", sheet_uuid=row["sheet_uuid"], new_tab=new_tab))
+        enqueue_crm_payload(build_crm_payload(
+            "append_note", sheet_uuid=row["sheet_uuid"],
+            note=f"[{today_str}] Rejected - auto-archived to {new_tab} from the inbound rejection."))
+        record_application_outcome(row["sheet_uuid"], "rejection", company=company)
+        logging.info(f"[REJECTION ROUTING] Archived {company} / {row['title']} to {new_tab}")
+        return (f"\n💀 <b>Auto-archived to {new_tab}:</b> {html.escape(row['title'])}\n"
+                f"<i>The only live row at {html.escape(company)}.</i>\n")
+
+    # Ambiguous. Park the candidates against the company key and ask.
+    with _PENDING_KILL_LOCK:
+        PENDING_REJECTION_KILLS[normalize_company_for_match(company)] = {
+            "company": company, "rows": rows, "at": today_str,
+        }
+    lines = [f"\n⚠️ <b>{len(rows)} live roles at {html.escape(company)}</b> - "
+             f"<i>nothing archived, pick one:</i>"]
+    for i, row in enumerate(rows, 1):
+        status = f" · {html.escape(row['status'])}" if row["status"] else ""
+        lines.append(f"  <b>{i}.</b> {html.escape(row['title'])} <i>({html.escape(row['tab'])}{status})</i>")
+    lines.append(f"<code>/kill {html.escape(company)} 1</code> · "
+                 f"<code>/kill {html.escape(company)} all</code> · ignore to keep them all")
+    return "\n".join(lines) + "\n"
+
+
+def resolve_pending_kill(company_token, choice):
+    """`/kill <company> <n|all>` -> archive the picked row(s). Returns a Telegram-ready reply."""
+    key = normalize_company_for_match(company_token)
+    with _PENDING_KILL_LOCK:
+        pending = PENDING_REJECTION_KILLS.get(key)
+    if not pending:
+        return (f"⚠️ <b>Nothing pending</b> for <code>{html.escape(company_token)}</code>. "
+                f"A pick expires when the bot restarts - archive it with <code>/x</code> on the card instead.")
+    rows = pending["rows"]
+    choice = str(choice or "").strip().lower()
+    if choice == "all":
+        picked = list(rows)
+    else:
+        try:
+            idx = int(choice)
+        except ValueError:
+            return f"⚠️ <b>Pick a number</b> 1-{len(rows)}, or <code>all</code>."
+        if not 1 <= idx <= len(rows):
+            return f"⚠️ <b>Out of range:</b> pick 1-{len(rows)}, or <code>all</code>."
+        picked = [rows[idx - 1]]
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    done = []
+    for row in picked:
+        new_tab = resolve_smart_target_tab(row["tab"], "kill")
+        enqueue_crm_payload(build_crm_payload(
+            "update_status", sheet_uuid=row["sheet_uuid"], new_tab=new_tab))
+        enqueue_crm_payload(build_crm_payload(
+            "append_note", sheet_uuid=row["sheet_uuid"],
+            note=f"[{today_str}] Rejected - archived to {new_tab} via /kill."))
+        record_application_outcome(row["sheet_uuid"], "rejection", company=pending["company"])
+        done.append(f"• {html.escape(row['title'])} → {new_tab}")
+    # Cleared either way: a second /kill on the same card would re-archive rows already moved.
+    with _PENDING_KILL_LOCK:
+        PENDING_REJECTION_KILLS.pop(key, None)
+    return f"💀 <b>Archived {len(done)} role(s)</b> at {html.escape(pending['company'])}\n" + "\n".join(done)
+
 
 def promote_job_card_contact(chat_id, token, extra):
     """`/promote <job_id> Name name@company.com` -> a new Carmen Hot row. True when handled.
@@ -11479,6 +11656,25 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
+        # /kill <company> <n|all> - resolve the pick card a multi-row rejection raised. A typed
+        # command rather than a swipe because the card lists several rows and
+        # _parse_sheet_uuid_from_card_text() takes the FIRST uuid it finds, so a swipe there would
+        # always archive entry #1 whatever Kevin meant.
+        kill_cmd_match = re.match(r"^/kill\s+(.+?)\s+(\d+|all)$", text, re.IGNORECASE)
+        if kill_cmd_match:
+            send_telegram_message(chat_id, resolve_pending_kill(
+                kill_cmd_match.group(1).strip(), kill_cmd_match.group(2)))
+            return
+        if text.startswith("/kill"):
+            with _PENDING_KILL_LOCK:
+                open_picks = [v["company"] for v in PENDING_REJECTION_KILLS.values()]
+            hint = ("\n<i>Waiting on:</i> " + ", ".join(html.escape(c) for c in open_picks)) if open_picks else \
+                   "\n<i>Nothing is waiting on a pick right now.</i>"
+            send_telegram_message(
+                chat_id,
+                f"⚠️ <b>Usage:</b> <code>/kill &lt;company&gt; &lt;number|all&gt;</code>{hint}")
+            return
+
         # Canonical Status advance by short_id (no reply context): /replied <id>, /interview <id>.
         # Resolves the short_id to a sheet_uuid the same way callbacks do (get_sheet_uuid_by_short_id)
         # and writes only the Status field - never a tab move.
@@ -11678,6 +11874,7 @@ def process_webhook_payload_async(data):
                 "/warm - Smart-route lead to its Warm tab\n"
                 "/cold - Smart-route lead to its Cold tab\n"
                 "/x - Archive lead to Died/Killed tab\n"
+                "/kill &lt;company&gt; &lt;n|all&gt; - Archive the role a rejection named (pick card)\n"
                 "/dead - Mark the posting itself expired (decoy) - feeds /decoys\n"
                 "/n - Append timestamped note\n"
                 "/f - Snooze follow-up by [days]\n"
