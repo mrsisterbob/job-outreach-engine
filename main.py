@@ -9813,7 +9813,18 @@ def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
                 today_str,
                 job.get("employer_name"),
                 job.get("job_title"),
-                item["target_email"],
+                # A GUESS never reaches the sheet. resolve_target_email() invents
+                # "operations@<company>.com [⚠️ Fallback Email]" so the CARD has something to draft
+                # to, but writing that into Contact Email filled the column with addresses nobody
+                # verified - indistinguishable at a glance from one Kevin confirmed, and noise to
+                # sort by. The card keeps its guess (item["target_email"]); the cell stays blank
+                # until /e types a real address or the sent-mail back-fill promotes one.
+                # is_guessed_contact_email() already treats "" as a placeholder, so a blank cell
+                # remains eligible for that back-fill. It is also the right test here rather than
+                # is_unverified_email(): the [⚠️ Fallback] tag only marks a guess whose DOMAIN was
+                # invented too, so "operations@mahle.com" - a real domain, an invented mailbox -
+                # is untagged and would otherwise still land in the column.
+                "" if is_guessed_contact_email(item["target_email"]) else item["target_email"],
                 item["score"],
                 "Matched",
                 followup_date,

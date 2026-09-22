@@ -6645,6 +6645,42 @@ def _tier1_match(company, title, short_id, sent_uuid, score=90):
     }
 
 
+def test_a_guessed_email_is_blank_in_the_sheet_but_still_on_the_card(monkeypatch):
+    """resolve_target_email() invents operations@<company>.com so the CARD has a recipient. That
+    guess filled the Contact Email column with addresses nobody verified - indistinguishable from
+    a confirmed one and noise to sort by."""
+    payloads, cards = [], []
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: payloads.append(payload) or _batch_resp(2))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: cards.append(a[2]))
+
+    tagged = _tier1_match("MAHLE", "Global Trade Data & BI Intern", "s1", "U-1")
+    tagged["target_email"] = "operations@mahle.com [⚠️ Fallback Email]"
+    untagged = _tier1_match("NBHS", "Business Ops", "s2", "U-2")
+    untagged["target_email"] = "bizops@nbhs.com"      # real domain, invented mailbox, NO tag
+    real = _tier1_match("Altarum", "BTA", "s3", "U-3")
+    real["target_email"] = "kara.wise@altarum.org"
+
+    m.dispatch_tier1_matches([tagged, untagged, real])
+
+    rows = [r["row_data"] for p in payloads for r in p.get("rows", [])]
+    emails = {r[1]: r[3] for r in rows}          # company -> Contact Email cell
+    assert emails["MAHLE"] == "", "a tagged fallback must not reach the sheet"
+    assert emails["NBHS"] == "", "an untagged role-mailbox guess must not reach the sheet either"
+    assert emails["Altarum"] == "kara.wise@altarum.org", "a real address must survive"
+    # The card still drafts to the guess - only the SHEET cell is blanked.
+    assert "operations@mahle.com [⚠️ Fallback Email]" in cards
+
+
+def test_a_blank_contact_email_is_still_eligible_for_backfill():
+    """Blanking the cell must not opt the row out of the sent-mail back-fill."""
+    assert m.is_guessed_contact_email("") is True
+    assert m.is_guessed_contact_email("bizops@nbhs.com") is True
+    assert m.is_guessed_contact_email("kara.wise@altarum.org") is False
+
+
 def test_suppressed_row_card_is_repointed_at_the_live_row(monkeypatch):
     """THE BUG: Code.gs drops a duplicate row from the batch but reports overall success, so the
     card shipped carrying a uuid that was never written to any tab. Every later /warm, /apply and
