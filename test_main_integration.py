@@ -7189,6 +7189,45 @@ def test_standup_leads_with_an_overdue_conversation(monkeypatch):
     assert "/brief" in msg
 
 
+def test_dead_says_the_row_did_not_move(monkeypatch):
+    """/dead is measurement only. Saying just "Marked dead" read as an archive, so a row left
+    deliberately in place looked like a failed write."""
+    sent = []
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, cid, label: {
+        "sheet_uuid": "u-dead", "sheet_tab": "Tetiana Warm", "contact_company": "Huntington"})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {
+        "employer_name": "Huntington", "job_title": "Foreign Exchange Ops Analyst 2",
+        "job_id": "js_1", "job_apply_link": "https://huntington.com/j/1"})
+    monkeypatch.setattr(m, "get_posted_hours_at_card", lambda u: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    monkeypatch.setattr(m, "edit_telegram_message", lambda *a, **k: None)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    outcomes = []
+    monkeypatch.setattr(m, "record_application_outcome",
+                        lambda u, s, **kw: outcomes.append((u, s)) or True)
+
+    _dispatch("/dead")
+
+    assert enqueued == [], "/dead must not move the row - /x does that"
+    assert outcomes == [("u-dead", "dead_link")]
+    assert "NOT moved" in sent[0] and "/x" in sent[0]
+
+
+def test_links_points_at_x_not_dead_for_archiving(monkeypatch):
+    """The /links footer told Kevin "/dead on the card retires it", which contradicts the code."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    monkeypatch.setattr(m, "get_dead_job_links", lambda **kw: [
+        ("u-app", "Huntington", "FX Ops Analyst 2", "http://x/1", "Applied", "HTTP 404", 0,
+         datetime.now().date().isoformat())])
+    _dispatch("/links")
+
+    msg = sent[-1]
+    assert "<code>/x</code> on the card archives it" in msg
+    assert "/dead</code> only records the decoy" in msg
+
+
 def test_dead_since_label_reads_as_a_takedown_date():
     """first_dead_at was stored from the start and never shown. On an APPLIED row it is the
     useful number: when the company stopped sourcing."""

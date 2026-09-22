@@ -10831,7 +10831,8 @@ def process_webhook_payload_async(data):
                     )
                 lines.append(
                     "<i>They stopped sourcing - that is not a rejection. Worth a status chase "
-                    "while the req is fresh. <code>/dead</code> on the card retires it.</i>\n"
+                    "while the req is fresh. <code>/x</code> on the card archives it; "
+                    "<code>/dead</code> only records the decoy and leaves the row alone.</i>\n"
                 )
 
             if retired_rows:
@@ -11784,7 +11785,14 @@ def process_webhook_payload_async(data):
             age_note = f" · {posted_hours}h old when carded" if posted_hours is not None else " · age unknown"
             # Measurement only - no CRM write. /dead answers "was this listing real", which is a
             # different question from what Kevin wants the row to become; /x still kills it.
-            send_telegram_message(chat_id, f"💀 <b>Marked dead</b> - {marked_date}{html.escape(age_note)}")
+            # Say that the ROW did not move. "Marked dead" alone reads as an archive, so a row
+            # left deliberately in place looks like a failed write - which is exactly how it read
+            # on 2026-09-22 when Huntington stayed in Tetiana Warm after two /dead swipes.
+            send_telegram_message(
+                chat_id,
+                f"💀 <b>Marked dead</b> - {marked_date}{html.escape(age_note)}\n"
+                f"<i>Decoy recorded for /decoys. The row was NOT moved - reply "
+                f"<code>/x</code> to archive it.</i>")
             record_application_outcome(
                 sheet_uuid, "dead_link",
                 company=company, role=job.get("job_title"),
