@@ -1323,11 +1323,182 @@ def test_promote_refuses_unknown_ambiguous_and_already_hot(monkeypatch):
     assert enqueued2 == [] and "already in Carmen Hot" in sent2[0]
 
 
+def _beth(uuid_val="beth-uuid-0000-0000", name="Beth Young", email="beth.young@altarum.org"):
+    """A Carmen Cold row as /e's capture path writes it - no cached job, so no short_id."""
+    return {"sheet_uuid": uuid_val, "name": name, "email": email,
+            "company": "Altarum", "last_contact": "2026-09-21", "next_followup": "2026-09-25"}
+
+
+def test_promote_by_email_moves_an_existing_carmen_contact(monkeypatch):
+    """The UUID is hidden in Column J, so the address on screen has to work."""
+    sent, enqueued = _promote_env(monkeypatch, cold=[_beth()])
+    _dispatch("/promote beth.young@altarum.org")
+
+    assert [p["action"] for p in enqueued] == ["update_status", "append_note"]
+    assert enqueued[0] == {**enqueued[0], "sheet_uuid": "beth-uuid-0000-0000", "new_tab": "Carmen Hot"}
+    assert "Promoted Beth Young" in sent[0]
+
+
+def test_promote_by_full_name_spanning_two_words(monkeypatch):
+    """"Beth Young" arrives split across the token and the trailing group."""
+    sent, enqueued = _promote_env(monkeypatch, cold=[_beth()])
+    _dispatch("/promote Beth Young")
+    assert enqueued[0]["new_tab"] == "Carmen Hot"
+    assert "Promoted Beth Young" in sent[0]
+
+
+def test_promote_by_name_is_case_insensitive_and_demote_works_too(monkeypatch):
+    _, enqueued = _promote_env(monkeypatch, cold=[_beth()])
+    _dispatch("/promote beth young")
+    assert enqueued[0]["new_tab"] == "Carmen Hot"
+
+    _, enqueued2 = _promote_env(monkeypatch, hot=[_beth()])
+    _dispatch("/demote beth.young@altarum.org")
+    assert enqueued2[0]["new_tab"] == "Carmen Warm"
+
+
+def test_promote_by_name_refuses_two_people_with_the_same_name(monkeypatch):
+    """Ambiguity must refuse rather than guess which row to move."""
+    sent, enqueued = _promote_env(monkeypatch, cold=[
+        _beth("uuid-a-0000-0000", email="beth.young@altarum.org"),
+        _beth("uuid-b-0000-0000", email="b.young@example.com"),
+    ])
+    _dispatch("/promote Beth Young")
+    assert enqueued == [] and "matches more than one contact" in sent[0]
+
+
+def test_promote_partial_name_does_not_match(monkeypatch):
+    """A bare first name is a coin flip the day a second Beth is captured."""
+    sent, enqueued = _promote_env(monkeypatch, cold=[_beth()])
+    _dispatch("/promote beth")
+    assert enqueued == [] and "is not a Carmen Cold or Carmen Hot contact" in sent[0]
+
+
+def test_an_existing_contact_is_moved_never_duplicated_by_the_job_card_form(monkeypatch):
+    """/promote <job_id> Beth Young beth.young@altarum.org when Beth ALREADY has a row: the
+    contact lookup wins, so she is promoted rather than written a second time."""
+    sent, enqueued = _promote_env(monkeypatch, cold=[_beth()])
+    written = []
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda p: written.append(p) or True)
+    _dispatch("/promote beth.young@altarum.org Beth Young")
+    assert written == []
+    assert enqueued[0]["new_tab"] == "Carmen Hot"
+
+
+def _job_card_env(monkeypatch, job=None, logged=False, write_ok=True):
+    """/promote <job_id> Name email - the job-card form. Carmen tabs are deliberately EMPTY:
+    the whole point is the person has no contact row yet."""
+    sent, written, cached = [], [], []
+    monkeypatch.setattr(m, "fetch_networking_cards", lambda code, qty=None: [])
+    monkeypatch.setattr(m, "get_sheet_uuid_by_short_id", lambda sid: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: None)
+    monkeypatch.setattr(m, "get_job_from_cache", lambda t: dict(job) if job else {})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda t: {})
+    monkeypatch.setattr(m, "is_logged_person_contact", lambda e: logged)
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda p: written.append(p) or write_ok)
+    monkeypatch.setattr(m, "record_captured_contact", lambda **kw: cached.append(kw) or True)
+    return sent, written, cached
+
+
+_ALTARUM_JOB = {"employer_name": "Altarum", "job_title": "Business Technology Analyst"}
+
+
+def test_promote_from_a_job_card_creates_a_carmen_hot_contact(monkeypatch):
+    """The real case: Beth replied from an address the CRM has never seen, and the only 🆔 in
+    Telegram is the Altarum JOB card."""
+    sent, written, cached = _job_card_env(monkeypatch, job=_ALTARUM_JOB)
+    _dispatch("/promote 4e886991 Beth Young beth.young@altarum.org")
+
+    assert len(written) == 1
+    p = written[0]
+    assert p["action"] == "quick_add" and p["target_code"] == "CH"
+    assert p["name"] == "Beth Young" and p["email"] == "beth.young@altarum.org"
+    assert p["company"] == "Altarum" and p["status"] == "Replied"
+    assert "Business Technology Analyst" in p["note"]
+    # The local cache mirrors the row, so the NEXT /promote finds her as a contact.
+    assert cached[0]["sheet_tab"] == "Carmen Hot"
+    assert cached[0]["contact_email"] == "beth.young@altarum.org"
+    assert "Added Beth Young" in sent[0] and "job row was not moved" in sent[0]
+
+
+def test_promote_from_a_job_card_never_moves_the_job_row(monkeypatch):
+    """A JOBS->PEOPLE tab move would blank the name column and delete the application. The job
+    id is READ for its company and nothing else."""
+    sent, written, _ = _job_card_env(monkeypatch, job=_ALTARUM_JOB)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    _dispatch("/promote 4e886991 Beth Young beth.young@altarum.org")
+
+    assert enqueued == []                                    # no update_status, no tab move
+    assert all(p["action"] != "update_status" for p in written)
+    assert "/interview 4e886991" in sent[0]                   # points at the command that advances it
+
+
+def test_promote_job_card_derives_the_name_when_only_an_email_is_given(monkeypatch):
+    _, written, _ = _job_card_env(monkeypatch, job=_ALTARUM_JOB)
+    _dispatch("/promote 4e886991 beth.young@altarum.org")
+    assert written[0]["name"] == "Beth Young"                 # from the local part
+
+
+def test_promote_job_card_refuses_role_mailboxes_and_duplicates(monkeypatch):
+    """bizops@ is the inbox the outreach went TO, not the person who replied."""
+    sent, written, _ = _job_card_env(monkeypatch, job=_ALTARUM_JOB)
+    _dispatch("/promote 4e886991 Biz Ops bizops@altarum.org")
+    assert written == [] and "role mailbox" in sent[0]
+
+    sent2, written2, _ = _job_card_env(monkeypatch, job=_ALTARUM_JOB, logged=True)
+    _dispatch("/promote 4e886991 Beth Young beth.young@altarum.org")
+    assert written2 == [] and "already a CRM contact" in sent2[0]
+
+
+def test_promote_job_card_reports_a_failed_crm_write(monkeypatch):
+    """A silent failure here would leave Kevin believing the contact exists."""
+    sent, _, cached = _job_card_env(monkeypatch, job=_ALTARUM_JOB, write_ok=False)
+    _dispatch("/promote 4e886991 Beth Young beth.young@altarum.org")
+    assert cached == [] and "CRM write failed" in sent[0]
+
+
+def test_promote_with_a_job_id_and_no_email_explains_both_commands(monkeypatch):
+    """The message that cost Kevin five minutes: "not a contact" is true but unactionable."""
+    sent, written, _ = _job_card_env(monkeypatch, job=_ALTARUM_JOB)
+    _dispatch("/promote 4e886991")
+    assert written == []
+    assert "is a JOB, not a contact" in sent[0]
+    assert "/interview 4e886991" in sent[0] and "Name name@company.com" in sent[0]
+
+
+def test_promote_job_card_form_leaves_the_plain_contact_promote_untouched(monkeypatch):
+    """Regression: the two-token form must still move an existing Carmen Cold row."""
+    sent, enqueued = _promote_env(monkeypatch, cold=[_person(_PROMOTE_UUID, "2026-05-01")])
+    _dispatch(f"/promote {_PROMOTE_UUID[:8]}")
+    assert [p["action"] for p in enqueued] == ["update_status", "append_note"]
+    assert enqueued[0]["new_tab"] == "Carmen Hot"
+
+
 def test_help_lists_promote_and_demote(monkeypatch):
     sent = []
     monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
     _dispatch("/help")
-    assert "/promote &lt;id&gt;" in "".join(sent) and "/demote &lt;id&gt;" in "".join(sent)
+    menu = "".join(sent)
+    # /promote's label now names what Kevin can actually see and type - the UUID is hidden in
+    # Column J, so "<id>" alone was never the usual way in.
+    assert "/promote &lt;email | name | id&gt;" in menu and "/demote &lt;id&gt;" in menu
+    assert "/promote &lt;job id&gt; Name email" in menu
+    # The optional date is the part Kevin will not remember six weeks from now, so every place
+    # that prints these commands has to show the template, not just the bare id form.
+    assert "/interview &lt;id&gt; [YYYY-MM-DD]" in menu
+
+
+def test_the_daily_card_prints_the_interview_date_template(monkeypatch):
+    """The follow-up card's footer is what Kevin actually reads while acting on a row - a bare
+    "/interview <id>" there hides the date argument no matter what /help says."""
+    card = m.render_followup_needs_card({
+        "counts": {"followups_ready": 1},
+        "followups_ready": [{"company": "Altarum", "role": "Business Technology Analyst",
+                             "short_id": "abc123", "next_followup": "2026-09-25"}],
+    })
+    assert "/interview &lt;id&gt; [YYYY-MM-DD]" in card
 
 
 # ---- Daily "needs you today" card (render_followup_needs_card) ----
@@ -1714,6 +1885,65 @@ def test_status_short_id_commands_build_set_status_payload(monkeypatch, command,
         "sheet_uuid": "uuid-target", "status": expected_status,
     }]
     assert any(expected_status in line for line in sent)
+
+
+def _interview_env(monkeypatch, short_id="abc123"):
+    sent, enqueued = [], []
+    monkeypatch.setattr(m, "get_sheet_uuid_by_short_id",
+                        lambda sid: "uuid-target" if sid == short_id else None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    return sent, enqueued
+
+
+def test_interview_with_a_date_anchors_the_followup_to_the_day_after(monkeypatch):
+    """Status alone leaves Next Followup Date wherever the outreach ladder put it, so a role
+    being actively interviewed for keeps a stale anchor and the sequencer goes quiet."""
+    sent, enqueued = _interview_env(monkeypatch)
+    _dispatch("/interview abc123 2026-09-25")
+
+    assert [p["action"] for p in enqueued] == ["set_status", "update_snooze", "append_note"]
+    assert enqueued[0]["status"] == "Interviewing"
+    assert enqueued[1]["next_followup"] == "2026-09-26"          # the day AFTER the call
+    assert "Interview scheduled for 2026-09-25" in enqueued[2]["note"]
+    assert "Interview:" in sent[0] and "2026-09-26" in sent[0]
+
+
+def test_interview_without_a_date_is_unchanged(monkeypatch):
+    """Regression: the bare form must still write Status and nothing else."""
+    _, enqueued = _interview_env(monkeypatch)
+    _dispatch("/interview abc123")
+    assert [p["action"] for p in enqueued] == ["set_status"]
+    assert enqueued[0]["status"] == "Interviewing"
+
+
+def test_interview_rejects_a_malformed_date_instead_of_defaulting(monkeypatch):
+    """Silently writing today's anchor for "9/25" would schedule the wrong follow-up."""
+    for bad in ("9/25", "2026-13-01", "next-tuesday", "25-09-2026"):
+        sent, enqueued = _interview_env(monkeypatch)
+        _dispatch(f"/interview abc123 {bad}")
+        assert enqueued == [], f"{bad} should not have written anything"
+        assert "Bad date" in sent[0]
+
+
+def test_replied_refuses_a_date_argument(monkeypatch):
+    """/replied has no interview to anchor to - a date there is a typo, not an instruction."""
+    sent, enqueued = _interview_env(monkeypatch)
+    _dispatch("/replied abc123 2026-09-25")
+    assert enqueued == [] and "takes no date" in sent[0]
+
+
+def test_interview_date_is_validated_before_the_id_is_resolved(monkeypatch):
+    """A bad date on an unknown id reports the date, not a confusing "record not found"."""
+    sent, enqueued = _interview_env(monkeypatch)
+    _dispatch("/interview totally-unknown-id 9/25")
+    assert enqueued == [] and "Bad date" in sent[0]
+
+
+def test_interview_usage_mentions_the_optional_date(monkeypatch):
+    sent, enqueued = _interview_env(monkeypatch)
+    _dispatch("/interview")
+    assert enqueued == [] and "YYYY-MM-DD" in sent[0]
 
 
 def test_status_short_id_command_unknown_id_reports_not_found_and_enqueues_nothing(monkeypatch):

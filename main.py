@@ -617,7 +617,7 @@ EMAIL_SENDER_BLACKLIST = os.environ.get(
 # above, never here. Only notification subdomains and scraper job boards qualify.
 EMAIL_BULK_SENDER_DOMAINS = tuple(d.strip().lower() for d in os.environ.get(
     "EMAIL_BULK_DOMAINS",
-    "mynotifications.cvs.com,update.hevyapp.com,lensa.com,jooble.org"
+    "mynotifications.cvs.com,update.hevyapp.com,lensa.com,jooble.org,bandana.com"
 ).split(",") if d.strip())
 # Applicant tracking systems that send real interview invitations and scheduling links from
 # noreply@ mailboxes. Matched against the sender's DOMAIN (exact or subdomain) to exempt it from
@@ -7627,14 +7627,115 @@ def find_carmen_contacts(token):
         return []
     exact = str(get_sheet_uuid_by_short_id(token) or "").lower()
     prefix = token.lower() if len(token) >= 8 else ""
+    # EMAIL or NAME, because the UUID is the one identifier Kevin cannot see: Column J is hidden
+    # by formatSheet(), and a Carmen contact captured by /e or the sent-mail sweep has no job card
+    # and therefore no 🆔 in Telegram at all. Promoting Beth Young by UUID meant unhiding a column
+    # and copying 8 characters by hand; "beth.young@altarum.org" is on screen and unambiguous.
+    # Name is matched case-insensitively and in full - a bare "beth" would be a coin flip the day
+    # a second Beth is captured, and find_carmen_contacts()'s contract is that 2+ hits refuse.
+    needle = token.lower()
     hits = {}
     for code, tab_name in (("CC", "Carmen Cold"), ("CH", "Carmen Hot")):
         for rec in fetch_networking_cards(code, qty=None) or []:
             uuid_val = str(rec.get("sheet_uuid") or "")
             low = uuid_val.lower()
-            if uuid_val and ((exact and low == exact) or (prefix and low.startswith(prefix))):
+            matched = bool(uuid_val) and ((exact and low == exact) or (prefix and low.startswith(prefix)))
+            if not matched:
+                rec_email = str(rec.get("email") or "").strip().lower()
+                rec_name = str(rec.get("name") or "").strip().lower()
+                matched = bool(needle) and needle in (rec_email, rec_name)
+            if matched and uuid_val:
                 hits[uuid_val] = (uuid_val, tab_name, rec)
     return list(hits.values())
+
+def promote_job_card_contact(chat_id, token, extra):
+    """`/promote <job_id> Name name@company.com` -> a new Carmen Hot row. True when handled.
+
+    The job row is READ, never moved: its company is the only field borrowed, so the role stays in
+    its pipeline tab with its Status, Fit Score and Golden Ratio contribution intact. A JOBS->PEOPLE
+    tab move would instead blank the name column (JOBS has no `name` field), demote the title to a
+    "[Former Role: ...]" note, and delete the source row - losing the application to gain a nameless
+    contact.
+
+    Returns False without sending anything when `extra` carries no email, so the caller falls
+    through to its own "not a contact" message and the normal two-token /promote is untouched.
+    """
+    email_match = re.search(r"[\w\.\-\+]+@[\w\.\-]+\.\w+", extra or "")
+    if not email_match:
+        return False
+    email = email_match.group(0).strip().lower()
+    # Whatever is left once the address is removed is the person's name. Falls back to the
+    # address's local part, the same way log_addressed_contact_to_carmen_cold() does.
+    name = re.sub(re.escape(email_match.group(0)), "", extra, flags=re.IGNORECASE).strip(" ,<>-").strip()
+
+    job = get_job_from_cache(token) or get_job_by_sheet_uuid(token) or {}
+    company = str(job.get("employer_name") or "").strip()
+    title = str(job.get("job_title") or "").strip()
+    if not job:
+        send_telegram_message(
+            chat_id,
+            f"⚠️ <b>Not added:</b> <code>{html.escape(token)}</code> is not a job 🆔 in the cache. "
+            f"Use the 🆔 exactly as the card shows it."
+        )
+        return True
+
+    if is_logged_person_contact(email):
+        send_telegram_message(chat_id, f"ℹ️ <code>{html.escape(email)}</code> is already a CRM contact.")
+        return True
+    # Role mailboxes and consumer domains are refused for the same reason the /e capture gate
+    # refuses them: bizops@ is an inbox, not the person who replied.
+    if is_role_mailbox(email) or not company_domain_of(email):
+        send_telegram_message(
+            chat_id,
+            f"⚠️ <b>Not added:</b> <code>{html.escape(email)}</code> is a role mailbox or a "
+            f"consumer address - Carmen rows are for named people."
+        )
+        return True
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    sheet_uuid = str(uuid.uuid4())
+    contact_name = name or name_from_email_local_part(email)
+    contact_company = company or (company_domain_of(email) or "").split(".")[0].title()
+    note = f"[{today_str}] Replied re: {title} - promoted from the job card." if title else \
+           f"[{today_str}] Promoted from the job card."
+    # Straight into Carmen Hot: this path exists because the person ALREADY replied, which is the
+    # exact condition /promote's Cold->Hot move is for. Routing via Carmen Cold would need a
+    # second command to undo.
+    payload = build_crm_payload(
+        "quick_add",
+        target_code="CH",
+        sheet_uuid=sheet_uuid,
+        first_contact=today_str,
+        last_contact=today_str,
+        name=contact_name,
+        company=contact_company,
+        email=email,
+        priority=9,
+        status="Replied",
+        next_followup=(datetime.now() + timedelta(days=CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d"),
+        source="Promoted from job card",
+        note=note,
+    )
+    if not log_to_sheets_crm(payload):
+        send_telegram_message(chat_id, f"⚠️ <b>CRM write failed</b> for {html.escape(contact_name)} - not added.")
+        return True
+    record_captured_contact(
+        sheet_uuid=sheet_uuid,
+        sheet_tab="Carmen Hot",
+        contact_name=contact_name,
+        contact_company=contact_company,
+        contact_email=email,
+    )
+    logging.info(f"[/promote] Created Carmen Hot contact {email} ({contact_company}) from job {token}")
+    role_line = f"\n<i>Re: {html.escape(title)}</i>" if title else ""
+    send_telegram_message(
+        chat_id,
+        f"🔥 <b>Added {html.escape(contact_name)}</b> to Carmen Hot\n"
+        f"📧 <code>{html.escape(email)}</code> @ {html.escape(contact_company)}{role_line}\n"
+        f"<i>The job row was not moved - use /interview {html.escape(token)} to advance it.</i>"
+    )
+    return True
+
 
 def build_followup_bump_draft(record, attempt):
     """Draft the follow-up text from the followup_bumps template bank via the existing
@@ -8084,7 +8185,8 @@ def render_followup_needs_card(result, on_demand=False):
         # and _parse_sheet_uuid_from_card_text takes the first UUID it finds, so a swipe-reply would
         # silently act on entry #1. Swipes here fail cleanly instead; actions carry their own id.
         lines.append("<i>Swipe-replies don't work on this card - act via the 📋 links, or "
-                     "<code>/replied &lt;id&gt;</code> · <code>/interview &lt;id&gt;</code> with the 🆔 above.</i>")
+                     "<code>/replied &lt;id&gt;</code> · <code>/interview &lt;id&gt; [YYYY-MM-DD]</code> "
+                     "with the 🆔 above.</i>")
 
     promote = result.get("ready_to_promote", [])
     if promote:
@@ -11380,13 +11482,39 @@ def process_webhook_payload_async(data):
         # Canonical Status advance by short_id (no reply context): /replied <id>, /interview <id>.
         # Resolves the short_id to a sheet_uuid the same way callbacks do (get_sheet_uuid_by_short_id)
         # and writes only the Status field - never a tab move.
-        status_cmd_match = re.match(r"^/(replied|interview)(?:\s+(\S+))?$", text)
+        #
+        # /interview also takes the interview DATE: "/interview <id> 2026-09-25". Status alone
+        # leaves Next Followup Date wherever the outreach ladder last set it, so a role Kevin is
+        # actively interviewing for keeps its old anchor and the sequencer either nags mid-process
+        # or - once the anchor is stale - says nothing at all. Passing the date re-anchors the row
+        # to the day AFTER the call, which is when a thank-you or a status chase is actually due.
+        status_cmd_match = re.match(r"^/(replied|interview)(?:\s+(\S+))?(?:\s+(\S+))?$", text)
         if status_cmd_match:
             cmd, short_id = status_cmd_match.group(1), (status_cmd_match.group(2) or "").strip()
+            date_arg = (status_cmd_match.group(3) or "").strip()
             new_status = "Replied" if cmd == "replied" else "Interviewing"
             if not short_id:
-                send_telegram_message(chat_id, f"⚠️ <b>Usage:</b> <code>/{cmd} &lt;short_id&gt;</code>")
+                usage = (f"⚠️ <b>Usage:</b> <code>/{cmd} &lt;short_id&gt;</code>"
+                         + (" <code>[YYYY-MM-DD]</code>" if cmd == "interview" else ""))
+                send_telegram_message(chat_id, usage)
                 return
+            # The date is optional, so a bad one must never be swallowed: writing today's anchor
+            # when Kevin typed "9/25" would silently schedule the wrong follow-up.
+            interview_date = None
+            if date_arg:
+                if cmd != "interview":
+                    send_telegram_message(chat_id, f"⚠️ <code>/{cmd}</code> takes no date. Use <code>/interview &lt;id&gt; YYYY-MM-DD</code>.")
+                    return
+                try:
+                    interview_date = datetime.strptime(date_arg, "%Y-%m-%d")
+                except ValueError:
+                    send_telegram_message(
+                        chat_id,
+                        f"⚠️ <b>Bad date:</b> <code>{html.escape(date_arg)}</code> - use "
+                        f"<code>YYYY-MM-DD</code>, e.g. <code>/interview {html.escape(short_id)} "
+                        f"{(datetime.now() + timedelta(days=3)).strftime('%Y-%m-%d')}</code>."
+                    )
+                    return
             sheet_uuid = get_sheet_uuid_by_short_id(short_id)
             if not sheet_uuid:
                 send_telegram_message(
@@ -11396,24 +11524,70 @@ def process_webhook_payload_async(data):
                 )
                 return
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-            send_telegram_message(chat_id, f"✅ {new_status} - {datetime.now().strftime('%Y-%m-%d')}")
+            confirm = f"✅ {new_status} - {datetime.now().strftime('%Y-%m-%d')}"
+            if interview_date:
+                # +1 day: a follow-up due the morning OF the interview is noise, and one due that
+                # evening is what Kevin actually wants to act on.
+                follow_up = (interview_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                confirm += (f"\n📅 Interview: <b>{interview_date.strftime('%a %b %d, %Y').replace(' 0', ' ')}</b>"
+                            f"\n🔔 Follow-up anchored to {follow_up}")
+            send_telegram_message(chat_id, confirm)
             enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status=new_status))
+            if interview_date:
+                enqueue_crm_payload(build_crm_payload(
+                    "update_snooze", sheet_uuid=sheet_uuid,
+                    next_followup=(interview_date + timedelta(days=1)).strftime("%Y-%m-%d")))
+                enqueue_crm_payload(build_crm_payload(
+                    "append_note", sheet_uuid=sheet_uuid,
+                    note=f"[{datetime.now().strftime('%Y-%m-%d')}] Interview scheduled for "
+                         f"{interview_date.strftime('%Y-%m-%d')} via /interview."))
             return
 
         # Carmen contact lifecycle (no reply context): /promote <id> moves a contact who replied from
         # Carmen Cold to Carmen Hot; /demote <id> parks a Cold or Hot contact on the Carmen Warm bench.
-        people_cmd_match = re.match(r"^/(promote|demote)(?:\s+(\S+))?$", text)
+        #
+        # The usual form is an EMAIL or a NAME - both visible in the sheet and in the reply Kevin
+        # just read, unlike the UUID, which formatSheet() hides in Column J:
+        #   /promote beth.young@altarum.org
+        #   /promote Beth Young
+        #
+        # /promote also accepts a JOB 🆔 plus a name and email, for someone with no contact row yet:
+        #   /promote <job_id> Beth Young beth.young@altarum.org
+        # That form creates the contact straight into Carmen Hot and leaves the job row ALONE -
+        # never a tab move, because transposeRowValues() would blank the name column and delete
+        # the job from its pipeline tab.
+        people_cmd_match = re.match(r"^/(promote|demote)(?:\s+(\S+))?(?:\s+(.+))?$", text)
         if people_cmd_match:
             cmd, token = people_cmd_match.group(1), (people_cmd_match.group(2) or "").strip()
+            extra = (people_cmd_match.group(3) or "").strip()
             if not token:
-                send_telegram_message(chat_id, f"⚠️ <b>Usage:</b> <code>/{cmd} &lt;id&gt;</code> - the 🆔 from the morning card")
+                send_telegram_message(chat_id, f"⚠️ <b>Usage:</b> <code>/{cmd} &lt;id or name or email&gt;</code>")
                 return
-            matches = find_carmen_contacts(token)
+            # "Beth Young" arrives split across token and extra, so the WHOLE argument is tried as
+            # a contact first. Checked before the single token so a full name beats a stray prefix
+            # match, and before the job-card form so an existing contact is always moved, never
+            # duplicated into a second row.
+            full = f"{token} {extra}".strip() if extra else token
+            matches = find_carmen_contacts(full) if extra else []
+            if not matches:
+                matches = find_carmen_contacts(token)
+            if cmd == "promote" and not matches and extra:
+                handled = promote_job_card_contact(chat_id, token, extra)
+                if handled:
+                    return
             if len(matches) != 1:
+                shown = full if extra else token
                 problem = "matches more than one contact" if matches else "is not a Carmen Cold or Carmen Hot contact"
+                hint = ""
+                # The id resolves to a JOB. Say so and name both commands, rather than letting
+                # Kevin re-read a "not a contact" message that is true but unactionable.
+                if not matches and (get_job_from_cache(token) or get_job_by_sheet_uuid(token)):
+                    hint = (f"\n\n<i>That 🆔 is a JOB, not a contact.</i>\n"
+                            f"• <code>/interview {html.escape(token)}</code> - mark the role Interviewing\n"
+                            f"• <code>/promote {html.escape(token)} Name name@company.com</code> - add the person who replied")
                 send_telegram_message(
-                    chat_id, f"⚠️ <b>Not moved:</b> <code>{html.escape(token)}</code> {problem}. "
-                             f"Use the 🆔 exactly as the morning card shows it."
+                    chat_id, f"⚠️ <b>Not moved:</b> <code>{html.escape(shown)}</code> {problem}. "
+                             f"Try the contact's email address, their full name, or the 🆔.{hint}"
                 )
                 return
             sheet_uuid, source_tab, record = matches[0]
@@ -11495,8 +11669,9 @@ def process_webhook_payload_async(data):
                 "decision-maker searches and the tailored PDF, each with a copy button.\n"
                 "/apply - Mark Applied (Status only, no tab move)\n"
                 "/replied &lt;id&gt; - Set Status to Replied\n"
-                "/interview &lt;id&gt; - Set Status to Interviewing\n"
-                "/promote &lt;id&gt; - Move a contact who replied to Carmen Hot\n"
+                "/interview &lt;id&gt; [YYYY-MM-DD] - Set Status to Interviewing (date anchors the follow-up)\n"
+                "/promote &lt;email | name | id&gt; - Move a contact who replied to Carmen Hot\n"
+                "/promote &lt;job id&gt; Name email - Add the person who replied, from a job card\n"
                 "/demote &lt;id&gt; - Park a Carmen Cold/Hot contact on the Warm bench\n"
                 "/offer - Log an offer for this record\n"
                 "/withdraw - Log a withdrawn application\n"
