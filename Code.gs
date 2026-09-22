@@ -68,6 +68,20 @@ const PEOPLE_EMAIL_COL = 4; // Column D - Contact Email (PEOPLE only; JOBS col D
 // when deduping and to bucket rows for funnel_stats.
 const STATUS_VOCAB = ["Matched", "Applied", "Replied", "Screening", "Interviewing", "Offer", "Rejected"];
 
+// PEOPLE-tab Status vocabulary. Deliberately SEPARATE from STATUS_VOCAB and deliberately sharing
+// none of its words: Column F is the same position in both schemas, and statusRank() buckets it
+// for funnel_stats and picks the surviving row when deduping. A contact set to "Interviewing"
+// would be counted as a job application at the interview stage and inflate the funnel with a
+// person who is not a req.
+//
+// These are answers to "what IS this conversation", which is the question Carmen Hot exists to
+// pose - an interview and a good networking call both land there and need telling apart.
+// "Cold Lead"/"Warm Lead" are kept because /e and the sent-mail sweep already write them.
+const PEOPLE_STATUS_VOCAB = [
+  "Cold Lead", "Warm Lead", "Phone Screen", "Interview", "Networking Call",
+  "Referral", "Follow-up Due", "No Longer Relevant"
+];
+
 function statusRank(value) {
   const needle = (value || "").toString().trim().toLowerCase();
   for (let i = 0; i < STATUS_VOCAB.length; i++) {
@@ -338,6 +352,25 @@ function doPost(e) {
       }
       found.sheet.getRange(found.rowNum, FOLLOWUP_COL).setValue(nextFollowup);
       return respondJSON({ status: "success", message: `Follow-up snoozed to ${nextFollowup}` });
+    }
+
+    // 4a. Clear Follow-up Date (/promote -> build_crm_payload("clear_followup", ...))
+    // A separate action rather than an empty next_followup on update_snooze: that guard rejects a
+    // blank date on purpose, and loosening it would let a bug in any caller silently wipe the
+    // column /f depends on. Promoting to Carmen Hot is the one case where blank is the INTENT -
+    // the tab is outside SEQUENCER_SCAN_TABS, so the cell is Kevin's to fill with the real call
+    // time from the date picker, and a stale ladder date there reads as a commitment that is not.
+    if (action === "clear_followup") {
+      const sheetUuid = payload.sheet_uuid;
+      if (!sheetUuid) {
+        return respondJSON({ status: "error", message: "clear_followup requires sheet_uuid" });
+      }
+      const found = findRecordBySheetUuid(ss, sheetUuid);
+      if (!found) {
+        return respondJSON({ status: "error", message: `No record found for sheet_uuid ${sheetUuid}` });
+      }
+      found.sheet.getRange(found.rowNum, FOLLOWUP_COL).clearContent();
+      return respondJSON({ status: "success", message: `Follow-up date cleared for ${sheetUuid}` });
     }
 
     // 4b. Manual Apollo Email Override (/e, /email -> build_crm_payload("update_contact_email", ...))
@@ -1044,18 +1077,21 @@ function formatSheet(sheet) {
   sheet.getRange(2, 1, maxRows - 1, numCols)
     .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
 
-  // JOBS tabs only: canonical Status dropdown on Column F (rows 2..maxRows). allowInvalid(true)
-  // keeps pre-migration values from erroring; any prior validation on the range is cleared first.
-  // PEOPLE tabs keep their free-text Status column untouched.
-  if (schemaType === "JOBS") {
-    const statusRange = sheet.getRange(2, STATUS_COL, maxRows - 1, 1);
-    statusRange.clearDataValidations();
-    const statusRule = SpreadsheetApp.newDataValidation()
-      .requireValueInList(STATUS_VOCAB, true)
-      .setAllowInvalid(true)
-      .build();
-    statusRange.setDataValidation(statusRule);
-  }
+  // Canonical Status dropdown on Column F (rows 2..maxRows), from the schema's own vocabulary.
+  // allowInvalid(true) keeps pre-migration values from erroring; any prior validation on the
+  // range is cleared first.
+  //
+  // PEOPLE tabs get one too, and it is the point of Carmen Hot: an interview and a networking
+  // call both arrive there, and until the column could say which, every row read "Cold Lead" -
+  // wrong for someone who replied and is booking time. The two vocabularies never overlap, so a
+  // contact can never be counted as a job application (see PEOPLE_STATUS_VOCAB).
+  const statusRange = sheet.getRange(2, STATUS_COL, maxRows - 1, 1);
+  statusRange.clearDataValidations();
+  const statusRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(schemaType === "JOBS" ? STATUS_VOCAB : PEOPLE_STATUS_VOCAB, true)
+    .setAllowInvalid(true)
+    .build();
+  statusRange.setDataValidation(statusRule);
 
   applyConditionalFormatting(sheet, maxRows, numCols);
 }

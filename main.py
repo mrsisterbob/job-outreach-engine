@@ -7594,6 +7594,12 @@ SEQUENCER_PEOPLE_SCHEMA_TABS = frozenset({"Carmen Cold"})
 # ghosts to the bench instead. A contact who DID reply is never moved automatically.
 CARMEN_GHOST_TAB = "Killed"
 
+# What a promoted Carmen Hot row's Status becomes. Mirrors PEOPLE_STATUS_VOCAB in Code.gs, which
+# is deliberately disjoint from the JOBS vocabulary - a contact must never rank as a job
+# application in funnel_stats. Neutral on purpose: an interview and a networking call both land
+# in Carmen Hot, and the dropdown is where Kevin says which.
+CARMEN_HOT_DEFAULT_STATUS = "Follow-up Due"
+
 def _sequencer_already_actioned(sheet_uuid, run_date):
     """True if this row was already actioned by the sequencer earlier today (same-day idempotency
     guard - a re-run, or /queue's sibling, must not double-queue or double-bury)."""
@@ -7878,6 +7884,12 @@ def promote_job_card_contact(chat_id, token, extra):
     # Straight into Carmen Hot: this path exists because the person ALREADY replied, which is the
     # exact condition /promote's Cold->Hot move is for. Routing via Carmen Cold would need a
     # second command to undo.
+    #
+    # next_followup is left BLANK on purpose. Carmen Hot is not in SEQUENCER_SCAN_TABS, so no
+    # automation reads this column here - a ladder date written into it is not a schedule, it is
+    # decoration that looks like a commitment. The column is Kevin's to fill with the actual call
+    # time from Sheets' own date picker, and an empty cell reads as "fill me in" where a wrong
+    # date reads as "already handled".
     payload = build_crm_payload(
         "quick_add",
         target_code="CH",
@@ -7888,8 +7900,8 @@ def promote_job_card_contact(chat_id, token, extra):
         company=contact_company,
         email=email,
         priority=9,
-        status="Replied",
-        next_followup=(datetime.now() + timedelta(days=CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d"),
+        status=CARMEN_HOT_DEFAULT_STATUS,
+        next_followup="",
         source="Promoted from job card",
         note=note,
     )
@@ -8028,7 +8040,7 @@ def run_followup_sequencer(today=None, dry_run=False):
 
     result = {"run_date": run_date, "followups_ready": [], "ready_to_promote": [], "revived": [],
               "applications_quiet": [], "going_cold": [], "buried": [], "killed": [],
-              "top_matched": [], "counts": {}}
+              "top_matched": [], "live_conversations": [], "counts": {}}
     buries_written = 0
     buries_suppressed = 0
     kills_written = 0
@@ -8286,9 +8298,11 @@ def run_followup_sequencer(today=None, dry_run=False):
             "sheet_uuid": su, "fit_score": _parse_fit_score(r.get("raw_priority")),
         })
 
+    result["live_conversations"] = scan_carmen_hot_conversations(today)
+
     result["counts"] = {k: len(result[k]) for k in ("followups_ready", "ready_to_promote", "revived",
                                                      "applications_quiet", "going_cold", "buried",
-                                                     "killed", "top_matched")}
+                                                     "killed", "top_matched", "live_conversations")}
     # Not a section length like the four above: how many of result["buried"] were reported but
     # left unwritten by the cap. Never nonzero on its own (it implies buried > 0), so the card's
     # all-empty early return stays correct.
@@ -8296,6 +8310,70 @@ def run_followup_sequencer(today=None, dry_run=False):
     # And a subset of killed: ghosts listed but left in Carmen Cold by MAX_AUTO_KILLS_PER_RUN.
     result["counts"]["kills_suppressed"] = kills_suppressed
     return result
+
+def scan_carmen_hot_conversations(today=None):
+    """Carmen Hot, rendered for the morning card. READ-ONLY - returns rows, writes nothing.
+
+    Carmen Hot is the only PEOPLE tab outside SEQUENCER_SCAN_TABS, and that is correct: these are
+    people mid-conversation, and an automated bump to someone with a call booked is exactly the
+    wrong move. But not scanning it at all made it write-only - /promote put Kevin's best contacts
+    in and nothing ever read them back, so the only people who had actually replied were the only
+    ones with no safety net, while every colder contact got a ladder.
+
+    So it is SURFACED, never automated. Each row is classified off the date Kevin typed into the
+    picker and the Status he chose from the dropdown:
+
+      "today"    - the call is today
+      "upcoming" - it is ahead
+      "overdue"  - the date has PASSED and Status still is not a settled one. This is the case the
+                   tab exists for: the post-call follow-up is the thing people actually drop, and
+                   nothing else in the system would have said a word about it.
+      "undated"  - promoted but no date set yet; a prompt to fill it in, not a nag.
+
+    Sorted most-urgent first. Rows whose Status says the conversation is finished are dropped
+    entirely - a closed thread is not something that needs Kevin today.
+    """
+    if isinstance(today, datetime):
+        today = today.date()
+    today = today or datetime.now().date()
+    today_str = today.strftime("%Y-%m-%d")
+    # Terminal states: nothing is owed on these, so they never reach the card.
+    settled = {"no longer relevant"}
+    out = []
+    for rec in fetch_networking_cards("CH", qty=None) or []:
+        status = str(rec.get("status") or "").strip()
+        if status.lower() in settled:
+            continue
+        when = str(rec.get("next_followup") or "").strip()
+        if not when or is_followup_unscheduled(when):
+            state, days = "undated", None
+        else:
+            try:
+                d = datetime.strptime(when[:10], "%Y-%m-%d").date()
+            except ValueError:
+                state, days = "undated", None
+            else:
+                delta = (d - today).days
+                days = delta
+                state = "today" if delta == 0 else ("upcoming" if delta > 0 else "overdue")
+        out.append({
+            "sheet_uuid": rec.get("sheet_uuid") or "",
+            "name": str(rec.get("name") or "").strip(),
+            "company": str(rec.get("company") or "").strip(),
+            "email": str(rec.get("email") or "").strip(),
+            "status": status,
+            "when": "" if state == "undated" else when[:10],
+            "state": state,
+            "days": days,
+        })
+    order = {"overdue": 0, "today": 1, "upcoming": 2, "undated": 3}
+    # Overdue first and, within it, the longest-overdue first: that is the one most likely dropped.
+    # `days` is NEGATIVE for overdue, so ascending days already puts the oldest miss at the top;
+    # for upcoming, ascending puts the soonest first. Both want the plain value.
+    return sorted(out, key=lambda r: (order.get(r["state"], 9),
+                                      r["days"] if r["days"] is not None else 0,
+                                      r["name"].lower()))
+
 
 def _seq_id_tag(entry):
     """short_id for /replied /interview, falling back to a sheet_uuid stub, or an em dash."""
@@ -8341,6 +8419,31 @@ def render_followup_needs_card(result, on_demand=False):
     header = "Queue Preview" if on_demand else "Needs You Today"
     note = " <i>(read-only, no writes)</i>" if on_demand else ""
     lines = [f"🗂️ <b>{header} · {today_str}</b>{note}"]
+
+    # Carmen Hot first: these are the only people who actually replied, and an overdue
+    # post-interview follow-up outranks every cold nudge below it.
+    live = result.get("live_conversations", [])
+    if live:
+        overdue_n = sum(1 for e in live if e.get("state") == "overdue")
+        suffix = f" · <i>{overdue_n} need you now</i>" if overdue_n else ""
+        lines.append(f"\n🔥 <b>Live conversations ({len(live)})</b>{suffix}")
+        marks = {"overdue": "🔴", "today": "🟡", "upcoming": "🟢", "undated": "⚪"}
+        for e in live:
+            who = html.escape(e.get("name") or e.get("email") or "—")
+            company = html.escape(e.get("company") or "—")
+            status = html.escape(e.get("status") or "")
+            state, days = e.get("state"), e.get("days")
+            if state == "overdue":
+                when = f"was {html.escape(e.get('when') or '')} · <b>{abs(days)}d ago</b>"
+            elif state == "today":
+                when = "<b>today</b>"
+            elif state == "upcoming":
+                when = f"{html.escape(e.get('when') or '')} · in {days}d"
+            else:
+                when = "<i>no date set</i>"
+            tail = f" · {status}" if status else ""
+            lines.append(f"{marks.get(state, '•')} <b>{who}</b> — {company} · {when}{tail}")
+        lines.append("<i>Set the date and Status in Carmen Hot; nothing here is auto-sent.</i>")
 
     ready = result.get("followups_ready", [])
     if ready:
@@ -11656,6 +11759,18 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
+        # /hot - read Carmen Hot on demand. The tab was reachable only by opening Sheets, which
+        # made the system's best contacts the least visible ones.
+        if text == "/hot":
+            live = scan_carmen_hot_conversations()
+            if not live:
+                send_telegram_message(chat_id, "🔥 <b>Carmen Hot</b>\n\n<i>No live conversations.</i>")
+                return
+            send_telegram_message(chat_id, render_followup_needs_card(
+                {"counts": {"live_conversations": len(live)}, "live_conversations": live},
+                on_demand=True))
+            return
+
         # /kill <company> <n|all> - resolve the pick card a multi-row rejection raised. A typed
         # command rather than a swipe because the card lists several rows and
         # _parse_sheet_uuid_from_card_text() takes the FIRST uuid it finds, so a swipe there would
@@ -11798,8 +11913,24 @@ def process_webhook_payload_async(data):
                 return
             today_str = datetime.now().strftime("%Y-%m-%d")
             verb = "Promoted" if cmd == "promote" else "Demoted"
-            send_telegram_message(chat_id, f"{'🔥' if cmd == 'promote' else '🪑'} {verb} {who} to {target_tab}.")
+            confirm = f"{'🔥' if cmd == 'promote' else '🪑'} {verb} {who} to {target_tab}."
+            if cmd == "promote":
+                confirm += "\n📅 <i>Next Followup Date cleared - set the call time in Sheets.</i>"
+            send_telegram_message(chat_id, confirm)
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=target_tab))
+            # A promote carries the OUTREACH ladder's date across the move - Beth landed in Carmen
+            # Hot showing 9/24, a nudge date for a conversation that had already happened. Carmen
+            # Hot is not in SEQUENCER_SCAN_TABS, so nothing reads it; blanking it hands the column
+            # to Kevin and Sheets' own date picker for the real call time. /demote keeps its date:
+            # the bench IS a follow-up cadence.
+            if cmd == "promote":
+                enqueue_crm_payload(build_crm_payload("clear_followup", sheet_uuid=sheet_uuid))
+                # "Cold Lead" is false the moment someone replies and starts booking time, and it
+                # was what every promoted row still read. "Follow-up Due" is the honest neutral:
+                # it says a human owes this person something without asserting an interview that
+                # may turn out to be a networking call. Kevin picks the real one from the dropdown.
+                enqueue_crm_payload(build_crm_payload(
+                    "set_status", sheet_uuid=sheet_uuid, status=CARMEN_HOT_DEFAULT_STATUS))
             enqueue_crm_payload(build_crm_payload(
                 "append_note", sheet_uuid=sheet_uuid,
                 note=f"[{today_str}] {verb} from {source_tab} to {target_tab} via /{cmd}.",
@@ -11859,7 +11990,8 @@ def process_webhook_payload_async(data):
                 "/c - Pull combined networking cards\n"
                 "/cw - Pull Warm Rolodex cards\n"
                 "/cc - Pull Cold VP Sprint cards\n"
-                "/p - Query priority tier contacts\n\n"
+                "/p - Query priority tier contacts\n"
+                "/hot - Live conversations in Carmen Hot (calls, interviews, referrals)\n\n"
                 "<b>SWIPE-REPLY ACTIONS (reply to a card):</b>\n"
                 "Every card carries a 📋 Full Card link - ATS bullets, LinkedIn note, cold draft,\n"
                 "decision-maker searches and the tailored PDF, each with a copy button.\n"

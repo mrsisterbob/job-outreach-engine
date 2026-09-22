@@ -503,7 +503,8 @@ def test_sequencer_stale_nudge_and_top_matched_do_not_write(monkeypatch):
     assert all(p["sheet_uuid"] not in ("seq-m1", "seq-m2") for p in enqueued)
     assert result["counts"] == {"followups_ready": 0, "ready_to_promote": 0, "revived": 0,
                                 "applications_quiet": 1, "going_cold": 1, "buried": 1, "killed": 0,
-                                "top_matched": 2, "buries_suppressed": 0, "kills_suppressed": 0}
+                                "top_matched": 2, "live_conversations": 0, "buries_suppressed": 0,
+                                "kills_suppressed": 0}
 
 
 def test_sequencer_is_idempotent_across_two_consecutive_runs(monkeypatch):
@@ -526,7 +527,8 @@ def test_sequencer_dry_run_performs_zero_writes(monkeypatch):
 
     assert result["counts"] == {"followups_ready": 0, "ready_to_promote": 0, "revived": 0,
                                 "applications_quiet": 1, "going_cold": 1, "buried": 1, "killed": 0,
-                                "top_matched": 2, "buries_suppressed": 0, "kills_suppressed": 0}
+                                "top_matched": 2, "live_conversations": 0, "buries_suppressed": 0,
+                                "kills_suppressed": 0}
     assert enqueued == []
     with m.get_db_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM followup_sequencer_log").fetchone()[0] == 0
@@ -1284,9 +1286,11 @@ def test_promote_by_the_cards_uuid_stub_moves_to_carmen_hot_with_a_note(monkeypa
     sent, enqueued = _promote_env(monkeypatch, cold=[_person(_PROMOTE_UUID, "2026-05-01")])
     _dispatch(f"/promote {_PROMOTE_UUID[:8]}")
 
-    assert [p["action"] for p in enqueued] == ["update_status", "append_note"]
+    # clear_followup sits between the move and the note: see
+    # test_promote_clears_the_followup_date_but_demote_keeps_it.
+    assert [p["action"] for p in enqueued] == ["update_status", "clear_followup", "set_status", "append_note"]
     assert enqueued[0] == {**enqueued[0], "sheet_uuid": _PROMOTE_UUID, "new_tab": "Carmen Hot"}
-    assert re.match(r"^\[\d{4}-\d{2}-\d{2}\] Promoted from Carmen Cold to Carmen Hot", enqueued[1]["note"])
+    assert re.match(r"^\[\d{4}-\d{2}-\d{2}\] Promoted from Carmen Cold to Carmen Hot", enqueued[3]["note"])
     assert "Promoted" in sent[0]
 
 
@@ -1465,9 +1469,138 @@ def test_promote_by_email_moves_an_existing_carmen_contact(monkeypatch):
     sent, enqueued = _promote_env(monkeypatch, cold=[_beth()])
     _dispatch("/promote beth.young@altarum.org")
 
-    assert [p["action"] for p in enqueued] == ["update_status", "append_note"]
+    assert [p["action"] for p in enqueued] == ["update_status", "clear_followup", "set_status", "append_note"]
     assert enqueued[0] == {**enqueued[0], "sheet_uuid": "beth-uuid-0000-0000", "new_tab": "Carmen Hot"}
     assert "Promoted Beth Young" in sent[0]
+
+
+def test_promote_clears_the_followup_date_but_demote_keeps_it(monkeypatch):
+    """Beth landed in Carmen Hot showing 9/24 - the outreach ladder's nudge date, carried across
+    the move, for a conversation that had already happened. Carmen Hot is not in
+    SEQUENCER_SCAN_TABS, so nothing reads it; blank hands the column to Kevin's date picker."""
+    sent, enqueued = _promote_env(monkeypatch, cold=[_beth()])
+    _dispatch("/promote beth.young@altarum.org")
+
+    assert [p["action"] for p in enqueued] == ["update_status", "clear_followup", "set_status", "append_note"]
+    assert enqueued[1]["sheet_uuid"] == "beth-uuid-0000-0000"
+    assert "Next Followup Date cleared" in sent[0]
+
+    # The bench IS a follow-up cadence, so /demote must not blank it.
+    _, enqueued2 = _promote_env(monkeypatch, hot=[_beth()])
+    _dispatch("/demote beth.young@altarum.org")
+    assert "clear_followup" not in [p["action"] for p in enqueued2]
+
+
+def _hot_row(name, when, status="Follow-up Due", company="Altarum"):
+    return {"sheet_uuid": f"uuid-{name.lower().replace(' ', '-')}", "name": name,
+            "company": company, "email": f"{name.split()[0].lower()}@x.com",
+            "status": status, "next_followup": when}
+
+
+def _hot_env(monkeypatch, rows):
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(r) for r in rows] if code == "CH" else [])
+
+
+def test_carmen_hot_classifies_by_the_date_kevin_typed(monkeypatch):
+    """The picker date is the whole point - nothing read that column before."""
+    _hot_env(monkeypatch, [
+        _hot_row("Beth Young", "2026-09-19"),      # 3 days ago
+        _hot_row("Cara Today", "2026-09-22"),      # today
+        _hot_row("Dan Later", "2026-09-25"),       # in 3 days
+        _hot_row("Eve Undated", ""),
+    ])
+    out = m.scan_carmen_hot_conversations(date(2026, 9, 22))
+
+    assert [(e["name"], e["state"]) for e in out] == [
+        ("Beth Young", "overdue"), ("Cara Today", "today"),
+        ("Dan Later", "upcoming"), ("Eve Undated", "undated")]
+    assert out[0]["days"] == -3 and out[2]["days"] == 3
+
+
+def test_carmen_hot_puts_the_longest_overdue_first(monkeypatch):
+    """The post-call follow-up is the thing that actually gets dropped."""
+    _hot_env(monkeypatch, [
+        _hot_row("Recent Miss", "2026-09-21"),
+        _hot_row("Old Miss", "2026-09-10"),
+        _hot_row("Upcoming", "2026-09-30"),
+    ])
+    out = m.scan_carmen_hot_conversations(date(2026, 9, 22))
+    assert [e["name"] for e in out] == ["Old Miss", "Recent Miss", "Upcoming"]
+
+
+def test_carmen_hot_drops_settled_conversations(monkeypatch):
+    """A closed thread is not something that needs Kevin today."""
+    _hot_env(monkeypatch, [
+        _hot_row("Live One", "2026-09-19"),
+        _hot_row("Done Deal", "2026-09-19", status="No Longer Relevant"),
+    ])
+    out = m.scan_carmen_hot_conversations(date(2026, 9, 22))
+    assert [e["name"] for e in out] == ["Live One"]
+
+
+def test_carmen_hot_survives_a_garbled_date(monkeypatch):
+    """A hand-typed cell can hold anything; it must not crash the morning card."""
+    _hot_env(monkeypatch, [_hot_row("Typo Person", "next tuesday")])
+    out = m.scan_carmen_hot_conversations(date(2026, 9, 22))
+    assert out[0]["state"] == "undated"
+
+
+def test_the_daily_card_leads_with_live_conversations(monkeypatch):
+    """An overdue post-interview follow-up outranks every cold nudge on the card."""
+    card = m.render_followup_needs_card({
+        "counts": {"live_conversations": 2, "followups_ready": 1},
+        "live_conversations": [
+            {"name": "Beth Young", "company": "Altarum", "status": "Phone Screen",
+             "when": "2026-09-19", "state": "overdue", "days": -3},
+            {"name": "Dan Later", "company": "Sanctuary", "status": "Networking Call",
+             "when": "2026-09-25", "state": "upcoming", "days": 3},
+        ],
+        "followups_ready": [{"company": "X", "role": "Analyst", "short_id": "abc",
+                             "next_followup": "2026-09-22"}],
+    })
+    assert "Live conversations (2)" in card and "1 need you now" in card
+    assert "Beth Young" in card and "3d ago" in card and "Phone Screen" in card
+    # Live conversations must come BEFORE the cold-nudge section.
+    assert card.index("Live conversations") < card.index("Nudge these people")
+    assert "nothing here is auto-sent" in card
+
+
+def test_carmen_hot_is_never_added_to_the_sequencer_scan(monkeypatch):
+    """Surfacing is not automating: an auto-bump to someone with a call booked is wrong, and
+    followup_action() can return bury_ghosted."""
+    assert all(code != "CH" for code, _ in m.SEQUENCER_SCAN_TABS)
+
+
+def test_people_statuses_can_never_rank_as_job_applications():
+    """Column F is the same position in both schemas and statusRank() buckets it for funnel_stats.
+    A contact set to a JOBS word would be counted as a real application at that stage."""
+    people_vocab = ["Cold Lead", "Warm Lead", "Phone Screen", "Interview", "Networking Call",
+                    "Referral", "Follow-up Due", "No Longer Relevant"]
+    assert all(m.status_rank(s) == -1 for s in people_vocab)
+    # "Interview" is NOT "Interviewing" - the near-miss is the whole reason this is checked.
+    assert m.status_rank("Interview") == -1 and m.status_rank("Interviewing") == 4
+    assert m.CARMEN_HOT_DEFAULT_STATUS in people_vocab
+
+
+def test_promote_sets_an_honest_status_not_cold_lead(monkeypatch):
+    """Beth replied and is booking a call, and her row still read "Cold Lead"."""
+    _, enqueued = _promote_env(monkeypatch, cold=[_beth()])
+    _dispatch("/promote beth.young@altarum.org")
+
+    status_writes = [p for p in enqueued if p["action"] == "set_status"]
+    assert len(status_writes) == 1
+    assert status_writes[0]["status"] == m.CARMEN_HOT_DEFAULT_STATUS
+    assert status_writes[0]["status"] != "Cold Lead"
+    assert m.status_rank(status_writes[0]["status"]) == -1     # never a funnel application
+
+
+def test_a_job_card_promote_writes_no_followup_date(monkeypatch):
+    """The created-from-scratch path must match: an invented ladder date in Carmen Hot looks like
+    a commitment Kevin never made."""
+    _, written, _ = _job_card_env(monkeypatch, job=_ALTARUM_JOB)
+    _dispatch("/promote 4e886991 Beth Young beth.young@altarum.org")
+    assert written[0]["next_followup"] == ""
 
 
 def test_promote_by_full_name_spanning_two_words(monkeypatch):
@@ -1545,7 +1678,7 @@ def test_promote_from_a_job_card_creates_a_carmen_hot_contact(monkeypatch):
     p = written[0]
     assert p["action"] == "quick_add" and p["target_code"] == "CH"
     assert p["name"] == "Beth Young" and p["email"] == "beth.young@altarum.org"
-    assert p["company"] == "Altarum" and p["status"] == "Replied"
+    assert p["company"] == "Altarum" and p["status"] == m.CARMEN_HOT_DEFAULT_STATUS
     assert "Business Technology Analyst" in p["note"]
     # The local cache mirrors the row, so the NEXT /promote finds her as a contact.
     assert cached[0]["sheet_tab"] == "Carmen Hot"
@@ -1603,7 +1736,7 @@ def test_promote_job_card_form_leaves_the_plain_contact_promote_untouched(monkey
     """Regression: the two-token form must still move an existing Carmen Cold row."""
     sent, enqueued = _promote_env(monkeypatch, cold=[_person(_PROMOTE_UUID, "2026-05-01")])
     _dispatch(f"/promote {_PROMOTE_UUID[:8]}")
-    assert [p["action"] for p in enqueued] == ["update_status", "append_note"]
+    assert [p["action"] for p in enqueued] == ["update_status", "clear_followup", "set_status", "append_note"]
     assert enqueued[0]["new_tab"] == "Carmen Hot"
 
 
