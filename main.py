@@ -7051,22 +7051,21 @@ def send_tuesday_pipeline_executive_hub(chat_id):
     ats_count = len(safe_list(get_filter("ats_company_slugs", [])))
     overdue = get_overdue_followups()
     today_str = datetime.now().strftime("%Y-%m-%d")
+    # Headline only. Every counter that used to print here - the full pipeline table, coverage,
+    # per-source outcomes - now lives on /brief. Those numbers move slowly and are never acted on
+    # from the lock screen, and printing them pushed the one line Kevin DOES act on (overdue) to
+    # the bottom of a fourteen-line wall.
+    brief_url = html.escape(f"{BASE_URL}/brief", quote=True)
     hub = (
-        f"📈 <b>Tuesday Pipeline Executive &amp; Batch Hub ({today_str})</b>\n\n"
-        f"<b>Rolling 7-Day Pipeline:</b>\n"
-        f"• Discovered: {weekly['listing_discovered']} | AI Screened: {weekly['ai_screened']}\n"
-        f"• Drafted: {weekly['gmail_draft_staged']} | Applied: {weekly['applied']} | Interviews: {weekly['interview_set']}\n"
-        f"• <b>Golden Ratio:</b> {golden_ratio:.1f}% (interviews / staged drafts)\n\n"
-        f"<b>Coverage &amp; Enrichment:</b>\n"
-        f"• ATS boards: {ats_count}\n"
-        f"• Hunter.io: {api_usage['hunter']} | Prospeo: {api_usage['prospeo']} | GetProspect: {api_usage['getprospect']} (month-to-date local calls)\n\n"
-        f"⚠️ <b>Overdue:</b> {len(overdue)} records\n"
-        f"<code>/sendall</code> Draft bumps + set all eligible records to +14d\n"
-        f"<code>/snoozeall 7</code> Move all overdue follow-ups by N days\n"
-        f"<code>/overdue</code> Full overdue list on demand"
+        f"📈 <b>Tuesday Hub ({today_str})</b>\n\n"
+        f"7-day: <b>{weekly['applied']}</b> applied · <b>{weekly['interview_set']}</b> interviews"
+        f" · Golden Ratio <b>{golden_ratio:.1f}%</b>\n"
+        f"⚠️ Overdue: <b>{len(overdue)}</b> records\n\n"
+        f"📊 <a href='{brief_url}'>Open the full brief</a>"
+        f" <i>— pipeline, outcomes by source, coverage</i>\n\n"
+        f"<code>/sendall</code> · <code>/snoozeall 7</code> · <code>/overdue</code>"
     )
     send_telegram_message(chat_id, hub)
-    send_telegram_message(chat_id, format_outcome_metrics_message())
     if not overdue:
         return
     send_overdue_digest(chat_id, overdue)
@@ -7077,22 +7076,45 @@ def send_daily_standup(chat_id):
     activity = get_daily_activity(today_str)
     streak = calculate_active_day_streak()
     overdue_count = len(get_overdue_followups())
+    # Live conversations first when any are overdue: a call that happened three days ago with no
+    # follow-up outranks a streak counter.
+    live = scan_carmen_hot_conversations()
+    live_overdue = [e for e in live if e.get("state") == "overdue"]
+    live_today = [e for e in live if e.get("state") == "today"]
+    lead = ""
+    if live_overdue:
+        who = ", ".join(html.escape(e.get("name") or "?") for e in live_overdue[:3])
+        lead = f"🔴 <b>{len(live_overdue)} conversation(s) need you:</b> {who}\n\n"
+    elif live_today:
+        who = ", ".join(html.escape(e.get("name") or "?") for e in live_today[:3])
+        lead = f"🟡 <b>Today:</b> {who}\n\n"
+    brief_url = html.escape(f"{BASE_URL}/brief", quote=True)
     digest = (
         f"🌅 <b>Daily Standup ({today_str})</b>\n\n"
+        f"{lead}"
         f"🔥 <b>Active Streak:</b> {streak} days\n"
         f"🎯 <b>Today's Staged Goal:</b> {activity['drafts_staged']} / 5\n"
         f"⚠️ <b>Overdue Actions:</b> {overdue_count}\n\n"
-        f"Run <code>/s</code> to review overdue contacts or <code>/t</code> to trigger the search pipeline."
+        f"📊 <a href='{brief_url}'>Full brief</a> · <code>/s</code> overdue · <code>/t</code> search"
     )
     # Job links that died since the last digest. Reported once each (notified flag), so a posting
     # that stays dead does not repeat every morning.
     fresh_dead = get_dead_job_links(include_notified=False, limit=10)
     if fresh_dead:
-        digest += f"\n\n🔗 <b>Job links gone dead ({len(fresh_dead)}):</b>"
-        for uuid_v, company, role, _link, status, _reason, retired, _first in fresh_dead:
-            tag = "⚰️ retired" if retired else f"⚠️ {html.escape(str(status or '?'))}"
-            digest += f"\n• {html.escape(str(company or '?'))} - {html.escape(str(role or '?'))} ({tag})"
-        digest += "\n<i>⚰️ auto-moved to Died. ⚠️ you applied, so it was left alone.</i> <code>/links</code>"
+        # Applied rows lead: a posting coming down on a job Kevin is waiting to hear about is the
+        # only half of this list he can act on. Retired rows are collapsed to a count - they are
+        # already in Died and reading their names changes nothing.
+        applied = [r for r in fresh_dead if not r[6]]
+        retired_n = len(fresh_dead) - len(applied)
+        if applied:
+            digest += f"\n\n🔗 <b>Applied - posting came down ({len(applied)}):</b>"
+            for uuid_v, company, role, _link, status, _reason, _retired, first_dead in applied:
+                digest += (f"\n• {html.escape(str(company or '?'))} - {html.escape(str(role or '?'))}"
+                           f" · down {_dead_since_label(first_dead)}")
+            digest += "\n<i>They stopped sourcing, not a rejection - worth a status chase.</i>"
+        if retired_n:
+            digest += f"\n\n⚰️ <i>{retired_n} dead link(s) auto-retired to Died.</i>"
+        digest += " <code>/links</code>"
         mark_dead_links_notified([r[0] for r in fresh_dead])
 
     health_warnings = check_system_health()
@@ -8783,6 +8805,28 @@ def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=L
         f"[LINKCHECK] checked={checked} dead={len(dead)} retired={len(retired)} unknown={unknown}"
     )
     return {"checked": checked, "dead": dead, "retired": retired, "unknown": unknown}
+
+
+def _dead_since_label(first_dead_at):
+    """"2026-09-22 (today)" / "2026-09-19 (3d ago)" for a first_dead_at timestamp, or "date unknown".
+
+    The sweep has always stored first_dead_at and never shown it. On an APPLIED row that date is
+    the useful one: it says when the company stopped sourcing, which is how fresh a status chase
+    to the recruiter still is.
+    """
+    text = str(first_dead_at or "").strip()
+    if not text:
+        return "date unknown"
+    try:
+        when = datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return "date unknown"
+    days = (datetime.now().date() - when).days
+    if days <= 0:
+        return f"{when.isoformat()} (today)"
+    if days == 1:
+        return f"{when.isoformat()} (yesterday)"
+    return f"{when.isoformat()} ({days}d ago)"
 
 
 def get_dead_job_links(include_notified=True, limit=40):
@@ -10767,20 +10811,36 @@ def process_webhook_payload_async(data):
                     "preview one now with <code>/links check</code> (writes nothing)."
                 )
                 return
+            # Split by what Kevin can DO about each, rather than listing them together. A retired
+            # row is finished - it is reported once and needs nothing. An APPLIED row whose posting
+            # came down is a live thread where the company stopped sourcing, which is a reason to
+            # chase the recruiter, and burying it in a list of corpses is what made the whole
+            # digest read as noise.
+            retired_rows = [r for r in rows if r[6]]
+            applied_rows = [r for r in rows if not r[6]]
             lines = ["🔗 <b>Dead Job Links</b>\n"]
-            for uuid_v, company, role, link, status, reason, retired, first_dead in rows:
-                mark = "⚰️ retired" if retired else f"⚠️ still in {html.escape(str(status or '?'))}"
+
+            if applied_rows:
+                lines.append(f"▶ <b>You applied - posting came down ({len(applied_rows)})</b>")
+                for uuid_v, company, role, link, status, reason, _retired, first_dead in applied_rows:
+                    down = _dead_since_label(first_dead)
+                    lines.append(
+                        f"⚠️ <b>{html.escape(str(company or '?'))}</b> - {html.escape(str(role or '?'))}\n"
+                        f"  taken down {down} · still in {html.escape(str(status or '?'))}\n"
+                        f"  🆔 <code>{html.escape(str(uuid_v))}</code>"
+                    )
                 lines.append(
-                    f"<b>{html.escape(str(company or '?'))}</b> - {html.escape(str(role or '?'))}\n"
-                    f"  {mark} · <i>{html.escape(str(reason or ''))}</i>\n"
-                    f"  🆔 <code>{html.escape(str(uuid_v))}</code>"
+                    "<i>They stopped sourcing - that is not a rejection. Worth a status chase "
+                    "while the req is fresh. <code>/dead</code> on the card retires it.</i>\n"
                 )
-            lines.append(
-                "\n⚰️ = auto-moved to Died (was still 'Matched').\n"
-                "⚠️ = you applied, so nothing was moved. The posting is down, which means they "
-                "stopped sourcing - not that you were rejected. Reply <code>/dead</code> to that "
-                "job's card if you want it retired."
-            )
+
+            if retired_rows:
+                lines.append(f"▶ <b>Auto-retired to Died ({len(retired_rows)})</b> <i>— no action needed</i>")
+                for uuid_v, company, role, link, status, reason, _retired, first_dead in retired_rows:
+                    lines.append(
+                        f"⚰️ <b>{html.escape(str(company or '?'))}</b> - {html.escape(str(role or '?'))}"
+                        f" · {_dead_since_label(first_dead)}"
+                    )
             send_telegram_message(chat_id, "\n".join(lines))
             return
 
@@ -11802,6 +11862,15 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             return
 
+        if text == "/brief":
+            brief_url = html.escape(f"{BASE_URL}/brief", quote=True)
+            send_telegram_message(
+                chat_id,
+                f"📊 <a href='{brief_url}'>Morning Brief</a>\n"
+                f"<i>Live conversations, 7-day pipeline, outcomes by source, coverage, "
+                f"and applied roles whose posting came down.</i>")
+            return
+
         # /hot - read Carmen Hot on demand. The tab was reachable only by opening Sheets, which
         # made the system's best contacts the least visible ones.
         if text == "/hot":
@@ -12034,7 +12103,8 @@ def process_webhook_payload_async(data):
                 "/cw - Pull Warm Rolodex cards\n"
                 "/cc - Pull Cold VP Sprint cards\n"
                 "/p - Query priority tier contacts\n"
-                "/hot - Live conversations in Carmen Hot (calls, interviews, referrals)\n\n"
+                "/hot - Live conversations in Carmen Hot (calls, interviews, referrals)\n"
+                "/brief - One page: pipeline, outcomes, coverage, live conversations\n\n"
                 "<b>SWIPE-REPLY ACTIONS (reply to a card):</b>\n"
                 "Every card carries a 📋 Full Card link - ATS bullets, LinkedIn note, cold draft,\n"
                 "decision-maker searches and the tailored PDF, each with a copy button.\n"
@@ -12422,6 +12492,99 @@ def followup_draft_on_demand(sheet_uuid):
         return redirect(f"https://mail.google.com/mail/u/0/#drafts/{urllib.parse.quote(str(draft_id), safe='')}", 302)
     return _followup_copy_page(title, f"Gmail draft not created: {reason}. Copy the text below instead.",
                                draft_text, 502)
+
+@app.route("/brief", methods=["GET"])
+def morning_brief_view():
+    """One page holding everything the morning used to dump into Telegram as four messages.
+
+    The chat is a NOTIFICATION surface - it is read on a phone, in a glance, and every extra line
+    pushes the one actionable item further up the scrollback. The Tuesday hub alone printed
+    fourteen lines of counters that change slowly and are never acted on in the moment. Those
+    belong on a page Kevin opens when he wants them, which is what /stage already proved works.
+
+    Read-only: renders the same snapshots and counters the messages did, and writes nothing.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    title = f"Morning Brief · {today_str}"
+    weekly = get_rolling_metric_counts(days=7)
+    staged = weekly["gmail_draft_staged"]
+    golden = (weekly["interview_set"] / staged * 100) if staged else 0.0
+    api_usage = get_monthly_api_usage()
+    outcomes = get_outcome_metrics()
+    live = scan_carmen_hot_conversations()
+    overdue = get_overdue_followups()
+    dead = get_dead_job_links(limit=20)
+    snapshot = load_followup_queue_snapshot(today_str) or {}
+
+    def esc(v):
+        return html.escape(str(v if v is not None else "—"))
+
+    parts = [f"<h2>{esc(title)}</h2>"]
+
+    # Live conversations lead: the only section with a person waiting on the other end.
+    if live:
+        overdue_n = sum(1 for e in live if e.get("state") == "overdue")
+        tail = f" — <b>{overdue_n} need you now</b>" if overdue_n else ""
+        parts.append(f"<h3>🔥 Live Conversations ({len(live)}){tail}</h3><table>"
+                     "<tr><th>Who</th><th>Company</th><th>When</th><th>Status</th></tr>")
+        for e in live:
+            state = e.get("state")
+            days = e.get("days")
+            when = {"overdue": f"<b style='color:#b00'>{abs(days or 0)}d ago</b>",
+                    "today": "<b>today</b>",
+                    "upcoming": f"in {days}d"}.get(state, "<i>no date</i>")
+            parts.append(f"<tr><td><b>{esc(e.get('name'))}</b></td><td>{esc(e.get('company'))}</td>"
+                         f"<td>{when}</td><td>{esc(e.get('status'))}</td></tr>")
+        parts.append("</table>")
+
+    parts.append("<h3>📈 Rolling 7-Day Pipeline</h3><table>"
+                 f"<tr><td>Discovered</td><td><b>{weekly['listing_discovered']}</b></td></tr>"
+                 f"<tr><td>AI screened</td><td><b>{weekly['ai_screened']}</b></td></tr>"
+                 f"<tr><td>Drafted</td><td><b>{staged}</b></td></tr>"
+                 f"<tr><td>Applied</td><td><b>{weekly['applied']}</b></td></tr>"
+                 f"<tr><td>Interviews</td><td><b>{weekly['interview_set']}</b></td></tr>"
+                 f"<tr><td>Golden Ratio</td><td><b>{golden:.1f}%</b> "
+                 f"<span class='meta'>(interviews / staged drafts)</span></td></tr></table>")
+
+    if outcomes.get("by_source"):
+        parts.append("<h3>🧭 Outcomes by Source</h3><table>"
+                     "<tr><th>Source</th><th>Applied</th><th>Interview</th><th>Reply rate</th></tr>")
+        for source, s in sorted(outcomes["by_source"].items()):
+            parts.append(f"<tr><td>{esc(source)}</td><td>{s['applied']}</td>"
+                         f"<td>{s['interview']}</td><td>{s['reply_rate']:.1f}%</td></tr>")
+        parts.append("</table>")
+    else:
+        parts.append("<h3>🧭 Outcomes by Source</h3>"
+                     "<p class='meta'>No applications recorded yet — nothing measured.</p>")
+
+    ready = snapshot.get("followups_ready") or []
+    quiet = snapshot.get("applications_quiet") or []
+    if ready or quiet:
+        queue_url = html.escape(f"{BASE_URL}/followups", quote=True)
+        parts.append(f"<h3>✉️ Today's Queue</h3><p class='meta'>{len(ready)} to nudge · "
+                     f"{len(quiet)} going quiet — <a href='{queue_url}'>open the full queue</a></p>")
+
+    applied_dead = [d for d in dead if not d[6]]
+    if applied_dead:
+        parts.append(f"<h3>🔗 Applied — Posting Came Down ({len(applied_dead)})</h3>"
+                     "<p class='meta'>They stopped sourcing. That is not a rejection — worth a "
+                     "status chase while the req is fresh.</p><table>"
+                     "<tr><th>Company</th><th>Role</th><th>Taken down</th></tr>")
+        for uuid_v, company, role, _l, _s, _r, _ret, first_dead in applied_dead:
+            parts.append(f"<tr><td><b>{esc(company)}</b></td><td>{esc(role)}</td>"
+                         f"<td>{esc(_dead_since_label(first_dead))}</td></tr>")
+        parts.append("</table>")
+
+    parts.append("<h3>⚙️ Coverage &amp; Enrichment</h3><table>"
+                 f"<tr><td>ATS boards watched</td><td><b>{len(safe_list(get_filter('ats_company_slugs', [])))}</b></td></tr>"
+                 f"<tr><td>Hunter.io</td><td>{api_usage['hunter']}</td></tr>"
+                 f"<tr><td>Prospeo</td><td>{api_usage['prospeo']}</td></tr>"
+                 f"<tr><td>GetProspect</td><td>{api_usage['getprospect']}</td></tr>"
+                 f"<tr><td>Overdue follow-ups</td><td><b>{len(overdue)}</b></td></tr></table>"
+                 "<p class='meta'>API counts are month-to-date local calls.</p>")
+
+    return _followups_page(title, "".join(parts)), 200
+
 
 @app.route("/stage/<short_id>", methods=["GET"])
 def desktop_stage_view(short_id):

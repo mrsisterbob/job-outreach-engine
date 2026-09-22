@@ -7126,6 +7126,106 @@ def test_dead_links_are_recorded_and_readable(monkeypatch):
     assert rows[0][1] == "Huntington" and rows[0][2] == "FX Ops"
 
 
+def test_brief_page_holds_the_depth_the_chat_used_to_dump(monkeypatch):
+    """Four Telegram messages of counters became one page. The page must carry the numbers."""
+    monkeypatch.setattr(m, "get_rolling_metric_counts", lambda days=7: {
+        "listing_discovered": 2280, "ai_screened": 913, "gmail_draft_staged": 75,
+        "applied": 46, "interview_set": 1})
+    monkeypatch.setattr(m, "get_monthly_api_usage", lambda: {"hunter": 0, "prospeo": 0, "getprospect": 0})
+    monkeypatch.setattr(m, "get_outcome_metrics", lambda: {"by_source": {
+        "jsearch:learn4good.com": {"applied": 4, "interview": 0, "reply_rate": 0.0}}})
+    monkeypatch.setattr(m, "scan_carmen_hot_conversations", lambda *a, **k: [
+        {"name": "Beth Young", "company": "Altarum", "status": "Phone Screen",
+         "when": "2026-09-19", "state": "overdue", "days": -3}])
+    monkeypatch.setattr(m, "get_overdue_followups", lambda: [])
+    monkeypatch.setattr(m, "get_dead_job_links", lambda **kw: [])
+    monkeypatch.setattr(m, "load_followup_queue_snapshot", lambda d: None)
+    monkeypatch.setattr(m, "get_filter", lambda k, default=None: [] if default is None else default)
+
+    body, status = m.morning_brief_view()
+    assert status == 200
+    assert "Live Conversations (1)" in body and "1 need you now" in body
+    assert "Beth Young" in body and "3d ago" in body
+    assert "2280" in body and "913" in body and "1.3%" in body   # golden ratio 1/75
+    assert "jsearch:learn4good.com" in body                      # publisher split is visible
+
+
+def test_tuesday_hub_is_a_headline_plus_a_link_not_a_wall(monkeypatch):
+    """The hub printed 14 lines of slow-moving counters, pushing the actionable one to the end."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    monkeypatch.setattr(m, "get_rolling_metric_counts", lambda days=7: {
+        "listing_discovered": 2280, "ai_screened": 913, "gmail_draft_staged": 75,
+        "applied": 46, "interview_set": 0})
+    monkeypatch.setattr(m, "get_monthly_api_usage", lambda: {"hunter": 0, "prospeo": 0, "getprospect": 0})
+    monkeypatch.setattr(m, "get_overdue_followups", lambda: [])
+    monkeypatch.setattr(m, "get_filter", lambda k, default=None: [] if default is None else default)
+
+    m.send_tuesday_pipeline_executive_hub(1)
+
+    assert len(sent) == 1, "the separate outcomes message should no longer be sent"
+    msg = sent[0]
+    assert "/brief" in msg and "46" in msg
+    assert "Hunter.io" not in msg and "ATS boards" not in msg   # moved to the page
+    assert len(msg.splitlines()) < 12
+
+
+def test_standup_leads_with_an_overdue_conversation(monkeypatch):
+    """A call that happened 3 days ago with no follow-up outranks a streak counter."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    monkeypatch.setattr(m, "get_daily_activity", lambda d: {"drafts_staged": 2})
+    monkeypatch.setattr(m, "calculate_active_day_streak", lambda: 5)
+    monkeypatch.setattr(m, "get_overdue_followups", lambda: [])
+    monkeypatch.setattr(m, "get_dead_job_links", lambda **kw: [])
+    monkeypatch.setattr(m, "check_system_health", lambda: [])
+    monkeypatch.setattr(m, "scan_carmen_hot_conversations", lambda *a, **k: [
+        {"name": "Beth Young", "state": "overdue", "days": -3}])
+
+    m.send_daily_standup(1)
+    msg = sent[0]
+    assert "Beth Young" in msg
+    assert msg.index("Beth Young") < msg.index("Active Streak")
+    assert "/brief" in msg
+
+
+def test_dead_since_label_reads_as_a_takedown_date():
+    """first_dead_at was stored from the start and never shown. On an APPLIED row it is the
+    useful number: when the company stopped sourcing."""
+    today = datetime.now().date()
+    assert "(today)" in m._dead_since_label(today.isoformat())
+    assert "(yesterday)" in m._dead_since_label((today - timedelta(days=1)).isoformat())
+    three = (today - timedelta(days=3)).isoformat()
+    assert m._dead_since_label(three) == f"{three} (3d ago)"
+    # A timestamp, not just a date, is what SQLite actually stores.
+    assert "(today)" in m._dead_since_label(f"{today.isoformat()} 07:45:00")
+    assert m._dead_since_label("") == "date unknown"
+    assert m._dead_since_label("not-a-date") == "date unknown"
+
+
+def test_links_separates_applied_rows_from_retired_ones(monkeypatch):
+    """Huntington and Auto Warehousing were listed beside corpses. An applied row whose posting
+    came down is a live thread to chase, not a dead row to read past."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    today = datetime.now().date().isoformat()
+    monkeypatch.setattr(m, "get_dead_job_links", lambda **kw: [
+        ("u-app", "Huntington", "Foreign Exchange Ops Analyst 2", "http://x/1",
+         "Applied", "HTTP 404", 0, today),
+        ("u-ret", "Coric Equipment", "Treasury Analyst", "http://x/2",
+         "Matched", "no longer available", 1, today),
+    ])
+    _dispatch("/links")
+
+    msg = sent[-1]
+    assert "You applied - posting came down (1)" in msg
+    assert "Auto-retired to Died (1)" in msg
+    # The applied row leads, carries its takedown date, and says what it means.
+    assert msg.index("Huntington") < msg.index("Coric Equipment")
+    assert "taken down" in msg and "(today)" in msg
+    assert "not a rejection" in msg
+
+
 def test_each_death_is_reported_only_once(monkeypatch):
     """The digest must not repeat the same dead posting every morning."""
     _linkcheck_env(
