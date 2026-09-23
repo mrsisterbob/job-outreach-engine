@@ -120,6 +120,14 @@ HELP = {
         "Open conversations that still need a reply from you.",
         "/inbox",
     ),
+    "/linksx": (
+        "Archives every dead-link row you APPLIED to straight to Died, in one go. The nightly "
+        "sweep will not do this on its own - a posting coming down on a job you applied to is "
+        "not a rejection, so those rows wait for you. This is that decision, taken for all of "
+        "them at once. Each role is also recorded locally as buried, so /t can never re-source "
+        "it. Rows already auto-retired are untouched.",
+        "/linksx",
+    ),
     "/trace": (
         "Answers 'did my system actually see this reply?' for one address. Shows whether the "
         "poller logged the thread, whether Telegram alerted, and - the part that bites - whether "

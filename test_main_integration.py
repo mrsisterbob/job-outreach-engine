@@ -39,6 +39,9 @@ def clean_tables():
         for table in ("crm_outbox", "sheet_row_map", "company_cooldown", "company_identities",
                       "jobs", "followup_sequencer_log", "followup_queue_snapshot", "gmail_drafts", "seen_jobs",
                       "seen_content_hashes", "jd_term_yield", "job_link_status",
+                      # died_roles is permanent by design, so a row left behind by one test would
+                      # silently suppress a role in every later one.
+                      "died_roles",
                       "command_usage"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
@@ -294,6 +297,83 @@ def test_died_suppression_survives_a_sheets_outage_that_clears_the_live_set(monk
     assert keys, "but the Died keys are still enforced"
     assert m.is_role_tracked("DACUT", "Data Analyst (SQL / Business Intelligence)"), \
         "a buried role stays buried even when Sheets is unreachable"
+
+
+def _seed_dead_link(sheet_uuid, company, role, status, retired=0):
+    """One row in job_link_status as the nightly sweep records it."""
+    with m.get_db_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO job_link_status "
+            "(sheet_uuid, company, role, job_link, status, verdict, reason, retired, notified, "
+            " first_dead_at) "
+            "VALUES (?, ?, ?, ?, ?, 'dead', 'page says no longer available', ?, 0, ?)",
+            (sheet_uuid, company, role, "https://example.com/job", status, retired,
+             date.today().isoformat()))
+        conn.commit()
+
+
+def test_linksx_archives_the_applied_rows_the_sweep_refuses_to_touch(monkeypatch):
+    """The three rows /links reports but will not move on its own.
+
+    The nightly sweep only auto-retires a "Matched" row - a posting coming down on a job Kevin
+    APPLIED to is not a rejection, so those wait for his call. /linksx is that call, made once
+    for all of them instead of hunting down each card to swipe /x.
+    """
+    _seed_dead_link("u-yochana", "Yochana", "Jr. Analyst - Entry Level", "Applied")
+    _seed_dead_link("u-autowh", "Auto Warehousing", "Hybrid Revenue Systems Analyst", "Applied")
+    _seed_dead_link("u-hunt", "Huntington", "Foreign Exchange Ops Analyst 2", "Applied")
+    # Already retired by the sweep - /linksx must leave it alone, it is finished.
+    _seed_dead_link("u-optech", "OpTech", "IT Systems Analyst", "Matched", retired=1)
+
+    sent, payloads = [], []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p))
+
+    _dispatch("/linksx")
+
+    moved = [p for p in payloads if p.get("action") == "update_status"]
+    assert {p["sheet_uuid"] for p in moved} == {"u-yochana", "u-autowh", "u-hunt"}, \
+        "every APPLIED dead-link row moves, and the already-retired one is not touched again"
+    assert all(p["new_tab"] == "Died" for p in moved)
+    # Each move is preceded by a note recording why, the same two-step the sweep uses.
+    assert len([p for p in payloads if p.get("action") == "append_note"]) == 3
+
+    # THE WRITE PATH: what the NEXT /t run reads back. A role archived here must be permanently
+    # unsourceable, not merely moved on the sheet.
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: None)
+    m._TRACKED_ROLE_CACHE["fetched_at"] = 0
+    m._TRACKED_ROLE_CACHE["data"] = set()
+    m._DIED_SUPPRESSION_CACHE["fetched_at"] = 0
+    m._DIED_SUPPRESSION_CACHE["data"] = set()
+    m._DIED_GATE_ALERTED["at"] = 0
+    assert m.is_role_tracked("Yochana", "Jr. Analyst - Entry Level")
+    assert m.is_role_tracked("Huntington", "Foreign Exchange Ops Analyst 2")
+
+
+def test_linksx_says_so_plainly_when_there_is_nothing_waiting(monkeypatch):
+    """Only auto-retired rows exist, so there is no decision left for Kevin to make."""
+    _seed_dead_link("u-optech", "OpTech", "IT Systems Analyst", "Matched", retired=1)
+    sent, payloads = [], []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p))
+
+    _dispatch("/linksx")
+
+    assert payloads == [], "nothing is written when nothing is waiting"
+    assert "Nothing to archive" in sent[0]
+
+
+def test_the_links_card_advertises_linksx_when_rows_are_waiting(monkeypatch):
+    """A command Kevin cannot discover is a command he will not use - the card has to name it."""
+    _seed_dead_link("u-yochana", "Yochana", "Jr. Analyst - Entry Level", "Applied")
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+
+    _dispatch("/links")
+
+    assert "/linksx" in sent[0]
+    assert "archive all 1 to Died" in sent[0]
 
 
 def test_an_undeployed_apps_script_cannot_silently_disable_the_died_gate(monkeypatch):
@@ -7957,8 +8037,10 @@ def test_links_points_at_x_not_dead_for_archiving(monkeypatch):
     _dispatch("/links")
 
     msg = sent[-1]
-    assert "<code>/x</code> on the card archives it" in msg
+    assert "<code>/x</code> on the card archives one" in msg
     assert "/dead</code> only records the decoy" in msg
+    # The bulk form is offered alongside the per-card swipe, not instead of it.
+    assert "<code>/linksx</code>" in msg
 
 
 def test_dead_since_label_reads_as_a_takedown_date():

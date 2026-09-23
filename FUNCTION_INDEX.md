@@ -21,14 +21,14 @@ grep -i "contact" FUNCTION_INDEX.md
 | 134 | `build_index` | _(no docstring)_ |
 | 188 | `main` | _(no docstring)_ |
 
-## `command_help.py` — 2 defs, 219 lines
+## `command_help.py` — 2 defs, 227 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 185 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
-| 200 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
+| 193 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
+| 208 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
-## `main.py` — 294 defs, 13,694 lines
+## `main.py` — 299 defs, 13,891 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -49,285 +49,290 @@ grep -i "contact" FUNCTION_INDEX.md
 | 549 | `default_email_max_age_seconds` | The age gate's default, derived from the poll cadence instead of being a fixed number. |
 | 704 | `get_db_conn` | Yields a SQLite connection tuned for concurrent writers: WAL + NORMAL sync + busy_timeout. |
 | 936 | `init_db` | Initializes local SQLite tables with WAL mode enabled for multithreaded concurrency. |
-| 1214 | `hydrate_filters_from_sheets` | On startup, pull load_system_config from Sheets so local filters reflect any manual spreadsheet edits. |
-| 1247 | `restore_core_sourcing_filters` | Put target_queries back from DEFAULT_SEARCH_FILTERS if it is missing, not a list, or empty. |
-| 1283 | `safe_int` | _(no docstring)_ |
-| 1289 | `safe_list` | _(no docstring)_ |
-| 1302 | `get_filter` | _(no docstring)_ |
-| 1314 | `set_filter` | Set filter atomically via BEGIN IMMEDIATE. Dual-write to System_Config sheet. |
-| 1331 | `update_filter_param` | _(no docstring)_ |
-| 1364 | `save_job_to_cache` | Save job to cache atomically via BEGIN IMMEDIATE. |
-| 1378 | `remap_cached_job_uuid` | Re-point a cached job at a different sheet row. |
-| 1398 | `get_job_from_cache` | _(no docstring)_ |
-| 1410 | `get_sheet_uuid_by_short_id` | Resolve a cached job's sheet_uuid for metric attribution on later callback actions. |
-| 1422 | `get_short_id_by_sheet_uuid` | Reverse of get_sheet_uuid_by_short_id: the cached job's short_id for a sheet_uuid, or None. |
-| 1438 | `get_job_by_sheet_uuid` | Resolve cached job JSON by sheet_uuid, for swipe-reply commands like /prep and /pitch. |
-| 1451 | `update_job_target_email` | Overwrite the cached job JSON's target_email field by sheet_uuid (used by the manual /e Apollo override). |
-| 1470 | `is_job_seen_db` | _(no docstring)_ |
-| 1479 | `save_seen_job_db` | Upsert seen job hash atomically via BEGIN IMMEDIATE, tracking first/last seen + repost count. |
-| 1497 | `get_ghost_listing_penalty` | Returns (score_penalty, badge) if a job hash has reposted >3 times across >45 days, else (0, ""). |
-| 1516 | `is_content_seen` | _(no docstring)_ |
-| 1525 | `save_content_hash` | _(no docstring)_ |
-| 1533 | `add_company_cooldown` | Add company cooldown atomically via BEGIN IMMEDIATE. |
-| 1548 | `log_metric_event` | Persist a pipeline metric event (e.g. message_sent, interview_set) to SQLite atomically. |
-| 1566 | `get_metric_count` | Return the total persisted count of a given metric event_type. |
-| 1577 | `record_application_outcome` | Append an application_outcomes row (event-sourced, one row per transition) so /outcomes and |
-| 1607 | `get_posted_hours_at_card` | The posting's age in hours at the moment its card was sent, or None if it cannot be derived. |
-| 1649 | `_median_or_none` | Median of a numeric list, or None when it is empty - no data is not a median of zero. |
-| 1657 | `get_decoy_metrics` | Aggregate application_outcomes into per-source decoy rates for /decoys. |
-| 1700 | `format_decoy_metrics_message` | Render get_decoy_metrics() into one HTML Telegram message for /decoys. |
-| 1742 | `get_outcome_metrics` | Aggregate application_outcomes into evidence-based conversion metrics: |
-| 1823 | `format_outcome_metrics_message` | Render get_outcome_metrics() into an HTML Telegram message, shared by /outcomes and the Tuesday hub. |
-| 1855 | `get_rolling_metric_counts` | Return metric counts recorded during the trailing `days` window, including zero-count keys. |
-| 1887 | `get_market_supply` | READ-ONLY. Market supply over the trailing `days` window. Never writes. |
-| 1939 | `format_market_supply_message` | Render get_market_supply() as the /funnel card's supply section. Pure - no I/O. |
-| 1985 | `get_template_reply_rates` | READ-ONLY. Reply rate grouped by outreach_template_id and by linkedin_template_id, |
-| 2064 | `format_template_reply_rates_message` | Render get_template_reply_rates() as an HTML Telegram message (used by /treplies). |
-| 2103 | `log_daily_activity` | Increment today's daily_activity counter atomically for a valid activity_type. |
-| 2123 | `get_daily_activity` | Return {drafts_staged, applied_count, notes_logged} for a given date, zeroed if no row exists. |
-| 2139 | `get_lifetime_activity_totals` | Return lifetime SUM() totals across all daily_activity rows. |
-| 2151 | `increment_api_usage_counter` | Bump this calendar month's local call counter for a paid email-lookup provider |
-| 2171 | `get_monthly_api_usage` | Return {"hunter": n, "prospeo": n, "getprospect": n} local call counts for the current |
-| 2187 | `log_email_enrichment_attempt` | Persist one resolve_email_waterfall() outcome (verified hit vs unverified fallback guess) so |
-| 2204 | `get_query_start_page` | Return the next JSearch page offset to resume from for this exact query text, default 1. |
-| 2216 | `save_query_next_page` | Persist the rolling page offset for this query so the next /t run resumes past this batch instead of re-fetching page 1. |
-| 2230 | `calculate_active_day_streak` | Count consecutive active days (any activity logged) ending today or yesterday. |
-| 2251 | `render_ascii_funnel` | Render an ASCII bar funnel from a list of (label, count) tuples, bar widths scaled to the largest count. |
-| 2262 | `is_company_on_cooldown` | _(no docstring)_ |
-| 2274 | `save_message_mapping` | Persist (telegram_message_id, sheet_uuid, sheet_tab, contact_email) atomically so swipe-replies |
-| 2295 | `record_captured_contact` | Persist a CRM contact that was created without a Telegram card behind it. |
-| 2321 | `get_mapping_from_message_id` | Resolve a replied-to Telegram message back to its CRM sheet_uuid/tab, or None if unmapped. |
-| 2340 | `get_contact_by_sheet_uuid` | Resolve contact_name/contact_company from sheet_row_map for the auto-stage bump action. |
-| 2353 | `build_crm_payload` | Standardize outbound CRM payloads: every action includes rowOperationOrder DESC for bottom-to-top Apps Script loops. |
-| 2361 | `_parse_company_title_from_card_text` | Extracts (company, title) from a dispatched job-card's Telegram text via its 💼/🏢 markers, |
-| 2375 | `_parse_sheet_uuid_from_card_text` | Extracts (sheet_uuid, sheet_tab) embedded directly in a dispatched card's own 🆔 marker. |
-| 2389 | `_parse_routing_from_card_text` | Extracts Gemini's routing decisions from a card's own 🧭 marker: the resume track letter, |
-| 2413 | `_fuzzy_find_job_in_sheets` | Searches Tetiana Cold then Clavicular via get_followups for a legal-suffix/case-insensitive |
-| 2426 | `_fuzzy_find_job_in_local_cache` | Scans the local SQLite jobs cache for a dedup-hash match on (company, title), returning |
-| 2446 | `resolve_reply_mapping` | For swipe-reply commands, resolve reply_to_message -> sheet_uuid mapping. |
-| 2507 | `rebuild_job_from_card` | Backfill a wiped job dict from the card's own text so /draft and /e still work. |
-| 2534 | `_job_data_available` | True if either the cached job JSON or the CRM mapping has real company data to work from. |
-| 2574 | `died_suppression_keys` | Every role in the Died archive, as dedup keys that /t must never source again. |
-| 2620 | `normalize_company_for_match` | Lowercase and strip legal suffixes so CRM and scraped company-name variants compare reliably. |
-| 2626 | `upsert_company_identity` | Merge newly-learned facts about a company into the canonical company_identities record, |
-| 2666 | `_record_query_yield` | Accumulate this run's per-query raw/passed counts into the query_yield table. |
-| 2691 | `probe_crm_read` | One-line diagnosis of what the CRM webhook actually answers on a read. |
-| 2728 | `normalize_command_name` | The bare command from a raw Telegram message, or "" when it is not a command. |
-| 2746 | `record_command_usage` | Log one command invocation. Telemetry only - never raises, never blocks the command. |
-| 2760 | `get_command_usage` | (command, count, last_used) over the last `days`, most used first. |
-| 2784 | `get_command_usage_totals` | (total_invocations, distinct_commands, first_seen) for the window. |
-| 2803 | `get_query_yield_rows` | Lifetime query yield, worst first (fewest passed, then most wasted raw). |
-| 2818 | `get_tracked_job_keys` | Every role already sitting in a live JOB tab (Tetiana Cold + Warm + Clavicular), as hashes. |
-| 2924 | `locate_tracked_role` | Find the LIVE sheet row that makes this role count as tracked, or None. |
-| 2967 | `invalidate_tracked_role_cache` | Force the next tracked-role check to re-read Sheets. |
-| 2978 | `is_role_tracked` | True when this company+role already has a live CRM row, under EITHER dedup algorithm. |
-| 2991 | `get_applied_crm_companies` | Fetch Tetiana Warm companies as a short-lived suppression set for fresh job discovery. |
-| 3019 | `get_warm_crm_contacts` | Fetch every Carmen Warm CRM contact keyed by lowercased company name, each tagged with a |
-| 3062 | `backfill_job_contacts_from_carmen_cold` | Fill a job row's Contact Email from the real person already emailed at that company. |
-| 3178 | `auto_fill_job_contacts_from_carmen_cold` | Scheduled wrapper: commit the Carmen Cold -> job row contact fill and report what changed. |
-| 3212 | `sanitize_text` | Strip corporate fluff/AI clichés while preserving apostrophes, hyphens, and paragraph breaks. |
-| 3230 | `get_current_role_blurb` | Returns (core_exp_phrase, full_sentence) cleaned of job-title suffixes |
-| 3257 | `clean_company_for_copy` | Drops legal-entity suffixes so outreach copy reads 'Atwell', not 'Atwell Group, Inc.'. |
-| 3288 | `resume_pdf_filename` | The filename a recruiter sees on the resume attachment: "Kevin_Miller_Resume_Atwell.pdf". |
-| 3322 | `render_outreach_email` | THE single rendering path for every candidate-facing email body, cold or warm or bump. |
-| 3343 | `generate_cold_email` | Cold email body from the cold_ops bank. `template_id` is the Gemini-routed |
-| 3353 | `resolve_outreach_body` | THE body every Telegram command (/draft, /eh, /e) shows AND drafts into Gmail. |
-| 3378 | `generate_warm_email` | Render a warm_alumni SCAFFOLD, not sendable copy. |
-| 3389 | `generate_bump_email` | Follow-up nudge from the followup_bumps bank, for threads that went unanswered. |
-| 3401 | `format_email_block` | _(no docstring)_ |
-| 3408 | `build_system_prompt` | Builds the Gemini job-screener system prompt fresh on every call so Evidence Bank edits |
-| 3449 | `send_health_alert` | _(no docstring)_ |
-| 3461 | `send_status_update` | _(no docstring)_ |
-| 3472 | `calculate_keyword_overlap` | _(no docstring)_ |
-| 3486 | `record_jd_terms` | Fold one scored JD's vocabulary into jd_term_yield. Observation only - never changes how a |
-| 3516 | `get_resume_vocabulary` | Every term Kevin's resume/outreach copy already claims, normalized for comparison. |
-| 3545 | `load_resume_bullet_tracks` | The bullet bank as {track_key: [bullet, ...]}. Empty dict if unreadable. |
-| 3555 | `resolve_bullet_track_key` | Accept 'e', 'track_e', 'bizops' or the full key for track_e_bizops. |
-| 3571 | `draft_bullets_for_gaps` | Ask Gemini to phrase resume bullets that use the market's vocabulary. |
-| 3621 | `get_jd_term_gaps` | Terms the market uses in high-fit roles that Kevin's resume copy never says. |
-| 3663 | `soft_cap_score` | Clamp to 1-100, but compress above SOFT_CAP_KNEE instead of flattening. |
-| 3678 | `calculate_hybrid_score_modifier` | Layer 1 of the additive scoring: keyword/salary modifiers on top of Gemini's holistic base. |
-| 3784 | `resolve_live_alumni_at_company` | JIT alumni resolution: live-queries DuckDuckGo HTML search for a LinkedIn profile ath |
-| 3840 | `discover_ecosystem_network` | Queries Gemini to discover ecosystem keywords and probable ATS board slugs for a target entity. |
-| 3890 | `probe_ats_slug` | Attempts a quick HEAD/GET to three major ATS board APIs to verify a slug is live. |
-| 3917 | `verify_live_slugs` | Probes multiple ATS slugs in parallel (max_workers=8) and returns only the live ones. |
-| 3935 | `expand_ecosystem_filter` | Orchestrates ecosystem discovery, ATS verification, and filter merge atomically. |
-| 4005 | `extract_domain_from_website` | Parse a root domain (no scheme/www/path) out of a company website URL, or None if unusable. |
-| 4022 | `resolve_target_email` | Resolve target email. Prefers the real domain parsed from employer_website; |
-| 4040 | `parse_quick_command` | Format: /quick Name @ Company [1-10] Note  (also reused by the /cold and /warm quick-add variants) |
-| 4085 | `call_gemini_api` | Call Gemini API with resilience handling: exponential backoff retry on 429/5xx. Return None on final failure. |
-| 4121 | `evaluate_job_with_gemini` | Evaluate job with Gemini acting strictly as a classifier/router (Strict Deterministic |
-| 4170 | `generate_interview_prep` | 3 talking points + 2 reverse questions tailored to a role; safe static fallback if Gemini is unavailable. |
-| 4209 | `generate_elevator_pitch` | Tight 3-sentence elevator pitch tailored to a company/role; safe static fallback if Gemini is unavailable. |
-| 4238 | `generate_cover_letter` | Assembles a 3-paragraph plain-text cover letter deterministically from the track-keyed |
-| 4320 | `_passes_remote_filter` | passes_strict_filter minus the geography gates, for genuinely remote postings. |
-| 4401 | `is_aggregator_relist` | True when a job's apply link points at a reseller that scrapes listings it does not own. |
-| 4437 | `FunnelTrace` | Counts why candidates were dropped during one pipeline run. |
-| 4447 | `FunnelTrace.__init__` | _(no docstring)_ |
-| 4454 | `FunnelTrace.set_query` | Attribute subsequent candidates to `query` (None = non-JSearch sources: ATS boards, |
-| 4461 | `FunnelTrace._bump` | _(no docstring)_ |
-| 4465 | `FunnelTrace.note` | Record one rejection. Unknown reasons are counted under their raw key rather than |
-| 4470 | `FunnelTrace.query_yield_report` | Per-query raw->passed counts, worst first. Empty when no query was ever attributed. |
-| 4479 | `FunnelTrace.summary_line` | One-line funnel breakdown, most common rejection first, or "" when nothing was dropped. |
-| 4488 | `passes_strict_filter` | True when a job clears every hard gate. `trace`, if given, records WHICH gate rejected it - |
-| 4596 | `resolve_outreach_copy` | Re-resolves (linkedin_note, outreach_email) for a cached job from the local template banks. |
-| 4625 | `process_single_candidate` | _(no docstring)_ |
-| 4830 | `save_gmail_draft_record` | Persist a created Gmail draft's identity atomically for 24h dedup checks. |
-| 4845 | `check_existing_gmail_draft` | Return existing draft metadata if (to_email, subject) was drafted in the last 24h, else None. |
-| 4860 | `should_send_alert` | Returns True if the alert has not been triggered within cooldown_hours (debounces repetitive alerts). |
-| 4881 | `get_gmail_access_token` | Refresh a Gmail OAuth access token. Alerts Telegram (debounced) and returns None on any failure. |
-| 4925 | `is_placeholder_company_name` | True when company_name is empty or one of the known UI placeholder strings. |
-| 4930 | `create_gmail_draft` | Create Gmail draft with 24h dedup check and OAuth token expiry handling. |
-| 5025 | `compile_resume_pdf_resilient` | Compiles the tailored resume PDF with a fallback retry (track 'a', bullet_indices [0,1,2]) |
-| 5047 | `send_telegram_document` | Uploads an in-memory PDF to Telegram as a document. Returns True on success. |
-| 5070 | `resolve_letter_for_job` | THE cover letter every command renders, so /letter, /e and /eh cannot drift apart. |
-| 5092 | `cover_letter_pdf_filename` | "Kevin_Miller_Cover_Letter_Atwell.pdf" - same slug rules as resume_pdf_filename(). |
-| 5096 | `send_cover_letter_pdf_async` | Compiles and sends the cover letter PDF on a background thread. |
-| 5117 | `stage_outreach_draft` | THE shared tail of /e and /eh: resume PDF -> email body -> Gmail draft -> Telegram card. |
-| 5183 | `is_verified_crm_contact` | Strict, exact-match CRM whitelist check for the inbound email anti-spam gatekeeper. |
-| 5249 | `match_unknown_sender_to_crm_company` | Second-chance lookup for a sender the strict whitelist rejected: does their DOMAIN belong |
-| 5286 | `is_thread_kevin_started` | True when this Gmail thread already contains a message Kevin SENT. |
-| 5327 | `_gmail_header_value` | One header off a Gmail payload, matched case-insensitively. |
-| 5341 | `display_name_from_sender` | A readable human name for a From: header, for the alert's CRM Match line. |
-| 5353 | `_decode_gmail_part_data` | Gmail part bodies are base64url with the padding stripped; restore it before decoding. |
-| 5365 | `extract_plain_body` | Pull readable text out of a Gmail payload for the classifier. Returns "" when there is none. |
-| 5418 | `_format_ics_dtstart` | Render an iCalendar DTSTART as readable text, or None if it is not a shape we parse. |
-| 5446 | `extract_calendar_invite` | Find a calendar invitation inside a Gmail message payload. Returns (is_invite, start_text). |
-| 5494 | `classify_inbound_ats_email` | Classifies ATS email into 'offer', 'interview', 'rejection', or 'general'. |
-| 5597 | `passes_email_sender_blocks` | The sender rules that hold even for a Tier 1 interview signal: the no-reply@ blacklist, the |
-| 5653 | `passes_email_prefilter` | Bulk-vs-human pre-filter shield, enforced BEFORE any CRM whitelist check runs. |
-| 5733 | `route_inbound_reply_to_crm` | Carmen Cold is the hot seat: every verified inbound reply gets its follow-up pulled in, and a |
-| 5809 | `record_inbound_thread` | Upsert one conversation into the inbound tray. Returns (is_new_thread, message_count). |
-| 5855 | `mark_inbound_thread_alerted` | Record that Telegram accepted an alert for this thread. Never raises. |
-| 5865 | `close_inbound_thread` | Mark a conversation dealt with. Returns True if a row was actually updated. |
-| 5880 | `get_open_inbound_threads` | Open conversations, most recently active first. Returns a list of dicts; [] on error. |
-| 5897 | `format_inbound_tray_message` | Render the tray for Telegram. Mirrors the Needs You Today card's shape so /inbox reads like |
-| 5920 | `find_inbound_threads_by_sender` | Every tray row for one sender, newest first, whatever its state. Returns []; never raises. |
-| 5949 | `format_trace_report` | Render /trace for one address: what the poller saw, and what the CRM row now says. |
-| 6027 | `record_shadow_thread` | Insert a tray row ONLY if the thread is absent. Returns True when a row was created. |
-| 6058 | `report_poller_failure` | Tell Kevin in Telegram when the poller itself breaks, not just the log file. |
-| 6087 | `check_inbound_gmail_replies` | Poll Gmail for unread inbound replies and alert on the ones a human sent. |
-| 6505 | `sweep_read_mail_into_tray` | Record recent inbound mail in the tray even when Kevin already read it in Gmail. |
-| 6597 | `sweep_spam_for_interview_signals` | Surface Tier 1 interview signals that Gmail filed as spam. Nothing else from Spam is ever |
-| 6763 | `get_all_crm_job_companies` | Every company that has ever appeared as a job, across all job tabs. |
-| 6792 | `is_logged_person_contact` | True when this address is already a row in a PEOPLE tab (see PEOPLE_TABS). |
-| 6836 | `log_addressed_contact_to_carmen_cold` | Log a person Kevin explicitly addressed via /e or /eh into Carmen Cold. |
-| 6889 | `capture_contacts_from_sent_mail` | Auto-populate Carmen Cold with every unique person emailed at a tracked job company. |
-| 7044 | `get_job_rows_with_guessed_email` | Every live JOBS row whose Contact Email is still a pipeline guess. |
-| 7066 | `backfill_contact_emails_from_sent_mail` | Replace guessed JOBS Contact Emails with the address actually emailed. |
-| 7148 | `scheduled_email_poll_job` | APScheduler job target: fires on the EMAIL_POLL_HOURS cadence, independent of webhook load. |
-| 7183 | `start_gmail_poller` | Register the Gmail reply poller on an EMAIL_POLL_HOURS interval trigger (APScheduler), |
-| 7217 | `verify_backup_snapshot` | Restore-verify a snapshot: PRAGMA integrity_check plus a row-count floor per critical table |
-| 7249 | `backup_sqlite_db` | Snapshot jobs_cache.db via the SQLite online backup API (safe under concurrent WAL writers) |
-| 7296 | `scheduled_backup_job` | _(no docstring)_ |
-| 7300 | `start_backup_scheduler` | Register the weekly SQLite backup on the existing background scheduler (Sunday 3 AM local). |
-| 7319 | `count_backup_snapshots` | Whether backup_dir exists and how many jobs_cache_*.db snapshots are in it. |
-| 7331 | `get_persistence_status` | Row counts for the tables a wiped/misconfigured disk used to silently zero out, plus the |
-| 7362 | `format_followup_due` | The 'due' cell of one digest line, with Code.gs's blank-date sentinel translated back. |
-| 7371 | `render_overdue_lines` | One HTML-escaped '• <b>Company</b> - Name \| Tab \| due X' line per overdue record. |
-| 7382 | `send_overdue_digest` | Send the overdue list to Telegram, chunked to stay under the message size cap. |
-| 7414 | `send_tuesday_pipeline_executive_hub` | Send Tuesday's weekly operations hub and all overdue records in Telegram-safe chunks. |
-| 7441 | `send_daily_standup` | Send the compact 08:30 standup used on every non-Tuesday morning. |
-| 7493 | `morning_digest_loop` | Dispatch Tuesday's executive hub or the compact daily standup at 08:30 local time. |
-| 7511 | `check_system_health` | Returns human-readable warnings for missing critical config. Surfaced daily in the morning |
-| 7529 | `start_morning_digest` | Spin up the 8:30 AM daily standup digest as a daemon thread. |
-| 7533 | `PermanentCRMRejection` | A CRM write Apps Script refused for a reason that cannot change on retry. |
-| 7541 | `PermanentCRMRejection.__init__` | _(no docstring)_ |
-| 7556 | `_stash_batch_dispositions` | Record Code.gs's per-row verdict for the batch just sent. |
-| 7568 | `get_batch_disposition` | The verdict for one sent uuid, or None when Apps Script reported nothing. |
-| 7591 | `is_permanent_crm_rejection` | True when an Apps Script rejection message cannot resolve itself on a retry. |
-| 7597 | `crm_failure_alert_text` | One line identifying WHICH write failed and why. |
-| 7621 | `log_to_sheets_crm` | Log to Google Sheets CRM. Payload may include row UUID and note timestamp. |
-| 7776 | `enqueue_crm_payload` | Enqueues an outbound Sheets write to local SQLite atomically (durable outbox pattern). |
-| 7791 | `process_crm_outbox_batch` | One outbox drain pass (<=5 pending rows): dispatch each to Sheets, delete on success or bump |
-| 7852 | `crm_outbox_worker_loop` | Background daemon processing queued Sheets writes with exponential backoff. |
-| 7861 | `start_crm_outbox_worker` | Spin up the persistent CRM outbox worker as a daemon thread. |
-| 7865 | `fetch_networking_cards` | Rows from one CRM tab, or [] when the read failed. |
-| 7908 | `_alert_crm_read_rejection` | _(no docstring)_ |
-| 7932 | `get_overdue_followups` | Return every overdue Carmen Cold, Carmen Warm and Tetiana Cold record sorted by |
-| 7962 | `process_overdue_batch` | Apply a batch follow-up action to every overdue record using the durable CRM outbox. |
-| 8040 | `_sequencer_already_actioned` | True if this row was already actioned by the sequencer earlier today (same-day idempotency |
-| 8057 | `_record_sequencer_action` | Mark (sheet_uuid, today) as handled so a same-day re-run skips it. |
-| 8072 | `_parse_fit_score` | Best-effort numeric Fit Score from the get_followups raw_priority field (Column E for JOBS). |
-| 8079 | `find_carmen_contacts` | Resolve a /promote or /demote id to [(sheet_uuid, tab, record)] among Carmen Cold and |
-| 8119 | `extract_company_from_rejection` | The employer named inside an ATS rejection, or "". |
-| 8150 | `find_live_job_rows_for_company` | Live JOB rows at `company`, newest tab first: [{sheet_uuid, tab, title, status}]. |
-| 8177 | `route_rejection_to_died` | A classified REJECTION -> archive the job row it refers to. Returns a Telegram-ready |
-| 8233 | `resolve_pending_kill` | `/kill <company> <n\|all>` -> archive the picked row(s). Returns a Telegram-ready reply. |
-| 8271 | `promote_job_card_contact` | `/promote <job_id> Name name@company.com` -> a new Carmen Hot row. True when handled. |
-| 8366 | `build_followup_bump_draft` | Draft the follow-up text from the followup_bumps template bank via the existing |
-| 8392 | `_sequencer_draft_recipient` | The row's real address, or "" when there is nothing safe to draft to. Same guard as the |
-| 8398 | `_sequencer_draft_subject` | The follow-up bump's subject, mirroring process_overdue_batch()'s sendall bump: "Re:" so it |
-| 8424 | `autosend_block_reason` | Why this follow-up must NOT be sent unattended, or None when it is safe to send. |
-| 8502 | `_autosend_company_key` | Group rows by employer. Legal-suffix-insensitive, so "Acme Corp" and "Acme Corp Inc." |
-| 8509 | `_apply_autosend_plan` | Annotate each ready follow-up with whether it may auto-send today, and if not, why. |
-| 8580 | `_stage_sequencer_draft` | Stage one follow-up as a Gmail draft - never sends. Returns (draft_id, created, message). |
-| 8605 | `run_followup_sequencer` | Scan Tetiana Cold/Warm + Clavicular via get_followups, run followup_action() on every row, |
-| 8940 | `scan_carmen_hot_conversations` | Carmen Hot, rendered for the morning card. READ-ONLY - returns rows, writes nothing. |
-| 9004 | `_seq_id_tag` | short_id for /replied /interview, falling back to a sheet_uuid stub, or an em dash. |
-| 9008 | `_followup_date_label` | A CRM date for display: the 1970-01-01 "unscheduled" sentinel and blanks read as `blank`. |
-| 9013 | `_next_step_label` | What follows this nudge: the next rung's date, or - after the last rung - the triage date |
-| 9021 | `_silence_dot` | Severity dot for an application's silence, on the job card's fit-dot idiom. The bands |
-| 9034 | `render_followup_needs_card` | Render the single 'needs you today' Telegram message from a run_followup_sequencer() result. |
-| 9209 | `_send_telegram_card_chunked` | Send a long HTML card as newline-split chunks so it never trips Telegram's length cap. |
-| 9222 | `save_followup_queue_snapshot` | Persist one run's full result under its run_date for GET /followups, and prune snapshots |
-| 9247 | `load_followup_queue_snapshot` | The saved result for run_date, or None when there is none (or it cannot be read). |
-| 9270 | `fetch_job_link_state` | GET a job posting and return (status_code, final_url, text, error). Never raises. |
-| 9281 | `check_job_links` | Sweep live JOBS rows, classify each Job Link, record the verdict and retire the safe ones. |
-| 9371 | `_dead_since_label` | "2026-09-22 (today)" / "2026-09-19 (3d ago)" for a first_dead_at timestamp, or "date unknown". |
-| 9393 | `get_dead_job_links` | Dead links recorded by the sweep, newest first. |
-| 9409 | `mark_dead_links_notified` | Flag these as already surfaced so the digest reports each death once. |
-| 9427 | `scheduled_job_link_check` | APScheduler target: nightly link sweep, after the sequencer and before the digest. |
-| 9436 | `scheduled_followup_sequencer_job` | APScheduler target: nightly follow-up sequencer pass (07:30 local, before the digest). |
-| 9458 | `start_followup_sequencer` | Register the nightly sequencer on the shared background scheduler (07:30 local, one hour |
-| 9477 | `start_job_link_checker` | Register the nightly job-link sweep at 07:45 local - after the sequencer's 07:30 pass so |
-| 9493 | `edit_telegram_message` | Edit an existing Telegram message in-place instead of sending a redundant new one. |
-| 9512 | `send_telegram_message` | Send a plain-text Telegram message (no inline keyboards - pure text-based swipe-reply CLI). |
-| 9551 | `send_telegram_card` | Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only. |
-| 9648 | `send_warm_radar_card` | Lean /w warm-radar card: no AI fit score, no fit reason, no tailored outreach copy - just |
-| 9695 | `_fetch_jsearch_page_with_retry` | GETs one JSearch page with exponential backoff on timeout/429/5xx. |
-| 9726 | `fetch_single_query_jobs` | Worker function for parallel JSearch API query execution. |
-| 9762 | `fetch_greenhouse_jobs` | Pull unauthenticated postings from a Greenhouse job board for a company slug. |
-| 9802 | `fetch_lever_jobs` | Pull unauthenticated postings from a Lever job board for a company slug. |
-| 9843 | `fetch_workday_jobs` | Pull postings from one Workday tenant's public CXS API. |
-| 9926 | `fetch_ashby_jobs` | Pull unauthenticated postings from an Ashby job board for a company slug. |
-| 10004 | `apply_search_gear` | Write one gear's settings into the filter store. Returns the applied gear dict. |
-| 10021 | `current_search_gear` | The gear the filters are actually in, not merely the last one set. |
-| 10039 | `describe_search_gear` | Telegram-ready summary of the current breadth, including the live source counts. |
-| 10065 | `_strip_html_to_text` | Board descriptions arrive as HTML. The AI prompt and the CRM both want plain text. |
-| 10078 | `fetch_remoteok_jobs` | RemoteOK public JSON. Element 0 is a legal/metadata stub, not a posting - skip it. |
-| 10106 | `fetch_himalayas_jobs` | Himalayas public JSON. pubDate is a unix epoch string, not ISO. |
-| 10137 | `fetch_remotive_jobs` | Remotive public JSON. |
-| 10173 | `fetch_weworkremotely_jobs` | WeWorkRemotely RSS. Titles arrive as 'Company: Role', so the employer is split off the |
-| 10207 | `fetch_remote_feed_jobs` | Pull every keyless remote feed in parallel. One dead feed never blocks the others. |
-| 10221 | `fetch_ats_jobs` | Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in |
-| 10264 | `auto_expand_ats_slug` | Silent Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its |
-| 10304 | `resolve_warm_company_ats_slugs` | Resolves an ATS board slug for every unique Carmen Warm CRM company: prefers the |
-| 10334 | `dispatch_tier1_matches` | Land a set of scored matches in the CRM, then card the ones whose row actually wrote. |
-| 10490 | `scrape_job_page` | Best-effort server-side fetch of ANY job posting page -> (title, company, description). |
-| 10538 | `ingest_manual_job` | Run one hand-picked posting through the exact Stage 2 path /t uses, then land it in the CRM. |
-| 10642 | `run_job_pipeline` | Job search pipeline with two-stage architecture: |
-| 10887 | `run_warm_radar_scan` | /w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen |
-| 10991 | `process_webhook_payload_async` | Executes heavy workloads in background worker threads so HTTP return is instant. |
-| 12910 | `_is_oneshot_invocation` | True when this process was launched as `python main.py --once` (the CI batch entrypoint). |
-| 12936 | `health_check` | Return JSON health status in <5ms. |
-| 12957 | `_run_pipeline_and_notify` | Background thread target for /t: runs the heavy pipeline off the request thread, |
-| 12968 | `_run_overdue_batch_and_notify` | Background target for the Tuesday batch-hub commands so webhook acknowledgement remains instant. |
-| 12994 | `telegram_webhook` | Instant non-blocking execution (<0.05s return). Validates Telegram's secret token header, |
-| 13022 | `format_ats_plaintext` | Builds a plain-text ATS-safe fallback block (identity/experience/education/bullets) for the |
-| 13056 | `_followups_page` | Wrap /followups content in the /stage page's shell: same CSS, same copyField() script. |
-| 13093 | `followup_queue_view` | The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail |
-| 13201 | `_followup_copy_page` | The fallback for an on-demand draft that could not be created: the reason, and the text to |
-| 13214 | `followup_draft_on_demand` | Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it. |
-| 13263 | `morning_brief_view` | One page holding everything the morning used to dump into Telegram as four messages. |
-| 13360 | `desktop_stage_view` | Desktop review page - the card's "Full Card" target. Everything the Telegram card used to |
-| 13478 | `desktop_stage_pdf` | Serves raw PDF bytes for browser preview and download. |
-| 13500 | `desktop_ingest` | Secure endpoint for desktop bookmarklet ingestion of manual job links/text. |
-| 13574 | `_public_stats_days_running` | Whole days from PUBLIC_STATS_START_DATE to today, floored at 0. |
-| 13581 | `build_public_stats` | Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable. |
-| 13643 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
+| 1233 | `hydrate_filters_from_sheets` | On startup, pull load_system_config from Sheets so local filters reflect any manual spreadsheet edits. |
+| 1266 | `restore_core_sourcing_filters` | Put target_queries back from DEFAULT_SEARCH_FILTERS if it is missing, not a list, or empty. |
+| 1302 | `safe_int` | _(no docstring)_ |
+| 1308 | `safe_list` | _(no docstring)_ |
+| 1321 | `get_filter` | _(no docstring)_ |
+| 1333 | `set_filter` | Set filter atomically via BEGIN IMMEDIATE. Dual-write to System_Config sheet. |
+| 1350 | `update_filter_param` | _(no docstring)_ |
+| 1383 | `save_job_to_cache` | Save job to cache atomically via BEGIN IMMEDIATE. |
+| 1397 | `remap_cached_job_uuid` | Re-point a cached job at a different sheet row. |
+| 1417 | `get_job_from_cache` | _(no docstring)_ |
+| 1429 | `get_sheet_uuid_by_short_id` | Resolve a cached job's sheet_uuid for metric attribution on later callback actions. |
+| 1441 | `get_short_id_by_sheet_uuid` | Reverse of get_sheet_uuid_by_short_id: the cached job's short_id for a sheet_uuid, or None. |
+| 1457 | `get_job_by_sheet_uuid` | Resolve cached job JSON by sheet_uuid, for swipe-reply commands like /prep and /pitch. |
+| 1470 | `update_job_target_email` | Overwrite the cached job JSON's target_email field by sheet_uuid (used by the manual /e Apollo override). |
+| 1489 | `is_job_seen_db` | _(no docstring)_ |
+| 1498 | `save_seen_job_db` | Upsert seen job hash atomically via BEGIN IMMEDIATE, tracking first/last seen + repost count. |
+| 1516 | `get_ghost_listing_penalty` | Returns (score_penalty, badge) if a job hash has reposted >3 times across >45 days, else (0, ""). |
+| 1535 | `is_content_seen` | _(no docstring)_ |
+| 1544 | `save_content_hash` | _(no docstring)_ |
+| 1552 | `add_company_cooldown` | Add company cooldown atomically via BEGIN IMMEDIATE. |
+| 1567 | `log_metric_event` | Persist a pipeline metric event (e.g. message_sent, interview_set) to SQLite atomically. |
+| 1585 | `get_metric_count` | Return the total persisted count of a given metric event_type. |
+| 1596 | `record_application_outcome` | Append an application_outcomes row (event-sourced, one row per transition) so /outcomes and |
+| 1626 | `get_posted_hours_at_card` | The posting's age in hours at the moment its card was sent, or None if it cannot be derived. |
+| 1668 | `_median_or_none` | Median of a numeric list, or None when it is empty - no data is not a median of zero. |
+| 1676 | `get_decoy_metrics` | Aggregate application_outcomes into per-source decoy rates for /decoys. |
+| 1719 | `format_decoy_metrics_message` | Render get_decoy_metrics() into one HTML Telegram message for /decoys. |
+| 1761 | `get_outcome_metrics` | Aggregate application_outcomes into evidence-based conversion metrics: |
+| 1842 | `format_outcome_metrics_message` | Render get_outcome_metrics() into an HTML Telegram message, shared by /outcomes and the Tuesday hub. |
+| 1874 | `get_rolling_metric_counts` | Return metric counts recorded during the trailing `days` window, including zero-count keys. |
+| 1906 | `get_market_supply` | READ-ONLY. Market supply over the trailing `days` window. Never writes. |
+| 1958 | `format_market_supply_message` | Render get_market_supply() as the /funnel card's supply section. Pure - no I/O. |
+| 2004 | `get_template_reply_rates` | READ-ONLY. Reply rate grouped by outreach_template_id and by linkedin_template_id, |
+| 2083 | `format_template_reply_rates_message` | Render get_template_reply_rates() as an HTML Telegram message (used by /treplies). |
+| 2122 | `log_daily_activity` | Increment today's daily_activity counter atomically for a valid activity_type. |
+| 2142 | `get_daily_activity` | Return {drafts_staged, applied_count, notes_logged} for a given date, zeroed if no row exists. |
+| 2158 | `get_lifetime_activity_totals` | Return lifetime SUM() totals across all daily_activity rows. |
+| 2170 | `increment_api_usage_counter` | Bump this calendar month's local call counter for a paid email-lookup provider |
+| 2190 | `get_monthly_api_usage` | Return {"hunter": n, "prospeo": n, "getprospect": n} local call counts for the current |
+| 2206 | `log_email_enrichment_attempt` | Persist one resolve_email_waterfall() outcome (verified hit vs unverified fallback guess) so |
+| 2223 | `get_query_start_page` | Return the next JSearch page offset to resume from for this exact query text, default 1. |
+| 2235 | `save_query_next_page` | Persist the rolling page offset for this query so the next /t run resumes past this batch instead of re-fetching page 1. |
+| 2249 | `calculate_active_day_streak` | Count consecutive active days (any activity logged) ending today or yesterday. |
+| 2270 | `render_ascii_funnel` | Render an ASCII bar funnel from a list of (label, count) tuples, bar widths scaled to the largest count. |
+| 2281 | `is_company_on_cooldown` | _(no docstring)_ |
+| 2293 | `save_message_mapping` | Persist (telegram_message_id, sheet_uuid, sheet_tab, contact_email) atomically so swipe-replies |
+| 2314 | `record_captured_contact` | Persist a CRM contact that was created without a Telegram card behind it. |
+| 2340 | `get_mapping_from_message_id` | Resolve a replied-to Telegram message back to its CRM sheet_uuid/tab, or None if unmapped. |
+| 2359 | `get_contact_by_sheet_uuid` | Resolve contact_name/contact_company from sheet_row_map for the auto-stage bump action. |
+| 2372 | `build_crm_payload` | Standardize outbound CRM payloads: every action includes rowOperationOrder DESC for bottom-to-top Apps Script loops. |
+| 2380 | `_parse_company_title_from_card_text` | Extracts (company, title) from a dispatched job-card's Telegram text via its 💼/🏢 markers, |
+| 2394 | `_parse_sheet_uuid_from_card_text` | Extracts (sheet_uuid, sheet_tab) embedded directly in a dispatched card's own 🆔 marker. |
+| 2408 | `_parse_routing_from_card_text` | Extracts Gemini's routing decisions from a card's own 🧭 marker: the resume track letter, |
+| 2432 | `_fuzzy_find_job_in_sheets` | Searches Tetiana Cold then Clavicular via get_followups for a legal-suffix/case-insensitive |
+| 2445 | `_fuzzy_find_job_in_local_cache` | Scans the local SQLite jobs cache for a dedup-hash match on (company, title), returning |
+| 2465 | `resolve_reply_mapping` | For swipe-reply commands, resolve reply_to_message -> sheet_uuid mapping. |
+| 2526 | `rebuild_job_from_card` | Backfill a wiped job dict from the card's own text so /draft and /e still work. |
+| 2553 | `_job_data_available` | True if either the cached job JSON or the CRM mapping has real company data to work from. |
+| 2593 | `record_died_role` | Remember locally that this role is buried. Called wherever a row moves to Died. |
+| 2617 | `backfill_died_roles_from_sheet` | Seed the local ledger from the Died tab. Returns (recorded, total) or (0, 0) on failure. |
+| 2646 | `_reset_died_ledger` | Empty the local buried-role ledger and its caches. For tests and a deliberate /t reset. |
+| 2658 | `local_died_keys` | Every locally-recorded buried dedup key. Returns set(); never raises. |
+| 2672 | `_report_died_gate_down` | Say out loud that Died enforcement is not running. Rate-limited to once an hour. |
+| 2692 | `died_suppression_keys` | Every role in the Died archive, as dedup keys that /t must never source again. |
+| 2755 | `normalize_company_for_match` | Lowercase and strip legal suffixes so CRM and scraped company-name variants compare reliably. |
+| 2761 | `upsert_company_identity` | Merge newly-learned facts about a company into the canonical company_identities record, |
+| 2801 | `_record_query_yield` | Accumulate this run's per-query raw/passed counts into the query_yield table. |
+| 2826 | `probe_crm_read` | One-line diagnosis of what the CRM webhook actually answers on a read. |
+| 2863 | `normalize_command_name` | The bare command from a raw Telegram message, or "" when it is not a command. |
+| 2881 | `record_command_usage` | Log one command invocation. Telemetry only - never raises, never blocks the command. |
+| 2895 | `get_command_usage` | (command, count, last_used) over the last `days`, most used first. |
+| 2919 | `get_command_usage_totals` | (total_invocations, distinct_commands, first_seen) for the window. |
+| 2938 | `get_query_yield_rows` | Lifetime query yield, worst first (fewest passed, then most wasted raw). |
+| 2953 | `get_tracked_job_keys` | Every role already sitting in a live JOB tab (Tetiana Cold + Warm + Clavicular), as hashes. |
+| 3059 | `locate_tracked_role` | Find the LIVE sheet row that makes this role count as tracked, or None. |
+| 3102 | `invalidate_tracked_role_cache` | Force the next tracked-role check to re-read Sheets. |
+| 3113 | `is_role_tracked` | True when this company+role already has a live CRM row, under EITHER dedup algorithm. |
+| 3126 | `get_applied_crm_companies` | Fetch Tetiana Warm companies as a short-lived suppression set for fresh job discovery. |
+| 3154 | `get_warm_crm_contacts` | Fetch every Carmen Warm CRM contact keyed by lowercased company name, each tagged with a |
+| 3197 | `backfill_job_contacts_from_carmen_cold` | Fill a job row's Contact Email from the real person already emailed at that company. |
+| 3313 | `auto_fill_job_contacts_from_carmen_cold` | Scheduled wrapper: commit the Carmen Cold -> job row contact fill and report what changed. |
+| 3347 | `sanitize_text` | Strip corporate fluff/AI clichés while preserving apostrophes, hyphens, and paragraph breaks. |
+| 3365 | `get_current_role_blurb` | Returns (core_exp_phrase, full_sentence) cleaned of job-title suffixes |
+| 3392 | `clean_company_for_copy` | Drops legal-entity suffixes so outreach copy reads 'Atwell', not 'Atwell Group, Inc.'. |
+| 3423 | `resume_pdf_filename` | The filename a recruiter sees on the resume attachment: "Kevin_Miller_Resume_Atwell.pdf". |
+| 3457 | `render_outreach_email` | THE single rendering path for every candidate-facing email body, cold or warm or bump. |
+| 3478 | `generate_cold_email` | Cold email body from the cold_ops bank. `template_id` is the Gemini-routed |
+| 3488 | `resolve_outreach_body` | THE body every Telegram command (/draft, /eh, /e) shows AND drafts into Gmail. |
+| 3513 | `generate_warm_email` | Render a warm_alumni SCAFFOLD, not sendable copy. |
+| 3524 | `generate_bump_email` | Follow-up nudge from the followup_bumps bank, for threads that went unanswered. |
+| 3536 | `format_email_block` | _(no docstring)_ |
+| 3543 | `build_system_prompt` | Builds the Gemini job-screener system prompt fresh on every call so Evidence Bank edits |
+| 3584 | `send_health_alert` | _(no docstring)_ |
+| 3596 | `send_status_update` | _(no docstring)_ |
+| 3607 | `calculate_keyword_overlap` | _(no docstring)_ |
+| 3621 | `record_jd_terms` | Fold one scored JD's vocabulary into jd_term_yield. Observation only - never changes how a |
+| 3651 | `get_resume_vocabulary` | Every term Kevin's resume/outreach copy already claims, normalized for comparison. |
+| 3680 | `load_resume_bullet_tracks` | The bullet bank as {track_key: [bullet, ...]}. Empty dict if unreadable. |
+| 3690 | `resolve_bullet_track_key` | Accept 'e', 'track_e', 'bizops' or the full key for track_e_bizops. |
+| 3706 | `draft_bullets_for_gaps` | Ask Gemini to phrase resume bullets that use the market's vocabulary. |
+| 3756 | `get_jd_term_gaps` | Terms the market uses in high-fit roles that Kevin's resume copy never says. |
+| 3798 | `soft_cap_score` | Clamp to 1-100, but compress above SOFT_CAP_KNEE instead of flattening. |
+| 3813 | `calculate_hybrid_score_modifier` | Layer 1 of the additive scoring: keyword/salary modifiers on top of Gemini's holistic base. |
+| 3919 | `resolve_live_alumni_at_company` | JIT alumni resolution: live-queries DuckDuckGo HTML search for a LinkedIn profile ath |
+| 3975 | `discover_ecosystem_network` | Queries Gemini to discover ecosystem keywords and probable ATS board slugs for a target entity. |
+| 4025 | `probe_ats_slug` | Attempts a quick HEAD/GET to three major ATS board APIs to verify a slug is live. |
+| 4052 | `verify_live_slugs` | Probes multiple ATS slugs in parallel (max_workers=8) and returns only the live ones. |
+| 4070 | `expand_ecosystem_filter` | Orchestrates ecosystem discovery, ATS verification, and filter merge atomically. |
+| 4140 | `extract_domain_from_website` | Parse a root domain (no scheme/www/path) out of a company website URL, or None if unusable. |
+| 4157 | `resolve_target_email` | Resolve target email. Prefers the real domain parsed from employer_website; |
+| 4175 | `parse_quick_command` | Format: /quick Name @ Company [1-10] Note  (also reused by the /cold and /warm quick-add variants) |
+| 4220 | `call_gemini_api` | Call Gemini API with resilience handling: exponential backoff retry on 429/5xx. Return None on final failure. |
+| 4256 | `evaluate_job_with_gemini` | Evaluate job with Gemini acting strictly as a classifier/router (Strict Deterministic |
+| 4305 | `generate_interview_prep` | 3 talking points + 2 reverse questions tailored to a role; safe static fallback if Gemini is unavailable. |
+| 4344 | `generate_elevator_pitch` | Tight 3-sentence elevator pitch tailored to a company/role; safe static fallback if Gemini is unavailable. |
+| 4373 | `generate_cover_letter` | Assembles a 3-paragraph plain-text cover letter deterministically from the track-keyed |
+| 4455 | `_passes_remote_filter` | passes_strict_filter minus the geography gates, for genuinely remote postings. |
+| 4536 | `is_aggregator_relist` | True when a job's apply link points at a reseller that scrapes listings it does not own. |
+| 4572 | `FunnelTrace` | Counts why candidates were dropped during one pipeline run. |
+| 4582 | `FunnelTrace.__init__` | _(no docstring)_ |
+| 4589 | `FunnelTrace.set_query` | Attribute subsequent candidates to `query` (None = non-JSearch sources: ATS boards, |
+| 4596 | `FunnelTrace._bump` | _(no docstring)_ |
+| 4600 | `FunnelTrace.note` | Record one rejection. Unknown reasons are counted under their raw key rather than |
+| 4605 | `FunnelTrace.query_yield_report` | Per-query raw->passed counts, worst first. Empty when no query was ever attributed. |
+| 4614 | `FunnelTrace.summary_line` | One-line funnel breakdown, most common rejection first, or "" when nothing was dropped. |
+| 4623 | `passes_strict_filter` | True when a job clears every hard gate. `trace`, if given, records WHICH gate rejected it - |
+| 4731 | `resolve_outreach_copy` | Re-resolves (linkedin_note, outreach_email) for a cached job from the local template banks. |
+| 4760 | `process_single_candidate` | _(no docstring)_ |
+| 4965 | `save_gmail_draft_record` | Persist a created Gmail draft's identity atomically for 24h dedup checks. |
+| 4980 | `check_existing_gmail_draft` | Return existing draft metadata if (to_email, subject) was drafted in the last 24h, else None. |
+| 4995 | `should_send_alert` | Returns True if the alert has not been triggered within cooldown_hours (debounces repetitive alerts). |
+| 5016 | `get_gmail_access_token` | Refresh a Gmail OAuth access token. Alerts Telegram (debounced) and returns None on any failure. |
+| 5060 | `is_placeholder_company_name` | True when company_name is empty or one of the known UI placeholder strings. |
+| 5065 | `create_gmail_draft` | Create Gmail draft with 24h dedup check and OAuth token expiry handling. |
+| 5160 | `compile_resume_pdf_resilient` | Compiles the tailored resume PDF with a fallback retry (track 'a', bullet_indices [0,1,2]) |
+| 5182 | `send_telegram_document` | Uploads an in-memory PDF to Telegram as a document. Returns True on success. |
+| 5205 | `resolve_letter_for_job` | THE cover letter every command renders, so /letter, /e and /eh cannot drift apart. |
+| 5227 | `cover_letter_pdf_filename` | "Kevin_Miller_Cover_Letter_Atwell.pdf" - same slug rules as resume_pdf_filename(). |
+| 5231 | `send_cover_letter_pdf_async` | Compiles and sends the cover letter PDF on a background thread. |
+| 5252 | `stage_outreach_draft` | THE shared tail of /e and /eh: resume PDF -> email body -> Gmail draft -> Telegram card. |
+| 5318 | `is_verified_crm_contact` | Strict, exact-match CRM whitelist check for the inbound email anti-spam gatekeeper. |
+| 5384 | `match_unknown_sender_to_crm_company` | Second-chance lookup for a sender the strict whitelist rejected: does their DOMAIN belong |
+| 5421 | `is_thread_kevin_started` | True when this Gmail thread already contains a message Kevin SENT. |
+| 5462 | `_gmail_header_value` | One header off a Gmail payload, matched case-insensitively. |
+| 5476 | `display_name_from_sender` | A readable human name for a From: header, for the alert's CRM Match line. |
+| 5488 | `_decode_gmail_part_data` | Gmail part bodies are base64url with the padding stripped; restore it before decoding. |
+| 5500 | `extract_plain_body` | Pull readable text out of a Gmail payload for the classifier. Returns "" when there is none. |
+| 5553 | `_format_ics_dtstart` | Render an iCalendar DTSTART as readable text, or None if it is not a shape we parse. |
+| 5581 | `extract_calendar_invite` | Find a calendar invitation inside a Gmail message payload. Returns (is_invite, start_text). |
+| 5629 | `classify_inbound_ats_email` | Classifies ATS email into 'offer', 'interview', 'rejection', or 'general'. |
+| 5732 | `passes_email_sender_blocks` | The sender rules that hold even for a Tier 1 interview signal: the no-reply@ blacklist, the |
+| 5788 | `passes_email_prefilter` | Bulk-vs-human pre-filter shield, enforced BEFORE any CRM whitelist check runs. |
+| 5868 | `route_inbound_reply_to_crm` | Carmen Cold is the hot seat: every verified inbound reply gets its follow-up pulled in, and a |
+| 5944 | `record_inbound_thread` | Upsert one conversation into the inbound tray. Returns (is_new_thread, message_count). |
+| 5990 | `mark_inbound_thread_alerted` | Record that Telegram accepted an alert for this thread. Never raises. |
+| 6000 | `close_inbound_thread` | Mark a conversation dealt with. Returns True if a row was actually updated. |
+| 6015 | `get_open_inbound_threads` | Open conversations, most recently active first. Returns a list of dicts; [] on error. |
+| 6032 | `format_inbound_tray_message` | Render the tray for Telegram. Mirrors the Needs You Today card's shape so /inbox reads like |
+| 6055 | `find_inbound_threads_by_sender` | Every tray row for one sender, newest first, whatever its state. Returns []; never raises. |
+| 6084 | `format_trace_report` | Render /trace for one address: what the poller saw, and what the CRM row now says. |
+| 6162 | `record_shadow_thread` | Insert a tray row ONLY if the thread is absent. Returns True when a row was created. |
+| 6193 | `report_poller_failure` | Tell Kevin in Telegram when the poller itself breaks, not just the log file. |
+| 6222 | `check_inbound_gmail_replies` | Poll Gmail for unread inbound replies and alert on the ones a human sent. |
+| 6640 | `sweep_read_mail_into_tray` | Record recent inbound mail in the tray even when Kevin already read it in Gmail. |
+| 6732 | `sweep_spam_for_interview_signals` | Surface Tier 1 interview signals that Gmail filed as spam. Nothing else from Spam is ever |
+| 6898 | `get_all_crm_job_companies` | Every company that has ever appeared as a job, across all job tabs. |
+| 6927 | `is_logged_person_contact` | True when this address is already a row in a PEOPLE tab (see PEOPLE_TABS). |
+| 6971 | `log_addressed_contact_to_carmen_cold` | Log a person Kevin explicitly addressed via /e or /eh into Carmen Cold. |
+| 7024 | `capture_contacts_from_sent_mail` | Auto-populate Carmen Cold with every unique person emailed at a tracked job company. |
+| 7179 | `get_job_rows_with_guessed_email` | Every live JOBS row whose Contact Email is still a pipeline guess. |
+| 7201 | `backfill_contact_emails_from_sent_mail` | Replace guessed JOBS Contact Emails with the address actually emailed. |
+| 7283 | `scheduled_email_poll_job` | APScheduler job target: fires on the EMAIL_POLL_HOURS cadence, independent of webhook load. |
+| 7318 | `start_gmail_poller` | Register the Gmail reply poller on an EMAIL_POLL_HOURS interval trigger (APScheduler), |
+| 7352 | `verify_backup_snapshot` | Restore-verify a snapshot: PRAGMA integrity_check plus a row-count floor per critical table |
+| 7384 | `backup_sqlite_db` | Snapshot jobs_cache.db via the SQLite online backup API (safe under concurrent WAL writers) |
+| 7431 | `scheduled_backup_job` | _(no docstring)_ |
+| 7435 | `start_backup_scheduler` | Register the weekly SQLite backup on the existing background scheduler (Sunday 3 AM local). |
+| 7454 | `count_backup_snapshots` | Whether backup_dir exists and how many jobs_cache_*.db snapshots are in it. |
+| 7466 | `get_persistence_status` | Row counts for the tables a wiped/misconfigured disk used to silently zero out, plus the |
+| 7497 | `format_followup_due` | The 'due' cell of one digest line, with Code.gs's blank-date sentinel translated back. |
+| 7506 | `render_overdue_lines` | One HTML-escaped '• <b>Company</b> - Name \| Tab \| due X' line per overdue record. |
+| 7517 | `send_overdue_digest` | Send the overdue list to Telegram, chunked to stay under the message size cap. |
+| 7549 | `send_tuesday_pipeline_executive_hub` | Send Tuesday's weekly operations hub and all overdue records in Telegram-safe chunks. |
+| 7576 | `send_daily_standup` | Send the compact 08:30 standup used on every non-Tuesday morning. |
+| 7628 | `morning_digest_loop` | Dispatch Tuesday's executive hub or the compact daily standup at 08:30 local time. |
+| 7646 | `check_system_health` | Returns human-readable warnings for missing critical config. Surfaced daily in the morning |
+| 7664 | `start_morning_digest` | Spin up the 8:30 AM daily standup digest as a daemon thread. |
+| 7668 | `PermanentCRMRejection` | A CRM write Apps Script refused for a reason that cannot change on retry. |
+| 7676 | `PermanentCRMRejection.__init__` | _(no docstring)_ |
+| 7691 | `_stash_batch_dispositions` | Record Code.gs's per-row verdict for the batch just sent. |
+| 7703 | `get_batch_disposition` | The verdict for one sent uuid, or None when Apps Script reported nothing. |
+| 7726 | `is_permanent_crm_rejection` | True when an Apps Script rejection message cannot resolve itself on a retry. |
+| 7732 | `crm_failure_alert_text` | One line identifying WHICH write failed and why. |
+| 7756 | `log_to_sheets_crm` | Log to Google Sheets CRM. Payload may include row UUID and note timestamp. |
+| 7911 | `enqueue_crm_payload` | Enqueues an outbound Sheets write to local SQLite atomically (durable outbox pattern). |
+| 7926 | `process_crm_outbox_batch` | One outbox drain pass (<=5 pending rows): dispatch each to Sheets, delete on success or bump |
+| 7987 | `crm_outbox_worker_loop` | Background daemon processing queued Sheets writes with exponential backoff. |
+| 7996 | `start_crm_outbox_worker` | Spin up the persistent CRM outbox worker as a daemon thread. |
+| 8000 | `fetch_networking_cards` | Rows from one CRM tab, or [] when the read failed. |
+| 8043 | `_alert_crm_read_rejection` | _(no docstring)_ |
+| 8067 | `get_overdue_followups` | Return every overdue Carmen Cold, Carmen Warm and Tetiana Cold record sorted by |
+| 8097 | `process_overdue_batch` | Apply a batch follow-up action to every overdue record using the durable CRM outbox. |
+| 8175 | `_sequencer_already_actioned` | True if this row was already actioned by the sequencer earlier today (same-day idempotency |
+| 8192 | `_record_sequencer_action` | Mark (sheet_uuid, today) as handled so a same-day re-run skips it. |
+| 8207 | `_parse_fit_score` | Best-effort numeric Fit Score from the get_followups raw_priority field (Column E for JOBS). |
+| 8214 | `find_carmen_contacts` | Resolve a /promote or /demote id to [(sheet_uuid, tab, record)] among Carmen Cold and |
+| 8254 | `extract_company_from_rejection` | The employer named inside an ATS rejection, or "". |
+| 8285 | `find_live_job_rows_for_company` | Live JOB rows at `company`, newest tab first: [{sheet_uuid, tab, title, status}]. |
+| 8312 | `route_rejection_to_died` | A classified REJECTION -> archive the job row it refers to. Returns a Telegram-ready |
+| 8370 | `resolve_pending_kill` | `/kill <company> <n\|all>` -> archive the picked row(s). Returns a Telegram-ready reply. |
+| 8410 | `promote_job_card_contact` | `/promote <job_id> Name name@company.com` -> a new Carmen Hot row. True when handled. |
+| 8505 | `build_followup_bump_draft` | Draft the follow-up text from the followup_bumps template bank via the existing |
+| 8531 | `_sequencer_draft_recipient` | The row's real address, or "" when there is nothing safe to draft to. Same guard as the |
+| 8537 | `_sequencer_draft_subject` | The follow-up bump's subject, mirroring process_overdue_batch()'s sendall bump: "Re:" so it |
+| 8563 | `autosend_block_reason` | Why this follow-up must NOT be sent unattended, or None when it is safe to send. |
+| 8641 | `_autosend_company_key` | Group rows by employer. Legal-suffix-insensitive, so "Acme Corp" and "Acme Corp Inc." |
+| 8648 | `_apply_autosend_plan` | Annotate each ready follow-up with whether it may auto-send today, and if not, why. |
+| 8719 | `_stage_sequencer_draft` | Stage one follow-up as a Gmail draft - never sends. Returns (draft_id, created, message). |
+| 8744 | `run_followup_sequencer` | Scan Tetiana Cold/Warm + Clavicular via get_followups, run followup_action() on every row, |
+| 9081 | `scan_carmen_hot_conversations` | Carmen Hot, rendered for the morning card. READ-ONLY - returns rows, writes nothing. |
+| 9145 | `_seq_id_tag` | short_id for /replied /interview, falling back to a sheet_uuid stub, or an em dash. |
+| 9149 | `_followup_date_label` | A CRM date for display: the 1970-01-01 "unscheduled" sentinel and blanks read as `blank`. |
+| 9154 | `_next_step_label` | What follows this nudge: the next rung's date, or - after the last rung - the triage date |
+| 9162 | `_silence_dot` | Severity dot for an application's silence, on the job card's fit-dot idiom. The bands |
+| 9175 | `render_followup_needs_card` | Render the single 'needs you today' Telegram message from a run_followup_sequencer() result. |
+| 9350 | `_send_telegram_card_chunked` | Send a long HTML card as newline-split chunks so it never trips Telegram's length cap. |
+| 9363 | `save_followup_queue_snapshot` | Persist one run's full result under its run_date for GET /followups, and prune snapshots |
+| 9388 | `load_followup_queue_snapshot` | The saved result for run_date, or None when there is none (or it cannot be read). |
+| 9411 | `fetch_job_link_state` | GET a job posting and return (status_code, final_url, text, error). Never raises. |
+| 9422 | `check_job_links` | Sweep live JOBS rows, classify each Job Link, record the verdict and retire the safe ones. |
+| 9516 | `_dead_since_label` | "2026-09-22 (today)" / "2026-09-19 (3d ago)" for a first_dead_at timestamp, or "date unknown". |
+| 9538 | `get_dead_job_links` | Dead links recorded by the sweep, newest first. |
+| 9554 | `mark_dead_links_notified` | Flag these as already surfaced so the digest reports each death once. |
+| 9572 | `scheduled_job_link_check` | APScheduler target: nightly link sweep, after the sequencer and before the digest. |
+| 9581 | `scheduled_followup_sequencer_job` | APScheduler target: nightly follow-up sequencer pass (07:30 local, before the digest). |
+| 9603 | `start_followup_sequencer` | Register the nightly sequencer on the shared background scheduler (07:30 local, one hour |
+| 9622 | `start_job_link_checker` | Register the nightly job-link sweep at 07:45 local - after the sequencer's 07:30 pass so |
+| 9638 | `edit_telegram_message` | Edit an existing Telegram message in-place instead of sending a redundant new one. |
+| 9657 | `send_telegram_message` | Send a plain-text Telegram message (no inline keyboards - pure text-based swipe-reply CLI). |
+| 9696 | `send_telegram_card` | Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only. |
+| 9793 | `send_warm_radar_card` | Lean /w warm-radar card: no AI fit score, no fit reason, no tailored outreach copy - just |
+| 9840 | `_fetch_jsearch_page_with_retry` | GETs one JSearch page with exponential backoff on timeout/429/5xx. |
+| 9871 | `fetch_single_query_jobs` | Worker function for parallel JSearch API query execution. |
+| 9907 | `fetch_greenhouse_jobs` | Pull unauthenticated postings from a Greenhouse job board for a company slug. |
+| 9947 | `fetch_lever_jobs` | Pull unauthenticated postings from a Lever job board for a company slug. |
+| 9988 | `fetch_workday_jobs` | Pull postings from one Workday tenant's public CXS API. |
+| 10071 | `fetch_ashby_jobs` | Pull unauthenticated postings from an Ashby job board for a company slug. |
+| 10149 | `apply_search_gear` | Write one gear's settings into the filter store. Returns the applied gear dict. |
+| 10166 | `current_search_gear` | The gear the filters are actually in, not merely the last one set. |
+| 10184 | `describe_search_gear` | Telegram-ready summary of the current breadth, including the live source counts. |
+| 10210 | `_strip_html_to_text` | Board descriptions arrive as HTML. The AI prompt and the CRM both want plain text. |
+| 10223 | `fetch_remoteok_jobs` | RemoteOK public JSON. Element 0 is a legal/metadata stub, not a posting - skip it. |
+| 10251 | `fetch_himalayas_jobs` | Himalayas public JSON. pubDate is a unix epoch string, not ISO. |
+| 10282 | `fetch_remotive_jobs` | Remotive public JSON. |
+| 10318 | `fetch_weworkremotely_jobs` | WeWorkRemotely RSS. Titles arrive as 'Company: Role', so the employer is split off the |
+| 10352 | `fetch_remote_feed_jobs` | Pull every keyless remote feed in parallel. One dead feed never blocks the others. |
+| 10366 | `fetch_ats_jobs` | Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in |
+| 10409 | `auto_expand_ats_slug` | Silent Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its |
+| 10449 | `resolve_warm_company_ats_slugs` | Resolves an ATS board slug for every unique Carmen Warm CRM company: prefers the |
+| 10479 | `dispatch_tier1_matches` | Land a set of scored matches in the CRM, then card the ones whose row actually wrote. |
+| 10635 | `scrape_job_page` | Best-effort server-side fetch of ANY job posting page -> (title, company, description). |
+| 10683 | `ingest_manual_job` | Run one hand-picked posting through the exact Stage 2 path /t uses, then land it in the CRM. |
+| 10787 | `run_job_pipeline` | Job search pipeline with two-stage architecture: |
+| 11032 | `run_warm_radar_scan` | /w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen |
+| 11136 | `process_webhook_payload_async` | Executes heavy workloads in background worker threads so HTTP return is instant. |
+| 13107 | `_is_oneshot_invocation` | True when this process was launched as `python main.py --once` (the CI batch entrypoint). |
+| 13133 | `health_check` | Return JSON health status in <5ms. |
+| 13154 | `_run_pipeline_and_notify` | Background thread target for /t: runs the heavy pipeline off the request thread, |
+| 13165 | `_run_overdue_batch_and_notify` | Background target for the Tuesday batch-hub commands so webhook acknowledgement remains instant. |
+| 13191 | `telegram_webhook` | Instant non-blocking execution (<0.05s return). Validates Telegram's secret token header, |
+| 13219 | `format_ats_plaintext` | Builds a plain-text ATS-safe fallback block (identity/experience/education/bullets) for the |
+| 13253 | `_followups_page` | Wrap /followups content in the /stage page's shell: same CSS, same copyField() script. |
+| 13290 | `followup_queue_view` | The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail |
+| 13398 | `_followup_copy_page` | The fallback for an on-demand draft that could not be created: the reason, and the text to |
+| 13411 | `followup_draft_on_demand` | Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it. |
+| 13460 | `morning_brief_view` | One page holding everything the morning used to dump into Telegram as four messages. |
+| 13557 | `desktop_stage_view` | Desktop review page - the card's "Full Card" target. Everything the Telegram card used to |
+| 13675 | `desktop_stage_pdf` | Serves raw PDF bytes for browser preview and download. |
+| 13697 | `desktop_ingest` | Secure endpoint for desktop bookmarklet ingestion of manual job links/text. |
+| 13771 | `_public_stats_days_running` | Whole days from PUBLIC_STATS_START_DATE to today, floored at 0. |
+| 13778 | `build_public_stats` | Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable. |
+| 13840 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
 
-## `pipeline_utils.py` — 75 defs, 1,999 lines
+## `pipeline_utils.py` — 75 defs, 2,017 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -376,36 +381,36 @@ grep -i "contact" FUNCTION_INDEX.md
 | 1095 | `name_from_email_local_part` | Fall back to a display name derived from the address ('eina.assali@x' -> 'Eina Assali') |
 | 1105 | `build_sent_contact` | One Sent message -> a Carmen Cold contact dict, or None when it should not capture. |
 | 1125 | `is_guessed_contact_email` | True when a JOBS row's Contact Email is a pipeline guess rather than a real person. |
-| 1143 | `resolve_sent_email_backfill` | One Sent message -> (sheet_uuid, real_email) for a JOBS row whose Contact Email is still |
-| 1214 | `carmen_ladder_for` | The ladder tuple a row walks: engaged when the contact has ever replied, else cold. |
-| 1222 | `carmen_terminal_gap` | The gap the final rung writes for `ladder`: last offset + the grace week. |
-| 1260 | `carmen_ladder_rung` | Which rung a Carmen Cold row currently sits on, from the gap between its anchor and |
-| 1278 | `carmen_ladder_action` | Pure: what a Carmen Cold row needs today. Side-effect free. |
-| 1321 | `_latest_marker_date` | Most recent "[YYYY-MM-DD] <marker>" date in a notes cell, or None. Notes accumulate one |
-| 1336 | `carmen_reply_anchor` | The date of the most recent inbound reply recorded in a notes cell, or None. |
-| 1341 | `carmen_restart_anchor` | The date the sequencer last restarted this row's ladder, or None. |
-| 1346 | `carmen_linkedin_anchor` | The date of the most recent OUTBOUND LinkedIn touch recorded in a notes cell, or None. |
-| 1357 | `CarmenPlan` | (action, next_date, revived, anchor). Unpacks as a 4-tuple; use .action / .next_date / |
-| 1366 | `CarmenPlan.__new__` | _(no docstring)_ |
-| 1379 | `plan_carmen_ladder` | String-in planner for a raw Carmen Cold row. Returns a CarmenPlan. |
-| 1451 | `carmen_status_marker` | The Column E marker for a row the sequencer just planned, or None when it has nothing to |
-| 1485 | `carmen_marker_cell` | Column E's new value: `marker`, with any text Kevin typed preserved after it. |
-| 1498 | `plan_carmen_followup` | Two-value form of plan_carmen_ladder(): (action, next_date). Same anchoring and revival |
-| 1517 | `is_expired_matched_row` | True for a JOBS row still sitting at 'Matched' (never applied to, never replied to) |
-| 1543 | `extract_linkedin_job_id` | Pull the numeric posting id out of a LinkedIn job URL, or None. |
-| 1578 | `strip_tracking_params` | Drop campaign/analytics query params, preserving everything that identifies the posting. |
-| 1599 | `canonical_job_url` | Normalize any job URL for use as a dedup key and stored apply link. |
-| 1612 | `canonical_linkedin_job_url` | Back-compat alias for canonical_job_url(). Prefer canonical_job_url in new code. |
-| 1617 | `is_linkedin_job_url` | True if this looks like a LinkedIn URL carrying a job posting id. |
-| 1627 | `parse_job_command` | Parse `/job <url>` and `/job Title @ Company <url>` into (title, company, url). |
-| 1659 | `parse_job_page_html` | Best-effort extraction of (title, company, description) from ANY job posting page. |
-| 1742 | `strip_html_to_text` | Flatten an HTML fragment to readable plain text - tags dropped, entities decoded, |
-| 1759 | `build_ingest_job_dict` | Assemble a manually-ingested posting into the same job dict shape the JSearch/ATS feeds |
-| 1837 | `_jd_singularize` | Crude, deliberate stemmer: collapse plurals so 'reconciliations' and 'reconciliation' |
-| 1852 | `extract_jd_terms` | Domain vocabulary from one job description, as a list of normalized terms. |
-| 1938 | `is_opaque_job_host` | True when a plain GET on this host cannot distinguish a live posting from a dead one. |
-| 1944 | `classify_job_link` | Classify one job link as 'dead', 'alive' or 'unknown'. |
-| 1997 | `may_auto_retire` | True when a dead link is sufficient grounds to move this row to Died without asking. |
+| 1161 | `resolve_sent_email_backfill` | One Sent message -> (sheet_uuid, real_email) for a JOBS row whose Contact Email is still |
+| 1232 | `carmen_ladder_for` | The ladder tuple a row walks: engaged when the contact has ever replied, else cold. |
+| 1240 | `carmen_terminal_gap` | The gap the final rung writes for `ladder`: last offset + the grace week. |
+| 1278 | `carmen_ladder_rung` | Which rung a Carmen Cold row currently sits on, from the gap between its anchor and |
+| 1296 | `carmen_ladder_action` | Pure: what a Carmen Cold row needs today. Side-effect free. |
+| 1339 | `_latest_marker_date` | Most recent "[YYYY-MM-DD] <marker>" date in a notes cell, or None. Notes accumulate one |
+| 1354 | `carmen_reply_anchor` | The date of the most recent inbound reply recorded in a notes cell, or None. |
+| 1359 | `carmen_restart_anchor` | The date the sequencer last restarted this row's ladder, or None. |
+| 1364 | `carmen_linkedin_anchor` | The date of the most recent OUTBOUND LinkedIn touch recorded in a notes cell, or None. |
+| 1375 | `CarmenPlan` | (action, next_date, revived, anchor). Unpacks as a 4-tuple; use .action / .next_date / |
+| 1384 | `CarmenPlan.__new__` | _(no docstring)_ |
+| 1397 | `plan_carmen_ladder` | String-in planner for a raw Carmen Cold row. Returns a CarmenPlan. |
+| 1469 | `carmen_status_marker` | The Column E marker for a row the sequencer just planned, or None when it has nothing to |
+| 1503 | `carmen_marker_cell` | Column E's new value: `marker`, with any text Kevin typed preserved after it. |
+| 1516 | `plan_carmen_followup` | Two-value form of plan_carmen_ladder(): (action, next_date). Same anchoring and revival |
+| 1535 | `is_expired_matched_row` | True for a JOBS row still sitting at 'Matched' (never applied to, never replied to) |
+| 1561 | `extract_linkedin_job_id` | Pull the numeric posting id out of a LinkedIn job URL, or None. |
+| 1596 | `strip_tracking_params` | Drop campaign/analytics query params, preserving everything that identifies the posting. |
+| 1617 | `canonical_job_url` | Normalize any job URL for use as a dedup key and stored apply link. |
+| 1630 | `canonical_linkedin_job_url` | Back-compat alias for canonical_job_url(). Prefer canonical_job_url in new code. |
+| 1635 | `is_linkedin_job_url` | True if this looks like a LinkedIn URL carrying a job posting id. |
+| 1645 | `parse_job_command` | Parse `/job <url>` and `/job Title @ Company <url>` into (title, company, url). |
+| 1677 | `parse_job_page_html` | Best-effort extraction of (title, company, description) from ANY job posting page. |
+| 1760 | `strip_html_to_text` | Flatten an HTML fragment to readable plain text - tags dropped, entities decoded, |
+| 1777 | `build_ingest_job_dict` | Assemble a manually-ingested posting into the same job dict shape the JSearch/ATS feeds |
+| 1855 | `_jd_singularize` | Crude, deliberate stemmer: collapse plurals so 'reconciliations' and 'reconciliation' |
+| 1870 | `extract_jd_terms` | Domain vocabulary from one job description, as a list of normalized terms. |
+| 1956 | `is_opaque_job_host` | True when a plain GET on this host cannot distinguish a live posting from a dead one. |
+| 1962 | `classify_job_link` | Classify one job link as 'dead', 'alive' or 'unknown'. |
+| 2015 | `may_auto_retire` | True when a dead link is sufficient grounds to move this row to Died without asking. |
 
 ## `response_schema.py` — 4 defs, 40 lines
 
@@ -460,21 +465,21 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 | ---: | :--- | :--- |
 | 162 | `add_row` | Accepts payload.row_data as either a structured array or a named object |
 | 189 | `batch_add_rows` | Processes multiple Tier-1/Tier-2 pipeline matches under a single lock/execution |
-| 290 | `quick_add` | /quick, /cold, /warm Contact Creation (main.py: build_crm_payload("quick_add", ...)) |
-| 329 | `update_status` | Swipe-Reply Tab Move (/tw, /cw, /cc, /tc, /x -> build_crm_payload("update_status", ...)) |
-| 357 | `set_status` | the row stays in whatever tab it already lives in. |
-| 372 | `update_snooze` | Snooze Follow-up (/f -> build_crm_payload("update_snooze", ...)) |
-| 392 | `clear_followup` | time from the date picker, and a stale ladder date there reads as a commitment that is not. |
-| 406 | `update_contact_email` | Manual Apollo Email Override (/e, /email -> build_crm_payload("update_contact_email", ...)) |
-| 430 | `set_context` | An empty string is a legal value here (it clears the cell), so only sheet_uuid is required. |
-| 444 | `append_note` | Append Timestamped Note (/n -> build_crm_payload("append_note", ...)) |
-| 462 | `get_followups` | Networking Card Pull (/c, /cw, /cc, TW suppression -> {"action": "get_followups", "tab": target_code}) |
-| 529 | `update_system_config` | Dynamic Filter Mirroring (main.py set_filter dual-write) |
-| 571 | `get_priority` | Fetch Priority Contacts sorted strictly by Overdue Next Followup Date |
-| 610 | `load_system_config` | Load Mirrored System_Config on Startup |
-| 631 | `find_contact_by_email` | for an exact case-insensitive match. Authoritative source of truth for the Sheets CRM. |
-| 675 | `funnel_stats` | the migration (item 5) uses, so pre-migration data still buckets sanely. Touches no data. |
+| 291 | `quick_add` | /quick, /cold, /warm Contact Creation (main.py: build_crm_payload("quick_add", ...)) |
+| 330 | `update_status` | Swipe-Reply Tab Move (/tw, /cw, /cc, /tc, /x -> build_crm_payload("update_status", ...)) |
+| 358 | `set_status` | the row stays in whatever tab it already lives in. |
+| 373 | `update_snooze` | Snooze Follow-up (/f -> build_crm_payload("update_snooze", ...)) |
+| 393 | `clear_followup` | time from the date picker, and a stale ladder date there reads as a commitment that is not. |
+| 407 | `update_contact_email` | Manual Apollo Email Override (/e, /email -> build_crm_payload("update_contact_email", ...)) |
+| 431 | `set_context` | An empty string is a legal value here (it clears the cell), so only sheet_uuid is required. |
+| 445 | `append_note` | Append Timestamped Note (/n -> build_crm_payload("append_note", ...)) |
+| 463 | `get_followups` | Networking Card Pull (/c, /cw, /cc, TW suppression -> {"action": "get_followups", "tab": target_code}) |
+| 530 | `update_system_config` | Dynamic Filter Mirroring (main.py set_filter dual-write) |
+| 572 | `get_priority` | Fetch Priority Contacts sorted strictly by Overdue Next Followup Date |
+| 611 | `load_system_config` | Load Mirrored System_Config on Startup |
+| 632 | `find_contact_by_email` | for an exact case-insensitive match. Authoritative source of truth for the Sheets CRM. |
+| 676 | `funnel_stats` | the migration (item 5) uses, so pre-migration data still buckets sanely. Touches no data. |
 
 ---
 
-**418 definitions across 8 files + Code.gs.**
+**423 definitions across 8 files + Code.gs.**

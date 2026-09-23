@@ -11570,8 +11570,10 @@ def process_webhook_payload_async(data):
                     )
                 lines.append(
                     "<i>They stopped sourcing - that is not a rejection. Worth a status chase "
-                    "while the req is fresh. <code>/x</code> on the card archives it; "
+                    "while the req is fresh. <code>/x</code> on the card archives one; "
                     "<code>/dead</code> only records the decoy and leaves the row alone.</i>\n"
+                    f"⚰️ <code>/linksx</code> - archive all {len(applied_rows)} to Died "
+                    "<i>(no reply needed)</i>\n"
                 )
 
             if retired_rows:
@@ -11582,6 +11584,45 @@ def process_webhook_payload_async(data):
                         f" · {_dead_since_label(first_dead)}"
                     )
             send_telegram_message(chat_id, "\n".join(lines))
+            return
+
+        if text == "/linksx":
+            # Bulk-archive the dead-link rows /links reports but will not touch on its own.
+            #
+            # The nightly sweep only auto-retires a "Matched" row (AUTO_RETIRE_STATUSES), because
+            # a posting coming down on a job Kevin APPLIED to is not a rejection - the req may be
+            # filled, paused, or simply re-listed, and burying it automatically would lose a live
+            # application. So those rows sit in the report until he decides. This is that decision,
+            # taken for all of them at once instead of hunting down each card to swipe /x.
+            rows = [r for r in get_dead_job_links() if not r[6]]
+            if not rows:
+                send_telegram_message(
+                    chat_id,
+                    "✅ <b>Nothing to archive.</b>\n<i>No dead-link rows are waiting on you - "
+                    "anything the sweep could retire on its own already went to Died.</i>"
+                )
+                return
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            archived = []
+            for uuid_v, company, role, _link, _status, reason, _retired, _first_dead in rows:
+                enqueue_crm_payload(build_crm_payload(
+                    "append_note", sheet_uuid=uuid_v,
+                    note=f"[{today_str}] Archived via /linksx: job link dead ({reason})."))
+                enqueue_crm_payload(build_crm_payload(
+                    "update_status", sheet_uuid=uuid_v, new_tab="Died"))
+                # Died means died: record it locally so /t can never re-source the role, whatever
+                # state the Apps Script deployment is in.
+                record_died_role(company, role)
+                archived.append(f"⚰️ <b>{html.escape(str(company or '?'))}</b> - "
+                                f"{html.escape(str(role or '?'))}")
+            # Flag them notified so the morning digest does not keep reporting rows now in Died.
+            mark_dead_links_notified([r[0] for r in rows])
+            send_telegram_message(
+                chat_id,
+                f"⚰️ <b>Archived {len(archived)} dead posting(s) to Died.</b>\n\n"
+                + "\n".join(archived[:20])
+                + "\n\n<i>Each role is now forbidden from /t - a repost will not come back.</i>"
+            )
             return
 
         if text == "/resync":
@@ -13045,6 +13086,7 @@ def process_webhook_payload_async(data):
                 "/crazy - Stop a CRM retry/alert storm (add 'go' to clear the outbox)\n"
                 "/queries - Per-query yield: which search phrases earn their slot\n"
                 "/links - Dead job postings · <code>/links check</code> dry run · <code>/links go</code> retires\n"
+                "/linksx - Archive every dead-link row you applied to straight to Died\n"
                 "/usage - How often you use each command (week/month/90/all)\n"
                 "/resync - Re-read the job tabs after deleting rows by hand\n"
                 "/job! &lt;url&gt; - Force a card: skips the duplicate check AND the AI screener\n"
