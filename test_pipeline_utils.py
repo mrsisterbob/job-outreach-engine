@@ -9,6 +9,7 @@ whichever test module imports main first owns the temp DB and the other reuses i
 """
 import json
 import os
+import pytest
 import tempfile
 import types
 import urllib.parse
@@ -136,22 +137,25 @@ def _added(days_ago):
     return (_TODAY - timedelta(days=days_ago)).strftime("%Y-%m-%d")
 
 
-def test_followup_action_applied_boundary_days_3_4_5():
-    assert pu.followup_action("Applied", _added(3), "", _TODAY) == "none"
-    assert pu.followup_action("Applied", _added(4), "", _TODAY) == "send_followup_1"
-    assert pu.followup_action("Applied", _added(5), "", _TODAY) == "send_followup_1"
+def test_followup_action_applied_boundary_days_1_2_3():
+    assert pu.followup_action("Applied", _added(1), "", _TODAY) == "none"
+    assert pu.followup_action("Applied", _added(2), "", _TODAY) == "send_followup_1"
+    assert pu.followup_action("Applied", _added(3), "", _TODAY) == "send_followup_1"
 
 
-def test_followup_action_applied_boundary_days_8_9_10():
-    assert pu.followup_action("Applied", _added(8), "", _TODAY) == "send_followup_1"
-    assert pu.followup_action("Applied", _added(9), "", _TODAY) == "send_followup_2"
-    assert pu.followup_action("Applied", _added(10), "", _TODAY) == "send_followup_2"
+def test_followup_action_bumps_fast_but_buries_slow():
+    """The bump and the bury answer different questions. A row stays Applied through the whole
+    window Kevin's queue shows replies arriving in (4-8 days silent) and is only buried at +14."""
+    for day in (4, 8, 13):
+        assert pu.followup_action("Applied", _added(day), "", _TODAY) == "send_followup_1"
+    assert pu.followup_action("Applied", _added(14), "", _TODAY) == "bury_ghosted"
+    assert pu.followup_action("Applied", _added(20), "", _TODAY) == "bury_ghosted"
 
 
-def test_followup_action_applied_boundary_days_15_16_17():
-    assert pu.followup_action("Applied", _added(15), "", _TODAY) == "send_followup_2"
-    assert pu.followup_action("Applied", _added(16), "", _TODAY) == "bury_ghosted"
-    assert pu.followup_action("Applied", _added(17), "", _TODAY) == "bury_ghosted"
+def test_followup_action_never_issues_a_second_bump():
+    """One follow-up, then the bury. No day may produce send_followup_2 - the rung was cut."""
+    for day in range(0, 40):
+        assert pu.followup_action("Applied", _added(day), "", _TODAY) != "send_followup_2"
 
 
 def test_followup_action_future_next_followup_always_none():
@@ -935,33 +939,26 @@ _LADDER_TODAY = date(2026, 9, 12)
 
 
 def test_carmen_ladder_walks_every_rung_then_stops():
-    """The whole point: three nudges at CARMEN_LADDER_DAYS_ENGAGED offsets from the day the
-    contact landed. Dates are derived from the constant rather than hardcoded, so retuning the
-    cadence is a one-line change instead of a test rewrite.
+    """The whole point: ONE nudge at the CARMEN_LADDER_DAYS_ENGAGED offset from the day the
+    contact landed, then the grace week, then spent. Dates are derived from the constant rather
+    than hardcoded, so retuning the cadence is a one-line change instead of a test rewrite.
 
-    The row carries a reply note, which is what puts it on the engaged ladder: since the
-    cold/engaged split a contact who has never written back walks the shorter (4, 11) ladder.
+    The row carries a reply note, which is what puts it on the engaged ladder.
     The anchor stays Date Added because the reply predates it here.
     """
     anchor_date = date(2026, 9, 12)
     anchor = anchor_date.isoformat()
     note = f"[{(anchor_date - timedelta(days=1)).isoformat()}] {pu.INBOUND_REPLY_NOTE_MARKER} - said to circle back"
-    d1, d2, d3 = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS_ENGAGED)
+    (d1,) = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS_ENGAGED)
 
     action, nxt = pu.plan_carmen_followup(anchor, "", _LADDER_TODAY, note)
     assert (action, nxt) == ("schedule", d1)
 
-    action, nxt = pu.plan_carmen_followup(anchor, d1.isoformat(), d1, note)
-    assert (action, nxt) == ("nudge_1", d2)
-
-    action, nxt = pu.plan_carmen_followup(anchor, d2.isoformat(), d2, note)
-    assert (action, nxt) == ("nudge_2", d3)
-
-    # Final rung advances to the triage date (last rung + grace week) rather than writing
-    # nothing - with no date written, the row re-read as rung 3 and nudge #3 fired forever.
+    # Final (and only) rung advances to the triage date (last rung + grace week) rather than
+    # writing nothing - with no date written, the row re-read as its last rung and re-fired.
     terminal = anchor_date + timedelta(days=pu.CARMEN_TERMINAL_GAP_DAYS)
-    action, nxt = pu.plan_carmen_followup(anchor, d3.isoformat(), d3, note)
-    assert (action, nxt) == ("nudge_3", terminal)
+    action, nxt = pu.plan_carmen_followup(anchor, d1.isoformat(), d1, note)
+    assert (action, nxt) == ("nudge_1", terminal)
 
     # Quiet through the grace week, then exhausted - the path that used to be unreachable.
     assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal - timedelta(days=1), note) == ("none", None)
@@ -969,19 +966,108 @@ def test_carmen_ladder_walks_every_rung_then_stops():
 
 
 def test_cold_ladder_stops_one_nudge_earlier_than_engaged():
-    """A contact who has never replied gets three TOTAL contacts (day 0 + two nudges), not four.
-    The day-21 nudge to someone who ignored three emails is the rung the split removes."""
+    """A contact who has never replied gets two TOTAL contacts (day 0 + one nudge), and reaches
+    that single nudge a day sooner than an engaged row does."""
     anchor_date = date(2026, 9, 12)
     anchor = anchor_date.isoformat()
-    d1, d2 = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS_COLD)
+    (d1,) = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS_COLD)
 
-    assert pu.plan_carmen_followup(anchor, d1.isoformat(), d1) == ("nudge_1", d2)
+    assert pu.CARMEN_LADDER_DAYS_COLD[0] < pu.CARMEN_LADDER_DAYS_ENGAGED[0]
 
     terminal = anchor_date + timedelta(days=pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_COLD))
-    assert pu.plan_carmen_followup(anchor, d2.isoformat(), d2) == ("nudge_2", terminal)
+    assert pu.plan_carmen_followup(anchor, d1.isoformat(), d1) == ("nudge_1", terminal)
 
-    # No third nudge: the grace week runs, then the row is spent.
+    # No second nudge: the grace week runs, then the row is spent.
     assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal) == ("exhausted", None)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    # The title from the CRM that started this: aggregator filler must not reach a stranger.
+    ("Financial Operations Analyst Intermediate /work from home reputed company reputed company/",
+     "Financial Operations Analyst Intermediate"),
+    ("Financial Operations Analyst, reputed company and Cash Conversion",
+     "Financial Operations Analyst"),
+    # Req numbers, in the three shapes the boards use.
+    ("Account Receivable Compliance Analyst (3114)", "Account Receivable Compliance Analyst"),
+    ("Production Support Analyst - #26343", "Production Support Analyst"),
+    ("Finance Manager REQ 99283", "Finance Manager"),
+    # Work style and schedule tails.
+    ("Business Systems Analyst  - Remote", "Business Systems Analyst"),
+    ("Salesforce Technical Administrator (Hybrid)", "Salesforce Technical Administrator"),
+    ("Patient Financial Services Analyst, FT, Days, - Remote", "Patient Financial Services Analyst"),
+    ("CBO Business Operation Analyst - Full Time Days - Hybrid (Michigan Residents)",
+     "CBO Business Operation Analyst"),
+    # Location tails, including the board restating the employer inside the title.
+    ("Salesforce Administrator at Bedrock Management Services LLC Detroit, MI",
+     "Salesforce Administrator"),
+    ("Wealth Planner - Farmington Hills, MI", "Wealth Planner"),
+    ("Import/Export & Warehouse Operations Specialist – Detroit, MI (On-site)",
+     "Import/Export & Warehouse Operations Specialist"),
+    # Salary bait.
+    ("Remote Customer Success Associate 60k 80k FinTech 23", "Remote Customer Success Associate"),
+    # ALREADY CLEAN - these must come out byte-identical. The comma in "Analyst, Financial
+    # Operations" is load-bearing, and "(Investment Team)" is a real qualifier, not a location.
+    ("Analyst, Financial Operations", "Analyst, Financial Operations"),
+    ("Financial Analyst (Investment Team)", "Financial Analyst (Investment Team)"),
+    ("Strategic Finance Analyst II (Revenue)", "Strategic Finance Analyst II (Revenue)"),
+    ("Customs Analyst - Import/Export Operations Analyst",
+     "Customs Analyst - Import/Export Operations Analyst"),
+    ("Data Analyst", "Data Analyst"),
+    ("", ""),
+])
+def test_sanitize_job_title_peels_board_noise_without_touching_real_titles(raw, expected):
+    assert pu.sanitize_job_title(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "AlixPartners", "Blue Cross Blue Shield of Michigan", "Stripe", "Plante Moran",
+    "Compu-Vision - Northeast",   # a company name that landed in the Role column
+    "N/A", "TBD", "", "   ", "-",
+])
+def test_is_clean_job_title_rejects_anything_that_is_not_a_role(raw):
+    """These are all real Role-column values. None of them may be interpolated into a sentence
+    that auto-sends - "the Stripe role at Stripe" is how a system announces itself as a bot."""
+    assert pu.is_clean_job_title(raw) is False
+
+
+@pytest.mark.parametrize("raw", [
+    "Data Analyst", "Analyst, Financial Operations", "Salesforce Tech Admin – Hybrid Role",
+    "Financial Operations Analyst Intermediate /work from home reputed company reputed company/",
+    "Client Operations Specialist - Livonia", "Salesforce BA: Process Improvement & UAT Support",
+])
+def test_is_clean_job_title_accepts_real_roles_including_ones_needing_cleanup(raw):
+    assert pu.is_clean_job_title(raw) is True
+
+
+def test_a_linkedin_touch_reanchors_without_faking_a_reply():
+    """THE POINT of a separate marker: /linkedin records that KEVIN reached out on another
+    channel. It must move the anchor - the contact was just contacted, so an email bump two days
+    later reads as pestering - while leaving the row on the COLD track. Reusing the inbound marker
+    here would promote the row and count a reply that never happened."""
+    added = date(2026, 9, 1)
+    touched = date(2026, 9, 6)
+    note = f"[{touched.isoformat()}] {pu.LINKEDIN_TOUCH_NOTE_MARKER} - connect/DM sent by hand."
+
+    plan = pu.plan_carmen_ladder(added.isoformat(), "", touched, note)
+    assert plan.anchor == touched, "the ladder spaces off the real last contact"
+    assert plan.replied is False, "a touch Kevin sent is NOT a reply"
+    assert plan.ladder == pu.CARMEN_LADDER_DAYS_COLD, "and must not promote the track"
+    assert pu.carmen_linkedin_anchor(note) == touched
+    assert pu.carmen_reply_anchor(note) is None, "it must never read as an inbound reply"
+
+
+def test_a_real_reply_still_outranks_a_linkedin_touch():
+    """Both markers on one row: the anchor is the latest of the two, but the TRACK is decided by
+    the reply alone - so a later LinkedIn touch re-spaces the ladder without demoting an engaged
+    contact back to cold."""
+    replied = date(2026, 9, 6)
+    touched = date(2026, 9, 10)
+    note = (f"[{replied.isoformat()}] {pu.INBOUND_REPLY_NOTE_MARKER} - asked for a call\n"
+            f"[{touched.isoformat()}] {pu.LINKEDIN_TOUCH_NOTE_MARKER} - connect/DM sent by hand.")
+
+    plan = pu.plan_carmen_ladder("2026-09-01", "", touched, note)
+    assert plan.anchor == touched
+    assert plan.replied is True and plan.ladder == pu.CARMEN_LADDER_DAYS_ENGAGED
 
 
 def test_a_reply_promotes_a_cold_row_to_the_engaged_ladder():
@@ -1011,7 +1097,7 @@ def test_legacy_mid_ladder_cold_row_gets_its_last_nudge_not_a_kill():
     cold_terminal = anchor + timedelta(days=pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_COLD))
 
     action, nxt = pu.plan_carmen_followup(anchor.isoformat(), legacy.isoformat(), legacy)
-    assert (action, nxt) == ("nudge_2", cold_terminal)
+    assert (action, nxt) == ("nudge_1", cold_terminal)
 
     # And it still terminates rather than looping.
     assert pu.plan_carmen_followup(anchor.isoformat(), cold_terminal.isoformat(), cold_terminal) == ("exhausted", None)
@@ -1023,11 +1109,10 @@ def test_legacy_mid_ladder_cold_row_gets_its_last_nudge_not_a_kill():
 
 
 def test_carmen_status_marker_counts_total_contacts_not_rungs():
-    """Day 0 is the original email, so the cold ladder's two nudges read '1 of 3' and '2 of 3'."""
+    """Day 0 is the original email, so the single nudge on either ladder reads '1 of 2'."""
     cold, engaged = pu.CARMEN_LADDER_DAYS_COLD, pu.CARMEN_LADDER_DAYS_ENGAGED
-    assert pu.carmen_status_marker("nudge_1", False, cold) == "COLD · 1 of 3"
-    assert pu.carmen_status_marker("nudge_2", False, cold) == "COLD · 2 of 3"
-    assert pu.carmen_status_marker("nudge_3", True, engaged) == "WARM · 3 of 4"
+    assert pu.carmen_status_marker("nudge_1", False, cold) == "COLD · 1 of 2"
+    assert pu.carmen_status_marker("nudge_1", True, engaged) == "WARM · 1 of 2"
     assert pu.carmen_status_marker("schedule", False, cold) == "NEW · unsent"
     assert pu.carmen_status_marker("exhausted", False, cold) == "COLD · spent"
     assert pu.carmen_status_marker("exhausted", True, engaged) == "WARM · spent"
@@ -1049,15 +1134,15 @@ def test_carmen_marker_cell_preserves_hand_typed_context():
 
 def test_carmen_ladder_starts_a_manually_moved_row_from_today():
     """A row dragged into Carmen Cold by hand carries a stale Date Added and no follow-up date.
-    It must enter the ladder on the next pass, not be skipped and not fire all three at once."""
+    It must enter the ladder on the next pass, not be skipped and not fire immediately."""
     action, nxt = pu.plan_carmen_followup("2026-01-04", "", _LADDER_TODAY)
     assert action == "schedule"
-    assert nxt == _LADDER_TODAY + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
+    assert nxt == _LADDER_TODAY + timedelta(days=pu.CARMEN_LADDER_DAYS_COLD[0])
 
     # Same for a row with no Date Added at all.
     action, nxt = pu.plan_carmen_followup("", "", _LADDER_TODAY)
     assert action == "schedule"
-    assert nxt == _LADDER_TODAY + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
+    assert nxt == _LADDER_TODAY + timedelta(days=pu.CARMEN_LADDER_DAYS_COLD[0])
 
 
 def test_carmen_ladder_is_quiet_until_due_and_after_exhaustion():
@@ -1091,7 +1176,7 @@ def test_stale_bench_contact_with_a_set_date_starts_at_rung_1_not_exhausted():
     old = (today - timedelta(days=210)).isoformat()
     plan = pu.plan_carmen_ladder(old, today.isoformat(), today)
     assert plan.action == "schedule"
-    assert plan.next_date == today + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
+    assert plan.next_date == today + timedelta(days=pu.CARMEN_LADDER_DAYS_COLD[0])
     assert plan.revived is True
     assert plan.anchor == today
     # Two-value wrapper agrees and keeps its contract.
@@ -1103,7 +1188,7 @@ def test_revived_row_climbs_the_ladder_once_its_restart_note_is_recorded():
     otherwise the next pass revives again and the row never gets past "schedule"."""
     today = date(2026, 9, 12)
     old = (today - timedelta(days=210)).isoformat()
-    first = today + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
+    first = today + timedelta(days=pu.CARMEN_LADDER_DAYS_COLD[0])
     note = f"[2026-01-01] Met at conference\n[{today.isoformat()}] {pu.LADDER_RESTART_NOTE_MARKER} (revived)"
 
     plan = pu.plan_carmen_ladder(old, first.isoformat(), first, note=note)
@@ -1143,7 +1228,7 @@ def test_blank_anchor_still_falls_back_to_today():
     today = date(2026, 9, 12)
     plan = pu.plan_carmen_ladder("", "", today)
     assert plan.action == "schedule"
-    assert plan.next_date == today + timedelta(days=pu.CARMEN_LADDER_DAYS[0])
+    assert plan.next_date == today + timedelta(days=pu.CARMEN_LADDER_DAYS_COLD[0])
     assert plan.anchor == today
     # Flagged as a revival so the caller records the restart: a blank Date Added otherwise
     # re-anchors on a new "today" every pass and the row never reaches rung 1.
@@ -1178,7 +1263,11 @@ def test_reply_anchor_skips_malformed_dates():
 
 def test_reply_older_than_date_added_leaves_the_anchor_alone():
     today = date(2026, 9, 12)
-    plan = pu.plan_carmen_ladder("2026-09-08", "2026-09-12", today, note=_reply("2026-08-20"))
+    # Scheduled exactly one engaged rung after Date Added, so the row reads as sitting on rung 1
+    # whatever that rung's offset currently is.
+    scheduled = date(2026, 9, 8) + timedelta(days=pu.CARMEN_LADDER_DAYS_ENGAGED[0])
+    plan = pu.plan_carmen_ladder("2026-09-08", scheduled.isoformat(), scheduled,
+                                 note=_reply("2026-08-20"))
     assert plan.anchor == date(2026, 9, 8)
     assert plan.action == "nudge_1"
 
@@ -1187,8 +1276,11 @@ def test_reply_newer_than_date_added_restarts_the_ladder_from_the_reply():
     """A live conversation must not die on the same clock as a ghost."""
     today = date(2026, 9, 12)
     reply_day = date(2026, 9, 8)
-    # Date Added is 22 days before the reply; the reply handler set Next Followup = reply + 4.
-    plan = pu.plan_carmen_ladder("2026-08-17", (reply_day + timedelta(days=4)).isoformat(), today,
+    # Date Added is 22 days before the reply; the reply handler set Next Followup one engaged
+    # rung past the reply, which is where the ladder picks the row up.
+    rung = pu.CARMEN_LADDER_DAYS_ENGAGED[0]
+    plan = pu.plan_carmen_ladder("2026-08-17", (reply_day + timedelta(days=rung)).isoformat(),
+                                 reply_day + timedelta(days=rung),
                                  note=_reply(reply_day.isoformat()))
     assert plan.anchor == reply_day
     assert (plan.action, plan.revived) == ("nudge_1", False)

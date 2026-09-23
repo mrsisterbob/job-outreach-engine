@@ -26,6 +26,7 @@ os.close(_tmp_db_fd)
 os.environ["JOBS_DB_PATH"] = _TMP_DB_PATH
 
 import main as m  # noqa: E402  (must import after JOBS_DB_PATH is set)
+import pipeline_utils  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -471,8 +472,8 @@ def test_sequencer_queues_followup_1_with_window_snooze(monkeypatch):
 
     snoozes = [p for p in enqueued if p["action"] == "update_snooze" and p["sheet_uuid"] == "seq-fu1"]
     assert len(snoozes) == 1
-    # anchor (Date Added 2026-05-28) + FOLLOWUP_2_DAYS -> the next window boundary
-    assert snoozes[0]["next_followup"] == "2026-06-06"
+    # anchor (Date Added 2026-05-28) + FOLLOWUP_BURY_DAYS -> straight to the bury boundary
+    assert snoozes[0]["next_followup"] == "2026-06-11"
     # the future-dated Applied row is never touched
     assert all(p["sheet_uuid"] != "seq-future" for p in enqueued)
 
@@ -637,7 +638,7 @@ def _due_person(i, email="pat@acme.com", today=_SEQ_TODAY):
     """A Carmen Cold contact sitting on its first rung's due date (nudge #1 due `today`)."""
     return {"sheet_uuid": f"cc-{i}", "company": f"Co{i}", "title": "", "name": f"Pat{i}",
             "email": email, "status": "Cold Lead",
-            "date_added": (today - timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d"),
+            "date_added": (today - timedelta(days=m.CARMEN_LADDER_DAYS_COLD[0])).strftime("%Y-%m-%d"),
             "next_followup": today.strftime("%Y-%m-%d"), "raw_priority": "High"}
 
 
@@ -646,6 +647,42 @@ def _due_application(i, email="kjmiller406@gmail.com"):
     return {"sheet_uuid": f"app-{i}", "company": f"Acme{i}", "title": "Ops Analyst", "name": "",
             "email": email, "status": "Applied", "date_added": "2026-05-28",
             "next_followup": "1970-01-01", "raw_priority": "70"}
+
+
+def test_the_gate_sees_the_real_sequencer_row_not_just_a_hand_built_dict(monkeypatch):
+    """REGRESSION. autosend_block_reason() reads `note` and `title`, and the sequencer's entry
+    dict originally carried NEITHER - it had `role` for display and dropped the notes cell. Every
+    unit test passed because they hand-built dicts that happened to have those keys, while in
+    production the reply check read "" and could never fire: a contact mid-conversation would have
+    been auto-bumped. This drives the real sequencer, so the entry is the one production builds."""
+    # The reply re-anchors the ladder to the reply date, so the row is placed on its ENGAGED
+    # rung-1 due date - otherwise nothing is due and the gate is never reached.
+    replied_on = _SEQ_TODAY - timedelta(days=m.CARMEN_LADDER_DAYS_ENGAGED[0])
+    replied = _due_person(1)
+    replied["note"] = f"[{replied_on.isoformat()}] {m.INBOUND_REPLY_NOTE_MARKER} - asked for a call"
+    replied["date_added"] = replied_on.strftime("%Y-%m-%d")
+    replied["next_followup"] = _SEQ_TODAY.strftime("%Y-%m-%d")
+    _mock_followup_rows(monkeypatch, cc_rows=[replied])
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    ready = result["followups_ready"]
+    assert len(ready) == 1
+    assert "note" in ready[0] and "title" in ready[0], "the gate's inputs must survive into the entry"
+    assert ready[0]["autosend"] is False
+    assert ready[0]["autosend_block"] == "already_replied"
+
+
+def test_a_real_sequencer_row_with_a_messy_title_is_held_back(monkeypatch):
+    """The other gate input the entry used to drop. A JOBS-schema row carrying board noise must
+    not auto-send, however clean the sanitized version reads."""
+    row = _due_person(2)
+    row["title"] = "Ops Analyst Intermediate /work from home reputed company reputed company/"
+    _mock_followup_rows(monkeypatch, cc_rows=[row])
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert result["followups_ready"][0]["autosend_block"] == "messy_title"
 
 
 def test_sequencer_creates_no_gmail_drafts(monkeypatch):
@@ -681,7 +718,7 @@ def test_sequencer_dry_run_creates_no_gmail_drafts(monkeypatch):
 
 def test_sequencer_jobs_rows_are_watched_not_drafted(monkeypatch):
     """A Tetiana Warm application never gets bump text, but its clock still advances (snooze +
-    log) so the +16 bury is reached."""
+    log) so the bury is reached."""
     _mock_followup_rows(monkeypatch, jobs_rows=[_due_application(0)])
     bumped = []
     monkeypatch.setattr(m, "build_followup_bump_draft", lambda *a, **k: bumped.append(a) or "text")
@@ -698,12 +735,12 @@ def test_sequencer_jobs_rows_are_watched_not_drafted(monkeypatch):
     assert app["attempt"] == 1
     assert app["date_added"] == "2026-05-28"
     assert app["next_followup"] == "1970-01-01"
-    assert app["new_next_followup"] == "2026-06-06"  # anchor + FOLLOWUP_2_DAYS
+    assert app["new_next_followup"] == "2026-06-11"  # anchor + FOLLOWUP_BURY_DAYS
     assert app["days_silent"] == 4
-    assert app["buries_on"] == "2026-06-13"  # anchor + FOLLOWUP_BURY_DAYS
+    assert app["buries_on"] == "2026-06-11"  # anchor + FOLLOWUP_BURY_DAYS
     assert "draft_text" not in app and "draft_id" not in app
     snoozes = [p for p in enqueued if p["action"] == "update_snooze"]
-    assert [(p["sheet_uuid"], p["next_followup"]) for p in snoozes] == [("app-0", "2026-06-06")]
+    assert [(p["sheet_uuid"], p["next_followup"]) for p in snoozes] == [("app-0", "2026-06-11")]
     assert _logged_uuids() == {"app-0"}
 
 
@@ -954,7 +991,7 @@ def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeyp
     CARMEN_LADDER_DAYS people ladder. A row sitting on its first rung's due date draws follow-up
     #1 with a roleless draft and is advanced to the second rung."""
     assert ("CC", "Carmen Cold") in m.SEQUENCER_SCAN_TABS
-    anchor = (_SEQ_TODAY - timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d")
+    anchor = (_SEQ_TODAY - timedelta(days=m.CARMEN_LADDER_DAYS_COLD[0])).strftime("%Y-%m-%d")
     cc_row = {"sheet_uuid": "cc-fu1", "company": "Nliven", "title": "", "name": "Dana Reyes",
               "status": "Applied", "date_added": anchor,
               "next_followup": _SEQ_TODAY.strftime("%Y-%m-%d"), "raw_priority": "High"}
@@ -967,7 +1004,7 @@ def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeyp
 
     ready = result["followups_ready"]
     assert [r["sheet_uuid"] for r in ready] == ["cc-fu1"]
-    assert ready[0]["ladder_day"] == m.CARMEN_LADDER_DAYS[0]
+    assert ready[0]["ladder_day"] == m.CARMEN_LADDER_DAYS_COLD[0]
     draft = ready[0]["draft_text"]
     assert draft.startswith("Hi Dana Reyes,")
     assert "{" not in draft
@@ -991,7 +1028,7 @@ def test_carmen_cold_undated_row_joins_the_ladder_instead_of_drafting(monkeypatc
     result = m.run_followup_sequencer(today=_SEQ_TODAY)
 
     assert result["followups_ready"] == []
-    expected = (_SEQ_TODAY + timedelta(days=m.CARMEN_LADDER_DAYS[0])).strftime("%Y-%m-%d")
+    expected = (_SEQ_TODAY + timedelta(days=m.CARMEN_LADDER_DAYS_COLD[0])).strftime("%Y-%m-%d")
     assert [p["action"] for p in enqueued] == ["append_note", "update_snooze", "set_context"]
     assert enqueued[0]["note"].startswith(f"[{_SEQ_TODAY.isoformat()}] {m.LADDER_RESTART_NOTE_MARKER}")
     assert enqueued[1]["next_followup"] == expected
@@ -1149,7 +1186,7 @@ def test_a_contact_who_replied_walks_the_longer_engaged_ladder(monkeypatch):
     # it is done laddering and waiting on Kevin.
     markers = [p["context"] for p in sheet.payloads if p["action"] == "set_context"]
     assert markers[-1] == "WARM · spent | Medium"
-    assert "WARM · 3 of 4 | Medium" in markers
+    assert "WARM · 1 of 2 | Medium" in markers
 
 
 def test_ladder_marker_tracks_the_row_through_column_e(monkeypatch):
@@ -1167,8 +1204,7 @@ def test_ladder_marker_tracks_the_row_through_column_e(monkeypatch):
     # /promote - see test_a_contact_who_replied_walks_the_longer_engaged_ladder.
     assert markers == [
         "NEW · unsent | Medium",
-        "COLD · 1 of 3 | Medium",
-        "COLD · 2 of 3 | Medium",
+        "COLD · 1 of 2 | Medium",
     ]
     # One write per state change, not one per day: the quiet between rungs must not re-stamp the
     # cell, or the marker would never show the rung the row is actually on.
@@ -1188,7 +1224,7 @@ def test_promoted_bench_contact_with_ancient_dates_is_nudged_not_killed(monkeypa
     assert [r["sheet_uuid"] for r in results[0]["revived"]] == ["bench"]
     restart_notes = [p for p in sheet.payloads if m.LADDER_RESTART_NOTE_MARKER in p.get("note", "")]
     assert len(restart_notes) == 1  # recorded once, then the ladder climbs normally
-    assert [e["attempt"] for e in results[4]["followups_ready"]] == [1]
+    assert [e["attempt"] for e in results[m.CARMEN_LADDER_DAYS_COLD[0]]["followups_ready"]] == [1]
     assert sheet.row("bench")["date_added"] == old  # real history is never rewritten
     card = m.render_followup_needs_card(results[0])
     assert "Back on the ladder (1)" in card and "revived — ladder restarted today" in card
@@ -1207,20 +1243,34 @@ def test_same_day_rerun_does_not_record_a_second_restart(monkeypatch):
 def test_responder_reaches_ready_to_promote_and_is_never_moved(monkeypatch):
     start = _SEQ_TODAY
     reply = f"[{start.isoformat()}] {m.INBOUND_REPLY_NOTE_MARKER} (they wrote to Kevin, not a send)."
+    # Scheduled one engaged rung past the reply - where route_inbound_reply_to_crm leaves it -
+    # so the row sits on rung 1 whatever that rung's offset currently is.
+    rung = m.CARMEN_LADDER_DAYS[0]
     sheet = _FakeCarmenSheet(monkeypatch, [_person("talker", (start - timedelta(days=20)).isoformat(),
-                                                   next_followup=(start + timedelta(days=4)).isoformat(),
+                                                   next_followup=(start + timedelta(days=rung)).isoformat(),
                                                    note=reply)])
-    results = _run_days(sheet, start, 45)
+    # Stop before CARMEN_STALE_ANCHOR_DAYS past the reply: beyond that the row is deliberately
+    # revived onto the ladder (see below), which is a different phase from the one under test.
+    last_promote = pipeline_utils.CARMEN_STALE_ANCHOR_DAYS + 12
+    results = _run_days(sheet, start, last_promote)
 
-    # The reply restarted the ladder from its own date: nudges at 4/11/21 after the reply.
+    # The reply restarted the ladder from its own date: the single engaged nudge after the reply.
     nudge_days = sorted(n for n, r in results.items() if r["followups_ready"])
     assert nudge_days == list(m.CARMEN_LADDER_DAYS)
+    # Every morning until acted on, but only while the reply anchor is still fresh: at
+    # CARMEN_STALE_ANCHOR_DAYS past the reply the row is revived onto the ladder instead, which is
+    # the intended escape from nagging Kevin about the same contact forever.
+    first_promote = m.CARMEN_LADDER_DAYS[-1] + 7
+    # Ends the day the stale-anchor revival fires - that day the row rejoins the ladder instead
+    # of waiting on Kevin, which is the intended escape from nagging him forever.
+    revives_on = max(results)
+    assert results[revives_on]["revived"], "sanity: the window ends at the revival, not mid-promote"
     promote_days = [n for n, r in results.items() if r["ready_to_promote"]]
-    assert promote_days == list(range(m.CARMEN_LADDER_DAYS[-1] + 7, 45))  # every morning until acted on
+    assert promote_days == list(range(first_promote, revives_on))
     assert sheet.moves == []
-    entry = results[44]["ready_to_promote"][0]
+    entry = results[first_promote]["ready_to_promote"][0]
     assert entry["replied_on"] == start.isoformat()
-    card = m.render_followup_needs_card(results[44])
+    card = m.render_followup_needs_card(results[first_promote])
     assert "Ready to promote (1)" in card
     assert "<code>/promote talker</code>" in card
 
@@ -2047,6 +2097,225 @@ def _dispatch(text, reply_to_message=None):
     if reply_to_message is not None:
         msg["reply_to_message"] = reply_to_message
     m.process_webhook_payload_async({"message": msg})
+
+
+def _sendable(**over):
+    """A follow-up entry that passes every auto-send gate; override one field per test."""
+    base = {"sheet_uuid": "u-1", "email": "dana@acme.com", "name": "Dana",
+            "title": "Operations Analyst", "company": "Acme", "company_raw": "Acme",
+            "draft_text": "Hi Dana,\n\nCircling back.\n\nBest,\nKevin", "note": "",
+            "next_followup": "2026-09-20"}
+    base.update(over)
+    return base
+
+
+def test_a_clean_followup_is_allowed_to_autosend():
+    assert m.autosend_block_reason(_sendable(), _sendable()["draft_text"]) is None
+
+
+@pytest.mark.parametrize("override,reason", [
+    ({"email": ""}, "no_address"),
+    ({"email": "operations@acme.com [⚠️ Fallback Email]"}, "guessed_address"),
+    ({"email": "operations@acme.com"}, "role_mailbox"),
+    ({"name": ""}, "no_name"),
+    ({"title": "Financial Operations Analyst Intermediate /work from home reputed company reputed company/"},
+     "messy_title"),
+    ({"title": "AlixPartners"}, "messy_title"),
+])
+def test_the_gate_refuses_every_way_an_autosend_can_embarrass_him(override, reason):
+    """Each of these is survivable in a draft Kevin reads, and not survivable once the message
+    leaves on its own. The gate fails CLOSED: the row goes back to being a manual draft."""
+    entry = _sendable(**override)
+    assert m.autosend_block_reason(entry, entry["draft_text"]) == reason
+
+
+def test_the_gate_refuses_a_row_whose_contact_already_replied():
+    """The reply collision. Re-anchoring re-TIMES a bump; it does not cancel it, and a bump to
+    someone mid-conversation is exactly what makes a system look automated."""
+    note = f"[2026-09-22] {m.INBOUND_REPLY_NOTE_MARKER} - asked for a call"
+    entry = _sendable(note=note)
+    assert m.autosend_block_reason(entry, entry["draft_text"]) == "already_replied"
+
+
+def test_the_gate_refuses_a_row_touched_on_linkedin():
+    """/linkedin feeds the same gate: Kevin messaged them there, so the email must not fire."""
+    note = f"[2026-09-22] {m.LINKEDIN_TOUCH_NOTE_MARKER} - connect/DM sent by hand."
+    entry = _sendable(note=note)
+    assert m.autosend_block_reason(entry, entry["draft_text"]) == "already_replied"
+
+
+def test_the_gate_refuses_an_unfilled_placeholder():
+    """An unrendered {company} means interpolation fell through to the raw template."""
+    entry = _sendable(draft_text="Hi Dana,\n\nAbout the role at {company}.\n\nKevin")
+    assert m.autosend_block_reason(entry, entry["draft_text"]) == "unresolved_placeholder"
+    assert m.autosend_block_reason(_sendable(), "") == "empty_draft"
+
+
+def test_multiple_contacts_at_one_company_are_staggered_across_days():
+    """THE MEASURED BUG: three emails to flagstar.com inside 7 minutes. Same three people, same
+    ladder - spaced two days apart, so only the longest-waiting one goes today."""
+    entries = [
+        _sendable(sheet_uuid="a", email="a@flagstar.com", name="Andy", next_followup="2026-09-20"),
+        _sendable(sheet_uuid="b", email="b@flagstar.com", name="Zach", next_followup="2026-09-21"),
+        _sendable(sheet_uuid="c", email="c@flagstar.com", name="Karen", next_followup="2026-09-22"),
+    ]
+    for e in entries:
+        e["company_raw"] = "Flagstar Bank"
+
+    m._apply_autosend_plan(entries, date(2026, 9, 23))
+
+    assert [e["autosend"] for e in entries] == [True, False, False]
+    assert [e["autosend_block"] for e in entries] == [None, "company_spacing", "company_spacing"]
+    # And the held rows are told when they go, rather than silently vanishing.
+    # 24h23m apart, minute-precision: the drift is the point, so it is asserted, not rounded away.
+    assert [e["autosend_on"] for e in entries] == [
+        "2026-09-23 07:30", "2026-09-24 07:53", "2026-09-25 08:16"]
+
+
+def test_different_companies_all_send_the_same_day():
+    """Spacing is per EMPLOYER, not a global throttle - one contact each at three companies is
+    not the pattern that trips a corporate filter."""
+    entries = [_sendable(sheet_uuid=s, email=f"x@{c}.com", company_raw=c)
+               for s, c in (("a", "acme"), ("b", "beta"), ("c", "gamma"))]
+
+    m._apply_autosend_plan(entries, date(2026, 9, 23))
+
+    assert all(e["autosend"] for e in entries)
+
+
+def test_a_legal_suffix_does_not_split_one_company_into_two():
+    """"Acme Corp" and "Acme Corp Inc." are one employer; treating them as two would send both
+    on the same morning, which is the exact thing the spacing exists to stop."""
+    entries = [_sendable(sheet_uuid="a", email="a@acme.com", company_raw="Acme Corp"),
+               _sendable(sheet_uuid="b", email="b@acme.com", company_raw="Acme Corp Inc.")]
+
+    m._apply_autosend_plan(entries, date(2026, 9, 23))
+
+    assert [e["autosend"] for e in entries] == [True, False]
+
+
+def test_a_blocked_row_never_consumes_a_companys_slot():
+    """A colleague whose message can never auto-send must not push an eligible one to next week."""
+    entries = [_sendable(sheet_uuid="bad", email="", company_raw="Acme"),
+               _sendable(sheet_uuid="good", email="dana@acme.com", company_raw="Acme")]
+
+    m._apply_autosend_plan(entries, date(2026, 9, 23))
+
+    assert entries[0]["autosend"] is False and entries[0]["autosend_block"] == "no_address"
+    assert entries[1]["autosend"] is True, "the sendable colleague still goes today"
+
+
+def test_the_run_cap_bounds_unattended_volume():
+    """Unattended volume is what burns a sender. Past the ceiling rows defer, never drop."""
+    entries = [_sendable(sheet_uuid=str(i), email=f"x@c{i}.com", company_raw=f"c{i}")
+               for i in range(m.MAX_AUTOSENDS_PER_RUN + 3)]
+
+    m._apply_autosend_plan(entries, date(2026, 9, 23))
+
+    assert sum(1 for e in entries if e["autosend"]) == m.MAX_AUTOSENDS_PER_RUN
+    assert all(e["autosend_block"] == "run_cap" for e in entries if not e["autosend"])
+
+
+def _linkedin_env(monkeypatch, rows):
+    """Stub the tab scan /linkedin walks, and capture what it sends and enqueues."""
+    sent, enqueued = [], []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    monkeypatch.setattr(m, "log_daily_activity", lambda *a, **k: None)
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    # /linkedin now asks Code.gs to search every tab instead of pulling tabs down and scanning
+    # here, so the stub answers the lookup rather than the tab fetch.
+    class _Res:
+        status_code = 200
+        def __init__(self, payload): self._p = payload
+        def json(self): return self._p
+    def _lookup(params):
+        email = str(params.get("email") or "").lower()
+        for tab, recs in rows.items():
+            for r in recs:
+                cell = re.sub(r'\s*\[.*?\]\s*', '', str(r.get("email") or "")).strip().lower()
+                if cell and cell == email:
+                    return _Res({"status": "success", "found": True,
+                                 "sheet_uuid": r.get("sheet_uuid", ""), "sheet_tab": tab,
+                                 "name": r.get("name", ""), "company": r.get("company", "")})
+        return _Res({"status": "success", "found": False})
+    monkeypatch.setattr(m, "crm_get", _lookup)
+    return sent, enqueued
+
+
+def test_linkedin_logs_an_outbound_touch_against_the_matching_row(monkeypatch):
+    """The reply-collision fix: Kevin messaged them on LinkedIn, so the email ladder must stop
+    treating them as untouched. Found by email address across the scanned tabs."""
+    sent, enqueued = _linkedin_env(monkeypatch, {"Carmen Cold": [
+        {"sheet_uuid": "u-1", "email": "dana@acme.com", "name": "Dana Reed", "company": "Acme"}]})
+
+    _dispatch("/linkedin dana@acme.com")
+
+    assert len(enqueued) == 1
+    assert enqueued[0]["action"] == "append_note" and enqueued[0]["sheet_uuid"] == "u-1"
+    assert m.LINKEDIN_TOUCH_NOTE_MARKER in enqueued[0]["note"]
+    assert "Dana Reed" in sent[0] and "Carmen Cold" in sent[0]
+
+
+def test_linkedin_matches_through_a_bracketed_confidence_tag(monkeypatch):
+    """The stored cell can read "dana@acme.com [⚠️ Fallback Email]" - the address still matches."""
+    sent, enqueued = _linkedin_env(monkeypatch, {"Tetiana Warm": [
+        {"sheet_uuid": "u-2", "email": "dana@acme.com [⚠️ Fallback Email]", "name": "Dana"}]})
+
+    _dispatch("/linkedin DANA@ACME.COM")
+
+    assert len(enqueued) == 1 and enqueued[0]["sheet_uuid"] == "u-2"
+
+
+def test_linkedin_writes_nothing_when_no_row_matches(monkeypatch):
+    """A miss must be loud and harmless: no note may be appended to a row Kevin did not mean."""
+    sent, enqueued = _linkedin_env(monkeypatch, {"Carmen Cold": [
+        {"sheet_uuid": "u-1", "email": "someone@else.com", "name": "Someone"}]})
+
+    _dispatch("/linkedin dana@acme.com")
+
+    assert enqueued == []
+    assert "No CRM row found" in sent[0]
+
+
+def test_linkedin_says_unreachable_rather_than_not_found_on_a_crm_outage(monkeypatch):
+    """A dead CRM read must never read as a successful write, and must not be reported as "no row
+    found" either - that would send Kevin off to re-add a contact who is already there."""
+    sent, enqueued = _linkedin_env(monkeypatch, {})
+    monkeypatch.setattr(m, "crm_get", lambda params: None)
+
+    _dispatch("/linkedin dana@acme.com")
+
+    assert enqueued == []
+    assert "unreachable" in sent[0].lower()
+
+
+def test_linkedin_finds_a_contact_outside_the_sequencer_tabs(monkeypatch):
+    """Code.gs searches EVERY tab. The original hand-rolled scan only walked the four sequencer
+    tabs, so an older networking contact in Carmen Warm was silently unreachable."""
+    sent, enqueued = _linkedin_env(monkeypatch, {"Carmen Warm": [
+        {"sheet_uuid": "u-9", "email": "old@friend.com", "name": "Sam", "company": "Beta"}]})
+
+    _dispatch("/linkedin old@friend.com")
+
+    assert len(enqueued) == 1 and enqueued[0]["sheet_uuid"] == "u-9"
+    assert "Carmen Warm" in sent[0]
+
+
+def test_linkedin_rejects_a_malformed_address_without_scanning(monkeypatch):
+    sent, enqueued = _linkedin_env(monkeypatch, {})
+
+    _dispatch("/linkedin not-an-email")
+
+    assert enqueued == [] and "not a valid email" in sent[0]
+
+
+def test_linkedin_bare_command_explains_itself(monkeypatch):
+    sent, enqueued = _linkedin_env(monkeypatch, {})
+
+    _dispatch("/linkedin")
+
+    assert enqueued == [] and "Usage" in sent[0]
 
 
 def test_apply_swipe_writes_status_applied_and_never_moves_tabs(monkeypatch):
@@ -7025,18 +7294,19 @@ def test_bare_e_leaves_contact_email_blank_when_it_only_has_a_guess(monkeypatch)
 
     assert saved["local"] == [], "a guessed address must never reach the local cache"
     assert saved["crm"] == [], "a guessed address must never reach the sheet"
-    assert m.is_unverified_email(saved["drafted_to"]), "sanity: this run WAS a guess"
 
 
-def test_bare_e_still_drafts_to_the_guess(monkeypatch):
-    """Not persisting it must not mean not drafting - a draft needs a recipient, and Kevin reads
-    it before sending."""
+def test_bare_e_refuses_to_draft_to_an_invented_role_mailbox(monkeypatch):
+    """With no employer website, resolution invents BOTH the mailbox and the domain
+    (operations@<mangled-name>.com). That is not an address, and a draft addressed to one is
+    indistinguishable from a real draft in the Gmail list - which is how operations@mahle.com got
+    sent on 2026-09-23. /e declines and asks for a name instead."""
     saved = _e_env(monkeypatch, employer_website=None)
 
     _dispatch("/e", reply_to_message={"text": "card"})
 
-    assert saved.get("drafted_to"), "the draft must still be addressed"
-    assert "NOT saved" in saved["headers"][0], "the header must say it was not saved"
+    assert not saved.get("drafted_to"), "no draft may be addressed to an invented role mailbox"
+    assert saved["local"] == [] and saved["crm"] == []
 
 
 def test_bare_e_persists_an_address_off_the_real_domain(monkeypatch):
@@ -7160,6 +7430,37 @@ def test_dead_links_are_recorded_and_readable(monkeypatch):
     rows = m.get_dead_job_links()
     assert len(rows) == 1
     assert rows[0][1] == "Huntington" and rows[0][2] == "FX Ops"
+
+
+def test_a_plain_human_reply_counts_toward_reply_rate(monkeypatch):
+    """THE BUG: only interview/rejection/offer were ever recorded, so a mailbox holding a real
+    reply still reported 0.0%. A GENERAL reply now writes its own 'reply' row, and reply rate is
+    replied/applied - not interview/applied wearing the word "reply"."""
+    uuid = "reply-metrics"
+    m.record_application_outcome(uuid, "applied", company="Acme", source="jsearch:test",
+                                 outreach_path="cold")
+    m.record_application_outcome(uuid, "reply", company="Acme")
+
+    metrics = m.get_outcome_metrics()
+    src = metrics["by_source"]["jsearch:test"]
+    assert src["applied"] == 1 and src["replied"] == 1
+    assert src["reply_rate"] == 100.0, "a human answered - that is a reply"
+    assert src["interview_rate"] == 0.0, "but it is NOT an interview"
+
+    # And the cold path is now a measurable bucket of its own, not folded into "ats".
+    assert metrics["by_outreach_path"]["cold"]["replied"] == 1
+
+
+def test_a_rejection_is_still_a_reply(monkeypatch):
+    """Excluding rejections would report a channel that only ever says no as producing 0 replies,
+    which is the opposite of what reply rate is for."""
+    uuid = "rejection-metrics"
+    m.record_application_outcome(uuid, "applied", company="Acme", source="jsearch:rej")
+    m.record_application_outcome(uuid, "rejection", company="Acme")
+
+    src = m.get_outcome_metrics()["by_source"]["jsearch:rej"]
+    assert src["replied"] == 1 and src["reply_rate"] == 100.0
+    assert src["interview"] == 0
 
 
 def test_brief_page_holds_the_depth_the_chat_used_to_dump(monkeypatch):

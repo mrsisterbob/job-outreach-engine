@@ -46,6 +46,119 @@ def _strip_legal_suffixes(company_name):
     return re.sub(r'\s+', ' ', clean).strip()
 
 
+# Trailing noise a job board appends to the actual role. Order matters only in that each is
+# applied repeatedly until the title stops shrinking, so "Analyst - Remote (Hybrid)" peels both.
+#
+# Every pattern here was written against a REAL title from the CRM (see the fixtures): the whole
+# point is that "Financial Operations Analyst Intermediate /work from home reputed company
+# reputed company/" must interpolate into an email as "Financial Operations Analyst", because the
+# raw string instantly exposes the automation. A title that is already clean must come out
+# untouched - "Analyst, Financial Operations" is a real role and its comma is load-bearing, so
+# commas are never stripped wholesale.
+_TITLE_NOISE_PATTERNS = (
+    # Aggregator filler: "/work from home reputed company reputed company/" and friends. Killed
+    # first because it carries its own slashes and would otherwise confuse the segment rules.
+    r'\s*/?\s*\bwork from home\b[^/]*/?\s*$',
+    r'\s*[,/-]?\s*\breputed company\b.*$',
+    # Requisition ids: "(3114)", "- #26343", "REQ 99283", "Job ID 12345".
+    r'\s*[-–—]?\s*#\s*\d{3,}\b.*$',
+    r'\s*\(\s*(?:req(?:uisition)?\.?\s*)?#?\s*\d{3,}\s*\)\s*$',
+    r'\s*[-–—,]?\s*\b(?:req(?:uisition)?|job)\s*(?:id|#|no\.?|number)?\s*[:#]?\s*\d{3,}\b.*$',
+    # Work-style / schedule / location tails, bracketed or dashed.
+    r'\s*[\(\[]\s*(?:remote|hybrid|on[- ]?site|onsite|contract|temp(?:orary)?|full[- ]?time|'
+    r'part[- ]?time|w2|c2c|\d+\s*(?:month|week)s?)[^)\]]*[\)\]]\s*$',
+    r'\s*[-–—]\s*(?:100%\s*)?(?:remote|hybrid|on[- ]?site|onsite|virtual)\b.*$',
+    r'\s*[-–—,]?\s*\bfull[- ]?time\b.*$',
+    r'\s*[-–—,]?\s*\b(?:ft|pt)\b\s*[,-]?\s*(?:days?|nights?|evenings?)?\s*[,-]?\s*$',
+    # Parenthetical eligibility notes: "(Local Candidates Only)", "(Michigan Residents)".
+    r'\s*\(\s*[^)]*\b(?:candidates?|residents?|applicants?|eligible)\b[^)]*\)\s*$',
+    # A bare parenthetical place name: "(Dearborn)", "(Detroit Metro)". Restricted to 1-3
+    # capitalized words that do NOT name a team or function, so "(Investment Team)" and
+    # "(Revenue)" - real qualifiers Kevin would want in the sentence - survive.
+    r'\s*\((?![^)]*\b(?:team|group|division|unit|desk|revenue|finance|operations|ops|'
+    r'sales|product|risk|tax|audit|hybrid|remote)\b)'
+    r'\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\s*\)\s*$',
+    # "... at <Company> <City>, ST" - the board restating the employer inside the title.
+    r'\s+\bat\b\s+[A-Z][\w&.\'-]*(?:\s+[A-Z][\w&.\'-]*){0,4}(?:\s+[A-Z][a-z]+)?,\s*[A-Z]{2}\s*$',
+    # A bare trailing "City, ST" or "United States".
+    r'\s*[-–—,]\s*[A-Z][\w.\'-]*(?:\s+[A-Z][\w.\'-]*){0,3},\s*[A-Z]{2}\s*$',
+    r'\s*[-–—,]?\s*\b(?:united states|usa|u\.s\.a?\.?)\s*$',
+    # Salary bait: "60k 80k", "$75,000 - $90,000".
+    r'\s*[-–—,]?\s*\$?\s*\d{2,3}[k,]\s*[-–—]?\s*\$?\s*\d{2,3}k?\b.*$',
+)
+
+# Junk that means the "title" is not a role at all. A first-touch email built on one of these
+# reads as broken, and an AUTO-SENT one cannot be caught before it leaves - so these make
+# is_clean_job_title() return False rather than being cleaned into something plausible.
+_TITLE_NOT_A_ROLE = re.compile(
+    r'^\s*(?:n/?a|none|null|tbd|unknown|untitled|-+|\.+)\s*$', re.IGNORECASE)
+
+# A real role names a job family. Without one of these the string is almost always a company
+# name that landed in the Role column ("AlixPartners", "Blue Cross Blue Shield of Michigan",
+# "Compu-Vision - Northeast" are all real examples from the CRM).
+_TITLE_ROLE_WORDS = re.compile(
+    r'\b(analyst|associate|specialist|coordinator|manager|administrator|assistant|engineer|'
+    r'accountant|advisor|adviser|consultant|developer|intern|trainee|officer|clerk|'
+    r'representative|director|supervisor|lead|architect|programmer|technician|planner|'
+    r'operations|processor|underwriter|auditor|bookkeeper|controller|strategist|'
+    r'generalist|partner|president|banker|broker|examiner|adjuster|recruiter|'
+    # Common shorthands that are the whole role word in real postings: "Salesforce Tech Admin",
+    # "Salesforce BA", "FP&A Analyst II". Without these a legitimate title is rejected and its
+    # follow-up silently falls back to manual, which is a worse failure than a slightly loose gate.
+    r'admin|analytics|accounting|payroll|treasury|compliance|bookkeeping)\b|'
+    r'\b(?:BA|QA|PM|SDR|BDR|CSM)\b',
+    re.IGNORECASE)
+
+
+def sanitize_job_title(job_title):
+    """A job title fit to drop into an email sentence, or "" when nothing usable survives.
+
+    Peels board noise off the END of the title only - req numbers, work-style tags, location
+    tails, salary bait, aggregator filler - repeatedly, until it stops shrinking. Never touches
+    the middle: "Customs Analyst - Import/Export Operations Analyst" and "Analyst, Financial
+    Operations" are real roles that read correctly as-is, and a rule aggressive enough to "fix"
+    them would mangle far more titles than it repaired.
+
+    Returns "" (not a guess) when the input is junk - see is_clean_job_title(). Callers that must
+    not send a broken sentence check that instead of trusting a cleaned string.
+    """
+    title = re.sub(r'\s+', ' ', str(job_title or '').replace('–', '-').replace('—', '-')).strip()
+    if not title:
+        return ""
+    previous = None
+    while previous != title:
+        previous = title
+        for pattern in _TITLE_NOISE_PATTERNS:
+            title = re.sub(pattern, '', title, flags=re.IGNORECASE).strip()
+        # Tidy punctuation the peels leave behind, then let the loop run again.
+        title = re.sub(r'\s+', ' ', title).strip(' \t-–—,:;|/')
+        # An unbalanced "(" left by a stripped tail, e.g. "Finance Analyst(Systems III".
+        if title.count('(') > title.count(')'):
+            title = title[:title.rfind('(')].strip(' \t-–—,:;|/')
+        # And the mirror case: stray closers with nothing opening them ("Analyst)))"), which a
+        # malformed feed produces and which would otherwise ride into the email verbatim.
+        while title.count(')') > title.count('('):
+            title = title.replace(')', '', 1)
+        title = title.strip(' \t-–—,:;|/')
+    return title
+
+
+def is_clean_job_title(job_title):
+    """True when sanitize_job_title() produced something safe to interpolate into an email.
+
+    The gate for anything that sends WITHOUT Kevin reading it first. Three ways to fail: nothing
+    survived sanitizing, the remainder is a placeholder like "N/A", or it names no job family at
+    all (a company name in the Role column). Length is bounded because a 90-character "title" is
+    a sentence fragment from a description, not a role.
+    """
+    clean = sanitize_job_title(job_title)
+    if not clean or len(clean) < 3 or len(clean) > 70:
+        return False
+    if _TITLE_NOT_A_ROLE.match(clean):
+        return False
+    return bool(_TITLE_ROLE_WORDS.search(clean))
+
+
 def build_hiring_manager_dork(company_name, job_title=""):
     """Google dork to surface a company's Head/Director/VP of Operations or COO on LinkedIn."""
     clean_comp = _strip_legal_suffixes(company_name)
@@ -193,9 +306,22 @@ def status_rank(value):
 #   * STALE_HOT_DAYS is independent (it only gates the read-only stale_nudge on hot
 #     statuses, which never auto-bury).
 # ------------------------------------------------------------------------------
-FOLLOWUP_1_DAYS = 4       # Applied + no reply -> follow-up #1 becomes due at anchor + 4d
-FOLLOWUP_2_DAYS = 9       # Applied + no reply -> follow-up #2 becomes due at anchor + 9d
-FOLLOWUP_BURY_DAYS = 16   # Applied + no reply -> auto-bury as ghosted at anchor + 16d
+# These reqs are actively being filled. The measured silence on Kevin's own open applications is
+# a median of 6 days (4-8 across the queue) while postings close inside 7-10 - so a bump that
+# waits 3+ days is landing against a req that may already be shortlisted. Day 2 is the floor:
+# tighter than that and the bump arrives before a human has plausibly triaged the first email.
+FOLLOWUP_1_DAYS = 2       # Applied + no reply -> follow-up #1 becomes due at anchor + 2d
+# ONE follow-up, not two. A second unanswered bump reads as pestering to the recipient, and a
+# contact who ignored the first has decided. FOLLOWUP_2_DAYS is kept only to satisfy the strictly
+# increasing constraint documented above - it now sits between rung 1 and the bury, and no row
+# reaches it because followup_action() stops issuing send_followup_2.
+FOLLOWUP_2_DAYS = 3       # Retired rung - retained so the 1 < 2 < BURY ordering still holds
+# The BUMP is fast; the BURY is not, and they are different questions. A bury moves the row to
+# Died, so burying at +5 was discarding applications while they were still inside the window
+# Kevin's own queue shows replies arriving in (4-8 days silent, median 6). 14 days is the number
+# he asked for: a full working fortnight, which covers the whole observed response range with
+# room to spare, and still clears the board of genuinely dead rows.
+FOLLOWUP_BURY_DAYS = 14   # Applied + no reply after the single bump -> auto-bury at anchor + 14d
 STALE_HOT_DAYS = 5        # Replied/Screening/Interviewing untouched > 5d -> stale_nudge
 
 # Fifth knob, counted from *today* rather than from followup_anchor(): when a verified inbound
@@ -258,8 +384,9 @@ def followup_action(status, date_added, next_followup, today):
     """Pure: the one thing that should happen to a JOBS row today. Side-effect free.
 
     Returns one of FOLLOWUP_ACTIONS:
-      - "send_followup_1" / "send_followup_2": Applied, no reply, in the +4..+9 / +9..+16 window
-      - "bury_ghosted": Applied, no reply, >= +16 days -> move to Died + note the reason
+      - "send_followup_1": Applied, no reply, in the +3..+5 window (the ONLY bump; see
+        FOLLOWUP_2_DAYS for why "send_followup_2" is never returned any more)
+      - "bury_ghosted": Applied, no reply, >= +5 days -> move to Died + note the reason
       - "stale_nudge": Replied/Screening/Interviewing untouched > STALE_HOT_DAYS (never auto-buried)
       - "none": nothing due
 
@@ -297,8 +424,9 @@ def followup_action(status, date_added, next_followup, today):
     # canonical == "Applied"
     if days >= FOLLOWUP_BURY_DAYS:
         return "bury_ghosted"
-    if days >= FOLLOWUP_2_DAYS:
-        return "send_followup_2"
+    # No send_followup_2 rung: one bump, then the bury. The second touch was cut deliberately -
+    # see FOLLOWUP_2_DAYS. "send_followup_2" stays in FOLLOWUP_ACTIONS so a row mid-flight that
+    # already recorded it replays without a KeyError.
     if days >= FOLLOWUP_1_DAYS:
         return "send_followup_1"
     return "none"
@@ -1040,10 +1168,9 @@ def resolve_sent_email_backfill(to_header, job_rows):
 # ==============================================================================
 # CARMEN COLD 4/11/21 FOLLOW-UP LADDER (pure, no I/O)
 #
-# A networking contact gets three nudges at fixed offsets from the day they landed in
-# Carmen Cold, then stops. Distinct from followup_action()'s JOBS windows (+4/+9/+16 with
-# an auto-bury) because these are people: the ladder ends quietly rather than burying, and
-# the cadence is tighter since a cold intro goes stale faster than a job application.
+# A networking contact gets ONE nudge at a fixed offset from the day they landed in
+# Carmen Cold, then stops. Distinct from followup_action()'s JOBS windows (+3 then bury at +5)
+# because these are people: the ladder ends quietly rather than burying.
 #
 # Ladder position is read from the row itself, never from local state: the sequencer
 # advances Next Followup Date along CARMEN_LADDER_DAYS, so the gap between the anchor and
@@ -1054,20 +1181,24 @@ def resolve_sent_email_backfill(to_header, job_rows):
 
 # Two ladders, picked per row by whether the contact has EVER replied (carmen_reply_anchor).
 #
-# COLD - a stranger who has never written back. Day 0 is the original email, so (4, 11) is three
-# total contacts, ending at day 18 with the grace week. The fourth contact the old single ladder
-# sent (day 21, to someone who had ignored three emails) is the one rung with no case for it: a
-# cold contact silent for eleven days has decided, and the third unanswered touch is where spam
-# complaints concentrate - which this sender cannot afford on a SPF SOFTFAIL domain.
+# COLD - a stranger who has never written back. Day 0 is the original email, so (2,) is two total
+# contacts, ending at day 9 with the grace week. Tightened from 3 to 2 for the same reason as
+# FOLLOWUP_1_DAYS: these reqs fill inside 7-10 days, so a nudge that waits longer is arriving
+# after the decision. Everything past that first bump was cut - repeat unanswered touches are
+# where spam complaints concentrate.
 #
 # ENGAGED - has replied at least once, so this is a live conversation, not a push against silence.
-# Keeps the original 4/11/21. An ask that needs a call before much moves needs the long runway.
+# Gets one day more runway before the single bump, and nothing after it.
 #
 # A cold row is PROMOTED automatically the moment a reply lands: carmen_reply_anchor() starts
 # returning a date, the row switches to the engaged ladder, and the anchor resets to the reply
 # date. Nothing to set by hand.
-CARMEN_LADDER_DAYS_COLD = (4, 11)
-CARMEN_LADDER_DAYS_ENGAGED = (4, 11, 21)
+# Both ladders now carry ONE rung against silence. A cold contact who ignored the first nudge has
+# decided, and a second unanswered touch reads as pestering - the cost is reputational, not just a
+# wasted send. ENGAGED keeps a longer gap because a live thread earns more runway, but it still
+# only bumps once before triage.
+CARMEN_LADDER_DAYS_COLD = (2,)
+CARMEN_LADDER_DAYS_ENGAGED = (3,)
 
 # Back-compat alias. Callers that predate the split (and the migration guard below) still read
 # the engaged ladder, which is the old single ladder unchanged.
@@ -1113,6 +1244,12 @@ CARMEN_STALE_ANCHOR_DAYS = 30
 # never drift apart. Both are written as "[YYYY-MM-DD] <marker> ..." by main.py.
 INBOUND_REPLY_NOTE_MARKER = "Inbound reply received"   # route_inbound_reply_to_crm, GENERAL replies
 LADDER_RESTART_NOTE_MARKER = "Ladder restarted"        # the sequencer, when it revives a stale row
+# /linkedin: Kevin touched this contact on LinkedIn (connect or DM). Deliberately NOT the inbound
+# marker - that one means THEY wrote back, and reusing it here would promote the row to the engaged
+# ladder and count a reply that never happened, corrupting the reply rate. This is an OUTBOUND
+# touch: it re-anchors the ladder (the contact was just contacted, so an email bump two days later
+# would read as pestering) without claiming a response.
+LINKEDIN_TOUCH_NOTE_MARKER = "LinkedIn touch"
 
 # Ceiling on automatic moves to Killed per sequencer pass - same reasoning and the same deferral
 # semantics as MAX_AUTO_BURIES_PER_RUN: overflow is reported, not written, and not logged, so it
@@ -1206,6 +1343,17 @@ def carmen_restart_anchor(note):
     return _latest_marker_date(note, LADDER_RESTART_NOTE_MARKER)
 
 
+def carmen_linkedin_anchor(note):
+    """The date of the most recent OUTBOUND LinkedIn touch recorded in a notes cell, or None.
+
+    Separate from carmen_reply_anchor() on purpose: this says Kevin reached out on another
+    channel, not that the contact answered. It re-anchors the ladder so the next email bump is
+    spaced from the real last contact, but it must never promote the row to the engaged ladder -
+    that track is for people who actually wrote back.
+    """
+    return _latest_marker_date(note, LINKEDIN_TOUCH_NOTE_MARKER)
+
+
 class CarmenPlan(tuple):
     """(action, next_date, revived, anchor). Unpacks as a 4-tuple; use .action / .next_date /
     .revived / .anchor for readability. `revived` means the ladder was restarted from today on
@@ -1231,8 +1379,10 @@ class CarmenPlan(tuple):
 def plan_carmen_ladder(date_added, next_followup, today, note=""):
     """String-in planner for a raw Carmen Cold row. Returns a CarmenPlan.
 
-    Anchor = the latest of Date Added, the last inbound reply and the last ladder restart, all
-    read from the row. A reply therefore restarts 4/11/21 from the day they wrote back.
+    Anchor = the latest of Date Added, the last inbound reply, the last ladder restart and the
+    last outbound LinkedIn touch, all read from the row. A reply therefore restarts the ladder
+    from the day they wrote back; a LinkedIn touch restarts it from the day Kevin messaged them,
+    without moving the row onto the engaged track (that needs a real reply).
 
     Revival: a row with no usable anchor, or whose anchor is over CARMEN_STALE_ANCHOR_DAYS old
     and whose follow-up date is not one the ladder wrote, restarts from today as unscheduled.
@@ -1244,9 +1394,12 @@ def plan_carmen_ladder(date_added, next_followup, today, note=""):
     date is respected: the row waits for it rather than being restarted early.
     """
     replied_on = carmen_reply_anchor(note)
+    # carmen_ladder_for() reads REPLIES only. A LinkedIn touch moves the anchor below but must not
+    # change track: Kevin messaging them is not them answering.
     ladder = carmen_ladder_for(replied_on)
     candidates = [d for d in (_parse_sequencer_date(date_added), replied_on,
-                              carmen_restart_anchor(note)) if d is not None]
+                              carmen_restart_anchor(note),
+                              carmen_linkedin_anchor(note)) if d is not None]
     anchor = max(candidates) if candidates else None
     scheduled = None if is_followup_unscheduled(next_followup) else _parse_sequencer_date(next_followup)
 

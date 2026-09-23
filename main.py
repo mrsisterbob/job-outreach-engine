@@ -16,7 +16,7 @@ import time
 import urllib.parse
 import uuid
 from xml.etree import ElementTree
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 from email.message import EmailMessage
 import requests
 from flask import Flask, jsonify, request, Response, redirect
@@ -34,12 +34,14 @@ from pipeline_utils import (
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     is_guessed_contact_email, resolve_sent_email_backfill,
+    sanitize_job_title, is_clean_job_title,
     is_role_mailbox, is_automated_sender, company_domain_of, name_from_email_local_part, parse_email_recipient,
     match_email_to_crm_company,
-    plan_carmen_ladder, carmen_reply_anchor, CARMEN_LADDER_DAYS,
+    plan_carmen_ladder, carmen_reply_anchor, carmen_linkedin_anchor, CARMEN_LADDER_DAYS,
     CARMEN_LADDER_DAYS_COLD, CARMEN_LADDER_DAYS_ENGAGED,
     carmen_status_marker, carmen_marker_cell,
-    INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, MAX_AUTO_KILLS_PER_RUN,
+    INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, LINKEDIN_TOUCH_NOTE_MARKER,
+    MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
     classify_job_link, may_auto_retire, is_opaque_job_host,
     parse_job_command, parse_job_page_html, build_ingest_job_dict, extract_jd_terms,
@@ -238,9 +240,11 @@ _FALLBACK_OUTREACH_TEMPLATES = {
 # render "the this role role at your team". Same register as the bank, anchored on the person and
 # company instead of a role. build_followup_bump_draft()/generate_bump_email() route here on a
 # blank title. Held to lint_outreach_template() by test_pipeline_utils.py like every other bank.
+# Both entries are identical on purpose. The ladder now sends ONE bump, and these must be
+# sendable with no editing - so whichever rung a mid-flight row replays produces the same text.
 _ROLELESS_FOLLOWUP_BUMPS = [
-    "Hi{name},\n\nCircling back on my earlier note to {company} in case it got buried.\n\nStill keen to connect. Happy to answer anything useful.\n\nBest,\nKevin",
-    "Hi{name},\n\nI reached out earlier about {company} and wanted to try once more.\n\nMy guess is this isn't the right time, which is completely fine. If that changes, I am around.\n\nBest,\nKevin",
+    "Hi{name},\n\nCircling back on my earlier note to {company} in case it got buried.\n\nStill keen to connect, and happy to answer anything useful.\n\nBest,\nKevin",
+    "Hi{name},\n\nCircling back on my earlier note to {company} in case it got buried.\n\nStill keen to connect, and happy to answer anything useful.\n\nBest,\nKevin",
 ]
 _FALLBACK_LINKEDIN_TEMPLATES = {
     "linkedin_templates": ["Hi{name}. Saw you're hiring a {job_title} at {company}. I'd like to connect."]
@@ -329,11 +333,20 @@ def interpolate_template(template, name="", company="", job_title="", their_desk
     if clean_name.lower() == "there":
         clean_name = ""
     normalized = str(template or "").replace(" {name}", "{name}")
+    # {job_title} goes through sanitize_job_title() HERE because this is the one choke point every
+    # candidate-facing email passes through - cold, warm, bump and LinkedIn alike. A board title
+    # like "Financial Operations Analyst Intermediate /work from home reputed company reputed
+    # company/" reads as machine-generated the instant it lands in a sentence, and that string is
+    # real (see the CRM). Sanitizing at the source beats sanitizing at six call sites.
+    #
+    # A title that sanitizes to nothing falls back to "this role", which is what an empty title
+    # already did - a vague sentence, never a broken one.
+    clean_title = sanitize_job_title(job_title)
     try:
         return normalized.format(
             name=f" {clean_name}" if clean_name else "",
             company=company or "your team",
-            job_title=job_title or "this role",
+            job_title=clean_title or "this role",
             their_desk=str(their_desk or "").strip().rstrip(",") or "Given how much of this sits under you",
         )
     except Exception as e:
@@ -1558,8 +1571,12 @@ def get_metric_count(event_type):
 def record_application_outcome(sheet_uuid, status, company=None, role=None, source=None, outreach_path=None, posted_hours=None):
     """Append an application_outcomes row (event-sourced, one row per transition) so /outcomes and
     the Tuesday hub can compute evidence-based reply/interview rates and time-to-response, instead
-    of relying on gut-feel. status is one of: applied, interview, rejection, offer, withdrawn,
-    dead_link.
+    of relying on gut-feel. status is one of: applied, reply, interview, rejection, offer,
+    withdrawn, dead_link.
+
+    'reply' is a plain human answer that is not yet a stage change (the inbound router's GENERAL).
+    It is deliberately separate from 'interview'/'rejection'/'offer': those are outcomes, this is
+    contact. Reply rate needs it; the funnel must not count it as a move.
 
     posted_hours is the posting's age when it was carded (see get_posted_hours_at_card), stored on
     the row rather than recomputed at read time: the listing keeps aging after the swipe, and
@@ -1734,18 +1751,34 @@ def get_outcome_metrics():
         rows = []
 
     applied_at_by_uuid = {}
+    # A follow-on row (reply/interview/rejection/offer) is written by the inbound poller, which
+    # knows the sheet_uuid but not which SOURCE the job came from - so those rows carry source
+    # NULL. Bucketing them as "unknown" put every reply in a column that no 'applied' row shared,
+    # making every real source read 0 replies forever. The 'applied' row is the one that knows, so
+    # its source/path is inherited by everything that follows for the same sheet_uuid. Rows are
+    # ordered by (sheet_uuid, created_at), so the 'applied' row is seen first.
+    origin_by_uuid = {}
     for sheet_uuid, source, outreach_path, status, created_at in rows:
-        source = source or "unknown"
-        outreach_path = outreach_path or "unknown"
-        by_source.setdefault(source, {"applied": 0, "interview": 0})
-        by_path.setdefault(outreach_path, {"applied": 0, "interview": 0})
+        if status == "applied":
+            origin_by_uuid[sheet_uuid] = (source or "unknown", outreach_path or "unknown")
+        inherited_source, inherited_path = origin_by_uuid.get(sheet_uuid, (None, None))
+        source = source or inherited_source or "unknown"
+        outreach_path = outreach_path or inherited_path or "unknown"
+        by_source.setdefault(source, {"applied": 0, "interview": 0, "replied": 0})
+        by_path.setdefault(outreach_path, {"applied": 0, "interview": 0, "replied": 0})
         if status == "applied":
             by_source[source]["applied"] += 1
             by_path[outreach_path]["applied"] += 1
             applied_at_by_uuid[sheet_uuid] = created_at
+        elif status == "reply":
+            # A human answered without (yet) changing stage. Counts toward reply rate only.
+            by_source[source]["replied"] += 1
+            by_path[outreach_path]["replied"] += 1
         elif status == "interview":
             by_source[source]["interview"] += 1
             by_path[outreach_path]["interview"] += 1
+            by_source[source]["replied"] += 1
+            by_path[outreach_path]["replied"] += 1
             applied_at = applied_at_by_uuid.get(sheet_uuid)
             if applied_at:
                 try:
@@ -1754,6 +1787,10 @@ def get_outcome_metrics():
                 except Exception:
                     pass
         elif status in ("rejection", "offer"):
+            # A rejection is still a human answering. Counting it keeps "reply rate" honest -
+            # excluding it would report a channel that only ever says no as producing 0 replies.
+            by_source[source]["replied"] += 1
+            by_path[outreach_path]["replied"] += 1
             applied_at = applied_at_by_uuid.get(sheet_uuid)
             if applied_at:
                 try:
@@ -1764,7 +1801,10 @@ def get_outcome_metrics():
 
     for bucket in (by_source, by_path):
         for stats in bucket.values():
-            stats["reply_rate"] = (stats["interview"] / stats["applied"] * 100) if stats["applied"] else 0.0
+            # Two DIFFERENT rates. reply_rate was previously interview/applied under a name that
+            # said "reply", so a channel producing real replies but no interviews read as 0.0%.
+            stats["reply_rate"] = (stats["replied"] / stats["applied"] * 100) if stats["applied"] else 0.0
+            stats["interview_rate"] = (stats["interview"] / stats["applied"] * 100) if stats["applied"] else 0.0
 
     median_days = None
     if response_days:
@@ -1780,17 +1820,21 @@ def format_outcome_metrics_message():
     lines = ["📈 <b>Evidence-Based Outcomes</b>\n"]
 
     if metrics["by_source"]:
-        lines.append("<b>By Source (applied → interview, reply rate):</b>")
+        lines.append("<b>By Source (sent → replied → interview):</b>")
         for source, stats in sorted(metrics["by_source"].items()):
-            lines.append(f"• {html.escape(source)}: {stats['applied']} → {stats['interview']} ({stats['reply_rate']:.1f}%)")
+            lines.append(
+                f"• {html.escape(source)}: {stats['applied']} → {stats['replied']} → {stats['interview']} "
+                f"<i>({stats['reply_rate']:.1f}% reply, {stats['interview_rate']:.1f}% interview)</i>")
     else:
         lines.append("<b>By Source:</b> No applications recorded yet.")
 
     lines.append("")
     if metrics["by_outreach_path"]:
-        lines.append("<b>By Outreach Path (applied → interview, rate):</b>")
+        lines.append("<b>By Outreach Path (sent → replied → interview):</b>")
         for path, stats in sorted(metrics["by_outreach_path"].items()):
-            lines.append(f"• {html.escape(path)}: {stats['applied']} → {stats['interview']} ({stats['reply_rate']:.1f}%)")
+            lines.append(
+                f"• {html.escape(path)}: {stats['applied']} → {stats['replied']} → {stats['interview']} "
+                f"<i>({stats['reply_rate']:.1f}% reply, {stats['interview_rate']:.1f}% interview)</i>")
     else:
         lines.append("<b>By Outreach Path:</b> No applications recorded yet.")
 
@@ -1926,11 +1970,11 @@ def format_market_supply_message(supply):
 # and /apply, /offer write application_outcomes rows keyed by the same sheet_uuid, so a
 # template id maps to its outcomes directly.
 #
-# Known gap: a GENERAL inbound reply (real human, not an interview/rejection) is routed to
-# the CRM by route_inbound_reply_to_crm() but is NOT written to application_outcomes, so it
-# is invisible here. "replied" below therefore means "got an interview / rejection / offer
-# signal", the reply statuses that are actually persisted with a sheet_uuid.
-TEMPLATE_REPLY_STATUSES = ("interview", "rejection", "offer")
+# A GENERAL inbound reply (a real human who is not yet an interview/rejection) now writes a
+# 'reply' row, so "replied" here means what the words say: a human answered. Before that it
+# silently meant "got an interview/rejection/offer signal", which is why a mailbox holding a
+# genuine reply still reported a 0.0% rate.
+TEMPLATE_REPLY_STATUSES = ("reply", "interview", "rejection", "offer")
 
 def get_template_reply_rates():
     """READ-ONLY. Reply rate grouped by outreach_template_id and by linkedin_template_id,
@@ -6089,6 +6133,15 @@ def check_inbound_gmail_replies():
                 record_application_outcome(crm_match.get("sheet_uuid"), "interview", company=crm_match.get("company"))
             elif status_label == "REJECTION":
                 record_application_outcome(crm_match.get("sheet_uuid"), "rejection", company=crm_match.get("company"))
+            else:
+                # GENERAL: a real human wrote back. Previously recorded NOTHING, which is why
+                # every reply-rate readout showed 0.0% while Kevin had an actual reply sitting in
+                # his inbox - the only replies that counted were ones that also happened to be an
+                # interview, rejection or offer. A plain "thanks, not right now" IS the signal
+                # cold outreach is judged on, so it gets its own status rather than being folded
+                # into one of the stage transitions, which would fake a funnel move that never
+                # happened.
+                record_application_outcome(crm_match.get("sheet_uuid"), "reply", company=crm_match.get("company"))
 
             # Follow-up bump for every verified reply; Carmen Cold move + dated note for a live
             # human conversation (GENERAL). Never changes the alert text below - this is what makes
@@ -8032,6 +8085,179 @@ def _sequencer_draft_subject(record):
         return f"Re: {record.get('title')} @ {company}"
     return f"Re: {company}"
 
+# Follow-ups may SEND without Kevin reading them; a first touch never may. These are the
+# conditions under which an auto-send is refused and the row falls back to a staged draft.
+AUTOSEND_BLOCK_REASONS = {
+    "no_address": "no verified address on file",
+    "guessed_address": "the address is a pipeline guess, not a confirmed contact",
+    "role_mailbox": "the address is a shared inbox, not a person",
+    "no_name": "no contact first name - the greeting would read 'Hi,'",
+    "messy_title": "the job title is board noise and would expose the automation",
+    "already_replied": "they already replied - a bump now reads as a bot",
+    "empty_draft": "the draft body is empty",
+    "unresolved_placeholder": "the draft still contains an unfilled {placeholder}",
+    # Not faults - deferrals. The row is safe to send, just not today.
+    "company_spacing": "another contact at this company is being emailed first",
+    "run_cap": "this run's auto-send ceiling was reached",
+}
+
+
+def autosend_block_reason(record, draft_text):
+    """Why this follow-up must NOT be sent unattended, or None when it is safe to send.
+
+    Everything here is a failure that only matters once a human stops reading each message. A
+    staged draft with a messy title is a 5-second fix in Gmail; the same string sent automatically
+    is a stranger reading "the Financial Operations Analyst Intermediate /work from home reputed
+    company reputed company/ role". So the gate is deliberately strict and fails CLOSED: anything
+    it cannot vouch for goes back to being a draft Kevin sends by hand.
+
+    Ordered cheapest-first, and the reason is returned rather than a bare False so the queue can
+    tell Kevin exactly which rows opted out and why.
+    """
+    body = str(draft_text or "").strip()
+    if not body:
+        return "empty_draft"
+    # An unfilled {placeholder} means interpolation fell through to the raw template.
+    if re.search(r'\{[a-z_]+\}', body):
+        return "unresolved_placeholder"
+
+    email = str(record.get("email") or "").strip()
+    if not email or "[" in email:
+        # "[" is the bracketed confidence tag; _sequencer_draft_recipient() uses the same test.
+        return "no_address" if not email else "guessed_address"
+    # Role mailboxes are checked FIRST: is_guessed_contact_email() already counts one as a guess,
+    # so testing it first would make "role_mailbox" unreachable and report every shared inbox as
+    # a generic guess. The distinction matters in the queue - "operations@" needs a name, while a
+    # guess needs verification.
+    if is_role_mailbox(email):
+        return "role_mailbox"
+    if is_guessed_contact_email(email):
+        return "guessed_address"
+
+    # A bump opening "Hi," to a stranger is worse than no bump. PEOPLE rows carry a name; a JOBS
+    # row usually does not, which is one reason applications are watched rather than messaged.
+    if not str(record.get("name") or "").strip():
+        return "no_name"
+
+    # Roleless PEOPLE rows are fine - their template never mentions a title. Only a row that WILL
+    # interpolate one has to prove the title is clean.
+    #
+    # Judged on the RAW value, not the sanitized one. interpolate_template() cleans the title on
+    # the way into the body, so a sanitized check would pass anything that merely survives
+    # cleaning - including "... /work from home reputed company reputed company/", which cleans to
+    # a valid role. The question here is not "can this be cleaned" but "do we trust this row
+    # enough to send it unread", and a title that needed heavy cleaning is exactly the row a human
+    # should glance at. Sanitizing still improves the draft; it just does not unlock auto-send.
+    title = str(record.get("title") or "").strip()
+    if title and (not is_clean_job_title(title) or sanitize_job_title(title) != title):
+        return "messy_title"
+
+    # The collision the Gmail poller and /linkedin both feed. plan_carmen_ladder already re-anchors
+    # on these markers, but re-anchoring only re-times the bump - it does not cancel it, and a bump
+    # to someone mid-conversation is exactly what makes a system look automated.
+    note = str(record.get("note") or record.get("notes") or "")
+    if carmen_reply_anchor(note) or carmen_linkedin_anchor(note):
+        return "already_replied"
+    return None
+
+
+# Gap between two auto-sent follow-ups to the SAME company. The measured failure was three emails
+# to flagstar.com inside 7 minutes: a same-day burst to one employer reads as a phishing pattern
+# to a corporate filter, and the second recipient forwarding to the third sees near identical copy.
+#
+# 24h23m rather than a flat 2 days: these reqs are actively being filled, and a contact spaced a
+# full extra day can be reading about a closed role. The odd 23 minutes is the point, not a
+# rounding artifact - a gap of exactly 24:00 puts every message at the same clock time each day,
+# which is itself a machine signature. Drifting the slot forward ~23 minutes per step breaks that
+# without meaningfully changing the spacing.
+#
+# Expressed as a timedelta because it is now sub-daily: see _apply_autosend_plan for why the
+# sequencer's own once-a-day cadence still bounds when a deferred row actually goes.
+AUTOSEND_COMPANY_SPACING = timedelta(hours=24, minutes=23)
+
+# Ceiling on how many auto-sends one run may dispatch. Unattended volume is the thing that turns
+# a slow channel into a burned domain, and 22 sends in a day by hand is already Kevin's ceiling.
+MAX_AUTOSENDS_PER_RUN = 8
+
+
+def _autosend_company_key(entry):
+    """Group rows by employer. Legal-suffix-insensitive, so "Acme Corp" and "Acme Corp Inc."
+    are one company for spacing purposes rather than two."""
+    raw = str(entry.get("company_raw") or entry.get("company") or "").strip()
+    return normalize_company_for_match(raw) or raw.lower()
+
+
+def _apply_autosend_plan(entries, today):
+    """Annotate each ready follow-up with whether it may auto-send today, and if not, why.
+
+    Adds three keys per entry, and writes nothing to the CRM or to Gmail:
+      autosend       - True when this row may be dispatched unattended on this run
+      autosend_block - the AUTOSEND_BLOCK_REASONS key when it may not, else None
+      autosend_on    - the date it becomes eligible, when it was only deferred for spacing
+
+    Two independent filters, in order. The GATE (autosend_block_reason) asks "is this message
+    safe to send without a human reading it". The STAGGER then asks "and is today the right day",
+    spacing multiple contacts at one employer AUTOSEND_COMPANY_SPACING_DAYS apart.
+
+    Spacing is derived from position within the company's group, not from send history: the
+    sequencer is the only thing dispatching these, it runs once a day, and a deferred row simply
+    re-enters tomorrow's queue one slot nearer the front. That keeps the rule stateless - nothing
+    to persist, nothing to drift - at the cost of a row's eligible date being recomputed each run.
+
+    A gated row still appears in the queue with its draft. Refusing to auto-send is never refusing
+    to follow up; it hands the row back to Kevin, which is where every one of these started.
+    """
+    # The plan is computed in real time, not whole days, because the spacing is 24h23m. `now` is
+    # the moment this run dispatches: the first contact at a company goes at `now`, the next one
+    # becomes eligible one interval later.
+    #
+    # The sequencer runs once a day, so a row eligible at 07:53 tomorrow is picked up by tomorrow
+    # morning's 07:30 pass only if it has already come due - otherwise it waits for the pass after.
+    # That is intended: the interval is a FLOOR on the gap, never a promise to send at that minute.
+    # Stretching a 24h23m floor to ~48h for some rows is the cost of not running a second daily
+    # pass, and it still beats the flat 2-day rule it replaces.
+    if isinstance(today, datetime):
+        now = today
+    elif today is None:
+        now = datetime.now()
+    else:
+        # A plain date means "this run, that day" - anchor to the sequencer's 07:30 slot so the
+        # eligible times below read as real send times rather than midnight.
+        now = datetime.combine(today, dt_time(hour=7, minute=30))
+
+    by_company = {}
+    for entry in entries or []:
+        block = autosend_block_reason(entry, entry.get("draft_text"))
+        entry["autosend_block"] = block
+        entry["autosend"] = False
+        entry["autosend_on"] = None
+        if block:
+            continue
+        # Only ungated rows compete for a company's slots; a blocked row must not push an eligible
+        # colleague into next week over a message that is never going to be auto-sent anyway.
+        by_company.setdefault(_autosend_company_key(entry), []).append(entry)
+
+    dispatched = 0
+    for group in by_company.values():
+        # Deterministic order so a rerun on the same day makes the same choice: the longest-
+        # waiting contact goes first, ties broken by sheet_uuid rather than dict order.
+        group.sort(key=lambda e: (str(e.get("next_followup") or ""), str(e.get("sheet_uuid") or "")))
+        for position, entry in enumerate(group):
+            eligible = now + (AUTOSEND_COMPANY_SPACING * position)
+            # Minute precision: the 23 minutes are the whole point of the interval, so a
+            # date-only readout would hide the drift that makes the pattern look human.
+            entry["autosend_on"] = eligible.strftime("%Y-%m-%d %H:%M")
+            if position == 0 and dispatched < MAX_AUTOSENDS_PER_RUN:
+                entry["autosend"] = True
+                dispatched += 1
+            elif position > 0:
+                entry["autosend_block"] = "company_spacing"
+            else:
+                # Position 0 but over the per-run ceiling: eligible, just not today.
+                entry["autosend_block"] = "run_cap"
+    return entries
+
+
 def _stage_sequencer_draft(record, draft_text):
     """Stage one follow-up as a Gmail draft - never sends. Returns (draft_id, created, message).
 
@@ -8233,6 +8459,13 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "company_raw": rec.get("company") or "",
                 "next_followup": rec.get("next_followup") or "",
                 "new_next_followup": ladder_next.strftime("%Y-%m-%d") if ladder_next else None,
+                # Fields the auto-send gate reads. "role" above is the DISPLAY title and "note" was
+                # not carried at all, so without these autosend_block_reason() saw an empty note on
+                # every row - the reply/LinkedIn check could never fire, and a contact mid
+                # conversation would have been auto-bumped. The gate must see the same raw values
+                # plan_carmen_ladder() just read.
+                "title": rec.get("title") or "",
+                "note": note_text,
             }
             result["followups_ready"].append(entry)
             if dry_run or not sheet_uuid or _sequencer_already_actioned(sheet_uuid, run_date):
@@ -8285,7 +8518,9 @@ def run_followup_sequencer(today=None, dry_run=False):
         if action in ("send_followup_1", "send_followup_2"):
             attempt = 1 if action == "send_followup_1" else 2
             base = anchor or today
-            push_days = FOLLOWUP_2_DAYS if attempt == 1 else FOLLOWUP_BURY_DAYS
+            # Bump #1 is the only bump, so its snooze goes straight to the bury boundary. Pushing
+            # to FOLLOWUP_2_DAYS would park the row on a retired rung that never fires.
+            push_days = FOLLOWUP_BURY_DAYS
             new_nf = (base + timedelta(days=push_days)).strftime("%Y-%m-%d")
             if rec.get("sheet_tab") not in SEQUENCER_PEOPLE_SCHEMA_TABS:
                 # A job application is watched, not messaged: its Contact Email is often Kevin's own
@@ -8312,6 +8547,8 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "name": rec.get("name") or "",
                 "next_followup": rec.get("next_followup") or "", "new_next_followup": new_nf,
                 "email": rec.get("email") or "", "company_raw": rec.get("company") or "",
+                # Gate inputs - see the matching comment on the Carmen entry above.
+                "title": rec.get("title") or "", "note": rec.get("note") or "",
             }
             result["followups_ready"].append(entry)
             if dry_run or already or not sheet_uuid:
@@ -8364,6 +8601,11 @@ def run_followup_sequencer(today=None, dry_run=False):
         })
 
     result["live_conversations"] = scan_carmen_hot_conversations(today)
+
+    # Per-company stagger + auto-send gate. Runs LAST, over the assembled list, because spacing is
+    # a property of the batch rather than of any one row: only here is it known that three people
+    # at one company all came due together.
+    _apply_autosend_plan(result["followups_ready"], today)
 
     result["counts"] = {k: len(result[k]) for k in ("followups_ready", "ready_to_promote", "revived",
                                                      "applications_quiet", "going_cold", "buried",
@@ -10396,7 +10638,11 @@ def run_warm_radar_scan(chat_id=None):
         clavicular_rows.append({
             "sheet_uuid": sheet_uuid,
             "row_data": [
-                today_str, company, title, target_email, "",
+                # Same rule as the standard rows below: a GUESS never reaches the sheet. The card
+                # keeps target_email so it has something to draft to; the cell stays blank until
+                # /e types a real address or the sent-mail back-fill promotes one.
+                today_str, company, title,
+                "" if is_guessed_contact_email(target_email) else target_email, "",
                 "Matched", followup_date, job.get("job_apply_link", ""),
                 f"Warm Radar Match (no AI score): {contact_name}"
             ]
@@ -11268,6 +11514,74 @@ def process_webhook_payload_async(data):
             enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup))
             return
 
+        if text == "/linkedin" or text == "/li" or text.startswith(("/linkedin ", "/li ")):
+            # Record an OUTBOUND LinkedIn touch against a contact, found by email address.
+            #
+            # This closes the one reply-collision the Gmail poller structurally cannot see: a
+            # contact who ignores the email but accepts the connection and answers on LinkedIn.
+            # There is no server-readable record of a LinkedIn DM without scraping, so Kevin is
+            # the sensor - one command, and the ladder stops treating them as untouched.
+            #
+            # It records a TOUCH, not a reply. The row re-anchors (so the next bump is spaced from
+            # the real last contact) but stays on the cold track, because Kevin messaging them is
+            # not them answering. Promoting here would inflate the reply rate with a response that
+            # never happened.
+            parts = text.split(None, 1)
+            raw_email = parts[1].strip() if len(parts) > 1 else ""
+            if not raw_email:
+                send_telegram_message(
+                    chat_id,
+                    "❌ Usage: <code>/linkedin name@company.com</code>\n"
+                    "<i>Logs a LinkedIn connect/DM so the email ladder stops nudging them.</i>")
+                return
+            if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", raw_email):
+                send_telegram_message(chat_id, f"❌ <code>{html.escape(raw_email)}</code> is not a valid email address.")
+                return
+
+            # Server-side lookup rather than pulling four tabs down and scanning them here. Code.gs
+            # searches EVERY tab, so a contact sitting in Carmen Warm, Carmen Hot or Killed is
+            # found too - a hand-rolled scan over SEQUENCER_SCAN_TABS silently missed those, which
+            # is exactly where an older networking contact lives.
+            res = crm_get({"action": "find_contact_by_email", "email": raw_email.lower()})
+            if res is None:
+                send_telegram_message(
+                    chat_id,
+                    "⚠️ <b>CRM unreachable</b> - nothing written. Try again in a moment.")
+                return
+            try:
+                payload = res.json() if res.status_code == 200 else {}
+            except Exception as e:
+                logging.error(f"[LINKEDIN] lookup parse error for {raw_email}: {e}")
+                payload = {}
+            # A rejected read answers 200 with an error body, which parses to found=False - the
+            # same shape as a genuine miss. Say "not found", never "added", so a CRM outage can
+            # never read as a successful write.
+            if not payload.get("found"):
+                send_telegram_message(
+                    chat_id,
+                    f"🔍 No CRM row found for <code>{html.escape(raw_email)}</code>.\n"
+                    "<i>Nothing was written. Add them first, or check the address.</i>")
+                return
+
+            sheet_uuid = str(payload.get("sheet_uuid") or "").strip()
+            if not sheet_uuid:
+                send_telegram_message(chat_id, "⚠️ That row has no sheet id - nothing safe to write to.")
+                return
+
+            match_tab = str(payload.get("sheet_tab") or "the CRM")
+            who = str(payload.get("name") or "").strip() or raw_email
+            company = str(payload.get("company") or "").strip()
+            note = f"[{today_str}] {LINKEDIN_TOUCH_NOTE_MARKER} - connect/DM sent by hand."
+            send_telegram_message(
+                chat_id,
+                f"🔗 <b>LinkedIn touch logged</b>\n"
+                f"{html.escape(who)}{' — ' + html.escape(company) if company else ''}\n"
+                f"<i>In {html.escape(match_tab)}. The email ladder re-anchors to today, so the next "
+                f"bump is spaced from this contact rather than from the original email.</i>")
+            enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=sheet_uuid, note=note))
+            log_daily_activity("notes_logged")
+            return
+
         if text.startswith("/n "):
             note_str = text[3:].strip()
             if not note_str:
@@ -11313,6 +11627,21 @@ def process_webhook_payload_async(data):
                     return
             else:
                 target = resolve_target_email(comp, title, job.get("employer_website"))
+            # A shared inbox at an INVENTED domain is not a person and not even a real address.
+            # A Gmail draft addressed to one sits in the drafts list looking exactly like a real
+            # one, which is how operations@mahle.com got sent on 2026-09-23. Both conditions must
+            # hold: operations@<real-employer-domain> is a convention worth trying, because the
+            # domain came off the employer's own website. Only the fully invented pair is refused.
+            if (is_unverified_email(target)
+                    and is_role_mailbox(re.sub(r'\s*\[.*?\]\s*', '', target).strip())):
+                send_telegram_message(
+                    chat_id,
+                    f"⚠️ <b>Role Mailbox - Draft Not Created</b>\n"
+                    f"<b>Best guess:</b> <code>{html.escape(target)}</code>\n\n"
+                    f"That is a shared inbox, not a person. Reply <code>/e actual@email.com</code> "
+                    f"with a real address to create the draft."
+                )
+                return
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
             tone_mode = job.get("tone_mode", "conservative")
@@ -11421,6 +11750,21 @@ def process_webhook_payload_async(data):
             new_email = raw_email if typed_email else resolve_target_email(
                 comp, title, job.get("employer_website")
             )
+            # Bare /e that lands on a role mailbox at an INVENTED domain declines. Two things have
+            # to be wrong before refusing: the mailbox is shared AND the domain was guessed from
+            # the company name (the [⚠️ Fallback] tag). operations@<real-employer-domain> is a
+            # convention worth trying - the domain is evidence - so it still drafts. A TYPED
+            # address is always honoured: writing to careers@ deliberately is Kevin's call.
+            if (not typed_email and is_unverified_email(new_email)
+                    and is_role_mailbox(re.sub(r'\s*\[.*?\]\s*', '', new_email).strip())):
+                send_telegram_message(
+                    chat_id,
+                    f"⚠️ <b>Role Mailbox - Draft Not Created</b>\n"
+                    f"<b>Best guess:</b> <code>{html.escape(new_email)}</code>\n\n"
+                    f"That is a shared inbox, not a person. Reply <code>/e actual@email.com</code> "
+                    f"with a real address to create the draft."
+                )
+                return
             # A GUESSED address is not a contact. resolve_target_email() always returns something -
             # when it has no real domain it invents one from the company name and tags it
             # [⚠️ Fallback Email] - and writing that to the sheet filled the Contact Email column
@@ -11763,7 +12107,15 @@ def process_webhook_payload_async(data):
                 sheet_uuid, "applied",
                 company=company, role=job.get("job_title"),
                 source=derive_job_source(job.get("job_id"), job.get("job_apply_link")),
-                outreach_path="warm" if mapping.get("contact_name") else "ats"
+                # Three paths, not two. "ats" used to absorb every application without a named
+                # warm contact, including ones where Kevin cold-emailed a real person - so the
+                # per-path rates could never answer "is cold outreach working", the question the
+                # whole channel exists to settle. A row carrying a real (non-guessed) contact
+                # email was emailed; one with a blank or guessed cell is portal-only.
+                outreach_path=(
+                    "warm" if mapping.get("contact_name")
+                    else ("cold" if not is_guessed_contact_email(job.get("target_email")) else "ats")
+                )
             )
             # Canonical Status write on the row in place - no tab move (see set_status in Code.gs).
             enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status="Applied"))
@@ -12141,6 +12493,7 @@ def process_webhook_payload_async(data):
                 "/kill &lt;company&gt; &lt;n|all&gt; - Archive the role a rejection named (pick card)\n"
                 "/dead - Mark the posting itself expired (decoy) - feeds /decoys\n"
                 "/n - Append timestamped note\n"
+                "/linkedin &lt;email&gt; - Log a LinkedIn connect/DM so the email ladder re-spaces\n"
                 "/f - Snooze follow-up by [days]\n"
                 "/e <email> - Lock Apollo email override & re-draft\n"
                 "/eh [Name] - On-demand API email lookup & re-draft\n"
@@ -12406,17 +12759,42 @@ def followup_queue_view():
                 f'<button class="btn btn-secondary" onclick="copyField(\'{field_id}\')" '
                 f'style="border: none; cursor: pointer;">📋 Copy Draft</button>'
             )
+            # LinkedIn lookup, sitting ABOVE the draft on purpose: the workflow is look them up →
+            # copy their About section → regenerate the email with {their_desk} filled. That one
+            # concrete detail about the RECIPIENT's desk is what separates the two best emails in
+            # the Sent folder from the generic "Given how much of this sits under you" fallback.
+            # A site: query rather than LinkedIn's own search, which demands a login.
+            lookup_terms = " ".join(t for t in (str(e.get("name") or ""), company) if t and t != "—").strip()
+            if lookup_terms:
+                lookup_url = html.escape(
+                    "https://www.google.com/search?q=" + urllib.parse.quote(f'site:linkedin.com/in "{lookup_terms}"'),
+                    quote=True)
+                links = (f'<a class="btn btn-secondary" href="{lookup_url}" target="_blank">🔎 Look up on LinkedIn</a>'
+                         + links)
             no_address_note = ""
             if e.get("sheet_uuid") and _sequencer_draft_recipient(e):
                 open_url = html.escape(f"/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}", quote=True)
                 links += f'<a class="btn btn-primary" href="{open_url}" target="_blank">✉️ Open in Gmail</a>'
             else:
                 no_address_note = "<p class='meta'><i>No verified address on file - copy the draft and send it by hand.</i></p>"
+            # Auto-send verdict, stated plainly. A row that will NOT dispatch on its own is the
+            # one Kevin has to act on, so the reason is spelled out rather than implied by absence.
+            if e.get("autosend"):
+                verdict = "<span style='color:#137333;'>🤖 Auto-sends today</span>"
+            elif e.get("autosend_block") in ("company_spacing", "run_cap"):
+                on = e.get("autosend_on")
+                verdict = ("⏳ Held: " + html.escape(AUTOSEND_BLOCK_REASONS.get(e["autosend_block"], ""))
+                           + (f" · auto-sends {html.escape(str(on))}" if on else ""))
+            elif e.get("autosend_block"):
+                verdict = ("✋ Manual: "
+                           + html.escape(AUTOSEND_BLOCK_REASONS.get(e["autosend_block"], e["autosend_block"])))
+            else:
+                verdict = "✋ Manual"
             parts.append(
                 f"<h3 style='margin-top: 24px;'>{html.escape(who)} — {html.escape(company)}</h3>"
                 f"<p class='meta'>Follow-up #{html.escape(str(e.get('attempt', 1)))} · "
                 f"due {html.escape(due)} → {html.escape(step)} · "
-                f"🆔 <code>{html.escape(_seq_id_tag(e))}</code></p>"
+                f"🆔 <code>{html.escape(_seq_id_tag(e))}</code><br>{verdict}</p>"
                 f'<textarea id="{field_id}" rows="10" style="width: 100%;" readonly>'
                 f"{html.escape(str(e.get('draft_text') or ''))}</textarea>"
                 f'<div style="margin-top: 10px;">{links}</div>'
@@ -12567,10 +12945,14 @@ def morning_brief_view():
 
     if outcomes.get("by_source"):
         parts.append("<h3>🧭 Outcomes by Source</h3><table>"
-                     "<tr><th>Source</th><th>Applied</th><th>Interview</th><th>Reply rate</th></tr>")
+                     "<tr><th>Source</th><th>Applied</th><th>Replied</th><th>Interview</th>"
+                     "<th>Reply rate</th></tr>")
         for source, s in sorted(outcomes["by_source"].items()):
+            # .get on the new keys: a snapshot rendered from an older payload (or a test stub)
+            # must not 500 the whole brief over a column that did not exist when it was written.
             parts.append(f"<tr><td>{esc(source)}</td><td>{s['applied']}</td>"
-                         f"<td>{s['interview']}</td><td>{s['reply_rate']:.1f}%</td></tr>")
+                         f"<td>{s.get('replied', 0)}</td>"
+                         f"<td>{s['interview']}</td><td>{s.get('reply_rate', 0.0):.1f}%</td></tr>")
         parts.append("</table>")
     else:
         parts.append("<h3>🧭 Outcomes by Source</h3>"
