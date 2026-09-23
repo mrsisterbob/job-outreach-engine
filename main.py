@@ -39,7 +39,7 @@ from pipeline_utils import (
     is_role_mailbox, is_automated_sender, company_domain_of, name_from_email_local_part, parse_email_recipient,
     match_email_to_crm_company,
     plan_carmen_ladder, carmen_reply_anchor, carmen_linkedin_anchor, CARMEN_LADDER_DAYS,
-    CARMEN_LADDER_DAYS_COLD, CARMEN_LADDER_DAYS_ENGAGED,
+    CARMEN_LADDER_DAYS_COLD, CARMEN_LADDER_DAYS_ENGAGED, carmen_ladder_for,
     carmen_status_marker, carmen_marker_cell,
     INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, LINKEDIN_TOUCH_NOTE_MARKER,
     MAX_AUTO_KILLS_PER_RUN,
@@ -5488,6 +5488,11 @@ def classify_inbound_ats_email(sender: str, subject: str, snippet: str):
         r"send (?:over|me) some times", r"what(?:'s| is) your availability",
         r"works for me", r"let'?s (?:chat|talk|connect|set)", r"grab (?:15|20|30|a few)",
         r"calendly", r"book a time",
+        # Microsoft Bookings, the Outlook-shop equivalent of a Calendly link. A real AAA Life TA
+        # rep sent one in a signature reading "feel free to book as per your convenience", which
+        # matched nothing above - "book a time" is not what anyone actually writes. The URL is the
+        # reliable half: no newsletter carries a personal booking page.
+        r"outlook\.office\.com/bookwithme", r"bookings\.ms/",
         # The bare word, which every pattern above managed to miss. Two real interview emails
         # classified GENERAL while their subject lines literally read "Interview" - the phrases
         # were all written for formal ATS copy, and a recruiter writing to a human just says
@@ -5836,6 +5841,141 @@ def format_inbound_tray_message(threads):
             f"    🆔 <code>{html.escape(str(t.get('thread_id')))}</code>")
     lines.append("\n<i>Mark one dealt with: /done &lt;id&gt;</i>")
     return "\n".join(lines)
+
+
+def find_inbound_threads_by_sender(sender_email, limit=5):
+    """Every tray row for one sender, newest first, whatever its state. Returns []; never raises.
+
+    Unlike get_open_inbound_threads() this deliberately includes state='done' rows: /trace answers
+    "what happened to this message", and a closed thread is an answer, not an omission.
+    """
+    clean = str(sender_email or "").strip().lower()
+    if not clean:
+        return []
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT thread_id, sender_email, sender_name, company, subject, status_label, "
+                "match_reason, message_count, last_seen, is_tier1, alerted, state, sheet_uuid "
+                "FROM inbound_threads WHERE LOWER(sender_email) = ? "
+                "ORDER BY last_seen DESC LIMIT ?", (clean, limit))
+            cols = ("thread_id", "sender_email", "sender_name", "company", "subject",
+                    "status_label", "match_reason", "message_count", "last_seen", "is_tier1",
+                    "alerted", "state", "sheet_uuid")
+            return [dict(zip(cols, r)) for r in cursor.fetchall()]
+    except Exception as e:
+        logging.error(f"Inbound tray sender lookup error ({clean}): {e}")
+        return []
+
+
+CARMEN_TRACE_TABS = ("CC", "CH", "CW")
+
+
+def format_trace_report(sender_email):
+    """Render /trace for one address: what the poller saw, and what the CRM row now says.
+
+    Answers the question logs used to be the only source for - "did my system notice this reply?"
+    - by reading the two places that would have changed, and naming the one that did not.
+
+    Reads only. Deliberately reports the ABSENCE of each artifact as a finding rather than
+    omitting it, because absence is the diagnosis: no tray row means the poller never listed the
+    message, and no reply anchor means the contact is still walking the cold ladder.
+    """
+    clean = str(sender_email or "").strip().lower()
+    lines = [f"🔍 <b>Trace</b> - <code>{html.escape(clean)}</code>\n"]
+
+    threads = find_inbound_threads_by_sender(clean)
+    if not threads:
+        lines.append(
+            "📭 <b>Inbox tray:</b> no record.\n"
+            "    <i>The poller never logged a message from them. Either they have not written, "
+            "or it was read in Gmail before a poll ran and predates the shadow sweep.</i>")
+    else:
+        lines.append(f"📬 <b>Inbox tray:</b> {len(threads)} thread(s)")
+        for t in threads:
+            alerted = "alerted" if t.get("alerted") else "<b>never alerted</b>"
+            how = str(t.get("match_reason") or "")
+            via = " · read before poll" if how == "read before poll" else ""
+            lines.append(
+                f"    • <i>{html.escape(str(t.get('subject') or '(No Subject)')[:60])}</i>\n"
+                f"      {html.escape(str(t.get('status_label') or 'GENERAL'))} · "
+                f"{alerted} · {html.escape(str(t.get('state') or 'open'))}{via}\n"
+                f"      last seen {html.escape(str(t.get('last_seen') or '?'))}")
+
+    crm = is_verified_crm_contact(clean) or {}
+    if not crm.get("sheet_uuid"):
+        lines.append(
+            "\n🗂 <b>CRM:</b> no row matches that address.\n"
+            "    <i>Nothing to anchor a ladder to - inbound routing would have skipped the "
+            "CRM write.</i>")
+        return "\n".join(lines)
+
+    tab = str(crm.get("tab") or "")
+    lines.append(f"\n🗂 <b>CRM:</b> {html.escape(str(crm.get('company') or 'Unknown'))} · "
+                 f"{html.escape(tab or 'Unknown tab')}")
+
+    # The note is the ground truth for the ladder, and only get_followups returns it.
+    row = None
+    for code in CARMEN_TRACE_TABS:
+        try:
+            res = crm_get({"action": "get_followups", "tab": code})
+            if not res or res.status_code != 200:
+                continue
+            for r in res.json().get("followups", []):
+                if str(r.get("sheet_uuid") or "") == str(crm.get("sheet_uuid")):
+                    row = r
+                    break
+        except Exception as e:
+            logging.error(f"/trace get_followups({code}) failed: {e}")
+        if row:
+            break
+
+    if not row:
+        lines.append("    <i>Row not found on a Carmen tab - it may live on a Tetiana or "
+                     "Died tab, which the ladder does not drive.</i>")
+        return "\n".join(lines)
+
+    note = str(row.get("note") or "")
+    replied_on = carmen_reply_anchor(note)
+    ladder = carmen_ladder_for(replied_on)
+    track = "ENGAGED" if replied_on else "COLD"
+    lines.append(f"    Next follow-up: <code>{html.escape(str(row.get('next_followup') or '-'))}</code>")
+    if replied_on:
+        lines.append(f"    ✅ Reply anchor: <code>{replied_on.isoformat()}</code> · "
+                     f"track <b>{track}</b> {ladder}")
+    else:
+        lines.append(f"    ⚠️ <b>No reply anchor.</b> Track <b>{track}</b> {ladder} - "
+                     f"<i>the sequencer still treats them as never having written back.</i>")
+    return "\n".join(lines)
+
+
+def record_shadow_thread(thread_id, sender_email, sender_name, company, subject, snippet,
+                         status_label, match_reason, sheet_uuid, is_tier1):
+    """Insert a tray row ONLY if the thread is absent. Returns True when a row was created.
+
+    The shadow pass's write path, and deliberately not record_inbound_thread(): that one is an
+    upsert that bumps message_count and forces state back to 'open'. The shadow pass re-lists the
+    same already-read message every cycle, so reusing it would inflate the count without bound and
+    resurrect every thread Kevin closed with /done - the tray would refill itself forever.
+
+    INSERT OR IGNORE, so the thread_id primary key does the work and a row the alert path wrote
+    (or is writing concurrently) is never touched. Never raises.
+    """
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO inbound_threads (thread_id, sender_email, sender_name, "
+                "company, subject, snippet, status_label, match_reason, sheet_uuid, is_tier1, "
+                "alerted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (thread_id, sender_email, sender_name, company, subject, snippet,
+                 status_label, match_reason, sheet_uuid, 1 if is_tier1 else 0))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"Shadow tray write error ({thread_id}): {e}")
+        return False
 
 
 POLLER_FAILURE_ALERT_COOLDOWN_HOURS = 6
@@ -6280,6 +6420,101 @@ def check_inbound_gmail_replies():
 
     # Second, narrower query. Runs after the INBOX pass and shares its access token.
     sweep_spam_for_interview_signals(headers)
+    # Third pass: the messages the is:unread query above structurally cannot see.
+    sweep_read_mail_into_tray(headers)
+
+
+SHADOW_SWEEP_MAX_RESULTS = 25
+SHADOW_SWEEP_WINDOW = "2d"
+
+
+def sweep_read_mail_into_tray(request_headers):
+    """Record recent inbound mail in the tray even when Kevin already read it in Gmail.
+
+    The gap this closes: the main poll lists `is:unread`, so a message Kevin opens on his phone
+    before the hourly cycle fires is never listed, never recorded, and leaves no trace anywhere -
+    no alert, no tray row, no CRM note, no reply anchor. The contact then stays on the COLD ladder
+    and gets bumped as though they never wrote back. That happened with a real reply that arrived
+    at 3:29 and was read at 3:44, inside one poll interval.
+
+    This pass drops `is:unread` and reads the last SHADOW_SWEEP_WINDOW instead. It is deliberately
+    the weakest possible version of the poller:
+
+      - It NEVER alerts. Telegram is the alert path's job, and re-notifying mail Kevin has already
+        read is exactly the noise that would make him mute the bot.
+      - It NEVER marks anything read, so it cannot interfere with the alert path's retry mechanism
+        (which depends on UNREAD surviving a failed send).
+      - It NEVER writes to the CRM. A row's ladder is driven by the alert path; a silent second
+        writer would be untraceable.
+      - It only INSERTs absent threads (record_shadow_thread), so message_count never inflates and
+        a thread closed with /done is never resurrected.
+
+    The result is that /inbox and /trace see every real conversation, whoever got to it first.
+    Sender gates still apply - bulk mail and blocked domains do not belong in the tray - but the
+    age gate does not, because the window here is already the age gate.
+    """
+    try:
+        list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+        query = f"newer_than:{SHADOW_SWEEP_WINDOW} -from:me label:{EMAIL_LABEL_TARGET_INBOX} {EMAIL_QUERY_EXCLUSIONS}".strip()
+        params = {"q": query, "maxResults": SHADOW_SWEEP_MAX_RESULTS}
+        res = requests.get(list_url, headers=request_headers, params=params, timeout=10)
+        if res.status_code != 200:
+            logging.error(f"Gmail Shadow Sweep List Error: {res.status_code}")
+            return
+        msg_ids = [m["id"] for m in res.json().get("messages", [])][:SHADOW_SWEEP_MAX_RESULTS]
+        logging.info(f"[SHADOW SWEEP] {len(msg_ids)} message(s) in the last {SHADOW_SWEEP_WINDOW} to reconcile")
+    except Exception as e:
+        logging.error(f"Gmail Shadow Sweep List Exception: {e}")
+        return
+
+    recorded = 0
+    for msg_id in msg_ids:
+        try:
+            detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
+            # format=metadata is enough here: this pass never inspects a calendar part, because it
+            # never decides Tier 1 and never alerts. Cheaper body, same 5 quota units.
+            res = requests.get(detail_url, headers=request_headers,
+                               params={"format": "metadata",
+                                       "metadataHeaders": ["From", "Subject", "List-Unsubscribe"]},
+                               timeout=10)
+            if res.status_code != 200:
+                continue
+            detail = res.json()
+            thread_id = detail.get("threadId", msg_id)
+            hdrs = {h["name"].lower(): h["value"]
+                    for h in detail.get("payload", {}).get("headers", [])}
+            sender = hdrs.get("from", "")
+            subject = hdrs.get("subject", "(No Subject)")
+            snippet = detail.get("snippet", "")
+
+            # Bulk mail is not a conversation. Same List-Unsubscribe test the alert path uses as
+            # its bulk-vs-human line.
+            if hdrs.get("list-unsubscribe"):
+                continue
+            passed, _ = passes_email_sender_blocks(sender)
+            if not passed:
+                continue
+
+            sender_address = (re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender or "") or [None])
+            sender_address = sender_address.group(0).lower() if hasattr(sender_address, "group") else ""
+            if not sender_address:
+                continue
+
+            crm_match = is_verified_crm_contact(sender) or {}
+            status_label, _ = classify_inbound_ats_email(sender, subject, snippet)
+            if record_shadow_thread(
+                    thread_id, sender_address, display_name_from_sender(sender),
+                    str(crm_match.get("company") or "Unknown"), subject, snippet,
+                    status_label, "read before poll", str(crm_match.get("sheet_uuid") or ""),
+                    False):
+                recorded += 1
+                logging.info(
+                    f"[SHADOW SWEEP] Recorded thread {thread_id} from {sender_address} "
+                    f"({status_label}) - read before the poller saw it")
+        except Exception as e:
+            logging.error(f"Gmail Shadow Sweep Processing Error ({msg_id}): {e}")
+    if recorded:
+        logging.info(f"[SHADOW SWEEP] {recorded} conversation(s) added to the tray that is:unread missed")
 
 
 SPAM_SWEEP_MAX_RESULTS = 10
@@ -11930,6 +12165,33 @@ def process_webhook_payload_async(data):
                     "Run /inbox for the current list."))
             return
 
+        if text.startswith("/trace"):
+            # "Did the system see this email?" - the question that previously required reading
+            # Render logs. Absence was unobservable: a message the poller never listed left no
+            # record anywhere, so a missing alert and a missing reply were indistinguishable.
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                send_telegram_message(chat_id, (
+                    "Usage: <code>/trace &lt;email address&gt;</code>\n"
+                    "<i>Shows whether the poller saw their reply, whether it alerted, "
+                    "and what the CRM row says.</i>"))
+                return
+            target = parts[1].strip().lower()
+            if "@" not in target:
+                send_telegram_message(chat_id, "❌ <i>Give an email address, e.g. "
+                                               "<code>/trace someone@company.com</code></i>")
+                return
+
+            def _trace_and_notify():
+                try:
+                    send_telegram_message(chat_id, format_trace_report(target))
+                except Exception as e:
+                    logging.error(f"/trace Error: {e}")
+                    send_telegram_message(chat_id, f"❌ Trace failed: {html.escape(str(e)[:200])}")
+
+            threading.Thread(target=_trace_and_notify, daemon=True).start()
+            return
+
         if text == "/prep":
             mapping = resolve_reply_mapping(msg, chat_id, "/prep")
             if not mapping:
@@ -12527,6 +12789,7 @@ def process_webhook_payload_async(data):
                 "/poll - Run the email poll cycle now (scheduled: daily)\n"
                 "/inbox - Open conversations that still need a reply\n"
                 "/done &lt;id&gt; - Mark a conversation dealt with (id is printed on /inbox)\n"
+                "/trace &lt;email&gt; - Did the poller see their reply? Tray + CRM + ladder state\n"
                 "/backfillcontacts - Preview a full Sent-history contact sweep (add 'go' to write)\n\n"
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"

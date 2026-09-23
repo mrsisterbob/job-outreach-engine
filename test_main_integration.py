@@ -5255,12 +5255,19 @@ def _fake_tray_recorder(tray_state):
 
 
 def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_started=False,
-                              spam_messages=None, tray_state=None, delivery_fails=False):
+                              spam_messages=None, tray_state=None, delivery_fails=False,
+                              shadow_messages=None):
     """Drive the real check_inbound_gmail_replies() against a faked Gmail API.
 
-    `messages` answers the label:INBOX query and `spam_messages` the label:SPAM one - the fake
-    routes on the `q` param, because serving the same list to both is how a message gets processed
-    twice and a test quietly asserts against the wrong pass.
+    `messages` answers the label:INBOX query, `spam_messages` the label:SPAM one and
+    `shadow_messages` the shadow sweep's newer_than: query - the fake routes on the `q` param,
+    because serving the same list to several passes is how a message gets processed twice and a
+    test quietly asserts against the wrong one.
+
+    shadow_messages defaults to EMPTY rather than to `messages`. In production both queries hit
+    label:INBOX and overlap heavily, but a test that wants the shadow path asks for it: the poll
+    tests assert on alerts, and silently feeding them a second pass over the same mail would mean
+    every one of them was also exercising a path it never mentions.
 
     Returns (alerts, marked_read): the Telegram messages actually sent, and the ids whose UNREAD
     label was removed. Nothing here asserts on a return value - check_inbound_gmail_replies has
@@ -5286,7 +5293,8 @@ def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_sta
 
     inbox_by_id = {msg["id"]: msg for msg in messages}
     spam_by_id = {msg["id"]: msg for msg in (spam_messages or [])}
-    by_id = {**inbox_by_id, **spam_by_id}
+    shadow_by_id = {msg["id"]: msg for msg in (shadow_messages or [])}
+    by_id = {**inbox_by_id, **spam_by_id, **shadow_by_id}
     alerts, marked_read = [], []
 
     class _Res:
@@ -5300,7 +5308,12 @@ def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_sta
     def fake_get(url, **kwargs):
         if url.endswith("/messages"):
             query = (kwargs.get("params") or {}).get("q", "")
-            listed = spam_by_id if "label:SPAM" in query else inbox_by_id
+            if "label:SPAM" in query:
+                listed = spam_by_id
+            elif query.startswith("newer_than:"):
+                listed = shadow_by_id
+            else:
+                listed = inbox_by_id
             return _Res({"messages": [{"id": i} for i in listed]})
         return _Res(by_id[url.rsplit("/", 1)[-1]])
 
@@ -5581,7 +5594,16 @@ def test_inbox_query_excludes_gmail_categories_before_spending_the_budget(monkey
         if url.endswith("/messages"):
             params = kwargs.get("params") or {}
             q = params.get("q", "")
-            if "label:SPAM" not in q:
+            # Three queries now run per cycle: the alert path (is:unread), the spam sweep
+            # (label:SPAM) and the shadow sweep (newer_than:). Keyed by which pass issued it,
+            # because capturing "the last non-SPAM query" silently started asserting against
+            # the shadow sweep the moment it was added.
+            if "label:SPAM" in q:
+                captured["spam_q"] = q
+            elif q.startswith("newer_than:"):
+                captured["shadow_q"] = q
+                captured["shadow_maxResults"] = params.get("maxResults")
+            else:
                 captured["q"] = q
                 captured["maxResults"] = params.get("maxResults")
         return _Res()
@@ -5596,6 +5618,13 @@ def test_inbox_query_excludes_gmail_categories_before_spending_the_budget(monkey
     assert "is:unread" in captured["q"] and "-from:me" in captured["q"]
     # 10 was far below one day's real inbound volume at any sane cadence.
     assert captured["maxResults"] == 50
+
+    # The shadow sweep must carry the SAME exclusions but NOT is:unread - dropping that term is
+    # its entire reason for existing, and keeping the exclusions is what stops it filling the
+    # tray with promotions the alert path deliberately skips.
+    assert "is:unread" not in captured["shadow_q"]
+    assert "-from:me" in captured["shadow_q"]
+    assert "-category:promotions" in captured["shadow_q"]
 
 
 def test_a_dead_refresh_token_tells_kevin_instead_of_going_quiet(monkeypatch):
@@ -5878,6 +5907,124 @@ def test_tier1_conversations_sort_above_everything_else_in_the_tray():
     m.record_inbound_thread("T-offer", "c@d.com", "C", "D", "Offer", "x", "OFFER_EXTENDED", "", "", True)
     assert [t["thread_id"] for t in m.get_open_inbound_threads()][0] == "T-offer"
     _clear_tray()
+
+
+def test_the_shadow_pass_never_resurrects_a_closed_thread_or_inflates_its_count():
+    """The failure that makes a shadow sweep dangerous. It re-lists the SAME already-read message
+    every cycle, so if it wrote through record_inbound_thread's upsert, every thread Kevin closed
+    with /done would reopen an hour later and message_count would climb forever. INSERT OR IGNORE
+    is what makes re-running it free, and this is the test that holds that line."""
+    _clear_tray()
+    args = ("T-shadow", "debdas@aaalife.com", "Debdas", "AAA Life", "Re: Annuity",
+            "sent your resume", "GENERAL", "read before poll", "", False)
+
+    assert m.record_shadow_thread(*args) is True, "first sight creates the row"
+    assert m.record_shadow_thread(*args) is False, "the same message again writes nothing"
+    assert m.record_shadow_thread(*args) is False
+
+    with m.get_db_conn() as conn:
+        count, state = conn.execute(
+            "SELECT message_count, state FROM inbound_threads WHERE thread_id = 'T-shadow'"
+        ).fetchone()
+    assert count == 1, "re-listing the same message is not a new message"
+
+    assert m.close_inbound_thread("T-shadow") is True
+    m.record_shadow_thread(*args)
+    assert m.get_open_inbound_threads() == [], "a closed thread stays closed through later sweeps"
+    _clear_tray()
+
+
+def test_the_shadow_pass_yields_to_the_alert_path_and_never_clears_its_alerted_flag():
+    """Both writers target one table. The alert path owns the row - it is the one that actually
+    notified Kevin - so the shadow pass must never overwrite what it recorded."""
+    _clear_tray()
+    m.record_inbound_thread("T-both", "dana@atwell.com", "Dana", "Atwell", "Real subject",
+                            "x", "INTERVIEW_SET", "crm contact", "uuid-1", True)
+    m.mark_inbound_thread_alerted("T-both")
+
+    assert m.record_shadow_thread("T-both", "dana@atwell.com", "Dana", "Atwell", "Shadow subject",
+                                  "y", "GENERAL", "read before poll", "", False) is False
+
+    with m.get_db_conn() as conn:
+        subject, status, alerted, tier1 = conn.execute(
+            "SELECT subject, status_label, alerted, is_tier1 FROM inbound_threads "
+            "WHERE thread_id = 'T-both'").fetchone()
+    assert subject == "Real subject" and status == "INTERVIEW_SET"
+    assert alerted == 1 and tier1 == 1
+    _clear_tray()
+
+
+def test_a_reply_read_before_the_poll_still_lands_in_the_tray_without_alerting(monkeypatch):
+    """The Debdas case, end to end. His reply arrived at 3:29 and was read at 3:44 - inside one
+    poll interval - so the is:unread query could never list it: no alert, no tray row, no trace
+    anywhere that it had happened. The shadow pass records it. It must NOT alert (Kevin has
+    already read it) and must NOT mark anything read (that would break the alert path's retry)."""
+    _clear_tray()
+    msg = _gmail_message("debdas", "Debdas Patnaik <dpatnaik@aaalife.com>",
+                         "Annuity Processing Specialist @ AAA Life Insurance Company",
+                         "I have sent your resume to the recruiter who handles the role.")
+    # The alert path sees nothing (the message is read); only the shadow query returns it.
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [], shadow_messages=[msg])
+
+    assert alerts == [], "mail Kevin already read must never generate a Telegram alert"
+    assert marked_read == [], "the shadow pass must not touch UNREAD"
+
+    tray = m.find_inbound_threads_by_sender("dpatnaik@aaalife.com")
+    assert len(tray) == 1, "the conversation is now visible to /inbox and /trace"
+    assert tray[0]["match_reason"] == "read before poll"
+    assert tray[0]["alerted"] == 0, "it was recorded, not announced"
+    _clear_tray()
+
+
+def test_trace_names_a_missing_reply_anchor_as_the_reason_a_contact_is_still_cold(monkeypatch):
+    """What /trace exists to answer. A contact who wrote back but whose note carries no reply
+    anchor is still on the COLD ladder and will be bumped - and before /trace, the only way to
+    discover that was to read the sheet by hand."""
+    monkeypatch.setattr(m, "is_verified_crm_contact",
+                        lambda s: {"name": "Debdas", "company": "AAA Life",
+                                   "tab": "Carmen Cold", "sheet_uuid": "uuid-9"})
+
+    class _Res:
+        status_code = 200
+
+        def json(self):
+            return {"status": "success", "followups": [
+                {"sheet_uuid": "uuid-9", "note": "[2026-09-23] Cold email sent.",
+                 "next_followup": "2026-09-25", "date_added": "2026-09-23"}]}
+
+    monkeypatch.setattr(m, "crm_get", lambda params, **kw: _Res())
+    report = m.format_trace_report("dpatnaik@aaalife.com")
+    assert "No reply anchor" in report
+    assert "COLD" in report
+
+    class _Replied(_Res):
+        def json(self):
+            return {"status": "success", "followups": [
+                {"sheet_uuid": "uuid-9",
+                 "note": f"[2026-09-23] {m.INBOUND_REPLY_NOTE_MARKER} (they wrote to Kevin).",
+                 "next_followup": "2026-09-27", "date_added": "2026-09-23"}]}
+
+    monkeypatch.setattr(m, "crm_get", lambda params, **kw: _Replied())
+    report = m.format_trace_report("dpatnaik@aaalife.com")
+    assert "Reply anchor" in report and "ENGAGED" in report
+
+
+def test_a_microsoft_bookings_link_reads_as_an_interview_signal():
+    """Debdas's signature carried an outlook.office.com/bookwithme link under the words 'feel free
+    to book as per your convenience' - which matched no pattern, because 'book a time' is not what
+    anyone actually writes. The URL is the half that cannot be a newsletter."""
+    label, _ = m.classify_inbound_ats_email(
+        "Debdas Patnaik <dpatnaik@aaalife.com>", "Annuity Processing Specialist",
+        "Feel free to book as per your convenience using the link below. "
+        "https://outlook.office.com/bookwithme/user/abc123@aaalife.com?anonymous")
+    assert label == "INTERVIEW_SET"
+
+    # The guard that keeps it honest: a decline mentioning a booking page is still a decline,
+    # because rejection is matched before every interview pattern.
+    label, _ = m.classify_inbound_ats_email(
+        "recruiter@corp.com", "Update",
+        "Unfortunately we are not moving forward. https://outlook.office.com/bookwithme/user/x")
+    assert label == "REJECTION"
 
 
 def test_the_tray_message_renders_ids_and_an_empty_state():

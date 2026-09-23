@@ -120,6 +120,13 @@ HELP = {
         "Open conversations that still need a reply from you.",
         "/inbox",
     ),
+    "/trace": (
+        "Answers 'did my system actually see this reply?' for one address. Shows whether the "
+        "poller logged the thread, whether Telegram alerted, and - the part that bites - whether "
+        "the CRM note carries a reply anchor. No anchor means the sequencer still thinks they "
+        "never wrote back, and will bump them.",
+        "/trace dpatnaik@aaalife.com",
+    ),
     "/brief": (
         "One page covering the whole pipeline - intake, outcomes, board coverage and live "
         "conversations.",
