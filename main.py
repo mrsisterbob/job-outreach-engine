@@ -8197,7 +8197,7 @@ def _apply_autosend_plan(entries, today):
 
     Two independent filters, in order. The GATE (autosend_block_reason) asks "is this message
     safe to send without a human reading it". The STAGGER then asks "and is today the right day",
-    spacing multiple contacts at one employer AUTOSEND_COMPANY_SPACING_DAYS apart.
+    spacing multiple contacts at one employer AUTOSEND_COMPANY_SPACING apart.
 
     Spacing is derived from position within the company's group, not from send history: the
     sequencer is the only thing dispatching these, it runs once a day, and a deferred row simply
