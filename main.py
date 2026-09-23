@@ -23,6 +23,7 @@ from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from response_schema import GeminiJobScreenerResponse
+from command_help import lookup_command_help
 from pipeline_utils import (
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
@@ -232,7 +233,8 @@ _FALLBACK_OUTREACH_TEMPLATES = {
     "cold_ops": ["Hi{name},\n\nYour {job_title} posting is what got me to write, but I mostly wanted your perspective on where the manual work still sits.\n\nMy day job is Python and SQL that replaces reporting people used to run by hand. Do you have 10 minutes for a brief call?\n\nHappy to work around your schedule.\n\nBest,\nKevin Miller"],
     "warm_alumni": ["Hi{name},\n\n[how you know them, and the specific occasion you last spoke]. [one concrete detail so this reads like you].\n\n[the one thing you want their perspective on at {company}]. [your ask, and a concrete time window].\n\nBest,\nKevin"],
     "followup_bumps": ["Hi{name},\n\nCircling back on the {job_title} role in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nThanks,\nKevin Miller"],
-    "recruiter": ["Hi{name},\n\nI recently applied for the {job_title} role at {company} and wanted to reach out directly. Most of my recent work is custodial reconciliation and Python that replaces manual reporting.\n\nIs the search still open, and is there a rough timeline for first interviews? A one-line reply is plenty.\n\nBest,\nKevin Miller"]
+    "recruiter": ["Hi{name},\n\nI recently applied for the {job_title} role at {company} and wanted to reach out directly. Most of my recent work is custodial reconciliation and Python that replaces manual reporting.\n\nIs the search still open, and is there a rough timeline for first interviews? A one-line reply is plenty.\n\nBest,\nKevin Miller"],
+    "reactivation": ["Hi{name},\n\nLast time we spoke I said I would let you know where I landed. I was at Signal through the summer. The role I was working toward got redefined around a decade of experience, and I finished up there this month. While that was playing out I built a Python system that runs my job search and flags new postings.\n\nI saw the {job_title} opening and would rather come in through someone who knows the team than through the portal. Who owns that req on your side?\n\nHappy to work around your schedule.\n\nBest,\nKevin"]
 }
 
 # Follow-up bump copy for PEOPLE-schema rows (Carmen Cold networking contacts): these tabs have
@@ -374,7 +376,7 @@ def first_name_for_greeting(full_name):
 
 RESUME_BULLETS_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_bullets_bank.json")
 
-EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|T[A-E])(\d+)$", re.IGNORECASE)
+EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|R|T[A-E])(\d+)$", re.IGNORECASE)
 
 def resolve_edit_target(id_str):
     """Maps a /edit ID to (file_path, list_key, index):
@@ -382,6 +384,7 @@ def resolve_edit_target(id_str):
       C0-C5 -> templates/outreach_templates.json[cold_ops]
       W0-W1 -> templates/outreach_templates.json[warm_alumni]
       B0-B1 -> templates/outreach_templates.json[followup_bumps]
+      R0-R3 -> templates/outreach_templates.json[reactivation]
       TA0-TA9 ... TE0-TE9 -> resume_bullets_bank.json[track_x_...]
     Returns None if the ID prefix is unrecognized.
     """
@@ -397,6 +400,8 @@ def resolve_edit_target(id_str):
         return (OUTREACH_TEMPLATES_PATH, "warm_alumni", idx)
     if prefix == "B":
         return (OUTREACH_TEMPLATES_PATH, "followup_bumps", idx)
+    if prefix == "R":
+        return (OUTREACH_TEMPLATES_PATH, "reactivation", idx)
     if len(prefix) == 2 and prefix[0] == "T":
         pool_key = TRACK_BULLET_POOL_KEYS.get(prefix[1].lower())
         if pool_key:
@@ -412,6 +417,7 @@ _EDIT_LINT_KINDS = {
     "warm_alumni": "email",
     "followup_bumps": "email",
     "recruiter": "email",
+    "reactivation": "email",
 }
 
 def lint_edited_template(list_key, new_text):
@@ -10679,6 +10685,15 @@ def process_webhook_payload_async(data):
         # without touching 70 handlers. Pure telemetry - see record_command_usage().
         record_command_usage(text)
 
+        # 1a. Per-command help: a TRAILING slash asks what a command does instead of running it
+        # ("/w/" explains the warm radar, "/w" runs it). This must sit above every handler below -
+        # /w, /e, /x and friends match on exact text or a prefix, so a later check would never be
+        # reached. Anything that is not a /cmd/ request returns None and falls straight through.
+        help_reply = lookup_command_help(text)
+        if help_reply:
+            send_telegram_message(chat_id, help_reply)
+            return
+
         # 1b. Tuesday Batch Hub Commands (/sendall, /snoozeall)
         if text == "/sendall":
             send_telegram_message(chat_id, "⏳ <b>Send-All Started:</b> creating bump drafts and queueing +14-day follow-ups...")
@@ -12428,15 +12443,17 @@ def process_webhook_payload_async(data):
                 send_telegram_message(
                     chat_id,
                     "❌ <b>Usage:</b> <code>/edit ID New Text</code>\n"
-                    "IDs: <code>L0-L5</code> (LinkedIn), <code>C0-C2</code> (Cold), "
-                    "<code>W0-W1</code> (Warm), <code>B0-B1</code> (Bump), "
-                    "<code>TA0-TA9</code>...<code>TE0-TE9</code> (Resume Bullets)"
+                    "IDs: <code>L0-L9</code> (LinkedIn), <code>C0-C5</code> (Cold), "
+                    "<code>W0-W5</code> (Warm), <code>B0-B1</code> (Bump), "
+                    "<code>R0-R3</code> (Reactivation), "
+                    "<code>TA0-TA9</code>...<code>TE0-TE9</code> (Resume Bullets)\n"
+                    "Send <code>/edit/</code> for the long version."
                 )
                 return
             edit_id, new_text = parts[0], parts[1].strip()
             target = resolve_edit_target(edit_id)
             if not target:
-                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L5, C0-C2, W0-W1, B0-B1, TA0-TA9...TE0-TE9.")
+                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L9, C0-C5, W0-W5, B0-B1, R0-R3, TA0-TA9...TE0-TE9.")
                 return
             file_path, list_key, idx = target
             ok, result_msg = update_template_entry(file_path, list_key, idx, new_text)
@@ -12460,6 +12477,8 @@ def process_webhook_payload_async(data):
             send_telegram_message(
                 chat_id,
                 ("📖 <b>Command Reference</b>\n\n" if text == "/help" else "⚠️ <b>Command Unrecognized</b>\n\n") +
+                "<i>Add a trailing slash to any command to see what it does instead of running it "
+                "-  <code>/w/</code> explains, <code>/w</code> runs.</i>\n\n"
                 "<b>CORE COMMANDS:</b>\n"
                 "/t - Pull fresh job cards\n"
                 "/job, /j &lt;url&gt; - Add a job you found yourself (scores &amp; files it like /t)\n"
@@ -12467,7 +12486,7 @@ def process_webhook_payload_async(data):
                 "/search - View or update live search filters\n"
                 "/quick - Create contact (Name @ Firm Priority Note)\n"
                 "/cold, /warm - Quick-add a Cold/Warm contact (Name @ Firm Priority Note)\n"
-                "/edit - Edit a template (e.g. /edit L0 New note)\n"
+                "/edit - Edit a banked template by slot code (e.g. /edit L0 New note) - see /edit/\n"
                 "/ecosystem, /eco add - View/expand tracked ATS boards\n\n"
                 "<b>PULL CRM DATA:</b>\n"
                 "/c - Pull combined networking cards\n"

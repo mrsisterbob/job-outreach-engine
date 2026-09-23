@@ -641,6 +641,69 @@ def test_warm_alumni_entries_are_unsendable_scaffolds():
         assert pu.lint_outreach_template(m.sanitize_text(rendered), "email") == []
 
 
+def test_reactivation_entries_are_built_around_one_banked_gap_block():
+    """Reactivation copy (dormant Carmen Warm contacts). Its middle paragraph is BANKED - the
+    Signal ending is the same fact for every recipient, so it is written once and must be
+    byte-identical across all four slots. If an edit drifts one copy, Kevin tells two versions of
+    one story to people who may compare notes."""
+    pool = _load_bank("outreach_templates.json")["reactivation"]
+    assert len(pool) == 4, "reactivation is a /edit addressing contract (R0-R3)"
+
+    banked = "I was at Signal through the summer."
+    for idx, template in enumerate(pool):
+        rendered = m.interpolate_template(template, name="", company=_LINT_COMPANY,
+                                          job_title=_LINT_TITLE)
+        assert banked in rendered, f"reactivation[{idx}] lost the banked gap block"
+        assert pu.lint_outreach_template(rendered, "email") == [], f"reactivation[{idx}] fails lint"
+        assert pu.lint_outreach_template(m.sanitize_text(rendered), "email") == []
+
+    # The banked paragraph itself, identical everywhere. Compare the full sentence run, not just
+    # the opener, so a reworded middle clause fails loudly instead of drifting.
+    blocks = []
+    for template in pool:
+        start = template.index(banked)
+        blocks.append(template[start:template.index("\n\n", start)])
+    assert len(set(blocks)) == 1, f"the banked gap block drifted across slots: {set(blocks)}"
+
+
+def test_reactivation_splits_into_banked_ask_and_open_ask_halves():
+    """Kevin's bench splits in two (confirmed 2026-09-23). About half have a live posting, so the
+    ask is always the same and is BANKED - R0/R1 are sendable with only the greeting and title
+    filled in. The other half have no posting and the ask depends on the person, so R2/R3 keep it
+    bracketed. A blank left in R0/R1 means the banked half silently became hand-work again."""
+    pool = _load_bank("outreach_templates.json")["reactivation"]
+
+    for idx in (0, 1):
+        rendered = m.interpolate_template(pool[idx], name="Dana", company=_LINT_COMPANY,
+                                          job_title=_LINT_TITLE)
+        assert "Who owns that req on your side?" in rendered, f"R{idx} lost the banked ask"
+        assert "[" not in rendered.split("\n\n")[-3], f"R{idx} has a blank in its ask paragraph"
+
+    for idx in (2, 3):
+        rendered = m.interpolate_template(pool[idx], name="Dana", company=_LINT_COMPANY,
+                                          job_title=_LINT_TITLE)
+        assert rendered.count("[") >= 2 and rendered.count("]") >= 2, \
+            f"R{idx} is the open-ask half and must stay unsendable until Kevin fills it"
+
+    # R0 is the one fully-banked slot: promise + gap + ask, no blanks anywhere. It is the default
+    # for the posting half and must be sendable as-is.
+    r0 = m.interpolate_template(pool[0], name="Dana", company=_LINT_COMPANY, job_title=_LINT_TITLE)
+    assert "[" not in r0 and "]" not in r0, "R0 must be fully banked - no blanks left to fill"
+
+
+def test_reactivation_banked_ask_survives_a_garbage_job_title():
+    """Board titles carry garbage ("... /work from home reputed company/"), and a long one
+    interpolated into R0/R1 could push the email over the word cap. sanitize_job_title() runs
+    first on the real send path; this pins that the banked half still lints after it."""
+    garbage = "Financial Operations Analyst Intermediate /work from home reputed company/"
+    pool = _load_bank("outreach_templates.json")["reactivation"]
+    for idx in (0, 1):
+        rendered = m.interpolate_template(pool[idx], name="Dana", company=_LINT_COMPANY,
+                                          job_title=pu.sanitize_job_title(garbage))
+        assert pu.lint_outreach_template(rendered, "email") == [], \
+            f"R{idx} busts the cap on a real sanitized board title"
+
+
 # ---- One voice, both paths: the real banks and the real generators ----
 
 _LINT_COMPANY = "Atwell"
@@ -681,6 +744,7 @@ def test_every_shipped_template_passes_the_voice_linter():
         ("warm_alumni", "email", _load_bank("outreach_templates.json")["warm_alumni"]),
         ("followup_bumps", "email", _load_bank("outreach_templates.json")["followup_bumps"]),
         ("recruiter", "email", _load_bank("outreach_templates.json")["recruiter"]),
+        ("reactivation", "email", _load_bank("outreach_templates.json")["reactivation"]),
         ("linkedin_templates", "linkedin", _load_bank("linkedin_templates.json")["linkedin_templates"]),
     ]
     failures = []
@@ -1807,3 +1871,98 @@ def test_only_matched_rows_may_auto_retire():
     assert pu.may_auto_retire("Applied") is False
     assert pu.may_auto_retire("Interviewing") is False
     assert pu.may_auto_retire("") is False
+
+
+def test_edit_ids_route_to_the_pool_they_name():
+    """/edit writes into a bank by slot code, so a prefix collision silently corrupts the wrong
+    pool. R0-R3 was added 2026-09-23 for reactivation and must not shadow the existing prefixes."""
+    cases = {
+        "C0": "cold_ops",
+        "W5": "warm_alumni",
+        "B1": "followup_bumps",
+        "R0": "reactivation",
+        "R3": "reactivation",
+        "r2": "reactivation",          # the pattern is case-insensitive
+    }
+    for slot, expected_pool in cases.items():
+        target = m.resolve_edit_target(slot)
+        assert target is not None, f"{slot} did not resolve"
+        path, pool_key, idx = target
+        assert pool_key == expected_pool, f"{slot} routed to {pool_key}, expected {expected_pool}"
+        assert path == m.OUTREACH_TEMPLATES_PATH
+        assert idx == int(slot[1:])
+
+    assert m.resolve_edit_target("Z0") is None
+    # Every outreach pool /edit can reach must have a lint kind, or an edit ships unchecked.
+    for pool_key in ("cold_ops", "warm_alumni", "followup_bumps", "reactivation"):
+        assert pool_key in m._EDIT_LINT_KINDS, f"{pool_key} is editable but never linted"
+
+
+def test_reactivation_fallback_bank_matches_the_shipped_one():
+    """_FALLBACK_OUTREACH_TEMPLATES is what ships when the JSON fails to load. A pool present in
+    one and missing from the other is the silent-zero failure this repo keeps hitting."""
+    shipped = _load_bank("outreach_templates.json")
+    for pool_key in shipped:
+        assert pool_key in m._FALLBACK_OUTREACH_TEMPLATES, f"{pool_key} has no in-code fallback"
+    fallback = m._FALLBACK_OUTREACH_TEMPLATES["reactivation"][0]
+    rendered = m.interpolate_template(fallback, name="", company=_LINT_COMPANY)
+    assert "I was at Signal through the summer." in rendered
+    assert pu.lint_outreach_template(rendered, "email") == []
+
+
+# ---- Per-command help (/cmd/) ----
+
+def test_trailing_slash_help_never_shadows_a_real_command():
+    """`/w/` explains, `/w` runs. lookup_command_help() sits ABOVE every handler in
+    process_webhook_payload_async, so if it ever answered a real invocation it would silently
+    disable that command. Anything without a trailing slash must return None."""
+    import command_help as ch
+    live = ["/t", "/w", "/e", "/eh", "/draft", "/sendall", "/help", "/edit", "/x", "/apply",
+            "/promote", "/cv", "/letter", "/inbox", "/hot", "/brief", "/n", "/f"]
+    for cmd in live:
+        assert ch.lookup_command_help(cmd) is None, f"{cmd} was swallowed by the help handler"
+        # With arguments it is unambiguously an invocation, trailing slash or not.
+        assert ch.lookup_command_help(f"{cmd} some args") is None
+        assert ch.lookup_command_help(f"{cmd} https://example.com/jobs/1/") is None
+
+    # Degenerate inputs must not be read as help requests either.
+    for junk in ("", "   ", "/", "//", "not a command", "plain text/"):
+        assert ch.lookup_command_help(junk) is None, f"{junk!r} was read as a help request"
+
+
+def test_trailing_slash_help_answers_and_resolves_aliases():
+    import command_help as ch
+    assert "Warm radar" in ch.lookup_command_help("/w/")
+    assert ch.lookup_command_help("/W/") == ch.lookup_command_help("/w/"), "should be case-insensitive"
+
+    # An alias resolves to its canonical entry and says so, rather than dead-ending.
+    resume = ch.lookup_command_help("/resume/")
+    assert "/cv" in resume and "same as" in resume
+
+    # An unknown command still gets an answer pointing at /help, never silence.
+    unknown = ch.lookup_command_help("/nosuchcommand/")
+    assert "/help" in unknown
+
+
+def test_every_help_entry_has_prose_and_an_example():
+    """An entry that is a bare restatement of the command name is not help. This exists because
+    the /help wall was already confusing - a thin entry here would be the same failure again."""
+    import command_help as ch
+    for cmd, (summary, example) in ch.HELP.items():
+        assert cmd.startswith("/"), f"{cmd} is not a command"
+        assert len(summary.split()) >= 8, f"{cmd} summary is too thin to help"
+        assert example.strip(), f"{cmd} has no example"
+    for alias, canonical in ch.ALIASES.items():
+        assert canonical in ch.HELP, f"alias {alias} points at {canonical}, which has no entry"
+
+
+def test_help_covers_the_commands_kevin_actually_applies_with():
+    """/e and /letter are the go-to pair, and /edit is the one with the confusing slot codes.
+    These three must always have an entry - they are why this module exists."""
+    import command_help as ch
+    for cmd in ("/e", "/eh", "/letter", "/cv", "/edit", "/w", "/t"):
+        assert cmd in ch.HELP, f"{cmd} lost its help entry"
+    # The /edit entry must name every live slot bank, since that is the actual confusion.
+    edit_help = ch.lookup_command_help("/edit/")
+    for code in ("C0-C5", "W0-W5", "B0-B1", "R0-R3", "L0-L9"):
+        assert code in edit_help, f"/edit help does not mention {code}"

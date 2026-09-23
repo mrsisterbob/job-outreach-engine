@@ -7877,3 +7877,49 @@ def test_sweep_checks_a_row_that_has_both_uuid_and_link(monkeypatch):
     )
     result = m.check_job_links(sleep_between=0)
     assert result["checked"] == 1
+
+
+# ---- Per-command help intercepts before dispatch (/cmd/) ----
+
+def test_trailing_slash_help_intercepts_before_the_real_handler(monkeypatch):
+    """`/w/` must explain the warm radar, not RUN it. The help lookup sits above every handler in
+    process_webhook_payload_async, so this drives the real webhook entry point rather than calling
+    lookup_command_help() directly - the whole risk is a dispatch-order mistake, which a unit test
+    on the helper cannot see."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+
+    ran = []
+    monkeypatch.setattr(m, "run_warm_radar_scan", lambda *a, **k: ran.append("radar"))
+
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/w/"}})
+    assert ran == [], "/w/ executed the warm radar instead of explaining it"
+    assert sent and "Warm radar" in sent[-1]
+
+
+def test_bare_command_still_reaches_its_handler(monkeypatch):
+    """The other half of the contract: adding the help layer must not shadow a real invocation.
+    /edit with no arguments has a distinctive usage reply, so it proves dispatch got through."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/edit"}})
+    assert sent and "Usage:" in sent[-1], "/edit no longer reaches its own handler"
+
+
+def test_edit_usage_lists_the_slot_codes_that_actually_exist(monkeypatch):
+    """The usage string drifted once already - it advertised C0-C2/W0-W1 long after both pools
+    grew to six, and never learned about R. Pin it against the real banks so the next resize
+    cannot leave the help lying."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/edit"}})
+    usage = sent[-1]
+
+    banks = m.load_outreach_templates()
+    for prefix, pool_key in (("C", "cold_ops"), ("W", "warm_alumni"),
+                             ("B", "followup_bumps"), ("R", "reactivation")):
+        top = len(banks[pool_key]) - 1
+        assert f"{prefix}0-{prefix}{top}" in usage, \
+            f"/edit usage does not advertise {prefix}0-{prefix}{top} for {pool_key}"
+        # And the top slot must really resolve, so the advertised range is not a lie.
+        assert m.resolve_edit_target(f"{prefix}{top}") is not None
