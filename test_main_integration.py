@@ -7240,6 +7240,65 @@ def test_a_guessed_email_is_blank_in_the_sheet_but_still_on_the_card(monkeypatch
     assert "operations@mahle.com [⚠️ Fallback Email]" in cards
 
 
+@pytest.mark.parametrize("addr", [
+    "operations@kuehne-nagel.com",
+    "operations@maximus.com",
+    "operations@universallogistics.com",
+    "operations@advantageagentservices.com",
+    # The waterfall's placeholder-name output - a REAL domain, so the fallback tag never applies
+    # and the role-mailbox list never matched it either. This is what /eh wrote into Tetiana Warm.
+    "operations.lead@kuehne-nagel.com",
+    "operations.lead@maximus.com [⚠️ Unverified]",
+    "hiring.manager@maximus.com",
+])
+def test_no_generic_address_may_ever_reach_the_contact_email_column(addr):
+    """Every one of these was sitting in Tetiana Warm's Contact Email column. None is a person.
+
+    The old predicate only caught a bare role mailbox or the literal "[⚠️ Fallback Email]" tag,
+    so an address the waterfall PATTERNED from the placeholder name "Operations Lead" - at the
+    employer's real domain - passed both tests and was written as though it were confirmed.
+    """
+    assert m.is_guessed_contact_email(addr) is True, addr
+
+
+@pytest.mark.parametrize("addr", [
+    "msalk@inveniam.io", "jeffrey.cooley@cvshealth.com", "dpatnaik@aaalife.com",
+    "craig.radomski@siemens.com", "kara.wise@altarum.org", "awarner@crain.com",
+])
+def test_a_real_person_is_never_mistaken_for_a_guess(addr):
+    """The other half of the line: widening the guess test must not start blanking addresses
+    Kevin actually confirmed, which would silently erase real contacts from the sheet."""
+    assert m.is_guessed_contact_email(addr) is False, addr
+
+
+def test_eh_does_not_write_a_patterned_guess_to_the_sheet(monkeypatch):
+    """/eh used to persist unconditionally - the reasoning being that spending provider credits
+    made the result evidence. But when no provider answers, the waterfall falls back to a pattern
+    built from the placeholder name, which is a guess with extra steps."""
+    payloads = []
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, cid, label: {
+        "sheet_uuid": "uuid-eh", "sheet_tab": "Tetiana Cold",
+        "contact_name": "", "contact_company": "Kuehne+Nagel"})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {
+        "job_title": "Sea Logistics Revenue Specialist 1", "employer_name": "Kuehne+Nagel",
+        "employer_website": "https://kuehne-nagel.com", "job_id": "x"})
+    monkeypatch.setattr(m, "rebuild_job_from_card", lambda job, txt: (job, False))
+    monkeypatch.setattr(m, "_job_data_available", lambda job, mapping: True)
+    monkeypatch.setattr(m, "resolve_email_waterfall",
+                        lambda *a, **k: "operations.lead@kuehne-nagel.com [⚠️ Unverified]")
+    monkeypatch.setattr(m, "log_email_enrichment_attempt", lambda *a, **k: None)
+    monkeypatch.setattr(m, "update_job_target_email", lambda u, e: None)
+    monkeypatch.setattr(m, "log_addressed_contact_to_carmen_cold", lambda *a, **k: None)
+    monkeypatch.setattr(m, "stage_outreach_draft", lambda *a, **k: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: None)
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p))
+
+    _dispatch("/eh", reply_to_message={"text": "card"})
+
+    assert not [p for p in payloads if p.get("action") == "update_contact_email"], \
+        "a patterned guess must never be written to the Contact Email column"
+
+
 def test_a_blank_contact_email_is_still_eligible_for_backfill():
     """Blanking the cell must not opt the row out of the sent-mail back-fill."""
     assert m.is_guessed_contact_email("") is True

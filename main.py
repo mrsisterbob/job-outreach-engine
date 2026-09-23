@@ -12180,7 +12180,15 @@ def process_webhook_payload_async(data):
             confidence = "unverified" if is_unverified_email(target) else "verified"
             log_email_enrichment_attempt(mapping["sheet_uuid"], "waterfall", target, confidence)
             update_job_target_email(mapping["sheet_uuid"], target)
-            enqueue_crm_payload(build_crm_payload("update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=target))
+            # A guess never reaches the Contact Email column, whatever produced it. /eh used to
+            # write unconditionally on the theory that spending provider credits made the result
+            # evidence - but when no provider returns a hit, the waterfall falls back to a pattern
+            # built from the PLACEHOLDER name ("Operations Lead" -> operations.lead@<domain>).
+            # That is not a lookup result, it is resolve_target_email with extra steps, and it is
+            # what filled Tetiana Warm with operations@kuehne-nagel.com and friends.
+            if not is_guessed_contact_email(target):
+                enqueue_crm_payload(build_crm_payload(
+                    "update_contact_email", sheet_uuid=mapping["sheet_uuid"], email=target))
             # Same reasoning as /e: an address resolved and drafted to here is one Kevin is
             # actively working, so it belongs in Carmen Cold regardless of company tracking.
             #

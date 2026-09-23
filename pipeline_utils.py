@@ -1133,11 +1133,29 @@ def is_guessed_contact_email(email):
     raw = str(email or "").strip()
     if not raw:
         return True
-    if "Fallback Email" in raw:
+    # Any bracketed confidence tag means the pipeline made this up: [⚠️ Fallback Email],
+    # [⚠️ Fallback] and [⚠️ Unverified] all mark an address no provider confirmed. Matching only
+    # "Fallback Email" let the waterfall's [⚠️ Unverified] results through, and those are the ones
+    # that filled Tetiana Warm.
+    if "[" in raw and "]" in raw:
         return True
     # Strip the bracketed confidence tag the same way the send path does before inspecting.
     bare = re.sub(r'\s*\[.*?\]\s*', '', raw).strip()
-    return is_role_mailbox(bare)
+    if is_role_mailbox(bare):
+        return True
+    # Addresses patterned from a PLACEHOLDER name rather than a real one. When no provider
+    # answers, the waterfall still returns first.last@domain built from whatever name it was
+    # handed - and /eh hands it "Operations Lead" when the row has no contact, producing
+    # operations.lead@kuehne-nagel.com. That is a guess wearing a person's shape.
+    return _PLACEHOLDER_LOCALPART_RE.match(bare.split("@")[0].strip().lower()) is not None
+
+
+# Local parts that can only have come from a placeholder name, not a real person. Anchored and
+# exact so a genuine "Ops Leadbetter" style surname cannot match by accident.
+_PLACEHOLDER_LOCALPART_RE = re.compile(
+    r'^(?:operations|ops|hiring|talent|recruiting|contact|team|the)'
+    r'[._-]?(?:lead|leader|manager|mgr|team|contact|dept|department)?$'
+)
 
 
 def resolve_sent_email_backfill(to_header, job_rows):
