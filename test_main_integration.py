@@ -191,6 +191,10 @@ def _stub_tracked_tabs(monkeypatch, sheet):
     monkeypatch.setattr(m, "crm_post", _post)
     m._TRACKED_ROLE_CACHE["fetched_at"] = 0
     m._TRACKED_ROLE_CACHE["data"] = set()
+    # The Died set is a SEPARATE cache with no staleness bound, so it must be cleared explicitly -
+    # a set left over from a previous test would keep suppressing here and nowhere would say why.
+    m._DIED_SUPPRESSION_CACHE["fetched_at"] = 0
+    m._DIED_SUPPRESSION_CACHE["data"] = set()
     return asked
 
 
@@ -202,7 +206,9 @@ def test_tracked_keys_include_clavicular_tab(monkeypatch):
     role = {"company": "Doeren Mayhew", "title": "Client Onboarding and Operations Specialist"}
     asked = _stub_tracked_tabs(monkeypatch, {"TC": [], "TW": [], "CL": [role]})
     m.get_tracked_job_keys()
-    assert asked == ["TC", "TW", "CL"], "every tab dispatch can write to must be read back"
+    # DD (Died) is read too, but for the opposite reason: TC/TW/CL are tabs a dispatch can WRITE
+    # to, Died is the tab a role can never be sourced out of again.
+    assert asked == ["TC", "TW", "CL", "DD"], "every tab dispatch can write to must be read back"
     assert m.is_role_tracked(role["company"], role["title"])
 
 
@@ -238,8 +244,77 @@ def test_tracked_keys_errs_open_when_sheets_is_down(monkeypatch):
     monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: None)
     m._TRACKED_ROLE_CACHE["fetched_at"] = 0
     m._TRACKED_ROLE_CACHE["data"] = set()
+    m._DIED_SUPPRESSION_CACHE["fetched_at"] = 0
+    m._DIED_SUPPRESSION_CACHE["data"] = set()
     assert m.get_tracked_job_keys() == set()
     assert not m.is_role_tracked("Doeren Mayhew", "Client Onboarding and Operations Specialist")
+
+
+# ---- Died is terminal: a buried role is forbidden from /t, permanently ----
+
+def test_a_role_in_died_is_never_sourced_again(monkeypatch):
+    """The DACUT case. "Data Analyst (SQL / Business Intelligence)" was auto-retired to Died when
+    its link went dead, then rediscovered the next day and written straight back into Tetiana Cold
+    - because the discovery gate read only the live tabs. Died is terminal: whatever put a role
+    there (an /x, a rejection, a dead posting), it must never be sourced again."""
+    _stub_tracked_tabs(monkeypatch, {
+        "TC": [], "TW": [], "CL": [],
+        "DD": [{"company": "DACUT", "title": "Data Analyst (SQL / Business Intelligence)"}],
+    })
+    m.get_tracked_job_keys()
+    assert m.is_role_tracked("DACUT", "Data Analyst (SQL / Business Intelligence)")
+    # The punctuation variant too: Code.gs keys on normalizeDedupKey, and a role that slips the
+    # md5 hash but collides there would be refused at the write with no card to show for it.
+    assert m.is_role_tracked("DACUT", "Data Analyst SQL Business Intelligence")
+    # A different role at the same company is still fair game - burying one job does not
+    # blacklist the employer.
+    assert not m.is_role_tracked("DACUT", "Treasury Operations Manager")
+
+
+def test_died_suppression_survives_a_sheets_outage_that_clears_the_live_set(monkeypatch):
+    """The two caches must fail in OPPOSITE directions. The live-tab set errs open past its
+    staleness bound so a role whose row Kevin deleted becomes ingestable again. Died has no such
+    escape: erring open there re-sources exactly what he buried."""
+    _stub_tracked_tabs(monkeypatch, {
+        "TC": [{"company": "Rocket", "title": "FX Analyst"}], "TW": [], "CL": [],
+        "DD": [{"company": "DACUT", "title": "Data Analyst (SQL / Business Intelligence)"}],
+    })
+    m.get_tracked_job_keys()
+    assert m.is_role_tracked("Rocket", "FX Analyst")
+
+    # Sheets stops answering, and both caches go stale past the live set's bound.
+    monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: None)
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    stale = time.time() - (m._TRACKED_ROLE_CACHE_MAX_STALE_SECONDS + 60)
+    m._TRACKED_ROLE_CACHE["fetched_at"] = stale
+    m._DIED_SUPPRESSION_CACHE["fetched_at"] = stale
+
+    keys = m.get_tracked_job_keys()
+    assert not m.is_role_tracked("Rocket", "FX Analyst"), "the live set errs open, as it always has"
+    assert keys, "but the Died keys are still enforced"
+    assert m.is_role_tracked("DACUT", "Data Analyst (SQL / Business Intelligence)"), \
+        "a buried role stays buried even when Sheets is unreachable"
+
+
+def test_locate_tracked_role_names_died_so_the_block_is_explainable(monkeypatch):
+    """Without this, a role blocked by Died reported "not found" - which reads as a stale-cache
+    ghost and invites Kevin to retry an ingest that is permanently forbidden."""
+    _stub_tracked_tabs(monkeypatch, {
+        "TC": [], "TW": [], "CL": [],
+        "DD": [{"company": "DACUT", "title": "Data Analyst (SQL / Business Intelligence)"}],
+    })
+    found = m.locate_tracked_role("DACUT", "Data Analyst (SQL / Business Intelligence)")
+    assert found and found["tab"] == "Died"
+
+
+def test_a_died_suppressed_row_never_ships_a_card(monkeypatch):
+    """Code.gs refuses the write and reports died_suppressed. Unlike duplicate_suppressed there is
+    no live row to re-point the card at, so the card must be withheld outright - shipping one would
+    give every /apply and /warm on it a uuid that exists in no tab."""
+    m._stash_batch_dispositions({}, [
+        {"sent_uuid": "uuid-died", "status": "died_suppressed", "existing_uuid": ""},
+    ])
+    assert m.get_batch_disposition("uuid-died")["status"] == "died_suppressed"
 
 
 def test_crm_outbox_drops_permanently_rejected_payload(monkeypatch):

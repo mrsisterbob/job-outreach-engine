@@ -2562,6 +2562,61 @@ _TRACKED_ROLE_CACHE_TTL_SECONDS = 300
 # gate errs OPEN (a duplicate card is recoverable; an un-ingestable role is not).
 _TRACKED_ROLE_CACHE_MAX_STALE_SECONDS = 900
 
+# The Died archive's keys, cached separately from _TRACKED_ROLE_CACHE and governed by the opposite
+# rule. That cache errs OPEN when Sheets goes quiet, because a role whose row Kevin deleted must
+# stay ingestable. This one errs CLOSED and has no staleness bound at all: a role in Died is
+# forbidden from /t permanently, and "Sheets is slow" is not a reason to re-source it. The only
+# thing that empties it is a successful read that no longer contains the key.
+_DIED_SUPPRESSION_CACHE = {"data": set(), "fetched_at": 0.0}
+_DIED_SUPPRESSION_CACHE_TTL_SECONDS = 300
+
+
+def died_suppression_keys():
+    """Every role in the Died archive, as dedup keys that /t must never source again.
+
+    Died is terminal by definition. A row lands there three ways - Kevin's /x, a rejection routed
+    by route_rejection_to_died(), or check_job_links() retiring a posting whose link went dead -
+    and none of them mean "show me this again if it reappears".
+
+    Two keys per row for the same reason get_tracked_job_keys() stores two: the discovery path
+    hashes with generate_dedup_hash() while Code.gs's batch_add_rows guard keys on
+    normalizeDedupKey(), and the two disagree on punctuation and stop tokens. Storing only one
+    lets a role the remote guard WOULD block read as clear locally, which dispatches a card whose
+    write is then silently suppressed - a card with no row behind it.
+
+    On a failed read the last good set keeps answering, with no expiry. That is deliberate and is
+    the opposite of the tracked-role cache: suppressing too much here costs a role Kevin already
+    finished with, suppressing too little re-sources a job he killed.
+    """
+    now = time.time()
+    if now - _DIED_SUPPRESSION_CACHE["fetched_at"] < _DIED_SUPPRESSION_CACHE_TTL_SECONDS:
+        return _DIED_SUPPRESSION_CACHE["data"]
+    try:
+        res = crm_post({"action": "get_followups", "tab": "DD"})
+        if res and res.status_code == 200:
+            data = res.json()
+            if data.get("status") == "success":
+                died = set()
+                for row in data.get("followups", []):
+                    company = str(row.get("company") or "").strip()
+                    title = str(row.get("job_title") or row.get("title") or "").strip()
+                    if company and title:
+                        died.add(generate_dedup_hash(company, title))
+                        died.add(normalize_dedup_key(company, title))
+                _DIED_SUPPRESSION_CACHE["data"] = died
+                _DIED_SUPPRESSION_CACHE["fetched_at"] = now
+                logging.info(f"Died suppression set refreshed: {len(died)} keys - these are forbidden from /t")
+                return died
+    except Exception as e:
+        logging.error(f"died_suppression_keys Error: {e}")
+    # Keep serving the last good set. No staleness bound: see the cache comment above.
+    if _DIED_SUPPRESSION_CACHE["data"]:
+        logging.warning(
+            f"Died suppression refresh failed - still enforcing "
+            f"{len(_DIED_SUPPRESSION_CACHE['data'])} cached keys")
+    return _DIED_SUPPRESSION_CACHE["data"]
+
+
 def normalize_company_for_match(company_name):
     """Lowercase and strip legal suffixes so CRM and scraped company-name variants compare reliably."""
     company = str(company_name or "").strip().lower()
@@ -2789,12 +2844,24 @@ def get_tracked_job_keys():
     write. That mismatch is what dispatched a card whose sheet_uuid had no row behind it, leaving
     every later /warm and /apply on it rejected as "No record found".
 
-    Died is deliberately NOT read: an archived role is one Kevin killed, and re-surfacing it if it
-    is reposted is the intended behavior - the tab is a graveyard, not a live tracking state.
+    Died IS read, and permanently. It used to be excluded on the theory that a reposted role
+    deserved a second look, but that is not what the tab means in practice: a role reaches Died
+    because it is finished - Kevin killed it with /x, a rejection routed it there, or the posting
+    itself went dead. Re-sourcing it is never wanted. Leaving it out put DACUT's "Data Analyst
+    (SQL / Business Intelligence)" and thyssenkrupp's "IT Business Systems Analyst" back into
+    Tetiana Cold within a day of being auto-retired, because a 404 that reindexes overnight reads
+    to the discovery path as a brand new posting.
+
+    Died keys survive the stale-cache drop below. That bound exists so a row Kevin DELETED can be
+    ingested again once Sheets stops answering - but a Died row was not deleted, and erring open
+    on it would re-source exactly what this is here to forbid. See _DIED_SUPPRESSION_CACHE.
     """
     now = time.time()
     if now - _TRACKED_ROLE_CACHE["fetched_at"] < _TRACKED_ROLE_CACHE_TTL_SECONDS:
-        return _TRACKED_ROLE_CACHE["data"]
+        # The union must be on BOTH exits. Returning the bare live set on a cache hit meant Died
+        # suppression worked once and then silently stopped for the rest of the TTL - which is
+        # every call after the first, i.e. almost all of them.
+        return _TRACKED_ROLE_CACHE["data"] | died_suppression_keys()
     tracked = set()
     fetched_any = False
     for target_code in ("TC", "TW", "CL"):
@@ -2848,7 +2915,10 @@ def get_tracked_job_keys():
                 "Cards may repeat for roles already in a tab."
             )
             _TRACKED_ROLE_CACHE["data"] = set()
-    return _TRACKED_ROLE_CACHE["data"]
+    # Died is unioned in on the way OUT, never stored in _TRACKED_ROLE_CACHE. Keeping the two sets
+    # apart is what lets the stale-cache drop above clear live-tab keys (so a deleted row becomes
+    # ingestable again) without ever clearing the Died keys along with them.
+    return _TRACKED_ROLE_CACHE["data"] | died_suppression_keys()
 
 
 def locate_tracked_role(company, title):
@@ -2862,7 +2932,11 @@ def locate_tracked_role(company, title):
     """
     want_hash = generate_dedup_hash(company, title)
     want_key = normalize_dedup_key(company, title)
-    for target_code, tab_name in (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "Clavicular")):
+    # Died is searched LAST but is searched: without it, a role blocked by the Died set reported
+    # "not found" here, which reads as a stale-cache ghost and tells Kevin to retry an ingest that
+    # is in fact permanently forbidden. The tab name in the answer is the explanation.
+    for target_code, tab_name in (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"),
+                                  ("CL", "Clavicular"), ("DD", "Died")):
         try:
             res = crm_post({"action": "get_followups", "tab": target_code})
             if not res or res.status_code != 200:
@@ -7637,8 +7711,12 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on
                                 # cases where a batch is most likely to be entirely duplicates.
                                 # dispatch_tier1_matches re-points each card at its live row.
                                 if written <= 0:
+                                    # died_suppressed counts the same way: the batch was refused
+                                    # on purpose, not lost. Treating it as a failure fired a
+                                    # health alert every time a rerun turned up only roles Kevin
+                                    # had already buried, which is the normal steady state.
                                     all_dupes = bool(dispositions_reported) and all(
-                                        d.get("status") == "duplicate_suppressed"
+                                        d.get("status") in ("duplicate_suppressed", "died_suppressed")
                                         for d in dispositions_reported
                                     )
                                     if not all_dupes:
@@ -10351,6 +10429,15 @@ def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
         # drive the row that is actually there.
         card_uuid = item.get("sheet_uuid")
         disposition = get_batch_disposition(card_uuid)
+        if disposition and disposition["status"] == "died_suppressed":
+            # The role is in the Died archive, so no row was written and there is nothing to point
+            # a card at. Silent by design: Kevin finished with this job, and a "we skipped one"
+            # alert on every rerun would be noise about a decision he already made.
+            logging.info(
+                f"Card withheld for {job.get('employer_name')} - {job.get('job_title')}: "
+                f"the role is in Died and is forbidden from /t"
+            )
+            continue
         if disposition and disposition["status"] == "duplicate_suppressed":
             existing = disposition.get("existing_uuid") or ""
             if existing:

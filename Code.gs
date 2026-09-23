@@ -196,7 +196,8 @@ function doPost(e) {
 
       // In-append dedup guard (JOBS only): seed the set of live Company+Role keys already in
       // the tab, then skip any batch row that collides with it or with an earlier row in this
-      // same batch. Terminal rows (Rejected / the Died tab) never count as a live duplicate.
+      // same batch. A Rejected row does not count as a live duplicate. The Died tab is handled
+      // separately below - it blocks the write entirely rather than re-pointing a card.
       // Maps the dedup key to the uuid of the LIVE row already holding it, not just a boolean.
       // The uuid is what main.py needs to recover: a suppressed row's card would otherwise carry
       // the uuid this batch generated, which was never written to any tab, so every later
@@ -210,6 +211,26 @@ function doPost(e) {
         }
       }
 
+      // The Died archive blocks a write outright. main.py's discovery gate already refuses these
+      // before a card is dispatched; this is the backstop that keeps the two layers agreeing, and
+      // it matters because they key on DIFFERENT algorithms - anything that slips past the Python
+      // hash still has to clear normalizeDedupKey() here.
+      //
+      // Mapped to "" rather than to a uuid: a suppressed duplicate normally re-points its card at
+      // the live row holding the key, but a Died row is not something to open a card onto. The
+      // disposition below reports it as died_suppressed so main.py can say so plainly.
+      const diedKeys = {};
+      if (schemaType === "JOBS") {
+        const diedSheet = ss.getSheetByName("Died");
+        if (diedSheet && diedSheet.getLastRow() >= 2) {
+          const buried = diedSheet.getRange(2, 1, diedSheet.getLastRow() - 1, SCHEMAS.JOBS.length).getValues();
+          for (let d = 0; d < buried.length; d++) {
+            const key = normalizeDedupKey(buried[d][1], buried[d][2]);
+            if (key !== "|") diedKeys[key] = true;
+          }
+        }
+      }
+
       let suppressed = 0;
       // Per-row disposition, parallel to the rows the caller sent. main.py reads this to re-point a
       // suppressed row's card at the row that actually exists.
@@ -220,6 +241,15 @@ function doPost(e) {
         const normalized = normalizeRowData(item.row_data, schemaType);
         if (schemaType === "JOBS") {
           const key = normalizeDedupKey(normalized[1], normalized[2]);
+          if (key !== "|" && diedKeys.hasOwnProperty(key)) {
+            suppressed++;
+            dispositions.push({
+              sent_uuid: item.sheet_uuid || "",
+              status: "died_suppressed",
+              existing_uuid: ""
+            });
+            continue;
+          }
           if (key !== "|" && liveKeys.hasOwnProperty(key)) {
             suppressed++;
             dispositions.push({
@@ -436,7 +466,12 @@ function doPost(e) {
                       payload.tab === "CH" ? "Carmen Hot" :
                       payload.tab === "TC" ? "Tetiana Cold" :
                       payload.tab === "TW" ? "Tetiana Warm" :
-                      payload.tab === "CL" ? "Clavicular" : null;
+                      payload.tab === "CL" ? "Clavicular" :
+                      // The Died archive, readable ONLY so the discovery gate can refuse to
+                      // re-source what is in it. A role reaching Died is forbidden from /t
+                      // permanently - see died_suppression_keys() in main.py. Nothing writes
+                      // here through this action; it is a read of a graveyard.
+                      payload.tab === "DD" ? "Died" : null;
       if (!tabName) {
         return respondJSON({ status: "error", message: `Unknown target_code: ${payload.tab}` });
       }
