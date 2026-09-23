@@ -12247,14 +12247,18 @@ def process_webhook_payload_async(data):
             # refused every job-alert row without a website and bare /e could not draft at all.
             # The draft is the point; Kevin reads it before anything is sent.
             #
-            # A GUESSED address is not a contact. resolve_target_email() always returns something -
-            # when it has no real domain it invents one from the company name and tags it
-            # [⚠️ Fallback Email] - and writing that to the sheet filled the Contact Email column
-            # with addresses nobody had verified, indistinguishable at a glance from ones Kevin
-            # actually confirmed. A bare /e that resolves a guess now leaves the column BLANK; the
-            # draft still goes out to the guess, because a draft needs a recipient and Kevin reads
-            # it before sending.
-            persist_email = typed_email or not is_unverified_email(new_email)
+            # A GUESSED address is not a contact, and is_guessed_contact_email() is the ONLY test
+            # that decides it. This used to gate on is_unverified_email(), which reads the
+            # [⚠️ Fallback] tag - a tag that marks an invented DOMAIN and nothing else. So
+            # operations@computacenter.com and wealthops@waldronprivatewealth.com, role mailboxes
+            # at the employer's REAL domain, carried no tag, read as "verified" and were written
+            # straight into the Contact Email column. Every generic address in Tetiana Warm got
+            # there through this line.
+            #
+            # The two predicates must never diverge again: the discovery path at
+            # dispatch_tier1_matches() already blanks the cell with is_guessed_contact_email(), so
+            # gating the /e write on anything weaker meant /e could write what discovery refused.
+            persist_email = typed_email or not is_guessed_contact_email(new_email)
             if persist_email:
                 update_job_target_email(mapping["sheet_uuid"], new_email)
 
@@ -12263,8 +12267,8 @@ def process_webhook_payload_async(data):
             # command look like three different outcomes.
             #
             # The [⚠️ Fallback Email] tag is stripped for DISPLAY only. new_email keeps it, because
-            # is_unverified_email() reads that tag and persist_email above depends on it - dropping
-            # it from the value would start writing guessed addresses into the CRM.
+            # is_guessed_contact_email() reads any bracketed tag and persist_email above depends on
+            # it - dropping it from the value would start writing guessed addresses into the CRM.
             header = (f"🎯 <b>Apollo Email Locked:</b> "
                       f"<code>{html.escape(re.sub(r'\s*\[.*?\]\s*', '', new_email).strip())}</code>")
             # Resume PDF, email body, Gmail draft and card - shared with /eh

@@ -7271,6 +7271,27 @@ def test_a_real_person_is_never_mistaken_for_a_guess(addr):
     assert m.is_guessed_contact_email(addr) is False, addr
 
 
+@pytest.mark.parametrize("company,site,expected", [
+    ("Computacenter", "https://computacenter.com", "operations@computacenter.com"),
+    ("Raymond James", "https://raymondjames.com", "operations@raymondjames.com"),
+    # _e_env's job title has no "wealth" keyword, so this resolves to operations@ rather than the
+    # wealthops@ the real Waldron card produced. The mailbox prefix is not what is under test -
+    # that a role mailbox at a REAL domain is refused, is.
+    ("Waldron Private Wealth", "https://waldronprivatewealth.com",
+     "operations@waldronprivatewealth.com"),
+])
+def test_the_exact_addresses_that_reached_the_sheet_are_now_blocked(monkeypatch, company, site,
+                                                                    expected):
+    """Each of these was written into a real CRM row by bare /e. All three are role mailboxes at
+    the employer's genuine domain - untagged, so the old is_unverified_email() gate passed them."""
+    saved = _e_env(monkeypatch, employer_website=site, company=company)
+
+    _dispatch("/e", reply_to_message={"text": "card"})
+
+    assert saved["drafted_to"] == expected, "the draft is still produced"
+    assert saved["local"] == [] and saved["crm"] == [], f"{expected} must never be stored"
+
+
 def test_eh_does_not_write_a_patterned_guess_to_the_sheet(monkeypatch):
     """/eh used to persist unconditionally - the reasoning being that spending provider credits
     made the result evidence. But when no provider answers, the waterfall falls back to a pattern
@@ -7672,14 +7693,26 @@ def test_bare_e_still_drafts_to_an_invented_role_mailbox_but_says_do_not_send(mo
     assert saved["crm"] == [], "a guessed address must never reach the sheet"
 
 
-def test_bare_e_persists_an_address_off_the_real_domain(monkeypatch):
-    """An address built from the employer's actual website is evidence, not a guess."""
+def test_bare_e_never_persists_a_role_mailbox_even_at_the_real_domain(monkeypatch):
+    """A REAL domain does not make operations@ a person, and this test used to assert the
+    opposite - that operations@realco.com was "evidence" worth writing to the sheet.
+
+    That rule is what filled Tetiana Warm with operations@computacenter.com,
+    operations@raymondjames.com and wealthops@waldronprivatewealth.com. The gate was
+    is_unverified_email(), which only reads the [⚠️ Fallback] tag - and that tag marks an invented
+    DOMAIN, not an invented mailbox. A role mailbox at the employer's own domain carries no tag,
+    so it read as verified and was written.
+
+    The only test that decides this is is_guessed_contact_email(), the same one the discovery
+    path uses to blank the cell. If /e used a weaker rule it could write what discovery refused.
+    """
     saved = _e_env(monkeypatch, employer_website="https://realco.com", company="Real Co")
 
     _dispatch("/e", reply_to_message={"text": "card"})
 
-    assert saved["local"] == ["operations@realco.com"]
-    assert len(saved["crm"]) == 1, "a resolved real-domain address still syncs to the sheet"
+    assert saved["drafted_to"] == "operations@realco.com", "it must still DRAFT to the guess"
+    assert saved["local"] == [], "but a role mailbox must never reach the local cache"
+    assert saved["crm"] == [], "and never reach the sheet"
 
 
 def test_typed_address_always_persists(monkeypatch):
