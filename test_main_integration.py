@@ -7518,17 +7518,24 @@ def test_bare_e_leaves_contact_email_blank_when_it_only_has_a_guess(monkeypatch)
     assert saved["crm"] == [], "a guessed address must never reach the sheet"
 
 
-def test_bare_e_refuses_to_draft_to_an_invented_role_mailbox(monkeypatch):
+def test_bare_e_still_drafts_to_an_invented_role_mailbox_but_says_do_not_send(monkeypatch):
     """With no employer website, resolution invents BOTH the mailbox and the domain
-    (operations@<mangled-name>.com). That is not an address, and a draft addressed to one is
-    indistinguishable from a real draft in the Gmail list - which is how operations@mahle.com got
-    sent on 2026-09-23. /e declines and asks for a name instead."""
+    (operations@<mangled-name>.com) - the shape that got operations@mahle.com sent on 2026-09-23.
+
+    This used to REFUSE to draft. That was an outage, not a guard: resolve_target_email() has no
+    non-role output at all (operations@/bizops@/compliance@/wealthops@ are its only returns), so
+    every job-alert row without a website answered "Draft Not Created" and bare /e was dead.
+
+    The draft is not the dangerous step - sending is, and Kevin reads every draft first. So the
+    copy is produced, the header says DO NOT SEND, and the address still never reaches the CRM.
+    """
     saved = _e_env(monkeypatch, employer_website=None)
 
     _dispatch("/e", reply_to_message={"text": "card"})
 
-    assert not saved.get("drafted_to"), "no draft may be addressed to an invented role mailbox"
-    assert saved["local"] == [] and saved["crm"] == []
+    assert saved.get("drafted_to"), "the draft must still be produced - refusing here broke /e"
+    assert saved["local"] == [], "a guessed address must never reach the local cache"
+    assert saved["crm"] == [], "a guessed address must never reach the sheet"
 
 
 def test_bare_e_persists_an_address_off_the_real_domain(monkeypatch):

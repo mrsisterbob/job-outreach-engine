@@ -11964,21 +11964,6 @@ def process_webhook_payload_async(data):
                     return
             else:
                 target = resolve_target_email(comp, title, job.get("employer_website"))
-            # A shared inbox at an INVENTED domain is not a person and not even a real address.
-            # A Gmail draft addressed to one sits in the drafts list looking exactly like a real
-            # one, which is how operations@mahle.com got sent on 2026-09-23. Both conditions must
-            # hold: operations@<real-employer-domain> is a convention worth trying, because the
-            # domain came off the employer's own website. Only the fully invented pair is refused.
-            if (is_unverified_email(target)
-                    and is_role_mailbox(re.sub(r'\s*\[.*?\]\s*', '', target).strip())):
-                send_telegram_message(
-                    chat_id,
-                    f"⚠️ <b>Role Mailbox - Draft Not Created</b>\n"
-                    f"<b>Best guess:</b> <code>{html.escape(target)}</code>\n\n"
-                    f"That is a shared inbox, not a person. Reply <code>/e actual@email.com</code> "
-                    f"with a real address to create the draft."
-                )
-                return
             track = job.get("track", "a")
             bullet_indices = job.get("bullet_indices")
             tone_mode = job.get("tone_mode", "conservative")
@@ -12087,21 +12072,12 @@ def process_webhook_payload_async(data):
             new_email = raw_email if typed_email else resolve_target_email(
                 comp, title, job.get("employer_website")
             )
-            # Bare /e that lands on a role mailbox at an INVENTED domain declines. Two things have
-            # to be wrong before refusing: the mailbox is shared AND the domain was guessed from
-            # the company name (the [⚠️ Fallback] tag). operations@<real-employer-domain> is a
-            # convention worth trying - the domain is evidence - so it still drafts. A TYPED
-            # address is always honoured: writing to careers@ deliberately is Kevin's call.
-            if (not typed_email and is_unverified_email(new_email)
-                    and is_role_mailbox(re.sub(r'\s*\[.*?\]\s*', '', new_email).strip())):
-                send_telegram_message(
-                    chat_id,
-                    f"⚠️ <b>Role Mailbox - Draft Not Created</b>\n"
-                    f"<b>Best guess:</b> <code>{html.escape(new_email)}</code>\n\n"
-                    f"That is a shared inbox, not a person. Reply <code>/e actual@email.com</code> "
-                    f"with a real address to create the draft."
-                )
-                return
+            # /e always drafts, whatever the address resolves to. It used to refuse when the
+            # mailbox AND the domain were both guesses, but resolve_target_email() has no non-role
+            # output (operations@/bizops@/compliance@/wealthops@ are its only returns), so that
+            # refused every job-alert row without a website and bare /e could not draft at all.
+            # The draft is the point; Kevin reads it before anything is sent.
+            #
             # A GUESSED address is not a contact. resolve_target_email() always returns something -
             # when it has no real domain it invents one from the company name and tags it
             # [⚠️ Fallback Email] - and writing that to the sheet filled the Contact Email column
@@ -12113,16 +12089,15 @@ def process_webhook_payload_async(data):
             if persist_email:
                 update_job_target_email(mapping["sheet_uuid"], new_email)
 
-            if typed_email:
-                header = f"🎯 <b>Apollo Email Locked:</b> <code>{html.escape(new_email)}</code>"
-            elif persist_email:
-                header = f"✉️ <b>Drafted to:</b> <code>{html.escape(new_email)}</code> <i>(auto-resolved)</i>"
-            else:
-                header = (
-                    f"✉️ <b>Drafted to:</b> <code>{html.escape(new_email)}</code>\n"
-                    "<i>Guessed from the company name - NOT saved to the CRM. Send "
-                    "<code>/e name@company.com</code> once you have a real address.</i>"
-                )
+            # One header for every path. How the address was resolved is a distinction Kevin does
+            # not act on - he reads the draft either way - and three variants only made the same
+            # command look like three different outcomes.
+            #
+            # The [⚠️ Fallback Email] tag is stripped for DISPLAY only. new_email keeps it, because
+            # is_unverified_email() reads that tag and persist_email above depends on it - dropping
+            # it from the value would start writing guessed addresses into the CRM.
+            header = (f"🎯 <b>Apollo Email Locked:</b> "
+                      f"<code>{html.escape(re.sub(r'\s*\[.*?\]\s*', '', new_email).strip())}</code>")
             # Resume PDF, email body, Gmail draft and card - shared with /eh
             stage_outreach_draft(chat_id, mapping, job, comp, title, is_warm, new_email, header, "/e")
             if persist_email:
