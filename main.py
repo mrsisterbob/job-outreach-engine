@@ -1096,6 +1096,25 @@ def init_db():
             payload_json TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        # Locally-known buried roles. Written the moment anything moves a row to Died, so the
+        # discovery gate can enforce "Died means died" WITHOUT a round trip to Apps Script.
+        #
+        # The remote read (get_followups tab=DD) is still the authority on rows Kevin buried by
+        # hand in the sheet, but it is only as good as the deployed Code.gs - an older deployment
+        # answers that request with an error body and HTTP 200, which read as "no buried roles"
+        # and let ALPINE POWER SYSTEMS / ADMIN respawn out of Died. This table has no such
+        # dependency: it is written by the same process that does the burying.
+        #
+        # Two keys per row, matching the two dedup algorithms that disagree (generate_dedup_hash
+        # keeps punctuation, normalize_dedup_key strips it). Stored, not recomputed, so a later
+        # change to either function cannot silently unbury a role.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS died_roles (
+            dedup_key TEXT PRIMARY KEY,
+            company TEXT,
+            title TEXT,
+            buried_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
         # The inbound tray: one row per Gmail THREAD, not per message.
         #
         # This is the ledger the notification path never had. Before it, Gmail's own UNREAD flag
@@ -2571,6 +2590,105 @@ _DIED_SUPPRESSION_CACHE = {"data": set(), "fetched_at": 0.0}
 _DIED_SUPPRESSION_CACHE_TTL_SECONDS = 300
 
 
+def record_died_role(company, title):
+    """Remember locally that this role is buried. Called wherever a row moves to Died.
+
+    Idempotent (INSERT OR IGNORE on the key), never raises, and stores BOTH dedup keys so the
+    gate matches whichever algorithm a later caller uses. Returns True if anything was written.
+    """
+    company = str(company or "").strip()
+    title = str(title or "").strip()
+    if not company or not title:
+        return False
+    try:
+        with get_db_conn() as conn:
+            for key in (generate_dedup_hash(company, title), normalize_dedup_key(company, title)):
+                conn.execute(
+                    "INSERT OR IGNORE INTO died_roles (dedup_key, company, title) VALUES (?, ?, ?)",
+                    (key, company, title))
+            conn.commit()
+        logging.info(f"[DIED] Buried locally: {company} - {title} (forbidden from /t)")
+        return True
+    except Exception as e:
+        logging.error(f"record_died_role error ({company} / {title}): {e}")
+        return False
+
+
+def backfill_died_roles_from_sheet():
+    """Seed the local ledger from the Died tab. Returns (recorded, total) or (0, 0) on failure.
+
+    The ledger only knows what this process buried, so on first run it is empty and everything
+    already in Died is unprotected. This reads the tab once and records what is there.
+
+    Requires a Code.gs that knows the DD target code - which is exactly what may be missing, so
+    the caller must treat (0, 0) as "could not read" rather than "nothing to do".
+    """
+    res = crm_post({"action": "get_followups", "tab": "DD"})
+    if not res or res.status_code != 200:
+        return 0, 0
+    try:
+        data = res.json()
+    except Exception:
+        return 0, 0
+    if data.get("status") != "success":
+        return 0, 0
+    rows = data.get("followups", [])
+    recorded = 0
+    for row in rows:
+        company = str(row.get("company") or "").strip()
+        title = str(row.get("job_title") or row.get("title") or "").strip()
+        if company and title and record_died_role(company, title):
+            recorded += 1
+    logging.info(f"[DIED] Backfilled {recorded} buried role(s) from the Died tab into the local ledger")
+    return recorded, len(rows)
+
+
+def _reset_died_ledger():
+    """Empty the local buried-role ledger and its caches. For tests and a deliberate /t reset."""
+    try:
+        with get_db_conn() as conn:
+            conn.execute("DELETE FROM died_roles")
+            conn.commit()
+    except Exception as e:
+        logging.error(f"_reset_died_ledger error: {e}")
+    _DIED_SUPPRESSION_CACHE["data"] = set()
+    _DIED_SUPPRESSION_CACHE["fetched_at"] = 0.0
+
+
+def local_died_keys():
+    """Every locally-recorded buried dedup key. Returns set(); never raises."""
+    try:
+        with get_db_conn() as conn:
+            return {r[0] for r in conn.execute("SELECT dedup_key FROM died_roles")}
+    except Exception as e:
+        logging.error(f"local_died_keys error: {e}")
+        return set()
+
+
+_DIED_GATE_ALERTED = {"at": 0.0}
+_DIED_GATE_ALERT_COOLDOWN_SECONDS = 3600
+
+
+def _report_died_gate_down(detail):
+    """Say out loud that Died enforcement is not running. Rate-limited to once an hour.
+
+    Silence here is the whole problem: an un-deployed Code.gs answers the DD read with an error
+    body and HTTP 200, so the suppression set came back empty and /t happily re-sourced buried
+    roles while every log line looked normal.
+    """
+    logging.error(f"[DIED GATE DOWN] Died suppression is NOT enforcing: {detail}")
+    now = time.time()
+    if now - _DIED_GATE_ALERTED["at"] < _DIED_GATE_ALERT_COOLDOWN_SECONDS:
+        return
+    _DIED_GATE_ALERTED["at"] = now
+    send_health_alert(
+        "🛑 <b>Died suppression is OFF</b> - buried roles can be re-sourced by /t.\n"
+        f"<i>{html.escape(str(detail))}</i>\n\n"
+        "Apps Script does not recognise the <code>DD</code> target code. Re-deploy Code.gs "
+        "(Deploy → Manage deployments → Edit → Deploy) to turn the gate back on."
+    )
+
+
 def died_suppression_keys():
     """Every role in the Died archive, as dedup keys that /t must never source again.
 
@@ -2588,9 +2706,13 @@ def died_suppression_keys():
     the opposite of the tracked-role cache: suppressing too much here costs a role Kevin already
     finished with, suppressing too little re-sources a job he killed.
     """
+    # The local ledger is unioned into EVERY return path below. It needs no network and no
+    # up-to-date Apps Script deployment, so it is what actually holds the line when the remote
+    # read fails - which it does silently on an older Code.gs.
+    local = local_died_keys()
     now = time.time()
     if now - _DIED_SUPPRESSION_CACHE["fetched_at"] < _DIED_SUPPRESSION_CACHE_TTL_SECONDS:
-        return _DIED_SUPPRESSION_CACHE["data"]
+        return _DIED_SUPPRESSION_CACHE["data"] | local
     try:
         res = crm_post({"action": "get_followups", "tab": "DD"})
         if res and res.status_code == 200:
@@ -2606,15 +2728,28 @@ def died_suppression_keys():
                 _DIED_SUPPRESSION_CACHE["data"] = died
                 _DIED_SUPPRESSION_CACHE["fetched_at"] = now
                 logging.info(f"Died suppression set refreshed: {len(died)} keys - these are forbidden from /t")
-                return died
+                return died | local
+            # An Apps Script that does not know the "DD" target code answers HTTP 200 with
+            # {"status":"error","message":"Unknown target_code: DD"}. That used to fall through to
+            # an empty set and suppress NOTHING, silently - Died enforcement looked deployed and
+            # was not, which is how ALPINE POWER SYSTEMS / ADMIN respawned out of Died.
+            #
+            # This is the one failure that must never be quiet: it means Code.gs is out of date.
+            _report_died_gate_down(str(data.get("message") or "")[:160])
+        elif res is not None:
+            _report_died_gate_down(f"HTTP {res.status_code}")
+        else:
+            _report_died_gate_down("no response from Apps Script")
     except Exception as e:
         logging.error(f"died_suppression_keys Error: {e}")
+        _report_died_gate_down(str(e)[:160])
     # Keep serving the last good set. No staleness bound: see the cache comment above.
-    if _DIED_SUPPRESSION_CACHE["data"]:
+    if _DIED_SUPPRESSION_CACHE["data"] or local:
         logging.warning(
             f"Died suppression refresh failed - still enforcing "
-            f"{len(_DIED_SUPPRESSION_CACHE['data'])} cached keys")
-    return _DIED_SUPPRESSION_CACHE["data"]
+            f"{len(_DIED_SUPPRESSION_CACHE['data'] | local)} keys "
+            f"({len(local)} from the local ledger)")
+    return _DIED_SUPPRESSION_CACHE["data"] | local
 
 
 def normalize_company_for_match(company_name):
@@ -8211,6 +8346,8 @@ def route_rejection_to_died(company, subject="", snippet=""):
             "append_note", sheet_uuid=row["sheet_uuid"],
             note=f"[{today_str}] Rejected - auto-archived to {new_tab} from the inbound rejection."))
         record_application_outcome(row["sheet_uuid"], "rejection", company=company)
+        if new_tab == "Died":
+            record_died_role(company, row.get("title"))
         logging.info(f"[REJECTION ROUTING] Archived {company} / {row['title']} to {new_tab}")
         return (f"\n💀 <b>Auto-archived to {new_tab}:</b> {html.escape(row['title'])}\n"
                 f"<i>The only live row at {html.escape(company)}.</i>\n")
@@ -8261,6 +8398,8 @@ def resolve_pending_kill(company_token, choice):
             "append_note", sheet_uuid=row["sheet_uuid"],
             note=f"[{today_str}] Rejected - archived to {new_tab} via /kill."))
         record_application_outcome(row["sheet_uuid"], "rejection", company=pending["company"])
+        if new_tab == "Died":
+            record_died_role(pending["company"], row.get("title"))
         done.append(f"• {html.escape(row['title'])} → {new_tab}")
     # Cleared either way: a second /kill on the same card would re-archive rows already moved.
     with _PENDING_KILL_LOCK:
@@ -8819,6 +8958,7 @@ def run_followup_sequencer(today=None, dry_run=False):
                 note=f"[reason: never actioned after {MATCHED_EXPIRY_DAYS}d]",
             ))
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Died"))
+            record_died_role(rec.get("company"), rec.get("title"))
             _record_sequencer_action(sheet_uuid, run_date, "expire_matched")
             buries_written += 1
             continue
@@ -8898,6 +9038,7 @@ def run_followup_sequencer(today=None, dry_run=False):
             # The one automatic write: note the reason (row still in its source tab), then move to Died.
             enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=sheet_uuid, note="[reason: ghosted]"))
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Died"))
+            record_died_role(company, role)
             _record_sequencer_action(sheet_uuid, run_date, action)
             buries_written += 1
 
@@ -9350,6 +9491,10 @@ def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=L
                     enqueue_crm_payload(build_crm_payload(
                         "update_status", sheet_uuid=sheet_uuid, new_tab="Died"
                     ))
+                    # This is the path that buried ALPINE POWER SYSTEMS / ADMIN and every other
+                    # "Auto-retired: job link dead" row, so it is the one that most needs to make
+                    # the bury stick locally.
+                    record_died_role(company, role)
                     try:
                         with get_db_conn() as conn:
                             conn.execute("UPDATE job_link_status SET retired = 1 WHERE sheet_uuid = ?", (sheet_uuid,))
@@ -11441,6 +11586,21 @@ def process_webhook_payload_async(data):
 
         if text == "/resync":
             invalidate_tracked_role_cache()
+            _DIED_SUPPRESSION_CACHE["fetched_at"] = 0.0
+            # Also reconcile the Died ledger. This is the command Kevin reaches for when the sheet
+            # and the system disagree, and "a buried role came back" is exactly that complaint.
+            buried_new, buried_total = backfill_died_roles_from_sheet()
+            local_buried = len(local_died_keys()) // 2
+            if buried_total == 0 and local_buried == 0:
+                died_line = ("\n\n🛑 <b>Died gate: OFF</b> - Apps Script did not answer the Died "
+                             "read. Re-deploy Code.gs, or buried roles can come back.")
+            elif buried_total == 0:
+                died_line = (f"\n\n⚠️ <b>Died gate: LOCAL ONLY</b> - enforcing {local_buried} "
+                             f"buried role(s) from the local ledger, but Sheets did not answer, "
+                             f"so rows you buried by hand are not covered. Re-deploy Code.gs.")
+            else:
+                died_line = (f"\n\n💀 <b>Died gate: ON</b> - {local_buried} buried role(s) "
+                             f"forbidden from /t ({buried_new} newly recorded).")
             keys = get_tracked_job_keys()
             if keys:
                 send_telegram_message(
@@ -11448,6 +11608,7 @@ def process_webhook_payload_async(data):
                     "🔄 <b>Suppression list refreshed</b>\n\n"
                     f"Re-read Tetiana Cold + Warm + Clavicular: <b>{len(keys) // 2}</b> role(s) "
                     "are currently tracked.\n\nA role you deleted by hand will now ingest normally."
+                    + died_line
                 )
             else:
                 send_telegram_message(
@@ -12570,6 +12731,13 @@ def process_webhook_payload_async(data):
             # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"❌ Archived to {new_tab}.")
             enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+            # A JOB killed by hand is the most deliberate bury there is - record it locally so /t
+            # can never re-source it, whatever state the Apps Script deployment is in.
+            if new_tab == "Died":
+                job = get_job_by_sheet_uuid(sheet_uuid) or {}
+                record_died_role(
+                    job.get("employer_name") or mapping.get("contact_company"),
+                    job.get("job_title"))
             return
 
         if text == "/brief":

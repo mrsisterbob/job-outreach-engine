@@ -296,6 +296,81 @@ def test_died_suppression_survives_a_sheets_outage_that_clears_the_live_set(monk
         "a buried role stays buried even when Sheets is unreachable"
 
 
+def test_an_undeployed_apps_script_cannot_silently_disable_the_died_gate(monkeypatch):
+    """THE BUG that let ALPINE POWER SYSTEMS / ADMIN respawn out of Died.
+
+    An Apps Script that predates the DD target code answers the Died read with HTTP 200 and
+    {"status":"error","message":"Unknown target_code: DD"}. The old code checked only for
+    status=="success", fell through, and returned an EMPTY set - so the gate reported no buried
+    roles, suppressed nothing, and logged nothing unusual. It looked deployed and was not.
+
+    Two things must now hold: the local ledger keeps enforcing, and Kevin is told.
+    """
+    m._reset_died_ledger()
+    m.record_died_role("ALPINE POWER SYSTEMS", "ADMIN")
+
+    alerts = []
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+
+    class _OldDeployment:
+        status_code = 200
+        def json(self):
+            return {"status": "error", "message": "Unknown target_code: DD"}
+
+    monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: _OldDeployment())
+    m._DIED_SUPPRESSION_CACHE["fetched_at"] = 0
+    m._DIED_SUPPRESSION_CACHE["data"] = set()
+    m._DIED_GATE_ALERTED["at"] = 0
+
+    keys = m.died_suppression_keys()
+    assert keys, "an unreadable Died tab must not mean 'nothing is buried'"
+    assert m.generate_dedup_hash("ALPINE POWER SYSTEMS", "ADMIN") in keys
+    assert alerts and "Died suppression is OFF" in alerts[0], \
+        "a gate that cannot enforce must say so - silence is what caused the respawn"
+    m._reset_died_ledger()
+
+
+def test_the_local_ledger_blocks_a_buried_role_with_no_network_at_all(monkeypatch):
+    """The ledger is written by the same process that does the burying, so it holds the line
+    when Apps Script is unreachable, un-deployed, or answering nonsense."""
+    m._reset_died_ledger()
+    m.record_died_role("ALPINE POWER SYSTEMS", "ADMIN")
+
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: None)
+    m._TRACKED_ROLE_CACHE["fetched_at"] = 0
+    m._TRACKED_ROLE_CACHE["data"] = set()
+    m._DIED_SUPPRESSION_CACHE["fetched_at"] = 0
+    m._DIED_SUPPRESSION_CACHE["data"] = set()
+    m._DIED_GATE_ALERTED["at"] = 0
+
+    assert m.is_role_tracked("ALPINE POWER SYSTEMS", "ADMIN"), \
+        "a locally-buried role is forbidden from /t even with Sheets down"
+    # Case and the punctuation variant collapse to the same keys.
+    assert m.is_role_tracked("Alpine Power Systems", "ADMIN")
+    # A different role at the same company is still allowed through.
+    assert not m.is_role_tracked("ALPINE POWER SYSTEMS", "Operations Analyst")
+    m._reset_died_ledger()
+
+
+def test_burying_a_role_records_it_locally_so_the_next_pull_refuses_it(monkeypatch):
+    """The write path, per CLAUDE.md: drive the real retire and assert what the NEXT discovery
+    pass reads back, not what the function returned."""
+    m._reset_died_ledger()
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    monkeypatch.setattr(m, "crm_post", lambda p, timeout=10: None)
+    m._DIED_SUPPRESSION_CACHE["fetched_at"] = 0
+    m._DIED_SUPPRESSION_CACHE["data"] = set()
+    m._DIED_GATE_ALERTED["at"] = 0
+
+    assert not m.is_role_tracked("Stellantis Financial", "ICT Product Analyst, Purchasing Systems")
+    m.record_died_role("Stellantis Financial", "ICT Product Analyst, Purchasing Systems")
+    m._DIED_SUPPRESSION_CACHE["fetched_at"] = 0
+    assert m.is_role_tracked("Stellantis Financial", "ICT Product Analyst, Purchasing Systems")
+    m._reset_died_ledger()
+
+
 def test_locate_tracked_role_names_died_so_the_block_is_explainable(monkeypatch):
     """Without this, a role blocked by Died reported "not found" - which reads as a stale-cache
     ghost and invites Kevin to retry an ingest that is permanently forbidden."""
