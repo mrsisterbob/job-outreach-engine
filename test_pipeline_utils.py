@@ -739,11 +739,11 @@ def _load_bank(filename):
 def test_template_banks_have_the_exact_lengths_gemini_routes_against():
     # Gemini routes by integer index and /edit addresses by position; a resize silently
     # corrupts routing (a bad index falls back to 0, so every email becomes identical).
-    # These counts are mirrored in response_schema.py (le=9, le=5) and main.build_system_prompt().
+    # These counts are mirrored in response_schema.py (le=9, le=7) and main.build_system_prompt().
     outreach = _load_bank("outreach_templates.json")
     linkedin = _load_bank("linkedin_templates.json")
-    assert len(outreach["cold_ops"]) == 6
-    # warm_alumni is the one pool Gemini does NOT route into: outreach_template_id is le=5 and
+    assert len(outreach["cold_ops"]) == 8
+    # warm_alumni is the one pool Gemini does NOT route into: outreach_template_id is le=7 and
     # selects cold_ops, while generate_warm_email takes an explicit template_id (default 0). So
     # this count is a /edit addressing contract (W0-W5), not a routing one, and growing the pool
     # is safe. Six entries so the highest-converting path has real variety in the ask.
@@ -806,7 +806,7 @@ def test_cold_ops_encodes_the_professional_corpus_voice():
     they described the previous bank's habits, and the new copy shares one body by design.
     """
     cold = _load_bank("outreach_templates.json")["cold_ops"]
-    assert len(cold) == 6
+    assert len(cold) == 8
     rendered_all = [
         m.interpolate_template(t, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE)
         for t in cold
@@ -851,14 +851,14 @@ def test_gmail_generators_pass_the_same_linter_as_the_card_templates():
 def test_gmail_generators_render_the_same_string_the_card_shows():
     """Byte-for-byte parity is the point: /draft re-renders the routed template_id, so the Gmail
     body is the copy Kevin already approved on the card, not cold_ops[0] every time."""
-    for template_id in range(6):
+    for template_id in range(8):
         card_copy = m.render_outreach_email(
             "cold_ops", template_id, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE
         )
         gmail_copy = m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, template_id=template_id)
         assert card_copy == gmail_copy
     # Distinct entries really are distinct - a silent fallback-to-index-0 would collapse them.
-    assert len({m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, template_id=i) for i in range(6)}) == 6
+    assert len({m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, template_id=i) for i in range(8)}) == 8
 
 
 def test_generators_use_the_contact_name_when_one_is_known():
@@ -1995,5 +1995,5 @@ def test_help_covers_the_commands_kevin_actually_applies_with():
         assert cmd in ch.HELP, f"{cmd} lost its help entry"
     # The /edit entry must name every live slot bank, since that is the actual confusion.
     edit_help = ch.lookup_command_help("/edit/")
-    for code in ("C0-C5", "W0-W5", "B0-B1", "R0-R3", "L0-L9"):
+    for code in ("C0-C7", "W0-W5", "B0-B1", "R0-R3", "L0-L9"):
         assert code in edit_help, f"/edit help does not mention {code}"

@@ -125,18 +125,56 @@ picks one entry from each and joins them with blank lines.
 | Pool | What it is | Selected by |
 |---|---|---|
 | `openers` | "I am writing to express my interest in the {job_title} position at {company}." | routed index |
-| `track_a_wealth_ops` ... `track_e_bizops` | Paragraph 1 body, the adjacency claim | `track` letter from Gemini |
-| `bridges_conservative` / `bridges_tech` | Paragraph 2 | `tone_mode` from Gemini |
-| `closers` | Paragraph 3 | routed index |
+| `track_a_wealth_ops` ... `track_h_technical_systems` | Paragraph 1 body, the adjacency claim | `track` letter from Gemini |
+| `bridges_<pool_key>` | Paragraph 2 for one track, when present | `track` letter from Gemini |
+| `bridges_conservative` / `bridges_tech` | Paragraph 2 fallback | `tone_mode`, only if no bespoke pool |
+| `closers_<pool_key>` | Paragraph 3 for one track, when present | `track` letter from Gemini |
+| `closers` | Paragraph 3 fallback | routed index |
 | `signoffs` | "Thank you for your time and consideration." | routed index |
 
-Track letters map through `TRACK_BULLET_POOL_KEYS` in `resume_engine.py`, the same map the resume
-PDF uses, so the letter and the attached resume always argue one case. Never introduce a second
-naming scheme.
+Track letters map through `TRACK_BULLET_POOL_KEYS`, which now lives in `track_registry.py` and is
+re-exported by `resume_engine.py`. It is the same map the resume PDF uses, so the letter and the
+attached resume always argue one case. Never introduce a second naming scheme.
 
-Index 0 of `bridges_*` and `closers` is deliberately billing-flavored. `generate_cover_letter()`
-skips past it unless the job title matches billing/invoice/revenue/AR. If you add more
-role-specific copy, extend that regex rather than letting the copy leak into unrelated roles.
+There are eight tracks. `f` (operations & logistics), `g` (supply chain & multi-site ops) and `h`
+(technical systems & automation) are the non-finance ones, and a pool added to the registry without
+a matching block here fails `test_registry_and_banks_cover_the_same_tracks`. Tracks f and g must
+name no carrier, freight, TMS, warehouse or inventory work, and track h must not claim software
+engineering - Kevin has none of that experience.
+
+### Paragraphs 2 and 3 are track-keyed first
+
+`bridges_<pool_key>` and `closers_<pool_key>` override the shared pools for a single track and
+**ignore `tone_mode` entirely**, because a track-specific argument tells a reader more than a
+tone-specific register does. A track with no bespoke pool falls back to `bridges_<tone>` / `closers`
+exactly as before, which is what makes this shippable one track at a time.
+
+Tracks **b, d, f, g and h** have bespoke pools. Tracks **a, c and e** stay on the shared copy,
+because the shared copy's subject matter *is* theirs. Before this existed, paragraphs 2 and 3 were
+byte-identical across all eight tracks, so a supply-chain letter opened on multi-site reconciliation
+and then pivoted to Salesforce for no reason.
+
+Index 0 of the **shared** `bridges_*` and `closers` pools is deliberately billing-flavored.
+`generate_cover_letter()` skips past it unless the job title matches billing/invoice/revenue/AR. If
+you add more role-specific copy, extend that regex rather than letting the copy leak into unrelated
+roles. **A bespoke pool is never sliced** - it has no billing-flavored index 0, and slicing it would
+drop a good paragraph and shift every remaining index by one
+(`test_billing_gate_never_slices_a_track_keyed_pool`).
+
+`bridges_conservative[2]` also appears verbatim in `bridges_track_f_operations_logistics`. The shared
+copy is deliberately left in place: removing it would renumber that pool, and Gemini routes shared
+bridges by index.
+
+### The location flag
+
+`_openers_take_location` is a boolean list parallel to `openers`. Index 1 is `false` because that
+opener ends "...and wanted to add some context", which cannot carry a trailing `" in <city>."` - it
+shipped a real letter reading "wanted to add some context in Dearborn, Michigan." When the routed
+opener cannot take a location, the location is **omitted**; the opener is never rewritten and a
+different one is never substituted, because the opener index is part of the routing.
+
+The key is underscore-prefixed on purpose. Every prose linter in the suite iterates the pools whose
+key does not start with `_`, and `re.split()` on a list of booleans raises `TypeError`.
 
 Only `{company}` and `{job_title}` interpolate. `{name}` is not supported.
 

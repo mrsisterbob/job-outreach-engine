@@ -2,8 +2,8 @@
 
 [![Tests](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml)
 <!-- AUTO-STATS:START -->
-![Lines of source](https://img.shields.io/badge/source-13952_lines-c9a24b)
-![Tests](https://img.shields.io/badge/tests-518-4a8a5c)
+![Lines of source](https://img.shields.io/badge/source-18611_lines-c9a24b)
+![Tests](https://img.shields.io/badge/tests-826-4a8a5c)
 <!-- AUTO-STATS:END -->
 
 An AI-assisted job search pipeline: sources listings from multiple job boards, screens/tailors
@@ -19,7 +19,9 @@ pipeline_utils.py   Pure helpers (no I/O): dork builders, scoring/dedup/formatti
 resume_engine.py    Deterministic Typst->PDF resume compiler from the local bullet bank.
 Code.gs             Google Apps Script Web App - the CRM backend (Sheets tabs) main.py talks to.
 templates/          Editable JSON banks for cold/warm/LinkedIn outreach + cover letter copy (live-reloaded).
-resume_bullets_bank.json   Track-based (a-e) resume bullet pools, resolved deterministically.
+resume_bullets_bank.json   Track-based (a-h) resume bullet pools, resolved deterministically.
+                    An entry is a plain string, or {"text", "source_job", "replaces"} when its
+                    claim belongs to an employer other than the most recent one.
 evidence_bank.json  Single source of truth for real experience/skills fed into every AI prompt.
 test_pipeline_utils.py     Unit tests for pipeline_utils.py (pytest, no network/DB required).
 ```
@@ -159,6 +161,11 @@ surfaces **Config Health Warnings** automatically if any of the above go missing
     Kevin's call, not the poller's. Non-matching spam is not touched at all.
 - **Editing outreach copy without a redeploy:** use the Telegram `/edit` command, or edit
   `templates/*.json` / `resume_bullets_bank.json` directly - both are hot-reloaded on every use.
+  A resume bullet may be a `{"text", "source_job", "replaces"}` object rather than a string, which
+  is how a bullet describing ABC Technologies' or 40 Acres' work renders under **that** employer
+  instead of the most recent one. `/edit TG0` rewords such an entry and keeps its tags; editing the
+  JSON by hand, replace only the `"text"` value. A bare string means the most recent employer,
+  which is what 110 of the 120 entries are.
 - **Adding a job you found yourself:** `/job <linkedin-url>` pushes one hand-picked posting
   through the *same* Stage 2 path `/t` uses (`process_single_candidate` → `dispatch_tier1_matches`),
   so it lands in Tetiana Cold as a real card with a live `sheet_uuid` - swipe-reply (`/apply`,

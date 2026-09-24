@@ -19,7 +19,17 @@
         "Audited onboarding paperwork for 500+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
         "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
         "Managed Salesforce ticketing queues and engaged directly with custodians to resolve urgent advisor requests within 1 to 2 hour SLAs.",
-        "Reconciled IAA agreements and account records against custodial data during offboarding to ensure clean handoff of active client files."
+        "Reconciled IAA agreements and account records against custodial data during offboarding to ensure clean handoff of active client files.",
+        "Cleaned and revalidated 1,500+ legacy account records against custodial guidelines during an internal database migration.",
+        "Resolved $250k in ledger variances across institutional custody accounts using SQL queries against internal reporting tables.",
+        "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
+        "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
+        "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
+        "Established escalation paths for custodial account transfers, cutting request turnaround time by 25%.",
+        "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
+        "Verified licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
+        "Trained incoming operations analysts on DocuSign and Salesforce, shortening onboarding ramp from 3 weeks to 10 days.",
+        "Wrote Python scrapers with pandas to pull recurring account data, saving 15 hours of manual lookup each week."
       ]
     },
     {
@@ -108,7 +118,7 @@
     }
   ],
   "technical_skills": [
-    "Python", "SQL", "Salesforce", "Power BI", "Excel", "HubSpot CRM", "Schwab Advisor Center", "Fidelity Wealthscape", "DocuSign", "Orion Eclipse", "Typst", "Flask", "SQLite"
+    "Python", "SQL", "Salesforce", "Power BI", "Excel", "HubSpot CRM", "Schwab Advisor Center", "Fidelity Wealthscape", "DocuSign", "Orion Eclipse", "Typst", "Flask", "SQLite", "bSwift"
   ],
   "banned_words": [
     "leveraging", "passionate", "seamless", "synergy", "cutting-edge", "paradigm", "spearheaded", "utilizing", "dynamic", "robust"

@@ -7,7 +7,9 @@ init_db() builds its schema there instead of touching the real jobs_cache.db, an
 worker, morning digest, backup scheduler) so nothing races against these tests' assertions.
 """
 import base64
+import difflib
 import html
+import io
 import json
 import os
 import re
@@ -26,6 +28,8 @@ os.close(_tmp_db_fd)
 os.environ["JOBS_DB_PATH"] = _TMP_DB_PATH
 
 import main as m  # noqa: E402  (must import after JOBS_DB_PATH is set)
+import resume_engine  # noqa: E402
+import track_registry  # noqa: E402
 import pipeline_utils  # noqa: E402
 
 
@@ -4096,7 +4100,7 @@ def test_get_persistence_status_flags_missing_backup_dir(monkeypatch):
 # candidate-facing word traces to templates/cover_letter_templates.json, never to a model.
 
 def _all_letter_combos():
-    for track in "abcde":
+    for track in track_registry.TRACK_LETTERS:
         for tone in ("conservative", "tech"):
             for idx in range(6):
                 yield track, tone, idx
@@ -4121,13 +4125,69 @@ def test_cover_letter_body_comes_from_the_routed_track_bank():
     assert body.split(".")[0].strip() in letter
 
 
+def _resolved_bridge_pool(bank, track, tone, billing=False):
+    """Mirror of generate_cover_letter's paragraph-2 resolution: track-keyed pool first, then tone.
+
+    Kept in one place so the 6-gram guard below cannot silently check a different pool than the one
+    a reader actually receives. The tests that use it also assert the chosen bridge really appears
+    in the rendered letter, which pins this mirror to the function instead of to a memory of it.
+    """
+    pool_key = m.TRACK_BULLET_POOL_KEYS[track]
+    bespoke = bank.get(f"bridges_{pool_key}")
+    pool = bespoke or bank.get(f"bridges_{tone}") or bank.get("bridges_conservative") or []
+    # The billing gate slices index 0 off the SHARED pool only - never off a bespoke one.
+    if not billing and not bespoke and len(pool) > 1:
+        pool = pool[1:]
+    return pool
+
+
 def test_cover_letter_tone_mode_swaps_only_the_bridge_paragraph():
+    """Still the contract for a track on the SHARED pools. Track e has no bespoke bridge, so tone
+    is what picks its paragraph 2. Narrowed deliberately when track-keyed pools shipped - see the
+    sibling test below for what a bespoke track does instead."""
+    bank = m.load_cover_letter_templates()
+    assert "bridges_track_e_bizops" not in bank, "track e is the shared-pool case in this test"
+
     conservative = m.generate_cover_letter("Crain", "Billing Operations Analyst", "e", 0, "", "conservative")
     tech = m.generate_cover_letter("Crain", "Billing Operations Analyst", "e", 0, "", "tech")
     assert conservative != tech
     # Paragraph 1 and the closer are tone-independent; only paragraph 2 moves.
     assert conservative.split("\n\n")[1] == tech.split("\n\n")[1]
     assert conservative.split("\n\n")[3] == tech.split("\n\n")[3]
+
+
+def test_bespoke_bridge_beats_the_tone_pool():
+    """A track with its own bridge pool ignores tone_mode entirely: a track-specific argument is
+    more informative than a tone-specific register. Before this, paragraphs 2 and 3 were
+    byte-identical across all eight tracks, so a supply-chain letter opened on multi-site
+    reconciliation and then pivoted to Salesforce for no reason."""
+    bank = m.load_cover_letter_templates()
+    for track in ("f", "g", "h", "b", "d"):
+        pool_key = m.TRACK_BULLET_POOL_KEYS[track]
+        bespoke = bank[f"bridges_{pool_key}"]
+        conservative = m.generate_cover_letter("Rivian", "Operations Analyst", track, 1, "", "conservative")
+        tech = m.generate_cover_letter("Rivian", "Operations Analyst", track, 1, "", "tech")
+        assert conservative == tech, f"track {track} still moves with tone"
+        assert bespoke[1 % len(bespoke)] in tech, f"track {track} did not use its own bridge"
+        for shared in bank["bridges_tech"] + bank["bridges_conservative"]:
+            # bridges_conservative[2] was deliberately COPIED into track f, with the shared entry
+            # left in place so that pool keeps its indices (Gemini routes shared bridges by index).
+            # So a shared paragraph only indicates a fallback if it is not also bespoke copy.
+            if shared in bespoke:
+                continue
+            assert shared not in tech, f"track {track} fell back to a shared bridge"
+
+
+def test_track_without_a_bespoke_pool_still_uses_the_shared_one():
+    """The fallback is what makes this additive and shippable track by track."""
+    bank = m.load_cover_letter_templates()
+    for track in ("a", "c", "e"):
+        pool_key = m.TRACK_BULLET_POOL_KEYS[track]
+        assert f"bridges_{pool_key}" not in bank
+        assert f"closers_{pool_key}" not in bank
+        letter = m.generate_cover_letter("Acme", "Operations Associate", track, 2, "", "tech")
+        expected = _resolved_bridge_pool(bank, track, "tech")
+        assert expected[2 % len(expected)] in letter, f"track {track} lost the shared bridge"
 
 
 def test_cover_letter_unknown_track_falls_back_to_track_a():
@@ -4154,6 +4214,32 @@ def test_cover_letter_appends_location_only_when_known():
     without = m.generate_cover_letter("Crain", "Analyst", "e", 0, "")
     assert "in Detroit, MI." in with_loc
     assert "Detroit" not in without
+
+
+def test_cover_letter_omits_the_location_on_an_opener_that_cannot_take_one():
+    """Opener 1 ends "...and wanted to add some context", which cannot carry a trailing city. The
+    location is dropped rather than the opener rewritten or a different one routed, because the
+    opener index is part of the routing Gemini already returned."""
+    bank = m.load_cover_letter_templates()
+    flags = bank["_openers_take_location"]
+    assert flags[1] is False, "opener 1 is the one that cannot take a location"
+
+    letter = m.generate_cover_letter("Crain", "Analyst", "e", 1, "Normal, IL")
+    assert "add some context." in letter
+    assert "Normal" not in letter
+
+    # A flagged-true opener still gets it, so the fix did not just disable the feature.
+    assert "in Normal, IL." in m.generate_cover_letter("Crain", "Analyst", "e", 0, "Normal, IL")
+
+
+def test_no_letter_says_add_some_context_in_a_city():
+    """The exact shipped regression. Kevin sent a letter reading "wanted to add some context in
+    Dearborn, Michigan." Checked across every routed combination, not just opener 1."""
+    for track, tone, idx in _all_letter_combos():
+        letter = m.generate_cover_letter("Rivian", "Operations Analyst", track, idx, "Normal, IL", tone)
+        assert re.search(r"context in [A-Z]", letter) is None, f"track={track} tone={tone} idx={idx}"
+        assert re.search(r"\bin Normal, IL\.(?!\s*$)", letter) or "Normal" not in letter or \
+            letter.count("Normal") == 1, f"track={track} idx={idx} location rendered oddly"
 
 
 def test_cover_letter_every_combo_is_clean_and_well_formed():
@@ -4203,11 +4289,17 @@ def test_cover_letter_never_repeats_a_phrase_across_paragraphs():
     pool_keys = m.TRACK_BULLET_POOL_KEYS
     for track, tone, idx in _all_letter_combos():
         bodies = bank[pool_keys[track]]
-        bridges = bank[f"bridges_{tone}"]
+        # Resolve paragraph 2 exactly as generate_cover_letter does. Reading bank["bridges_<tone>"]
+        # directly went blind the moment bespoke track pools shipped: it would have checked a pool
+        # those tracks never render, and the guard would have passed on unchecked prose.
+        bridges = _resolved_bridge_pool(bank, track, tone)
+        bridge = bridges[idx % len(bridges)]
+        # Cross-check the mirror against the real output, so this cannot drift from the function.
+        rendered = m.generate_cover_letter("Qzco", "Operations Analyst", track, idx, "", tone)
+        assert bridge in rendered, f"resolution mirror is wrong for track={track} tone={tone} idx={idx}"
         # Strip placeholders first: {company}/{job_title} legitimately recur across paragraphs,
         # so only the banked prose around them is under test.
-        combined = re.sub(r"\{\w+\}", " ",
-                          bodies[idx % len(bodies)] + " " + bridges[idx % len(bridges)])
+        combined = re.sub(r"\{\w+\}", " ", bodies[idx % len(bodies)] + " " + bridge)
         words = re.findall(r"[a-z']+", combined.lower())
         grams = [" ".join(words[i:i + 6]) for i in range(len(words) - 5)]
         dupes = {g for g in grams if grams.count(g) > 1}
@@ -4227,12 +4319,63 @@ def test_cover_letter_billing_copy_only_reaches_billing_roles():
         assert "before an invoice goes out" not in letter, title
 
 
+def test_billing_gate_never_slices_a_track_keyed_pool(monkeypatch):
+    """The billing gate skips index 0 of the SHARED bridge/closer pools, because index 0 there is
+    deliberately billing-flavored. A track-keyed pool has no such entry, so slicing [1:] off it
+    silently drops a perfectly good paragraph and shifts every other index by one.
+
+    Built on a synthetic bank rather than the real one so it tests the gate itself: it fails for
+    the right reason even if no shipped track has a bespoke pool yet.
+    """
+    fake = {
+        "openers": ["I am writing about the {job_title} opening at {company}."],
+        "track_a_wealth_ops": ["Body paragraph that carries the adjacency claim for this track."],
+        "bridges_track_a_wealth_ops": ["BESPOKE-BRIDGE-ZERO.", "BESPOKE-BRIDGE-ONE."],
+        "closers_track_a_wealth_ops": ["BESPOKE-CLOSER-ZERO.", "BESPOKE-CLOSER-ONE."],
+        "bridges_conservative": ["SHARED-BILLING-BRIDGE.", "SHARED-BRIDGE-ONE."],
+        "bridges_tech": ["SHARED-BILLING-BRIDGE.", "SHARED-BRIDGE-ONE."],
+        "closers": ["SHARED-BILLING-CLOSER.", "SHARED-CLOSER-ONE."],
+        "signoffs": ["Thank you for your time and consideration."],
+    }
+    monkeypatch.setattr(m, "load_cover_letter_templates", lambda: fake)
+
+    # Non-billing title: the gate fires. A bespoke pool must still surrender its index 0.
+    letter = m.generate_cover_letter("Acme", "Operations Associate", "a", 0, "", "conservative")
+    assert "BESPOKE-BRIDGE-ZERO." in letter, "gate sliced index 0 off a track-keyed bridge pool"
+    assert "BESPOKE-CLOSER-ZERO." in letter, "gate sliced index 0 off a track-keyed closer pool"
+
+    # The shared pools must keep being gated - that behavior is the reason the gate exists.
+    del fake["bridges_track_a_wealth_ops"]
+    del fake["closers_track_a_wealth_ops"]
+    shared = m.generate_cover_letter("Acme", "Operations Associate", "a", 0, "", "conservative")
+    assert "SHARED-BILLING-BRIDGE." not in shared
+    assert "SHARED-BILLING-CLOSER." not in shared
+
+
+def test_logistics_and_supply_chain_letters_claim_no_freight_work():
+    """Kevin has no trucking, freight, warehouse or inventory experience. Tracks f and g are the
+    ones a logistics or manufacturing posting routes to, so their letters are where an invented
+    claim would land - and it would surface in the interview, not in review."""
+    banned = (r"\bcarriers?\b|freight|\bTMS\b|\btrucks?\b|\brail\b|\bocean\b|\bdocks?\b|"
+              r"\blanes?\b|dispatch|OTIF|bill of lading|warehouse|inventory")
+    for track in ("f", "g"):
+        for tone in ("conservative", "tech"):
+            for idx in range(6):
+                letter = m.generate_cover_letter("Rivian", "Carrier Operations Analyst",
+                                                 track, idx, "Normal, IL", tone)
+                # The job TITLE legitimately contains "Carrier" - only the banked prose is on trial.
+                prose = letter.replace("Carrier Operations Analyst", " ")
+                hits = sorted({h.group(0) for h in re.finditer(banned, prose, re.I)})
+                assert hits == [], f"track={track} tone={tone} idx={idx} claims freight work: {hits}"
+
+
 def test_cover_letter_bank_uses_contractions():
     """The hand-written reference letter contracts ("I've made it a point"). An all-formal bank
     reads stiff and machine-written, which is the exact failure mode this copy exists to avoid.
     Assert the habit is present across the prose pools rather than checking any one sentence."""
     bank = m.load_cover_letter_templates()
-    prose_keys = [k for k in bank if k.startswith("track_") or k.startswith("bridges_")]
+    prose_keys = [k for k in bank
+                  if k.startswith("track_") or k.startswith("bridges_") or k.startswith("closers_")]
     entries = [s for k in prose_keys for s in bank[k]]
     contracted = [s for s in entries if re.search(r"\b(I've|I'm|I'd|don't|doesn't|it's|that's)\b", s)]
     assert len(contracted) >= len(entries) // 2, (
@@ -8436,3 +8579,440 @@ def test_edit_usage_lists_the_slot_codes_that_actually_exist(monkeypatch):
             f"/edit usage does not advertise {prefix}0-{prefix}{top} for {pool_key}"
         # And the top slot must really resolve, so the advertised range is not a lie.
         assert m.resolve_edit_target(f"{prefix}{top}") is not None
+
+
+# ==============================================================================
+# Eight-track expansion: registry, pools, and the non-finance resumes
+# ==============================================================================
+# These exist because a Rivian logistics posting rendered a wealth-operations resume: there was no
+# non-finance track, so Gemini had to route it to `a`. The guards below are the ones that would
+# have caught it, plus the two pool bullets that were silently never rendering.
+
+_SECTION_BANNERS = (
+    "SUMMARY", "PROFESSIONAL EXPERIENCE", "TECHNICAL PROJECTS",
+    "EDUCATION & CREDENTIALS", "SKILLS & SYSTEMS",
+)
+
+
+def _markup_section(markup, banner):
+    """The body of one rendered resume section, banner line excluded."""
+    marker = "[" + banner + "]"
+    start = markup.index(marker) + len(marker)
+    later = [markup.index("[" + b + "]") for b in _SECTION_BANNERS
+             if b != banner and markup.find("[" + b + "]") > start]
+    return markup[start:min(later)] if later else markup[start:]
+
+
+def _routed_bullet_lines(markup):
+    """Only the FIRST job's bullets - the ones the routed track actually controls. Later jobs are
+    Kevin's real employment history and legitimately say SEC, RIA and custodial."""
+    section = _markup_section(markup, "PROFESSIONAL EXPERIENCE")
+    lines = []
+    for raw in section.splitlines():
+        line = raw.strip()
+        if line.startswith("#v(") and lines:
+            break  # spacer before the second job header
+        if line.startswith("- "):
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _track_controlled_text(markup):
+    """Everything on the page the track letter chooses: summary, routed bullets, skills footer."""
+    return "\n".join((
+        _markup_section(markup, "SUMMARY"),
+        _routed_bullet_lines(markup),
+        _markup_section(markup, "SKILLS & SYSTEMS"),
+    ))
+
+
+def test_no_pool_bullet_is_silently_dropped():
+    """resume_engine drops any pool bullet >=0.80 similar to a static bullet of a job it is NOT
+    attributed to, so such a bullet never renders and its pool quietly ships one entry short. Two
+    were live when the eight-track work started (track_c[2] at 0.881, track_d[1] at 1.000). This is
+    the regression guard for a bug that was already in production, not a hypothetical.
+
+    Widened with source tags rather than narrowed: the comparison set is now per bullet (every job
+    except its own, plus the project bullets, which were previously unguarded entirely), so a
+    correctly-attributed ABC bullet is no longer measured against ABC's own statics.
+    """
+    evidence = m.load_evidence_bank()
+    bank = json.load(open(resume_engine.RESUME_BULLETS_BANK_PATH, encoding="utf-8"))
+    dropped = []
+    for pool, bullets in bank.items():
+        for i, entry in enumerate(bullets):
+            text = resume_engine.bullet_text(entry)
+            src = resume_engine.bullet_source_job(entry, evidence)
+            for o in resume_engine._duplicate_check_targets(evidence, src):
+                ratio = difflib.SequenceMatcher(None, text.lower(), str(o).lower()).ratio()
+                if ratio >= 0.80:
+                    dropped.append(f"{pool}[{i}] source_job={src} ratio={ratio:.3f}")
+    assert dropped == [], f"these pool bullets can never render: {dropped}"
+
+
+def test_logistics_track_resume_never_says_custodial():
+    """THE Rivian regression test. Track f is what a Carrier Operations Analyst posting routes to,
+    and the part of the page the track controls - summary, routed bullets, skills footer - must
+    carry no wealth-operations vocabulary.
+
+    Deliberately scoped to the track-controlled regions rather than the whole markup: the later
+    jobs and the certificates are Kevin's real history and do say SEC, RIA and Schwab. A recruiter
+    expects a finance work history. What lost the Rivian resume was the SUMMARY claiming a
+    custodial-accounts persona, which is exactly what this asserts against.
+
+    Salesforce is legitimate cross-industry tooling and is deliberately NOT in this list.
+    """
+    banned = r"custodial|advisor|Schwab|Fidelity|Wealthscape|ACAT|\bRIA\b|\bSEC\b|FinCEN|Form D|401\(k\)|broker"
+    for tone in ("conservative", "tech"):
+        markup = resume_engine.render_typst_markup("Rivian", "f", [0, 1, 2, 3], tone)
+        hits = sorted({h.group(0) for h in re.finditer(banned, _track_controlled_text(markup), re.I)})
+        assert hits == [], f"track f resume ({tone}) still reads as wealth ops: {hits}"
+
+
+def test_new_tracks_claim_no_trucking_experience():
+    """Kevin has no trucking, freight, warehouse or inventory experience. A resume that implies
+    otherwise gets him into an interview he cannot survive, which is worse than not routing there
+    at all. Checked over the ENTIRE page, since none of this vocabulary belongs anywhere on it."""
+    banned = (r"\bcarriers?\b|freight|\bTMS\b|\btrucks?\b|\brail\b|\bocean\b|\bdocks?\b|"
+              r"\blanes?\b|dispatch|OTIF|bill of lading|warehouse|inventory")
+    for track in ("f", "g"):
+        for tone in ("conservative", "tech"):
+            markup = resume_engine.render_typst_markup("Rivian", track, [0, 1, 2, 3], tone)
+            hits = sorted({h.group(0) for h in re.finditer(banned, markup, re.I)})
+            assert hits == [], f"track {track} ({tone}) claims logistics experience: {hits}"
+
+
+def test_registry_and_banks_cover_the_same_tracks():
+    """The point of track_registry.py: adding a ninth track is a data edit. Forgetting one of the
+    two JSON banks used to fall back to track a silently - the cover-letter half of the same bug
+    that produced the Rivian resume."""
+    bullets = json.load(open(resume_engine.RESUME_BULLETS_BANK_PATH, encoding="utf-8"))
+    letters = m.load_cover_letter_templates()
+    for letter, pool_key in track_registry.TRACK_BULLET_POOL_KEYS.items():
+        assert pool_key in bullets, f"track {letter}: {pool_key} missing from resume_bullets_bank"
+        assert pool_key in letters, f"track {letter}: {pool_key} missing from cover_letter_templates"
+        assert bullets[pool_key], f"{pool_key} is empty"
+        assert letters[pool_key], f"{pool_key} letter pool is empty"
+    orphans = [k for k in bullets if k not in track_registry.TRACK_BULLET_POOL_KEYS.values()]
+    assert orphans == [], f"bullet pools no track routes to: {orphans}"
+
+
+def test_all_eight_tracks_compile_to_a_pdf():
+    """Every track x tone really renders. Also catches an unescaped Typst character in a new
+    summary or bullet, which fails at compile time and nowhere earlier."""
+    for track in track_registry.TRACK_LETTERS:
+        for tone in ("conservative", "tech"):
+            pdf = resume_engine.compile_resume_pdf("Acme Group, Inc.", track, [0, 1, 2], tone)
+            assert isinstance(pdf, bytes) and pdf.startswith(b"%PDF"), f"track={track} tone={tone}"
+
+
+def test_routing_marker_round_trips_every_track():
+    """The card's own marker is the durable copy of Gemini's routing. Its regex was [a-e], so a
+    card routed to f/g/h did not match at all and /draft degraded to default routing with no
+    error."""
+    for track in track_registry.TRACK_LETTERS:
+        text = f"\U0001F9ED <code>{track}|tech|0,2,5|3</code>"
+        parsed = m._parse_routing_from_card_text(text)
+        assert parsed.get("track") == track, f"{track} did not round-trip: {parsed}"
+        assert parsed.get("tone_mode") == "tech"
+        assert parsed.get("bullet_indices") == [0, 2, 5]
+        assert parsed.get("outreach_template_id") == 3
+
+
+def test_screener_response_accepts_every_registry_track():
+    """track was a Literal["a".."e"], so Gemini answering "f " or "logistics" raised a
+    ValidationError and cost the whole card rather than one routing decision."""
+    from response_schema import GeminiJobScreenerResponse as Screener
+
+    for track in track_registry.TRACK_LETTERS:
+        assert Screener(score=70, track=track).track == track
+    assert Screener(score=70, track="F ").track == "f"
+    assert Screener(score=70, track="logistics").track == "f"
+    assert Screener(score=70, track="zzz").track == track_registry.DEFAULT_TRACK
+    assert Screener(score=70, track=None).track == track_registry.DEFAULT_TRACK
+    # Whatever comes back must resolve to a real pool - that is the whole contract.
+    for value in ("a", "h", "F ", "zzz", None, 7):
+        assert track_registry.pool_key_for(Screener(score=70, track=value).track)
+
+
+def test_skills_footers_only_name_banked_systems():
+    """resume_engine's own docstring says every skill named in a footer must already exist in
+    evidence_bank's technical_skills. Nothing enforced that until now, which is how a non-finance
+    track could quietly start claiming TMS, WMS or SAP - tools Kevin has never used."""
+    banked = [s.lower() for s in m.load_evidence_bank().get("technical_skills", [])]
+    unbanked = []
+    for letter, data in track_registry.TRACK_REGISTRY.items():
+        for _label, desc in data["skills"]:
+            for item in (i.strip().rstrip(".") for i in desc.split(",")):
+                if item in track_registry.CAPABILITY_TERMS:
+                    continue
+                if any(skill in item.lower() for skill in banked):
+                    continue
+                unbanked.append(f"track {letter}: {item!r}")
+    assert unbanked == [], f"footer names a system not in evidence_bank: {unbanked}"
+
+
+def test_edit_addresses_every_new_pool():
+    """/edit slot codes were T[A-E]; TF0 and TH14 returned None, so the three new pools were
+    unreachable from Telegram."""
+    for letter, pool_key in track_registry.TRACK_BULLET_POOL_KEYS.items():
+        target = m.resolve_edit_target(f"T{letter.upper()}0")
+        assert target is not None, f"T{letter.upper()}0 does not resolve"
+        assert target[1] == pool_key
+    assert m.resolve_edit_target("TF0")[1] == "track_f_operations_logistics"
+    assert m.resolve_edit_target("TH14")[1:] == ("track_h_technical_systems", 14)
+    # An unknown letter must stay unknown rather than silently editing track a.
+    assert m.resolve_edit_target("TI0") is None
+    assert m.resolve_edit_target("TZ3") is None
+
+
+def test_cover_letter_renders_for_every_track():
+    """Every registry track assembles a well-formed letter from its own pool, including f/g/h."""
+    for track in track_registry.TRACK_LETTERS:
+        for tone in ("conservative", "tech"):
+            letter = m.generate_cover_letter("Acme Group, Inc.", "Operations Analyst",
+                                             track, 0, "Detroit, MI", tone)
+            ctx = f"track={track} tone={tone}"
+            assert letter.startswith("Dear Acme Group Hiring Team,"), ctx
+            assert letter.endswith("\n\nBest regards,\nKevin Miller"), ctx
+            assert "{" not in letter and "}" not in letter, ctx
+
+
+# ---------------------------------------------------------------------------------------------
+# Source-attributed routed bullets. Before these, a routed bullet always rendered under job 0,
+# so track g claimed Kevin cross-referenced payroll across 70+ manufacturing plants as a Wealth
+# Operations Specialist at a Detroit wealth firm in 2026. That work is ABC Technologies, 2024.
+# ---------------------------------------------------------------------------------------------
+
+def _experience_blocks(markup):
+    """The rendered Professional Experience section as {company: [bullet, ...]}.
+
+    Parsed out of the real Typst markup rather than from a renderer return value, because what
+    matters is which employer a claim is printed under - per CLAUDE.md, the write path.
+    """
+    blocks, current = {}, None
+    for line in markup.splitlines():
+        header = re.match(r"^\*[^*]+\* \| ([^#]+?) #h\(1fr\)", line)
+        if header:
+            current = header.group(1).strip()
+            blocks[current] = []
+        elif line.startswith("#line(") and current:
+            current = None
+        elif line.startswith("- ") and current:
+            blocks[current].append(line[2:])
+    return blocks
+
+
+def test_tagged_bullet_renders_under_its_own_employer():
+    """THE defect. track_g[0] is ABC Technologies' work (evidence_bank.json:66, the 70+
+    manufacturing facilities checklist), and it has to print under ABC's heading, not Signal's."""
+    bank = resume_engine.load_resume_bullets_bank()
+    entry = bank["track_g_supply_chain"][0]
+    text = resume_engine.bullet_text(entry)
+    assert resume_engine.bullet_source_job(entry, m.load_evidence_bank()) == 3
+
+    markup = resume_engine.render_typst_markup("Acme Manufacturing", "g", [0, 1, 2, 3], "tech")
+    blocks = _experience_blocks(markup)
+    assert text in blocks["ABC Technologies"], "the 70+ plants bullet is not under ABC"
+    assert text not in blocks["Signal Advisors"], "the 70+ plants bullet still claims Signal's job"
+    # Signal must still carry content - an employer heading with nothing under it looks like a bug.
+    assert blocks["Signal Advisors"], "Signal Advisors rendered as a bare heading"
+
+
+def test_untagged_bullet_still_renders_under_job_zero():
+    """110 of the 120 entries are bare strings and must be completely unaffected."""
+    bank = resume_engine.load_resume_bullets_bank()
+    entry = bank["track_a_wealth_ops"][0]
+    assert isinstance(entry, str), "this test needs an untagged entry"
+    blocks = _experience_blocks(resume_engine.render_typst_markup("Acme", "a", [0, 1, 2], "conservative"))
+    assert entry in blocks["Signal Advisors"]
+
+
+def test_bullet_helpers_never_raise_on_a_malformed_entry():
+    """/edit writes a bare string back into the bank from Kevin's phone, so these helpers see
+    whatever a hand edit produces. A loader that raised would take the resume renderer down at the
+    moment he is trying to apply to something."""
+    evidence = m.load_evidence_bank()
+    n_jobs = len(evidence["experience"])
+    junk = [None, 42, 3.5, [], {}, True, {"text": None}, {"text": ["a"]},
+            {"source_job": 2}, {"text": "x", "source_job": "3"}, {"text": "x", "source_job": True},
+            {"text": "x", "source_job": 1.0}, {"text": "x", "source_job": -1},
+            {"text": "x", "source_job": n_jobs}, {"text": "x", "source_job": 999},
+            {"text": "x", "source_job": 3, "replaces": "1"},
+            {"text": "x", "source_job": 3, "replaces": 99},
+            {"text": "x", "source_job": 3, "replaces": -2}]
+    for entry in junk:
+        assert isinstance(resume_engine.bullet_text(entry), str), entry
+        src = resume_engine.bullet_source_job(entry, evidence)
+        assert isinstance(src, int) and 0 <= src < n_jobs, entry
+        sub = resume_engine.bullet_replaces_static(entry, evidence)
+        assert isinstance(sub, int) and sub >= -1, entry
+    # A bare string is the pre-tag contract and means Signal Advisors, forever.
+    assert resume_engine.bullet_source_job("some bullet", evidence) == 0
+    assert resume_engine.bullet_text("some bullet") == "some bullet"
+
+
+def test_no_pool_bullet_duplicates_a_project_bullet():
+    """_bullets_of_other_jobs covered experience[1:] only, so a pool bullet matching a PROJECT
+    bullet was unguarded and rendered twice on one page under two headings. track_h[4] was live at
+    0.8067 before it was reworded. Measured zero now - this exists so the class cannot recur."""
+    evidence = m.load_evidence_bank()
+    bank = resume_engine.load_resume_bullets_bank()
+    project_bullets = [b for p in evidence.get("projects", []) for b in p.get("bullets", [])]
+    assert project_bullets, "no project bullets to guard against"
+    # The guard must actually LOOK at them. Measuring ratios here by hand passes either way, which
+    # let a mutation that dropped projects from _duplicate_check_targets go undetected.
+    for src in range(len(evidence["experience"])):
+        targets = resume_engine._duplicate_check_targets(evidence, src)
+        for pb in project_bullets:
+            assert pb in targets, f"project bullet is unguarded for source_job {src}"
+    hits = []
+    for pool, bullets in bank.items():
+        for i, entry in enumerate(bullets):
+            text = resume_engine.bullet_text(entry).lower()
+            for pb in project_bullets:
+                ratio = difflib.SequenceMatcher(None, text, pb.lower()).ratio()
+                if ratio >= resume_engine._DUPLICATE_BULLET_RATIO:
+                    hits.append(f"{pool}[{i}] ratio={ratio:.4f}")
+    assert hits == [], f"these render twice on one page: {hits}"
+
+
+def test_correctly_attributed_bullet_is_not_dropped_as_a_duplicate():
+    """The guard had to become source-aware in both directions at once.
+
+    A bullet tagged to ABC that resembles ABC's own statics is attribution working, so it must
+    survive. The SAME text tagged to Signal is the original defect and must be dropped.
+    """
+    evidence = m.load_evidence_bank()
+    abc_static = evidence["experience"][3]["bullets"][1]
+    tagged = {"text": abc_static, "source_job": 3}
+    untagged = abc_static
+
+    assert not resume_engine._is_duplicate_of_other_job(
+        resume_engine.bullet_text(tagged),
+        resume_engine._duplicate_check_targets(
+            evidence, resume_engine.bullet_source_job(tagged, evidence))), \
+        "a correctly attributed ABC bullet was dropped for matching ABC's own statics"
+    assert resume_engine._is_duplicate_of_other_job(
+        resume_engine.bullet_text(untagged),
+        resume_engine._duplicate_check_targets(
+            evidence, resume_engine.bullet_source_job(untagged, evidence))), \
+        "the same text claiming Signal's job was NOT dropped"
+
+
+def test_a_routed_bullet_never_sits_beside_the_static_it_restates():
+    """Appending under the right employer created a second defect: the pool bullet is usually a
+    rephrasing of one of that employer's statics, so ABC printed the checklist claim twice in two
+    wordings. `replaces` makes the substitution explicit, since similarity cannot decide it -
+    same-claim pairs measure 0.52-0.72 against their own statics and different claims 0.41-0.45."""
+    evidence = m.load_evidence_bank()
+    bank = resume_engine.load_resume_bullets_bank()
+    checked = 0
+    for pool, bullets in bank.items():
+        for i, entry in enumerate(bullets):
+            sub = resume_engine.bullet_replaces_static(entry, evidence)
+            if sub < 0:
+                continue
+            src = resume_engine.bullet_source_job(entry, evidence)
+            assert src > 0, f"{pool}[{i}] replaces a static of job 0, whose statics never render"
+            company = evidence["experience"][src]["company"]
+            superseded = evidence["experience"][src]["bullets"][sub]
+            track = pool.split("_")[1]
+            blocks = _experience_blocks(
+                resume_engine.render_typst_markup("Acme", track, [i, 0, 1], "tech"))
+            rendered = blocks[company]
+            assert resume_engine.bullet_text(entry) in rendered, f"{pool}[{i}] did not render"
+            assert superseded not in rendered, f"{pool}[{i}] rendered beside the static it restates"
+            checked += 1
+    assert checked == 10, f"expected 10 authored substitutions, found {checked}"
+
+
+def test_every_track_still_compiles_to_one_page():
+    """The regression source tags could plausibly cause. Redistributing bullets across employers
+    adds lines only if a job keeps its statics AND gains a bullet, which `replaces` prevents - so
+    the total is never higher than before. Asserted on the real PAGE COUNT, not on byte length,
+    because a two-page resume still produces plausible-looking bytes."""
+    from pypdf import PdfReader
+    for track in track_registry.TRACK_LETTERS:
+        for tone in ("conservative", "tech"):
+            pdf = resume_engine.compile_resume_pdf("Acme Group, Inc.", track, [0, 1, 2, 3], tone)
+            pages = len(PdfReader(io.BytesIO(pdf)).pages)
+            assert pages == 1, f"track={track} tone={tone} rendered {pages} pages"
+
+
+def test_worst_case_tag_distribution_still_fits_one_page():
+    """The pathological routing the suite would otherwise never reach: every routed index tagged
+    away from job 0, so Signal falls back to statics while a later job carries extra bullets."""
+    from pypdf import PdfReader
+    tagged_only = {"g": [0, 4, 6], "d": [1, 4, 8, 10], "c": [2, 10, 12]}
+    for track, indices in tagged_only.items():
+        for tone in ("conservative", "tech"):
+            markup = resume_engine.render_typst_markup("Acme", track, indices, tone)
+            blocks = _experience_blocks(markup)
+            assert blocks["Signal Advisors"], "Signal rendered empty when every bullet moved away"
+            pdf = resume_engine.compile_resume_pdf("Acme", track, indices, tone)
+            pages = len(PdfReader(io.BytesIO(pdf)).pages)
+            assert pages == 1, f"track={track} tone={tone} indices={indices} -> {pages} pages"
+
+
+def test_bare_string_and_tagged_entry_both_survive_a_phone_edit():
+    """Drives the real /edit write path (update_template_entry) against a temp copy of the bank and
+    reads it back through the renderer. A bare string must stay a bare string, and a tagged entry
+    must KEEP its source_job - otherwise one phone edit silently moves the bullet back under Signal
+    Advisors and undoes the whole fix."""
+    import shutil, tempfile
+    original = resume_engine.RESUME_BULLETS_BANK_PATH
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "resume_bullets_bank.json")
+        shutil.copy(original, path)
+
+        ok, _ = m.update_template_entry(path, "track_g_supply_chain", 0,
+                                        "Reworded the tagged bullet from a phone.")
+        assert ok
+        ok, _ = m.update_template_entry(path, "track_a_wealth_ops", 0,
+                                        "Reworded the bare bullet from a phone.")
+        assert ok
+
+        with open(path, encoding="utf-8") as f:
+            reloaded = json.load(f)
+        evidence = m.load_evidence_bank()
+        tagged = reloaded["track_g_supply_chain"][0]
+        bare = reloaded["track_a_wealth_ops"][0]
+        assert resume_engine.bullet_text(tagged) == "Reworded the tagged bullet from a phone."
+        assert resume_engine.bullet_source_job(tagged, evidence) == 3, "the phone edit stripped the tag"
+        assert resume_engine.bullet_replaces_static(tagged, evidence) == 1
+        assert isinstance(bare, str), "an untagged entry must stay a plain string"
+
+        # And it still renders, under the right employer.
+        resume_engine.RESUME_BULLETS_BANK_PATH = path
+        try:
+            blocks = _experience_blocks(
+                resume_engine.render_typst_markup("Acme", "g", [0, 1, 2], "tech"))
+        finally:
+            resume_engine.RESUME_BULLETS_BANK_PATH = original
+        assert "Reworded the tagged bullet from a phone." in blocks["ABC Technologies"]
+
+
+def test_a_later_job_keeps_its_other_statics_when_a_routed_bullet_lands_on_it():
+    """The rule differs by job, and this is the half that is easy to get wrong.
+
+    Job 0 has 14 statics that have never rendered, so routed bullets REPLACE them. Jobs 1-3 have
+    exactly 3 each and always render all 3, so a routed bullet APPENDS. Applying job 0's replace
+    rule uniformly would delete two of ABC's real claims in order to add one - the page would get
+    shorter and quieter, and no existing assertion would notice.
+    """
+    evidence = m.load_evidence_bank()
+    bank = resume_engine.load_resume_bullets_bank()
+    entry = bank["track_g_supply_chain"][0]
+    src = resume_engine.bullet_source_job(entry, evidence)
+    sub = resume_engine.bullet_replaces_static(entry, evidence)
+    assert src == 3 and sub == 1
+
+    blocks = _experience_blocks(
+        resume_engine.render_typst_markup("Acme", "g", [0, 1, 2, 3], "tech"))
+    abc = blocks["ABC Technologies"]
+    survivors = [b for i, b in enumerate(evidence["experience"][3]["bullets"]) if i != sub]
+    for static in survivors:
+        assert static in abc, f"ABC lost a real claim it has always made: {static[:60]}"
+    assert resume_engine.bullet_text(entry) in abc
+    assert len(abc) == len(evidence["experience"][3]["bullets"]),         "ABC's bullet count moved - append plus one substitution should leave it unchanged"

@@ -21,7 +21,9 @@ from email.message import EmailMessage
 import requests
 from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
+import resume_engine
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
+from track_registry import TRACK_PROMPT_LINE, normalize_track, pool_key_for
 from response_schema import GeminiJobScreenerResponse
 from command_help import lookup_command_help
 from pipeline_utils import (
@@ -376,16 +378,16 @@ def first_name_for_greeting(full_name):
 
 RESUME_BULLETS_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_bullets_bank.json")
 
-EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|R|T[A-E])(\d+)$", re.IGNORECASE)
+EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|R|T[A-H])(\d+)$", re.IGNORECASE)
 
 def resolve_edit_target(id_str):
     """Maps a /edit ID to (file_path, list_key, index):
       L0-L9 -> templates/linkedin_templates.json[linkedin_templates]
-      C0-C5 -> templates/outreach_templates.json[cold_ops]
+      C0-C7 -> templates/outreach_templates.json[cold_ops]
       W0-W1 -> templates/outreach_templates.json[warm_alumni]
       B0-B1 -> templates/outreach_templates.json[followup_bumps]
       R0-R3 -> templates/outreach_templates.json[reactivation]
-      TA0-TA9 ... TE0-TE9 -> resume_bullets_bank.json[track_x_...]
+      TA0-TA14 ... TH0-TH14 -> resume_bullets_bank.json[track_x_...]
     Returns None if the ID prefix is unrecognized.
     """
     m = EDIT_ID_PATTERN.match(str(id_str or "").strip())
@@ -403,6 +405,9 @@ def resolve_edit_target(id_str):
     if prefix == "R":
         return (OUTREACH_TEMPLATES_PATH, "reactivation", idx)
     if len(prefix) == 2 and prefix[0] == "T":
+        # Resolved strictly, NOT through normalize_track(): an unknown letter must stay
+        # unknown here so /edit reports a bad slot code instead of silently rewriting
+        # track a's pool under a typo.
         pool_key = TRACK_BULLET_POOL_KEYS.get(prefix[1].lower())
         if pool_key:
             return (RESUME_BULLETS_BANK_PATH, pool_key, idx)
@@ -461,7 +466,15 @@ def update_template_entry(file_path, list_key, idx, new_text):
     if idx < 0 or idx >= len(pool):
         return False, f"❌ Index {idx} out of range for <code>{html.escape(str(list_key))}</code> (valid: 0-{len(pool) - 1})."
 
-    pool[idx] = new_text
+    # A resume bullet may be a {"text", "source_job"} dict, and /edit only ever supplies prose.
+    # Overwriting the whole entry would silently drop the tag and send the bullet back under
+    # Signal Advisors, which is the exact misattribution source tags exist to prevent - one phone
+    # edit would undo it. Anything else in the bank stays a plain string, as it always was.
+    existing = pool[idx]
+    if isinstance(existing, dict) and "source_job" in existing:
+        pool[idx] = dict(existing, text=new_text)
+    else:
+        pool[idx] = new_text
     try:
         tmp_path = f"{file_path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -2418,12 +2431,15 @@ def _parse_routing_from_card_text(text):
     """
     if not text:
         return {}
-    match = re.search(r'🧭\s*(?:<code>)?([a-e])\|(conservative|tech)\|([0-9,]*)\|(\d+)(?:</code>)?', str(text))
+    # [a-z], not [a-e]: the pattern used to predate tracks f/g/h, so a card routed to one of them
+    # simply did not match and this returned {} - degrading /draft to default routing with no error.
+    # normalize_track() then guarantees the letter resolves to a real pool.
+    match = re.search(r'🧭\s*(?:<code>)?([a-z])\|(conservative|tech)\|([0-9,]*)\|(\d+)(?:</code>)?', str(text))
     if not match:
         return {}
     bullets = [int(i) for i in match.group(3).split(",") if i.strip().isdigit()]
     return {
-        "track": match.group(1),
+        "track": normalize_track(match.group(1)),
         "tone_mode": match.group(2),
         "bullet_indices": bullets or None,
         "outreach_template_id": int(match.group(4)),
@@ -3494,7 +3510,7 @@ def resolve_outreach_body(job, mapping, job_title, company_name, is_warm):
     resolved contact still rendered a nameless cold_ops[0]. Callers pass the result to
     create_gmail_draft(custom_body=...) so the draft is the same string, rendered once.
     """
-    # Gemini's outreach_template_id routes cold_ops only (response_schema caps it at le=5), and
+    # Gemini's outreach_template_id routes cold_ops only (response_schema caps it at le=7), and
     # warm copy is a hand-finished scaffold anyway, so warm stays on index 0 by design.
     if is_warm:
         return generate_warm_email(
@@ -3550,6 +3566,10 @@ def build_system_prompt():
     JSON template banks (see load_outreach_templates()/load_linkedin_templates()/resume_engine.filter_ats_bullets()).
     """
     evidence_block = build_evidence_context_block(mode="eval")
+    # Interpolated from track_registry so adding a track updates the prompt in one place; a
+    # hardcoded a-e list here is exactly how a logistics posting kept routing to wealth ops.
+    track_letters = "|".join(TRACK_BULLET_POOL_KEYS)
+    track_prompt_line = TRACK_PROMPT_LINE
     return f"""You are a strict technical job screener and template router evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
 High Priority Skills: Python, SQL, Salesforce, Excel, Schwab SAC, Fidelity Wealthscape, DocuSign, Process Automation.
 Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles, retail bank tellers, CPA tracks, Senior/Lead/Manager roles.
@@ -3560,7 +3580,7 @@ EVIDENCE BANK (the only source of truth for this candidate's real background):
 
 NEGATIVE CONSTRAINTS: You must strictly use facts from the Evidence Bank above. Never invent skills, employers, or experiences not listed there. You are STRICTLY a classifier/router - NEVER generate prose, sentences, resume bullets, email bodies, or LinkedIn notes yourself. Only return integer indices selecting from pre-approved local template banks; all actual text is interpolated deterministically in Python from those banks.
 
-Determine the target firm's conservatism level. If the company is a traditional bank, broker-dealer, legacy RIA, or insurance carrier, set "tone_mode" to "conservative". If the company is a fintech, crypto platform, tokenization startup, or software vendor, set "tone_mode" to "tech". When "tone_mode" is "conservative", DO NOT select bullet indices referencing crypto, Bitcoin, or Web3.
+Determine the target firm's conservatism level. "conservative" is for employers whose OWN BUSINESS is financial services - a traditional bank, broker-dealer, legacy RIA, custodian, or insurance carrier. Everyone else is "tech", including manufacturers, logistics and transportation companies, hospitals and health systems, retailers, municipalities and government agencies, and software vendors - a company being large, old or unglamorous does not make it conservative. When "tone_mode" is "conservative", DO NOT select bullet indices referencing crypto, Bitcoin, or Web3.
 
 SCORING BANDS - use the whole range. Most real postings land in 50-79; reserve 90+ for a genuine match, not merely a plausible one:
 90-100: Does what the candidate already does. Names his actual tools (Salesforce, Schwab/Fidelity, DocuSign, Python, SQL) AND is clearly entry-level (0-2 yrs).
@@ -3574,11 +3594,11 @@ Evaluate the job description and respond ONLY with a JSON object containing:
 {{
 "score": <integer 1-100, anchored to the bands below - an unanchored score clusters in the 70s and 80s and makes every candidate look alike, which is useless for ranking>,
 "reason": "<1-sentence concise explanation of why this role fits or does not fit>",
-"track": "<one letter a|b|c|d|e selecting the resume bullet pool that best matches this role: a=wealth operations, b=data/systems engineering, c=risk & regulatory compliance, d=business intelligence & analytics, e=business operations & CRM systems>",
+"track": "<one letter {track_letters} selecting the resume bullet pool that best matches this role: {track_prompt_line}>",
 "tone_mode": "<'conservative' or 'tech' - conservative for traditional banks/broker-dealers/legacy RIAs/insurance carriers, tech for fintech/crypto/tokenization startups/software vendors>",
 "bullet_indices": [<int>, <int>, <int>],
 "linkedin_template_id": <integer 0-9 selecting a LinkedIn connection note template>,
-"outreach_template_id": <integer 0-5 selecting a cold outreach email template>
+"outreach_template_id": <integer 0-7 selecting a cold outreach email template>
 }}"""
 
 def send_health_alert(error_msg):
@@ -3671,7 +3691,7 @@ def get_resume_vocabulary():
             bank = json.load(f)
         for bullets in (bank or {}).values():
             for bullet in bullets or []:
-                _fold(bullet)
+                _fold(resume_engine.bullet_text(bullet))
     except Exception as e:
         logging.error(f"Resume vocabulary read error: {e}")
     return vocab
@@ -4370,6 +4390,22 @@ def generate_elevator_pitch(company, job_title):
             logging.error(f"Elevator pitch parse failure: {e}")
     return fallback
 
+def _opener_takes_location(opener_index, bank):
+    """Whether the opener at this index can have " in <city>." appended without breaking.
+
+    Openers 0, 2 and 3 end on a noun phrase ("...the {job_title} position at {company}"), so a
+    location rides them cleanly. Opener 1 ends "...and wanted to add some context", which produced
+    the shipped artifact "wanted to add some context in Normal, IL." - a broken sentence on a real
+    letter Kevin sent.
+
+    Defaults to True when the bank carries no flag list, which is exactly today's behavior, so an
+    older or hand-edited bank keeps working instead of silently losing every location.
+    """
+    flags = bank.get("_openers_take_location")
+    if not isinstance(flags, list) or not 0 <= opener_index < len(flags):
+        return True
+    return bool(flags[opener_index])
+
 def generate_cover_letter(company, job_title, track="a", letter_index=0, job_location="", tone_mode="conservative"):
     """Assembles a 3-paragraph plain-text cover letter deterministically from the track-keyed
     bank in templates/cover_letter_templates.json. Never calls Gemini.
@@ -4385,12 +4421,17 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
     letter and the PDF make one case. Body paragraphs are keyed by TRACK_BULLET_POOL_KEYS, the same
     map resume_engine.py resolves bullets through, so the two banks cannot drift apart on naming.
 
-    `tone_mode` picks paragraph 2 the same way it constrains bullet selection in filter_ats_bullets:
-    a "tech" company hears the automation framed as engineering, a conservative one hears it framed
-    as process discipline. The underlying facts are identical - only the register moves.
+    Paragraphs 2 and 3 are resolved by TRACK first and only then by tone. A track with bespoke
+    `bridges_<pool_key>` / `closers_<pool_key>` pools uses them and ignores `tone_mode` entirely,
+    because a track-specific argument is more informative than a tone-specific one. A track without
+    them falls back to `bridges_<tone_mode>` / `closers`, where `tone_mode` still picks paragraph 2
+    the same way it constrains bullet selection in filter_ats_bullets: a "tech" company hears the
+    automation framed as engineering, a conservative one hears it framed as process discipline. The
+    underlying facts are identical - only the register moves.
 
-    `job_location` is appended to the opener only when known; a letter that guesses a city is worse
-    than one that omits it.
+    `job_location` is appended to the opener only when known AND when the routed opener can carry it
+    (see _opener_takes_location); a letter that guesses a city is worse than one that omits it, and
+    a letter with a broken sentence is worse than both.
     """
     bank = load_cover_letter_templates()
     track_key = str(track or "a").lower()
@@ -4404,17 +4445,25 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
 
     openers = bank.get("openers") or _FALLBACK_COVER_LETTER_TEMPLATES["openers"]
     bodies = bank.get(pool_key) or bank.get(TRACK_BULLET_POOL_KEYS["a"]) or _FALLBACK_COVER_LETTER_TEMPLATES["track_a_wealth_ops"]
-    bridges = bank.get(f"bridges_{tone_key}") or bank.get("bridges_conservative") or []
-    closers = bank.get("closers") or _FALLBACK_COVER_LETTER_TEMPLATES["closers"]
+    # Paragraphs 2 and 3 prefer a pool keyed to the TRACK, falling back to today's behavior when a
+    # track has no bespoke copy. Before this, bridges keyed on tone only and closers on index only -
+    # neither read pool_key - so two thirds of every letter was track-blind and a supply-chain
+    # letter opened on multi-site reconciliation and then pivoted to Salesforce for no reason.
+    bespoke_bridges = bank.get(f"bridges_{pool_key}")
+    bespoke_closers = bank.get(f"closers_{pool_key}")
+    bridges = bespoke_bridges or bank.get(f"bridges_{tone_key}") or bank.get("bridges_conservative") or []
+    closers = bespoke_closers or bank.get("closers") or _FALLBACK_COVER_LETTER_TEMPLATES["closers"]
 
     # Index 0 of the shared bridge/closer pools is deliberately billing-flavored ("before an
     # invoice goes out", "order-to-cash"): it is the strongest copy for a billing role and the
     # wrong copy for anything else. Skip past it unless the title actually says billing, so a
     # Client Onboarding Specialist is never told Kevin wants "a dedicated billing seat".
+    # Only the SHARED pools get sliced. A track-keyed pool has no billing-flavored index 0, so
+    # slicing it would drop a good paragraph and shift every remaining index by one.
     if not re.search(r"\b(billing|invoic|revenue|order.to.cash|accounts receivable|\bAR\b)", role, re.I):
-        if len(bridges) > 1:
+        if not bespoke_bridges and len(bridges) > 1:
             bridges = bridges[1:]
-        if len(closers) > 1:
+        if not bespoke_closers and len(closers) > 1:
             closers = closers[1:]
 
     # Each pool is sized independently, so wrap per-pool rather than bounds-failing to index 0 -
@@ -4428,7 +4477,7 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
     # Detroit desk job). It is deliberately omitted otherwise: a remote or multi-site posting that
     # gets "in Detroit, MI" appended reads as a candidate who misread the listing.
     loc = str(job_location or "").strip()
-    if loc:
+    if loc and _opener_takes_location(idx % len(openers), bank):
         opener = opener.rstrip(".") + f" in {loc}."
 
     def fill(text):
@@ -11718,7 +11767,8 @@ def process_webhook_payload_async(data):
                 )
                 return
             send_telegram_message(chat_id, f"✍️ Drafting bullets for <code>{track_key}</code>...")
-            drafted = draft_bullets_for_gaps(track_key, tracks.get(track_key, []), gaps)
+            existing = [resume_engine.bullet_text(b) for b in tracks.get(track_key, [])]
+            drafted = draft_bullets_for_gaps(track_key, [b for b in existing if b], gaps)
             if not drafted:
                 send_telegram_message(
                     chat_id,
@@ -12988,17 +13038,17 @@ def process_webhook_payload_async(data):
                 send_telegram_message(
                     chat_id,
                     "❌ <b>Usage:</b> <code>/edit ID New Text</code>\n"
-                    "IDs: <code>L0-L9</code> (LinkedIn), <code>C0-C5</code> (Cold), "
+                    "IDs: <code>L0-L9</code> (LinkedIn), <code>C0-C7</code> (Cold), "
                     "<code>W0-W5</code> (Warm), <code>B0-B1</code> (Bump), "
                     "<code>R0-R3</code> (Reactivation), "
-                    "<code>TA0-TA9</code>...<code>TE0-TE9</code> (Resume Bullets)\n"
+                    "<code>TA0-TA14</code>...<code>TH0-TH14</code> (Resume Bullets)\n"
                     "Send <code>/edit/</code> for the long version."
                 )
                 return
             edit_id, new_text = parts[0], parts[1].strip()
             target = resolve_edit_target(edit_id)
             if not target:
-                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L9, C0-C5, W0-W5, B0-B1, R0-R3, TA0-TA9...TE0-TE9.")
+                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L9, C0-C7, W0-W5, B0-B1, R0-R3, TA0-TA14...TH0-TH14.")
                 return
             file_path, list_key, idx = target
             ok, result_msg = update_template_entry(file_path, list_key, idx, new_text)

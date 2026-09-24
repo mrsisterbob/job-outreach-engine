@@ -11,3 +11,4 @@ websocket-client
 openpyxl
 pydantic
 pytest
+pypdf

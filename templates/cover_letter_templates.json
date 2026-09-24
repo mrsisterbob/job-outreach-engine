@@ -1,11 +1,18 @@
 {
-  "_comment": "Deterministic cover letter bank. Gemini routes a track letter (a-e) + an integer index; Python assembles. Same contract as resume_bullets_bank.json. {company}/{job_title} are the only placeholders; {name} is NOT supported (letters open 'Dear <Company> Hiring Team').",
+  "_comment": "Deterministic cover letter bank. Gemini routes a track letter (a-h, see track_registry.py) + an integer index; Python assembles. Same contract as resume_bullets_bank.json. {company}/{job_title} are the only placeholders; {name} is NOT supported (letters open 'Dear <Company> Hiring Team').",
   "_voice": "See .claude/skills/cover-letter-voice/SKILL.md for the 20 rules and the reference letter this bank reproduces. The short version: concede adjacency before claiming expertise, explain the mechanism instead of asserting the skill, average about 20 words per sentence with hard variance, and never write a claim that isn't in evidence_bank.json. Index 0 of bridges_*/closers is billing-flavored and is gated by job title in generate_cover_letter(); every other entry in a shared pool must be role-agnostic.",
   "openers": [
     "I am writing to express my interest in the {job_title} position at {company}.",
     "I recently applied for the {job_title} role at {company} and wanted to add some context.",
     "I would like to be considered for the {job_title} opening at {company}.",
     "I am writing about the {job_title} opening at {company}."
+  ],
+  "_openers_take_location_comment": "Parallel to `openers`. Index 1 ends '...wanted to add some context', which cannot take a trailing ' in <city>.' - that produced the shipped artifact 'wanted to add some context in Normal, IL.' See _opener_takes_location() in main.py.",
+  "_openers_take_location": [
+    true,
+    false,
+    true,
+    true
   ],
   "track_a_wealth_ops": [
     "Working in operations at an investment advisory firm, I handled the paperwork side of accounts that other people owned the relationships for. That meant auditing onboarding agreements before an account went live, then processing the daily transfers, cashiering and maintenance that followed once it was open. Most of it was catching a problem early. I'd rather find it than explain it.",
@@ -37,7 +44,25 @@
     "My most recent role was operations at an investment advisory firm, where I managed a shared Salesforce queue and audited agreements before they got processed. Billing sat next to us, and I'd made a point of learning how their cycle ran from order intake through to the invoice going out. It is the same discipline applied to a different ledger.",
     "I worked the intake-to-resolution path on an operations desk at an advisory firm, which is adjacent to the order and billing side rather than inside it. I audited the agreements and fee schedules that feed those records, and I'd manage the queue that the exceptions arrived in. I learned the downstream half by working next to the people who own it."
   ],
-  "_bridges_comment": "Paragraph 2. Selected by tone_mode, not track. A 'tech' company hears the automation framed as building, a 'conservative' one hears it as process discipline. Index 0 of each is billing-flavored and gated by job title in generate_cover_letter(); indices 1+ must stay role-agnostic, because a non-billing role only ever sees those.",
+  "track_f_operations_logistics": [
+    "My last role put me on an intake queue where every request arrived with a service window attached. I spent most of the day on the items that were stuck rather than the ones already moving, and I'd learned to tell quickly which was which. Somebody was always waiting at the other end of it.",
+    "I worked operations on a desk that took requests from intake through to resolution. When something came back rejected it was mine to find out why, and I'd rather spend the extra pass up front than rework the whole file later. The rework always cost more.",
+    "I spent my time clearing the handoffs that stall. A transfer waiting on one missing document doesn't resolve itself, and tracking those down with the firm on the other side was most of my week. It is unglamorous work and it is what keeps a queue from backing up.",
+    "My day was queue management and escalation at an operations desk. I watched where requests were landing, found a routing conflict between two teams, and wrote down the escalation path so it stopped depending on who picked the ticket up. Process that only lives in somebody's head isn't really process."
+  ],
+  "track_g_supply_chain": [
+    "In an earlier role I cross-referenced payroll data across more than seventy manufacturing facilities and built the checklists that made it repeatable. The value was in spotting that one deduction error repeated across sites rather than in correcting any single instance. That's the actual work.",
+    "I have worked between raw records and the reporting that depends on them. That meant maintaining the schedules behind recurring reports and reconciling data that arrived in different shapes from different places. When the reporting comes out wrong it's almost never the report. It's whatever fed it.",
+    "My background is data reconciliation and controls, at a manufacturer first and an advisory firm after. I built audit checklists, cleaned legacy records that no longer matched the schema, and reviewed supporting documentation for consistency across active sites. Careful repetitive work, and I think it's worth doing properly.",
+    "I spent my time making sure numbers from separate places agreed before anybody relied on them. Across seventy-plus facilities that meant a written check rather than a spot review, because a spot review only finds the error you happened to look at. I'd rather the checklist caught it."
+  ],
+  "track_h_technical_systems": [
+    "I came up through operations and wrote code to take the repetitive parts off my own desk. That started with a reconciliation I'd been running by hand and ended with a backend that tracks records, syncs status over webhooks and compiles documents on demand. None of it was anybody's plan for the role.",
+    "I'm an operations person who automates his own work, which is a different thing from being an engineer. I'd rather say so plainly than let a job title do it for me. The systems I've built are small and they're mine end to end, from the database locking to the PDF that comes out the other side.",
+    "Most of what I have built started as something tedious I was doing manually. Chasing missing signatures became a script that watched for them. Comparing two ledgers every month became a job that ran overnight and reported only what it flagged. I'd rather remove the task.",
+    "I write Python and SQL to make operations work stop being manual, and I've been deliberate about where the automation stops. In my own pipeline a model routes and scores while every line that reaches a document comes from copy I wrote and banked myself. Generated text was never going to be defensible."
+  ],
+  "_bridges_comment": "Paragraph 2 FALLBACK, used only by a track with no bridges_<pool_key> pool of its own. A 'tech' company hears the automation framed as building, a 'conservative' one hears it as process discipline. Index 0 of each is billing-flavored and gated by job title in generate_cover_letter(); indices 1+ must stay role-agnostic, because a non-billing role only ever sees those. Tracks a, c and e are the ones still on these pools.",
   "bridges_conservative": [
     "The workflows in your job description feel familiar from where I'd been sitting. I understand what has to be true before an invoice goes out, and I know how much that accuracy matters to the wider business.",
     "The reason this role appeals to me is that I was already doing a version of it from one seat over. I checked agreements against records, resolved whatever didn't match, and kept the files in a state that would survive somebody looking at them.",
@@ -52,12 +77,73 @@
     "My useful habit is noticing when a task has become a routine and making it stop being one. A reconciliation I ran by hand every month became a scheduled script, and the version of that problem in your posting looks recognizable.",
     "I've done enough of this work by hand to know which parts are worth automating and which are better left to a person who can actually look at them. The overnight checks and the formatting are worth it."
   ],
+  "_bespoke_pools_comment": "bridges_<pool_key> / closers_<pool_key> override the shared pools for one track and ignore tone_mode, because a track-specific argument beats a tone-specific one. A track with no bespoke pool falls back to bridges_<tone>/closers unchanged. These pools have NO billing-flavored index 0, so generate_cover_letter() must not slice [1:] off them.",
+  "bridges_track_f_operations_logistics": [
+    "I haven't worked a transportation network, and I'd be learning yours from the beginning. What transfers over is a deadline that belongs to somebody else, because a request sitting on my desk was a person somewhere waiting on an answer. I'd rather they hear about a delay from me than go looking for it themselves.",
+    "I'm used to a queue with a deadline attached to it. Requests came in with a service window at my last firm, and it was on me to resolve them or escalate them before the clock ran out. That made me reasonably good at telling what is urgent from what is merely loud.",
+    "The operations I ran were in financial services, so the vocabulary on your side is new to me even where the work isn't. Sorting the stuck items from the ones already moving is the same problem whatever sits in the queue. I learned it on a desk where the clock belonged to somebody else.",
+    "Nobody handed me a written process for the queue I inherited, which is how I ended up writing one myself. When two desks were quietly competing for the same tickets, I took it upstairs rather than working around it and hoping. Writing it down is the part I'd want to bring here."
+  ],
+  "bridges_track_g_supply_chain": [
+    "I've never run a supply chain, and I'd be taking your planning vocabulary on from scratch. Where I've been useful is one layer under the reporting, on the records that decide whether a number is right before anyone acts on it. Getting that wrong stays quiet for a long time before anyone notices.",
+    "My multi-site work was payroll and benefits data, not parts or production, so I'd be learning what actually moves through your plants. The habit that carries is checking a figure against its source instead of against last month's version of itself. That single habit is most of what kept our reporting defensible.",
+    "I haven't owned a plant's numbers end to end, only the reconciliations underneath them. What I'd bring is the assumption that a figure is wrong until something independent agrees with it, which slows the first pass and saves the second. That habit is cheap to keep and hard to regret.",
+    "The closest I've come to your world is a manufacturer's payroll, seventy-plus sites of it, which taught me how many ways one error can hide. I'd be learning your operation and I'd rather say that plainly than overstate the overlap. What transfers cleanly is the habit of writing the check down."
+  ],
+  "bridges_track_h_technical_systems": [
+    "I'm not applying as a software engineer and I'd fail that interview honestly. What I am is the operations person who got tired of running the same comparison every month and learned enough Python to stop. The tools are small and they work because I was the one being annoyed.",
+    "Everything I've built started as something I was doing by hand, which is also the limit of it. I've never maintained a system somebody else designed, and I'd be learning your conventions rather than bringing my own. Reading code I didn't write is the part I've done least.",
+    "I'd be the least formally trained person on the team and I'd rather lead with that than have it surface later. The work I can point at is a screening pipeline where the model only routes and scores, because I didn't trust generated text in anything a person would read. Every line it produced came from a file I had written myself.",
+    "My automation stops where judgement starts, and on my own systems that was a decision rather than a limitation I hadn't got round to. A script can flag that a signature is missing from a packet. Deciding what to do about the account was always going to stay mine."
+  ],
+  "bridges_track_b_engineering": [
+    "I'm not going to call myself a software engineer in this letter. Anyone I'd be working beside would find that out inside a week, and I'd rather say it first. What I've done is take the reconciliations off my own desk one at a time, and read enough of other people's code to keep mine from becoming a liability.",
+    "The code I've written exists because I was the person stuck doing the task, which is a narrow kind of experience to bring. I've not maintained anything a team depends on, and that is the gap I'd be closing here. The upside is that I've never automated something I didn't understand first.",
+    "My SQL and Python came out of necessity rather than any curriculum, so there are gaps in the theory I already know about. What I can do is find the point where two systems stopped agreeing and say why. I'd learned that on ledgers and it moves to other records.",
+    "I'd be the operations hire who writes code rather than the other way round, and that is the honest framing. The script I'm proudest of removed work instead of adding a feature. Nobody asked for any of them, which is either a recommendation or a warning."
+  ],
+  "bridges_track_d_business_intelligence": [
+    "I've built dashboards but I wouldn't call myself an analyst by training, and the modelling side is where I'd be catching up. The part I'm sure of is the layer underneath, where a number is either reconciled or it isn't. A chart built on an unreconciled figure is a confident mistake.",
+    "Most of my reporting served an operations desk rather than an executive audience, so presenting it is newer to me. Building the check that actually feeds it is not new at all. I'd been the person who got asked why two reports disagreed.",
+    "I'd be learning your reporting stack, and I'd want to say that before claiming otherwise. What I've done repeatedly is take a figure nobody trusted and trace it back through the reports to the record that made it wrong. The trace is slow and it is the only thing that settles an argument.",
+    "My analytics came from needing an answer rather than a mandate to produce insight. I'd be the person checking whether the underlying accounts actually agree before anyone builds a dashboard on top of them. That order matters more than whichever tool sits on top."
+  ],
   "closers": [
     "I'm looking to bring this background directly into a dedicated billing role. I would welcome the opportunity to support the team at {company} and help keep the order-to-cash process running cleanly.",
     "I'd like to take this experience into the {job_title} role and would welcome a conversation about it. I am happy to walk through any of the above in more detail.",
     "I'm looking to move this kind of operations work into a more focused seat, and the {job_title} position at {company} reads like the right one. I would welcome the chance to talk it through.",
     "If the work is roughly what I've described, I'd be glad to talk about the {job_title} role in more detail. I can make time whenever is convenient on your end.",
     "I would welcome the chance to discuss the {job_title} role and what the first few months would actually involve. I am available at whatever time works for your team."
+  ],
+  "closers_track_f_operations_logistics": [
+    "I'd like to bring the queue discipline into the {job_title} role and learn your side of the operation from the people who run it. I can make time for a conversation whenever it suits your team.",
+    "If the work is close to what I've described, I'd welcome a conversation about the {job_title} position. I'm happy to walk through how any of it actually ran day to day.",
+    "I'm looking to move this kind of exception work into a seat where it is the whole job rather than a corner of one. The {job_title} opening at {company} reads that way to me.",
+    "I'd rather be the person handling the exceptions than the person counting the volume, and the {job_title} role looks like it is mostly exceptions. I'm glad to talk about it whenever works for you."
+  ],
+  "closers_track_g_supply_chain": [
+    "I'd like to take the reconciliation side of this into the {job_title} role and learn the operational half from people who live in it. I can work around your schedule for a conversation whenever that helps.",
+    "If that is the shape of the {job_title} work, I'd welcome the chance to talk it through. I'm happy to explain how any of these checks actually ran.",
+    "I'm looking for a seat where accuracy across sites is the job rather than a task somebody fits in around other work. The {job_title} opening at {company} reads like that to me.",
+    "I'd like to be useful on the reporting that other people have to trust, and the {job_title} role looks like exactly that work. I'm available whenever it suits your team to have that conversation."
+  ],
+  "closers_track_h_technical_systems": [
+    "I'd like to bring the automation habit into the {job_title} role without pretending it makes me an engineer. I'm happy to walk through what I built and where I'd want help.",
+    "If the {job_title} work is mostly making manual processes stop being manual, I'd welcome a conversation about it. I can make time for a call whenever it suits you.",
+    "I'm looking for a seat where improving the process is part of the job rather than something done after hours. The {job_title} opening at {company} reads that way to me from the outside.",
+    "I'd like to keep doing this kind of work somewhere it is actually wanted, and the {job_title} role looks like that. I'm glad to talk it through whenever works for your team."
+  ],
+  "closers_track_b_engineering": [
+    "I'd like to take this into the {job_title} role and be honest that I'd be learning the engineering side properly for the first time. I'm happy to walk through any of the code that came out of it.",
+    "If the {job_title} work is closer to automating operations than to building product, I'd welcome a conversation. I can find time in any week that works for you.",
+    "I'm looking for a seat where writing the tool is part of the job rather than something I do around it. The {job_title} opening at {company} reads that way to me.",
+    "I'd rather keep removing manual work than accumulate a title, and the {job_title} role looks like the place to do it. I'm glad to talk it through whenever that works for you."
+  ],
+  "closers_track_d_business_intelligence": [
+    "I'd like to move into the {job_title} role and spend more of my time on the reporting rather than beside it. I'm happy to walk through any of these reconciliations in detail.",
+    "If the {job_title} work involves as much data cleanup as presentation, I'd welcome a conversation about it. I can find time in whichever week suits your team.",
+    "I'm looking for a seat where the accuracy of the numbers is somebody's actual responsibility. The {job_title} opening at {company} reads like that to me.",
+    "I'd like to keep working where a reconciled figure matters more than a fast one, and the {job_title} role looks like that. I'm glad to talk it through whenever works for you."
   ],
   "signoffs": [
     "Thank you for your time and consideration."

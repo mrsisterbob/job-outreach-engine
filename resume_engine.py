@@ -4,7 +4,7 @@ resume_engine.py
 High-Performance In-Memory Resume Compiler for Kevin Miller.
 Strict Deterministic Template Engine (SDTE): resumes are assembled entirely from local JSON
 banks (evidence_bank.json, resume_bullets_bank.json). Gemini never authors bullet prose here -
-it only ever selects a track letter (a-e) and a list of pool indices, which this module resolves
+it only ever selects a track letter (a-h) and a list of pool indices, which this module resolves
 and bounds-checks against the actual bullet pool before rendering.
 """
 
@@ -16,15 +16,43 @@ import os
 import re
 import typst
 
+# The track taxonomy lives in exactly one place now (track_registry.py). TRACK_BULLET_POOL_KEYS and
+# TRACKS are re-exported here because main.py and the suite already import them from this module.
+from track_registry import (
+    CRYPTO_SCRUB_TRACKS,
+    DEFAULT_TRACK,
+    FALLBACK_BULLETS_BY_POOL,
+    TRACK_BULLET_POOL_KEYS,
+    TRACK_LETTERS,
+    TRACK_REGISTRY,
+    TRACKS,
+    normalize_track,
+    pool_key_for,
+)
+
 # Company Conservatism & Culture Filter: crypto/Web3 language Gemini might otherwise route into
 # a conservative-tone resume (RIAs, banks, custodians) gets scrubbed to institutional-safe phrasing.
 _CRYPTO_TERMS_PATTERN = re.compile(r"\b(bitcoin|crypto(?:currency)?|tokeniz\w*|web3|blockchain|trading bots?)\b", re.IGNORECASE)
 
-def apply_tone_filter(text: str, tone_mode: str) -> str:
-    """Scrubs crypto/Web3 keywords to institutional-safe phrasing when tone_mode is 'conservative';
-    passes text through unchanged for 'tech' (or any other) tone_mode.
+def should_scrub_crypto(tone_mode: str, track=None) -> bool:
+    """True when crypto/Web3 phrasing has to come off this resume.
+
+    Two independent reasons, which is why this is no longer just a tone check. A conservative
+    employer is a financial-services business with a compliance view on crypto. Tracks f and g
+    sell to a logistics or manufacturing reader who simply reads it as unserious - and those
+    tracks route to tone_mode "tech" by design, so keying on tone alone left the crypto wording
+    in the resume that most needed it gone.
     """
-    if str(tone_mode or "").lower() != "conservative" or not text:
+    if str(tone_mode or "").lower() == "conservative":
+        return True
+    return track is not None and normalize_track(track) in CRYPTO_SCRUB_TRACKS
+
+
+def apply_tone_filter(text: str, tone_mode: str, track=None) -> str:
+    """Scrubs crypto/Web3 keywords to institutional-safe phrasing when should_scrub_crypto() says
+    so; passes text through unchanged otherwise.
+    """
+    if not text or not should_scrub_crypto(tone_mode, track):
         return text
     return _CRYPTO_TERMS_PATTERN.sub("custodial systems", text)
 
@@ -53,14 +81,9 @@ _FALLBACK_EVIDENCE_BANK = {
     "experience": [], "education": [], "technical_skills": [], "banned_words": []
 }
 
-# Minimal safe fallback if resume_bullets_bank.json is ever missing/corrupt - keeps PDF compilation alive.
-_FALLBACK_RESUME_BULLETS_BANK = {
-    "track_a_wealth_ops": ["Reconciled high-volume data variances and mapped ownership structures to establish risk escalation logic."],
-    "track_b_engineering": ["Designed and scripted ETL pipelines and schema validation logic to automate high-volume data reconciliation."],
-    "track_c_risk_compliance": ["Audited compliance documentation to enforce regulatory standards prior to execution."],
-    "track_d_business_intelligence": ["Built reporting pipelines to translate raw operational data into executive insights."],
-    "track_e_bizops": ["Automated routine data extraction and workflow tasks to reduce manual administrative overhead."]
-}
+# Minimal safe fallback if resume_bullets_bank.json is ever missing/corrupt - keeps PDF compilation
+# alive. Built from track_registry so every track letter is represented; see FALLBACK_BULLETS_BY_POOL.
+_FALLBACK_RESUME_BULLETS_BANK = dict(FALLBACK_BULLETS_BY_POOL)
 
 def load_json(path: str, fallback: dict) -> dict:
     """Generic JSON bank loader with a safe try/except fallback: logs an error and returns the
@@ -81,83 +104,104 @@ def load_evidence_bank() -> dict:
 def load_resume_bullets_bank() -> dict:
     return load_json(RESUME_BULLETS_BANK_PATH, _FALLBACK_RESUME_BULLETS_BANK)
 
-# Maps track letters a-e to resume_bullets_bank.json's descriptive pool names.
-TRACK_BULLET_POOL_KEYS = {
-    "a": "track_a_wealth_ops",
-    "b": "track_b_engineering",
-    "c": "track_c_risk_compliance",
-    "d": "track_d_business_intelligence",
-    "e": "track_e_bizops",
-}
-
 # Indices within specific (track, tone_mode) pairs to exclude regardless of what Gemini routed.
 # apply_tone_filter() already scrubs crypto/Web3 wording from bullet prose, so an index belongs
 # here only when the underlying work itself is off-message for the tone - not merely its phrasing.
 TRACK_TONE_CONSTRAINTS = {}
 
-# Persona framing only (subtitle/keywords/skills prose) - every skill named here must already
-# exist in evidence_bank.json's technical_skills; factual content (jobs, dates, bullets) lives in the bank.
-TRACKS = {
-    "a": {
-        "subtitle": "Financial Systems & Operations",
-        "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
-        "summary": "I reconcile custodial accounts across 500+ client files and automate onboarding paperwork with Python and Salesforce.",
-        "skills": [
-            ("Core Operations", "Custodial Cashiering & Reconciliations, Ticketing Queue Management, RIA Audits, Automation."),
-            ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Python, SQL, Excel.")
-        ]
-    },
-    "b": {
-        "subtitle": "Data & Systems Engineering",
-        "keywords": ("Python", "SQL", "REST APIs", "ETL", "Schema Architecture", "Process Automation"),
-        "summary": "I build Python and SQL tools that cut manual reporting work, including a pipeline that cleaned 1,500+ legacy account records.",
-        "skills": [
-            ("Engineering & Data", "Python, SQL, REST APIs, Webhook Integrations, SQLite WAL, Data Reconciliation."),
-            ("Platforms & Stack", "Salesforce, HubSpot CRM, Flask, Typst, Schwab Advisor Center, Fidelity Wealthscape.")
-        ]
-    },
-    "c": {
-        "subtitle": "Risk & Regulatory Compliance",
-        "keywords": ("Regulatory Compliance", "SEC/FinCEN Filings", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
-        "summary": "I audit onboarding files across 500+ accounts and draft SEC Form D filings to catch compliance risks before execution.",
-        "skills": [
-            ("Compliance & Risk", "SEC & FinCEN Filings, Suitability Reviews, Custodial Exception Audits, Form D."),
-            ("Systems & Controls", "Salesforce Queue Routing, DocuSign API, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
-        ]
-    },
-    "d": {
-        "subtitle": "Business Intelligence & Analytics",
-        "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
-        "summary": "I write SQL and build Power BI dashboards that resolved $250k in ledger variances across institutional custody accounts.",
-        "skills": [
-            ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Advanced Excel Modeling."),
-            ("Systems & Data", "Salesforce Reports, bSwift, Schwab Advisor Center, Fidelity Wealthscape, Python (pandas).")
-        ]
-    },
-    "e": {
-        "subtitle": "Business Operations & CRM Systems",
-        "keywords": ("Business Operations", "Salesforce", "HubSpot CRM", "Process Automation", "Ticket Routing", "Python"),
-        "summary": "I design Salesforce queues and DocuSign workflows that cut advisor packet review from 60 minutes to 20.",
-        "skills": [
-            ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management, Process Design."),
-            ("Systems & Tools", "Salesforce, HubSpot CRM, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Python.")
-        ]
-    }
-}
-
 # Above this similarity, a routed pool bullet is treated as the same claim as a static bullet.
 _DUPLICATE_BULLET_RATIO = 0.80
 
+# How many of job 0's 14 statics render when every routed bullet was tagged to a later employer.
+# Matches what jobs 1-3 carry, so the block stays the same size whichever way the tags fall.
+_JOB_ZERO_FALLBACK_BULLETS = 3
+
+
+def bullet_text(entry) -> str:
+    """The prose of a bullet bank entry, whether it is a bare string or a {"text", "source_job"} dict.
+
+    Total by construction: anything unrecognized becomes "". /edit writes bare strings back to the
+    bank from Kevin's phone (update_template_entry), so a loader that raised on an unexpected shape
+    would corrupt the bank on the next phone edit rather than on the next deploy.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        text = entry.get("text")
+        return text if isinstance(text, str) else ""
+    return ""
+
+
+def bullet_source_job(entry, evidence: dict = None) -> int:
+    """Which `evidence["experience"]` index a bullet's claim actually belongs to. Defaults to 0.
+
+    A bare string means 0 (Signal Advisors), which is every untagged entry in the bank and the
+    behavior that shipped before source tags existed. An index outside the experience list, a
+    bool, a float or a string digit all degrade to 0 rather than raising - the alternative is a
+    phone edit taking the resume renderer down.
+    """
+    if not isinstance(entry, dict):
+        return 0
+    raw = entry.get("source_job")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    jobs = (evidence or {}).get("experience", [])
+    if isinstance(jobs, list) and jobs and not 0 <= raw < len(jobs):
+        return 0
+    return max(raw, 0)
+
+
+def bullet_replaces_static(entry, evidence: dict = None) -> int:
+    """Which of its own job's static bullets a routed bullet restates, or -1 for none.
+
+    Source tagging alone fixed the attribution and created a second problem: a pool bullet is
+    usually a rephrasing of one of that employer's static bullets, so appending it under the right
+    employer printed the same claim twice in a row. "Built structured audit checklists to
+    cross-reference multi-plant payroll data ... across 70+ manufacturing facilities" followed by
+    "Built the audit checklists that cross-referenced payroll across 70+ manufacturing facilities"
+    reads as padding, which is worse on the page than the misattribution was.
+
+    A similarity threshold cannot make this call - measured against their own employer's statics,
+    same-claim pairs run 0.52-0.72 and genuinely different claims run 0.41-0.45, which do not
+    separate. So the substitution is authored in the bank, not inferred: `replaces` names the static
+    index, and its absence means the bullet adds a claim that employer's statics do not cover and
+    should append. Total, like its siblings: any malformed value means -1 (append).
+    """
+    if not isinstance(entry, dict):
+        return -1
+    raw = entry.get("replaces")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return -1
+    jobs = (evidence or {}).get("experience", [])
+    src = bullet_source_job(entry, evidence)
+    if isinstance(jobs, list) and 0 <= src < len(jobs):
+        if raw >= len(jobs[src].get("bullets", []) or []):
+            return -1
+    return raw
+
+
+def _duplicate_check_targets(evidence: dict, source_job: int = 0) -> list:
+    """Bullets a routed pool entry must not duplicate, given the job it will render under.
+
+    Two different reasons, both ending in the same failure on the page:
+
+    - Other JOBS: a bullet rendered under one employer that repeats another employer's static
+      bullet silently credits one job's work to another. The bullet's OWN job is excluded on
+      purpose - a correctly-tagged ABC bullet resembling ABC's own statics is attribution working,
+      not a collision, and dropping it would be exactly backwards.
+    - PROJECTS: projects render in their own section from their own data, so a match there is not
+      a misattribution at all. It is simply the same sentence printed twice on one page under two
+      headings, which reads as padding. track_h[4] was a live instance at 0.8067.
+    """
+    jobs = evidence.get("experience", []) or []
+    out = [b for idx, job in enumerate(jobs) if idx != source_job for b in job.get("bullets", [])]
+    out += [b for proj in evidence.get("projects", []) or [] for b in proj.get("bullets", [])]
+    return out
+
 
 def _bullets_of_other_jobs(evidence: dict) -> list:
-    """Static bullets belonging to every job EXCEPT the first one.
-
-    Routed bullets replace job 0's bullets, so a pool entry matching job 0 renders in the only
-    place it would have appeared anyway. Matching a LATER job is the problem: the same sentence
-    then appears twice on the page under two different employers, which reads as padding and
-    silently credits one job's work to another.
-    """
-    return [b for job in evidence.get("experience", [])[1:] for b in job.get("bullets", [])]
+    """Back-compat shim for the source_job 0 case. See _duplicate_check_targets()."""
+    return _duplicate_check_targets(evidence, 0)
 
 
 def _is_duplicate_of_other_job(bullet: str, other_bullets: list) -> bool:
@@ -169,7 +213,15 @@ def _is_duplicate_of_other_job(bullet: str, other_bullets: list) -> bool:
 
 
 def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> list:
-    """Resolves the actual bullet strings for a track + list of pool indices. Gemini only ever
+    """The bullet STRINGS for a track + routed indices - the shape three non-renderer call sites
+    consume (card routing, format_ats_plaintext, the stage page). A thin wrapper so that adding
+    source tags could not change this return type out from under them.
+    """
+    return [bullet_text(e) for e in filter_ats_bullet_entries(track, bullet_indices, tone_mode)]
+
+
+def filter_ats_bullet_entries(track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> list:
+    """Resolves the actual bullet entries for a track + list of pool indices. Gemini only ever
     routes a track letter and integer indices (Strict Deterministic Template Engine) - it never
     authors bullet text itself, so there is nothing to "validate" beyond bounds-checking.
     Defaults to [0, 1, 2] if bullet_indices is omitted, not a list of ints, or contains any
@@ -180,13 +232,16 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode:
     index flagged in TRACK_TONE_CONSTRAINTS for (track, tone_mode) is dropped and backfilled from
     _SAFE_FALLBACK_INDICES, so a conservative-tone resume never surfaces a Web3/crypto bullet even
     if Gemini's routed indices included one.
+    Returns the raw pool entries - a bare string, or a {"text", "source_job"} dict for a bullet
+    whose claim belongs to a later employer. Only the renderer needs that; everything else calls
+    filter_ats_bullets() and gets strings.
     """
     evidence_bank = load_evidence_bank()
     resume_bullets_bank = load_resume_bullets_bank()
-    track_key = str(track or "a").lower()
+    track_key = normalize_track(track)
     tone_key = str(tone_mode or "conservative").lower()
-    pool_key = TRACK_BULLET_POOL_KEYS.get(track_key, TRACK_BULLET_POOL_KEYS["a"])
-    pool = resume_bullets_bank.get(pool_key) or resume_bullets_bank.get(TRACK_BULLET_POOL_KEYS["a"], [])
+    pool_key = pool_key_for(track_key)
+    pool = resume_bullets_bank.get(pool_key) or resume_bullets_bank.get(TRACK_BULLET_POOL_KEYS[DEFAULT_TRACK], [])
     banned = [str(w).lower() for w in evidence_bank.get("banned_words", [])]
 
     is_valid = (
@@ -211,21 +266,27 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode:
         if not indices:
             indices = [0]
 
-    other_job_bullets = _bullets_of_other_jobs(evidence_bank)
+    # Cached per source job: the targets differ by bullet now, and SequenceMatcher over 17 static
+    # bullets runs for every candidate index including the backfill sweep.
+    targets_cache = {}
+
+    def _is_clean(i) -> bool:
+        text = bullet_text(pool[i])
+        if any(bw in text.lower() for bw in banned):
+            return False
+        src = bullet_source_job(pool[i], evidence_bank)
+        if src not in targets_cache:
+            targets_cache[src] = _duplicate_check_targets(evidence_bank, src)
+        return not _is_duplicate_of_other_job(text, targets_cache[src])
+
     target_len = len(indices)
-    kept = [
-        i for i in indices
-        if not any(bw in str(pool[i]).lower() for bw in banned)
-        and not _is_duplicate_of_other_job(pool[i], other_job_bullets)
-    ]
+    kept = [i for i in indices if _is_clean(i)]
     for fallback_i in range(len(pool)):
         if len(kept) >= target_len:
             break
         if fallback_i in kept or fallback_i in forbidden:
             continue
-        if any(bw in str(pool[fallback_i]).lower() for bw in banned):
-            continue
-        if _is_duplicate_of_other_job(pool[fallback_i], other_job_bullets):
+        if not _is_clean(fallback_i):
             continue
         kept.append(fallback_i)
 
@@ -235,11 +296,31 @@ def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode:
 def _render_experience_block(evidence: dict, dynamic_bullets: list = None) -> str:
     """Renders the Professional Experience section entirely from Evidence Bank data - every
     injected field is escape_typst()'d since none of this is a hardcoded literal anymore.
-    `dynamic_bullets`, if given, entirely replaces the first job's (Signal Advisors) static
-    bullets instead of stacking on top of them, so the track-routed bullets lead the section
-    without duplicating the static ones.
+    `dynamic_bullets`, if given, is a list of routed bullet bank ENTRIES, each placed under the
+    employer its claim actually came from (bullet_source_job). The rule differs by job, and the
+    difference is not an inconsistency:
+
+    - Job 0 (Signal Advisors) carries 14 static bullets that exist to feed the duplicate guard and
+      to source new copy. They have never rendered, because routed bullets REPLACE them. Stacking
+      them would put 18 bullets on a one-page resume.
+    - Jobs 1-3 carry exactly 3 statics each and always render all 3, so a routed bullet APPENDS.
+      Replacing them would delete two real claims in order to add one.
+
+    If every routed bullet was tagged away from job 0, job 0 falls back to a bounded slice of its
+    statics rather than rendering a bare heading with nothing under it.
+
+    A routed bullet appended to jobs 1-3 SUPERSEDES the static it restates (bullet_replaces_static),
+    so the section never prints one claim twice in two wordings, and its total line count is never
+    higher than before source tags existed.
     """
     lines = []
+    routed_by_job = {}
+    for entry in dynamic_bullets or []:
+        text = bullet_text(entry)
+        if text:
+            routed_by_job.setdefault(bullet_source_job(entry, evidence), []).append(
+                (text, bullet_replaces_static(entry, evidence)))
+
     for idx, job in enumerate(evidence.get("experience", [])):
         title = escape_typst(job.get("title", ""))
         company = escape_typst(job.get("company", ""))
@@ -249,7 +330,15 @@ def _render_experience_block(evidence: dict, dynamic_bullets: list = None) -> st
         if idx > 0:
             lines.append("#v(6.5pt)")
         lines.append(f"*{title}* | {company} #h(1fr) {location} | {start} -- {end}")
-        bullets = dynamic_bullets if (idx == 0 and dynamic_bullets) else job.get("bullets", [])
+        statics = job.get("bullets", []) or []
+        routed = [t for t, _ in routed_by_job.get(idx, [])]
+        if idx == 0:
+            bullets = routed or (statics[:_JOB_ZERO_FALLBACK_BULLETS] if dynamic_bullets else statics)
+        else:
+            # A routed bullet that restates one of this job's statics takes its place rather than
+            # sitting next to it - the claim survives, in the phrasing chosen for this posting.
+            superseded = {sub for _, sub in routed_by_job.get(idx, []) if sub >= 0}
+            bullets = [b for i, b in enumerate(statics) if i not in superseded] + routed
         for b in bullets:
             lines.append(f"- {escape_typst(b)}")
     return "\n".join(lines)
@@ -282,7 +371,7 @@ def _render_education_credentials_block(evidence: dict) -> str:
 
     return "\n".join(lines)
 
-def _render_projects_block(evidence: dict, tone_mode: str = "conservative") -> str:
+def _render_projects_block(evidence: dict, tone_mode: str = "conservative", track=None) -> str:
     """Renders the Technical Projects section - name/location/dates header line per project,
     followed by its bullets. `tone_mode` scrubs crypto/Web3 phrasing for conservative firms,
     same as the summary and dynamic experience bullets.
@@ -294,7 +383,7 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative") -> s
         # A project name is a proper noun, so it is swapped wholesale via name_conservative rather
         # than run through apply_tone_filter() - the regex turned "Crypto Breakout Alert" into
         # "custodial systems Breakout Alert" on every conservative resume.
-        if tone_key == "conservative" and proj.get("name_conservative"):
+        if should_scrub_crypto(tone_key, track) and proj.get("name_conservative"):
             name = escape_typst(proj["name_conservative"])
         else:
             name = escape_typst(proj.get("name", ""))
@@ -308,7 +397,7 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative") -> s
         repo_link = f' | #link("https://{repo_raw}")[Source]' if repo_raw else ""
         lines.append(f"*{name}*{repo_link} #h(1fr) {location} | {start} -- {end}")
         for b in bullets:
-            clean_b = apply_tone_filter(b, tone_key)
+            clean_b = apply_tone_filter(b, tone_key, track)
             lines.append(f"- {escape_typst(clean_b)}")
     return "\n".join(lines)
 
@@ -317,7 +406,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     claim (experience, education, certificates) from the centralized JSON banks (hot-reloaded
     fresh on every call), assembled into 4 sections: Summary, Professional Experience,
     Education & Credentials, Skills & Systems. Dynamic 30% customization is entirely
-    track-driven (a-e, already routed by Gemini as an SDTE integer/letter, never free text):
+    track-driven (a-h, already routed by Gemini as an SDTE integer/letter, never free text):
     the header summary, the leading achievement bullet, and skill emphasis all key off the
     same `track` value, so no live job-description text is required at render time - the
     resume still compiles correctly even from a bare "a" default with no cached job.
@@ -325,7 +414,8 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     crypto/Web3 language from the summary for conservative firms (RIAs, banks, custodians). The
     Skills & Systems footer always renders the track's own 2-line category blocks unchanged.
     """
-    track_data = TRACKS.get(str(track or "a").lower(), TRACKS["a"])
+    track_key = normalize_track(track)
+    track_data = TRACKS[track_key]
     tone_key = str(tone_mode or "conservative").lower()
     if tone_key not in ("conservative", "tech"):
         tone_key = "conservative"
@@ -333,10 +423,11 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     identity = evidence.get("identity", {})
     clean_company = escape_typst(company_name or "Target Operations")
 
-    selected_bullets = filter_ats_bullets(track, bullet_indices, tone_key)
+    # ENTRIES, not strings: the renderer is the only caller that needs each bullet's source job.
+    selected_bullets = filter_ats_bullet_entries(track_key, bullet_indices, tone_key)
 
     keywords_tuple = ", ".join(f'"{kw}"' for kw in track_data["keywords"])
-    summary = escape_typst(apply_tone_filter(track_data["summary"], tone_key))
+    summary = escape_typst(apply_tone_filter(track_data["summary"], tone_key, track_key))
 
     name = escape_typst(identity.get("name", "Kevin Miller"))
     email = escape_typst(identity.get("email", ""))
@@ -359,7 +450,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     contact_line = " • ".join(contact_fields)
 
     experience_block = _render_experience_block(evidence, dynamic_bullets=selected_bullets)
-    projects_block = _render_projects_block(evidence, tone_mode=tone_key)
+    projects_block = _render_projects_block(evidence, tone_mode=tone_key, track=track_key)
     education_credentials_block = _render_education_credentials_block(evidence)
     skills_lines = " \\\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
 

@@ -99,9 +99,9 @@ HELP = {
     "/edit": (
         "Edits one banked template in place by its slot code. The code is a letter for the bank "
         "plus a number for the position in it, and the new text is linted before it saves.\n\n"
-        "<b>C0-C5</b> cold outreach · <b>W0-W5</b> warm (hand-written scaffolds)\n"
+        "<b>C0-C7</b> cold outreach · <b>W0-W5</b> warm (hand-written scaffolds)\n"
         "<b>B0-B1</b> follow-up bumps · <b>R0-R3</b> reactivation (dormant warm contacts)\n"
-        "<b>L0-L9</b> LinkedIn notes · <b>TA0-TE9</b> resume bullets by track",
+        "<b>L0-L9</b> LinkedIn notes · <b>TA0-TH14</b> resume bullets by track",
         "/edit R2 Hi{name}, ...\n-> replaces reactivation slot 2",
     ),
 
