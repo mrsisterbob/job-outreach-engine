@@ -56,10 +56,16 @@ names, and nothing on the `Code.gs` side references them):
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `FOLLOWUP_1_DAYS` | `4` | `Applied` + no reply → follow-up #1 due at `anchor + 4d` |
-| `FOLLOWUP_2_DAYS` | `9` | `Applied` + no reply → follow-up #2 due at `anchor + 9d` |
-| `FOLLOWUP_BURY_DAYS` | `16` | `Applied` + no reply → auto-bury as ghosted at `anchor + 16d` |
+| `FOLLOWUP_1_DAYS` | `10` | `Applied` + no reply → follow-up #1 due at `anchor + 10d` |
+| `FOLLOWUP_2_DAYS` | `11` | Retired rung — kept only to satisfy the ordering constraint below; `followup_action()` never issues `send_followup_2` |
+| `FOLLOWUP_BURY_DAYS` | `21` | `Applied` + no reply → auto-bury as ghosted at `anchor + 21d` |
 | `STALE_HOT_DAYS` | `5` | `Replied`/`Screening`/`Interviewing` untouched longer than this → `stale_nudge` |
+
+Retuned **2026-09-24** to one bump at day 10 and a 21-day total lifespan. The previous numbers
+fired the bump at day 2, which landed before a recipient had plausibly acted on the first email.
+The contact-side ladder was moved to match: one nudge at day 4, spent at day 21
+(`CARMEN_LADDER_DAYS_COLD`/`_ENGAGED = (4,)`, `CARMEN_KILL_GRACE_DAYS = 17`), so an application
+and a contact now leave the board on the same three-week schedule.
 
 Retune constraint (locked by `test_followup_cadence_knobs_are_strictly_increasing`):
 `0 < FOLLOWUP_1_DAYS < FOLLOWUP_2_DAYS < FOLLOWUP_BURY_DAYS`. The nightly job pushes Next

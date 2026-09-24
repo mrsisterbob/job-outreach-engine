@@ -306,22 +306,22 @@ def status_rank(value):
 #   * STALE_HOT_DAYS is independent (it only gates the read-only stale_nudge on hot
 #     statuses, which never auto-bury).
 # ------------------------------------------------------------------------------
-# These reqs are actively being filled. The measured silence on Kevin's own open applications is
-# a median of 6 days (4-8 across the queue) while postings close inside 7-10 - so a bump that
-# waits 3+ days is landing against a req that may already be shortlisted. Day 2 is the floor:
-# tighter than that and the bump arrives before a human has plausibly triaged the first email.
-FOLLOWUP_1_DAYS = 2       # Applied + no reply -> follow-up #1 becomes due at anchor + 2d
+# Retuned 2026-09-24: the old day-2 bump was far too fast in practice. It was set from a measured
+# 4-8 day reply window on the theory that a bump had to beat the shortlist, but the effect was a
+# follow-up landing before the recipient had plausibly acted on the first email - which reads as
+# pestering and burns the contact. Day 10 gives a full working fortnight-minus for the first
+# email to be seen, answered, or ignored on its own merits.
+FOLLOWUP_1_DAYS = 10      # Applied + no reply -> follow-up #1 becomes due at anchor + 10d
 # ONE follow-up, not two. A second unanswered bump reads as pestering to the recipient, and a
 # contact who ignored the first has decided. FOLLOWUP_2_DAYS is kept only to satisfy the strictly
 # increasing constraint documented above - it now sits between rung 1 and the bury, and no row
 # reaches it because followup_action() stops issuing send_followup_2.
-FOLLOWUP_2_DAYS = 3       # Retired rung - retained so the 1 < 2 < BURY ordering still holds
+FOLLOWUP_2_DAYS = 11      # Retired rung - retained so the 1 < 2 < BURY ordering still holds
 # The BUMP is fast; the BURY is not, and they are different questions. A bury moves the row to
-# Died, so burying at +5 was discarding applications while they were still inside the window
-# Kevin's own queue shows replies arriving in (4-8 days silent, median 6). 14 days is the number
-# he asked for: a full working fortnight, which covers the whole observed response range with
-# room to spare, and still clears the board of genuinely dead rows.
-FOLLOWUP_BURY_DAYS = 14   # Applied + no reply after the single bump -> auto-bury at anchor + 14d
+# Died, so it must sit well clear of the window a reply can still arrive in. 21 days is the total
+# lifespan Kevin asked for: three weeks from application to the row leaving the board, with the
+# single bump at day 10 and eleven more days of silence before it is called.
+FOLLOWUP_BURY_DAYS = 21   # Applied + no reply after the single bump -> auto-bury at anchor + 21d
 STALE_HOT_DAYS = 5        # Replied/Screening/Interviewing untouched > 5d -> stale_nudge
 
 # Fifth knob, counted from *today* rather than from followup_anchor(): when a verified inbound
@@ -452,7 +452,10 @@ def followup_action(status, date_added, next_followup, today):
 _OUTREACH_BANNED_PATTERNS = [
     (r"best regards", "'Best regards' - use 'Thanks,' or 'Best,'"),
     (r"\balign\w*\b", "'align/alignment' - name the work instead"),
-    (r"\bfits?\b(?!\s+(?:in|into)\b)", "'fit' as a skills claim - name the work instead"),
+    # 'fit' was banned here as a vague skills claim ("I would be a great fit"). Retired 2026-09-24:
+    # Kevin's shipped cold copy asks to "discuss if this could be a good fit", which is the opposite
+    # move - it offers the recipient the judgement rather than asserting it. The rule could not tell
+    # the two apart and only fired on his own template.
     (r"hope (?:you|things) (?:are|have been|'ve been|is)[^.]{0,20}\bwell\b", "'hope you have been doing well' filler opener"),
     (r"\bhi there\b", "'Hi there' - the {name} placeholder renders a bare 'Hi,' when the name is unknown"),
     (r"\b(?:leverag|utiliz|spearhead|synerg|optimiz)\w*\b", "corporate verb (leverage/utilize/spearhead/synergy/optimize)"),
@@ -1199,34 +1202,38 @@ def resolve_sent_email_backfill(to_header, job_rows):
 
 # Two ladders, picked per row by whether the contact has EVER replied (carmen_reply_anchor).
 #
-# COLD - a stranger who has never written back. Day 0 is the original email, so (2,) is two total
-# contacts, ending at day 9 with the grace week. Tightened from 3 to 2 for the same reason as
-# FOLLOWUP_1_DAYS: these reqs fill inside 7-10 days, so a nudge that waits longer is arriving
-# after the decision. Everything past that first bump was cut - repeat unanswered touches are
-# where spam complaints concentrate.
+# Retuned 2026-09-24 to ONE bump at day 4 and a 21-day total lifespan, matching the job side.
+#
+# COLD - a stranger who has never written back. Day 0 is the original email, the single bump
+# lands at day 4, and the row then sits until day 21 before triage. The old (2,) fired the bump
+# roughly 48 hours after the first email, which is before a busy person has plausibly read it -
+# the touch arrived as pressure rather than as a reminder.
 #
 # ENGAGED - has replied at least once, so this is a live conversation, not a push against silence.
-# Gets one day more runway before the single bump, and nothing after it.
+# Same day-4 bump: a person mid-thread who has gone quiet for four days is the case a nudge is
+# actually for, and giving them a different number than a cold row bought nothing measurable.
 #
 # A cold row is PROMOTED automatically the moment a reply lands: carmen_reply_anchor() starts
 # returning a date, the row switches to the engaged ladder, and the anchor resets to the reply
 # date. Nothing to set by hand.
-# Both ladders now carry ONE rung against silence. A cold contact who ignored the first nudge has
-# decided, and a second unanswered touch reads as pestering - the cost is reputational, not just a
-# wasted send. ENGAGED keeps a longer gap because a live thread earns more runway, but it still
-# only bumps once before triage.
-CARMEN_LADDER_DAYS_COLD = (2,)
-CARMEN_LADDER_DAYS_ENGAGED = (3,)
+# Both ladders carry ONE rung against silence. A contact who ignored the first nudge has decided,
+# and a second unanswered touch reads as pestering - the cost is reputational, not just a wasted
+# send.
+CARMEN_LADDER_DAYS_COLD = (4,)
+CARMEN_LADDER_DAYS_ENGAGED = (4,)
 
 # Back-compat alias. Callers that predate the split (and the migration guard below) still read
 # the engaged ladder, which is the old single ladder unchanged.
 CARMEN_LADDER_DAYS = CARMEN_LADDER_DAYS_ENGAGED
 
 # After the last nudge the ladder writes one more date, anchor + ladder[-1] + this, so a silent
-# contact gets a week to answer before triage. That written date is what makes "exhausted"
+# contact gets time to answer before triage. That written date is what makes "exhausted"
 # reachable at all: without it the final rung left the row's gap at exactly the last offset, which
 # reads as the final rung again, and the last nudge re-fired every morning forever.
-CARMEN_KILL_GRACE_DAYS = 7
+#
+# 17, not 7, so that the day-4 bump plus this grace totals the 21-day lifespan the job side uses
+# (FOLLOWUP_BURY_DAYS). A contact and an application now leave the board on the same schedule.
+CARMEN_KILL_GRACE_DAYS = 17
 
 
 def carmen_ladder_for(replied):
@@ -1251,11 +1258,17 @@ def carmen_terminal_gap(ladder):
 # when deciding whether a stale anchor is a revival. Must stay the MAX across both ladders.
 CARMEN_TERMINAL_GAP_DAYS = carmen_terminal_gap(CARMEN_LADDER_DAYS_ENGAGED)
 
-# A Carmen Cold row traverses the whole ladder (grace included) in under 30 days, so an anchor
-# older than this cannot be mid-ladder. It is a revived bench contact (Carmen Warm rows carry Last
-# Contact Dates months old) or a stalled row, and today is the correct anchor for both. Without
-# this, a contact dragged in from the bench reads as long past the last rung and is killed on the
-# first pass without a single nudge.
+# A Carmen Cold row traverses the whole ladder (grace included) in CARMEN_TERMINAL_GAP_DAYS, so an
+# anchor older than this cannot be mid-ladder. It is a revived bench contact (Carmen Warm rows
+# carry Last Contact Dates months old) or a stalled row, and today is the correct anchor for both.
+# Without this, a contact dragged in from the bench reads as long past the last rung and is killed
+# on the first pass without a single nudge.
+#
+# MUST stay above CARMEN_TERMINAL_GAP_DAYS. plan_carmen_ladder() treats a row as mid-ladder while
+# BOTH the gap is within the terminal gap AND the scheduled date is within this bound of today, so
+# a row parked on its terminal date stays ladder-shaped for this many days past that date before
+# the revival can fire. Widening the grace therefore pushes the revival out too: at a 21-day
+# terminal gap a responder reaches ready_to_promote on day 21 and is revived on day 51.
 CARMEN_STALE_ANCHOR_DAYS = 30
 
 # Note text the CRM carries, defined once so the writers in main.py and the parsers below can

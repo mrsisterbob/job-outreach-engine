@@ -137,19 +137,35 @@ def _added(days_ago):
     return (_TODAY - timedelta(days=days_ago)).strftime("%Y-%m-%d")
 
 
-def test_followup_action_applied_boundary_days_1_2_3():
-    assert pu.followup_action("Applied", _added(1), "", _TODAY) == "none"
-    assert pu.followup_action("Applied", _added(2), "", _TODAY) == "send_followup_1"
-    assert pu.followup_action("Applied", _added(3), "", _TODAY) == "send_followup_1"
+def test_followup_action_applied_boundary_around_the_bump():
+    """The day before the bump is silence; the bump day and the day after both issue it.
+
+    Written against FOLLOWUP_1_DAYS rather than a literal, so retuning the cadence does not
+    require editing the boundary logic - only the values below that are deliberately absolute.
+    """
+    assert pu.followup_action("Applied", _added(pu.FOLLOWUP_1_DAYS - 1), "", _TODAY) == "none"
+    assert pu.followup_action("Applied", _added(pu.FOLLOWUP_1_DAYS), "", _TODAY) == "send_followup_1"
+    assert pu.followup_action("Applied", _added(pu.FOLLOWUP_1_DAYS + 1), "", _TODAY) == "send_followup_1"
 
 
-def test_followup_action_bumps_fast_but_buries_slow():
-    """The bump and the bury answer different questions. A row stays Applied through the whole
-    window Kevin's queue shows replies arriving in (4-8 days silent) and is only buried at +14."""
-    for day in (4, 8, 13):
-        assert pu.followup_action("Applied", _added(day), "", _TODAY) == "send_followup_1"
-    assert pu.followup_action("Applied", _added(14), "", _TODAY) == "bury_ghosted"
-    assert pu.followup_action("Applied", _added(20), "", _TODAY) == "bury_ghosted"
+def test_the_bump_waits_ten_days_and_the_bury_waits_three_weeks():
+    """The retuned cadence, pinned to absolute days on purpose.
+
+    The old numbers (bump at 2, bury at 14) fired a follow-up roughly 48 hours after the first
+    email - before a busy recipient had plausibly acted on it. Kevin retuned this on 2026-09-24
+    to one bump at day 10 and a 21-day total lifespan. These literals are the contract; if a
+    future change moves them, that should be a decision, not a silent drift.
+    """
+    assert pu.FOLLOWUP_1_DAYS == 10
+    assert pu.FOLLOWUP_BURY_DAYS == 21
+    # Silent through the first nine days - no touch at all.
+    for day in (1, 5, 9):
+        assert pu.followup_action("Applied", _added(day), "", _TODAY) == "none", day
+    # One bump, then it stands until the bury boundary.
+    for day in (10, 15, 20):
+        assert pu.followup_action("Applied", _added(day), "", _TODAY) == "send_followup_1", day
+    for day in (21, 30):
+        assert pu.followup_action("Applied", _added(day), "", _TODAY) == "bury_ghosted", day
 
 
 def test_followup_action_never_issues_a_second_bump():
@@ -166,7 +182,9 @@ def test_followup_action_future_next_followup_always_none():
 
 def test_followup_action_next_followup_today_is_not_future():
     # Due today (== today, not > today) -> the window math still applies.
-    assert pu.followup_action("Applied", _added(20), _TODAY.strftime("%Y-%m-%d"), _TODAY) == "bury_ghosted"
+    assert pu.followup_action(
+        "Applied", _added(pu.FOLLOWUP_BURY_DAYS), _TODAY.strftime("%Y-%m-%d"), _TODAY
+    ) == "bury_ghosted"
 
 
 def test_followup_action_hot_statuses_stale_nudge_after_five_days():
@@ -188,7 +206,7 @@ def test_followup_action_unknown_status_is_none():
 
 
 def test_followup_action_is_status_case_insensitive():
-    assert pu.followup_action("  applied  ", _added(4), "", _TODAY) == "send_followup_1"
+    assert pu.followup_action("  applied  ", _added(pu.FOLLOWUP_1_DAYS), "", _TODAY) == "send_followup_1"
 
 
 def test_followup_action_blank_dates_yield_none():
@@ -204,11 +222,13 @@ def test_followup_action_malformed_dates_yield_none():
 
 def test_followup_action_falls_back_to_next_followup_when_date_added_blank():
     # Date Added missing, past Next Followup Date -> used as the anchor.
-    assert pu.followup_action("Applied", "", _added(16), _TODAY) == "bury_ghosted"
+    assert pu.followup_action("Applied", "", _added(pu.FOLLOWUP_BURY_DAYS + 2), _TODAY) == "bury_ghosted"
 
 
 def test_followup_action_accepts_datetime_for_today():
-    assert pu.followup_action("Applied", _added(4), "", datetime(2026, 6, 1, 7, 30)) == "send_followup_1"
+    assert pu.followup_action(
+        "Applied", _added(pu.FOLLOWUP_1_DAYS), "", datetime(2026, 6, 1, 7, 30)
+    ) == "send_followup_1"
 
 
 def test_followup_anchor_prefers_date_added_over_next_followup():
@@ -772,14 +792,18 @@ def test_shipped_templates_open_on_a_bare_hi_when_no_name_is_known():
 
 def test_cold_ops_encodes_the_professional_corpus_voice():
     """Rules traceable to counts in the correct mailbox (kjmiller406@gmail.com, 62 emails):
-    a 10-minute timebox, 'Best,' + full name, and no college-corpus habits.
+    a 15-minute timebox, 'Best,' + 'Kevin', and no college-corpus habits.
 
-    The corpus markers that are habits rather than invariants - the word 'brief', the verbatim
-    release line, and a 'perspective'/'day to day' question - are asserted as BANK COVERAGE, not
-    per template. Requiring all three in all six is what collapsed the bank into six near-copies
-    of one email sharing ~80% of their words, which at pipeline volume means two people on the
-    same team can receive visibly identical notes. Coverage keeps the voice anchored in the
-    corpus while letting each entry open and close differently.
+    Retuned 2026-09-24 to the template Kevin wrote by hand and chose as the new standard. Three
+    rules moved with it, each a deliberate override of what the 62-email corpus showed:
+      * 15 minutes, not 10. A bigger ask, made once.
+      * Signs 'Kevin', not 'Kevin Miller'.
+      * "I saw you were hiring for this role" is now ALLOWED to open the second paragraph. The old
+        rule barred announcing the posting, on the theory it wastes the strongest line; Kevin's
+        copy uses it as the bridge into the ask and he kept it deliberately.
+
+    The 'brief' / 'Happy to work around your schedule' / 'perspective' coverage floors are gone:
+    they described the previous bank's habits, and the new copy shares one body by design.
     """
     cold = _load_bank("outreach_templates.json")["cold_ops"]
     assert len(cold) == 6
@@ -790,20 +814,19 @@ def test_cold_ops_encodes_the_professional_corpus_voice():
 
     for idx, (template, rendered) in enumerate(zip(cold, rendered_all)):
         ctx = f"cold_ops[{idx}]"
-        assert "10 minutes" in rendered, ctx
-        assert rendered.rstrip().endswith("Best,\nKevin Miller"), ctx
+        assert "15 minutes" in rendered, ctx
+        assert rendered.rstrip().endswith("Best,\nKevin"), ctx
         # college-corpus tells the professional corpus disproves
         assert "Yours In Service" not in rendered and "YIS" not in rendered, ctx
         assert "{name_bare}" not in template, ctx
         for banned_minutes in ("13 minute", "14 minute", "16 minute", "17 minute"):
             assert banned_minutes not in rendered, ctx
         assert "I built" not in rendered and "I automated" not in rendered, ctx
-        # does not open by announcing the posting
-        assert not rendered.split("\n\n")[1].startswith(("I saw you're hiring", "I saw the", "Saw you're hiring")), ctx
+        # Opens by naming the application, which is the one fact that earns the reply.
+        assert rendered.split("\n\n")[1].startswith("I recently applied to"), ctx
 
-    assert sum("brief" in r for r in rendered_all) >= 2
-    assert sum("\nHappy to work around your schedule.\n" in r for r in rendered_all) >= 2
-    assert sum(("perspective" in r) or ("day to day" in r) for r in rendered_all) >= 2
+    # Every entry states the day-to-day ask - that is the whole point of the note.
+    assert all(("day-to-day" in r) or ("day to day" in r) for r in rendered_all)
 
 
 def test_gmail_generators_pass_the_same_linter_as_the_card_templates():
@@ -1029,19 +1052,27 @@ def test_carmen_ladder_walks_every_rung_then_stops():
     assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal, note) == ("exhausted", None)
 
 
-def test_cold_ladder_stops_one_nudge_earlier_than_engaged():
-    """A contact who has never replied gets two TOTAL contacts (day 0 + one nudge), and reaches
-    that single nudge a day sooner than an engaged row does."""
+def test_both_contact_ladders_bump_once_at_day_four_then_run_to_three_weeks():
+    """Retuned 2026-09-24: ONE nudge at day 4, and the row is spent 21 days after the anchor.
+
+    Cold and engaged used to differ by a day (2 vs 3). They are now identical - a contact
+    mid-thread who has gone quiet for four days is the same case as a stranger who never
+    answered, and the split bought nothing measurable. The 21-day total matches the job side's
+    FOLLOWUP_BURY_DAYS so a contact and an application leave the board on the same schedule.
+    """
+    assert pu.CARMEN_LADDER_DAYS_COLD == (4,)
+    assert pu.CARMEN_LADDER_DAYS_ENGAGED == (4,)
+    assert pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_COLD) == 21
+    assert pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_ENGAGED) == pu.FOLLOWUP_BURY_DAYS
+
     anchor_date = date(2026, 9, 12)
     anchor = anchor_date.isoformat()
     (d1,) = (anchor_date + timedelta(days=n) for n in pu.CARMEN_LADDER_DAYS_COLD)
 
-    assert pu.CARMEN_LADDER_DAYS_COLD[0] < pu.CARMEN_LADDER_DAYS_ENGAGED[0]
-
     terminal = anchor_date + timedelta(days=pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_COLD))
     assert pu.plan_carmen_followup(anchor, d1.isoformat(), d1) == ("nudge_1", terminal)
 
-    # No second nudge: the grace week runs, then the row is spent.
+    # No second nudge: the grace period runs, then the row is spent.
     assert pu.plan_carmen_followup(anchor, terminal.isoformat(), terminal) == ("exhausted", None)
 
 

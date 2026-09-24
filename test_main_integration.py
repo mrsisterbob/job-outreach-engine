@@ -657,14 +657,22 @@ def test_process_overdue_batch_sendall_drafts_for_valid_email(monkeypatch):
 
 _SEQ_TODAY = date(2026, 6, 1)
 
-# Applied 4d ago -> follow-up #1 ; Applied 16d ago -> bury ; Interviewing 10d ago -> stale ;
-# two Matched rows for the "top 3" section ; one future-dated Applied row that must be left alone.
+# Applied at the bump boundary -> follow-up #1 ; Applied past the bury boundary -> bury ;
+# Interviewing 10d ago -> stale ; two Matched rows for the "top 3" section ; one future-dated
+# Applied row that must be left alone.
+#
+# The two Applied dates are DERIVED from the cadence knobs rather than hardcoded. They were
+# literals ("2026-05-28", "2026-05-16") chosen against the old bump-at-2 / bury-at-14 numbers,
+# so retuning the cadence silently flipped this row from a bump to silence and that one from a
+# bury to a bump - which is how twelve sequencer tests failed at once on a two-line change.
+_SEQ_BUMP_DATE = (_SEQ_TODAY - timedelta(days=m.FOLLOWUP_1_DAYS)).isoformat()
+_SEQ_BURY_DATE = (_SEQ_TODAY - timedelta(days=m.FOLLOWUP_BURY_DAYS + 2)).isoformat()
 _SEQ_RECORDS = {
     "TC": [
         {"sheet_uuid": "seq-fu1", "company": "Acme", "title": "Ops Analyst", "name": "",
-         "status": "Applied", "date_added": "2026-05-28", "next_followup": "1970-01-01", "raw_priority": "70"},
+         "status": "Applied", "date_added": _SEQ_BUMP_DATE, "next_followup": "1970-01-01", "raw_priority": "70"},
         {"sheet_uuid": "seq-bury", "company": "Beta", "title": "Ops Lead", "name": "",
-         "status": "Applied", "date_added": "2026-05-16", "next_followup": "1970-01-01", "raw_priority": "60"},
+         "status": "Applied", "date_added": _SEQ_BURY_DATE, "next_followup": "1970-01-01", "raw_priority": "60"},
         {"sheet_uuid": "seq-future", "company": "Gamma", "title": "Analyst", "name": "",
          "status": "Applied", "date_added": "2026-05-01", "next_followup": "2026-06-30", "raw_priority": "55"},
     ],
@@ -702,8 +710,10 @@ def test_sequencer_queues_followup_1_with_window_snooze(monkeypatch):
 
     snoozes = [p for p in enqueued if p["action"] == "update_snooze" and p["sheet_uuid"] == "seq-fu1"]
     assert len(snoozes) == 1
-    # anchor (Date Added 2026-05-28) + FOLLOWUP_BURY_DAYS -> straight to the bury boundary
-    assert snoozes[0]["next_followup"] == "2026-06-11"
+    # The bump snoozes straight to the bury boundary: anchor + FOLLOWUP_BURY_DAYS. Computed, not
+    # a literal date, so the assertion states the RULE rather than one cadence's arithmetic.
+    expected = (date.fromisoformat(_SEQ_BUMP_DATE) + timedelta(days=m.FOLLOWUP_BURY_DAYS)).isoformat()
+    assert snoozes[0]["next_followup"] == expected
     # the future-dated Applied row is never touched
     assert all(p["sheet_uuid"] != "seq-future" for p in enqueued)
 
@@ -873,9 +883,14 @@ def _due_person(i, email="pat@acme.com", today=_SEQ_TODAY):
 
 
 def _due_application(i, email="kjmiller406@gmail.com"):
-    """A JOBS row Applied 4 days ago - follow-up #1 due. Contact Email is often Kevin's own."""
+    """A JOBS row sitting exactly on the bump boundary - follow-up #1 due. Contact Email is often
+    Kevin's own.
+
+    Date derived from FOLLOWUP_1_DAYS rather than the old "2026-05-28" literal, which was four
+    days before _SEQ_TODAY and only landed on a bump while the knob was 2.
+    """
     return {"sheet_uuid": f"app-{i}", "company": f"Acme{i}", "title": "Ops Analyst", "name": "",
-            "email": email, "status": "Applied", "date_added": "2026-05-28",
+            "email": email, "status": "Applied", "date_added": _SEQ_BUMP_DATE,
             "next_followup": "1970-01-01", "raw_priority": "70"}
 
 
@@ -963,14 +978,22 @@ def test_sequencer_jobs_rows_are_watched_not_drafted(monkeypatch):
     app = result["applications_quiet"][0]
     assert app["sheet_tab"] == "Tetiana Warm"
     assert app["attempt"] == 1
-    assert app["date_added"] == "2026-05-28"
+    assert app["date_added"] == _SEQ_BUMP_DATE
     assert app["next_followup"] == "1970-01-01"
-    assert app["new_next_followup"] == "2026-06-11"  # anchor + FOLLOWUP_BURY_DAYS
-    assert app["days_silent"] == 4
-    assert app["buries_on"] == "2026-06-11"  # anchor + FOLLOWUP_BURY_DAYS
+    # anchor + FOLLOWUP_BURY_DAYS: the bump snoozes straight to the bury boundary.
+    assert app["new_next_followup"] == (
+        date.fromisoformat(_SEQ_BUMP_DATE) + timedelta(days=m.FOLLOWUP_BURY_DAYS)
+    ).isoformat()
+    assert app["days_silent"] == m.FOLLOWUP_1_DAYS
+    assert app["buries_on"] == (
+        date.fromisoformat(_SEQ_BUMP_DATE) + timedelta(days=m.FOLLOWUP_BURY_DAYS)
+    ).isoformat()
     assert "draft_text" not in app and "draft_id" not in app
     snoozes = [p for p in enqueued if p["action"] == "update_snooze"]
-    assert [(p["sheet_uuid"], p["next_followup"]) for p in snoozes] == [("app-0", "2026-06-11")]
+    bury_boundary = (
+        date.fromisoformat(_SEQ_BUMP_DATE) + timedelta(days=m.FOLLOWUP_BURY_DAYS)
+    ).isoformat()
+    assert [(p["sheet_uuid"], p["next_followup"]) for p in snoozes] == [("app-0", bury_boundary)]
     assert _logged_uuids() == {"app-0"}
 
 
@@ -1387,14 +1410,14 @@ def test_ghost_walks_the_whole_ladder_and_is_killed(monkeypatch):
     nudge_days = {n: e["attempt"] for n, r in results.items() for e in r["followups_ready"]}
     assert nudge_days == {d: i + 1 for i, d in enumerate(cold)}
     kill_days = [n for n, r in results.items() if r["killed"]]
-    assert kill_days == [cold[-1] + 7]
+    assert kill_days == [cold[-1] + pipeline_utils.CARMEN_KILL_GRACE_DAYS]
     assert sheet.moves == [("ghost", "Killed")]
     assert sheet.row("ghost") is None
     kill_note = [p for p in sheet.payloads if p["action"] == "append_note" and "reason" in p["note"]]
     assert [p["note"] for p in kill_note] == [f"[reason: no reply after {len(cold)} nudges]"]
     # The final nudge's card line says when the kill check happens.
     card = m.render_followup_needs_card(results[cold[-1]])
-    terminal = (start + timedelta(days=cold[-1] + 7)).isoformat()
+    terminal = (start + timedelta(days=cold[-1] + pipeline_utils.CARMEN_KILL_GRACE_DAYS)).isoformat()
     assert f"→ killed {terminal} if silent" in card
 
 
@@ -1411,7 +1434,7 @@ def test_a_contact_who_replied_walks_the_longer_engaged_ladder(monkeypatch):
     assert nudge_days == {d: i + 1 for i, d in enumerate(engaged)}
     # A contact who has talked to Kevin is never auto-killed: it waits for /promote or /demote.
     assert sheet.moves == []
-    assert [r["sheet_uuid"] for r in results[engaged[-1] + 7]["ready_to_promote"]] == ["talker"]
+    assert [r["sheet_uuid"] for r in results[engaged[-1] + pipeline_utils.CARMEN_KILL_GRACE_DAYS]["ready_to_promote"]] == ["talker"]
     # This is the row "spent" exists for: nothing is moved, so Column E is the only readout that
     # it is done laddering and waiting on Kevin.
     markers = [p["context"] for p in sheet.payloads if p["action"] == "set_context"]
@@ -1479,10 +1502,21 @@ def test_responder_reaches_ready_to_promote_and_is_never_moved(monkeypatch):
     sheet = _FakeCarmenSheet(monkeypatch, [_person("talker", (start - timedelta(days=20)).isoformat(),
                                                    next_followup=(start + timedelta(days=rung)).isoformat(),
                                                    note=reply)])
-    # Stop before CARMEN_STALE_ANCHOR_DAYS past the reply: beyond that the row is deliberately
-    # revived onto the ladder (see below), which is a different phase from the one under test.
-    last_promote = pipeline_utils.CARMEN_STALE_ANCHOR_DAYS + 12
-    results = _run_days(sheet, start, last_promote)
+    # Run exactly up to the day the stale-anchor revival fires, so the window ends on the phase
+    # change rather than somewhere past it.
+    #
+    # The revival is gated on BOTH the anchor being older than CARMEN_STALE_ANCHOR_DAYS and the
+    # scheduled date no longer looking ladder-shaped, so it lands a terminal gap past the stale
+    # bound - not at it. This was written as a literal "+ 12", which happened to equal that sum
+    # under the old 7-day grace and silently pointed 7 days past the revival once it changed.
+    # The row parks on its terminal date (anchor + CARMEN_TERMINAL_GAP_DAYS) and stays
+    # "ladder-shaped" for CARMEN_STALE_ANCHOR_DAYS past THAT date, so the revival fires on the sum.
+    # _run_days uses range(), hence the +1 to make the last simulated day the revival day itself.
+    #
+    # This was a literal "CARMEN_STALE_ANCHOR_DAYS + 12", which equalled that sum only while the
+    # grace was 7 days. Deriving it means the window tracks the cadence instead of drifting.
+    revival_day = pipeline_utils.CARMEN_TERMINAL_GAP_DAYS + pipeline_utils.CARMEN_STALE_ANCHOR_DAYS + 1
+    results = _run_days(sheet, start, revival_day + 1)
 
     # The reply restarted the ladder from its own date: the single engaged nudge after the reply.
     nudge_days = sorted(n for n, r in results.items() if r["followups_ready"])
@@ -1490,7 +1524,7 @@ def test_responder_reaches_ready_to_promote_and_is_never_moved(monkeypatch):
     # Every morning until acted on, but only while the reply anchor is still fresh: at
     # CARMEN_STALE_ANCHOR_DAYS past the reply the row is revived onto the ladder instead, which is
     # the intended escape from nagging Kevin about the same contact forever.
-    first_promote = m.CARMEN_LADDER_DAYS[-1] + 7
+    first_promote = m.CARMEN_LADDER_DAYS[-1] + pipeline_utils.CARMEN_KILL_GRACE_DAYS
     # Ends the day the stale-anchor revival fires - that day the row rejoins the ladder instead
     # of waiting on Kevin, which is the intended escape from nagging him forever.
     revives_on = max(results)
@@ -2051,7 +2085,8 @@ def test_needs_card_renders_every_populated_section(monkeypatch):
     _mock_sequencer_crm(monkeypatch)
     card = m.render_followup_needs_card(m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True))
     assert "Needs You Today" in card
-    assert "Applications going quiet (1)" in card and "4d silent" in card
+    assert "Applications going quiet (1)" in card
+    assert f"{m.FOLLOWUP_1_DAYS}d silent" in card
     assert "Going cold (1)" in card and "10d untouched" in card
     assert "Buried overnight (1)" in card
     assert "Top 3 untouched matches" in card

@@ -332,7 +332,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 13778 | `build_public_stats` | Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable. |
 | 13840 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
 
-## `pipeline_utils.py` — 75 defs, 2,017 lines
+## `pipeline_utils.py` — 75 defs, 2,030 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -357,60 +357,60 @@ grep -i "contact" FUNCTION_INDEX.md
 | 360 | `_parse_sequencer_date` | Lenient 'YYYY-MM-DD' -> datetime.date, or None for blank / the blank-date sentinel / |
 | 372 | `followup_anchor` | The stable day-0 the +4/+9/+16 windows count from. |
 | 383 | `followup_action` | Pure: the one thing that should happen to a JOBS row today. Side-effect free. |
-| 504 | `lint_outreach_template` | Returns a list of hard rule-violation strings for one rendered outreach string, empty if clean. |
-| 552 | `advise_outreach_template` | Soft style notes for one rendered outreach string - a nudge, never a failure. |
-| 599 | `ats_slug_guess` | The lowercase alphanumeric board slug auto_expand_ats_slug() probes for a company. |
-| 604 | `is_probable_company_name` | False when a Carmen Warm 'company' is obviously a person or a note, not a company. |
-| 630 | `generate_short_key` | fallback replaces time.time() as the entropy source when raw_id is falsy, keeping this pure. |
-| 635 | `parse_posted_hours` | _(no docstring)_ |
-| 646 | `get_age_badge` | _(no docstring)_ |
-| 659 | `extract_salary` | _(no docstring)_ |
-| 679 | `extract_work_style` | _(no docstring)_ |
-| 692 | `compute_description_simhash` | Normalized SimHash token for a job description, or "" when the text cannot identify a job. |
-| 723 | `_hunter_domain_search` | Hunter's domain-search: who is publicly listed at this company, when no NAME is known. |
-| 760 | `resolve_email_waterfall` | Cascading email discovery: Hunter.io -> Prospeo -> GetProspect -> deterministic guess. |
-| 839 | `derive_job_source` | Classify a job's origin for source-level outcome attribution. |
-| 865 | `job_link_host` | The registrable host of a job link, lowercased, with a leading 'www.' stripped, or ''. |
-| 874 | `is_unverified_email` | True if an email string carries an [⚠️ Unverified]/[⚠️ Fallback ...] tag from |
-| 924 | `is_automated_sender` | True when an address announces machine-generated bulk/transactional mail. |
-| 962 | `parse_email_recipient` | Split one RFC-5322 To: value into (display_name, email). Returns (None, None) if no |
-| 978 | `is_role_mailbox` | True for shared/role addresses (operations@, careers@, noreply@) - not a person. |
-| 985 | `company_domain_of` | The employer-bearing domain of an address, or '' for consumer mail and ATS senders. |
-| 1018 | `domain_matches_company` | True if an address's domain plausibly belongs to `company_name`. |
-| 1080 | `match_email_to_crm_company` | Return the CRM company name an address belongs to, or None. |
-| 1095 | `name_from_email_local_part` | Fall back to a display name derived from the address ('eina.assali@x' -> 'Eina Assali') |
-| 1105 | `build_sent_contact` | One Sent message -> a Carmen Cold contact dict, or None when it should not capture. |
-| 1125 | `is_guessed_contact_email` | True when a JOBS row's Contact Email is a pipeline guess rather than a real person. |
-| 1161 | `resolve_sent_email_backfill` | One Sent message -> (sheet_uuid, real_email) for a JOBS row whose Contact Email is still |
-| 1232 | `carmen_ladder_for` | The ladder tuple a row walks: engaged when the contact has ever replied, else cold. |
-| 1240 | `carmen_terminal_gap` | The gap the final rung writes for `ladder`: last offset + the grace week. |
-| 1278 | `carmen_ladder_rung` | Which rung a Carmen Cold row currently sits on, from the gap between its anchor and |
-| 1296 | `carmen_ladder_action` | Pure: what a Carmen Cold row needs today. Side-effect free. |
-| 1339 | `_latest_marker_date` | Most recent "[YYYY-MM-DD] <marker>" date in a notes cell, or None. Notes accumulate one |
-| 1354 | `carmen_reply_anchor` | The date of the most recent inbound reply recorded in a notes cell, or None. |
-| 1359 | `carmen_restart_anchor` | The date the sequencer last restarted this row's ladder, or None. |
-| 1364 | `carmen_linkedin_anchor` | The date of the most recent OUTBOUND LinkedIn touch recorded in a notes cell, or None. |
-| 1375 | `CarmenPlan` | (action, next_date, revived, anchor). Unpacks as a 4-tuple; use .action / .next_date / |
-| 1384 | `CarmenPlan.__new__` | _(no docstring)_ |
-| 1397 | `plan_carmen_ladder` | String-in planner for a raw Carmen Cold row. Returns a CarmenPlan. |
-| 1469 | `carmen_status_marker` | The Column E marker for a row the sequencer just planned, or None when it has nothing to |
-| 1503 | `carmen_marker_cell` | Column E's new value: `marker`, with any text Kevin typed preserved after it. |
-| 1516 | `plan_carmen_followup` | Two-value form of plan_carmen_ladder(): (action, next_date). Same anchoring and revival |
-| 1535 | `is_expired_matched_row` | True for a JOBS row still sitting at 'Matched' (never applied to, never replied to) |
-| 1561 | `extract_linkedin_job_id` | Pull the numeric posting id out of a LinkedIn job URL, or None. |
-| 1596 | `strip_tracking_params` | Drop campaign/analytics query params, preserving everything that identifies the posting. |
-| 1617 | `canonical_job_url` | Normalize any job URL for use as a dedup key and stored apply link. |
-| 1630 | `canonical_linkedin_job_url` | Back-compat alias for canonical_job_url(). Prefer canonical_job_url in new code. |
-| 1635 | `is_linkedin_job_url` | True if this looks like a LinkedIn URL carrying a job posting id. |
-| 1645 | `parse_job_command` | Parse `/job <url>` and `/job Title @ Company <url>` into (title, company, url). |
-| 1677 | `parse_job_page_html` | Best-effort extraction of (title, company, description) from ANY job posting page. |
-| 1760 | `strip_html_to_text` | Flatten an HTML fragment to readable plain text - tags dropped, entities decoded, |
-| 1777 | `build_ingest_job_dict` | Assemble a manually-ingested posting into the same job dict shape the JSearch/ATS feeds |
-| 1855 | `_jd_singularize` | Crude, deliberate stemmer: collapse plurals so 'reconciliations' and 'reconciliation' |
-| 1870 | `extract_jd_terms` | Domain vocabulary from one job description, as a list of normalized terms. |
-| 1956 | `is_opaque_job_host` | True when a plain GET on this host cannot distinguish a live posting from a dead one. |
-| 1962 | `classify_job_link` | Classify one job link as 'dead', 'alive' or 'unknown'. |
-| 2015 | `may_auto_retire` | True when a dead link is sufficient grounds to move this row to Died without asking. |
+| 507 | `lint_outreach_template` | Returns a list of hard rule-violation strings for one rendered outreach string, empty if clean. |
+| 555 | `advise_outreach_template` | Soft style notes for one rendered outreach string - a nudge, never a failure. |
+| 602 | `ats_slug_guess` | The lowercase alphanumeric board slug auto_expand_ats_slug() probes for a company. |
+| 607 | `is_probable_company_name` | False when a Carmen Warm 'company' is obviously a person or a note, not a company. |
+| 633 | `generate_short_key` | fallback replaces time.time() as the entropy source when raw_id is falsy, keeping this pure. |
+| 638 | `parse_posted_hours` | _(no docstring)_ |
+| 649 | `get_age_badge` | _(no docstring)_ |
+| 662 | `extract_salary` | _(no docstring)_ |
+| 682 | `extract_work_style` | _(no docstring)_ |
+| 695 | `compute_description_simhash` | Normalized SimHash token for a job description, or "" when the text cannot identify a job. |
+| 726 | `_hunter_domain_search` | Hunter's domain-search: who is publicly listed at this company, when no NAME is known. |
+| 763 | `resolve_email_waterfall` | Cascading email discovery: Hunter.io -> Prospeo -> GetProspect -> deterministic guess. |
+| 842 | `derive_job_source` | Classify a job's origin for source-level outcome attribution. |
+| 868 | `job_link_host` | The registrable host of a job link, lowercased, with a leading 'www.' stripped, or ''. |
+| 877 | `is_unverified_email` | True if an email string carries an [⚠️ Unverified]/[⚠️ Fallback ...] tag from |
+| 927 | `is_automated_sender` | True when an address announces machine-generated bulk/transactional mail. |
+| 965 | `parse_email_recipient` | Split one RFC-5322 To: value into (display_name, email). Returns (None, None) if no |
+| 981 | `is_role_mailbox` | True for shared/role addresses (operations@, careers@, noreply@) - not a person. |
+| 988 | `company_domain_of` | The employer-bearing domain of an address, or '' for consumer mail and ATS senders. |
+| 1021 | `domain_matches_company` | True if an address's domain plausibly belongs to `company_name`. |
+| 1083 | `match_email_to_crm_company` | Return the CRM company name an address belongs to, or None. |
+| 1098 | `name_from_email_local_part` | Fall back to a display name derived from the address ('eina.assali@x' -> 'Eina Assali') |
+| 1108 | `build_sent_contact` | One Sent message -> a Carmen Cold contact dict, or None when it should not capture. |
+| 1128 | `is_guessed_contact_email` | True when a JOBS row's Contact Email is a pipeline guess rather than a real person. |
+| 1164 | `resolve_sent_email_backfill` | One Sent message -> (sheet_uuid, real_email) for a JOBS row whose Contact Email is still |
+| 1239 | `carmen_ladder_for` | The ladder tuple a row walks: engaged when the contact has ever replied, else cold. |
+| 1247 | `carmen_terminal_gap` | The gap the final rung writes for `ladder`: last offset + the grace week. |
+| 1291 | `carmen_ladder_rung` | Which rung a Carmen Cold row currently sits on, from the gap between its anchor and |
+| 1309 | `carmen_ladder_action` | Pure: what a Carmen Cold row needs today. Side-effect free. |
+| 1352 | `_latest_marker_date` | Most recent "[YYYY-MM-DD] <marker>" date in a notes cell, or None. Notes accumulate one |
+| 1367 | `carmen_reply_anchor` | The date of the most recent inbound reply recorded in a notes cell, or None. |
+| 1372 | `carmen_restart_anchor` | The date the sequencer last restarted this row's ladder, or None. |
+| 1377 | `carmen_linkedin_anchor` | The date of the most recent OUTBOUND LinkedIn touch recorded in a notes cell, or None. |
+| 1388 | `CarmenPlan` | (action, next_date, revived, anchor). Unpacks as a 4-tuple; use .action / .next_date / |
+| 1397 | `CarmenPlan.__new__` | _(no docstring)_ |
+| 1410 | `plan_carmen_ladder` | String-in planner for a raw Carmen Cold row. Returns a CarmenPlan. |
+| 1482 | `carmen_status_marker` | The Column E marker for a row the sequencer just planned, or None when it has nothing to |
+| 1516 | `carmen_marker_cell` | Column E's new value: `marker`, with any text Kevin typed preserved after it. |
+| 1529 | `plan_carmen_followup` | Two-value form of plan_carmen_ladder(): (action, next_date). Same anchoring and revival |
+| 1548 | `is_expired_matched_row` | True for a JOBS row still sitting at 'Matched' (never applied to, never replied to) |
+| 1574 | `extract_linkedin_job_id` | Pull the numeric posting id out of a LinkedIn job URL, or None. |
+| 1609 | `strip_tracking_params` | Drop campaign/analytics query params, preserving everything that identifies the posting. |
+| 1630 | `canonical_job_url` | Normalize any job URL for use as a dedup key and stored apply link. |
+| 1643 | `canonical_linkedin_job_url` | Back-compat alias for canonical_job_url(). Prefer canonical_job_url in new code. |
+| 1648 | `is_linkedin_job_url` | True if this looks like a LinkedIn URL carrying a job posting id. |
+| 1658 | `parse_job_command` | Parse `/job <url>` and `/job Title @ Company <url>` into (title, company, url). |
+| 1690 | `parse_job_page_html` | Best-effort extraction of (title, company, description) from ANY job posting page. |
+| 1773 | `strip_html_to_text` | Flatten an HTML fragment to readable plain text - tags dropped, entities decoded, |
+| 1790 | `build_ingest_job_dict` | Assemble a manually-ingested posting into the same job dict shape the JSearch/ATS feeds |
+| 1868 | `_jd_singularize` | Crude, deliberate stemmer: collapse plurals so 'reconciliations' and 'reconciliation' |
+| 1883 | `extract_jd_terms` | Domain vocabulary from one job description, as a list of normalized terms. |
+| 1969 | `is_opaque_job_host` | True when a plain GET on this host cannot distinguish a live posting from a dead one. |
+| 1975 | `classify_job_link` | Classify one job link as 'dead', 'alive' or 'unknown'. |
+| 2028 | `may_auto_retire` | True when a dead link is sufficient grounds to move this row to Died without asking. |
 
 ## `response_schema.py` — 4 defs, 40 lines
 
