@@ -10,6 +10,7 @@ whichever test module imports main first owns the temp DB and the other reuses i
 import json
 import os
 import pytest
+import re
 import tempfile
 import types
 import urllib.parse
@@ -1997,3 +1998,50 @@ def test_help_covers_the_commands_kevin_actually_applies_with():
     edit_help = ch.lookup_command_help("/edit/")
     for code in ("C0-C7", "W0-W5", "B0-B1", "R0-R3", "L0-L9"):
         assert code in edit_help, f"/edit help does not mention {code}"
+
+
+def test_no_cold_ops_entry_is_malformed_with_an_empty_their_desk():
+    """cold_ops[2] shipped "{their_desk}, so I would love 15 minutes" to Koch.
+
+    their_desk is EMPTY on every automated send (generate_cold_email passes ""), so
+    interpolate_template supplied its fallback and the email read "Given how much of this sits
+    under you, so I would love 15 minutes" - not a sentence. The pass-2 path was broken the same
+    way, because their_desk renders a SUBORDINATE clause by contract: "Since employee care runs on
+    third-party administrators, so I would love 15 minutes". So this asserts BOTH renderings, not
+    just the fallback one - fixing only the fallback would have left the filled path ungrammatical.
+    """
+    for idx, template in enumerate(_load_bank("outreach_templates.json")["cold_ops"]):
+        for label, desk in (
+            ("empty", ""),
+            ("pass-2 filled", "Since employee care runs on third-party administrators and HRIS records"),
+        ):
+            rendered = m.sanitize_text(m.interpolate_template(
+                template, name="", company=_LINT_COMPANY, job_title=_LINT_TITLE, their_desk=desk))
+            ctx = f"cold_ops[{idx}] ({label})"
+            assert "{" not in rendered, f"{ctx} left a placeholder uninterpolated"
+            # The exact sentence that shipped.
+            assert ", so I would love" not in rendered, ctx
+            for sentence in re.split(r"(?<=[.!?])\s+", rendered):
+                assert not re.match(r"^(Given|Since|Because|Although|While)\b[^,]*,\s*(so|but|and|yet)\b",
+                                    sentence.strip(), re.IGNORECASE), f"{ctx}: {sentence.strip()!r}"
+            assert pu.lint_outreach_template(rendered, "email") == [], ctx
+
+
+def test_the_linter_catches_a_subordinate_clause_coordinated_with_a_conjunction():
+    """The guard behind the test above. Without this rule the collision is invisible to the suite:
+    linting the RAW template only sees "{their_desk}, so ...", and the placeholder hides it."""
+    assert any("subordinate" in v for v in pu.lint_outreach_template(
+        "Given how much of this sits under you, so I would love 15 minutes.", "email"))
+    assert any("subordinate" in v for v in pu.lint_outreach_template(
+        "Since the queue sits with you, but I would love 15 minutes.", "email"))
+    # A main clause with a legitimate result clause is correct English and must stay clean - this
+    # is cold_ops' own second sentence, which a looser rule flagged.
+    assert pu.lint_outreach_template(
+        "My background is in client intake and onboarding paperwork, keeping account records "
+        "accurate so nothing stalls downstream.", "email") == []
+    assert pu.lint_outreach_template(
+        "I saw you were hiring for this role, and I would love 15 minutes of your time.", "email") == []
+    # A correct subordinate clause followed by a later, legitimate coordination.
+    assert pu.lint_outreach_template(
+        "Given how much of this sits under you, I would love 15 minutes, and I can work "
+        "around your schedule.", "email") == []

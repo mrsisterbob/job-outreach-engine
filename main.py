@@ -23,7 +23,10 @@ from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 import resume_engine
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
-from track_registry import TRACK_PROMPT_LINE, normalize_track, pool_key_for
+from track_registry import (
+    TRACK_PROMPT_LINE, TRACK_TRIGGER_GUIDANCE, normalize_track, pool_key_for,
+    allowed_outreach_template_ids, coerce_outreach_template_id, override_track_for_title,
+)
 from response_schema import GeminiJobScreenerResponse
 from command_help import lookup_command_help
 from pipeline_utils import (
@@ -322,6 +325,14 @@ def interpolate_template(template, name="", company="", job_title="", their_desk
     raises KeyError on an unknown key and the except below returns the RAW template, which would
     put literal braces in a candidate-facing email.
 
+    Because the clause is SUBORDINATE, a template must follow "{their_desk}," with a main clause
+    and no second conjunction. cold_ops[2] shipped as "{their_desk}, so I would love 15 minutes",
+    which renders "Given how much of this sits under you, so I would love 15 minutes" - and with
+    pass 2 done, "Since employee care runs on third-party administrators, so I would love 15
+    minutes". "Given ... so" is not a sentence either way, so this broke the filled path as well
+    as the fallback, and it went out to Koch. test_no_cold_ops_entry_is_malformed_with_an_empty_their_desk
+    pins the shape for every entry in the pool.
+
     {name} renders WITH a leading space when a contact name is known and as an empty string when
     it is not, so a template written "Hi{name}," yields "Hi Dana," or a bare "Hi," - never the old
     "Hi there,". Templates must therefore not supply their own space before the placeholder; a
@@ -375,6 +386,35 @@ def first_name_for_greeting(full_name):
     if len(first) < 2 or not any(ch.isalpha() for ch in first):
         return ""
     return first
+
+def crm_contact_is_a_person(contact_name, company):
+    """False when a sheet_row_map contact_name is really the EMPLOYER's name, not a human's.
+
+    first_name_for_greeting() cannot make this call - "Rivian" and "Dana" are both just words to
+    it, and the company is the piece of context it never receives. This is the reader-side half of
+    the fix at save_message_mapping(): both job-card writers used to store the company in
+    contact_name, so every mapping row written before that was corrected still carries one, and
+    sheet_row_map is durable SQLite. Without this, every card Kevin already has in Telegram keeps
+    greeting "Hi Rivian," on swipe-reply until the row is overwritten.
+
+    Compared through normalize_company_for_match() so "Rivian Automotive, Inc." still matches the
+    card's "Rivian" - the suffix stripping is the whole reason that helper exists.
+    """
+    name = str(contact_name or "").strip()
+    if not name:
+        return False
+    comp = str(company or "").strip()
+    if not comp:
+        return True
+    norm_name = normalize_company_for_match(name)
+    norm_comp = normalize_company_for_match(comp)
+    if not norm_name or not norm_comp:
+        return True
+    # Equality, or the stored name being a leading fragment of the company (or the reverse) - the
+    # card writes job["employer_name"] verbatim while the CRM row may hold a longer legal name.
+    return not (norm_name == norm_comp
+                or norm_comp.startswith(norm_name + " ")
+                or norm_name.startswith(norm_comp + " "))
 
 RESUME_BULLETS_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_bullets_bank.json")
 
@@ -2306,6 +2346,13 @@ def is_company_on_cooldown(company_name):
 def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_name="", contact_company="", contact_email=""):
     """Persist (telegram_message_id, sheet_uuid, sheet_tab, contact_email) atomically so swipe-replies
     can resolve the CRM row and inbound mail can be matched against the CRM whitelist.
+
+    contact_name is a PERSON and nothing else. A job card has no person behind it, so it passes ""
+    here and the company goes in contact_company. Both job-card callers used to pass the company
+    positionally into contact_name, and three separate things read that field as proof of a human:
+    resolve_outreach_body greeted "Hi Rivian,", /draft took the named-contact branch and spent
+    provider credits resolving "Rivian" as a person, and /apply logged every portal application as
+    outreach_path="warm". See test_a_job_card_never_records_the_company_as_its_contact_name.
     """
     if not telegram_message_id or not sheet_uuid:
         return False
@@ -3510,16 +3557,22 @@ def resolve_outreach_body(job, mapping, job_title, company_name, is_warm):
     resolved contact still rendered a nameless cold_ops[0]. Callers pass the result to
     create_gmail_draft(custom_body=...) so the draft is the same string, rendered once.
     """
+    # A mapping row whose contact_name is really the EMPLOYER greets "Hi Rivian," / "Hi GPAC," /
+    # "Hi Koch," - four live sends on 2026-09-24. The writer is fixed (save_message_mapping), but
+    # rows written before that are still in SQLite, so the name is screened here too.
+    _mapped_name = (mapping or {}).get("contact_name", "")
+    if not crm_contact_is_a_person(_mapped_name, company_name):
+        _mapped_name = ""
     # Gemini's outreach_template_id routes cold_ops only (response_schema caps it at le=7), and
     # warm copy is a hand-finished scaffold anyway, so warm stays on index 0 by design.
     if is_warm:
         return generate_warm_email(
-            first_name_for_greeting((mapping or {}).get("contact_name", "")),
+            first_name_for_greeting(_mapped_name),
             company_name=company_name,
         )
     greeting_name = str((job or {}).get("outreach_contact_first_name") or "")
     if not greeting_name:
-        greeting_name = first_name_for_greeting((mapping or {}).get("contact_name", ""))
+        greeting_name = first_name_for_greeting(_mapped_name)
     return generate_cold_email(
         job_title, company_name,
         template_id=(job or {}).get("outreach_template_id") or 0,
@@ -3570,6 +3623,7 @@ def build_system_prompt():
     # hardcoded a-e list here is exactly how a logistics posting kept routing to wealth ops.
     track_letters = "|".join(TRACK_BULLET_POOL_KEYS)
     track_prompt_line = TRACK_PROMPT_LINE
+    track_trigger_guidance = TRACK_TRIGGER_GUIDANCE
     return f"""You are a strict technical job screener and template router evaluating roles for an early-career candidate (0-2 years experience). Target Profile: Non-sales W-2 roles in Tech, FinTech, Auto Tech, or Back-Office Systems/Operations in Metro Detroit or Remote.
 High Priority Skills: Python, SQL, Salesforce, Excel, Schwab SAC, Fidelity Wealthscape, DocuSign, Process Automation.
 Strictly FORBIDDEN: Sales, cold calling, client pitching, commission-based roles, retail bank tellers, CPA tracks, Senior/Lead/Manager roles.
@@ -3590,12 +3644,14 @@ SCORING BANDS - use the whole range. Most real postings land in 50-79; reserve 9
 25-49: Weak. Wrong function, or seniority he cannot credibly claim.
 1-24: Disqualifying - sales/commission, senior/lead/manager, CPA track, or a domain with no overlap.
 
+{track_trigger_guidance}
+
 Evaluate the job description and respond ONLY with a JSON object containing:
 {{
 "score": <integer 1-100, anchored to the bands below - an unanchored score clusters in the 70s and 80s and makes every candidate look alike, which is useless for ranking>,
 "reason": "<1-sentence concise explanation of why this role fits or does not fit>",
 "track": "<one letter {track_letters} selecting the resume bullet pool that best matches this role: {track_prompt_line}>",
-"tone_mode": "<'conservative' or 'tech' - conservative for traditional banks/broker-dealers/legacy RIAs/insurance carriers, tech for fintech/crypto/tokenization startups/software vendors>",
+"tone_mode": "<'conservative' or 'tech' - apply the conservatism rule stated above exactly; every employer whose own business is NOT financial services is 'tech', including manufacturers, logistics and transportation companies, hospitals, retailers and government>",
 "bullet_indices": [<int>, <int>, <int>],
 "linkedin_template_id": <integer 0-9 selecting a LinkedIn connection note template>,
 "outreach_template_id": <integer 0-7 selecting a cold outreach email template>
@@ -4305,9 +4361,31 @@ def evaluate_job_with_gemini(job):
                 validated = GeminiJobScreenerResponse.model_validate_json(cleaned_text)
 
                 final_score, layer1_bonus = calculate_hybrid_score_modifier(job, validated.score)
+
+                # ---- Deterministic routing repair, the single choke point for both keys ----
+                # Gemini returns `track` and `outreach_template_id` independently and nothing used
+                # to reconcile them, so a freight role could take a logistics resume and a
+                # custodial-reconciliation email. Both corrections happen here, before the tuple
+                # process_single_candidate persists onto the cached job. Every change is logged:
+                # a silent override is as bad as a silent misroute, because the rate is invisible.
+                track = override_track_for_title(
+                    validated.track, job.get("job_title"), job.get("employer_name"), validated.tone_mode)
+                if track != validated.track:
+                    logging.warning(
+                        f"[ROUTING] track override {validated.track} -> {track} for "
+                        f"{job.get('employer_name')} - {job.get('job_title')} "
+                        f"(tone_mode={validated.tone_mode})")
+                outreach_template_id = coerce_outreach_template_id(track, validated.outreach_template_id)
+                if outreach_template_id != validated.outreach_template_id:
+                    logging.warning(
+                        f"[ROUTING] cold_ops id snap {validated.outreach_template_id} -> "
+                        f"{outreach_template_id} for track {track} at {job.get('employer_name')} - "
+                        f"{job.get('job_title')} (allowed: "
+                        f"{list(allowed_outreach_template_ids(track))})")
+
                 return (
-                    (final_score >= 65), final_score, validated.reason, validated.track, validated.tone_mode,
-                    validated.bullet_indices, validated.linkedin_template_id, validated.outreach_template_id,
+                    (final_score >= 65), final_score, validated.reason, track, validated.tone_mode,
+                    validated.bullet_indices, validated.linkedin_template_id, outreach_template_id,
                     layer1_bonus, validated.score
                 )
             except Exception as e:
@@ -9833,7 +9911,10 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
             telegram_message_id = res.json().get("result", {}).get("message_id")
             log_metric_event("message_sent", sheet_uuid)
             if telegram_message_id and sheet_uuid:
-                save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab, company, "", target_email)
+                # contact_name="" - a job card has no person behind it. The company goes in
+                # contact_company, and RAW: `company` above is html-escaped for the card text, so
+                # passing it here wrote "Smith &amp; Sons" into the CRM.
+                save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab, "", company_raw, target_email)
             return telegram_message_id
     except Exception as e:
         logging.error(f"Failed to post card to Telegram: {e}")
@@ -9846,7 +9927,8 @@ def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid):
     """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return None
-    company = html.escape(str(job.get("employer_name") or "N/A"))
+    company_raw = str(job.get("employer_name") or "N/A")
+    company = html.escape(company_raw)
     title = html.escape(str(job.get("job_title") or "N/A"))
     apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
     card_text = (
@@ -9877,7 +9959,11 @@ def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid):
             telegram_message_id = res.json().get("result", {}).get("message_id")
             log_metric_event("message_sent", sheet_uuid)
             if telegram_message_id and sheet_uuid:
-                save_message_mapping(telegram_message_id, sheet_uuid, "Clavicular", company, "", "")
+                # This card DOES have a person - contact_name is a parameter - and it was being
+                # shadowed by the company in the same slot the job-card path got wrong. So a real
+                # warm referral lost its name here while a cold job card gained a fake one.
+                save_message_mapping(telegram_message_id, sheet_uuid, "Clavicular",
+                                     str(contact_name or ""), company_raw, "")
             return telegram_message_id
     except Exception as e:
         logging.error(f"Failed to post warm radar card to Telegram: {e}")
@@ -12201,7 +12287,10 @@ def process_webhook_payload_async(data):
             title = job.get("job_title") or "Operations Specialist"
             is_warm = mapping.get("sheet_tab") in WARM_TONE_TABS
             domain_hint = extract_domain_from_website(job.get("employer_website")) if job else None
-            if mapping.get("contact_name"):
+            # crm_contact_is_a_person, not a bare truthiness check: a job-card mapping row written
+            # before save_message_mapping was corrected holds the COMPANY here, and this branch
+            # then spent provider credits resolving "Rivian" as if it were a person's name.
+            if crm_contact_is_a_person(mapping.get("contact_name"), comp):
                 # Named CRM contact (not a generic job-alert row) - resolve a real person's email via the waterfall
                 target = resolve_email_waterfall(mapping["contact_name"], comp, domain_hint, on_provider_attempt=increment_api_usage_counter)
                 confidence = "unverified" if is_unverified_email(target) else "verified"
@@ -12715,8 +12804,13 @@ def process_webhook_payload_async(data):
                 # per-path rates could never answer "is cold outreach working", the question the
                 # whole channel exists to settle. A row carrying a real (non-guessed) contact
                 # email was emailed; one with a blank or guessed cell is portal-only.
+                #
+                # And the name has to be a PERSON's. Job cards stored the company in contact_name,
+                # so a bare truthiness check here recorded every single portal application as
+                # "warm" - which is precisely the measurement this three-way split exists to make,
+                # reading 100% warm no matter what Kevin actually did.
                 outreach_path=(
-                    "warm" if mapping.get("contact_name")
+                    "warm" if crm_contact_is_a_person(mapping.get("contact_name"), company)
                     else ("cold" if not is_guessed_contact_email(job.get("target_email")) else "ats")
                 )
             )

@@ -2,8 +2,8 @@
 
 [![Tests](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/mrsisterbob/job-outreach-engine/actions/workflows/tests.yml)
 <!-- AUTO-STATS:START -->
-![Lines of source](https://img.shields.io/badge/source-18611_lines-c9a24b)
-![Tests](https://img.shields.io/badge/tests-826-4a8a5c)
+![Lines of source](https://img.shields.io/badge/source-18887_lines-c9a24b)
+![Tests](https://img.shields.io/badge/tests-844-4a8a5c)
 <!-- AUTO-STATS:END -->
 
 An AI-assisted job search pipeline: sources listings from multiple job boards, screens/tailors
@@ -35,6 +35,19 @@ The cover letter (`/letter`) reuses the *same* track + tone routing as the resum
 never argue different cases for the same job: `track` picks the body paragraph from
 `cover_letter_templates.json`, and `tone_mode` picks whether the automation work is framed as
 engineering (`tech`) or as process discipline (`conservative`).
+
+Gemini's routing is then **repaired deterministically** in `evaluate_job_with_gemini()`, because it
+chooses `track` and `outreach_template_id` independently and nothing used to make them agree - a
+freight role could ship a logistics resume under an email describing Kevin as a custodial
+reconciliation person, which is what six of six sends did on 2026-09-24. Two corrections, both in
+`track_registry.py` and both logged so the rate stays visible:
+
+- `ALLOWED_EMAIL_IDS_BY_TRACK` lists the `cold_ops` indices each track may send. Gemini's pick is
+  honored when it is in the set, and otherwise snaps to the track's first allowed id. Tracks f, g
+  and h are limited to entries 6 and 7, the only two that claim no financial-services background.
+- `override_track_for_title()` moves a finance-framed track to f or g when the job TITLE names
+  carrier/freight/dispatch or supply-chain/procurement/plant work - unless the employer is itself a
+  financial-services business, checked both through `tone_mode` and the employer's name.
 
 ## Setup
 

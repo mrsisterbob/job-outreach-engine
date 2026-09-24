@@ -503,6 +503,24 @@ _CONTRACTION_RE = re.compile(
 OUTREACH_EMAIL_WORD_CAP = 100
 OUTREACH_LINKEDIN_CHAR_CAP = 220
 
+# "Given X, so Y" / "Since X, but Y": a subordinating conjunction opening the sentence, then a
+# comma, then a COORDINATING conjunction joining what should be the main clause. Anchored to a
+# sentence start (^ or after .?! ) so "keeping records accurate, so nothing stalls downstream" -
+# a main clause plus a legitimate result clause - is left alone. The comma is required: "Given how
+# much sits under you so I would love" is a different error this does not claim to catch.
+#
+# Only the FIRST comma after the subordinator counts, hence [^.!?\n,]* rather than a lazy match:
+# "Given how much sits under you, I would love 15 minutes, and I can work around you" is correct
+# English, and a lazy match ran on to that second comma and flagged it. A subordinate clause with
+# a comma of its own is therefore missed, which is the right way to be wrong - a false positive
+# here fails the suite on copy Kevin approved.
+_SUBORDINATE_THEN_CONJUNCTION_RE = re.compile(
+    r"(?:(?<=^)|(?<=[.!?]\s)|(?<=\n))\s*"
+    r"\b(Given|Since|Because|Although|Though|While|Whereas|If|Unless|After|Before|When)\b"
+    r"[^.!?\n,]*,\s*\b(so|but|and|yet)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def lint_outreach_template(text, kind="email"):
     """Returns a list of hard rule-violation strings for one rendered outreach string, empty if clean.
@@ -540,6 +558,19 @@ def lint_outreach_template(text, kind="email"):
     if " {name}" in body:
         violations.append("space before {name} - the placeholder supplies its own leading space, "
                           "so write 'Hi{name},' not 'Hi {name},'")
+
+    # A subordinate clause followed by a coordinating conjunction is not a sentence. cold_ops[2]
+    # shipped "{their_desk}, so I would love 15 minutes" and {their_desk} renders a SUBORDINATE
+    # clause by contract (main.interpolate_template), so every automated send read "Given how much
+    # of this sits under you, so I would love 15 minutes" and every pass-2 send read "Since <their
+    # desk>, so I would love 15 minutes". It went out to Koch. Checked per sentence and on the
+    # rendered string, because the collision only exists once {their_desk} is filled - linting the
+    # raw template would see a placeholder and pass.
+    for sentence in _SUBORDINATE_THEN_CONJUNCTION_RE.finditer(body):
+        violations.append(
+            f"{sentence.group(1)!r} opens a subordinate clause and {sentence.group(2)!r} then "
+            f"coordinates it - '{sentence.group(1)} X, {sentence.group(2)} Y' is not a sentence. "
+            f"Drop the conjunction or rewrite the opener as a main clause")
 
     if kind == "linkedin":
         if len(body) > OUTREACH_LINKEDIN_CHAR_CAP:

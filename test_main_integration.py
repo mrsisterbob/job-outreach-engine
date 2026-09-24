@@ -9016,3 +9016,323 @@ def test_a_later_job_keeps_its_other_statics_when_a_routed_bullet_lands_on_it():
         assert static in abc, f"ABC lost a real claim it has always made: {static[:60]}"
     assert resume_engine.bullet_text(entry) in abc
     assert len(abc) == len(evidence["experience"][3]["bullets"]),         "ABC's bullet count moved - append plus one substitution should leave it unchanged"
+
+
+# ---------------------------------------------------------------------------------------------
+# Generic-inbox greeting. Four live sends on 2026-09-24 opened "Hi Rivian," / "Hi GPAC," /
+# "Hi Koch," / "Hi UAW," because both job-card writers passed the company POSITIONALLY into
+# save_message_mapping's contact_name slot. Three readers took that as proof of a human.
+# ---------------------------------------------------------------------------------------------
+
+def test_generic_inbox_greeting_degrades_to_bare_hi():
+    """The rendered email a recipient reads - not a helper's return value. A mapping row carrying
+    the company in contact_name must still open on a bare "Hi,", which is the right register for
+    the shared inbox (operations@rivian.com) these actually go to."""
+    for company in ("Rivian", "GPAC", "Koch", "UAW Retiree Medical Benefits Trust"):
+        job = {"employer_name": company, "job_title": "Carrier Operations Analyst",
+               "outreach_template_id": 1}
+        mapping = {"contact_name": company, "contact_company": "", "sheet_tab": "Pipeline_Candidates"}
+        body = m.resolve_outreach_body(job, mapping, "Carrier Operations Analyst", company, False)
+        assert body.startswith("Hi,\n"), f"{company}: {body.splitlines()[0]!r}"
+        first_word = company.split()[0]
+        assert not body.startswith(f"Hi {first_word}"), company
+    # A real person is untouched - this must not have become "never greet anyone by name".
+    job = {"employer_name": "Rivian", "job_title": "Ops Analyst", "outreach_template_id": 1}
+    mapping = {"contact_name": "Dana Reyes", "contact_company": "Rivian", "sheet_tab": "Pipeline_Candidates"}
+    assert m.resolve_outreach_body(job, mapping, "Ops Analyst", "Rivian", False).startswith("Hi Dana,")
+
+
+def test_a_job_card_never_records_the_company_as_its_contact_name(monkeypatch, tmp_path):
+    """Drives the real writer: send_telegram_card -> save_message_mapping -> SQLite, then reads the
+    row back through the same accessor a swipe-reply uses. Asserting on the PERSISTED row, per
+    CLAUDE.md - the previous shape passed every test while writing "Rivian" into contact_name."""
+    monkeypatch.setattr(m, "TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "c")
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **k: None)
+
+    class _Res:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"result": {"message_id": 918273}}
+
+    monkeypatch.setattr(m.requests, "post", lambda *a, **k: _Res())
+    job = {"employer_name": "Rivian Automotive, Inc.", "job_title": "Carrier Operations Analyst",
+           "job_apply_link": "https://x/y", "track": "f"}
+    m.send_telegram_card(job, 83, "operations@rivian.com", "", "$60k", "On-Site", 40,
+                         "sk1", sheet_uuid="uuid-rivian-1")
+
+    row = m.get_mapping_from_message_id(918273)
+    assert row is not None
+    assert row["contact_name"] == "", f"company leaked into contact_name: {row['contact_name']!r}"
+    # The company still gets recorded - in its own column, and UNESCAPED.
+    assert row["contact_company"] == "Rivian Automotive, Inc."
+
+    # And the email that mapping renders opens on a bare "Hi,".
+    body = m.resolve_outreach_body(job, row, "Carrier Operations Analyst", "Rivian Automotive, Inc.", False)
+    assert body.startswith("Hi,\n")
+
+
+def test_a_warm_radar_card_keeps_the_real_contact_name(monkeypatch):
+    """The mirror case. send_warm_radar_card had a contact_name parameter and stored the company
+    over it, so a genuine warm referral lost its name in the same slot a cold card gained a fake
+    one. Both directions have to be right or the greeting is wrong one way or the other."""
+    monkeypatch.setattr(m, "TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "c")
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **k: None)
+
+    class _Res:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"result": {"message_id": 918274}}
+
+    monkeypatch.setattr(m.requests, "post", lambda *a, **k: _Res())
+    job = {"employer_name": "Signal Advisors", "job_title": "Ops Analyst", "job_apply_link": "#"}
+    m.send_warm_radar_card(job, "Dana Reyes", "Active relationship", "uuid-warm-1")
+
+    row = m.get_mapping_from_message_id(918274)
+    assert row["contact_name"] == "Dana Reyes"
+    assert row["contact_company"] == "Signal Advisors"
+
+
+def test_crm_contact_is_a_person_screens_the_employer_but_keeps_real_names():
+    """The reader-side guard. sheet_row_map is durable SQLite, so every card sent before the writer
+    was fixed still carries a company in contact_name - fixing only the writer would leave every
+    card already in Kevin's Telegram greeting "Hi Rivian," forever."""
+    assert not m.crm_contact_is_a_person("Rivian", "Rivian")
+    assert not m.crm_contact_is_a_person("Rivian", "Rivian Automotive, Inc.")   # suffix-stripped match
+    assert not m.crm_contact_is_a_person("Rivian Automotive, Inc.", "Rivian")   # and the reverse
+    assert not m.crm_contact_is_a_person("UAW Retiree Medical Benefits Trust",
+                                         "UAW Retiree Medical Benefits Trust")
+    assert not m.crm_contact_is_a_person("", "Rivian")
+    assert m.crm_contact_is_a_person("Dana Reyes", "Rivian")
+    assert m.crm_contact_is_a_person("Dana Reyes", "")          # no company to compare against
+    # A person whose surname happens to be the company is still a person - only a leading-fragment
+    # match counts, so "Dana Rivian" is not screened out.
+    assert m.crm_contact_is_a_person("Dana Rivian", "Rivian")
+
+
+def test_apply_on_a_job_card_is_not_recorded_as_a_warm_application(monkeypatch):
+    """The channel-attribution half of the company-as-contact-name bug.
+
+    /apply chose outreach_path on `mapping.get("contact_name")` being truthy. Job cards stored the
+    company there, so EVERY portal application was recorded "warm" - the one measurement the
+    three-way split exists to make, reading 100% warm regardless of what Kevin did. Drives the real
+    /apply handler and asserts on the kwargs that reach record_application_outcome.
+    """
+    outcomes = []
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-path", "sheet_tab": "Tetiana Cold",
+        # exactly what a card written before the fix left behind
+        "contact_name": "Rivian", "contact_company": ""})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {
+        "job_title": "Carrier Operations Analyst", "employer_name": "Rivian",
+        "job_id": "gh_x", "target_email": "operations@rivian.com [⚠️ Fallback Email]"})
+    for name in ("send_telegram_message", "edit_telegram_message", "log_metric_event",
+                 "log_daily_activity", "add_company_cooldown", "upsert_company_identity",
+                 "enqueue_crm_payload"):
+        monkeypatch.setattr(m, name, lambda *a, **k: None)
+    monkeypatch.setattr(m, "record_application_outcome",
+                        lambda uuid_val, status, **kw: outcomes.append(kw) or True)
+
+    _dispatch("/apply")
+
+    assert len(outcomes) == 1
+    assert outcomes[0]["outreach_path"] == "ats", outcomes[0]
+    assert outcomes[0]["outreach_path"] != "warm"
+
+
+def test_apply_still_records_warm_for_a_real_named_contact(monkeypatch):
+    """The other direction: a genuine named person must still count as warm, or the fix has just
+    moved the measurement error somewhere else."""
+    outcomes = []
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-path2", "sheet_tab": "Tetiana Cold",
+        "contact_name": "Dana Reyes", "contact_company": "Rivian"})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {
+        "job_title": "Ops Analyst", "employer_name": "Rivian", "job_id": "gh_x",
+        "target_email": "dana@rivian.com"})
+    for name in ("send_telegram_message", "edit_telegram_message", "log_metric_event",
+                 "log_daily_activity", "add_company_cooldown", "upsert_company_identity",
+                 "enqueue_crm_payload"):
+        monkeypatch.setattr(m, name, lambda *a, **k: None)
+    monkeypatch.setattr(m, "record_application_outcome",
+                        lambda uuid_val, status, **kw: outcomes.append(kw) or True)
+
+    _dispatch("/apply")
+
+    assert outcomes[0]["outreach_path"] == "warm", outcomes[0]
+
+
+def test_draft_does_not_spend_provider_credits_resolving_the_company_as_a_person(monkeypatch):
+    """/draft branched on a truthy contact_name to decide "named CRM contact - run the email
+    waterfall". With the company sitting in that field, every job card ran a paid multi-provider
+    lookup for a person called "Rivian". Asserts the waterfall is never entered."""
+    calls = []
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-draft", "sheet_tab": "Tetiana Cold",
+        "contact_name": "Rivian", "contact_company": ""})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {
+        "job_title": "Carrier Operations Analyst", "employer_name": "Rivian",
+        "outreach_template_id": 1, "track": "f", "bullet_indices": [0, 1, 2]})
+    monkeypatch.setattr(m, "resolve_email_waterfall",
+                        lambda *a, **k: calls.append(a) or "rivian@rivian.com")
+    monkeypatch.setattr(m, "resolve_target_email", lambda *a, **k: "operations@rivian.com")
+    monkeypatch.setattr(m, "compile_resume_pdf_resilient", lambda *a, **k: b"%PDF-")
+    monkeypatch.setattr(m, "create_gmail_draft", lambda **k: (True, "ok", "d1"))
+    bodies = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: bodies.append(t))
+    for name in ("log_email_enrichment_attempt", "log_daily_activity", "increment_api_usage_counter",
+                 "send_telegram_document"):
+        monkeypatch.setattr(m, name, lambda *a, **k: None, raising=False)
+
+    _dispatch("/draft")
+
+    assert calls == [], f"the email waterfall ran for a company name: {calls}"
+    # And the drafted body is addressed to nobody in particular, which is correct for a shared inbox.
+    assert any("Hi," in b for b in bodies), bodies
+    assert not any("Hi Rivian" in b for b in bodies), bodies
+
+
+# ---------------------------------------------------------------------------------------------
+# Routing: the email's self-description bound to the resume track, and a title-pattern override
+# for the non-finance roles Gemini kept filing under a finance persona. Six of six live sends on
+# 2026-09-24 described Kevin as a custodial-reconciliation person whatever the role was.
+# ---------------------------------------------------------------------------------------------
+
+def _load_outreach_bank():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "outreach_templates.json")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _screen(monkeypatch, title, employer, track, tone_mode="tech", outreach_template_id=1,
+            description="Operations role.", score=80):
+    """Drive the REAL evaluate_job_with_gemini with a canned Gemini payload, then the REAL
+    process_single_candidate, and hand back the job dict as it was persisted. Per CLAUDE.md the
+    assertion target is what the next run reads back, not the screener's return value."""
+    payload = json.dumps({
+        "score": score, "reason": "fit", "track": track, "tone_mode": tone_mode,
+        "bullet_indices": [0, 1, 2], "linkedin_template_id": 0,
+        "outreach_template_id": outreach_template_id,
+    })
+    monkeypatch.setattr(m, "GEMINI_API_KEY", "k")
+    monkeypatch.setattr(m, "call_gemini_api", lambda prompt, system: payload)
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: default if default is not None else [])
+    monkeypatch.setattr(m, "resolve_live_alumni_at_company", lambda *a, **k: None)
+    monkeypatch.setattr(m, "get_warm_crm_contacts", lambda: {})
+    monkeypatch.setattr(m, "get_ghost_listing_penalty", lambda job_hash: (0, ""))
+    monkeypatch.setattr(m, "resolve_target_email", lambda *a, **k: "ops@example.com")
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    monkeypatch.setattr(m, "record_jd_terms", lambda *a, **k: None, raising=False)
+    result = m.process_single_candidate({
+        "job_title": title, "employer_name": employer, "job_id": f"gh_{title[:6]}",
+        "job_description": description, "job_city": "Detroit",
+    })
+    assert result is not None, "the canned score should have passed the gate"
+    return result
+
+
+def test_carrier_operations_title_routes_to_f(monkeypatch):
+    """Rivian, a truck manufacturer, hiring a Carrier Operations Analyst. Gemini returned track e
+    and a custodial-reconciliation email. Track f exists for exactly this and was not used."""
+    result = _screen(monkeypatch, "Carrier Operations Analyst", "Rivian", track="e",
+                     description="Manage carrier relationships, freight tendering and dispatch exceptions.")
+    assert result["job"]["track"] == "f", result["job"]["track"]
+    # And the email that ships with it must be one of f's, not the custodial one Gemini asked for.
+    assert result["job"]["outreach_template_id"] in track_registry.allowed_outreach_template_ids("f")
+    assert "custodial" not in result["outreach_email"].lower()
+
+
+def test_strategic_sourcing_title_routes_to_g(monkeypatch):
+    """Trinity Health, a hospital system, Strategic Sourcing Analyst - procurement, routed to e."""
+    result = _screen(monkeypatch, "Strategic Sourcing Analyst", "Trinity Health", track="e",
+                     description="Strategic sourcing and supplier negotiation across the system.")
+    assert result["job"]["track"] == "g", result["job"]["track"]
+    assert "custodial" not in result["outreach_email"].lower()
+
+
+def test_a_finance_employer_is_never_overridden_by_a_title_pattern(monkeypatch):
+    """The guard on the override. "Strategic Sourcing Analyst" at a bank is procurement AT A BANK,
+    and a multi-site manufacturing resume is the wrong document for it - overriding there would
+    trade one misroute for another. Two independent signals, tested separately below."""
+    # (1) the employer's name says financial services, even though tone_mode says tech
+    kept = _screen(monkeypatch, "Strategic Sourcing Analyst", "Comerica Bank", track="e",
+                   tone_mode="tech", description="Sourcing for the bank's vendor programs.")
+    assert kept["job"]["track"] == "e", "a bank was overridden onto a manufacturing track"
+    # (2) Gemini's own read that the employer's business is financial services
+    kept2 = _screen(monkeypatch, "Freight Operations Analyst", "Opaque Holdings", track="a",
+                    tone_mode="conservative")
+    assert kept2["job"]["track"] == "a"
+
+
+def test_an_already_non_finance_track_is_left_alone(monkeypatch):
+    """f, g and h are already the non-finance tracks. Gemini read the description and this has not,
+    so its choice among them outranks a title regex - g must not be dragged to f by "freight"."""
+    result = _screen(monkeypatch, "Freight Data Analyst", "Rivian", track="g")
+    assert result["job"]["track"] == "g"
+
+
+def test_logistics_track_never_sends_a_custodial_email(monkeypatch):
+    """The whole point. Whatever cold_ops id Gemini routes, a track f/g/h send must not describe
+    Kevin through a financial-services lens - it is the resume's own argument that gets contradicted."""
+    banned = ("custodial", "broker dealer", "broker-dealer", "fiduciary", "brokerage")
+    for track in ("f", "g", "h"):
+        for gemini_id in range(8):
+            body = m.generate_cold_email(
+                "Operations Analyst", "Rivian",
+                template_id=track_registry.coerce_outreach_template_id(track, gemini_id))
+            low = body.lower()
+            for word in banned:
+                assert word not in low, f"track {track}, gemini id {gemini_id}: {word!r} in {body!r}"
+
+
+def test_every_track_allows_at_least_one_email_id():
+    """An empty allowed set would make coerce_outreach_template_id raise on allowed[0] - on the
+    screening path, where an exception costs the whole card."""
+    cold = _load_outreach_bank()["cold_ops"]
+    for track in track_registry.TRACK_LETTERS:
+        allowed = track_registry.allowed_outreach_template_ids(track)
+        assert allowed, track
+        assert all(0 <= i < len(cold) for i in allowed), f"{track} names a cold_ops index that does not exist"
+        assert len(set(allowed)) == len(allowed), f"{track} lists a duplicate"
+    # An unknown track must still resolve rather than raising.
+    assert track_registry.allowed_outreach_template_ids("zzz")
+
+
+def test_gemini_id_outside_the_allowed_set_snaps_to_the_track_default():
+    for track in track_registry.TRACK_LETTERS:
+        allowed = track_registry.allowed_outreach_template_ids(track)
+        for legal in allowed:
+            # a legal pick is HONORED - Gemini read the description and this did not
+            assert track_registry.coerce_outreach_template_id(track, legal) == legal, (track, legal)
+        for illegal in [i for i in range(8) if i not in allowed]:
+            assert track_registry.coerce_outreach_template_id(track, illegal) == allowed[0], (track, illegal)
+        # total on junk, because this runs inside the screening path
+        for junk in (None, "3", 3.0, True, -1, 99, [], {}):
+            assert track_registry.coerce_outreach_template_id(track, junk) == allowed[0], (track, junk)
+
+
+def test_the_snapped_email_id_is_what_gets_persisted(monkeypatch):
+    """Not the coercion function's return value - the id written onto the cached job, which is what
+    /draft, /e and /stage re-render from on every later pass."""
+    result = _screen(monkeypatch, "Carrier Operations Analyst", "Rivian", track="f",
+                     outreach_template_id=1)   # cold_ops[1] is the custodial one, illegal for f
+    assert result["job"]["outreach_template_id"] == track_registry.allowed_outreach_template_ids("f")[0]
+    assert result["job"]["outreach_template_id"] == 6
+
+
+def test_the_prompt_names_a_concrete_trigger_for_every_non_finance_track():
+    """The prompt gave Gemini a bare list of eight labels, and "operations" appears in both e and
+    f, so the labels alone could not separate them."""
+    prompt = m.build_system_prompt()
+    assert "{" not in track_registry.TRACK_TRIGGER_GUIDANCE  # nothing to interpolate, so nothing to leak
+    assert track_registry.TRACK_TRIGGER_GUIDANCE in prompt
+    for trigger in ("carrier", "freight", "dispatch", "supply chain", "procurement",
+                    "strategic sourcing", "plant", "automation", "integrations"):
+        assert trigger in prompt.lower(), trigger
+    # The tone_mode line used to define the axis only in finance terms, so a manufacturer matched
+    # neither branch of the one instruction sitting closest to the output format.
+    tone_line = [l for l in prompt.splitlines() if l.startswith('"tone_mode"')][0]
+    assert "manufactur" in tone_line.lower(), tone_line

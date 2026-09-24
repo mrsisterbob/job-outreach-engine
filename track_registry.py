@@ -15,6 +15,8 @@ and response_schema must stay importable even on a machine where the Typst binar
 otherwise a rendering problem takes out Gemini response parsing too.
 """
 
+import re
+
 # Persona framing only. Factual content (jobs, dates, metrics) lives in evidence_bank.json; every
 # system named in a `skills` footer must already appear in evidence_bank's technical_skills, or be
 # a vetted capability phrase listed in CAPABILITY_TERMS below.
@@ -136,6 +138,68 @@ DEFAULT_TRACK = "a"
 
 TRACK_LETTERS = tuple(TRACK_REGISTRY)
 
+# ==============================================================================
+# WHICH cold_ops EMAIL EACH TRACK IS ALLOWED TO SEND
+#
+# Gemini picks `track` and `outreach_template_id` INDEPENDENTLY, and nothing used to make them
+# agree. Live sends on 2026-09-24: Rivian (Carrier Operations Analyst) shipped a track E resume
+# under an email describing Kevin as a custodial-reconciliation person; so did Trinity Health
+# (Strategic Sourcing) and GPAC (Treasury). Six of six sends that day described the wrong
+# background for the role, whatever resume was attached.
+#
+# The email's own self-description is the constraint. cold_ops entries by the background they
+# claim, in the order the pool ships:
+#   [0] broker dealers and fiduciary services          finance
+#   [1] custodial reconciliation                       finance   (the one that was over-selected)
+#   [2] client intake and onboarding paperwork         finance
+#   [3] operations and reporting, SQL                  neutral
+#   [4] account transfers, documentation exceptions    finance
+#   [5] brokerage and fiduciary services               finance
+#   [6] operations, intake queues with a service window  NEUTRAL
+#   [7] records and reporting, cleaning up data        NEUTRAL
+#
+# So f/g/h - the non-finance tracks - may only use 6 and 7, which are the only two entries that
+# name no financial-services context. This is deterministic Python on purpose: a prompt
+# instruction is exactly what already failed here.
+#
+# Index 0 of each list is the SNAP TARGET, used when Gemini picks something outside the set. It is
+# the best email for that track, not merely a legal one.
+ALLOWED_EMAIL_IDS_BY_TRACK = {
+    "a": (0, 1, 5, 4),   # wealth ops - the custodial/fiduciary copy is genuinely his desk
+    "b": (3, 7),         # data/systems - SQL and reporting, nothing client-facing
+    "c": (4, 0, 1),      # risk & compliance - documentation exceptions lead
+    "d": (3, 7),         # BI & analytics - reporting and data cleanup
+    "e": (2, 3, 0),      # bizops & CRM - intake and onboarding paperwork IS the work
+    "f": (6, 7),         # operations & logistics - queue/service-window copy only
+    "g": (7, 6),         # supply chain & multi-site - records and reporting leads
+    "h": (3, 7),         # technical systems - SQL and reporting
+}
+
+# response_schema caps outreach_template_id at le=7 and cold_ops ships 8 entries. Kept as the
+# fallback for an unrecognized track so a new track added to the registry without an entry above
+# degrades to "any email" rather than to track a's finance copy - the failure being fixed here.
+_EVERY_COLD_OPS_ID = (0, 1, 2, 3, 4, 5, 6, 7)
+
+
+def allowed_outreach_template_ids(track) -> tuple:
+    """The cold_ops indices `track` may send, snap target first. Never empty."""
+    return ALLOWED_EMAIL_IDS_BY_TRACK.get(normalize_track(track), _EVERY_COLD_OPS_ID)
+
+
+def coerce_outreach_template_id(track, template_id) -> int:
+    """Gemini's routed cold_ops id if this track is allowed to send it, else the track's default.
+
+    Honors Gemini's pick whenever it is legal - it sees the job description and this does not, so
+    its choice among a track's allowed entries is better than a fixed one. Only an illegal pick is
+    overridden, which is the case that shipped a custodial-reconciliation email for a freight role.
+    Total: any non-integer, out-of-range or unknown value lands on the track's default rather than
+    raising, because this sits on the screening path where an exception costs the whole card.
+    """
+    allowed = allowed_outreach_template_ids(track)
+    if isinstance(template_id, bool) or not isinstance(template_id, int):
+        return allowed[0]
+    return template_id if template_id in allowed else allowed[0]
+
 # Maps track letters to resume_bullets_bank.json / cover_letter_templates.json pool names.
 TRACK_BULLET_POOL_KEYS = {k: v["pool_key"] for k, v in TRACK_REGISTRY.items()}
 
@@ -154,6 +218,19 @@ TRACKS = {
 # The a=..., b=... line interpolated into main.build_system_prompt()'s "track" instruction, so
 # adding a track updates the prompt without a second edit.
 TRACK_PROMPT_LINE = ", ".join(f"{k}={v['prompt_label']}" for k, v in TRACK_REGISTRY.items())
+
+# Concrete triggers for the three non-finance tracks, injected into build_system_prompt().
+#
+# A bare list of eight labels was all the prompt gave, and the labels alone do not tell a model
+# that "Carrier Operations Analyst" is f rather than e - "operations" appears in both. Six of six
+# live sends on 2026-09-24 routed to a finance track, including a freight role at a truck
+# manufacturer. There is a deterministic title override behind this (override_track_for_title), but
+# the override only knows the title; the prompt is the only place the job DESCRIPTION gets read, so
+# both exist. Kept to one line per track: a long prompt section did not survive last time.
+TRACK_TRIGGER_GUIDANCE = """Picking the track: a, c and e are finance-framed and are for employers doing financial-services work. Do NOT default to them for an operations role at a non-finance employer - three tracks exist for that and were going unused:
+- f (operations & logistics): carrier, freight, dispatch, fleet, transportation, service delivery, queue or SLA-driven request handling. A carrier/freight operations role at a manufacturer is f, never e.
+- g (supply chain & multi-site ops): supply chain, procurement, strategic sourcing, plant or multi-site data, manufacturing reporting, warehouse or facility reconciliation.
+- h (technical systems & automation): automation, systems administration, integrations, internal tooling, data pipelines owned by an operations team (NOT a software engineering req, which scores 1-24)."""
 
 # Skills-footer entries that are process capabilities rather than named systems. Everything else in
 # a footer must name a system banked in evidence_bank.json's technical_skills - that is the
@@ -174,6 +251,80 @@ CAPABILITY_TERMS = frozenset({
 # logistics or manufacturing reader reads it as unserious, not as risky. Decoupled from
 # tone_mode="conservative", which is about the employer being a financial-services business.
 CRYPTO_SCRUB_TRACKS = ("f", "g")
+
+
+# ==============================================================================
+# POST-HOC TRACK OVERRIDE FROM THE JOB TITLE
+#
+# Nothing validated Gemini's track against the job: it arrived and was persisted. Live evidence
+# from 2026-09-24 - Rivian, a truck manufacturer, hiring a Carrier Operations Analyst, routed to
+# track e (business operations & CRM). Track f exists for exactly that posting and was not used.
+#
+# Deliberately NARROW. These are title words that only appear on work Kevin has no finance framing
+# for, and the tracks they select are the ones written for that work. A title word not listed here
+# leaves Gemini's choice alone - it read the description and this has not.
+_TITLE_TRACK_PATTERNS = (
+    # Freight and service-delivery operations -> f. "dispatch" and "fleet" are unambiguous;
+    # "transportation" appears on transit-agency and logistics reqs alike, both of which want f.
+    (r"\b(?:carrier|freight|logistics|transportation|fleet|dispatch|last[ -]?mile)\b", "f"),
+    # Multi-site / plant / supply-chain data work -> g. "sourcing" excludes TALENT sourcing, which
+    # is recruiting: "Sourcing Specialist" at a staffing firm is a different job entirely, and
+    # Kevin's screener forbids recruiting roles anyway.
+    (r"\b(?:supply[ -]?chain|procurement|plant|manufacturing|manufactur\w*|warehouse)\b", "g"),
+    (r"(?<!talent )(?<!technical )\bstrategic sourcing\b|(?<!talent )\bsourcing\b(?! specialist)", "g"),
+)
+
+_TITLE_TRACK_RULES = tuple(
+    (re.compile(p, re.IGNORECASE), letter) for p, letter in _TITLE_TRACK_PATTERNS
+)
+
+# A title word never outranks the employer's own industry. "Strategic Sourcing Analyst" at a bank
+# is procurement AT A BANK, and a multi-site manufacturing resume is the wrong document for it -
+# overriding there would trade one misroute for another. Two independent signals, because either
+# alone has a live failure mode: tone_mode is Gemini's read and can be wrong, and a name check
+# cannot see a financial-services firm whose name says nothing (Signal Advisors aside, "GPAC"
+# says nothing either).
+_FINANCE_EMPLOYER_RE = re.compile(
+    r"\b(?:bank|banking|bancorp|bancshares|credit union|savings|trust|fiduciar\w+|custodian|custody|"
+    r"wealth|advisor\w*|advisory|asset management|investment\w*|securities|brokerage|broker[ -]?dealer|"
+    r"insurance|assurance|underwrit\w+|reinsurance|mutual|annuit\w+|capital|equity|"
+    r"financial|finserv|fintech|mortgage|lending|loans|payments|treasury services)\b",
+    re.IGNORECASE,
+)
+
+# These tracks all describe Kevin through a financial-services lens, so a non-finance title is
+# evidence the router landed on the wrong one. f/g/h are already non-finance: Gemini's choice
+# among them is finer-grained than a title regex, so those are never overridden.
+_FINANCE_FRAMED_TRACKS = ("a", "b", "c", "d", "e")
+
+
+def employer_is_financial_services(employer) -> bool:
+    """True when the employer's NAME says its own business is financial services.
+
+    Name-based and therefore incomplete by construction - it is one of two guards, not the whole
+    test. The asymmetry is deliberate: a false positive here only means "do not override", which
+    is today's behavior, while a false negative is caught by the tone_mode check beside it.
+    """
+    return bool(_FINANCE_EMPLOYER_RE.search(str(employer or "")))
+
+
+def override_track_for_title(track, job_title, employer=None, tone_mode=None) -> str:
+    """`track`, or the track a high-confidence non-finance job TITLE demands instead.
+
+    Returns the input unchanged unless all of these hold: the title matches one of the narrow
+    patterns above, the current track is one of the finance-framed ones, and the employer is not
+    itself a financial-services business. Callers log every change - see evaluate_job_with_gemini.
+    """
+    letter = normalize_track(track)
+    if letter not in _FINANCE_FRAMED_TRACKS:
+        return letter
+    if tone_mode == "conservative" or employer_is_financial_services(employer):
+        return letter
+    title = str(job_title or "")
+    for pattern, target in _TITLE_TRACK_RULES:
+        if pattern.search(title):
+            return target
+    return letter
 
 
 def normalize_track(value) -> str:
