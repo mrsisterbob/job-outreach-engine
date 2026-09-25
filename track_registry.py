@@ -97,7 +97,7 @@ TRACK_REGISTRY = {
         "prompt_label": "operations & logistics",
         "subtitle": "Operations & Service Delivery",
         "keywords": ("Operations", "SLA Management", "Exception Handling", "Salesforce", "Process Automation", "Excel"),
-        "summary": "I work intake queues with a service window attached, resolving requests inside 1 to 2 hours and clearing the exceptions that stall a handoff before the person on the other end is waiting.",
+        "summary": "I work intake queues on a 1-to-2-hour turnaround, clearing exceptions before stalled handoffs leave anyone waiting.",
         "skills": [
             ("Operations & Service", "Queue & SLA Management, Exception Handling, Escalation Paths, Process Documentation."),
             ("Systems & Tools", "Salesforce, DocuSign, Excel, SQL, Python, HubSpot CRM.")
