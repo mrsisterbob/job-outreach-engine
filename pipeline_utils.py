@@ -746,6 +746,28 @@ def compute_description_simhash(text: str) -> str:
     return hashlib.md5("".join(sorted(shingles)).encode()).hexdigest()
 
 
+def classify_outreach_track(title):
+    """"recruiter" or "peer" for a follow-up, from the row's job title. Pure.
+
+    This decides ONE sentence: a recruiter hears "I am still interested", a peer hears "I would
+    still like to connect". The distinction is whether a REQ sits between Kevin and the recipient -
+    saying "still interested" to someone with no say over a role reads as a bot working a list.
+
+    The signal is the presence of a title, NOT its wording, and that is deliberate. Code.gs:495
+    populates `title` only for JOBS-schema tabs, where Column C is the role Kevin APPLIED TO; for
+    PEOPLE tabs (Carmen Cold/Warm networking contacts) it is hardcoded "" because those sheets have
+    no role column at all. So a title is present exactly when Kevin applied to a posting and is
+    chasing it - the recruiter case - and absent exactly when this is a networking contact.
+
+    A keyword heuristic over the title ("recruiter", "talent acquisition") was the obvious first
+    approach and is WRONG here: the field never holds the contact's own job title, so such a test
+    could only ever fire on a job whose ROLE NAME contained "recruiter" - classifying a req for a
+    recruiting position as a recruiter contact, and every other row as peer regardless of who the
+    person is.
+    """
+    return "recruiter" if str(title or "").strip() else "peer"
+
+
 # Names the pipeline invents when it has no real contact. None of them is a person, so the
 # person-finder providers can only miss on them.
 _PLACEHOLDER_CONTACT_NAMES = frozenset({

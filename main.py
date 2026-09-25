@@ -40,7 +40,7 @@ from pipeline_utils import (
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     is_guessed_contact_email, resolve_sent_email_backfill,
-    sanitize_job_title, is_clean_job_title,
+    sanitize_job_title, is_clean_job_title, classify_outreach_track,
     is_role_mailbox, is_automated_sender, company_domain_of, name_from_email_local_part, parse_email_recipient,
     match_email_to_crm_company,
     plan_carmen_ladder, carmen_reply_anchor, carmen_linkedin_anchor, CARMEN_LADDER_DAYS,
@@ -250,9 +250,18 @@ _FALLBACK_OUTREACH_TEMPLATES = {
 # Both entries are identical on purpose. The ladder now sends ONE bump, and these must be
 # sendable with no editing - so whichever rung a mid-flight row replays produces the same text.
 _ROLELESS_FOLLOWUP_BUMPS = [
-    "Hi{name},\n\nCircling back on my earlier note to {company} in case it got buried.\n\nStill keen to connect, and happy to answer anything useful.\n\nBest,\nKevin",
-    "Hi{name},\n\nCircling back on my earlier note to {company} in case it got buried.\n\nStill keen to connect, and happy to answer anything useful.\n\nBest,\nKevin",
+    "Hi{name},\n\nI'm just circling back on my earlier note to {company}.\n\nI would still like to connect if you have a moment, and I'm happy to answer anything helpful.\n\nBest,\nKevin",
+    "Hi{name},\n\nI'm just circling back on my earlier note to {company}.\n\nI would still like to connect if you have a moment, and I'm happy to answer anything helpful.\n\nBest,\nKevin",
 ]
+
+# The one sentence that differs between the two tracks, keyed by classify_outreach_track(). A
+# recruiter owns a req Kevin applied to, so "still interested" is the accurate thing to say; a peer
+# does not, and telling them you are still interested in a role they have no say over is what makes
+# a follow-up read as a bot working a list. Everything else in the bump is identical.
+_FOLLOWUP_BUMP_TRACK_SENTENCES = {
+    "peer": "I would still like to connect if you have a moment, and I'm happy to answer anything helpful.",
+    "recruiter": "I am still interested, and I'm happy to answer anything helpful.",
+}
 _FALLBACK_LINKEDIN_TEMPLATES = {
     "linkedin_templates": ["Hi{name}. Saw you're hiring a {job_title} at {company}. I'd like to connect."]
 }
@@ -310,10 +319,17 @@ def resolve_template_text(pool, idx, fallback_text=""):
         idx = 0
     return pool[idx]
 
-def interpolate_template(template, name="", company="", job_title="", their_desk=""):
-    """Deterministically fills {name}/{company}/{job_title}/{their_desk} placeholders via
-    str.format() - the only place candidate-facing outreach/LinkedIn copy is ever assembled.
-    Never calls Gemini.
+def interpolate_template(template, name="", company="", job_title="", their_desk="", track_sentence=""):
+    """Deterministically fills {name}/{company}/{job_title}/{their_desk}/{track_sentence}
+    placeholders via str.format() - the only place candidate-facing outreach/LinkedIn copy is ever
+    assembled. Never calls Gemini.
+
+    {track_sentence} is the follow-up bump's one track-dependent line: a recruiter is told "I am
+    still interested", a peer "I would still like to connect" (see classify_outreach_track and
+    _FOLLOWUP_BUMP_TRACK_SENTENCES). It defaults to the PEER sentence rather than "" because an
+    unfilled slot here would otherwise leave a follow-up with no ask at all, and peer is the safe
+    direction - it is a weaker email to a recruiter, where the reverse is a misfire to someone with
+    no say over the role.
 
     {their_desk} is the one concrete detail about the RECIPIENT's desk, read off their LinkedIn
     About/Experience during the manual pass-2 screen (see memory/outreach-screener.md). It renders
@@ -363,6 +379,7 @@ def interpolate_template(template, name="", company="", job_title="", their_desk
             company=company or "your team",
             job_title=clean_title or "this role",
             their_desk=str(their_desk or "").strip().rstrip(",") or "Given how much of this sits under you",
+            track_sentence=str(track_sentence or "").strip() or _FOLLOWUP_BUMP_TRACK_SENTENCES["peer"],
         )
     except Exception as e:
         logging.error(f"Template interpolation failed: {e}")
@@ -3517,7 +3534,7 @@ def resume_pdf_filename(company_name):
     slug = slug[:64].rstrip('_')
     return f"Kevin_Miller_Resume_{slug}.pdf" if slug else "Kevin_Miller_Resume.pdf"
 
-def render_outreach_email(pool_key, template_id=0, name="", company="", job_title="", their_desk=""):
+def render_outreach_email(pool_key, template_id=0, name="", company="", job_title="", their_desk="", track_sentence=""):
     """THE single rendering path for every candidate-facing email body, cold or warm or bump.
 
     Both consumers go through here - the Telegram card (process_single_candidate) and the Gmail
@@ -3535,7 +3552,7 @@ def render_outreach_email(pool_key, template_id=0, name="", company="", job_titl
     template = resolve_template_text(pool, template_id, fallback_text)
     return sanitize_text(interpolate_template(
         template, name=name, company=clean_company_for_copy(company), job_title=job_title,
-        their_desk=their_desk,
+        their_desk=their_desk, track_sentence=track_sentence,
     ))
 
 def generate_cold_email(job_title, company_name, template_id=0, contact_name="", their_desk=""):
@@ -3599,8 +3616,16 @@ def generate_bump_email(contact_name="", job_title="", company_name="", template
     if not str(job_title or "").strip():
         pool = _ROLELESS_FOLLOWUP_BUMPS
         template = pool[template_id] if isinstance(template_id, int) and 0 <= template_id < len(pool) else pool[0]
-        return sanitize_text(interpolate_template(template, name=contact_name, company=clean_company_for_copy(company_name)))
-    return render_outreach_email("followup_bumps", template_id, name=contact_name, company=company_name, job_title=job_title)
+        return sanitize_text(interpolate_template(
+            template, name=first_name_for_greeting(contact_name),
+            company=clean_company_for_copy(company_name)))
+    # Track passed explicitly so this path and build_followup_bump_draft() cannot drift: both feed
+    # the same bank, and the bank's {track_sentence} would otherwise silently take the peer default
+    # here while the sequencer sent the recruiter line for the same contact.
+    return render_outreach_email(
+        "followup_bumps", template_id, name=first_name_for_greeting(contact_name),
+        company=company_name, job_title=job_title,
+        track_sentence=_FOLLOWUP_BUMP_TRACK_SENTENCES[classify_outreach_track(job_title)])
 
 def format_email_block(email_text):
     sanitized = sanitize_text(email_text)
@@ -5119,6 +5144,28 @@ def check_existing_gmail_draft(to_email, subject):
         logging.error(f"DB Gmail Draft Lookup Error ({to_email}): {e}")
         return None
 
+def check_recent_gmail_draft_to(to_email):
+    """Most recent draft to to_email in the last 24h, ignoring subject, or None.
+
+    The subject-blind twin of check_existing_gmail_draft(), for the one caller that cannot know the
+    subject in advance: a threaded follow-up takes the existing conversation's subject, which is
+    only discovered inside create_gmail_draft(). Do NOT use this as a general dedup - matching on
+    address alone would collapse two legitimately different emails to the same person.
+    """
+    try:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT draft_id, created_at FROM gmail_drafts WHERE to_email = ? "
+                "AND created_at >= datetime('now', '-1 day') ORDER BY created_at DESC LIMIT 1",
+                (to_email,)
+            )
+            row = cursor.fetchone()
+            return {"draft_id": row[0], "created_at": row[1]} if row else None
+    except Exception as e:
+        logging.error(f"DB Gmail Draft Lookup Error ({to_email}): {e}")
+        return None
+
 def should_send_alert(alert_key: str, cooldown_hours: int = 6) -> bool:
     """Returns True if the alert has not been triggered within cooldown_hours (debounces repetitive alerts)."""
     try:
@@ -5189,9 +5236,18 @@ def is_placeholder_company_name(company_name):
     cleaned = str(company_name or "").strip()
     return not cleaned or cleaned.lower() in PLACEHOLDER_COMPANY_NAMES
 
-def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note="", custom_body=None, custom_subject=None, pdf_bytes=None, pdf_filename="Kevin_Miller_Resume.pdf"):
+def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_note="", custom_body=None, custom_subject=None, pdf_bytes=None, pdf_filename="Kevin_Miller_Resume.pdf", thread_reply=False):
     """Create Gmail draft with 24h dedup check and OAuth token expiry handling.
     Returns (success, message, draft_id) - draft_id is populated on success or when a duplicate is found.
+
+    thread_reply=True makes this a REPLY inside the existing conversation with to_email, when one
+    exists: the draft opens in Gmail with the prior history quoted, which is what a second or third
+    follow-up should look like. It is opt-in because a first touch must never thread - only the
+    sequencer's bump path passes it. When no prior thread is found the draft is created normally,
+    so this degrades to the old behaviour rather than failing.
+
+    Note that threading OVERRIDES custom_subject: Gmail requires the subject to match the thread's
+    own, so a computed one would break the very threading it was asked for.
     """
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars:
@@ -5238,6 +5294,23 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     else:
         subject = f"{job_title} @ {company_name}"
 
+    # The token is fetched BEFORE the dedup check because threading can rewrite `subject`, and
+    # subject is half of the dedup key - checking first would test a key we are about to change.
+    access_token = get_gmail_access_token()
+    if not access_token:
+        return False, "OAuth Token Unavailable", None
+
+    # Resolve the thread before dedup for the same reason. `thread` stays None on the first-touch
+    # path and whenever no prior conversation exists, and every downstream use is guarded on it.
+    thread = find_reply_thread(clean_to_email, access_token) if thread_reply else None
+    if thread:
+        # Gmail requires an exact Subject match to thread, so the thread's own subject wins over
+        # anything the caller computed. See find_reply_thread().
+        subject = thread["subject"]
+        logging.info(f"[THREAD] drafting into thread {thread['thread_id']} for {clean_to_email}")
+    elif thread_reply:
+        logging.info(f"[THREAD] no prior thread for {clean_to_email} - drafting as a new message")
+
     existing = check_existing_gmail_draft(clean_to_email, subject)
     if existing:
         if TELEGRAM_CHAT_ID:
@@ -5252,14 +5325,15 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         return False, "Draft already exists in Gmail", existing["draft_id"]
 
     try:
-        access_token = get_gmail_access_token()
-        if not access_token:
-            return False, "OAuth Token Unavailable", None
-
         message = EmailMessage()
         message["To"] = clean_to_email
         message["From"] = GMAIL_USER
         message["Subject"] = subject
+        if thread:
+            # Both headers, per RFC 2822 and the Threads guide: In-Reply-To names the message
+            # being answered, References carries the chain. threadId alone is not sufficient.
+            message["In-Reply-To"] = thread["message_id"]
+            message["References"] = thread["message_id"]
         message.set_content(body_content)
         if pdf_bytes:
             message.add_attachment(
@@ -5274,7 +5348,11 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         draft_url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-        res = requests.post(draft_url, headers=headers, json={"message": {"raw": raw_message}}, timeout=10)
+        draft_message = {"raw": raw_message}
+        if thread:
+            # threadId is a field on the Message inside the Draft, a sibling of `raw`.
+            draft_message["threadId"] = thread["thread_id"]
+        res = requests.post(draft_url, headers=headers, json={"message": draft_message}, timeout=10)
         if res.status_code in [200, 201]:
             draft_id = res.json().get("id", "")
             save_gmail_draft_record(clean_to_email, subject, draft_id)
@@ -5544,6 +5622,75 @@ def match_unknown_sender_to_crm_company(sender_raw):
         "tab": "Unverified",
         "sheet_uuid": "",
     }
+
+def find_reply_thread(to_email, access_token):
+    """Locate the existing conversation with to_email so a follow-up can be drafted INSIDE it.
+
+    Returns {"thread_id", "subject", "message_id"} for the most recent thread Kevin started with
+    this person, or None when there is no such thread (or anything goes wrong).
+
+    Gmail does NOT thread on a "Re:" in the subject string. Per the Threads guide, a draft joins a
+    thread only when all three of these hold: the request carries the thread's `threadId`, the
+    In-Reply-To/References headers are set per RFC 2822, and the Subject MATCHES the thread's
+    existing subject. That last one is why this returns `subject` rather than letting the caller
+    synthesize one - a computed "Re: {title} @ {company}" that differs by a character from what was
+    actually sent silently drops the draft into a new thread, which is the bug this replaces.
+
+    `message_id` is the RFC 2822 Message-ID header of the LAST message in the thread (not Gmail's
+    internal message id) - that is what In-Reply-To must point at.
+
+    Scoped with `from:me` so this only ever finds conversations Kevin STARTED. A thread he was
+    merely cc'd on is not a follow-up target, and replying into one would be worse than a new mail.
+    Errs toward None: every failure falls back to the existing new-thread behaviour rather than
+    blocking the draft.
+    """
+    if not to_email or not access_token:
+        return None
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        res = requests.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/threads",
+            headers=headers,
+            # maxResults=1: threads.list returns newest-first, and the newest conversation with
+            # this person is the one a follow-up belongs in.
+            params={"q": f"from:me to:{to_email}", "maxResults": 1},
+            timeout=10,
+        )
+        if res.status_code != 200:
+            logging.info(f"[THREAD] lookup HTTP {res.status_code} for {to_email}")
+            return None
+        threads = res.json().get("threads") or []
+        if not threads:
+            return None
+        thread_id = threads[0].get("id")
+        if not thread_id:
+            return None
+
+        detail = requests.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}",
+            headers=headers,
+            params={"format": "metadata", "metadataHeaders": ["Subject", "Message-ID"]},
+            timeout=10,
+        )
+        if detail.status_code != 200:
+            logging.info(f"[THREAD] detail HTTP {detail.status_code} for thread {thread_id}")
+            return None
+        messages = detail.json().get("messages") or []
+        if not messages:
+            return None
+        # Subject off the FIRST message (the thread's canonical subject, before any client
+        # decorated it with Re:/Fwd:); Message-ID off the LAST (what we are replying to).
+        first_headers = (messages[0].get("payload") or {}).get("headers") or []
+        last_headers = (messages[-1].get("payload") or {}).get("headers") or []
+        subject = _gmail_header_value(first_headers, "Subject")
+        message_id = _gmail_header_value(last_headers, "Message-ID")
+        if not subject or not message_id:
+            logging.info(f"[THREAD] thread {thread_id} missing Subject or Message-ID - not threading")
+            return None
+        return {"thread_id": thread_id, "subject": subject, "message_id": message_id}
+    except Exception as e:
+        logging.error(f"[THREAD] lookup error ({to_email}): {e}")
+        return None
 
 def is_thread_kevin_started(thread_id, access_token):
     """True when this Gmail thread already contains a message Kevin SENT.
@@ -8648,11 +8795,18 @@ def build_followup_bump_draft(record, attempt):
         fallback_pool = _FALLBACK_OUTREACH_TEMPLATES["followup_bumps"]
         fallback_text = fallback_pool[idx] if idx < len(fallback_pool) else fallback_pool[0]
         template = resolve_template_text(pool, idx, fallback_text)
+    # The greeting is the FIRST name: "Hi Chaunta Marshall," is the tell that a machine addressed
+    # you. The roled/roleless split above is about the body, so this applies to both.
     return interpolate_template(
         template,
-        name=record.get("name") or "",
+        name=first_name_for_greeting(record.get("name") or ""),
         company=record.get("company") or "",
         job_title=title,
+        # Keyed off whether a title is present at all, which is exactly the JOBS/PEOPLE schema
+        # split - see classify_outreach_track(). That makes the track agree with the roled/roleless
+        # template choice above by construction: both read the same field, so a roleless bump can
+        # never carry the recruiter sentence.
+        track_sentence=_FOLLOWUP_BUMP_TRACK_SENTENCES[classify_outreach_track(title)],
     )
 
 def _sequencer_draft_recipient(record):
@@ -8859,6 +9013,10 @@ def _stage_sequencer_draft(record, draft_text):
             job_title=record.get("title") or "",
             custom_body=draft_text,
             custom_subject=_sequencer_draft_subject(record),
+            # A sequencer bump is by definition not a first touch, so it threads when a prior
+            # conversation exists. custom_subject above stays as the fallback for when one does
+            # not; threading overrides it.
+            thread_reply=True,
         )
     except Exception as e:
         logging.error(f"[FOLLOWUPS] Gmail draft error ({record.get('sheet_uuid')}): {e}")
@@ -9347,18 +9505,33 @@ def render_followup_needs_card(result, on_demand=False):
             company = html.escape(str(e.get("company") or "—"))
             due = html.escape(_followup_date_label(e.get("next_followup")))
             step = html.escape(_next_step_label(e))
+            # Per-row draft link. Deliberately the ✉️ glyph alone rather than the name: tapping it
+            # CREATES a Gmail draft, and on a 24-row card a linked name is a mis-tap waiting to
+            # happen while scrolling. A stray tap is recoverable (the route is idempotent and never
+            # sends), but a small target keeps it rare.
+            #
+            # A URL, not a swipe: the multi-entry problem that rules out swipe-replies here is that
+            # _parse_sheet_uuid_from_card_text reads the FIRST 🆔 in the message. A link carries its
+            # own uuid in the path, so each row addresses itself correctly.
+            draft_link = ""
+            if e.get("sheet_uuid") and _sequencer_draft_recipient(e):
+                draft_url = html.escape(
+                    f"{BASE_URL}/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}",
+                    quote=True)
+                draft_link = f" · <a href='{draft_url}'>✉️</a>"
             lines.append(
                 f"💼 <b>{who}</b> — {company} · #{html.escape(str(e.get('attempt', 1)))} · due {due} → {step}"
-                f" · 🆔 <code>{html.escape(_seq_id_tag(e))}</code>"
+                f" · 🆔 <code>{html.escape(_seq_id_tag(e))}</code>{draft_link}"
             )
-        # Draft text and the on-demand Gmail links live on /followups, not here - this card stays a
-        # scannable list, and no draft exists until Kevin clicks one there.
+        # Draft text and the full per-person controls live on /followups - this card stays a
+        # scannable list. The ✉️ above is the one-tap path; no draft exists until one is clicked.
         queue_url = html.escape(f"{BASE_URL}/followups", quote=True)
         lines.append(f"📋 <a href='{queue_url}'>Open Follow-up Queue</a>")
         # No full-sheet_uuid 🆔 line and no swipe legend: this card holds N entries in one message,
         # and _parse_sheet_uuid_from_card_text takes the first UUID it finds, so a swipe-reply would
         # silently act on entry #1. Swipes here fail cleanly instead; actions carry their own id.
-        lines.append("<i>Swipe-replies don't work on this card - act via the 📋 links, or "
+        lines.append("<i>✉️ drafts the follow-up in Gmail and opens it, in the existing thread. "
+                     "Swipe-replies don't work on this card - act via the links, or "
                      "<code>/replied &lt;id&gt;</code> · <code>/interview &lt;id&gt; [YYYY-MM-DD]</code> "
                      "with the 🆔 above.</i>")
 
@@ -13589,7 +13762,13 @@ def followup_draft_on_demand(sheet_uuid):
     # A repeat click is answered here, before create_gmail_draft(): its own duplicate path would
     # also return the id, but it pings Telegram with "Draft Already Exists", which is noise from a
     # browser click.
-    existing = check_existing_gmail_draft(email, _sequencer_draft_subject(record))
+    #
+    # Matched on the ADDRESS alone, not (address, subject). Since these drafts thread, the subject
+    # Gmail actually stored is the existing conversation's, which this route cannot compute -
+    # _sequencer_draft_subject() is only the no-thread fallback. Pre-checking the computed subject
+    # would miss the draft the first click made and create a second one on every re-click. One
+    # follow-up per contact per day is the sequencer's own invariant, so address-only is exact here.
+    existing = check_recent_gmail_draft_to(email)
     draft_id = existing["draft_id"] if existing and existing.get("draft_id") else None
     reason = ""
     if not draft_id:

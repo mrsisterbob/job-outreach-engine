@@ -1138,8 +1138,12 @@ def test_draft_link_creates_the_draft_from_the_snapshot_and_redirects(monkeypatc
 
     assert status == 302
     assert location == "https://mail.google.com/mail/u/0/#drafts/draft-1"
+    # thread_reply=True is asserted here, not merely tolerated: a follow-up that silently stops
+    # threading is invisible in Gmail's own UI (the draft still looks right) and only shows up as a
+    # bare "Re:" with no quoted history in the RECIPIENT's inbox.
     assert calls == [{"to_email": "pat@acme.com", "company_name": "Nliven", "job_title": "",
-                      "custom_body": "Exact card text.", "custom_subject": "Re: Nliven"}]
+                      "custom_body": "Exact card text.", "custom_subject": "Re: Nliven",
+                      "thread_reply": True}]
     _click("cc-1")
     assert calls[1]["custom_subject"] == "Re: Ops Analyst @ Acme"
 
@@ -1188,6 +1192,10 @@ def test_second_click_redirects_to_the_same_draft_without_a_telegram_ping(monkey
         def json(self):
             return {"id": "draft-42"}
     monkeypatch.setattr(m.requests, "post", lambda url, **kw: posts.append(url) or Created())
+    # No prior conversation. Stubbed rather than left to the real requests.get: unstubbed, the
+    # thread lookup makes a LIVE call to Gmail, which 401s on the fake token and lands on this same
+    # branch by accident - a passing test that depended on the network and on nothing else.
+    monkeypatch.setattr(m, "find_reply_thread", lambda email, token: None)
     monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: pings.append(a) or 1)
     monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
     _save_today([_ready_entry("cc-0")])
@@ -1199,6 +1207,162 @@ def test_second_click_redirects_to_the_same_draft_without_a_telegram_ping(monkey
     assert second[:2] == first[:2]
     assert len(posts) == 1
     assert pings == []
+
+
+def _thread_env(monkeypatch):
+    """Env + OAuth for the real create_gmail_draft, and the POST captured for inspection."""
+    for var, val in (("GMAIL_CLIENT_ID", "cid"), ("GMAIL_CLIENT_SECRET", "cs"),
+                     ("GMAIL_REFRESH_TOKEN", "rt"), ("GMAIL_USER", "me@example.com")):
+        monkeypatch.setenv(var, val)
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: "token")
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: 1)
+    posts = []
+
+    class Created:
+        status_code = 200
+        def json(self):
+            return {"id": "draft-99"}
+
+    def fake_post(url, **kw):
+        posts.append(kw.get("json") or {})
+        return Created()
+
+    monkeypatch.setattr(m.requests, "post", fake_post)
+    return posts
+
+
+def _sent_message(post):
+    """The decoded RFC 2822 message out of a captured drafts.create body."""
+    raw = post["message"]["raw"]
+    return base64.urlsafe_b64decode(raw.encode()).decode()
+
+
+def test_followup_draft_threads_into_the_existing_conversation(monkeypatch):
+    """The whole point of the feature: Gmail must receive threadId + In-Reply-To + the thread's
+    own subject. Asserted on the REQUEST BODY, because every one of these is invisible in the
+    draft Kevin sees - a broken thread only shows up in the recipient's inbox."""
+    posts = _thread_env(monkeypatch)
+    monkeypatch.setattr(m, "find_reply_thread", lambda email, token: {
+        "thread_id": "t-500", "subject": "Ops Analyst @ Nliven", "message_id": "<abc@mail>"})
+    _save_today([_ready_entry("cc-0", text="Following up.")])
+
+    status, location, _ = _click("cc-0")
+
+    assert (status, location) == (302, "https://mail.google.com/mail/u/0/#drafts/draft-99")
+    assert posts[0]["message"]["threadId"] == "t-500"
+    sent = _sent_message(posts[0])
+    assert "In-Reply-To: <abc@mail>" in sent
+    assert "References: <abc@mail>" in sent
+    # The thread's real subject, NOT the computed "Re: Nliven": Gmail drops a draft whose subject
+    # does not match the thread, so a synthesized one would defeat the threading it asked for.
+    assert "Subject: Ops Analyst @ Nliven" in sent
+    assert "Re: Nliven" not in sent
+
+
+def test_draft_without_a_prior_thread_is_a_plain_new_message(monkeypatch):
+    """The degrade path. No thread found means no threadId and no reply headers - the old
+    behaviour, not an error."""
+    posts = _thread_env(monkeypatch)
+    monkeypatch.setattr(m, "find_reply_thread", lambda email, token: None)
+    _save_today([_ready_entry("cc-0")])
+
+    assert _click("cc-0")[0] == 302
+    assert "threadId" not in posts[0]["message"]
+    sent = _sent_message(posts[0])
+    assert "In-Reply-To" not in sent
+    assert "Subject: Re: Nliven" in sent
+
+
+def test_first_touch_never_threads(monkeypatch):
+    """/e and every other first-contact path must not reply into an old conversation, even when
+    one exists. thread_reply defaults False, so the lookup is never even attempted."""
+    posts = _thread_env(monkeypatch)
+    monkeypatch.setattr(m, "find_reply_thread",
+                        lambda email, token: pytest.fail("first touch must not look up a thread"))
+
+    ok, _, draft_id = m.create_gmail_draft(
+        to_email="pat@acme.com", company_name="Nliven", job_title="Analyst",
+        custom_body="First hello.")
+
+    assert (ok, draft_id) == (True, "draft-99")
+    assert "threadId" not in posts[0]["message"]
+
+
+def test_repeat_click_on_a_threaded_draft_does_not_create_a_second(monkeypatch):
+    """The dedup key regression. The stored subject is the THREAD's, which this route cannot
+    compute, so a subject-based pre-check would miss it and draft again on every click."""
+    posts = _thread_env(monkeypatch)
+    monkeypatch.setattr(m, "find_reply_thread", lambda email, token: {
+        "thread_id": "t-500", "subject": "Ops Analyst @ Nliven", "message_id": "<abc@mail>"})
+    _save_today([_ready_entry("cc-0")])
+
+    first = _click("cc-0")
+    second = _click("cc-0")
+
+    assert first[:2] == second[:2] == (302, "https://mail.google.com/mail/u/0/#drafts/draft-99")
+    assert len(posts) == 1
+
+
+def _thread_api(monkeypatch, listed, detail):
+    """Stub the two Gmail thread calls find_reply_thread makes. Returns the captured list query."""
+    seen = {}
+
+    class _Res:
+        def __init__(self, body, status=200):
+            self.status_code = status
+            self._body = body
+        def json(self):
+            return self._body
+
+    def fake_get(url, **kw):
+        if url.endswith("/threads"):
+            seen["q"] = (kw.get("params") or {}).get("q", "")
+            return _Res(listed)
+        return _Res(detail)
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    return seen
+
+
+def _hdrs(**kw):
+    return {"payload": {"headers": [{"name": k.replace("_", "-"), "value": v}
+                                    for k, v in kw.items()]}}
+
+
+def test_find_reply_thread_reads_first_subject_and_last_message_id(monkeypatch):
+    """Subject comes off the FIRST message (the thread's canonical subject) and Message-ID off the
+    LAST (what we are actually replying to). Taking both off the same message is the easy bug."""
+    seen = _thread_api(
+        monkeypatch,
+        {"threads": [{"id": "t-1"}]},
+        {"messages": [_hdrs(Subject="Ops Analyst @ Nliven", Message_ID="<first@mail>"),
+                      _hdrs(Subject="Re: Ops Analyst @ Nliven", Message_ID="<last@mail>")]},
+    )
+
+    assert m.find_reply_thread("pat@acme.com", "token") == {
+        "thread_id": "t-1", "subject": "Ops Analyst @ Nliven", "message_id": "<last@mail>"}
+    # from:me scopes this to conversations Kevin STARTED - replying into a thread he was merely
+    # cc'd on would be worse than sending a new mail.
+    assert seen["q"] == "from:me to:pat@acme.com"
+
+
+@pytest.mark.parametrize("listed,detail", [
+    ({"threads": []}, {}),                                          # no prior conversation
+    ({"threads": [{"id": "t-1"}]}, {"messages": []}),               # thread with no messages
+    ({"threads": [{"id": "t-1"}]},                                  # missing Message-ID
+     {"messages": [_hdrs(Subject="Ops Analyst @ Nliven")]}),
+])
+def test_find_reply_thread_returns_none_when_it_cannot_vouch_for_a_thread(monkeypatch, listed, detail):
+    """Every gap falls back to None (a plain new message) rather than a half-built reply."""
+    _thread_api(monkeypatch, listed, detail)
+    assert m.find_reply_thread("pat@acme.com", "token") is None
+
+
+def test_find_reply_thread_survives_a_gmail_error(monkeypatch):
+    def boom(url, **kw):
+        raise m.requests.exceptions.Timeout("gmail timed out")
+    monkeypatch.setattr(m.requests, "get", boom)
+    assert m.find_reply_thread("pat@acme.com", "token") is None
 
 
 def test_duplicate_return_with_ok_false_still_redirects(monkeypatch):
@@ -1263,7 +1427,8 @@ def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeyp
     assert [r["sheet_uuid"] for r in ready] == ["cc-fu1"]
     assert ready[0]["ladder_day"] == m.CARMEN_LADDER_DAYS_COLD[0]
     draft = ready[0]["draft_text"]
-    assert draft.startswith("Hi Dana Reyes,")
+    # FIRST name only: "Hi Dana Reyes," is the tell that a machine addressed you.
+    assert draft.startswith("Hi Dana,")
     assert "{" not in draft
     assert "this role" not in draft and "the  role" not in draft
     assert any(p["action"] == "update_snooze" and p["sheet_uuid"] == "cc-fu1" for p in enqueued)
@@ -2145,6 +2310,33 @@ def test_needs_card_people_are_a_short_list_with_no_drafts_and_no_swipeable_uuid
     assert uuid_a not in card and uuid_b not in card
     assert m._parse_sheet_uuid_from_card_text(card) == (None, None)
     assert "/apply" not in card and "Swipe-replies don't work on this card" in card
+
+
+def test_needs_card_gives_each_person_a_draft_link_without_breaking_swipe_safety():
+    """One-tap drafting from the card. The uuid now appears - but inside a URL, where the swipe
+    recovery parser does not read it, so the multi-entry invariant still holds: a swipe on this
+    card must resolve to NOTHING rather than silently to entry #1.
+
+    The link is the ✉️ glyph alone, not the person's name: tapping it creates a Gmail draft, and a
+    linked name across 24 rows is a mis-tap waiting to happen while scrolling."""
+    uuid_a, uuid_b = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+    ready = [
+        {"company": "Acme", "role": "", "name": "Dana", "attempt": 1, "draft_text": "hi",
+         "short_id": "abc123", "sheet_uuid": uuid_a, "sheet_tab": "Carmen Cold",
+         "email": "dana@acme.com", "next_followup": "2026-06-01", "new_next_followup": "2026-06-08"},
+        # No address on file - nothing to draft, so this row gets no link rather than a dead one.
+        {"company": "Beta", "role": "", "name": "Sam", "attempt": 2, "draft_text": "hi",
+         "short_id": "def456", "sheet_uuid": uuid_b, "sheet_tab": "Carmen Cold",
+         "email": "", "next_followup": "2026-06-01", "new_next_followup": "2026-06-08"},
+    ]
+    card = m.render_followup_needs_card(
+        {"followups_ready": ready, "going_cold": [], "buried": [], "top_matched": [],
+         "counts": {"followups_ready": 2}})
+
+    assert f"<a href='{m.BASE_URL}/followups/draft/{uuid_a}'>✉️</a>" in card
+    assert uuid_b not in card
+    assert m._parse_sheet_uuid_from_card_text(card) == (None, None)
+    assert "✉️ drafts the follow-up in Gmail" in card
 
 
 @pytest.mark.parametrize("days,dot", [(0, "🟢"), (4, "🟢"), (5, "🟡"), (9, "🟡"), (10, "🟠"),

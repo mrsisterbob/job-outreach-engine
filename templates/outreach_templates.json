@@ -18,8 +18,8 @@
     "Hi{name},\n\n[the real thread between you, however thin, stated plainly]. [the specific piece of their work at {company} that prompted this].\n\n[what you want to ask, narrowed to something answerable in a few sentences]. [your ask, and how much of their time it needs].\n\nBest,\nKevin"
   ],
   "followup_bumps": [
-    "Hi{name},\n\nCircling back on the {job_title} role at {company} in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nBest,\nKevin",
-    "Hi{name},\n\nCircling back on the {job_title} role at {company} in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nBest,\nKevin"
+    "Hi{name},\n\nI'm just circling back on my earlier note about the {job_title} role at {company}.\n\n{track_sentence}\n\nBest,\nKevin",
+    "Hi{name},\n\nI'm just circling back on my earlier note about the {job_title} role at {company}.\n\n{track_sentence}\n\nBest,\nKevin"
   ],
   "recruiter": [
     "Hi{name},\n\nI recently applied for the {job_title} role at {company} and wanted to reach out directly. Most of my recent work is custodial reconciliation and Python that replaces manual reporting.\n\nIs the search still open, and is there a rough timeline for first interviews? A one-line reply is plenty.\n\nBest,\nKevin Miller",

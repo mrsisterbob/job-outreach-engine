@@ -649,6 +649,72 @@ def test_roleless_followup_bumps_pass_the_voice_linter():
     assert failures == []
 
 
+def test_outreach_track_follows_the_jobs_people_schema_split():
+    """A title is present exactly when the row came from a JOBS tab, where Column C is the role
+    Kevin APPLIED TO (Code.gs:495). PEOPLE tabs hardcode "" because they have no role column. So
+    presence of a title - not its wording - is the recruiter/peer signal.
+
+    The wording cases are pinned because a keyword heuristic over this field is the obvious wrong
+    turn: it never holds the CONTACT's job title, so "Technical Recruiter" here is a REQ for a
+    recruiting position, which is still the recruiter track for the ordinary reason (Kevin applied
+    to it), and "Business Data Analyst" is not the peer track despite naming no recruiter.
+    """
+    assert pu.classify_outreach_track("Business Data Analyst") == "recruiter"
+    assert pu.classify_outreach_track("Technical Recruiter") == "recruiter"
+    for blank in ("", "   ", None):
+        assert pu.classify_outreach_track(blank) == "peer"
+
+
+def test_followup_bump_copy_is_exact_for_both_tracks():
+    """The shipped follow-up wording, asserted verbatim. Driven through build_followup_bump_draft
+    (the real sequencer entry point), not the template constants, so a break in the bank, the
+    interpolation, the track lookup or the greeting all surface here.
+
+    The two tracks differ in ONE sentence: a recruiter owns a req Kevin applied to, so "still
+    interested" is accurate; a peer does not, and claiming interest in a role they have no say over
+    is what makes a follow-up read as a bot working a list.
+    """
+    recruiter = m.build_followup_bump_draft(
+        {"name": "Kimberly Haller", "company": "Trinity Health MI", "title": "Business Data Analyst"}, 1)
+    assert recruiter == (
+        "Hi Kimberly,\n\n"
+        "I'm just circling back on my earlier note about the Business Data Analyst role at Trinity Health MI.\n\n"
+        "I am still interested, and I'm happy to answer anything helpful.\n\n"
+        "Best,\nKevin"
+    )
+
+    peer = m.build_followup_bump_draft(
+        {"name": "Chaunta Marshall", "company": "Trinity Health MI", "title": ""}, 1)
+    assert peer == (
+        "Hi Chaunta,\n\n"
+        "I'm just circling back on my earlier note to Trinity Health MI.\n\n"
+        "I would still like to connect if you have a moment, and I'm happy to answer anything helpful.\n\n"
+        "Best,\nKevin"
+    )
+
+
+def test_both_bump_paths_agree_on_the_track_sentence():
+    """generate_bump_email() and build_followup_bump_draft() feed the same bank. The bank's
+    {track_sentence} defaults to PEER when unfilled, so a path that forgot to pass the track would
+    silently send the peer line to a recruiter - a drift that renders as valid English and would
+    never fail a smoke test."""
+    for title in ("Business Data Analyst", ""):
+        via_draft = m.build_followup_bump_draft({"name": "Dana Reyes", "company": "Nliven", "title": title}, 1)
+        via_email = m.generate_bump_email(contact_name="Dana Reyes", job_title=title,
+                                          company_name="Nliven", template_id=1)
+        assert via_draft == via_email, f"bump paths disagree for title={title!r}"
+
+
+def test_an_unfilled_track_sentence_never_leaves_braces_in_an_email():
+    """interpolate_template() returns the RAW template on a KeyError, which would put literal
+    braces in a candidate-facing email. The slot must therefore have a real default."""
+    for template in _load_bank("outreach_templates.json")["followup_bumps"]:
+        rendered = m.interpolate_template(template, name="Dana", company=_LINT_COMPANY,
+                                          job_title=_LINT_TITLE)
+        assert "{" not in rendered and "}" not in rendered
+        assert "I would still like to connect" in rendered  # the peer default
+
+
 def test_warm_alumni_entries_are_unsendable_scaffolds():
     """Warm outreach is hand-written now. Each warm_alumni entry must be an obviously-unfinished
     skeleton (explicit bracketed blanks) so nothing generic can be fired off by /warm, yet still
