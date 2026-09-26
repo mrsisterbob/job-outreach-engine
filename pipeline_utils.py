@@ -2051,6 +2051,11 @@ DEAD_JOB_PHRASES = (
     "this job has expired",
     "job not found",
     "requisition is closed",
+    # JobLeads' retirement page: "Unfortunately, this job has recently been taken offline." It is
+    # served under a 404 today, so the code gate catches it first - these keep it dead if they
+    # ever switch to a 200. None of the phrases above match that sentence.
+    "taken offline",
+    "position is no longer available",
 )
 
 # Hosts that answer a server-side GET with an auth wall or a JS shell, so a 200 from them says
@@ -2065,13 +2070,50 @@ OPAQUE_JOB_HOSTS = (
     "jooble.org",
     "talent.com",
     "myworkdayjobs.com",  # Workday renders client-side; a 200 is not evidence of life
+    "career.io",          # answers every GET with a 202 JS shell - measured 2026-09-26
 )
+
+# Reason prefix for an 'unknown' that will never resolve: the host does not expose posting state
+# to a server-side fetch, so re-checking tomorrow learns nothing. Every other 'unknown' reason is
+# transient (timeout, 5xx, an odd status) and may classify on a later pass. /links counts the two
+# separately so "unknown" stops lumping a permanent blind spot in with a bad night.
+OPAQUE_LINK_REASON = "opaque host"
 
 
 def is_opaque_job_host(url):
     """True when a plain GET on this host cannot distinguish a live posting from a dead one."""
     lowered = str(url or "").lower()
     return any(host in lowered for host in OPAQUE_JOB_HOSTS)
+
+
+def is_opaque_link_reason(reason):
+    """True when classify_job_link()'s reason says the host can never be judged (not transient)."""
+    return str(reason or "").startswith(OPAQUE_LINK_REASON)
+
+
+def split_link_check_budget(row_counts, limit):
+    """Divide one sweep's `limit` across tabs so an oversized tab cannot starve the rest.
+
+    `row_counts` is the number of checkable rows per tab, in scan order. Each tab gets an even
+    share first; whatever a small tab leaves unspent is handed to the tabs that still have rows,
+    in scan order. Returns a list of allotments aligned with `row_counts` summing to at most
+    `limit`.
+    """
+    counts = [max(0, int(c or 0)) for c in row_counts]
+    alloc = [0] * len(counts)
+    remaining = max(0, int(limit or 0))
+    while remaining > 0:
+        open_tabs = [i for i, c in enumerate(counts) if alloc[i] < c]
+        if not open_tabs:
+            break
+        share = max(1, remaining // len(open_tabs))
+        for i in open_tabs:
+            give = min(share, counts[i] - alloc[i], remaining)
+            alloc[i] += give
+            remaining -= give
+            if remaining == 0:
+                break
+    return alloc
 
 
 def classify_job_link(url, status_code, final_url, page_text, fetch_error=None):
@@ -2088,6 +2130,9 @@ def classify_job_link(url, status_code, final_url, page_text, fetch_error=None):
     - 404/410 is 'dead' on any host: even an opaque one returns those honestly.
     - A redirect away from the posting toward a careers root is 'dead' - the standard ATS
       behavior for a pulled req.
+
+    An 'unknown' whose reason starts with OPAQUE_LINK_REASON is permanent (see
+    is_opaque_link_reason); any other 'unknown' is transient.
     """
     if fetch_error:
         return ("unknown", f"fetch failed: {str(fetch_error)[:120]}")
@@ -2104,11 +2149,14 @@ def classify_job_link(url, status_code, final_url, page_text, fetch_error=None):
 
     if code >= 500:
         return ("unknown", f"HTTP {code} (server error, not a retired posting)")
+
+    # 202 is a JS shell that fills in client-side (career.io): it accepted the request and said
+    # nothing about the posting, on any host. An opaque host's auth wall (Indeed 401, ZipRecruiter
+    # 403) is the same blind spot, not a transient failure.
+    if code == 202 or is_opaque_job_host(url):
+        return ("unknown", f"{OPAQUE_LINK_REASON}: HTTP {code}, posting state not exposed to a server-side fetch")
     if code != 200:
         return ("unknown", f"HTTP {code}")
-
-    if is_opaque_job_host(url):
-        return ("unknown", "host does not expose posting state to a server-side fetch")
 
     # A posting that redirects to the careers root or a search page has been pulled.
     src = str(url or "").rstrip("/").lower()

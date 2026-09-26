@@ -9643,3 +9643,110 @@ def test_permissive_mode_restores_alerting_every_stranger(monkeypatch):
         _gmail_message("perm", "community@legal.io", "Kevin, nearly half of lawyers feel worse off",
                        _JUNK_BODY)])
     assert len(alerts) == 1
+
+
+# ---- Job-link sweep: per-tab budget, opaque split, standup reasons ----
+
+def _linkcheck_env_by_tab(monkeypatch, rows_by_tab, fetches):
+    class _R:
+        status_code = 200
+        def __init__(self, rows): self.rows = rows
+        def json(self): return {"status": "success", "followups": self.rows}
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _R(rows_by_tab.get(payload.get("tab"), [])))
+    fetched = []
+    def _fetch(url):
+        fetched.append(url)
+        return fetches.get(url, (200, url, "<p>Apply now</p>", None))
+    monkeypatch.setattr(m, "fetch_job_link_state", _fetch)
+    queued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: queued.append(p))
+    monkeypatch.setattr(m.time, "sleep", lambda *a, **k: None)
+    return queued, fetched
+
+
+def test_sweep_budget_reaches_every_tab_when_tetiana_cold_is_huge(monkeypatch):
+    """THE BUG: `checked` was global, so a 50-row TC spent all 40 and TW/CL got zero."""
+    rows = {
+        "TC": [_job_row(f"tc{i}", "Matched", f"https://co.com/tc/{i}") for i in range(50)],
+        "TW": [_job_row(f"tw{i}", "Applied", f"https://co.com/tw/{i}") for i in range(9)],
+        "CL": [_job_row(f"cl{i}", "Applied", f"https://co.com/cl/{i}") for i in range(3)],
+    }
+    _q, fetched = _linkcheck_env_by_tab(monkeypatch, rows, {})
+
+    result = m.check_job_links(limit=40, sleep_between=0)
+
+    assert result["checked"] == 40 == len(fetched)
+    assert result["per_tab"] == {"TC": 28, "TW": 9, "CL": 3}
+    assert any("/tw/" in u for u in fetched) and any("/cl/" in u for u in fetched)
+
+
+def test_sweep_counts_opaque_separately_from_transient(monkeypatch):
+    rows = {"TC": [
+        _job_row("u-cio", "Matched", "https://career.io/job/x"),
+        _job_row("u-li", "Matched", "https://www.linkedin.com/jobs/view/1"),
+        _job_row("u-to", "Matched", "https://co.com/j/9"),
+    ]}
+    fetches = {
+        "https://career.io/job/x": (202, "https://career.io/job/x", "<div id=root></div>", None),
+        "https://www.linkedin.com/jobs/view/1": (200, "https://www.linkedin.com/jobs/view/1", "<p>Sign in</p>", None),
+        "https://co.com/j/9": (None, None, "", TimeoutError("boom")),
+    }
+    queued, _f = _linkcheck_env_by_tab(monkeypatch, rows, fetches)
+
+    result = m.check_job_links(sleep_between=0)
+
+    assert result["opaque"] == 2 and result["unknown"] == 1
+    assert result["dead"] == [] and queued == []
+
+
+def test_sweep_still_fetches_linkedin_because_it_404s_honestly(monkeypatch):
+    """Measured 2026-09-26: live LinkedIn job ids answer 200, missing ones 404. Skipping the fetch
+    for opaque hosts would throw away the only dead signal on a LinkedIn row."""
+    rows = {"TC": [_job_row("u-li", "Matched", "https://www.linkedin.com/jobs/view/1")]}
+    queued, fetched = _linkcheck_env_by_tab(
+        monkeypatch, rows,
+        {"https://www.linkedin.com/jobs/view/1": (404, "https://www.linkedin.com/jobs/view/1", "", None)})
+
+    result = m.check_job_links(sleep_between=0)
+
+    assert fetched == ["https://www.linkedin.com/jobs/view/1"]
+    assert len(result["retired"]) == 1
+
+
+def test_links_summary_breaks_out_opaque_transient_and_per_tab(monkeypatch):
+    rows = {"TC": [_job_row("u-cio", "Matched", "https://career.io/job/x")],
+            "TW": [_job_row("u-tw", "Applied", "https://co.com/tw/1")]}
+    _linkcheck_env_by_tab(monkeypatch, rows,
+                          {"https://career.io/job/x": (202, "https://career.io/job/x", "", None)})
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+
+    _dispatch("/links check")
+
+    summary = next(t for t in sent if "checked" in t)
+    assert "2 checked" in summary
+    assert "1 opaque (never classifiable)" in summary and "0 unknown (transient)" in summary
+    assert "TC 1 · TW 1 · CL 0" in summary
+
+
+def test_standup_names_each_auto_retired_row_and_why(monkeypatch):
+    """Write path: the sweep records the verdict, the NEXT morning's standup reads it back."""
+    rows = {"TC": [_job_row("u-slate", "Matched", "https://www.jobleads.com/us/job/x",
+                            company="Slate", role="Automotive Logistics Ops Specialist")]}
+    _linkcheck_env_by_tab(monkeypatch, rows,
+                          {"https://www.jobleads.com/us/job/x": (404, "https://www.jobleads.com/us/job/x", "", None)})
+    m.check_job_links(sleep_between=0)
+
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    monkeypatch.setattr(m, "get_daily_activity", lambda d: {"drafts_staged": 0})
+    monkeypatch.setattr(m, "calculate_active_day_streak", lambda: 1)
+    monkeypatch.setattr(m, "get_overdue_followups", lambda: [])
+    monkeypatch.setattr(m, "check_system_health", lambda: [])
+    monkeypatch.setattr(m, "scan_carmen_hot_conversations", lambda *a, **k: [])
+
+    m.send_daily_standup(1)
+
+    assert "Slate - Automotive Logistics Ops Specialist (HTTP 404)" in sent[0]
+    assert "u-slate" not in {r[0] for r in m.get_dead_job_links(include_notified=False)}

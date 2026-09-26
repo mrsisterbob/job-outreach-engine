@@ -2161,3 +2161,51 @@ def test_a_generic_domain_label_cannot_match_a_company_that_ends_in_it():
     assert pu.domain_matches_company("a@intactinsurance.com", "Intact Services USA LLC") is True
     assert pu.domain_matches_company("a@ncms.org", "National Center for Manufacturing Sciences") is True
     assert pu.company_domain_of("discover@services.discover.com") == "discover.com"
+
+
+def test_classify_jobleads_offline_page_is_dead_even_on_a_200():
+    """JobLeads serves "taken offline" under a 404 today. If they switch to a 200, the phrase is
+    the only thing standing between a dead posting and an 'alive' verdict."""
+    verdict, reason = pu.classify_job_link(
+        "https://www.jobleads.com/us/job/ops-specialist--x", 200,
+        "https://www.jobleads.com/us/job/ops-specialist--x",
+        "<p>Unfortunately, this job has recently been taken offline.</p>")
+    assert verdict == "dead" and "taken offline" in reason
+
+
+def test_classify_202_is_opaque_never_dead():
+    """career.io answers with a 202 JS shell - measured 2026-09-26. Permanent, not transient."""
+    for url in ("https://career.io/job/associate-ops-analyst-x", "https://co.com/careers/job/5"):
+        verdict, reason = pu.classify_job_link(url, 202, url, "<div id=root></div>")
+        assert verdict == "unknown", url
+        assert pu.is_opaque_link_reason(reason), reason
+
+
+def test_classify_opaque_host_auth_wall_is_opaque_not_transient():
+    """Indeed 401 / ZipRecruiter 403 (measured) are a blind spot that tomorrow will not fix."""
+    verdict, reason = pu.classify_job_link("https://www.indeed.com/viewjob?jk=1", 401, None, "")
+    assert verdict == "unknown" and pu.is_opaque_link_reason(reason)
+    verdict, reason = pu.classify_job_link("https://www.linkedin.com/jobs/view/1", 200, None, "<div/>")
+    assert verdict == "unknown" and pu.is_opaque_link_reason(reason)
+
+
+def test_classify_transient_misses_are_not_opaque():
+    for args, kw in (((None, None, ""), {"fetch_error": TimeoutError()}),
+                     ((503, None, ""), {}), ((403, None, ""), {})):
+        verdict, reason = pu.classify_job_link("https://co.com/j", *args, **kw)
+        assert verdict == "unknown" and not pu.is_opaque_link_reason(reason), reason
+
+
+def test_classify_opaque_hosts_never_dead_on_a_plain_200():
+    for url in ("https://www.linkedin.com/jobs/view/4412864916",
+                "https://www.indeed.com/viewjob?jk=abc", "https://www.ziprecruiter.com/c/x/Job/y"):
+        assert pu.classify_job_link(url, 200, "https://www.linkedin.com/", "<p>Sign in</p>")[0] != "dead", url
+
+
+def test_split_link_check_budget_never_starves_a_tab():
+    """THE BUG: one global counter let a 50-row Tetiana Cold eat all 40 and leave TW/CL at zero."""
+    assert pu.split_link_check_budget([50, 9, 3], 40) == [28, 9, 3]
+    assert pu.split_link_check_budget([50, 50, 50], 40) == [14, 13, 13]
+    assert pu.split_link_check_budget([22, 0, 0], 40) == [22, 0, 0]
+    assert pu.split_link_check_budget([5, 5, 5], 0) == [0, 0, 0]
+    assert sum(pu.split_link_check_budget([100, 100, 1], 40)) == 40

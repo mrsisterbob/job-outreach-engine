@@ -49,7 +49,7 @@ from pipeline_utils import (
     INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, LINKEDIN_TOUCH_NOTE_MARKER,
     MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
-    classify_job_link, may_auto_retire, is_opaque_job_host,
+    classify_job_link, may_auto_retire, is_opaque_job_host, is_opaque_link_reason, split_link_check_budget,
     parse_job_command, parse_job_page_html, build_ingest_job_dict, extract_jd_terms,
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
     strip_tracking_params, strip_html_to_text,
@@ -7913,18 +7913,21 @@ def send_daily_standup(chat_id):
     fresh_dead = get_dead_job_links(include_notified=False, limit=10)
     if fresh_dead:
         # Applied rows lead: a posting coming down on a job Kevin is waiting to hear about is the
-        # only half of this list he can act on. Retired rows are collapsed to a count - they are
-        # already in Died and reading their names changes nothing.
+        # only half of this list he can act on. Retired rows follow, one line each with the reason:
+        # a bare count sent Kevin to a browser to find out which rows went and why.
         applied = [r for r in fresh_dead if not r[6]]
-        retired_n = len(fresh_dead) - len(applied)
+        retired_rows = [r for r in fresh_dead if r[6]]
         if applied:
             digest += f"\n\n🔗 <b>Applied - posting came down ({len(applied)}):</b>"
             for uuid_v, company, role, _link, status, _reason, _retired, first_dead in applied:
                 digest += (f"\n• {html.escape(str(company or '?'))} - {html.escape(str(role or '?'))}"
                            f" · down {_dead_since_label(first_dead)}")
             digest += "\n<i>They stopped sourcing, not a rejection - worth a status chase.</i>"
-        if retired_n:
-            digest += f"\n\n⚰️ <i>{retired_n} dead link(s) auto-retired to Died.</i>"
+        if retired_rows:
+            digest += f"\n\n⚰️ <b>Auto-retired to Died ({len(retired_rows)}):</b>"
+            for _u, company, role, _link, _status, reason, _retired, _first in retired_rows:
+                digest += (f"\n• {html.escape(str(company or '?'))} - {html.escape(str(role or '?'))}"
+                           f" ({html.escape(str(reason or 'dead link'))})")
         digest += " <code>/links</code>"
         mark_dead_links_notified([r[0] for r in fresh_dead])
 
@@ -9761,20 +9764,30 @@ def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=L
     means the employer stopped sourcing, not that Kevin was rejected, and burying it would lose a
     live thread.
 
-    Returns a dict the digest and /dead render.
+    The `limit` is split across tabs by split_link_check_budget(): a single global counter let a
+    40-row Tetiana Cold spend the whole budget and leave Tetiana Warm and Clavicular at zero rows
+    checked while the summary still read as a clean sweep. `per_tab` reports what each tab got.
+
+    Returns a dict the digest and /dead render. "unknown" counts only transient misses; "opaque"
+    counts hosts that can never be judged (see is_opaque_link_reason).
     """
-    checked, dead, retired, unknown = 0, [], [], 0
+    checked, dead, retired, unknown, opaque = 0, [], [], 0, 0
     today_str = datetime.now().strftime("%Y-%m-%d")
 
+    tabs = []
     for code, tab_name in (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "Clavicular")):
+        rows = []
         for rec in fetch_networking_cards(code, qty=None) or []:
-            if checked >= limit:
-                break
             link = str(rec.get("job_link") or "").strip()
             sheet_uuid = str(rec.get("sheet_uuid") or "").strip()
-            if not (link.startswith("http") and sheet_uuid):
-                continue
+            if link.startswith("http") and sheet_uuid:
+                rows.append((rec, link, sheet_uuid))
+        tabs.append((code, tab_name, rows))
+    allotments = split_link_check_budget([len(rows) for _c, _t, rows in tabs], limit)
+    per_tab = {code: n for (code, _t, _r), n in zip(tabs, allotments)}
 
+    for (code, tab_name, rows), allotment in zip(tabs, allotments):
+        for rec, link, sheet_uuid in rows[:allotment]:
             checked += 1
             status_code, final_url, text, err = fetch_job_link_state(link)
             verdict, reason = classify_job_link(link, status_code, final_url, text, fetch_error=err)
@@ -9783,7 +9796,10 @@ def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=L
             role = rec.get("job_title") or rec.get("title") or ""
 
             if verdict == "unknown":
-                unknown += 1
+                if is_opaque_link_reason(reason):
+                    opaque += 1
+                else:
+                    unknown += 1
 
             try:
                 with get_db_conn() as conn:
@@ -9842,9 +9858,11 @@ def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=L
                 time.sleep(sleep_between)
 
     logging.info(
-        f"[LINKCHECK] checked={checked} dead={len(dead)} retired={len(retired)} unknown={unknown}"
+        f"[LINKCHECK] checked={checked} dead={len(dead)} retired={len(retired)} "
+        f"opaque={opaque} unknown={unknown} per_tab={per_tab}"
     )
-    return {"checked": checked, "dead": dead, "retired": retired, "unknown": unknown}
+    return {"checked": checked, "dead": dead, "retired": retired, "unknown": unknown,
+            "opaque": opaque, "per_tab": per_tab}
 
 
 def _dead_since_label(first_dead_at):
@@ -11868,9 +11886,12 @@ def process_webhook_payload_async(data):
                         f"<code>{html.escape(probe)}</code>"
                     )
                     return
+                per_tab = " · ".join(f"{c} {n}" for c, n in result.get("per_tab", {}).items())
                 summary = (
-                    f"🔗 Checked {result['checked']} links: <b>{len(result['dead'])}</b> dead, "
-                    f"{result['unknown']} unknown.\n"
+                    f"🔗 {result['checked']} checked · <b>{len(result['dead'])}</b> dead · "
+                    f"{result.get('opaque', 0)} opaque (never classifiable) · "
+                    f"{result['unknown']} unknown (transient)\n"
+                    + (f"<i>{per_tab}</i>\n" if per_tab else "")
                 )
                 if commit:
                     summary += f"⚰️ Retired {len(result['retired'])} row(s) to Died."
