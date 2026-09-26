@@ -6,7 +6,9 @@
     "location": "Detroit, MI",
     "website": "montelattice.com",
     "linkedin": "linkedin.com/in/kevinmiller",
-    "github": "github.com/mrsisterbob"
+    "github": "github.com/mrsisterbob",
+    "site_email": "kevin.miller@montelattice.com",
+    "linkedin_url": "https://www.linkedin.com/in/kevin-miller-7386a6252/"
   },
   "experience": [
     {
@@ -89,6 +91,65 @@
     "Member, Economic Club of Grand Rapids",
     "Varsity Cross Country & Track (2 years)"
   ],
+  "athletics": [
+    {
+      "honor": "All-American",
+      "sport": "Cross Country and Track",
+      "school": "Hope College",
+      "personal_bests": [
+        {"event": "5k", "time": "16:34"},
+        {"event": "8k", "time": "28:01"}
+      ]
+    }
+  ],
+  "research": [
+    {
+      "kind": "Senior seminar thesis",
+      "title": "Structural Lag in U.S. Tokenization Policy",
+      "course": "POL 494",
+      "school": "Hope College",
+      "summary": "on why federal adaptation to real world asset tokenization trails the EU's MiCA framework"
+    }
+  ],
+  "memberships": [
+    "Economic Club of Grand Rapids",
+    "Grand Rapids Young Professionals",
+    "Detroit Young Professionals"
+  ],
+  "mentors": [
+    {"name": "Robert Pocock", "role": "Professor", "school": "Hope College"}
+  ],
+  "site_profile": {
+    "_note": "Copy for the montelattice.com homepage, rendered at request time by montelattice-site (homepage.py). Nothing on the job engine reads this block. A figure with a `source` is shown only while that bullet still contains its value.",
+    "eyebrow": "Detroit, Michigan",
+    "claim": "I run operations, and I build the software that runs them. Not an engineer. A business grad who **builds the tools he needs**, with AI, and uses them daily.",
+    "figures": [
+      {"value": "$2.5B", "label": "AUM platform I ran operations on", "source": {"company": "Signal Advisors", "bullet": 6}},
+      {"value": "500+", "label": "Accounts audited under SEC rules", "source": {"company": "Signal Advisors", "bullet": 0}},
+      {"value": "4", "label": "Systems built, running in production"},
+      {"value": "150+", "label": "Hours building them, nights and weekends"}
+    ],
+    "story": [
+      {"text": "I started in wealth operations at Signal Advisors, which is the part of financial services nobody puts on a brochure. Custodial reconciliation. Onboarding paperwork for 500 accounts. Ticket queues with a one to two hour service window and an advisor on the other end who needs an answer. The job is accurate records and nothing stalling downstream, and I was good at it."},
+      {"text": "I went after the Series 65 because I wanted the credential behind the judgment rather than just the title on a business card. Studying for it is what made the shape of the industry clear to me. Most of the paths in front of a finance grad lead to a sales seat, and I could see myself doing that well enough. I also knew it was not where I was most useful."},
+      {"text": "What I actually liked was the machinery. The queue, the exception, the handoff, the reason the same thing broke twice.", "pull": true},
+      {"text": "At Hope, Professor Robert Pocock taught me something I use every week now, which is that your own brand and your own network are work you do on purpose. Not something that happens to you after enough time passes. Good work does not market itself, and the people who know what you can do are the reason opportunities show up at all. I took that seriously, and it is why I spend real time with the Economic Club of Grand Rapids, Grand Rapids Young Professionals, and Detroit Young Professionals rather than only reading about the industry from a desk."},
+      {"text": "That same instinct is why I wrote my senior seminar thesis on tokenization policy, asking why U.S. regulation of real world assets on blockchain rails moves so much slower than the EU's. It is the question underneath my work at 40 Acres, where I drafted SEC Form D filings for digital asset offerings. I like the places where the rules and the technology are still arguing."},
+      {"text": "So when the repetitive parts of my job kept repeating, I stopped waiting for a tool and built one. Then another. Python and SQL, with AI as the thing that lets one operations person move at the speed of a small team. Four systems now, all in production, all used daily by me. That is the combination I bring: someone who understands the operation from the inside and can build the thing that fixes it."}
+    ],
+    "role_bullets": {
+      "Signal Advisors": [0, 5, 7],
+      "40 Acres": [0, 1],
+      "Northwestern Mutual": [0],
+      "ABC Technologies": [0, 1]
+    },
+    "offhours": [
+      {"photo": "kevin-dog.jpg", "alt": "Kevin with his dog", "text": "Detroit based. I ran cross country and track at Hope, where I was an All-American, with personal bests of 16:34 in the 5k and 28:01 in the 8k. Running is where I learned that the boring consistent version of a thing beats the heroic version of it. That is how the systems above got built, an hour at a time, over 150 of them so far. The dog supervises."},
+      {"photo": "kevin-beach.jpg", "alt": "Kevin and his girlfriend on the Detroit River", "landscape": true, "text": "Outside of work I hike, cook, train, and travel whenever I can. The habit I am compounding hardest right now is using AI to build real solutions to real problems, which is less about the tools themselves and more about how much one person can actually fix once they stop waiting for someone else to build it."}
+    ],
+    "resume_note": "Available on request, tailored to the role",
+    "footnote": "Monte Lattice is where the systems live. Each one was built to solve something I was actually dealing with, and each one still runs."
+  },
   "projects": [
     {
       "name": "Document Automation Pipeline & Custom CRM",

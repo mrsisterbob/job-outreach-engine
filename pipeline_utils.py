@@ -8,6 +8,8 @@ it lives here for architectural cohesion with the rest of the outreach-resolutio
 is not covered by the no-network guarantee the rest of this module provides.
 """
 import hashlib
+import hmac
+import html
 import logging
 import os
 import re
@@ -2178,3 +2180,280 @@ AUTO_RETIRE_STATUSES = ("matched",)
 def may_auto_retire(status):
     """True when a dead link is sufficient grounds to move this row to Died without asking."""
     return str(status or "").strip().lower() in AUTO_RETIRE_STATUSES
+
+
+# ==============================================================================
+# PUBLIC DASHBOARD SHAPING (pure - no I/O)
+# ==============================================================================
+# main.build_public_dashboard() reads; these functions only arrange what it read. Every figure
+# the public Job Engine page shows passes through here, so the rules live in one place:
+#   - a count that could not be read is None, never 0 (a failed read must not look like "none")
+#   - a rate over an empty denominator is None, never 0.0%
+#   - the timeline starts at the first observed week, so an idle week reads as zero while weeks
+#     before the first event are not invented
+
+def week_start(day):
+    """Monday of the ISO week containing `day` (a date)."""
+    return day - timedelta(days=day.weekday())
+
+
+def weekly_volume_series(daily_rows, weeks, today):
+    """Bucket (YYYY-MM-DD, event_type, count) rows into the trailing `weeks` Monday-start weeks.
+
+    Returns [{"week": "YYYY-MM-DD", <event_type>: count, ...}] oldest first, one entry per week
+    from the first observed week (or the window start, whichever is later) to this week, every
+    event type zero-filled - a quiet week reads as zero, but no week before the first event is
+    invented. [] when there are no rows,
+    so an empty history renders as an empty state rather than a flat line of zeros.
+    """
+    rows = [r for r in (daily_rows or []) if r and r[0]]
+    if not rows:
+        return []
+    event_types = sorted({str(r[1]) for r in rows})
+    parsed = []
+    for r in rows:
+        try:
+            parsed.append(datetime.strptime(str(r[0])[:10], "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    if not parsed:
+        return []
+    first = week_start(min(parsed))
+    last = week_start(today)
+    starts = [s for s in (last - timedelta(weeks=i) for i in range(weeks - 1, -1, -1)) if s >= first]
+    buckets = {s: {e: 0 for e in event_types} for s in starts}
+    for day_str, event_type, count in rows:
+        try:
+            day = datetime.strptime(str(day_str)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        key = week_start(day)
+        if key in buckets:
+            buckets[key][str(event_type)] += int(count or 0)
+    return [dict({"week": s.isoformat()}, **buckets[s]) for s in starts]
+
+
+def funnel_rates(applications, replies, interviews, offers):
+    """Reply / interview / offer rates as percentages of applications, 1dp. None when a count is
+    missing or applications is zero - there is no rate to report, which is not the same as 0%."""
+    def pct(n):
+        if n is None or not applications:
+            return None
+        return round(100.0 * n / applications, 1)
+    return {"reply_rate_pct": pct(replies), "interview_rate_pct": pct(interviews),
+            "offer_rate_pct": pct(offers)}
+
+
+def shape_public_dashboard(raw):
+    """Arrange build_public_dashboard()'s raw readings into the public payload.
+
+    `raw` keys (any may be None when its read failed): roles_screened, listings_discovered,
+    crm (build_public_stats() dict or None), open_threads (list of inbound thread dicts),
+    dead_links (list of rows: retired at index 6, first_dead_at at index 7), median_fit,
+    scored_roles, tracks_total, tracks_used, documents_compiled, documents_since,
+    daily_volume (rows for weekly_volume_series), drafting (dict or None), today (date).
+    """
+    crm = raw.get("crm")
+    threads = raw.get("open_threads")
+    dead = raw.get("dead_links")
+    today = raw["today"]
+
+    live = None
+    if threads is not None:
+        # A rejection sits in the tray until it is acknowledged; it is not a live conversation.
+        live = sum(1 for t in threads if str(t.get("status_label") or "") != "REJECTION")
+
+    dead_block = None
+    if dead is not None:
+        week_ago = (today - timedelta(days=7)).isoformat()
+        dead_block = {
+            "detected": len(dead),
+            "retired": sum(1 for r in dead if r[6]),
+            "this_week": sum(1 for r in dead if r[7] and str(r[7])[:10] >= week_ago),
+        }
+
+    funnel = None
+    if crm:
+        funnel = dict(
+            {"replies": crm.get("replies"), "interviews": crm.get("interviews"),
+             "offers": crm.get("offers")},
+            **funnel_rates(crm.get("applications_logged"), crm.get("replies"),
+                           crm.get("interviews"), crm.get("offers")))
+
+    return {
+        "roles_screened": raw.get("roles_screened"),
+        "listings_discovered": raw.get("listings_discovered"),
+        "applications_sent": crm.get("applications_logged") if crm else None,
+        "days_running": crm.get("days_running") if crm else None,
+        "start_date": crm.get("start_date") if crm else None,
+        "live_conversations": live,
+        "dead_links": dead_block,
+        "median_fit_score": raw.get("median_fit"),
+        "scored_roles": raw.get("scored_roles"),
+        "tracks_total": raw.get("tracks_total"),
+        "tracks_used": raw.get("tracks_used"),
+        "documents_compiled": raw.get("documents_compiled"),
+        "documents_since": raw.get("documents_since"),
+        "timeline": weekly_volume_series(raw.get("daily_volume"), 12, today),
+        "drafting": raw.get("drafting"),
+        "funnel": funnel,
+        "as_of": today.isoformat(),
+    }
+
+
+# ==============================================================================
+# SITE VISITOR ANALYTICS (pure - no I/O)
+# ==============================================================================
+# montelattice.com forwards each pageview to the engine's /analytics/ingest; main.py hashes and
+# stores it. These functions decide what a visit IS and how the standup describes a day of them.
+# Privacy lives in what is stored, and nothing here ever returns an IP or a user agent:
+#   - visitor_id is an HMAC of ip|user-agent under a salt that exists for one day, in memory
+#     only, so ids group a day's pageviews and cannot be tied back to an address afterwards
+#   - the referrer is reduced to a bare host: a full referring URL can carry a message id or a
+#     search query, and the host ("linkedin.com") is the whole signal
+
+# Link unfurlers: a fetch by one of these means someone pasted the URL into that app. Counted
+# apart from crawlers because "LinkedInBot fetched the page" is itself a recruiter signal.
+LINK_PREVIEW_AGENTS = {
+    "linkedinbot": "LinkedIn", "facebookexternalhit": "Facebook", "slackbot": "Slack",
+    "twitterbot": "X", "discordbot": "Discord", "whatsapp": "WhatsApp", "telegrambot": "Telegram",
+    "skypeuripreview": "Skype", "microsoftpreview": "Teams/Outlook", "applebot": None,
+}
+HEALTH_AGENT_TOKENS = ("render/", "uptimerobot", "kube-probe", "pingdom", "statuscake",
+                       "healthcheck", "curl/", "wget/", "python-requests", "python-urllib",
+                       "go-http-client", "okhttp", "httpclient", "axios/", "node-fetch")
+CRAWLER_AGENT_TOKENS = ("googlebot", "bingbot", "duckduckbot", "yandex", "baiduspider", "slurp",
+                        "gptbot", "chatgpt-user", "claudebot", "anthropic-ai", "perplexitybot",
+                        "ccbot", "bytespider", "amazonbot", "ahrefsbot", "semrushbot", "mj12bot",
+                        "dotbot", "petalbot", "dataforseobot", "headlesschrome", "phantomjs",
+                        "lighthouse", "pagespeed", "applebot")
+_GENERIC_BOT = re.compile(r"(bot|crawler|spider|crawl|scraper)(?:[/ ;)+(-]|$)")
+
+
+def classify_visit(user_agent, ip, is_self, ignore_ips=()):
+    """What kind of pageview this is: None for a person, else 'self' / 'preview' / 'health' /
+    'crawler'. Checked in that order, so Kevin's own traffic never counts as a bot and a link
+    preview is never lost among crawlers. An empty user agent is a script, not a browser."""
+    if is_self or (ip and ip in set(ignore_ips or ())):
+        return "self"
+    ua = str(user_agent or "").strip().lower()
+    if not ua:
+        return "health"
+    for token, _app in LINK_PREVIEW_AGENTS.items():
+        if token in ua and token != "applebot":
+            return "preview"
+    if any(t in ua for t in HEALTH_AGENT_TOKENS):
+        return "health"
+    if any(t in ua for t in CRAWLER_AGENT_TOKENS) or _GENERIC_BOT.search(ua):
+        return "crawler"
+    return None
+
+
+def visit_bot_flag(user_agent, ip, is_self, ignore_ips=()):
+    """The stored bot column: None for a person, else classify_visit()'s kind, with the unfurling
+    app appended for previews ('preview:LinkedIn') so the standup can name who shared the link."""
+    kind = classify_visit(user_agent, ip, is_self, ignore_ips)
+    if kind != "preview":
+        return kind
+    ua = str(user_agent or "").lower()
+    app = next((a for token, a in LINK_PREVIEW_AGENTS.items() if a and token in ua), "")
+    return f"preview:{app}" if app else "preview"
+
+
+_HOST_OK = re.compile(r"^[a-z0-9.-]{1,253}$")
+_REFERRER_ALIASES = {"lnkd.in": "linkedin.com", "com.linkedin.android": "linkedin.com",
+                     "t.co": "x.com", "twitter.com": "x.com", "l.facebook.com": "facebook.com",
+                     "lm.facebook.com": "facebook.com", "m.facebook.com": "facebook.com"}
+
+
+def normalize_referrer_host(referrer, own_hosts=()):
+    """Bare external host of a Referer header, or '' for none / same-site / unparseable.
+    'https://www.linkedin.com/messaging/thread/2-abc/' -> 'linkedin.com'. The Android LinkedIn
+    app sends android-app://com.linkedin.android/, which maps to linkedin.com too."""
+    raw = str(referrer or "").strip()
+    if not raw:
+        return ""
+    try:
+        host = (urllib.parse.urlsplit(raw).hostname or "").lower()
+    except ValueError:
+        return ""
+    host = host[4:] if host.startswith("www.") else host
+    host = _REFERRER_ALIASES.get(host, host)
+    if not host or not _HOST_OK.match(host):
+        return ""
+    own = {h.lower().removeprefix("www.") for h in own_hosts or ()}
+    if host in own or any(host.endswith("." + h) for h in own):
+        return ""
+    return host
+
+
+# Hosts whose referral means someone in hiring is looking. They win ties in the standup line.
+JOB_MARKET_REFERRERS = ("linkedin.com", "indeed.com", "glassdoor.com", "greenhouse.io",
+                        "lever.co", "ashbyhq.com", "workday.com", "myworkdayjobs.com",
+                        "joinhandshake.com", "wellfound.com", "ziprecruiter.com")
+
+
+def is_job_market_referrer(host):
+    host = str(host or "").lower()
+    return any(host == h or host.endswith("." + h) for h in JOB_MARKET_REFERRERS)
+
+
+def daily_visitor_id(ip, user_agent, salt):
+    """16-hex HMAC-SHA256 of ip|user-agent under today's salt. Same visitor, same day -> same id;
+    without the salt (which is never stored) the id cannot be tied back to the address."""
+    msg = f"{ip or ''}|{user_agent or ''}".encode("utf-8")
+    return hmac.new(salt, msg, hashlib.sha256).hexdigest()[:16]
+
+
+def summarize_visits(rows):
+    """rows: (visitor_id, path, referrer, bot) for one window. Returns counts by DISTINCT visitor:
+    visitors, job_engine (visitors who opened /job-engine), referrers [(host, visitors)] most
+    first, bots {kind: pageviews}, previews {app: fetches} (a preview's bot flag is
+    'preview:<App>', see visit_bot_flag())."""
+    humans, job, by_ref = set(), set(), {}
+    bots, previews = {}, {}
+    for visitor_id, path, referrer, bot in rows or []:
+        if bot:
+            kind, _, app = str(bot).partition(":")
+            bots[kind] = bots.get(kind, 0) + 1
+            if kind == "preview" and app:
+                previews[app] = previews.get(app, 0) + 1
+            continue
+        humans.add(visitor_id)
+        if str(path or "").startswith("/job-engine"):
+            job.add(visitor_id)
+        if referrer:
+            by_ref.setdefault(referrer, set()).add(visitor_id)
+    referrers = sorted(((h, len(v)) for h, v in by_ref.items()),
+                       key=lambda x: (-x[1], not is_job_market_referrer(x[0]), x[0]))
+    return {"visitors": len(humans), "job_engine": len(job), "referrers": referrers,
+            "bots": bots, "previews": previews}
+
+
+def format_visitor_line(summary, site="montelattice.com"):
+    """The standup's one analytics line. Referrers lead - they are the signal; the raw count is
+    mostly noise at this volume. Always returns a line (a quiet day says so)."""
+    s = summary or {}
+    visitors = s.get("visitors", 0)
+    bots = sum((s.get("bots") or {}).values())
+    previews = s.get("previews") or {}
+    tail = []
+    if previews:
+        tail.append("link previews: " + ", ".join(
+            f"{html.escape(app)} ×{n}" for app, n in sorted(previews.items(), key=lambda x: -x[1])))
+    if bots:
+        tail.append(f"{bots} bot hit{'s' if bots != 1 else ''} filtered")
+    tail_str = (" · " + " · ".join(tail)) if tail else ""
+    if not visitors:
+        return f"🌐 {site}: quiet - no visitors in 24h{tail_str}"
+    refs = s.get("referrers") or []
+    if refs:
+        lead = "via " + ", ".join(
+            (f"<b>{html.escape(h)}</b>" if i == 0 else html.escape(h)) + f" ×{n}"
+            for i, (h, n) in enumerate(refs[:3]))
+    else:
+        lead = "no referred visits, all direct"
+    job = s.get("job_engine", 0)
+    job_str = f" · {job} → Job Engine" if job else ""
+    return (f"🌐 {site}: {lead} · {visitors} visitor{'s' if visitors != 1 else ''} (24h)"
+            f"{job_str}{tail_str}")

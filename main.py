@@ -1,6 +1,7 @@
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import hmac
 import html
 import io
 import json
@@ -25,7 +26,7 @@ import resume_engine
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from track_registry import (
     TRACK_PROMPT_LINE, TRACK_TRIGGER_GUIDANCE, normalize_track, pool_key_for,
-    allowed_outreach_template_ids, coerce_outreach_template_id, override_track_for_title,
+    allowed_outreach_template_ids, coerce_outreach_template_id, override_track_for_title, TRACKS,
 )
 from response_schema import GeminiJobScreenerResponse
 from command_help import lookup_command_help
@@ -42,7 +43,8 @@ from pipeline_utils import (
     is_guessed_contact_email, resolve_sent_email_backfill,
     sanitize_job_title, is_clean_job_title, classify_outreach_track,
     is_role_mailbox, is_automated_sender, inbound_sender_screen_reason, company_domain_of, name_from_email_local_part, parse_email_recipient,
-    match_email_to_crm_company,
+    match_email_to_crm_company, shape_public_dashboard,
+    daily_visitor_id, normalize_referrer_host, visit_bot_flag, summarize_visits, format_visitor_line,
     plan_carmen_ladder, carmen_reply_anchor, carmen_linkedin_anchor, CARMEN_LADDER_DAYS,
     CARMEN_LADDER_DAYS_COLD, CARMEN_LADDER_DAYS_ENGAGED, carmen_ladder_for,
     carmen_status_marker, carmen_marker_cell,
@@ -793,15 +795,35 @@ def get_db_conn():
     `with conn:` block still ends the transaction the same way, and the connection is closed
     in the finally.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    if getattr(_db_read_only, "active", False):
+        # Inside read_only_db(): SQLite itself refuses any write, so a public read path cannot
+        # mutate the pipeline even through a reused helper that happens to write.
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
+    else:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
-        conn.execute("PRAGMA journal_mode = WAL;")
+        if not getattr(_db_read_only, "active", False):
+            conn.execute("PRAGMA journal_mode = WAL;")  # setting it is a write; ro inherits the file's mode
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA busy_timeout = 5000;")
         with conn:
             yield conn
     finally:
         conn.close()
+
+_db_read_only = threading.local()
+
+
+@contextlib.contextmanager
+def read_only_db():
+    """Every get_db_conn() on this thread opens SQLite read-only (mode=ro) until the block exits.
+    Used by the public dashboard: a write attempted through any reader fails at the database."""
+    previous = getattr(_db_read_only, "active", False)
+    _db_read_only.active = True
+    try:
+        yield
+    finally:
+        _db_read_only.active = previous
 
 # Seed values for a brand-new search_filters table. Module-level (not inlined in init_db) so
 # restore_core_sourcing_filters() can put target_queries back if a restart ever leaves it blank.
@@ -1269,6 +1291,19 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_command_usage_cmd ON command_usage(command, used_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_command_usage_time ON command_usage(used_at)")
+        # montelattice.com pageviews, forwarded by the site (section 12). Deliberately minimal:
+        # no IP and no user agent ever reach this table - visitor_id is a daily-salted HMAC and
+        # referrer is a bare host. Pruned past ANALYTICS_RETENTION_DAYS, so it cannot grow unbounded.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS site_visits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            visited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            path TEXT,
+            visitor_id TEXT,
+            referrer TEXT,
+            bot TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_site_visits_time ON site_visits(visited_at)")
 
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -1641,6 +1676,12 @@ def add_company_cooldown(company_name):
     except Exception as e:
         logging.error(f"DB Cooldown Save Error ({clean}): {e}")
         return False
+
+# One row per résumé or cover-letter PDF actually delivered (/e, /eh, /cv, the letter PDF).
+# The /stage/<id>/pdf browser preview recompiles on every view and is deliberately NOT counted:
+# a page reload is not a document. Counting began when this event was added (2026-09-26), so
+# the public dashboard reports it "since" its first row rather than as a lifetime total.
+DOCUMENT_COMPILED_EVENT = "document_compiled"
 
 def log_metric_event(event_type, sheet_uuid=None, source=None):
     """Persist a pipeline metric event (e.g. message_sent, interview_set) to SQLite atomically.
@@ -5385,6 +5426,7 @@ def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_l
     try:
         pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
         if pdf_bytes:
+            log_metric_event(DOCUMENT_COMPILED_EVENT, source="resume")
             return pdf_bytes
         raise ValueError("compile_resume_pdf returned empty bytes")
     except Exception as e:
@@ -5392,6 +5434,7 @@ def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_l
         try:
             pdf_bytes = compile_resume_pdf(comp, track="a", bullet_indices=[0, 1, 2], tone_mode=tone_mode)
             if pdf_bytes:
+                log_metric_event(DOCUMENT_COMPILED_EVENT, source="resume")
                 return pdf_bytes
             raise ValueError("fallback compile_resume_pdf returned empty bytes")
         except Exception as e:
@@ -5460,6 +5503,7 @@ def send_cover_letter_pdf_async(chat_id, letter_text, comp, track, command_label
             pdf_bytes = compile_cover_letter_pdf(letter_text, comp)
             if not pdf_bytes:
                 raise ValueError("compile_cover_letter_pdf returned empty bytes")
+            log_metric_event(DOCUMENT_COMPILED_EVENT, source="cover_letter")
             caption = f"✉️ <b>Cover Letter: {html.escape(comp)}</b> · Track {html.escape(str(track).upper())}"
             send_telegram_document(
                 chat_id, pdf_bytes, cover_letter_pdf_filename(comp), caption, command_label
@@ -7892,6 +7936,12 @@ def send_tuesday_pipeline_executive_hub(chat_id):
         return
     send_overdue_digest(chat_id, overdue)
 
+def _standup_visitor_line():
+    """The site-visitor line plus its newline, or '' when analytics is off. The work is
+    site_visitor_standup_line() (section 12), which never raises."""
+    line = site_visitor_standup_line()
+    return f"{line}\n" if line else ""
+
 def send_daily_standup(chat_id):
     """Send the compact 08:30 standup used on every non-Tuesday morning."""
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -7916,7 +7966,8 @@ def send_daily_standup(chat_id):
         f"{lead}"
         f"🔥 <b>Active Streak:</b> {streak} days\n"
         f"🎯 <b>Today's Staged Goal:</b> {activity['drafts_staged']} / 5\n"
-        f"⚠️ <b>Overdue Actions:</b> {overdue_count}\n\n"
+        f"⚠️ <b>Overdue Actions:</b> {overdue_count}\n"
+        f"{_standup_visitor_line()}\n"
         f"📊 <a href='{brief_url}'>Full brief</a> · <code>/s</code> overdue · <code>/t</code> search"
     )
     # Job links that died since the last digest. Reported once each (notified flag), so a posting
@@ -12999,6 +13050,8 @@ def process_webhook_payload_async(data):
 
             try:
                 pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
+                if pdf_bytes:
+                    log_metric_event(DOCUMENT_COMPILED_EVENT, source="resume")
                 filename = resume_pdf_filename(comp)
 
                 caption_text = (
@@ -14217,6 +14270,7 @@ def build_public_stats(now=None):
         "applications_logged": applications_logged,
         "replies": replies,
         "interviews": interviews,
+        "offers": offer,
         "rejections": rejected,
         "still_sourcing": matched,
         "days_running": _public_stats_days_running(now),
@@ -14247,6 +14301,338 @@ def public_stats():
     with _public_stats_lock:
         _public_stats_cache["payload"] = payload
         _public_stats_cache["fetched_at"] = now
+    return jsonify(dict(payload, status="ok", cached=False)), 200
+
+
+# ==============================================================================
+# 12. SITE VISITOR ANALYTICS (private; surfaced only in the morning standup)
+# ==============================================================================
+# montelattice.com runs on a separate, disk-less service, so it cannot keep its own log. Its
+# before_request hook queues each pageview and a background thread POSTs batches here. This end
+# owns everything privacy-relevant:
+#
+#   - The raw IP and user agent arrive in the request body, are used in memory to classify the
+#     visit and derive visitor_id, and are never written anywhere.
+#   - visitor_id = HMAC(salt, ip|ua). The salt is random, held only in this process, and replaced
+#     when the local date changes; the previous day's is dropped. One gunicorn worker (see
+#     render.yaml) means one salt for the whole service. A restart mid-day draws a new salt, which
+#     can split one person into two "visitors" that day - the price of never persisting it.
+#   - No cookies, no third-party script, no external service. Nothing here is rendered publicly.
+#
+# Kevin's own traffic is flagged 'self' two ways: the site marks requests from a signed-in
+# Console session, and ANALYTICS_IGNORE_IPS lists his addresses (compared in memory, pre-hash).
+ANALYTICS_RETENTION_DAYS = int(os.environ.get("ANALYTICS_RETENTION_DAYS", "90"))
+ANALYTICS_PRUNE_EVERY_SECONDS = 3600
+ANALYTICS_MAX_BATCH = 200
+_visitor_salt = {"day": None, "salt": None}
+_visitor_salt_lock = threading.Lock()
+_analytics_last_prune = {"at": 0.0}
+
+
+def analytics_enabled():
+    """ANALYTICS_ENABLED (default true). Read per call, so flipping it needs no code change."""
+    return os.environ.get("ANALYTICS_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _analytics_own_hosts():
+    raw = os.environ.get("ANALYTICS_OWN_HOSTS", "montelattice.com,montelattice-site.onrender.com")
+    return [h.strip() for h in raw.split(",") if h.strip()]
+
+
+def _analytics_ignore_ips():
+    return [ip.strip() for ip in os.environ.get("ANALYTICS_IGNORE_IPS", "").split(",") if ip.strip()]
+
+
+def visitor_salt_for(day):
+    """Today's random salt. Asking for a new day replaces (and so forgets) the previous one."""
+    with _visitor_salt_lock:
+        if _visitor_salt["day"] != day:
+            _visitor_salt["day"] = day
+            _visitor_salt["salt"] = os.urandom(32)
+        return _visitor_salt["salt"]
+
+
+def _visit_timestamp(value):
+    """The site's UTC pageview time as 'YYYY-MM-DD HH:MM:SS' (CURRENT_TIMESTAMP's format), or None
+    to let SQLite stamp it."""
+    try:
+        return datetime.strptime(str(value or "")[:19], "%Y-%m-%dT%H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def record_site_visits(views, day=None):
+    """Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and
+    ua fields of each view are read here and dropped - only (visited_at, path, visitor_id,
+    referrer, bot) reach SQLite."""
+    day = day or datetime.now().date()
+    salt = visitor_salt_for(day)
+    own, ignore = _analytics_own_hosts(), _analytics_ignore_ips()
+    rows = []
+    for v in (views or [])[:ANALYTICS_MAX_BATCH]:
+        if not isinstance(v, dict):
+            continue
+        ip, ua = str(v.get("ip") or ""), str(v.get("ua") or "")
+        path = str(v.get("path") or "/").split("?", 1)[0][:200]
+        rows.append((
+            _visit_timestamp(v.get("ts")), path, daily_visitor_id(ip, ua, salt),
+            normalize_referrer_host(v.get("referrer"), own) or None,
+            visit_bot_flag(ua, ip, bool(v.get("self")), ignore),
+        ))
+    if not rows:
+        return 0
+    with get_db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany(
+            "INSERT INTO site_visits (visited_at, path, visitor_id, referrer, bot) "
+            "VALUES (COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)", rows)
+        conn.commit()
+    return len(rows)
+
+
+def prune_site_visits(retention_days=None):
+    """Delete pageviews older than the retention window. Returns rows removed."""
+    days = ANALYTICS_RETENTION_DAYS if retention_days is None else retention_days
+    with get_db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        removed = conn.execute(
+            "DELETE FROM site_visits WHERE visited_at < datetime('now', ?)", (f"-{int(days)} days",)
+        ).rowcount
+        conn.commit()
+    return removed
+
+
+def _maybe_prune_site_visits():
+    """Prune at most hourly, riding on ingest traffic - no scheduled job of its own."""
+    now = time.time()
+    if now - _analytics_last_prune["at"] < ANALYTICS_PRUNE_EVERY_SECONDS:
+        return
+    _analytics_last_prune["at"] = now
+    try:
+        prune_site_visits()
+    except Exception as e:
+        logging.error(f"[ANALYTICS] prune failed: {e}")
+
+
+@app.route("/analytics/ingest", methods=["POST"])
+def analytics_ingest():
+    """Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN."""
+    token = os.environ.get("ANALYTICS_INGEST_TOKEN", "")
+    supplied = request.headers.get("X-Analytics-Token", "")
+    if not token or not hmac.compare_digest(supplied.encode(), token.encode()):
+        return jsonify({"status": "forbidden"}), 403
+    if not analytics_enabled():
+        return jsonify({"status": "disabled", "stored": 0}), 200
+    data = request.get_json(silent=True) or {}
+    try:
+        stored = record_site_visits(data.get("views"))
+    except Exception as e:
+        logging.error(f"[ANALYTICS] ingest write failed: {e}")
+        return jsonify({"status": "error"}), 500
+    _maybe_prune_site_visits()
+    return jsonify({"status": "ok", "stored": stored}), 200
+
+
+def get_site_visit_rows(hours=24):
+    """READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises
+    on a read error - the standup turns that into an 'unavailable' line."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT visitor_id, path, referrer, bot FROM site_visits "
+            "WHERE visited_at >= datetime('now', ?)", (f"-{int(hours)} hours",)
+        ).fetchall()
+
+
+def site_visitor_standup_line():
+    """The standup's analytics line, or '' when analytics is switched off. Never raises: a failed
+    read becomes an honest 'unavailable' line, because the standup must send regardless."""
+    if not analytics_enabled():
+        return ""
+    try:
+        return format_visitor_line(summarize_visits(get_site_visit_rows(24)))
+    except Exception as e:
+        logging.error(f"[ANALYTICS] standup read failed: {e}")
+        return "🌐 montelattice.com: visitor log unavailable this morning"
+
+
+# ==============================================================================
+# 11b. PUBLIC DASHBOARD (read-only)
+# ==============================================================================
+# What montelattice.com/job-engine renders. Same contract as /public/stats above: aggregates
+# only, no row/company/person, and no number that was not read at request time. Two additions:
+#
+#   READ-ONLY BY CONSTRUCTION. Everything below runs inside read_only_db(), so each reused
+#   reader opens SQLite with mode=ro. A write attempted anywhere on this path fails at the
+#   database rather than depending on every helper happening not to write. The CRM is only
+#   read through crm_get (the funnel_stats GET action); nothing here posts.
+#
+#   A READ THAT FAILED IS None, NOT 0. The existing counters swallow errors into 0, which is
+#   right for a Telegram card and wrong for a public page, so the builder probes the database
+#   first and reports every SQLite-backed figure as None when the probe fails.
+#
+# Reply / interview / offer are left OUT of this payload unless PUBLIC_FUNNEL_STATS is true on
+# this service, because the page links the raw JSON. (The older /public/stats still carries
+# replies and interviews; it is unchanged here.)
+PUBLIC_DASHBOARD_TTL_SECONDS = int(os.environ.get("PUBLIC_DASHBOARD_TTL_SECONDS", "900"))
+# Timing is re-measured at most this often, so a public page cannot be used to burn CPU.
+DRAFTING_TIMING_TTL_SECONDS = int(os.environ.get("DRAFTING_TIMING_TTL_SECONDS", "3600"))
+_public_dashboard_cache = {"fetched_at": 0.0, "payload": None}
+_drafting_timing_cache = {"measured_at": 0.0, "result": None}
+_public_dashboard_lock = threading.Lock()
+
+
+def get_daily_metric_counts(event_types, days=90):
+    """READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the
+    public timeline. Raises on a read error - the caller reports the timeline as unavailable."""
+    marks = ",".join("?" for _ in event_types)
+    with get_db_conn() as conn:
+        return conn.execute(
+            f"SELECT date(timestamp), event_type, COUNT(*) FROM pipeline_metrics "
+            f"WHERE event_type IN ({marks}) AND timestamp >= datetime('now', ?) "
+            f"GROUP BY 1, 2 ORDER BY 1",
+            (*event_types, f"-{days} days"),
+        ).fetchall()
+
+
+def get_metric_first_seen(event_type):
+    """READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired."""
+    with get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT date(MIN(timestamp)) FROM pipeline_metrics WHERE event_type = ?", (event_type,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def get_cached_job_scoring():
+    """READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs
+    table only holds roles that cleared the screener, so this is the distribution of those."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT CAST(json_extract(job_json, '$.fit_score') AS REAL), "
+            "       json_extract(job_json, '$.track') "
+            "FROM jobs WHERE json_extract(job_json, '$.fit_score') IS NOT NULL"
+        ).fetchall()
+
+
+def get_latest_cached_job():
+    """READ-ONLY. The most recently cached job dict, or None."""
+    with get_db_conn() as conn:
+        row = conn.execute("SELECT job_json FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+    try:
+        return json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+
+
+def measure_drafting_time(runs=3):
+    """Time the real /e drafting path, match -> sendable draft, against the newest cached role:
+    resume PDF compile + cover letter render + cover letter PDF compile + email body render.
+
+    Calls the same functions stage_outreach_draft() and /letter use, minus their side effects:
+    no Gmail draft (that step is a network round-trip to Google, excluded and labelled so), no
+    Telegram send, no activity log. One warm-up pass is discarded - the first call in a process
+    pays Typst's import, which is not drafting time. Returns {"median_ms", "runs", "measured_at",
+    "steps"} or None when there is no cached role to time against.
+    """
+    job = get_latest_cached_job()
+    if not job:
+        return None
+    comp = job.get("employer_name") or "Target Company"
+    title = job.get("job_title") or "this role"
+    track = job.get("track", "a")
+    bullet_indices = job.get("bullet_indices")
+    tone_mode = job.get("tone_mode", "conservative")
+
+    def one_pass():
+        started = time.perf_counter()
+        compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
+        letter_text, _ = resolve_letter_for_job(job, {}, comp)
+        compile_cover_letter_pdf(letter_text, comp)
+        resolve_outreach_body(job, {}, title, comp, False)
+        return (time.perf_counter() - started) * 1000
+
+    one_pass()  # warm-up, discarded
+    timings = [one_pass() for _ in range(max(1, runs))]
+    return {
+        "median_ms": round(_median_or_none(timings), 1),
+        "runs": len(timings),
+        "measured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "steps": ["resume PDF", "cover letter PDF", "email body"],
+    }
+
+
+def _cached_drafting_timing():
+    now = time.time()
+    with _public_dashboard_lock:
+        cached = _drafting_timing_cache["result"]
+        if cached is not None and now - _drafting_timing_cache["measured_at"] < DRAFTING_TIMING_TTL_SECONDS:
+            return cached
+    try:
+        result = measure_drafting_time()
+    except Exception as e:
+        logging.error(f"Public dashboard: drafting timing failed: {e}")
+        return cached  # last good measurement (it carries its own measured_at), or None
+    if result is not None:
+        with _public_dashboard_lock:
+            _drafting_timing_cache["result"] = result
+            _drafting_timing_cache["measured_at"] = now
+    return result
+
+
+def build_public_dashboard(today=None):
+    """Read every public dashboard figure (read-only) and shape it. See section 11b's header."""
+    today = today or datetime.now(timezone.utc).date()
+    raw = {"today": today, "crm": build_public_stats(), "tracks_total": len(TRACKS)}
+    with read_only_db():
+        try:
+            with get_db_conn() as conn:
+                conn.execute("SELECT 1 FROM pipeline_metrics LIMIT 1").fetchall()
+            db_ok = True
+        except Exception as e:
+            logging.error(f"Public dashboard: database probe failed: {e}")
+            db_ok = False
+        if db_ok:
+            raw["roles_screened"] = get_metric_count("ai_screened")
+            raw["listings_discovered"] = get_metric_count("listing_discovered")
+            raw["documents_compiled"] = get_metric_count(DOCUMENT_COMPILED_EVENT)
+            raw["open_threads"] = get_open_inbound_threads(limit=100000)
+            raw["dead_links"] = get_dead_job_links(limit=100000)
+            try:
+                raw["documents_since"] = get_metric_first_seen(DOCUMENT_COMPILED_EVENT)
+                scoring = get_cached_job_scoring()
+                fits = [f for f, _ in scoring if f is not None]
+                raw["median_fit"] = _median_or_none(fits)
+                raw["scored_roles"] = len(fits)
+                raw["tracks_used"] = len({normalize_track(t) for _, t in scoring if t})
+                raw["daily_volume"] = get_daily_metric_counts(("listing_discovered", "ai_screened"))
+            except Exception as e:
+                logging.error(f"Public dashboard: read failed: {e}")
+            raw["drafting"] = _cached_drafting_timing()
+    payload = shape_public_dashboard(raw)
+    if not _public_funnel_stats():
+        payload["funnel"] = None  # the page links this JSON, so hiding must happen here too
+    return payload
+
+
+def _public_funnel_stats():
+    """PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer.
+    Set the same variable on the site service to show them on the page."""
+    return os.environ.get("PUBLIC_FUNNEL_STATS", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+@app.route("/public/dashboard", methods=["GET"])
+def public_dashboard():
+    """Public, unauthenticated, aggregate-only dashboard payload. Performs no writes."""
+    now = time.time()
+    with _public_dashboard_lock:
+        cached = _public_dashboard_cache["payload"]
+        fresh = cached is not None and (now - _public_dashboard_cache["fetched_at"]) < PUBLIC_DASHBOARD_TTL_SECONDS
+    if fresh:
+        return jsonify(dict(cached, status="ok", cached=True)), 200
+    payload = build_public_dashboard()
+    with _public_dashboard_lock:
+        _public_dashboard_cache["payload"] = payload
+        _public_dashboard_cache["fetched_at"] = now
     return jsonify(dict(payload, status="ok", cached=False)), 200
 
 

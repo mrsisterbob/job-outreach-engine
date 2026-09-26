@@ -2209,3 +2209,41 @@ def test_split_link_check_budget_never_starves_a_tab():
     assert pu.split_link_check_budget([22, 0, 0], 40) == [22, 0, 0]
     assert pu.split_link_check_budget([5, 5, 5], 0) == [0, 0, 0]
     assert sum(pu.split_link_check_budget([100, 100, 1], 40)) == 40
+
+
+# ==============================================================================
+# Public dashboard shaping
+# ==============================================================================
+
+def test_weekly_volume_series_starts_at_first_observed_week_and_zero_fills_after():
+    rows = [("2026-09-02", "ai_screened", 3), ("2026-09-20", "ai_screened", 2),
+            ("2026-09-21", "listing_discovered", 5)]
+    series = pu.weekly_volume_series(rows, 12, date(2026, 9, 26))
+    assert [w["week"] for w in series] == ["2026-08-31", "2026-09-07", "2026-09-14", "2026-09-21"]
+    assert series[1] == {"week": "2026-09-07", "ai_screened": 0, "listing_discovered": 0}
+    assert series[2]["ai_screened"] == 2  # Sunday 09-20 belongs to the week of Monday 09-14
+
+
+def test_weekly_volume_series_is_empty_without_rows():
+    assert pu.weekly_volume_series([], 12, date(2026, 9, 26)) == []
+
+
+def test_funnel_rates_are_none_without_applications():
+    assert pu.funnel_rates(0, 0, 0, 0) == {"reply_rate_pct": None, "interview_rate_pct": None,
+                                        "offer_rate_pct": None}
+    assert pu.funnel_rates(50, 2, 0, 0)["reply_rate_pct"] == 4.0
+
+
+def test_shape_public_dashboard_keeps_failed_reads_as_none():
+    shaped = pu.shape_public_dashboard({"today": date(2026, 9, 26)})
+    for key in ("roles_screened", "applications_sent", "live_conversations", "dead_links",
+                "median_fit_score", "drafting", "funnel"):
+        assert shaped[key] is None, key
+    assert shaped["timeline"] == []
+
+
+def test_shape_public_dashboard_counts_dead_links_this_week_and_retired():
+    today = date(2026, 9, 26)
+    dead = [(None,) * 6 + (1, "2026-09-25 08:00:00"), (None,) * 6 + (0, "2026-09-01 08:00:00")]
+    shaped = pu.shape_public_dashboard({"today": today, "dead_links": dead})
+    assert shaped["dead_links"] == {"detected": 2, "retired": 1, "this_week": 1}

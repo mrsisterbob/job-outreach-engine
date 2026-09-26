@@ -9963,3 +9963,372 @@ def test_standup_names_each_auto_retired_row_and_why(monkeypatch):
 
     assert "Slate - Automotive Logistics Ops Specialist (HTTP 404)" in sent[0]
     assert "u-slate" not in {r[0] for r in m.get_dead_job_links(include_notified=False)}
+
+
+# ==============================================================================
+# /public/dashboard - read-only, None-not-zero, and the document_compiled write path
+# ==============================================================================
+
+@pytest.fixture
+def dashboard_env(monkeypatch):
+    """Empty metric tables, cold caches, and a CRM that answers funnel_stats."""
+    with m.get_db_conn() as conn:
+        for table in ("pipeline_metrics", "inbound_threads", "application_outcomes"):
+            conn.execute(f"DELETE FROM {table}")
+        conn.commit()
+    for cache, keys in ((m._public_dashboard_cache, ("payload", "fetched_at")),
+                        (m._drafting_timing_cache, ("result", "measured_at"))):
+        cache[keys[0]] = None
+        cache[keys[1]] = 0.0
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL))
+    yield
+    m._public_dashboard_cache["payload"] = None
+    m._drafting_timing_cache["result"] = None
+
+
+def _db_fingerprint():
+    """Row count and max rowid of every table: any INSERT/UPDATE-by-replace/DELETE moves one."""
+    with m.get_db_conn() as conn:
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        return {t: conn.execute(f"SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM {t}").fetchone()
+                for t in tables}, conn.total_changes
+
+
+def test_read_only_db_makes_sqlite_refuse_writes(dashboard_env):
+    with m.read_only_db():
+        assert m.log_metric_event("ai_screened") is False  # the INSERT fails at the database
+    assert m.get_metric_count("ai_screened") == 0
+    assert m.log_metric_event("ai_screened") is True       # and the flag does not leak out
+    assert m.get_metric_count("ai_screened") == 1
+
+
+def test_public_dashboard_performs_zero_writes(dashboard_env, monkeypatch):
+    """Seeded with real rows (including a cached role, so the drafting timing actually runs),
+    the route must leave every table untouched and never post to the CRM or Telegram."""
+    for _ in range(3):
+        m.log_metric_event("ai_screened")
+    m.save_job_to_cache("dash1", dict(_CARD_JOB, track="a", bullet_indices=[0], fit_score=88,
+                                      tone_mode="conservative", outreach_template_id=0),
+                        sheet_uuid="uuid-dash-1")
+    def _forbidden(*a, **k):
+        raise AssertionError("public dashboard attempted an outbound write")
+    for name in ("crm_post", "send_telegram_message", "send_telegram_document", "create_gmail_draft",
+                 "record_application_outcome", "log_daily_activity"):
+        monkeypatch.setattr(m, name, _forbidden)
+    before, _ = _db_fingerprint()
+    with m.app.test_client() as client:
+        res = client.get("/public/dashboard")
+    after, _ = _db_fingerprint()
+    assert res.status_code == 200
+    assert before == after
+    body = res.get_json()
+    assert body["roles_screened"] == 3
+    assert body["drafting"]["median_ms"] > 0 and body["drafting"]["runs"] == 3
+
+
+def test_public_dashboard_empty_dataset_is_honest(dashboard_env):
+    """Nothing logged yet: counts are real zeros, but anything with no data behind it is None
+    or empty - never a fabricated median, timeline or timing."""
+    with m.app.test_client() as client:
+        body = client.get("/public/dashboard").get_json()
+    assert body["roles_screened"] == 0
+    assert body["documents_compiled"] == 0 and body["documents_since"] is None
+    assert body["median_fit_score"] is None and body["scored_roles"] == 0
+    assert body["timeline"] == []
+    assert body["drafting"] is None
+    assert body["dead_links"] == {"detected": 0, "retired": 0, "this_week": 0}
+    assert body["live_conversations"] == 0
+
+
+def test_public_dashboard_reports_none_not_zero_when_the_database_is_unreadable(dashboard_env, monkeypatch):
+    monkeypatch.setattr(m, "DB_PATH", os.path.join(os.path.dirname(_TMP_DB_PATH), "no_such_dir", "x.db"))
+    body = m.build_public_dashboard()
+    for key in ("roles_screened", "documents_compiled", "live_conversations", "dead_links",
+                "median_fit_score", "drafting"):
+        assert body[key] is None, key
+    assert body["applications_sent"] == 51  # the CRM half still reports
+
+
+def test_compiled_resume_is_counted_and_read_back_by_the_dashboard(dashboard_env):
+    """Write path: a real /e-style compile logs document_compiled, and the NEXT dashboard read
+    reports it with the date counting began."""
+    pdf = m.compile_resume_pdf_resilient(None, "Acme Capital", "a", [0], "/e")
+    assert pdf
+    body = m.build_public_dashboard()
+    assert body["documents_compiled"] == 1
+    assert body["documents_since"] == m.datetime.now(m.timezone.utc).strftime("%Y-%m-%d")
+
+
+def test_public_dashboard_live_conversations_exclude_rejections(dashboard_env):
+    with m.get_db_conn() as conn:
+        conn.executemany(
+            "INSERT INTO inbound_threads (thread_id, status_label, state) VALUES (?, ?, ?)",
+            [("t1", "GENERAL", "open"), ("t2", "INTERVIEW_SET", "open"),
+             ("t3", "REJECTION", "open"), ("t4", "GENERAL", "done")])
+        conn.commit()
+    assert m.build_public_dashboard()["live_conversations"] == 2
+
+
+def test_public_dashboard_omits_the_funnel_by_default(dashboard_env, monkeypatch):
+    monkeypatch.delenv("PUBLIC_FUNNEL_STATS", raising=False)
+    assert m.build_public_dashboard()["funnel"] is None
+
+
+def test_public_dashboard_funnel_carries_offers_and_rates(dashboard_env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_FUNNEL_STATS", "true")
+    funnel = m.build_public_dashboard()["funnel"]
+    assert funnel["offers"] == 1 and funnel["interviews"] == 6 and funnel["replies"] == 12
+    assert funnel["reply_rate_pct"] == round(100 * 12 / 51, 1)
+
+
+# ==============================================================================
+# Site visitor analytics - privacy, bots, retention, and what the NEXT standup reads back
+# ==============================================================================
+import hashlib as _hashlib
+import importlib.util as _importlib_util
+
+_ANALYTICS_TOKEN = "test-analytics-token"
+_HUMAN_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+# LinkedIn's in-app browser is a PERSON reading the page; only LinkedInBot is an unfurler.
+_LINKEDIN_APP_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 "
+                    "(KHTML, like Gecko) Mobile/15E148 [LinkedInApp]/9.30.1234")
+
+# Real user-agent strings, as the crawlers publish them.
+_BOT_AGENTS = [
+    ("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", "crawler"),
+    ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; "
+     "+http://www.google.com/bot.html) Chrome/128.0.0.0 Safari/537.36", "crawler"),
+    ("Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)", "crawler"),
+    ("DuckDuckBot/1.1; (+http://duckduckgo.com/duckduckbot.html)", "crawler"),
+    ("Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)", "crawler"),
+    ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; "
+     "+https://openai.com/gptbot)", "crawler"),
+    ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; "
+     "+claudebot@anthropic.com)", "crawler"),
+    ("Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)", "crawler"),
+    ("Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)", "crawler"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+     "Version/13.1.1 Safari/605.1.15 (Applebot/0.1; +http://www.apple.com/go/applebot)", "crawler"),
+    ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+     "HeadlessChrome/128.0.0.0 Safari/537.36", "crawler"),
+    ("LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)", "preview:LinkedIn"),
+    ("facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)", "preview:Facebook"),
+    ("Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)", "preview:Slack"),
+    ("Twitterbot/1.0", "preview:X"),
+    ("Render/1.0", "health"),
+    ("Mozilla/5.0+(compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)", "health"),
+    ("curl/8.7.1", "health"),
+    ("python-requests/2.32.3", "health"),
+    ("Go-http-client/2.0", "health"),
+    ("", "health"),
+]
+
+
+@pytest.fixture
+def analytics_env(monkeypatch):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM site_visits")
+        conn.commit()
+    monkeypatch.setenv("ANALYTICS_INGEST_TOKEN", _ANALYTICS_TOKEN)
+    monkeypatch.setenv("ANALYTICS_ENABLED", "true")
+    monkeypatch.delenv("ANALYTICS_IGNORE_IPS", raising=False)
+    m._visitor_salt.update(day=None, salt=None)
+    m._analytics_last_prune["at"] = 0.0
+    yield
+
+
+def _ingest(views, token=_ANALYTICS_TOKEN):
+    with m.app.test_client() as client:
+        return client.post("/analytics/ingest", json={"views": views},
+                           headers={"X-Analytics-Token": token})
+
+
+def _view(ip="203.0.113.7", ua=_HUMAN_UA, path="/", referrer="", is_self=False, ts=None):
+    v = {"ip": ip, "ua": ua, "path": path, "referrer": referrer, "self": is_self}
+    if ts:
+        v["ts"] = ts
+    return v
+
+
+def _stored_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute(
+            "SELECT id, visited_at, path, visitor_id, referrer, bot FROM site_visits ORDER BY id").fetchall()
+
+
+def _standup_text(monkeypatch):
+    """Drive the REAL send_daily_standup and return what it would post to Telegram."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    monkeypatch.setattr(m, "get_daily_activity", lambda d: {"drafts_staged": 0})
+    monkeypatch.setattr(m, "calculate_active_day_streak", lambda: 0)
+    monkeypatch.setattr(m, "get_overdue_followups", lambda: [])
+    monkeypatch.setattr(m, "get_dead_job_links", lambda **kw: [])
+    monkeypatch.setattr(m, "check_system_health", lambda: [])
+    monkeypatch.setattr(m, "scan_carmen_hot_conversations", lambda *a, **k: [])
+    m.send_daily_standup(1)
+    assert len(sent) == 1
+    return sent[0]
+
+
+def test_ingest_rejects_a_missing_or_wrong_token(analytics_env):
+    assert _ingest([_view()], token="wrong").status_code == 403
+    assert _stored_rows() == []
+
+
+def test_no_raw_ip_or_user_agent_is_ever_persisted(analytics_env):
+    ip = "203.0.113.7"
+    assert _ingest([_view(ip=ip, referrer="https://www.linkedin.com/messaging/thread/2-XYZ/")]).status_code == 200
+    (row,) = _stored_rows()
+    flat = " ".join(str(c) for c in row)
+    assert ip not in flat and "Chrome/128" not in flat and "2-XYZ" not in flat
+    visitor_id = row[3]
+    # Not any unsalted digest of the address...
+    for algo in ("md5", "sha1", "sha256"):
+        for msg in (ip, f"{ip}|{_HUMAN_UA}"):
+            assert not _hashlib.new(algo, msg.encode()).hexdigest().startswith(visitor_id)
+    # ...only reproducible WITH today's in-memory salt, and not with any other.
+    today = m.datetime.now().date()
+    assert visitor_id == m.daily_visitor_id(ip, _HUMAN_UA, m.visitor_salt_for(today))
+    assert visitor_id != m.daily_visitor_id(ip, _HUMAN_UA, b"\x00" * 32)
+    assert row[4] == "linkedin.com"  # a bare host, never the referring URL
+
+
+def test_salt_rotates_daily_and_forgets_yesterday(analytics_env):
+    day1, day2 = date(2026, 9, 25), date(2026, 9, 26)
+    m.record_site_visits([_view()], day=day1)
+    salt1 = m.visitor_salt_for(day1)
+    m.record_site_visits([_view()], day=day2)
+    ids = [r[3] for r in _stored_rows()]
+    assert ids[0] != ids[1]                        # same IP, different days, different ids
+    assert m.visitor_salt_for(day1) != salt1       # yesterday's salt is gone for good
+    m.record_site_visits([_view(), _view(path="/job-engine")], day=day2)
+    assert len({r[3] for r in _stored_rows()[2:]}) == 1  # but same-day pageviews group
+
+
+@pytest.mark.parametrize("ua,expected", _BOT_AGENTS)
+def test_real_crawler_agents_are_classified(ua, expected):
+    assert m.visit_bot_flag(ua, "198.51.100.1", False) == expected
+
+
+@pytest.mark.parametrize("ua", [
+    _HUMAN_UA, _LINKEDIN_APP_UA,
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.6 Mobile/15E148 Safari/604.1"])
+def test_real_browsers_are_people(ua):
+    assert m.visit_bot_flag(ua, "198.51.100.1", False) is None
+
+
+def test_bots_are_excluded_from_visitors_and_counted_separately(analytics_env, monkeypatch):
+    views = [_view(ip=f"198.51.100.{i}", ua=ua) for i, (ua, _) in enumerate(_BOT_AGENTS)]
+    views.append(_view(ip="192.0.2.10", ua=_HUMAN_UA, referrer="https://www.linkedin.com/feed/"))
+    assert _ingest(views).get_json()["stored"] == len(views)
+    line = _standup_text(monkeypatch).split("🌐", 1)[1].splitlines()[0]
+    assert "1 visitor (24h)" in line
+    assert f"{len(_BOT_AGENTS)} bot hits filtered" in line
+    assert "link previews: LinkedIn ×1" in line
+
+
+def test_kevin_is_self_by_console_session_or_ignore_list(analytics_env, monkeypatch):
+    monkeypatch.setenv("ANALYTICS_IGNORE_IPS", "192.0.2.99, 192.0.2.98")
+    _ingest([_view(ip="192.0.2.99"), _view(ip="192.0.2.50", is_self=True)])
+    assert [r[5] for r in _stored_rows()] == ["self", "self"]
+
+
+def test_rows_past_the_retention_window_are_pruned(analytics_env):
+    old = (m.datetime.now(m.timezone.utc) - m.timedelta(days=91)).strftime("%Y-%m-%dT%H:%M:%S")
+    fresh = (m.datetime.now(m.timezone.utc) - m.timedelta(days=89)).strftime("%Y-%m-%dT%H:%M:%S")
+    m.record_site_visits([_view(ts=old), _view(ts=fresh)])
+    assert len(_stored_rows()) == 2
+    _ingest([_view()])  # ingest itself prunes (at most hourly) - no separate job
+    stamps = [r[1] for r in _stored_rows()]
+    assert len(stamps) == 2 and all(s >= fresh.replace("T", " ") for s in stamps)
+
+
+def test_analytics_disabled_stores_nothing_and_drops_the_line(analytics_env, monkeypatch):
+    monkeypatch.setenv("ANALYTICS_ENABLED", "false")
+    res = _ingest([_view()])
+    assert res.status_code == 200 and res.get_json()["stored"] == 0
+    assert _stored_rows() == []
+    assert "🌐" not in _standup_text(monkeypatch)
+
+
+def test_standup_still_sends_when_the_analytics_read_fails(analytics_env, monkeypatch):
+    def _boom(*a, **k):
+        raise m.sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(m, "get_site_visit_rows", _boom)
+    msg = _standup_text(monkeypatch)
+    assert "Daily Standup" in msg and "Active Streak" in msg
+    assert "visitor log unavailable this morning" in msg
+
+
+def test_quiet_day_renders_an_honest_line(analytics_env, monkeypatch):
+    assert "🌐 montelattice.com: quiet - no visitors in 24h" in _standup_text(monkeypatch)
+
+
+def test_ingested_visits_are_what_the_next_standup_reads_back(analytics_env, monkeypatch):
+    """Write path, engine side: real ingest requests -> SQLite -> the real standup render."""
+    _ingest([
+        _view(ip="192.0.2.1", referrer="https://www.linkedin.com/in/someone/"),
+        _view(ip="192.0.2.1", path="/job-engine", referrer="https://montelattice.com/"),
+        _view(ip="192.0.2.2", referrer="android-app://com.linkedin.android/"),
+        _view(ip="192.0.2.3", path="/job-engine", referrer="https://www.google.com/"),
+        _view(ip="192.0.2.4"),
+        _view(ip="66.249.66.1", ua=_BOT_AGENTS[0][0]),
+    ])
+    msg = _standup_text(monkeypatch)
+    assert ("🌐 montelattice.com: via <b>linkedin.com</b> ×2, google.com ×1 · 4 visitors (24h)"
+            " · 2 → Job Engine · 1 bot hit filtered") in msg
+    assert msg.index("Overdue Actions") < msg.index("🌐") < msg.index("Full brief")
+
+
+_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "montelattice-site")
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.join(_SITE_DIR, "visits.py")),
+                    reason="montelattice-site checkout not beside this repo")
+def test_site_pageviews_reach_the_standup_end_to_end(analytics_env, monkeypatch):
+    """Write path across both services: real GETs through the SITE's Flask app and its
+    before_request hook, the forwarder's real batch, the ENGINE's real ingest route, then the
+    real standup render. Only the network hop is replaced by calling the engine's test client."""
+    site_dir = os.path.abspath(_SITE_DIR)
+    monkeypatch.syspath_prepend(site_dir)
+    monkeypatch.setenv("EVIDENCE_BANK_SOURCE",
+                       os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json"))
+    spec = _importlib_util.spec_from_file_location("montelattice_site_main", os.path.join(site_dir, "main.py"))
+    site = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(site)
+    import jobstats  # the site's modules, via the prepended path
+    import visits
+    monkeypatch.setattr(jobstats, "fetch", lambda: None)          # page content is not under test
+    monkeypatch.setattr(visits, "_ensure_worker", lambda: None)   # drained by hand below
+
+    browser = site.app.test_client()
+    browser.get("/", headers={"User-Agent": _HUMAN_UA, "X-Forwarded-For": "192.0.2.21",
+                              "Referer": "https://www.linkedin.com/messaging/thread/2-abc/"})
+    browser.get("/job-engine", headers={"User-Agent": _HUMAN_UA, "X-Forwarded-For": "192.0.2.21",
+                                        "Referer": "https://montelattice.com/"})
+    browser.get("/", headers={"User-Agent": _BOT_AGENTS[0][0], "X-Forwarded-For": "66.249.66.1"})
+    browser.get("/static/css/tokens.css", headers={"User-Agent": _HUMAN_UA})  # not a pageview
+
+    batch = visits.drain(wait=0.1)
+    assert len(batch) == 3
+    assert _ingest(batch).get_json()["stored"] == 3
+    msg = _standup_text(monkeypatch)
+    assert ("🌐 montelattice.com: via <b>linkedin.com</b> ×1 · 1 visitor (24h) · 1 → Job Engine"
+            " · 1 bot hit filtered") in msg
+
+
+def test_main_opens_no_bare_connections_to_the_live_database():
+    """Every live-DB connection goes through get_db_conn(). The only other sqlite3.connect calls
+    are the backup routine's, which open the BACKUP file and close it in a finally."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), encoding="utf-8").read()
+    callers = []
+    for match in re.finditer(r"sqlite3\.connect\(([^)]*)\)", src):
+        fn = re.findall(r"^def (\w+)", src[:match.start()], re.M)[-1]
+        callers.append((fn, match.group(1).split(",")[0].strip()))
+    live = [(fn, arg) for fn, arg in callers if "DB_PATH" in arg]
+    assert {fn for fn, _ in live} == {"get_db_conn"}, callers
+    assert all(arg == "dest_path" for fn, arg in callers if fn != "get_db_conn"), callers
