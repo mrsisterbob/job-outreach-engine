@@ -76,7 +76,8 @@ RESUME_BULLETS_BANK_PATH = os.path.join(BASE_DIR, "resume_bullets_bank.json")
 _FALLBACK_EVIDENCE_BANK = {
     "identity": {
         "name": "Kevin Miller", "email": "kjmiller406@gmail.com", "phone": "248-709-6326",
-        "location": "Detroit, MI", "website": "montelattice.com", "linkedin": "linkedin.com/in/kevinmiller"
+        "location": "Detroit, MI", "website": "montelattice.com",
+        "linkedin": "www.linkedin.com/in/kevin-miller-7386a6252/"
     },
     "experience": [], "education": [], "technical_skills": [], "banned_words": []
 }
@@ -434,7 +435,10 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     phone = escape_typst(identity.get("phone", ""))
     location = escape_typst(identity.get("location", ""))
     website_raw = str(identity.get("website", "") or "")
-    linkedin_raw = str(identity.get("linkedin", "linkedin.com/in/kevinmiller") or "")
+    # Fallback is "" on purpose: a missing identity.linkedin drops the link entirely rather
+    # than shipping a WRONG profile URL to an employer. A hardcoded default here pointed at
+    # linkedin.com/in/kevinmiller - not Kevin's profile - on every resume the bank failed to load.
+    linkedin_raw = str(identity.get("linkedin", "") or "")
     github_raw = str(identity.get("github", "") or "")
     website_label = escape_typst(website_raw)
 

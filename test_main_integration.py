@@ -9227,6 +9227,39 @@ def test_tagged_bullet_renders_under_its_own_employer():
     assert blocks["Signal Advisors"], "Signal Advisors rendered as a bare heading"
 
 
+def test_rendered_documents_link_kevins_real_linkedin_profile():
+    """Every shipped document must link the REAL profile, not a hardcoded wrong one.
+
+    identity.linkedin held "linkedin.com/in/kevinmiller" - which is NOT Kevin's profile - and
+    resume_engine carried the same string as a hardcoded fallback in TWO places (the default
+    identity dict and the .get() default). So roughly 50 applications shipped a resume and cover
+    letter whose LinkedIn link went somewhere else entirely, and nothing failed.
+
+    Drives the real render path for both document types rather than asserting on the bank value,
+    because the bug lived in the RENDERER's fallbacks, not in the data - a test that only read
+    evidence_bank.json would have passed the whole time the wrong link was going out.
+    """
+    real_profile = "kevin-miller-7386a6252"
+    wrong_profile = "linkedin.com/in/kevinmiller"
+
+    resume = resume_engine.render_typst_markup("Altarum", "d", [0, 1, 2], "tech")
+    letter = resume_engine.render_cover_letter_markup("Dear Team,\n\nBody paragraph.", "Altarum")
+
+    for label, markup in (("resume", resume), ("cover letter", letter)):
+        assert real_profile in markup, f"{label} does not link Kevin's real LinkedIn profile"
+        assert wrong_profile not in markup, f"{label} still links the wrong LinkedIn profile"
+        # The renderer prepends https://, so a scheme in the bank value yields https://https://...
+        assert "https://https://" not in markup, f"{label} double-prefixed the LinkedIn scheme"
+
+    # The fallback bank is what renders when evidence_bank.json is missing or corrupt. It must
+    # never carry a wrong profile either - a silent fallback to someone else's URL is worse than
+    # no link at all.
+    fallback_linkedin = str(
+        resume_engine._FALLBACK_EVIDENCE_BANK["identity"].get("linkedin", "")
+    )
+    assert wrong_profile not in fallback_linkedin, "fallback identity holds the wrong profile"
+
+
 def test_untagged_bullet_still_renders_under_job_zero():
     """110 of the 120 entries are bare strings and must be completely unaffected."""
     bank = resume_engine.load_resume_bullets_bank()
