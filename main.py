@@ -112,6 +112,10 @@ JSEARCH_PAGES_PER_RUN = 2
 JSEARCH_SEMAPHORE = threading.Semaphore(2)
 # 100-Query Rolling Master Engine: one oddball theme per 10-query slice, used to badge wildcard matches
 ODDBALL_KEYWORDS = ["supply chain", "revenue operations", "healthcare", "implementation", "erp", "logistics", "claims", "manufacturing", "cloud operations", "procurement", "transformation"]
+# Score points a wildcard match earns on top of its badge. A Layer 2 bonus like alumni/warm, so it
+# rides in total_boost and is trimmed by BONUS_STACK_CAP with the rest. Floored at 0: the cap
+# accounting treats every non-ghost entry in total_boost as a positive.
+WILDCARD_BONUS = max(0, int(os.environ.get("WILDCARD_BONUS", "2")))
 
 # Stacking cap for ALL additive score modifiers combined - Layer 1 (calculate_hybrid_score_modifier
 # keyword/salary bonuses) plus Layer 2 (process_single_candidate alumni/warm/Clavicular boosts) -
@@ -4990,7 +4994,8 @@ def process_single_candidate(job, force=False):
 
         # Oddball Wildcard Badge: flags roles matching the rolling query bank's oddball keyword themes
         oddball_text = f"{job_title.lower()} {str(job.get('job_description') or '')[:300].lower()}"
-        if any(kw in oddball_text for kw in ODDBALL_KEYWORDS):
+        is_wildcard = any(kw in oddball_text for kw in ODDBALL_KEYWORDS)
+        if is_wildcard:
             age_badge = f"{age_badge} 🎲 [WILDCARD ROLE]"
 
         # Forced cards are Kevin's call over the screener's, and the card must say so.
@@ -4998,7 +5003,7 @@ def process_single_candidate(job, force=False):
             age_badge = f"{age_badge} 🚩 [FORCED - AI SAID NO]"
 
         # Running total of the Layer 2 points added/subtracted below (ghost penalty, alumni, warm/
-        # Clavicular). Consumed two ways after the walk: (1) folded into the BONUS_STACK_CAP check
+        # Clavicular, wildcard). Consumed two ways after the walk: (1) folded into the BONUS_STACK_CAP check
         # alongside Layer 1's bonus, (2) recomputed into the card's (+N) so it shows the capped
         # relationship delta, not the raw stacked sum. Layer 1's own bonus is NOT in here - it
         # rides in via layer1_bonus from evaluate_job_with_gemini.
@@ -5073,6 +5078,12 @@ def process_single_candidate(job, force=False):
                     f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
                 )
 
+        # Wildcard bonus: applied after the warm/Clavicular walk so the Clavicular raw-score gate
+        # (>= 70) sees the same number it always did - +2 is a tie-breaker, not a route into +30.
+        if is_wildcard and WILDCARD_BONUS:
+            score = min(100, score + WILDCARD_BONUS)
+            total_boost += WILDCARD_BONUS
+
         # ---- Combined bonus stacking cap (Layer 1 + Layer 2) ----
         # score was walked up incrementally above so the Clavicular raw-score gate (>= 70) and the
         # per-step min(100, ...) clamps still saw the values they always did. Now recompute the
@@ -5083,7 +5094,7 @@ def process_single_candidate(job, force=False):
         # per-step ceiling: bonuses can't push past 100 before a penalty bites into that headroom.
         ghost_pen = min(0, penalty)                     # ghost-listing dock (<= 0), already in total_boost
         l1_pos, l1_neg = max(0, layer1_bonus), min(0, layer1_bonus)
-        l2_pos = total_boost - ghost_pen                # alumni + warm/Clavicular only (>= 0)
+        l2_pos = total_boost - ghost_pen                # alumni + warm/Clavicular + wildcard (>= 0)
         capped_pos = min(BONUS_STACK_CAP, l1_pos + l2_pos)
         score = max(1, min(100, min(100, gemini_base + capped_pos) + l1_neg + ghost_pen))
         # Baseline the card's "(+N)" reconstructs to: Gemini + Layer 1 alone, Layer 1's positive

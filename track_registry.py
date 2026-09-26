@@ -272,6 +272,15 @@ _TITLE_TRACK_PATTERNS = (
     # Kevin's screener forbids recruiting roles anyway.
     (r"\b(?:supply[ -]?chain|procurement|plant|manufacturing|manufactur\w*|warehouse)\b", "g"),
     (r"(?<!talent )(?<!technical )\bstrategic sourcing\b|(?<!talent )\bsourcing\b(?! specialist)", "g"),
+    # Automation / internal-systems work -> h, the "operations person who automates his own work"
+    # framing. Sits BEFORE d on purpose: "RPA Analyst" and "Automation & Reporting Analyst" are h,
+    # not d. Engineer-titled reqs never get here as a win - they are scored 1-24 regardless.
+    (r"\b(?:rpa|automation|systems admin\w*|integration\w*|workflow|low[- ]?code|power automate|internal tool\w*)\b", "h"),
+    # BI / reporting analysis -> d.
+    (r"\b(?:business intelligence|analytics|power bi|reporting analyst|data analyst)\b", "d"),
+    # No rule selects b (Data & Systems Engineering). An etl/pipeline/data-engineer pattern would
+    # push engineer-titled reqs onto an engineering-framed resume, which is exactly what the 1-24
+    # title rule in the screener prompt forbids. b stays reachable only from Gemini reading the JD.
 )
 
 _TITLE_TRACK_RULES = tuple(

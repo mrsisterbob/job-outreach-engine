@@ -3888,7 +3888,7 @@ def run_candidate(monkeypatch):
 
     monkeypatch.setattr(m, "evaluate_job_with_gemini", fake_eval)
 
-    def run(gemini_base, layer1_bonus, job_id="jsearch_1"):
+    def run(gemini_base, layer1_bonus, job_id="jsearch_1", **job_overrides):
         state.update(
             score=max(1, min(100, gemini_base + layer1_bonus)),
             layer1_bonus=layer1_bonus,
@@ -3898,6 +3898,7 @@ def run_candidate(monkeypatch):
             "job_title": "Operations Analyst", "employer_name": "Acme Co",
             "job_id": job_id, "job_description": "ops role", "job_city": "Detroit",
         }
+        job.update(job_overrides)
         return m.process_single_candidate(job)
 
     return run
@@ -3950,6 +3951,51 @@ def test_ghost_penalty_still_bites_when_layer1_bonus_is_large(run_candidate, mon
     # positives cap to 30 -> clamp(80+30)=100, then ghost -15 -> 85
     assert result["score"] == 85
     assert result["score_boost"] == -15
+
+
+def test_wildcard_role_earns_exactly_the_wildcard_bonus_through_total_boost(run_candidate):
+    """ODDBALL_KEYWORDS used to only badge the card. A match now also earns WILDCARD_BONUS (+2),
+    and it must ride in total_boost so the card's (+N) shows it and the stacking cap sees it."""
+    assert m.WILDCARD_BONUS == 2
+    plain = run_candidate(gemini_base=60, layer1_bonus=10)
+    assert plain["score"] == 70 and plain["score_boost"] == 0
+    assert "WILDCARD" not in plain["age_badge"]
+
+    wild = run_candidate(gemini_base=60, layer1_bonus=10, job_title="Supply Chain Operations Analyst")
+    assert wild["score"] == 72
+    assert wild["score_boost"] == 2
+    assert "🎲 [WILDCARD ROLE]" in wild["age_badge"]      # badge unchanged
+
+
+def test_wildcard_bonus_is_trimmed_by_the_stacking_cap(run_candidate, monkeypatch):
+    """Layer 1 already at the cap (+30): the wildcard +2 has no headroom and must not leak past
+    BONUS_STACK_CAP. With an alum (+20) on top, alum + wildcard together still cap at +30."""
+    at_cap = run_candidate(gemini_base=55, layer1_bonus=30, job_description="logistics ops role")
+    assert at_cap["score"] == 55 + m.BONUS_STACK_CAP
+    assert at_cap["score_boost"] == 0
+
+    monkeypatch.setattr(
+        m, "resolve_live_alumni_at_company",
+        lambda *a, **k: {"name": "Dana Reyes", "linkedin_url": "https://linkedin.com/in/dana",
+                         "headline": "Ops Lead"},
+    )
+    stacked = run_candidate(gemini_base=50, layer1_bonus=10, job_description="logistics ops role")
+    # l1 10 + alum 20 + wildcard 2 = 32 -> capped to 30
+    assert stacked["score"] == 50 + m.BONUS_STACK_CAP
+    assert stacked["score_boost"] == 20
+
+
+def test_wildcard_bonus_does_not_open_the_clavicular_gate(run_candidate, monkeypatch):
+    """Clavicular's +30 is gated at raw score >= 70. A 68 wildcard must not be lifted to 70 first."""
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Sam", "raw_company": "Acme Co", "note": "n", "priority_score": 10}},
+    )
+    result = run_candidate(gemini_base=68, layer1_bonus=0, job_id="gh_1",
+                           job_description="logistics ops role")
+    assert result["is_clavicular"] is False
+    assert result["score"] == 70 and result["score_boost"] == 2
 
 
 # ---- Carmen Cold as the hot seat: inbound-reply routing (route_inbound_reply_to_crm) ----
@@ -8928,6 +8974,173 @@ def test_screener_response_accepts_every_registry_track():
     # Whatever comes back must resolve to a real pool - that is the whole contract.
     for value in ("a", "h", "F ", "zzz", None, 7):
         assert track_registry.pool_key_for(Screener(score=70, track=value).track)
+
+
+def test_title_override_routes_automation_to_h_and_bi_to_d():
+    ov = track_registry.override_track_for_title
+    assert ov("a", "RPA Analyst") == "h"
+    assert ov("a", "Business Data Analyst") == "d"
+    # h is checked before d: automation work with a reporting title word is still h.
+    assert ov("a", "Automation & Analytics Analyst") == "h"
+    # The existing f/g rules are unchanged.
+    assert ov("a", "Carrier Operations Analyst") == "f"
+    assert ov("a", "Supply Chain Analyst") == "g"
+    # f/g/h are already non-finance and never overridden.
+    assert ov("f", "RPA Analyst") == "f"
+    assert ov("h", "Data Analyst") == "h"
+    # Both finance guards veto the override.
+    assert ov("a", "Data Analyst", employer="Flagstar Bank") == "a"
+    assert ov("a", "Data Analyst", tone_mode="conservative") == "a"
+
+
+def test_no_title_rule_routes_to_the_engineering_track_b():
+    """Track b is engineering-framed. No title may select it - see the 1-24 rule in the prompt."""
+    assert "b" not in {letter for _, letter in track_registry._TITLE_TRACK_RULES}
+    for title in ("Data Engineer", "ETL Developer", "Data Pipeline Engineer"):
+        assert track_registry.override_track_for_title("a", title) != "b", title
+
+
+def test_evaluate_job_with_gemini_returns_the_title_overridden_track(monkeypatch):
+    """Drive the real choke point: Gemini says track a for an RPA Analyst at a non-finance
+    employer; the tuple process_single_candidate persists must carry h."""
+    monkeypatch.setattr(m, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: default if default is not None else [])
+    monkeypatch.setattr(m, "call_gemini_api", lambda *a, **k: json.dumps(
+        {"score": 75, "reason": "fit", "track": "a", "tone_mode": "tech",
+         "bullet_indices": [0, 1, 2], "linkedin_template_id": 0, "outreach_template_id": 0}))
+    result = m.evaluate_job_with_gemini({"job_title": "RPA Analyst", "employer_name": "Acme Manufacturing",
+                                         "job_description": "Automate back-office workflows.",
+                                         "job_city": "Detroit"})
+    assert result[3] == "h"
+
+
+# Every job title in Tetiana Cold + Tetiana Warm on 2026-09-26, with the track
+# override_track_for_title("a", title) returned the day the h and d title rules landed. Frozen on
+# purpose: this catches drift in the title rules, it does not re-derive them. If a rule change moves
+# one of these, the diff should be a decision, not a surprise. Distribution at freeze:
+# a=58, d=7, f=4, g=7, h=3 (before the h/d rules: a=68, f=4, g=7).
+_LIVE_CRM_TITLE_TRACKS = (
+    ('Business Technology Analyst - Data Automation and AI', 'h'),
+    ('Client Service & Operations Associate', 'a'),
+    ('Admin Specialist Tax & Consulting', 'a'),
+    ('Customer Support Specialist', 'a'),
+    ('Billing Operations Analyst', 'a'),
+    ('Services Operations Specialist', 'a'),
+    ('Annuity Processing Specialist', 'a'),
+    ('Analyst', 'a'),
+    ('Revenue Cycle Analytics Process Improvement', 'd'),
+    ('Operations Analyst', 'a'),
+    ('MP&L MMP Business Process Analyst', 'a'),
+    ('Application Systems Analyst', 'a'),
+    ('Wealth Operations & Compliance Associate', 'a'),
+    ('Financial Analyst', 'a'),
+    ('IT Business Systems Analyst', 'a'),
+    ('Client Services Associate', 'a'),
+    ('Data Analyst Growth Marketing', 'd'),
+    ('Wealth Management Client Service Associate', 'a'),
+    ('EHR Clinical Analyst', 'a'),
+    ('Wealth Management Client Associate', 'a'),
+    ('Marketing Operations', 'a'),
+    ('Operations Support Analyst', 'a'),
+    ('Associate Operations Business Analyst - Surety', 'a'),
+    ('Entry Level Client Onboarding Specialist', 'a'),
+    ('Business Operations Specialist', 'a'),
+    ('Regional Partner Operations Analyst', 'a'),
+    ('Life Insurance Specialist', 'a'),
+    ('Client Onboarding and Operations Specialist', 'a'),
+    ('EFM - Analyst Accounting Operations', 'a'),
+    ('Core Business Analyst', 'a'),
+    ('Hybrid Operations & Analytics Associate', 'd'),
+    ('Jr. Operations Specialist - IRA', 'a'),
+    ('Service Operations Specialist', 'a'),
+    ('Revenue Operations Systems Administrator', 'h'),
+    ('Client Service Associate - Wealth Management', 'a'),
+    ('Wealth Advisor Assistant', 'a'),
+    ('Supply Chain Analyst - Data-Driven Optimization', 'g'),
+    ('Foreign Trade Intern', 'a'),
+    ('Global Trade Data Lt Intern', 'a'),
+    ('Financial Analyst (Hybrid)', 'a'),
+    ('Payments Implementation Specialist', 'a'),
+    ('Operations Compliance Analyst', 'a'),
+    ('Data Analyst', 'd'),
+    ('Operations Specialist - Real Estate', 'a'),
+    ('Consultant - Business Analyst', 'a'),
+    ('Sea Logistics Revenue Specialist 1', 'f'),
+    ('Product & Partnership Operations Specialist', 'a'),
+    ('Finance & Functional Analyst', 'a'),
+    ('Workforce Analyst', 'a'),
+    ('Human Resources Information System Analyst', 'a'),
+    ('IT Operations Analyst', 'a'),
+    ('Systems Business Analyst - Supply Chain Co-Op 2026', 'g'),
+    ('Customs Compliance Analyst', 'a'),
+    ('Electronic Data Interchange Coordinator', 'a'),
+    ('Supply Chain Analyst', 'g'),
+    ('PC Renewal Operations Analyst', 'a'),
+    ('Value Stream Mapping Operations Analyst', 'a'),
+    ('Senior Portfolio Analyst', 'a'),
+    ('Carrier Operations Analyst', 'f'),
+    ('Business Systems Analyst', 'a'),
+    ('Client Relationship Assistant', 'a'),
+    ('Treasure Analyst', 'a'),
+    ('Business Efficiency Continuous Improvement Associate Consultant', 'a'),
+    ('Remote Data Analyst - Revenue Ops', 'd'),
+    ('Baseball Analytics Associate', 'd'),
+    ('Change Control Analyst', 'a'),
+    ('NASCO/FACETS Systems Business Analyst', 'a'),
+    ('Business Data Analyst', 'd'),
+    ('Logistics Operations Specialist', 'f'),
+    ('Strategic Sourcing Analyst - Capital', 'g'),
+    ('RPA Analyst', 'h'),
+    ('Strategic Sourcing Analyst: Data Insight & Contracts', 'g'),
+    ('US E-Consulting Services - Retirement and Wealth Provider Solutions Analyst', 'a'),
+    ('Supply Chain Inventory Analyst', 'g'),
+    ('Supply Chain Operations Analyst', 'g'),
+    ('Business Systems Analyst Patent Office', 'a'),
+    ('Junior Business Systems Analyst: IT & Process Improvement', 'a'),
+    ('Operations Specialist: On-Time Production', 'a'),
+    ('Automotive Logistics Ops Specialist', 'f'),
+)
+
+
+def test_live_crm_titles_route_to_their_frozen_tracks():
+    assert len(_LIVE_CRM_TITLE_TRACKS) == 79
+    drift = [(title, expected, track_registry.override_track_for_title("a", title))
+             for title, expected in _LIVE_CRM_TITLE_TRACKS
+             if track_registry.override_track_for_title("a", title) != expected]
+    assert drift == [], f"title routing drifted (title, frozen, now): {drift}"
+
+
+def test_engineer_titles_never_route_to_track_b():
+    """Track b is engineering-framed; Kevin is an operations person who builds his own tools. The
+    screener scores these titles 1-24, and no title rule may hand one an engineering resume -
+    from any starting track, under either tone."""
+    for title in ("Data Engineer", "Software Engineer", "Salesforce Developer", "DevOps Engineer",
+                  "Solutions Architect", "ETL Developer", "Data Pipeline Engineer"):
+        for start in track_registry.TRACK_LETTERS:
+            for tone in ("tech", "conservative", None):
+                routed = track_registry.override_track_for_title(start, title, tone_mode=tone)
+                assert routed == start or routed != "b", (title, start, tone, routed)
+
+
+def test_every_track_lands_in_both_the_bullet_and_cover_letter_banks():
+    """A track must not half-land: its pool key needs real content in BOTH banks. Read from disk
+    rather than through the loaders, whose fallbacks would hide a missing pool."""
+    root = os.path.dirname(os.path.abspath(m.__file__))
+    with open(os.path.join(root, "resume_bullets_bank.json"), encoding="utf-8") as f:
+        bullets = json.load(f)
+    with open(os.path.join(root, "templates", "cover_letter_templates.json"), encoding="utf-8") as f:
+        letters = json.load(f)
+    assert len(track_registry.TRACK_LETTERS) == 8
+    for letter in track_registry.TRACK_LETTERS:
+        key = track_registry.pool_key_for(letter)
+        assert isinstance(bullets.get(key), list) and len(bullets[key]) >= 15, (letter, key)
+        assert isinstance(letters.get(key), list) and len(letters[key]) >= 4, (letter, key)
+
+
+def test_normalize_track_degrades_garbage_to_the_default():
+    assert track_registry.normalize_track("f ") == "f"
+    for junk in ("", None, "zzz", 7, "  ", "track b please"):
+        assert track_registry.normalize_track(junk) == track_registry.DEFAULT_TRACK, junk
 
 
 def test_skills_footers_only_name_banked_systems():
