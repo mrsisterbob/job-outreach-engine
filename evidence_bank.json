@@ -127,7 +127,8 @@
       {"value": "$2.5B", "label": "AUM platform I ran operations on", "source": {"company": "Signal Advisors", "bullet": 6}},
       {"value": "500+", "label": "Accounts audited under SEC rules", "source": {"company": "Signal Advisors", "bullet": 0}},
       {"value": "4", "label": "Systems built, running in production"},
-      {"value": "150+", "label": "Hours building them, nights and weekends"}
+      {"live": "commit_hours"},
+      {"live": "tracked_lines"}
     ],
     "story": [
       {"text": "I started in wealth operations at Signal Advisors, which is the part of financial services nobody puts on a brochure. Custodial reconciliation. Onboarding paperwork for 500 accounts. Ticket queues with a one to two hour service window and an advisor on the other end who needs an answer. The job is accurate records and nothing stalling downstream, and I was good at it."},
