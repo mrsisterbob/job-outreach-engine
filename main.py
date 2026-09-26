@@ -41,7 +41,7 @@ from pipeline_utils import (
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     is_guessed_contact_email, resolve_sent_email_backfill,
     sanitize_job_title, is_clean_job_title, classify_outreach_track,
-    is_role_mailbox, is_automated_sender, company_domain_of, name_from_email_local_part, parse_email_recipient,
+    is_role_mailbox, is_automated_sender, inbound_sender_screen_reason, company_domain_of, name_from_email_local_part, parse_email_recipient,
     match_email_to_crm_company,
     plan_carmen_ladder, carmen_reply_anchor, carmen_linkedin_anchor, CARMEN_LADDER_DAYS,
     CARMEN_LADDER_DAYS_COLD, CARMEN_LADDER_DAYS_ENGAGED, carmen_ladder_for,
@@ -724,6 +724,10 @@ try:
 except (TypeError, ValueError):
     EMAIL_MAX_AGE_SECONDS = default_email_max_age_seconds(EMAIL_POLL_HOURS)
 EMAIL_REQUIRE_DIRECT_REPLY = os.environ.get("EMAIL_REQUIRE_DIRECT_REPLY", "False").strip().lower() in ("1", "true", "yes")
+# "strict" (default): a stranger whose ADDRESS is a machine mailbox or mail relay is recorded in the
+# tray but not sent to Telegram - see inbound_sender_screen_reason(). "permissive" restores the old
+# alert-every-stranger behaviour, as a Render dashboard flip rather than a redeploy.
+INBOUND_ALERT_MODE = os.environ.get("INBOUND_ALERT_MODE", "strict").strip().lower()
 # 50 chars dropped "Hi Kevin, got a sec?" and "Can we talk tomorrow at 2?" - the shortest replies
 # are often the warmest, because a busy human writing back types one line. The gate exists to skip
 # empty auto-acknowledgements, not brevity, and bulk is already handled structurally by the sender
@@ -6706,6 +6710,36 @@ def check_inbound_gmail_replies():
                 match_reason = "thread participant"
             elif is_unverified:
                 match_reason = "domain match"
+
+            # SENDER SCREEN. The stranger fallback below exists so a recruiter's first email can
+            # never be dropped again - but it also alerted on every receipt and onboarding blast,
+            # because it asked nothing about who sent them. This asks exactly that, and only that:
+            # a machine mailbox or a relay domain is screened, whatever the message says. A cold
+            # recruiter at name@company.com has neither, so she still alerts with no interview
+            # vocabulary at all.
+            #
+            # Never screened: a verified CRM contact, a thread Kevin started, and Tier 1 - someone
+            # Kevin corresponds with may mail from an odd relay, and he must still hear it. A
+            # domain match is NOT exempt: invoice@mail.anthropic.com matching a tracked Anthropic
+            # role is still a receipt. Screened mail is not discarded: it goes into the tray, so
+            # /inbox shows it, and is marked read so it does not re-poll.
+            if (INBOUND_ALERT_MODE != "permissive" and not is_tier1
+                    and (not crm_match or match_reason == "domain match")):
+                hiring_verdict = has_calendar_invite or status_label in (
+                    "INTERVIEW_SET", "OFFER_EXTENDED", "REJECTION")
+                screen_reason = inbound_sender_screen_reason(sender, ATS_ROBOT_DOMAINS, hiring_verdict)
+                if screen_reason and match_reason == "domain match" and is_thread_kevin_started(thread_id, access_token):
+                    screen_reason = ""
+                if screen_reason:
+                    logging.info(f"[SCREENED] {sender} - {screen_reason}; recorded in tray, no alert")
+                    screened_address = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender or "")
+                    record_inbound_thread(
+                        thread_id, screened_address.group(0).lower() if screened_address else "",
+                        display_name_from_sender(sender), str((crm_match or {}).get("company") or "Unknown"),
+                        subject, snippet, status_label, f"screened: {screen_reason}", "", False)
+                    requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+                    continue
+
             if not crm_match:
                 # No CRM identity at all. This used to be a silent drop, and it is how a recruiter
                 # Kevin had never emailed - confirming a real interview, DKIM-signed, marked

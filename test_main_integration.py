@@ -5856,7 +5856,7 @@ def _fake_tray_recorder(tray_state):
 
 def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_started=False,
                               spam_messages=None, tray_state=None, delivery_fails=False,
-                              shadow_messages=None):
+                              shadow_messages=None, domain_match=None, real_tray=False):
     """Drive the real check_inbound_gmail_replies() against a faked Gmail API.
 
     `messages` answers the label:INBOX query, `spam_messages` the label:SPAM one and
@@ -5880,15 +5880,18 @@ def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_sta
     """
     if tray_state is None:
         tray_state = {}
-    monkeypatch.setattr(m, "record_inbound_thread", _fake_tray_recorder(tray_state))
-    monkeypatch.setattr(m, "mark_inbound_thread_alerted", lambda tid: tray_state.get(tid, {}).update(alerted=1))
+    # real_tray=True leaves the SQLite tray in place, for tests that read it back through
+    # get_open_inbound_threads() - the same read /inbox does.
+    if not real_tray:
+        monkeypatch.setattr(m, "record_inbound_thread", _fake_tray_recorder(tray_state))
+        monkeypatch.setattr(m, "mark_inbound_thread_alerted", lambda tid: tray_state.get(tid, {}).update(alerted=1))
 
     for var in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"):
         monkeypatch.setenv(var, "fake")
     monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
     monkeypatch.setattr(m, "get_gmail_access_token", lambda: "fake-token")
     monkeypatch.setattr(m, "is_verified_crm_contact", crm_lookup or (lambda sender: None))
-    monkeypatch.setattr(m, "match_unknown_sender_to_crm_company", lambda sender: None)
+    monkeypatch.setattr(m, "match_unknown_sender_to_crm_company", domain_match or (lambda sender: None))
     monkeypatch.setattr(m, "is_thread_kevin_started", lambda tid, token: thread_started)
 
     inbox_by_id = {msg["id"]: msg for msg in messages}
@@ -9528,3 +9531,115 @@ def test_the_prompt_names_a_concrete_trigger_for_every_non_finance_track():
     # neither branch of the one instruction sitting closest to the output format.
     tone_line = [l for l in prompt.splitlines() if l.startswith('"tone_mode"')][0]
     assert "manufactur" in tone_line.lower(), tone_line
+
+
+# --- Inbound sender screen (2026-09-26) -----------------------------------------------------------
+# Kevin: "only have messages that are important for the hiring process / important people I've had
+# calls with come through Telegram". Both halves: the junk stops, and a cold recruiter still alerts.
+_JUNK_OFF_KEVINS_PHONE = [
+    ("invoice+statements@mail.anthropic.com", "Your receipt from Anthropic, PBC"),
+    ("community@legal.io", "Kevin, nearly half of lawyers feel worse off than a year ago"),
+    ("discover@services.discover.com", "We've received your payment"),
+    ("discover@card-e.em.discover.com", "Reminder: Prepare to manage your account with Capital One"),
+    ("support@email.career.io", "Welcome to Career.io!"),
+    ("system@successfactors.com",
+     "Welcome and thank you for creating your account with Dana Incorporated!"),
+    ("indeedapply@indeed.com", "Indeed Application: Data Analyst"),
+    ("ejko.fa.sender.2@workflow.mail.us2.cloud.oracle.com",
+     "Your recent job application for Business Efficiency Analyst"),
+]
+_JUNK_BODY = "Thanks for being with us. This message was sent to you about your account activity."
+
+
+def test_all_eight_junk_senders_reach_the_tray_but_not_telegram(monkeypatch):
+    """WRITE PATH: drives the real poller against the real SQLite tray and reads it back the way
+    /inbox does. Screened means 'no Telegram', not 'discarded'."""
+    _clear_tray()
+    messages = [_gmail_message(f"junk{i}", sender, subject, _JUNK_BODY)
+                for i, (sender, subject) in enumerate(_JUNK_OFF_KEVINS_PHONE)]
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, messages, real_tray=True)
+
+    assert alerts == []
+    assert sorted(marked_read) == sorted(f"junk{i}" for i in range(8))
+    tray = {t["thread_id"]: t for t in m.get_open_inbound_threads()}
+    assert sorted(tray) == sorted(f"thread-junk{i}" for i in range(8))
+    assert all(t["match_reason"].startswith("screened: ") for t in tray.values())
+    _clear_tray()
+
+
+def test_a_cold_recruiter_with_no_interview_vocabulary_still_alerts(monkeypatch):
+    """Not in the CRM, a new thread, and nothing in the text that looks like hiring. If any rule
+    screens this, the rule is wrong."""
+    _clear_tray()
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("sarah", "Sarah Chen <sarah.chen@sanctuarywealth.com>", "Re: Kevin Miller",
+                       "Got your note, passing this to our team.")], real_tray=True)
+    assert len(alerts) == 1
+    assert "sarah.chen@sanctuarywealth.com" in alerts[0]
+    assert marked_read == ["sarah"]
+    assert [t["match_reason"] for t in m.get_open_inbound_threads()] == ["unknown sender"]
+    _clear_tray()
+
+
+def test_a_verified_crm_contact_on_an_automated_address_still_alerts(monkeypatch):
+    contact = {"name": "Dana", "company": "Career.io", "tab": "Carmen Cold", "sheet_uuid": ""}
+    monkeypatch.setattr(m, "record_application_outcome", lambda *a, **k: None)
+    monkeypatch.setattr(m, "route_inbound_reply_to_crm", lambda *a, **k: None)
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("crm", "support@email.career.io", "Following up on our call",
+                       "Great talking yesterday - sending the details we discussed.")],
+        crm_lookup=lambda sender: contact)
+    assert len(alerts) == 1
+    assert "New Gmail Reply" in alerts[0]
+
+
+def test_a_thread_kevin_started_is_never_screened(monkeypatch):
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("thr", "discover@card-e.em.discover.com", "Re: intro",
+                       "Looping you in with the hiring manager here.")], thread_started=True)
+    assert len(alerts) == 1
+    assert "thread participant" in alerts[0]
+
+
+def test_a_domain_match_does_not_exempt_a_receipt(monkeypatch):
+    """invoice@mail.anthropic.com resolving to a tracked Anthropic role is still a receipt."""
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("rcpt", "invoice+statements@mail.anthropic.com",
+                       "Your receipt from Anthropic, PBC", _JUNK_BODY)],
+        domain_match=lambda sender: {"name": "Anthropic", "company": "Anthropic",
+                                     "tab": "Carmen Cold", "sheet_uuid": ""})
+    assert alerts == []
+    assert marked_read == ["rcpt"]
+
+
+def test_tier1_from_an_unknown_sender_still_alerts_under_strict(monkeypatch):
+    assert m.INBOUND_ALERT_MODE == "strict"
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("fit", FITTERMAN_SENDER, FITTERMAN_SUBJECT, FITTERMAN_SNIPPET,
+                       ics=FITTERMAN_ICS, age_seconds=3600),
+        _gmail_message("stem", STEMLER_SENDER, STEMLER_SUBJECT, STEMLER_SNIPPET, age_seconds=3600)])
+    assert len(alerts) == 2
+    assert all("No CRM changes were made" in a for a in alerts)
+
+
+def test_an_ats_rejection_still_alerts_and_ats_account_setup_does_not(monkeypatch):
+    """noreply@myworkday.com is automated, so it never gets Tier 1 - its only route to Telegram is
+    the hiring-verdict carve-out. A rejection keeps it; a welcome email does not."""
+    monkeypatch.setattr(m, "route_rejection_to_died", lambda *a, **k: "")
+    alerts, marked_read = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("rej", "Workday <noreply@myworkday.com>", "Update on your application",
+                       "Unfortunately, we have decided to move forward with other candidates."),
+        _gmail_message("wel", "Workday <noreply@myworkday.com>", "Welcome to our careers site",
+                       "Thanks for creating your candidate account."),
+    ])
+    assert len(alerts) == 1
+    assert "Rejection" in alerts[0]
+    assert sorted(marked_read) == ["rej", "wel"]
+
+
+def test_permissive_mode_restores_alerting_every_stranger(monkeypatch):
+    monkeypatch.setattr(m, "INBOUND_ALERT_MODE", "permissive")
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [
+        _gmail_message("perm", "community@legal.io", "Kevin, nearly half of lawyers feel worse off",
+                       _JUNK_BODY)])
+    assert len(alerts) == 1

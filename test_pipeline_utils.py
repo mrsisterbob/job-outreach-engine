@@ -2111,3 +2111,53 @@ def test_the_linter_catches_a_subordinate_clause_coordinated_with_a_conjunction(
     assert pu.lint_outreach_template(
         "Given how much of this sits under you, I would love 15 minutes, and I can work "
         "around your schedule.", "email") == []
+
+
+# --- Inbound sender screen (2026-09-26) -----------------------------------------------------------
+# The 8 senders that reached Kevin's phone as "Unverified Reply" between 2026-09-24 and 09-26.
+_SCREEN_ATS = ("myworkday.com", "greenhouse.io", "successfactors.com")
+_TELEGRAM_JUNK_SENDERS = [
+    ("invoice+statements@mail.anthropic.com", "automated sender"),
+    ("community@legal.io", "automated sender"),
+    ("discover@services.discover.com", "automated sender"),
+    ("discover@card-e.em.discover.com", "relay subdomain"),
+    ("support@email.career.io", "automated sender"),
+    ("system@successfactors.com", "automated ATS mail"),
+    ("indeedapply@indeed.com", "automated sender"),
+    ("ejko.fa.sender.2@workflow.mail.us2.cloud.oracle.com", "automated sender"),
+]
+
+
+@pytest.mark.parametrize("sender,reason", _TELEGRAM_JUNK_SENDERS)
+def test_every_junk_sender_off_kevins_phone_is_screened(sender, reason):
+    assert pu.inbound_sender_screen_reason(sender, _SCREEN_ATS) == reason
+
+
+def test_a_cold_recruiter_with_no_interview_vocabulary_is_not_screened():
+    """The case Kevin refused to lose. If a rule screens her, the rule is wrong."""
+    for sender in ("Sarah Chen <sarah.chen@sanctuarywealth.com>", "astemler@nextpathcp.com",
+                   "jane@gmail.com", "careers@acme.com", "recruiting@acme.com", "hr@acme.com"):
+        assert pu.inbound_sender_screen_reason(sender, _SCREEN_ATS) == "", sender
+
+
+def test_an_ats_robot_passes_only_with_a_hiring_verdict():
+    """Workday sends real invitations and rejections from noreply@; it also sends account setup."""
+    assert pu.inbound_sender_screen_reason("noreply@myworkday.com", _SCREEN_ATS, hiring_verdict=True) == ""
+    assert pu.inbound_sender_screen_reason("noreply@myworkday.com", _SCREEN_ATS) == "automated ATS mail"
+    # A named person at an ATS domain is never screened.
+    assert pu.inbound_sender_screen_reason("pat@greenhouse.io", _SCREEN_ATS) == ""
+
+
+def test_plus_addressing_is_stripped_before_the_localpart_check():
+    assert pu.is_automated_sender("invoice+statements@anthropic.com") is True
+
+
+def test_a_generic_domain_label_cannot_match_a_company_that_ends_in_it():
+    """'CRM Match: Discover @ G-TECH Services' - label 'services' was a substring of the company."""
+    assert pu.domain_matches_company("discover@services.discover.com", "G-TECH Services") is False
+    assert pu.domain_matches_company("a@solutions.com", "Acme Solutions") is False
+    assert pu.domain_matches_company("a@signaladvisors.com", "Signal Advisors") is True
+    assert pu.domain_matches_company("a@ford.com", "Ford Motor Company") is True
+    assert pu.domain_matches_company("a@intactinsurance.com", "Intact Services USA LLC") is True
+    assert pu.domain_matches_company("a@ncms.org", "National Center for Manufacturing Sciences") is True
+    assert pu.company_domain_of("discover@services.discover.com") == "discover.com"

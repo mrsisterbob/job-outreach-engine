@@ -953,7 +953,8 @@ _ROLE_MAILBOX_LOCALPARTS = frozenset({
     "admin", "help", "sales", "team", "noreply", "no-reply", "donotreply",
 })
 
-# Local parts that mean "a machine sent this", used ONLY to deny the Tier 1 interview bypass.
+# Local parts that mean "a machine sent this": denies the Tier 1 bypass, and screens strangers
+# out of Telegram via inbound_sender_screen_reason().
 # Deliberately NOT _ROLE_MAILBOX_LOCALPARTS: that set contains careers@, recruiting@, talent@ and
 # hr@, which are exactly the addresses a real interview invitation arrives from, and denying those
 # would re-create the silent loss the bypass exists to prevent.
@@ -967,6 +968,9 @@ _AUTOMATED_SENDER_LOCALPARTS = frozenset({
     "promomail", "mailer", "mailer-daemon", "bounce", "bounces", "automated", "auto",
     "system", "notification", "account", "accounts", "billing", "receipts", "invoice",
     "security", "service", "services", "member", "members", "offers", "deals",
+    # Off Kevin's phone as "Unverified Reply", 2026-09-24..26: community@legal.io,
+    # invoice+statements@mail.anthropic.com, support@email.career.io, indeedapply@indeed.com.
+    "community", "statements", "support", "indeedapply",
 })
 
 # Subdomains that mark a bulk/transactional mail stream even when the local part looks human:
@@ -974,14 +978,16 @@ _AUTOMATED_SENDER_LOCALPARTS = frozenset({
 _AUTOMATED_MAIL_SUBDOMAINS = frozenset({
     "notify", "notifications", "promomail", "promo", "mailer", "email", "mail",
     "send", "sendgrid", "mailgun", "bounce", "bounces", "marketing", "news", "alerts",
+    # discover@services.discover.com (payment notices), *@workflow.mail.*.cloud.oracle.com.
+    "services", "em", "workflow",
 })
 
 
 def is_automated_sender(email):
     """True when an address announces machine-generated bulk/transactional mail.
 
-    Used to deny the Tier 1 interview bypass, NOT to drop mail: a message from one of these
-    still goes through the ordinary pre-filter and can still alert. A human recruiter scheduling
+    Denies the Tier 1 interview bypass, and - through inbound_sender_screen_reason() - keeps a
+    stranger's mail out of Telegram (it is still recorded in the tray). A human recruiter scheduling
     an interview does not write from welcome@notify.chime.com, so honouring this costs no real
     interview while closing the class of false Tier 1 that keyword tightening alone cannot.
 
@@ -994,6 +1000,8 @@ def is_automated_sender(email):
     if "@" not in addr:
         return False
     local, _, domain = addr.partition("@")
+    # Plus-addressing is a routing tag, not the mailbox: "invoice+statements@" is invoice@.
+    local = local.split("+", 1)[0]
     local = re.sub(r'[._-]?\d+$', '', local.strip())
     if local in _AUTOMATED_SENDER_LOCALPARTS:
         return True
@@ -1003,6 +1011,41 @@ def is_automated_sender(email):
         return True
     labels = domain.strip(".").split(".")
     return len(labels) >= 3 and labels[0] in _AUTOMATED_MAIL_SUBDOMAINS
+
+
+def inbound_sender_screen_reason(email, ats_domains=(), hiring_verdict=False):
+    """Why an unknown sender should NOT reach Telegram, or '' if it should.
+
+    Judges WHO sent the mail, never what it says: a cold recruiter writing "got your note,
+    passing this to our team" from sarah.chen@sanctuarywealth.com has no interview vocabulary at
+    all, and must still alert. What she does not have is a machine mailbox or a relay domain.
+
+      1. is_automated_sender() - receipts, onboarding, support desks, job-board confirmations.
+      2. A domain of 4+ labels (card-e.em.discover.com, workflow.mail.us2.cloud.oracle.com). A
+         person writes from name@company.com; a label stack that deep is a mail platform.
+
+    ATS robots are the exception. Workday and Greenhouse send REAL invitations and rejections from
+    noreply@, so an automated sender at one of `ats_domains` passes when the caller already has a
+    hiring verdict (calendar invite, interview, offer, rejection) - and is screened otherwise,
+    which is how "Welcome ... creating your account" from system@successfactors.com stops.
+
+    The caller applies this only to strangers: a verified CRM contact, a thread Kevin started
+    and a Tier 1 signal never reach it.
+    """
+    raw = str(email or "")
+    match = re.search(r'<\s*([^<>@\s]+@[^<>@\s]+)\s*>', raw)
+    addr = (match.group(1) if match else raw).strip().lower()
+    if "@" not in addr:
+        return ""
+    domain = addr.rsplit("@", 1)[-1].strip(".")
+    is_ats = any(domain == d or domain.endswith("." + d) for d in ats_domains or ())
+    if is_ats:
+        return "" if hiring_verdict or not is_automated_sender(addr) else "automated ATS mail"
+    if is_automated_sender(addr):
+        return "automated sender"
+    if len(domain.split(".")) >= 4:
+        return "relay subdomain"
+    return ""
 
 # Mail providers and ATS/job-board senders: the domain says nothing about an employer,
 # so company matching would be meaningless even when the local part is a real person.
@@ -1049,7 +1092,8 @@ def company_domain_of(email):
     if domain in _NON_COMPANY_EMAIL_DOMAINS:
         return ""
     parts = domain.split(".")
-    if len(parts) > 2 and parts[0] in ("mail", "email", "careers", "jobs", "smtp", "mx"):
+    if len(parts) > 2 and parts[0] in ("mail", "email", "careers", "jobs", "smtp", "mx",
+                                       "services", "em", "workflow"):
         domain = ".".join(parts[1:])
     return "" if domain in _NON_COMPANY_EMAIL_DOMAINS else domain
 
@@ -1090,7 +1134,12 @@ def domain_matches_company(email, company_name):
     company = re.sub(r'[^a-z0-9]', '', normalized)
     if not label or not company:
         return False
-    if label == company or (len(label) >= 5 and label in company) or (len(company) >= 5 and company in label):
+    # The label-inside-company test is gated on _GENERIC_BRAND_TOKENS: without it the domain
+    # services.discover.com (label "services") matched "G-TECH Services", and the alert read
+    # "CRM Match: Discover @ G-TECH Services". A generic word is not an identity.
+    if label == company or (len(company) >= 5 and company in label):
+        return True
+    if len(label) >= 5 and label not in _GENERIC_BRAND_TOKENS and label in company:
         return True
     # Brand-token match. A company's legal name and its mail domain often share only the brand:
     # "Intact Services USA LLC" sends from intactinsurance.com, where neither whole string
