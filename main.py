@@ -57,6 +57,7 @@ from pipeline_utils import (
     strip_tracking_params, strip_html_to_text,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
     REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
+    validate_lead, format_leads_messages,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -80,6 +81,13 @@ if not CRM_SHARED_SECRET:
     logging.warning(
         "[CONFIG WARNING] CRM_SHARED_SECRET is unset - outbound CRM requests will carry no secret, "
         "and Code.gs (deployed Execute as: Me, Access: Anyone) now fails closed and will reject them."
+    )
+# Separate from CRM_SHARED_SECRET on purpose: the public site holds this one, and it must not be
+# able to talk to the CRM. Read per request by /leads/ingest; this check only warns at boot.
+if not os.environ.get("LEAD_INGEST_TOKEN"):
+    logging.warning(
+        "[CONFIG WARNING] LEAD_INGEST_TOKEN is unset - /leads/ingest will refuse every lead with 503, "
+        "so contact-form submissions from montelattice.com cannot be stored."
     )
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
@@ -1304,6 +1312,18 @@ def init_db():
             bot TEXT
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_site_visits_time ON site_visits(visited_at)")
+        # Inbound leads from contact forms (section 12b). The site has no persistent disk, so this
+        # table is the only durable copy of a submission. source names the form it came from.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS inbound_leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            source TEXT NOT NULL,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            message TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_leads_time ON inbound_leads(received_at)")
 
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -11886,6 +11906,22 @@ def process_webhook_payload_async(data):
                 lines.append(f"• <b>{comp}</b> - {name} | {item['days_overdue']}d overdue | <code>/f 7</code>")
             send_telegram_message(chat_id, "\n".join(lines))
             return
+        # Contact-form leads stored by /leads/ingest. /leads [n], n capped at LEADS_MAX_LIMIT.
+        if text == "/leads" or text.startswith("/leads "):
+            arg = text[len("/leads"):].strip()
+            if arg and not arg.isdigit():
+                send_telegram_message(chat_id, "📥 Usage: <code>/leads</code> (latest 10) or <code>/leads 25</code>")
+                return
+            limit = min(max(int(arg or LEADS_DEFAULT_LIMIT), 1), LEADS_MAX_LIMIT)
+            try:
+                rows = get_recent_leads(limit)
+            except Exception as e:
+                logging.error(f"[LEADS] /leads read failed: {e}")
+                send_telegram_message(chat_id, "📥 Lead store unavailable - check the logs.")
+                return
+            for chunk in format_leads_messages(rows, limit, TELEGRAM_MAX_MESSAGE_CHARS):
+                send_telegram_message(chat_id, chunk)
+            return
         # NOT "/dead" - that is the swipe-reply that kills the replied-to row (see below).
         if text == "/usage" or text.startswith("/usage "):
             arg = text[len("/usage"):].strip().lower()
@@ -14453,6 +14489,61 @@ def site_visitor_standup_line():
     except Exception as e:
         logging.error(f"[ANALYTICS] standup read failed: {e}")
         return "🌐 montelattice.com: visitor log unavailable this morning"
+
+
+# ==============================================================================
+# 12b. INBOUND LEADS (contact forms forwarded by montelattice.com)
+# ==============================================================================
+# The site runs on an ephemeral filesystem, so it forwards each submission here and only tells
+# the submitter "thanks" once this route confirms the row is committed. Read back with /leads.
+
+LEADS_DEFAULT_LIMIT = 10
+LEADS_MAX_LIMIT = 50
+
+
+def record_inbound_lead(lead):
+    """Commit one validated lead (see validate_lead). Returns the new row id."""
+    with get_db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "INSERT INTO inbound_leads (source, name, email, message) VALUES (?, ?, ?, ?)",
+            (lead["source"], lead["name"], lead["email"], lead["message"]))
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_recent_leads(limit=LEADS_DEFAULT_LIMIT):
+    """READ-ONLY. (id, received_at, source, name, email, message), newest first."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT id, received_at, source, name, email, message FROM inbound_leads "
+            "ORDER BY id DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+
+
+@app.route("/leads/ingest", methods=["POST"])
+def leads_ingest():
+    """One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN.
+
+    Returns 200 {"status": "ok", "id": N} only after the row is committed - the site treats
+    anything else as a failed submission and tells the person so."""
+    token = os.environ.get("LEAD_INGEST_TOKEN", "")
+    if not token:
+        logging.warning("[CONFIG WARNING] LEAD_INGEST_TOKEN is unset - refusing an inbound lead.")
+        return jsonify({"status": "disabled"}), 503
+    supplied = request.headers.get("X-Lead-Token", "")
+    if not hmac.compare_digest(supplied.encode(), token.encode()):
+        return jsonify({"status": "forbidden"}), 403
+    lead, error = validate_lead(request.get_json(silent=True))
+    if error:
+        return jsonify({"status": "invalid", "error": error}), 400
+    try:
+        lead_id = record_inbound_lead(lead)
+    except Exception as e:
+        logging.error(f"[LEADS] write failed for {lead['source']} lead: {e}")
+        return jsonify({"status": "error"}), 500
+    logging.info(f"[LEADS] stored lead #{lead_id} from {lead['source']}")
+    return jsonify({"status": "ok", "id": lead_id}), 200
 
 
 # ==============================================================================

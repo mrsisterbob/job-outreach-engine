@@ -10365,3 +10365,121 @@ def test_main_opens_no_bare_connections_to_the_live_database():
     live = [(fn, arg) for fn, arg in callers if "DB_PATH" in arg]
     assert {fn for fn, _ in live} == {"get_db_conn"}, callers
     assert all(arg == "dest_path" for fn, arg in callers if fn != "get_db_conn"), callers
+
+
+# ---- Inbound leads: /leads/ingest writes, /leads reads back ----
+
+_LEAD_TOKEN = "lead-test-token"
+
+
+@pytest.fixture
+def leads_env(monkeypatch):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_leads")
+        conn.commit()
+    monkeypatch.setenv("LEAD_INGEST_TOKEN", _LEAD_TOKEN)
+    yield
+
+
+def _post_lead(payload, headers=None):
+    with m.app.test_client() as client:
+        return client.post("/leads/ingest", json=payload,
+                           headers={"X-Lead-Token": _LEAD_TOKEN} if headers is None else headers)
+
+
+def _lead_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute(
+            "SELECT source, name, email, message, received_at FROM inbound_leads ORDER BY id").fetchall()
+
+
+_GOOD_LEAD = {"name": "Dana Ruiz", "email": "dana@firm.com", "message": "40k PDFs", "source": "montelattice.com/docfiler"}
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-Lead-Token": "wrong"}, {"X-Lead-Token": ""}])
+def test_lead_ingest_rejects_a_missing_or_wrong_token(leads_env, headers):
+    assert _post_lead(_GOOD_LEAD, headers=headers).status_code == 403
+    assert _lead_rows() == []
+
+
+def test_lead_ingest_refuses_everything_when_the_token_is_unset(leads_env, monkeypatch):
+    """Unset must fail closed - not silently accept unauthenticated leads."""
+    monkeypatch.delenv("LEAD_INGEST_TOKEN")
+    for headers in ({}, {"X-Lead-Token": ""}, {"X-Lead-Token": _LEAD_TOKEN}):
+        assert _post_lead(_GOOD_LEAD, headers=headers).status_code == 503
+    assert _lead_rows() == []
+
+
+def test_lead_ingest_does_not_accept_the_crm_secret(leads_env, monkeypatch):
+    monkeypatch.setattr(m, "CRM_SHARED_SECRET", "crm-secret")
+    assert _post_lead(_GOOD_LEAD, headers={"X-Lead-Token": "crm-secret"}).status_code == 403
+    assert _lead_rows() == []
+
+
+def test_a_valid_lead_is_committed_and_readable_back(leads_env):
+    r = _post_lead(_GOOD_LEAD)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["status"] == "ok" and isinstance(body["id"], int)
+    (row,) = _lead_rows()
+    assert row[:4] == ("montelattice.com/docfiler", "Dana Ruiz", "dana@firm.com", "40k PDFs")
+    assert row[4]  # received_at stamped by SQLite
+
+
+@pytest.mark.parametrize("payload", [
+    {"email": "dana@firm.com"},
+    {"name": "Dana"},
+    {"name": "   ", "email": "dana@firm.com"},
+    {"name": "Dana", "email": "not-an-email"},
+    {"name": "Dana", "email": "a@" + "x" * 260 + ".com"},
+])
+def test_lead_ingest_rejects_missing_or_malformed_fields(leads_env, payload):
+    r = _post_lead(payload)
+    assert r.status_code == 400 and r.get_json()["error"]
+    assert _lead_rows() == []
+
+
+def test_lead_ingest_rejects_a_non_json_body(leads_env):
+    with m.app.test_client() as client:
+        r = client.post("/leads/ingest", data="name=x", headers={"X-Lead-Token": _LEAD_TOKEN})
+    assert r.status_code == 400
+    assert _lead_rows() == []
+
+
+def test_lead_ingest_caps_long_fields_instead_of_losing_the_lead(leads_env):
+    assert _post_lead({**_GOOD_LEAD, "name": "N" * 900, "message": "m" * 20000,
+                       "source": "s" * 500}).status_code == 200
+    source, name, _, message, _ = _lead_rows()[0]
+    assert len(name) == 200 and len(message) == 5000 and len(source) == 64
+
+
+def test_leads_command_reads_back_what_the_route_wrote(leads_env, monkeypatch):
+    """Write through the real route, read through the real Telegram dispatch."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    _post_lead({**_GOOD_LEAD, "name": "<script>alert(1)</script>"})
+    _post_lead({**_GOOD_LEAD, "name": "Second Lead", "email": "two@firm.com"})
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/leads"}})
+    assert len(sent) == 1
+    text = sent[0]
+    assert "two@firm.com" in text and "dana@firm.com" in text and "40k PDFs" in text
+    assert text.index("Second Lead") < text.index("dana@firm.com")  # newest first
+    assert "<script>" not in text and "&lt;script&gt;" in text
+
+
+def test_leads_command_honours_the_limit_and_rejects_junk(leads_env, monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    for i in range(3):
+        _post_lead({**_GOOD_LEAD, "email": f"p{i}@firm.com"})
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/leads 2"}})
+    assert "p2@firm.com" in sent[-1] and "p1@firm.com" in sent[-1] and "p0@firm.com" not in sent[-1]
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/leads all"}})
+    assert "Usage" in sent[-1]
+
+
+def test_leads_command_on_an_empty_store(leads_env, monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/leads"}})
+    assert sent == ["📥 <b>Leads</b>\n\nNo leads received yet."]

@@ -2457,3 +2457,63 @@ def format_visitor_line(summary, site="montelattice.com"):
     job_str = f" · {job} → Job Engine" if job else ""
     return (f"🌐 {site}: {lead} · {visitors} visitor{'s' if visitors != 1 else ''} (24h)"
             f"{job_str}{tail_str}")
+
+
+# ---- Inbound leads (contact forms forwarded by montelattice.com) ----
+
+LEAD_NAME_MAX = 200
+LEAD_EMAIL_MAX = 254          # RFC 5321's practical ceiling for a deliverable address
+LEAD_MESSAGE_MAX = 5000
+LEAD_SOURCE_MAX = 64
+_LEAD_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def validate_lead(payload):
+    """(lead_dict, None) or (None, error_message) for one submitted lead.
+
+    Name and email are required and a malformed email is rejected, not stored - a lead with no
+    reachable address is not a lead. Name, message and source are truncated to their caps rather
+    than rejected, so a long message never costs the submission."""
+    p = payload if isinstance(payload, dict) else {}
+    name = str(p.get("name") or "").strip()
+    email = str(p.get("email") or "").strip()
+    if not name or not email:
+        return None, "Name and email are required."
+    if len(email) > LEAD_EMAIL_MAX or not _LEAD_EMAIL_RE.match(email):
+        return None, "A valid email address is required."
+    return {
+        "name": name[:LEAD_NAME_MAX],
+        "email": email,
+        "message": str(p.get("message") or "").strip()[:LEAD_MESSAGE_MAX],
+        "source": (str(p.get("source") or "").strip() or "unknown")[:LEAD_SOURCE_MAX],
+    }, None
+
+
+def format_leads_messages(rows, limit, max_chars=4096):
+    """The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are
+    (id, received_at, source, name, email, message), newest first. Every field is
+    submitter-controlled, so all of it is escaped before it reaches HTML, and messages split only
+    between leads - slicing mid-entry could cut an HTML tag in half. One entry is bounded well under
+    4096 even fully escaped (name 200, email 254, snippet 280)."""
+    if not rows:
+        return ["📥 <b>Leads</b>\n\nNo leads received yet."]
+    header = f"📥 <b>Leads</b> - latest {len(rows)} (of up to {limit}), times UTC"
+    entries = []
+    for _id, received_at, source, name, email, message in rows:
+        snippet = (message or "").replace("\n", " ").strip()
+        if len(snippet) > 280:
+            snippet = snippet[:280].rstrip() + "…"
+        entries.append(
+            f"<b>{html.escape(name or '')}</b> · <code>{html.escape(email or '')}</code>\n"
+            f"{html.escape(str(received_at or ''))[:16]} · {html.escape(source or '')}"
+            + (f"\n<i>{html.escape(snippet)}</i>" if snippet else "")
+        )
+    messages, current = [], header
+    for entry in entries:
+        if len(current) + 2 + len(entry) > max_chars:
+            messages.append(current)
+            current = entry
+        else:
+            current += "\n\n" + entry
+    messages.append(current)
+    return messages

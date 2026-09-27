@@ -2247,3 +2247,25 @@ def test_shape_public_dashboard_counts_dead_links_this_week_and_retired():
     dead = [(None,) * 6 + (1, "2026-09-25 08:00:00"), (None,) * 6 + (0, "2026-09-01 08:00:00")]
     shaped = pu.shape_public_dashboard({"today": today, "dead_links": dead})
     assert shaped["dead_links"] == {"detected": 2, "retired": 1, "this_week": 1}
+
+
+# ---- Inbound leads ----
+
+def test_lead_source_defaults_when_absent():
+    lead, err = pu.validate_lead({"name": "A", "email": "a@b.co"})
+    assert err is None and lead["source"] == "unknown" and lead["message"] == ""
+
+
+def test_validate_lead_survives_a_non_dict_body():
+    assert pu.validate_lead(None) == (None, "Name and email are required.")
+    assert pu.validate_lead(["name"])[0] is None
+
+
+def test_leads_messages_split_between_entries_and_stay_under_the_limit():
+    """Worst case: every field at its cap and made of characters that expand when escaped."""
+    row = (1, "2026-09-27 12:00:00", "s" * 64, "&" * 200, "<" * 240 + "@x.co", "\"" * 5000)
+    msgs = pu.format_leads_messages([row] * 50, 50, max_chars=4096)
+    assert len(msgs) > 1
+    assert all(len(m) <= 4096 for m in msgs)
+    assert sum(m.count("<b>&amp;") for m in msgs) == 50  # no entry lost or cut in half
+    assert all(m.count("<i>") == m.count("</i>") for m in msgs)
