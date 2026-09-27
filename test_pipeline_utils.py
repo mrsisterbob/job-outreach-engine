@@ -857,6 +857,73 @@ def test_shipped_templates_open_on_a_bare_hi_when_no_name_is_known():
         assert with_name.startswith("Hi Dana,")
 
 
+# The two locked first-touch templates, written out here word for word so this file is a second
+# readable copy of the contract (main._FALLBACK_OUTREACH_TEMPLATES and
+# templates/outreach_templates.json are the other two). Set 2026-09-27 by Kevin. If you are changing
+# these strings, he asked for the change - the test failing is the point, not a bug to route around.
+_LOCKED_PEER_TEMPLATE = (
+    "Hi{name},\n\n"
+    "I recently applied to the {job_title} role at {company}, and would like to discuss "
+    "what the day-to-day work in this department looks like. My background is in operational "
+    "support, managing intake flows and catching errors before they slow down the rest of the team."
+    "\n\nI saw your team is hiring for this role, and I would love 15 minutes of your time this "
+    "week to learn more and discuss if this could be a good fit.\n\n"
+    "I look forward to hearing from you.\n\nBest,\nKevin"
+)
+_LOCKED_RECRUITER_TEMPLATE = (
+    "Hi{name},\n\n"
+    "I have been keeping an eye on {company}'s operations for a while and was glad to put my "
+    "application in for the {job_title} opening recently. My background is in operational support, "
+    "managing intake flows and catching errors before they slow down the rest of the team.\n\n"
+    "Are you running point on this req, or is there someone else I should route my note to?\n\n"
+    "I look forward to hearing from you.\n\nBest,\nKevin"
+)
+
+
+def test_the_two_locked_first_touch_templates_are_frozen():
+    """There are exactly TWO first-touch emails and their copy is fixed.
+
+    PEER goes out with no resume and is the whole cold_ops pool (all 8 entries identical, so
+    Gemini's routed outreach_template_id cannot pick a different voice). RECRUITER goes out with a
+    resume attached and is the single-entry `recruiter` pool, /edit slot RX0.
+
+    Only {name}, {company} and {job_title} vary, and all three are read off the Apollo/LinkedIn
+    screenshot. This test exists because the previous eight cold_ops entries were eight different
+    voices: a routing bug or an /edit to one slot changed what a given contact received, and there
+    was no single string anyone could point at as "the email Kevin sends".
+    """
+    bank = _load_bank("outreach_templates.json")
+
+    assert bank["cold_ops"] == [_LOCKED_PEER_TEMPLATE] * 8
+    assert bank["recruiter"] == [_LOCKED_RECRUITER_TEMPLATE]
+
+    # The in-code fallbacks must be the SAME copy. They render when the JSON is missing or
+    # unparseable, which is exactly the moment nobody is watching the output.
+    assert m._FALLBACK_OUTREACH_TEMPLATES["cold_ops"] == [_LOCKED_PEER_TEMPLATE]
+    assert m._FALLBACK_OUTREACH_TEMPLATES["recruiter"] == [_LOCKED_RECRUITER_TEMPLATE]
+
+    # The three dynamic slots really do fill, and nothing else is left as a brace.
+    for template in (_LOCKED_PEER_TEMPLATE, _LOCKED_RECRUITER_TEMPLATE):
+        rendered = m.sanitize_text(m.interpolate_template(
+            template, name="Connor", company="Rivian", job_title="Carrier Operations Analyst"))
+        assert rendered.startswith("Hi Connor,")
+        assert "Rivian" in rendered
+        assert "Carrier Operations Analyst" in rendered
+        assert "{" not in rendered and "}" not in rendered
+        assert rendered.rstrip().endswith("Best,\nKevin")
+        assert pu.lint_outreach_template(rendered) == []
+
+
+def test_the_locked_recruiter_template_is_reachable_from_edit_as_rx0():
+    """RX0 addresses the recruiter pool. The bare R prefix is the reactivation pool, so a
+    two-letter code was needed and RX must be matched before R in EDIT_ID_PATTERN."""
+    assert m.resolve_edit_target("RX0") == (m.OUTREACH_TEMPLATES_PATH, "recruiter", 0)
+    assert m.resolve_edit_target("rx0") == (m.OUTREACH_TEMPLATES_PATH, "recruiter", 0)
+    # The bare R prefix must not have been shadowed by the new branch.
+    assert m.resolve_edit_target("R0") == (m.OUTREACH_TEMPLATES_PATH, "reactivation", 0)
+    assert m.resolve_edit_target("C0") == (m.OUTREACH_TEMPLATES_PATH, "cold_ops", 0)
+
+
 def test_cold_ops_encodes_the_professional_corpus_voice():
     """Rules traceable to counts in the correct mailbox (kjmiller406@gmail.com, 62 emails):
     a 15-minute timebox, 'Best,' + 'Kevin', and no college-corpus habits.
@@ -924,8 +991,18 @@ def test_gmail_generators_render_the_same_string_the_card_shows():
         )
         gmail_copy = m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, template_id=template_id)
         assert card_copy == gmail_copy
-    # Distinct entries really are distinct - a silent fallback-to-index-0 would collapse them.
-    assert len({m.generate_cold_email(_LINT_TITLE, _LINT_COMPANY, template_id=i) for i in range(8)}) == 8
+    # This used to assert 8 DISTINCT renders, as a guard against a silent fallback-to-index-0
+    # collapsing the pool. That guard is retired: as of 2026-09-27 all 8 cold_ops entries are
+    # byte-identical by design (Kevin locked one peer template), so "they all render the same" is
+    # now the correct outcome and cannot distinguish routing from a fallback.
+    #
+    # What still needs guarding is the thing the old assertion was a proxy for: that a routed index
+    # RESOLVES rather than falling off the end of the pool. Assert that directly against the pool
+    # length, which is what Gemini's le=7 is calibrated to.
+    pool = m.load_outreach_templates()["cold_ops"]
+    assert len(pool) == 8, "outreach_template_id is le=7; a shorter pool makes high indices fall back"
+    for template_id in range(8):
+        assert m.resolve_template_text(pool, template_id, "SENTINEL") is pool[template_id]
 
 
 def test_generators_use_the_contact_name_when_one_is_known():

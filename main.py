@@ -248,11 +248,32 @@ COVER_LETTER_TEMPLATES_PATH = os.path.join(TEMPLATES_DIR, "cover_letter_template
 # deliberate, not a typo. interpolate_template() renders {name} WITH its own leading space
 # ("Hi Dana,") or as an empty string ("Hi,"), so a template must never put a space of its own
 # before the placeholder. Every string here is also held to pipeline_utils.lint_outreach_template().
+#
+# ==============================================================================
+# THE TWO LOCKED FIRST-TOUCH TEMPLATES (set 2026-09-27, by Kevin, word for word)
+# ==============================================================================
+# There are exactly TWO first-email templates now, and they are frozen copy:
+#
+#   PEER TRACK      -> cold_ops (this dict and templates/outreach_templates.json)
+#                      NO resume attached. Opens by naming the application.
+#   RECRUITER TRACK -> recruiter (same two places), /edit slot RX0
+#                      RESUME ATTACHED. Opens on the company, closes on a routing question.
+#
+# Only THREE things are dynamic, and all three come off the Apollo/LinkedIn screenshot:
+#   {name}      the contact's first name   -> "Hi Connor,"   (bare "Hi," if unknown)
+#   {company}   the employer               -> "Rivian"
+#   {job_title} the role Kevin applied to  -> "Carrier Operations Analyst"
+# Nothing else varies. Do NOT add a per-recipient anchor sentence, do NOT reintroduce
+# {their_desk} tailoring here, and do NOT write a fourth variant. All 8 cold_ops entries are
+# byte-identical on purpose - Gemini's outreach_template_id (le=7) still routes an index into
+# this pool, and identical entries make that routing a no-op instead of a copy lottery.
+# test_the_two_locked_first_touch_templates_are_frozen pins both strings.
 _FALLBACK_OUTREACH_TEMPLATES = {
-    "cold_ops": ["Hi{name},\n\nYour {job_title} posting is what got me to write, but I mostly wanted your perspective on where the manual work still sits.\n\nMy day job is Python and SQL that replaces reporting people used to run by hand. Do you have 10 minutes for a brief call?\n\nHappy to work around your schedule.\n\nBest,\nKevin Miller"],
+    "cold_ops": ["Hi{name},\n\nI recently applied to the {job_title} role at {company}, and would like to discuss what the day-to-day work in this department looks like. My background is in operational support, managing intake flows and catching errors before they slow down the rest of the team.\n\nI saw your team is hiring for this role, and I would love 15 minutes of your time this week to learn more and discuss if this could be a good fit.\n\nI look forward to hearing from you.\n\nBest,\nKevin"],
     "warm_alumni": ["Hi{name},\n\n[how you know them, and the specific occasion you last spoke]. [one concrete detail so this reads like you].\n\n[the one thing you want their perspective on at {company}]. [your ask, and a concrete time window].\n\nBest,\nKevin"],
     "followup_bumps": ["Hi{name},\n\nCircling back on the {job_title} role in case this got buried.\n\nStill interested, and happy to answer anything useful.\n\nThanks,\nKevin Miller"],
-    "recruiter": ["Hi{name},\n\nI recently applied for the {job_title} role at {company} and wanted to reach out directly. Most of my recent work is custodial reconciliation and Python that replaces manual reporting.\n\nIs the search still open, and is there a rough timeline for first interviews? A one-line reply is plenty.\n\nBest,\nKevin Miller"],
+    # RECRUITER TRACK, resume attached. See the locked-template block above.
+    "recruiter": ["Hi{name},\n\nI have been keeping an eye on {company}'s operations for a while and was glad to put my application in for the {job_title} opening recently. My background is in operational support, managing intake flows and catching errors before they slow down the rest of the team.\n\nAre you running point on this req, or is there someone else I should route my note to?\n\nI look forward to hearing from you.\n\nBest,\nKevin"],
     "reactivation": ["Hi{name},\n\nLast time we spoke I said I would let you know where I landed. I was at Signal through the summer. The role I was working toward got redefined around a decade of experience, and I finished up there this month. While that was playing out I built a Python system that runs my job search and flags new postings.\n\nI saw the {job_title} opening and would rather come in through someone who knows the team than through the portal. Who owns that req on your side?\n\nHappy to work around your schedule.\n\nBest,\nKevin"]
 }
 
@@ -449,12 +470,15 @@ def crm_contact_is_a_person(contact_name, company):
 
 RESUME_BULLETS_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resume_bullets_bank.json")
 
-EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|R|T[A-H])(\d+)$", re.IGNORECASE)
+# RX is matched BEFORE the bare R, or "RX0" would read as prefix R + a non-numeric remainder and
+# fail the pattern entirely. Two-letter prefixes therefore lead every alternation branch here.
+EDIT_ID_PATTERN = re.compile(r"^(L|C|W|B|RX|R|T[A-H])(\d+)$", re.IGNORECASE)
 
 def resolve_edit_target(id_str):
     """Maps a /edit ID to (file_path, list_key, index):
       L0-L9 -> templates/linkedin_templates.json[linkedin_templates]
-      C0-C7 -> templates/outreach_templates.json[cold_ops]
+      C0-C7 -> templates/outreach_templates.json[cold_ops]        (PEER first-touch, locked)
+      RX0   -> templates/outreach_templates.json[recruiter]       (RECRUITER first-touch, locked)
       W0-W1 -> templates/outreach_templates.json[warm_alumni]
       B0-B1 -> templates/outreach_templates.json[followup_bumps]
       R0-R3 -> templates/outreach_templates.json[reactivation]
@@ -469,6 +493,8 @@ def resolve_edit_target(id_str):
         return (LINKEDIN_TEMPLATES_PATH, "linkedin_templates", idx)
     if prefix == "C":
         return (OUTREACH_TEMPLATES_PATH, "cold_ops", idx)
+    if prefix == "RX":
+        return (OUTREACH_TEMPLATES_PATH, "recruiter", idx)
     if prefix == "W":
         return (OUTREACH_TEMPLATES_PATH, "warm_alumni", idx)
     if prefix == "B":
@@ -13460,7 +13486,8 @@ def process_webhook_payload_async(data):
                 send_telegram_message(
                     chat_id,
                     "❌ <b>Usage:</b> <code>/edit ID New Text</code>\n"
-                    "IDs: <code>L0-L9</code> (LinkedIn), <code>C0-C7</code> (Cold), "
+                    "IDs: <code>L0-L9</code> (LinkedIn), <code>C0-C7</code> (Cold peer), "
+                    "<code>RX0</code> (Cold recruiter), "
                     "<code>W0-W5</code> (Warm), <code>B0-B1</code> (Bump), "
                     "<code>R0-R3</code> (Reactivation), "
                     "<code>TA0-TA14</code>...<code>TH0-TH14</code> (Resume Bullets)\n"
@@ -13470,7 +13497,7 @@ def process_webhook_payload_async(data):
             edit_id, new_text = parts[0], parts[1].strip()
             target = resolve_edit_target(edit_id)
             if not target:
-                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L9, C0-C7, W0-W5, B0-B1, R0-R3, TA0-TA14...TH0-TH14.")
+                send_telegram_message(chat_id, f"❌ Unknown template ID: <code>{html.escape(edit_id)}</code>. Valid: L0-L9, C0-C7, RX0, W0-W5, B0-B1, R0-R3, TA0-TA14...TH0-TH14.")
                 return
             file_path, list_key, idx = target
             ok, result_msg = update_template_entry(file_path, list_key, idx, new_text)
