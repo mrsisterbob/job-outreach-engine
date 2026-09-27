@@ -12,7 +12,7 @@
     "Worked ACAT transfer exceptions across Schwab and Fidelity, clearing documentation holds before they aged past SLA.",
     "Reconciled advisory agreements against custodial records during an offboarding so the firm handed off active client files without a gap.",
     "Wrote down the escalation path for custodial transfers instead of leaving it to whoever picked up the ticket, cutting turnaround 25%.",
-    "Cleared $250k in ledger variances that had been sitting across institutional custody accounts, using SQL against internal reporting tables.",
+    "Reconciled institutional custody account records against internal reporting tables with SQL, clearing the variances that blocked month-end sign-off.",
     "Tracked onboarding throughput across a $2.5B AUM advisor platform to find the paperwork stages where client files were actually stalling.",
     "Chased documentation hold-ups with partner firms so an onboarding exception on a prospective client file never sat unresolved."
   ],
@@ -63,7 +63,7 @@
     "Handled the offboarding cutover on active client files, checking agreements against custodial data so nothing transferred half-finished."
   ],
   "track_d_business_intelligence": [
-    "Resolved $250k in ledger variances across institutional custody accounts using custom SQL queries.",
+    "Wrote SQL against internal reporting tables to reconcile institutional custody accounts and surface the variances behind each break.",
     {
       "text": "Chased down the 401(k) and healthcare deduction mismatches across 500+ employee accounts in bSwift and Excel until every ledger agreed.",
       "source_job": 3,
@@ -137,7 +137,7 @@
     },
     "Reconciled data from separate sites against one agreed source so recurring reporting came out right the first time.",
     "Maintained the supporting schedules behind recurring internal reports so variance analysis ran off one source instead of four workbooks.",
-    "Chased $250k of ledger variances across institutional accounts with SQL until the balances agreed.",
+    "Reconciled institutional account records against internal reporting tables with SQL until the balances agreed.",
     {
       "text": "Reviewed title records and supporting documentation so data stayed consistent across active sites rather than drifting site by site.",
       "source_job": 1,

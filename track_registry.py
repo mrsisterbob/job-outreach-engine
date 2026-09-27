@@ -67,7 +67,7 @@ TRACK_REGISTRY = {
         "prompt_label": "business intelligence & analytics",
         "subtitle": "Business Intelligence & Analytics",
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
-        "summary": "I write SQL and build Power BI dashboards that resolved $250k in ledger variances across institutional custody accounts.",
+        "summary": "I write SQL and build Power BI dashboards that reconcile institutional custody accounts and surface the variances behind each break.",
         "skills": [
             ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Advanced Excel Modeling."),
             ("Systems & Data", "Salesforce Reports, bSwift, Schwab Advisor Center, Fidelity Wealthscape, Python (pandas).")
