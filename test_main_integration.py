@@ -8493,10 +8493,105 @@ def test_links_separates_applied_rows_from_retired_ones(monkeypatch):
     msg = sent[-1]
     assert "You applied - posting came down (1)" in msg
     assert "Auto-retired to Died (1)" in msg
-    # The applied row leads, carries its takedown date, and says what it means.
-    assert msg.index("Huntington") < msg.index("Coric Equipment")
+    # The applied row leads and carries its takedown date. The retired row is now a count
+    # rather than a named line (see test_links_collapses_retired_rows_to_a_count), so the
+    # ordering that matters is the applied block coming before the retired heading.
+    assert msg.index("Huntington") < msg.index("Auto-retired to Died")
+    assert "Coric Equipment" not in msg
     assert "taken down" in msg and "(today)" in msg
     assert "not a rejection" in msg
+
+
+def _seed_dead_link_aged(sheet_uuid, company, role, status, days_ago, retired=0):
+    """A dead row whose FIRST death was `days_ago` days back, as the ledger would hold it."""
+    when = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
+    with m.get_db_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO job_link_status "
+            "(sheet_uuid, company, role, job_link, status, verdict, reason, retired, notified, "
+            " first_dead_at) "
+            "VALUES (?, ?, ?, ?, ?, 'dead', 'page says no longer available', ?, 0, ?)",
+            (sheet_uuid, company, role, "https://example.com/job", status, retired, when))
+        conn.commit()
+
+
+def test_links_shows_only_the_last_24h_not_the_whole_ledger(monkeypatch):
+    """The 89-row wall.
+
+    job_link_status never deletes, so /links was replaying every posting that had ever 404'd -
+    a day with two real deaths rendered as dozens, and pressing /linksx barely moved the count
+    because the old rows were already retired and already in Died. The default read is now the
+    last 24h. This drives the real command against the real table so the SQL window is what is
+    under test, not a stubbed reader.
+    """
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    _seed_dead_link_aged("u-fresh", "Yochana", "Jr. Analyst - Entry Level", "Applied", 0)
+    _seed_dead_link_aged("u-old", "Waldron Private Wealth", "Wealth Planner", "Applied", 5)
+    _seed_dead_link_aged("u-ancient", "OpTech", "IT Systems Analyst", "Matched", 7, retired=1)
+
+    _dispatch("/links")
+    msg = sent[-1]
+    assert "Yochana" in msg, "a posting that died today is the point of the report"
+    assert "Waldron" not in msg, "a five-day-old death is not news"
+    assert "OpTech" not in msg
+    assert "(last 24h)" in msg
+
+    # The full ledger stays one command away - nothing was deleted.
+    sent.clear()
+    _dispatch("/links all")
+    msg_all = sent[-1]
+    assert "Waldron" in msg_all and "OpTech" in msg_all
+    assert "(last 24h)" not in msg_all
+
+
+def test_links_collapses_retired_rows_to_a_count(monkeypatch):
+    """A retired row is finished business - noted, moved to Died, nothing left to do to it.
+
+    Naming each one is what buried the applied rows, the only half Kevin can act on.
+    """
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    _seed_dead_link_aged("u-app", "Huntington", "Foreign Exchange Ops Analyst 2", "Applied", 0)
+    _seed_dead_link_aged("u-r1", "Coric Equipment", "Treasury Analyst", "Matched", 0, retired=1)
+    _seed_dead_link_aged("u-r2", "HRU-Tech", "LMS Operations Analyst", "Matched", 0, retired=1)
+
+    _dispatch("/links")
+    msg = sent[-1]
+    assert "Auto-retired to Died (2)" in msg, "the count still tells him what the sweep did"
+    assert "Coric" not in msg and "HRU-Tech" not in msg, "but not one line each"
+    assert "Huntington" in msg, "the actionable row survives"
+
+
+def test_links_quotes_the_count_linksx_will_actually_archive(monkeypatch):
+    """The offer and the action must agree.
+
+    /links shows 24h; /linksx archives every un-retired row in the ledger. An offer reading
+    "archive all 1" that then archives 3 is what makes a button untrustworthy.
+    """
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    _seed_dead_link_aged("u-new", "Yochana", "Jr. Analyst", "Applied", 0)
+    _seed_dead_link_aged("u-old1", "Waldron", "Wealth Planner", "Applied", 4)
+    _seed_dead_link_aged("u-old2", "Dov Air", "Freight Payments Analyst", "Applied", 6)
+
+    _dispatch("/links")
+    msg = sent[-1]
+    assert "You applied - posting came down (1)" in msg, "only today's row is listed"
+    assert "archive all 3 to Died" in msg, "but the offer names what /linksx really touches"
+    assert "includes 2 older than 24h" in msg
+
+
+def test_links_distinguishes_a_quiet_day_from_an_empty_ledger(monkeypatch):
+    """"Nothing died today" and "the sweep has never recorded anything" are different facts."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    _seed_dead_link_aged("u-old", "Waldron", "Wealth Planner", "Applied", 9)
+
+    _dispatch("/links")
+    msg = sent[-1]
+    assert "Nothing died in the last 24h" in msg
+    assert "1 older death(s) on record" in msg, "so a quiet day never reads as a broken sweep"
 
 
 def test_each_death_is_reported_only_once(monkeypatch):

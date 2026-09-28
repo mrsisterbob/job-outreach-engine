@@ -9851,6 +9851,11 @@ LINK_CHECK_SLEEP = 0.8
 # A dead link may retire at most this many rows per pass, matching MAX_AUTO_KILLS_PER_RUN's
 # reasoning: overflow is reported, not written, and drains on the next run.
 MAX_AUTO_RETIRE_PER_RUN = 10
+# How far back /links looks by default. job_link_status never deletes, so the unwindowed read
+# is the entire history of every posting that ever 404'd - 89 rows on a day when two died.
+# Rolling hours, not "since midnight": first_dead_at is UTC (CURRENT_TIMESTAMP) and Kevin
+# reads in Eastern, so a midnight cut would file an 8pm death under the wrong day.
+DEAD_LINK_REPORT_WINDOW_HOURS = 24
 
 
 def fetch_job_link_state(url):
@@ -9995,17 +10000,35 @@ def _dead_since_label(first_dead_at):
     return f"{when.isoformat()} ({days}d ago)"
 
 
-def get_dead_job_links(include_notified=True, limit=40):
-    """Dead links recorded by the sweep, newest first."""
+def get_dead_job_links(include_notified=True, limit=40, since_hours=None):
+    """Dead links recorded by the sweep, newest first.
+
+    `since_hours` limits the read to postings whose FIRST death landed inside that rolling
+    window. Nothing is ever deleted from job_link_status, so without it this returns the whole
+    ledger - which is what /brief and the raw export want, and what made /links replay 89 rows
+    that had been dead for weeks. A row with a NULL first_dead_at is excluded from a windowed
+    read: an undated death cannot be shown to belong to today.
+
+    The window is rolling rather than "since local midnight" on purpose. first_dead_at is
+    written with SQLite's CURRENT_TIMESTAMP, which is UTC, while Kevin reads the report in
+    Eastern - a midnight boundary would push anything that died after 8pm onto the next day's
+    list. A rolling window never has to know the container's timezone.
+    """
     try:
         with get_db_conn() as conn:
             sql = """SELECT sheet_uuid, company, role, job_link, status, reason, retired,
                             first_dead_at
                      FROM job_link_status WHERE verdict = 'dead'"""
+            params = []
             if not include_notified:
                 sql += " AND notified = 0"
+            if since_hours is not None:
+                sql += (" AND first_dead_at IS NOT NULL"
+                        " AND first_dead_at >= datetime('now', ?)")
+                params.append(f"-{int(since_hours)} hours")
             sql += " ORDER BY first_dead_at DESC LIMIT ?"
-            return conn.execute(sql, (limit,)).fetchall()
+            params.append(limit)
+            return conn.execute(sql, tuple(params)).fetchall()
     except Exception as e:
         logging.error(f"[LINKCHECK] read error: {e}")
         return []
@@ -11988,6 +12011,12 @@ def process_webhook_payload_async(data):
             # is the one that actually moves rows. A sweep that retires rows the moment Kevin
             # types it gives him no way to see what it would do first.
             arg = text[len("/links"):].strip().lower()
+            # job_link_status is an append-only ledger - a posting that died three weeks ago is
+            # still in it with verdict='dead'. Reporting all of it turned a day with two real
+            # deaths into a wall of 89 rows, which reads as catastrophe and hides the two rows
+            # that actually changed. Default to the last 24h; "/links all" is the full ledger.
+            show_all = (arg == "all")
+            window_hours = None if show_all else DEAD_LINK_REPORT_WINDOW_HOURS
             if arg in ("check", "dry", "preview", "go"):
                 commit = (arg == "go")
                 send_telegram_message(
@@ -12029,13 +12058,24 @@ def process_webhook_payload_async(data):
                         + "\n\nRun <code>/links go</code> to apply."
                     )
                 send_telegram_message(chat_id, summary)
-            rows = get_dead_job_links()
+            rows = get_dead_job_links(since_hours=window_hours)
             if not rows:
-                send_telegram_message(
-                    chat_id,
-                    "🔗 <b>Dead Job Links</b>\n\nNone recorded. The sweep runs nightly at 07:45; "
-                    "preview one now with <code>/links check</code> (writes nothing)."
-                )
+                # "Nothing in 24h" and "nothing ever" are different facts, and answering the
+                # first with the second would read as a broken sweep on a quiet day.
+                if show_all:
+                    send_telegram_message(
+                        chat_id,
+                        "🔗 <b>Dead Job Links</b>\n\nNone recorded. The sweep runs nightly at "
+                        "07:45; preview one now with <code>/links check</code> (writes nothing)."
+                    )
+                else:
+                    total_ever = len(get_dead_job_links(limit=100000))
+                    send_telegram_message(
+                        chat_id,
+                        "🔗 <b>Dead Job Links</b>\n\n✅ <b>Nothing died in the last 24h.</b>"
+                        + (f"\n<i>{total_ever} older death(s) on record - "
+                           "<code>/links all</code>.</i>" if total_ever else "")
+                    )
                 return
             # Split by what Kevin can DO about each, rather than listing them together. A retired
             # row is finished - it is reported once and needs nothing. An APPLIED row whose posting
@@ -12044,7 +12084,8 @@ def process_webhook_payload_async(data):
             # digest read as noise.
             retired_rows = [r for r in rows if r[6]]
             applied_rows = [r for r in rows if not r[6]]
-            lines = ["🔗 <b>Dead Job Links</b>\n"]
+            lines = ["🔗 <b>Dead Job Links</b>"
+                     + ("" if show_all else " <i>(last 24h)</i>") + "\n"]
 
             if applied_rows:
                 lines.append(f"▶ <b>You applied - posting came down ({len(applied_rows)})</b>")
@@ -12055,21 +12096,35 @@ def process_webhook_payload_async(data):
                         f"  taken down {down} · still in {html.escape(str(status or '?'))}\n"
                         f"  🆔 <code>{html.escape(str(uuid_v))}</code>"
                     )
+                # /linksx archives every un-retired row in the ledger, not just the windowed
+                # ones shown above. Quote ITS count, not len(applied_rows) - an offer that says
+                # "archive all 2" and then archives 14 is the kind of mismatch that makes the
+                # button untrustworthy.
+                linksx_total = len([r for r in get_dead_job_links(limit=100000) if not r[6]])
+                older = linksx_total - len(applied_rows)
                 lines.append(
                     "<i>They stopped sourcing - that is not a rejection. Worth a status chase "
                     "while the req is fresh. <code>/x</code> on the card archives one; "
                     "<code>/dead</code> only records the decoy and leaves the row alone.</i>\n"
-                    f"⚰️ <code>/linksx</code> - archive all {len(applied_rows)} to Died "
-                    "<i>(no reply needed)</i>\n"
+                    f"⚰️ <code>/linksx</code> - archive all {linksx_total} to Died "
+                    + (f"<i>(includes {older} older than 24h)</i>" if older > 0
+                       else "<i>(no reply needed)</i>") + "\n"
                 )
 
             if retired_rows:
-                lines.append(f"▶ <b>Auto-retired to Died ({len(retired_rows)})</b> <i>— no action needed</i>")
-                for uuid_v, company, role, link, status, reason, _retired, first_dead in retired_rows:
-                    lines.append(
-                        f"⚰️ <b>{html.escape(str(company or '?'))}</b> - {html.escape(str(role or '?'))}"
-                        f" · {_dead_since_label(first_dead)}"
-                    )
+                # A retired row is finished: already noted, already moved to Died, nothing left
+                # to do to it. Naming every one of them is what buried the applied rows - the
+                # only half of this report Kevin can act on. Count here, names behind /links all.
+                lines.append(
+                    f"▶ <b>Auto-retired to Died ({len(retired_rows)})</b> <i>— no action needed</i>")
+                if show_all:
+                    for uuid_v, company, role, link, status, reason, _retired, first_dead in retired_rows:
+                        lines.append(
+                            f"⚰️ <b>{html.escape(str(company or '?'))}</b> - {html.escape(str(role or '?'))}"
+                            f" · {_dead_since_label(first_dead)}"
+                        )
+                else:
+                    lines.append("<i>Names: <code>/links all</code></i>")
             send_telegram_message(chat_id, "\n".join(lines))
             return
 
