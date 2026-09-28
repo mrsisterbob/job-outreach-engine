@@ -377,7 +377,7 @@ def test_the_links_card_advertises_linksx_when_rows_are_waiting(monkeypatch):
     _dispatch("/links")
 
     assert "/linksx" in sent[0]
-    assert "archive all 1 to Died" in sent[0]
+    assert "move the 1 above into the Died tab" in sent[0]
 
 
 def test_an_undeployed_apps_script_cannot_silently_disable_the_died_gate(monkeypatch):
@@ -8564,10 +8564,11 @@ def test_links_collapses_retired_rows_to_a_count(monkeypatch):
 
 
 def test_links_quotes_the_count_linksx_will_actually_archive(monkeypatch):
-    """The offer and the action must agree.
+    """The offer and the action must agree, and BOTH are scoped to the last 24h.
 
-    /links shows 24h; /linksx archives every un-retired row in the ledger. An offer reading
-    "archive all 1" that then archives 3 is what makes a button untrustworthy.
+    Kevin acts on what died today. /linksx used to archive every un-retired row in the ledger,
+    so a bare /linksx under a list of 1 moved rows from a week ago that he had already decided
+    about and never saw in the report. Offer and action now name the same windowed set.
     """
     sent = []
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
@@ -8578,8 +8579,22 @@ def test_links_quotes_the_count_linksx_will_actually_archive(monkeypatch):
     _dispatch("/links")
     msg = sent[-1]
     assert "You applied - posting came down (1)" in msg, "only today's row is listed"
-    assert "archive all 3 to Died" in msg, "but the offer names what /linksx really touches"
-    assert "includes 2 older than 24h" in msg
+    assert "move the 1 above into the Died tab" in msg, "the offer is exactly the list above it"
+    assert "2 older left alone" in msg, "and it says what it will NOT touch"
+
+    # Drive the real command: what it WRITES is the contract, not what /links advertised.
+    moved = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: moved.append(p) or 1)
+    monkeypatch.setattr(m, "record_died_role", lambda *a, **k: None)
+    _dispatch("/linksx")
+
+    to_died = {p.get("sheet_uuid") for p in moved if p.get("new_tab") == "Died"}
+    assert to_died == {"u-new"}, f"only today's death is moved, got {to_died}"
+    assert "u-old1" not in to_died and "u-old2" not in to_died, "older rows are left in place"
+
+    report = sent[-1]
+    assert "Moved 1 dead posting(s) to Died." in report
+    assert "gone from their old tab" in report, "the report says the sheet row actually moved"
 
 
 def test_links_distinguishes_a_quiet_day_from_an_empty_ledger(monkeypatch):

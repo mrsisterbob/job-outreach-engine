@@ -10034,6 +10034,19 @@ def get_dead_job_links(include_notified=True, limit=40, since_hours=None):
         return []
 
 
+def _older_unretired_dead_count():
+    """How many un-retired dead rows sit OUTSIDE the 24h report window.
+
+    /links and /linksx both act on the last 24h only, so this is the backlog neither one will
+    touch. Reported as a count so "nothing to archive" cannot be read as "nothing is on record"
+    on a day when a week of older deaths is still sitting in the ledger.
+    """
+    recent = {r[0] for r in get_dead_job_links(
+        limit=100000, since_hours=DEAD_LINK_REPORT_WINDOW_HOURS)}
+    return len([r for r in get_dead_job_links(limit=100000)
+                if not r[6] and r[0] not in recent])
+
+
 def mark_dead_links_notified(uuids):
     """Flag these as already surfaced so the digest reports each death once."""
     if not uuids:
@@ -12096,18 +12109,21 @@ def process_webhook_payload_async(data):
                         f"  taken down {down} · still in {html.escape(str(status or '?'))}\n"
                         f"  🆔 <code>{html.escape(str(uuid_v))}</code>"
                     )
-                # /linksx archives every un-retired row in the ledger, not just the windowed
-                # ones shown above. Quote ITS count, not len(applied_rows) - an offer that says
-                # "archive all 2" and then archives 14 is the kind of mismatch that makes the
-                # button untrustworthy.
-                linksx_total = len([r for r in get_dead_job_links(limit=100000) if not r[6]])
-                older = linksx_total - len(applied_rows)
+                # /linksx acts on the same 24h window this report shows, so the offer is exactly
+                # the rows listed above. Quoting a ledger-wide count here is what made the button
+                # say "archive all 14" under a list of 2 and then move rows Kevin never saw.
+                # On "/links all" the listed set is wider than what /linksx would take, so the
+                # offer still quotes the windowed count and says so.
+                older = _older_unretired_dead_count()
                 lines.append(
                     "<i>They stopped sourcing - that is not a rejection. Worth a status chase "
                     "while the req is fresh. <code>/x</code> on the card archives one; "
                     "<code>/dead</code> only records the decoy and leaves the row alone.</i>\n"
-                    f"⚰️ <code>/linksx</code> - archive all {linksx_total} to Died "
-                    + (f"<i>(includes {older} older than 24h)</i>" if older > 0
+                    f"⚰️ <code>/linksx</code> - move "
+                    + (f"the {len(applied_rows)} above" if not show_all
+                       else f"the last 24h ({len(applied_rows) - older} of these)")
+                    + " into the Died tab "
+                    + (f"<i>({older} older left alone)</i>" if older > 0
                        else "<i>(no reply needed)</i>") + "\n"
                 )
 
@@ -12136,17 +12152,27 @@ def process_webhook_payload_async(data):
             # filled, paused, or simply re-listed, and burying it automatically would lose a live
             # application. So those rows sit in the report until he decides. This is that decision,
             # taken for all of them at once instead of hunting down each card to swipe /x.
-            # Unwindowed AND unlimited, to match the count /links offers. The default limit=40
-            # would archive the first 40 of an "archive all 57" offer and report 40 - the exact
-            # mismatch the offer text at the /links call site is written to avoid.
-            rows = [r for r in get_dead_job_links(limit=100000) if not r[6]]
+            # Windowed to the same last 24h /links reports, and unlimited within it. Kevin only
+            # acts on what died today: an unwindowed read replayed deaths from a week ago that he
+            # had already decided about, and archiving those on a bare /linksx moved rows he never
+            # saw in the report. The limit stays high so "archive all N" archives all N - the
+            # default limit=40 would archive the first 40 of an offer of 57 and report 40.
+            rows = [r for r in get_dead_job_links(
+                limit=100000, since_hours=DEAD_LINK_REPORT_WINDOW_HOURS) if not r[6]]
             if not rows:
                 send_telegram_message(
                     chat_id,
-                    "✅ <b>Nothing to archive.</b>\n<i>No dead-link rows are waiting on you - "
-                    "anything the sweep could retire on its own already went to Died.</i>"
+                    "✅ <b>Nothing to archive.</b>\n<i>Nothing died in the last 24h that is "
+                    "waiting on you - anything the sweep could retire on its own already went "
+                    "to Died.</i>"
+                    + (f"\n<i>{_older_unretired_dead_count()} older death(s) are on record and "
+                       "were left alone. <code>/links all</code> to see them.</i>"
+                       if _older_unretired_dead_count() else "")
                 )
                 return
+            # Counted BEFORE the archive writes, while these rows are still un-retired - after
+            # mark_dead_links_notified the arithmetic would no longer describe what was skipped.
+            older_left = _older_unretired_dead_count() - len(rows)
             today_str = datetime.now().strftime("%Y-%m-%d")
             archived = []
             for uuid_v, company, role, _link, _status, reason, _retired, _first_dead in rows:
@@ -12164,9 +12190,14 @@ def process_webhook_payload_async(data):
             mark_dead_links_notified([r[0] for r in rows])
             send_telegram_message(
                 chat_id,
-                f"⚰️ <b>Archived {len(archived)} dead posting(s) to Died.</b>\n\n"
+                f"⚰️ <b>Moved {len(archived)} dead posting(s) to Died.</b> "
+                "<i>(died in the last 24h)</i>\n"
+                "<b>These rows are gone from their old tab</b> - each one was just moved into "
+                "the Died tab of the sheet.\n\n"
                 + "\n".join(archived[:20])
                 + "\n\n<i>Each role is now forbidden from /t - a repost will not come back.</i>"
+                + (f"\n<i>{older_left} older death(s) left alone - <code>/links all</code>.</i>"
+                   if older_left else "")
             )
             return
 
