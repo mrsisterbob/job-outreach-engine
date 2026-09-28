@@ -12136,7 +12136,10 @@ def process_webhook_payload_async(data):
             # filled, paused, or simply re-listed, and burying it automatically would lose a live
             # application. So those rows sit in the report until he decides. This is that decision,
             # taken for all of them at once instead of hunting down each card to swipe /x.
-            rows = [r for r in get_dead_job_links() if not r[6]]
+            # Unwindowed AND unlimited, to match the count /links offers. The default limit=40
+            # would archive the first 40 of an "archive all 57" offer and report 40 - the exact
+            # mismatch the offer text at the /links call site is written to avoid.
+            rows = [r for r in get_dead_job_links(limit=100000) if not r[6]]
             if not rows:
                 send_telegram_message(
                     chat_id,
