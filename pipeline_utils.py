@@ -1766,29 +1766,136 @@ def parse_job_command(text_input):
     The explicit form is the fallback for when LinkedIn blocks the server-side fetch: everything
     before the '@' is the title, everything after it (minus a trailing URL) is the company.
 
+    Only the FIRST url is returned, for back-compat with callers that expect a 3-tuple. Use
+    parse_job_command_urls() to get every pasted link - one posting is commonly reachable at a
+    LinkedIn, an ATS and an aggregator URL, and which of the three answers a server-side GET is
+    not predictable from the link alone.
+
     Returns None when no URL and no '@' form is present - i.e. nothing usable.
     """
+    parsed = parse_job_command_urls(text_input)
+    if not parsed:
+        return None
+    title, company, urls = parsed
+    return (title, company, urls[0] if urls else "")
+
+
+def parse_job_command_urls(text_input):
+    """Parse `/job` into (title, company, [url, ...]) keeping EVERY pasted link, in order.
+
+    Kevin pastes the same posting from several hosts at once because they fail independently: a
+    LinkedIn permalink 302s to a directory page once the posting expires, ZipRecruiter answers a
+    datacenter IP with 403, and the employer's own ATS page usually answers a plain GET with the
+    full JSON-LD. Taking only the first link threw away the two that would have worked.
+
+    Links may be comma- or whitespace-separated. Trailing commas and a trailing ')' or '.' are
+    stripped, since those come from prose rather than the URL.
+
+    Returns None when nothing usable is present.
+    """
     body = str(text_input or "").strip()
-    # Strip the leading /job or /j token
-    body = re.sub(r"^/(?:job|j)\b\s*", "", body, flags=re.IGNORECASE).strip()
+    # Strip the leading /job, /j, /job! or /j! token
+    body = re.sub(r"^/(?:job|j)!?\b\s*", "", body, flags=re.IGNORECASE).strip()
     if not body:
         return None
 
-    # A URL may sit anywhere in the text; pull the first one out and treat the rest as title/company.
-    url_match = re.search(r"https?://\S+", body)
-    url = url_match.group(0).rstrip(".,);") if url_match else ""
-    remainder = (body[:url_match.start()] + " " + body[url_match.end():]).strip() if url_match else body
+    urls = []
+    for raw in re.findall(r"https?://[^\s,]+", body):
+        cleaned = raw.rstrip(".,);")
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
 
+    # Everything that is not a URL is candidate title/company text.
+    remainder = re.sub(r"https?://[^\s,]+", " ", body).strip(" ,")
+
+    title = company = None
     if "@" in remainder:
         title_part, _, company_part = remainder.partition("@")
-        title = title_part.strip(" -–—")
-        company = company_part.strip(" -–—")
-        if title and company:
-            return (title, company, url)
+        t = title_part.strip(" -–—,")
+        c = company_part.strip(" -–—,")
+        if t and c:
+            title, company = t, c
 
-    if url:
-        return (None, None, url)
+    if urls or (title and company):
+        return (title, company, urls)
     return None
+
+
+# A LinkedIn posting that has closed no longer 404s - it answers 200 and redirects to a generic
+# "<keyword> jobs" directory page, which parses as a perfectly valid page for the WRONG job. The
+# redirect is the only reliable signal, so the final URL is what gets inspected, not the body.
+_EXPIRED_REDIRECT_MARKERS = ("expired_jd_redirect", "trk=expired")
+
+
+def is_expired_job_redirect(final_url, requested_url=""):
+    """True when a fetch landed on a directory page because the posting itself is gone.
+
+    LinkedIn signals this with `?trk=expired_jd_redirect` on a `/jobs/<keyword>-jobs` URL. Treating
+    that page as a scrape result is worse than failing: it yields a real title and company for a
+    role Kevin never asked about, which would land a card and a CRM row for the wrong job.
+    """
+    final = str(final_url or "").strip().lower()
+    if not final:
+        return False
+    if any(marker in final for marker in _EXPIRED_REDIRECT_MARKERS):
+        return True
+    # A /jobs/view/<id> request that comes back on a /jobs/<keyword>-jobs listing page has been
+    # bounced, even when the tracking param is absent.
+    requested = str(requested_url or "").strip().lower()
+    if "/jobs/view/" in requested and re.search(r"/jobs/[a-z0-9-]+-jobs(?:\?|/|$)", final):
+        return True
+    return False
+
+
+# LinkedIn builds its job permalinks as <title-slug>-at-<company-slug>-<numeric id>. That slug is
+# the posting's own title and employer, already in the URL Kevin pasted - so an auth wall, a 403 or
+# an expired redirect does not actually leave us with nothing to go on.
+_SLUG_ACRONYMS = {"f-i": "F&I", "hr": "HR", "it": "IT", "ap": "AP", "ar": "AR", "fx": "FX"}
+
+
+def _titleize_slug(slug_part):
+    """Turn a hyphenated URL slug fragment into display text, restoring known acronyms."""
+    raw = str(slug_part or "").strip("-")
+    if not raw:
+        return ""
+    for token, display in _SLUG_ACRONYMS.items():
+        raw = re.sub(rf"(?:^|-){token}(?:-|$)", f"-{display}-", raw, flags=re.IGNORECASE)
+    words = [w for w in raw.split("-") if w]
+    out = []
+    for w in words:
+        if w in _SLUG_ACRONYMS.values():
+            out.append(w)
+        elif len(w) <= 2 and w.lower() in {"of", "in", "at", "to", "on"}:
+            out.append(w.lower())
+        else:
+            out.append(w[:1].upper() + w[1:].lower())
+    return " ".join(out).strip()
+
+
+def title_company_from_linkedin_slug(url):
+    """Best-effort (title, company) read straight out of a LinkedIn job permalink slug.
+
+    `/jobs/view/automotive-finance-and-insurance-manager-f-i-at-serra-ford-farmington-hills-4459302636/`
+    yields ("Automotive Finance And Insurance Manager F&I", "Serra Ford Farmington Hills").
+
+    The split is on the LAST `-at-`, because a title may legitimately contain it ("Manager At Large")
+    while the separator LinkedIn inserts is always the final one before the company. Returns
+    ("", "") when the URL carries no slug - a bare /jobs/view/<id>/ permalink has nothing to read.
+
+    This is deliberately a LAST resort: the company is a slug, so "3M" comes back "3m" and
+    punctuation is lost. A slightly-off name on a real card still beats making Kevin retype it.
+    """
+    raw = str(url or "").strip()
+    if "linkedin.com" not in raw.lower():
+        return ("", "")
+    m = re.search(r"/jobs/view/([a-z0-9][a-z0-9-]*?)-(\d{6,})(?:/|\?|$)", raw, flags=re.IGNORECASE)
+    if not m:
+        return ("", "")
+    slug = m.group(1)
+    idx = slug.lower().rfind("-at-")
+    if idx == -1:
+        return (_titleize_slug(slug), "")
+    return (_titleize_slug(slug[:idx]), _titleize_slug(slug[idx + 4:]))
 
 
 def parse_job_page_html(html_text):

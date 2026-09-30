@@ -52,7 +52,8 @@ from pipeline_utils import (
     MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
     classify_job_link, may_auto_retire, is_opaque_job_host, is_opaque_link_reason, split_link_check_budget,
-    parse_job_command, parse_job_page_html, build_ingest_job_dict, extract_jd_terms,
+    parse_job_command, parse_job_command_urls, parse_job_page_html, build_ingest_job_dict,
+    is_expired_job_redirect, title_company_from_linkedin_slug, extract_jd_terms,
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
     strip_tracking_params, strip_html_to_text,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
@@ -11151,40 +11152,103 @@ def scrape_job_page(url, timeout=12):
     Returns ("", "", "") when nothing usable comes back, which is a NORMAL outcome (auth wall, JS-
     only page, bot challenge) - callers must treat it as "ask Kevin to type it", never as an error.
     """
-    attempts = []
-    job_id = None
+    title, company, description, _expired = scrape_job_page_detailed(url, timeout=timeout)
+    return (title, company, description)
+
+
+# Jina's reader proxy renders JavaScript and fetches from ITS OWN IP, which is the point: a
+# datacenter address (Render's) gets 403/999 from ZipRecruiter and LinkedIn where a residential one
+# does not, so no amount of header spoofing from the container fixes it. Last resort only - it is a
+# third party that sees the URL, and it returns prose rather than markup, so it can supply a
+# description but never a reliable company name.
+_JINA_READER_URL = "https://r.jina.ai/{url}"
+
+
+def _scrape_one_url(attempt_url, timeout):
+    """Fetch and parse ONE url -> (title, company, description, expired). Never raises."""
     try:
-        from pipeline_utils import extract_linkedin_job_id
-        if is_linkedin_job_url(url):
-            job_id = extract_linkedin_job_id(url)
-    except Exception:
-        pass
+        res = requests.get(attempt_url, headers=_JOB_SCRAPE_HEADERS, timeout=timeout, allow_redirects=True)
+    except Exception as e:
+        logging.warning(f"[INGEST] Fetch failed for {attempt_url}: {e}")
+        return ("", "", "", False)
+    # An expired posting answers 200 and redirects to a generic directory page that parses
+    # cleanly as the WRONG job. Check the landing URL before trusting the body.
+    if is_expired_job_redirect(getattr(res, "url", ""), attempt_url):
+        logging.warning(f"[INGEST] {attempt_url} redirected to a directory page - posting has expired")
+        return ("", "", "", True)
+    if res.status_code != 200 or not res.text:
+        logging.warning(f"[INGEST] HTTP {res.status_code} for {attempt_url}")
+        return ("", "", "", False)
+    title, company, description = parse_job_page_html(res.text)
+    if title or company:
+        logging.info(f"[INGEST] Scraped '{title}' @ '{company}' ({len(description)} desc chars) from {attempt_url}")
+    return (title, company, description, False)
 
-    if job_id:
-        attempts.append(_LINKEDIN_GUEST_JOB_URL.format(job_id=job_id))
-        attempts.append(canonical_linkedin_job_url(url))
-    elif url:
-        attempts.append(str(url))
 
-    for attempt_url in attempts:
+def scrape_job_page_detailed(url, timeout=12, extra_urls=None):
+    """scrape_job_page() plus an `expired` flag -> (title, company, description, expired).
+
+    `extra_urls` are additional links to the SAME posting, tried in order after the primary one.
+    Kevin pastes a LinkedIn, an ATS and an aggregator link together precisely because they fail
+    independently, and the first one is not the likeliest to work - the employer's own ATS page
+    usually is.
+
+    `expired` is True only when a LinkedIn fetch was bounced to a directory page. It is reported
+    separately from failure because it means something different and actionable: the posting is
+    closed, so no amount of retrying or retyping will help.
+    """
+    candidates = [str(url)] if url else []
+    for extra in (extra_urls or []):
+        if extra and str(extra) not in candidates:
+            candidates.append(str(extra))
+
+    attempts = []
+    for candidate in candidates:
+        job_id = None
         try:
-            res = requests.get(attempt_url, headers=_JOB_SCRAPE_HEADERS, timeout=timeout, allow_redirects=True)
-        except Exception as e:
-            logging.warning(f"[INGEST] Fetch failed for {attempt_url}: {e}")
+            from pipeline_utils import extract_linkedin_job_id
+            if is_linkedin_job_url(candidate):
+                job_id = extract_linkedin_job_id(candidate)
+        except Exception:
+            pass
+        if job_id:
+            # The guest endpoint first: it serves the posting without an auth wall and survives
+            # expiry, where the canonical /jobs/view/ permalink gets redirected away.
+            attempts.append(_LINKEDIN_GUEST_JOB_URL.format(job_id=job_id))
+            attempts.append(canonical_linkedin_job_url(candidate))
+        else:
+            attempts.append(candidate)
+
+    seen = set()
+    any_expired = False
+    best_desc = ""
+    for attempt_url in attempts:
+        if attempt_url in seen:
             continue
-        if res.status_code != 200 or not res.text:
-            logging.warning(f"[INGEST] HTTP {res.status_code} for {attempt_url}")
-            continue
-        title, company, description = parse_job_page_html(res.text)
+        seen.add(attempt_url)
+        title, company, description, expired = _scrape_one_url(attempt_url, timeout)
+        any_expired = any_expired or expired
         if title or company:
-            logging.info(f"[INGEST] Scraped '{title}' @ '{company}' ({len(description)} desc chars) from {attempt_url}")
-            return (title, company, description)
+            return (title, company, description, any_expired)
+        if description and not best_desc:
+            best_desc = description
+
+    # Every direct fetch failed. Try the reader proxy on each original link - it renders JS and
+    # comes from a residential-looking IP, so it clears the bot walls the container cannot.
+    for candidate in candidates:
+        try:
+            res = requests.get(_JINA_READER_URL.format(url=candidate), timeout=max(timeout, 30))
+            if res.status_code == 200 and res.text and len(res.text) > 200:
+                logging.info(f"[INGEST] Reader proxy returned {len(res.text)} chars for {candidate}")
+                return ("", "", res.text.strip()[:20000], any_expired)
+        except Exception as e:
+            logging.warning(f"[INGEST] Reader proxy failed for {candidate}: {e}")
 
     logging.info(f"[INGEST] No usable content scraped from {url} - auth wall, JS-only page, or unsupported layout")
-    return ("", "", "")
+    return ("", "", best_desc, any_expired)
 
 
-def ingest_manual_job(url="", title="", company="", description="", chat_id=None, source_label="/job", force=False):
+def ingest_manual_job(url="", title="", company="", description="", chat_id=None, source_label="/job", force=False, extra_urls=None):
     """Run one hand-picked posting through the exact Stage 2 path /t uses, then land it in the CRM.
 
     This is the shared core behind the Telegram /job command and the desktop bookmarklet's
@@ -11203,24 +11267,61 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
     # Scrape ANY posting URL, not just LinkedIn: employer careers pages (the destination behind
     # LinkedIn's own Apply button) answer a plain GET with a full schema.org JobPosting block,
     # so they are the better source whenever Kevin has that link.
-    scraped_title, scraped_company, scraped_desc = ("", "", "")
+    scraped_title, scraped_company, scraped_desc, expired = ("", "", "", False)
     if url and not (title and company):
-        scraped_title, scraped_company, scraped_desc = scrape_job_page(url)
+        scraped_title, scraped_company, scraped_desc, expired = scrape_job_page_detailed(
+            url, extra_urls=extra_urls
+        )
 
     final_title = (title or scraped_title or "").strip()
     final_company = (company or scraped_company or "").strip()
     final_desc = (description or scraped_desc or "").strip()
 
+    # Last resort before giving up: LinkedIn puts the title and employer in the permalink slug, so
+    # a blocked fetch still leaves them sitting in the URL Kevin already pasted. Reading them there
+    # is what keeps an auth wall or an expired posting from turning into "retype it by hand".
+    slug_used = False
     if not (final_title and final_company):
+        for candidate in [url] + list(extra_urls or []):
+            slug_title, slug_company = title_company_from_linkedin_slug(candidate)
+            if slug_title and slug_company:
+                final_title = final_title or slug_title
+                final_company = final_company or slug_company
+                slug_used = True
+                logging.info(f"[INGEST] Recovered '{final_title}' @ '{final_company}' from the URL slug")
+                break
+
+    if not (final_title and final_company):
+        if expired:
+            return (False, (
+                "🪦 <b>That posting has expired.</b> LinkedIn bounced the link to a generic jobs "
+                "page, which means it is closed - retyping it will not help.\n\n"
+                "If you still want the company in the pipeline, paste the employer's own careers "
+                "link, or name it:\n"
+                f"<code>/job {html.escape(str(final_title or 'Title'))} @ Company</code>"
+            ))
         blocked_host = "LinkedIn" if is_linkedin_job_url(url) else "That page"
         return (False, (
             f"🔒 <b>{blocked_host} didn't return a readable posting.</b> Usually an auth wall or a "
             "JavaScript-only page.\n\n"
-            "Send it with the title and company spelled out instead:\n"
+            "Paste the employer's own careers link too - it usually answers where the aggregators "
+            "block. Or spell it out:\n"
             f"<code>/job Foreign Exchange Ops Analyst 2 @ Huntington National Bank {html.escape(str(url or ''))}</code>"
         ))
 
     job = build_ingest_job_dict(final_title, final_company, final_desc, url)
+
+    # A posting can scrape cleanly from an ATS mirror while the LinkedIn original is already
+    # closed. Say so up front rather than landing it silently: applying is pointless, but the
+    # employer may still be worth outreach, so the row is still worth having.
+    if expired or slug_used:
+        notes = []
+        if expired:
+            notes.append("🪦 LinkedIn shows this posting as <b>expired</b> - the row lands, but the apply link is dead.")
+        if slug_used:
+            notes.append("✏️ Title/company were read from the URL slug, so check the spelling on the card.")
+        if chat_id:
+            send_telegram_message(chat_id, "\n".join(notes))
 
     # Dedup against roles already TRACKED in a job tab, not against everything /t has ever
     # glanced at - re-pasting a link for a role with no CRM row should still produce a card.
@@ -11715,18 +11816,21 @@ def process_webhook_payload_async(data):
         # Stage 2 path /t uses, so it lands in Tetiana Cold (or Clavicular) as a real card with a
         # live sheet_uuid - swipe-reply, the follow-up sequencer and /funnel all work on it after.
         if re.match(r"^/(job|j)\b", text, re.IGNORECASE):
-            parsed = parse_job_command(text)
+            parsed = parse_job_command_urls(text)
             if not parsed:
                 send_telegram_message(
                     chat_id,
                     "📋 <b>Add a job to the pipeline</b>\n\n"
-                    "Paste the link:\n"
+                    "Paste the link - or several for the same job, and the first one that "
+                    "answers wins:\n"
                     "<code>/job https://www.linkedin.com/jobs/view/4461280495/</code>\n\n"
-                    "If LinkedIn blocks the read, spell it out:\n"
+                    "If every host blocks the read, spell it out:\n"
                     "<code>/job Foreign Exchange Ops Analyst 2 @ Huntington National Bank</code>"
                 )
                 return
-            ing_title, ing_company, ing_url = parsed
+            ing_title, ing_company, ing_urls = parsed
+            ing_url = ing_urls[0] if ing_urls else ""
+            ing_extra = ing_urls[1:]
             # "/job!" overrides the tracked-role gate, for the case the gate gets wrong: the row was
             # deleted by hand, or Sheets was unreachable when the suppression set was last built.
             ing_force = bool(re.match(r"^/(job|j)!", text, re.IGNORECASE))
@@ -11739,9 +11843,9 @@ def process_webhook_payload_async(data):
                  "(Gemini fit, alumni lookup, warm routing).")
             )
 
-            def _ingest_and_report(u=ing_url, t=ing_title, c=ing_company, cid=chat_id, force=ing_force):
+            def _ingest_and_report(u=ing_url, t=ing_title, c=ing_company, cid=chat_id, force=ing_force, extra=ing_extra):
                 try:
-                    ok, message = ingest_manual_job(url=u, title=t or "", company=c or "", chat_id=cid, source_label="/job", force=force)
+                    ok, message = ingest_manual_job(url=u, title=t or "", company=c or "", chat_id=cid, source_label="/job", force=force, extra_urls=extra)
                     if not ok and message:
                         send_telegram_message(cid, message)
                 except Exception as e:

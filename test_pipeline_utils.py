@@ -1675,6 +1675,77 @@ def test_parse_job_command_explicit_form_without_a_url():
     assert pu.parse_job_command("/job Analyst @ Ally") == ("Analyst", "Ally", "")
 
 
+SERRA_SLUG_URL = ("https://www.linkedin.com/jobs/view/"
+                  "automotive-finance-and-insurance-manager-f-i-at-serra-ford-farmington-hills-4459302636/")
+
+
+def test_parse_job_command_urls_keeps_every_pasted_link():
+    """One posting, three hosts, three different failure modes - all three must survive parsing."""
+    title, company, urls = pu.parse_job_command_urls(
+        "/job https://www.linkedin.com/jobs/view/4459302636/, "
+        "https://careers.hireology.com/x/2847385/description,,"
+        "https://www.ziprecruiter.com/jobs/serra/fi?lvk=abc"
+    )
+    assert title is None and company is None
+    assert len(urls) == 3, urls
+    assert urls[1].endswith("/description")
+    assert "ziprecruiter" in urls[2]
+
+
+def test_parse_job_command_urls_dedups_and_survives_the_bang_form():
+    _, _, urls = pu.parse_job_command_urls("/job! https://a.com/x https://a.com/x https://b.com/y")
+    assert urls == ["https://a.com/x", "https://b.com/y"]
+
+
+def test_parse_job_command_still_returns_a_three_tuple():
+    """Back-compat: the bookmarklet path and existing callers unpack three values."""
+    assert pu.parse_job_command("/job Analyst @ Ally") == ("Analyst", "Ally", "")
+    t, c, u = pu.parse_job_command(f"/job {SERRA_SLUG_URL}")
+    assert (t, c) == (None, None) and u == SERRA_SLUG_URL
+
+
+def test_title_company_from_linkedin_slug_reads_the_real_posting():
+    title, company = pu.title_company_from_linkedin_slug(SERRA_SLUG_URL)
+    assert company == "Serra Ford Farmington Hills"
+    assert title == "Automotive Finance And Insurance Manager F&I"
+
+
+def test_title_company_from_linkedin_slug_splits_on_the_LAST_at():
+    """A title may contain '-at-'; the separator LinkedIn inserts is always the final one."""
+    title, company = pu.title_company_from_linkedin_slug(
+        "https://www.linkedin.com/jobs/view/manager-at-large-at-huntington-bank-4461280495/"
+    )
+    assert company == "Huntington Bank"
+    assert title == "Manager at Large"
+
+
+def test_title_company_from_linkedin_slug_is_empty_without_a_slug():
+    assert pu.title_company_from_linkedin_slug("https://www.linkedin.com/jobs/view/4459302636/") == ("", "")
+    assert pu.title_company_from_linkedin_slug("https://careers.hireology.com/x/123/description") == ("", "")
+
+
+def test_is_expired_job_redirect_catches_the_directory_bounce():
+    """An expired posting 200s onto a generic listing page that parses as the WRONG job."""
+    assert pu.is_expired_job_redirect(
+        "https://www.linkedin.com/jobs/group-risk-manager-jobs?trk=expired_jd_redirect",
+        "https://www.linkedin.com/jobs/view/4459302636/",
+    ) is True
+    # Bounced to a directory page even without the tracking param.
+    assert pu.is_expired_job_redirect(
+        "https://www.linkedin.com/jobs/group-risk-manager-jobs",
+        "https://www.linkedin.com/jobs/view/4459302636/",
+    ) is True
+
+
+def test_is_expired_job_redirect_leaves_good_pages_alone():
+    assert pu.is_expired_job_redirect(SERRA_SLUG_URL, SERRA_SLUG_URL) is False
+    assert pu.is_expired_job_redirect(
+        "https://careers.hireology.com/x/2847385/description",
+        "https://careers.hireology.com/x/2847385/description",
+    ) is False
+    assert pu.is_expired_job_redirect("", "https://www.linkedin.com/jobs/view/1/") is False
+
+
 def test_parse_job_command_rejects_unusable_input():
     assert pu.parse_job_command("/job") is None
     assert pu.parse_job_command("/job    ") is None

@@ -5074,6 +5074,126 @@ def test_ingest_manual_job_lands_a_row_and_a_card(monkeypatch):
     assert "TC" in captured
 
 
+class _FakeResponse:
+    def __init__(self, status_code=200, text="", url=""):
+        self.status_code = status_code
+        self.text = text
+        self.url = url
+
+
+# Frozen from the real 2026-09-30 fetches of the Serra Ford posting Kevin pasted. All three links
+# were for the SAME job and all three behaved differently: LinkedIn had expired, ZipRecruiter
+# 403'd a datacenter IP, and only the employer's Hireology page answered.
+_SERRA_LI = ("https://www.linkedin.com/jobs/view/"
+             "automotive-finance-and-insurance-manager-f-i-at-serra-ford-farmington-hills-4459302636/")
+_SERRA_HIREOLOGY = "https://careers.hireology.com/serrafordfarmingtonhills/2847385/description"
+_SERRA_ZIP = ("https://www.ziprecruiter.com/jobs/serra-ford-farmington-hills/"
+              "automotive-finance-and-insurance-manager-fi?lvk=fHbX7M7zOsRN_U-V_1Lf_g")
+_EXPIRED_LANDING = "https://www.linkedin.com/jobs/group-risk-manager-jobs?trk=expired_jd_redirect"
+
+_HIREOLOGY_HTML = """<html><head><title>Automotive Finance and Insurance Manager (F&I) |
+Farmington Hills, MI | Serra Ford Farmington Hills</title>
+<script type="application/ld+json">{"@type":"JobPosting",
+"title":"Automotive Finance and Insurance Manager (F&I)",
+"hiringOrganization":{"name":"Serra Ford Farmington Hills"},
+"description":"Serra Ford Farmington Hills is seeking an experienced F&I Manager."}</script>
+</head><body></body></html>"""
+
+
+def _serra_router(url, **kwargs):
+    """Answer each Serra Ford URL exactly as the live hosts did."""
+    if "ziprecruiter.com" in url:
+        return _FakeResponse(403, "blocked", url)
+    if "hireology.com" in url:
+        return _FakeResponse(200, _HIREOLOGY_HTML, url)
+    if "jobs-guest" in url:
+        return _FakeResponse(200, "<html><body>no topcard here</body></html>", url)
+    if "linkedin.com" in url:
+        return _FakeResponse(200, "<html><title>Group Risk Manager Jobs</title></html>", _EXPIRED_LANDING)
+    return _FakeResponse(404, "", url)
+
+
+def test_ingest_falls_through_to_the_employer_page_when_linkedin_expired(monkeypatch):
+    """The bug Kevin hit: three links for one job, only the third readable, and /job gave up.
+
+    Drives the real entry point and asserts the CRM WRITE, because the failure mode here is a
+    card dispatched for the wrong job - LinkedIn's expired-posting redirect serves a generic
+    directory page that parses cleanly as "Group Risk Manager".
+    """
+    captured = {}
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    monkeypatch.setattr(m.requests, "get", _serra_router)
+    # Echo the job dict back, so the assertion below tests what the SCRAPE produced rather than
+    # what the stub hardcodes - the write path is the thing under test here.
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match(
+        company=job["employer_name"], title=job["job_title"]))
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "is_role_tracked", lambda *a, **kw: False)
+    monkeypatch.setattr(m.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    ok, message = m.ingest_manual_job(url=_SERRA_LI, extra_urls=[_SERRA_HIREOLOGY, _SERRA_ZIP])
+
+    assert ok is True, f"expected the Hireology page to carry the ingest, got: {message}"
+    assert "TC" in captured, "the posting must land a Tetiana Cold row"
+    row = captured["TC"]["rows"][0]["row_data"]
+    assert any("Serra Ford" in str(cell) for cell in row), \
+        f"the row must name the real employer, not LinkedIn's directory page: {row}"
+    assert not any("Group Risk Manager" in str(cell) for cell in row), \
+        "the expired-redirect directory page must never reach the CRM"
+
+
+def test_expired_linkedin_alone_says_so_instead_of_asking_kevin_to_retype(monkeypatch):
+    """An expired posting is not an auth wall, and 'spell it out' is the wrong instruction."""
+    monkeypatch.setattr(m.requests, "get", lambda url, **kw: (
+        _FakeResponse(200, "<html></html>", _EXPIRED_LANDING) if "linkedin.com" in url
+        else _FakeResponse(404, "", url)
+    ))
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m.threading, "Thread", _NoopThread)
+
+    # A bare permalink has no slug to recover from, so this must fail LOUDLY and correctly.
+    ok, message = m.ingest_manual_job(url="https://www.linkedin.com/jobs/view/4459302636/")
+
+    assert ok is False
+    assert "expired" in message.lower()
+
+
+def test_ingest_recovers_title_and_company_from_the_url_slug(monkeypatch):
+    """Every fetch fails, but the permalink slug still names the job - so no retyping."""
+    captured = {}
+
+    def _write(p, **kw):
+        captured[p["target_code"]] = p
+        return True
+
+    # Every network call fails, including the reader proxy.
+    monkeypatch.setattr(m.requests, "get", lambda url, **kw: _FakeResponse(403, "", url))
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match(
+        company=job["employer_name"], title=job["job_title"]))
+    monkeypatch.setattr(m, "log_to_sheets_crm", _write)
+    monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **kw: None)
+    monkeypatch.setattr(m, "is_role_tracked", lambda *a, **kw: False)
+    monkeypatch.setattr(m.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    ok, message = m.ingest_manual_job(url=_SERRA_LI)
+
+    assert ok is True, f"the slug should have carried this: {message}"
+    row = captured["TC"]["rows"][0]["row_data"]
+    assert any("Serra Ford Farmington Hills" in str(cell) for cell in row), row
+
+
 def test_ingest_manual_job_has_no_score_gate(monkeypatch):
     """A hand-picked job Kevin chose is already vetted - a 61 must still land in Tetiana Cold.
     The >=80 Tier-1 gate exists to triage hundreds of machine-sourced listings, not this."""
@@ -5101,9 +5221,11 @@ def test_ingest_manual_job_asks_for_typed_details_when_linkedin_blocks(monkeypat
     def _fail(p, **kw):
         pytest.fail("no row should be written")
 
-    monkeypatch.setattr(m, "scrape_job_page", lambda url, timeout=8: ("", "", ""))
+    monkeypatch.setattr(m, "scrape_job_page_detailed", lambda url, timeout=8, extra_urls=None: ("", "", "", False))
     monkeypatch.setattr(m, "log_to_sheets_crm", _fail)
 
+    # A bare permalink carries no slug, so there is genuinely nothing to recover and the prompt
+    # is the correct outcome.
     ok, message = m.ingest_manual_job(url="https://www.linkedin.com/jobs/view/4461280495/")
 
     assert ok is False
@@ -5170,8 +5292,8 @@ def test_ingest_manual_job_scrapes_when_only_a_url_is_given(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        m, "scrape_job_page",
-        lambda url, timeout=8: ("FX Ops Analyst 2", "Huntington National Bank", "Settle trades."),
+        m, "scrape_job_page_detailed",
+        lambda url, timeout=8, extra_urls=None: ("FX Ops Analyst 2", "Huntington National Bank", "Settle trades.", False),
     )
     monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match())
     monkeypatch.setattr(m, "log_to_sheets_crm", _write)
@@ -5190,10 +5312,10 @@ def test_ingest_manual_job_scrapes_when_only_a_url_is_given(monkeypatch):
 
 def test_ingest_manual_job_skips_the_scrape_when_details_are_typed(monkeypatch):
     """The explicit form must not pay for a doomed HTTP round trip."""
-    def _no_scrape(url, timeout=8):
+    def _no_scrape(url, timeout=8, extra_urls=None):
         pytest.fail("scrape should be skipped when title and company are supplied")
 
-    monkeypatch.setattr(m, "scrape_job_page", _no_scrape)
+    monkeypatch.setattr(m, "scrape_job_page_detailed", _no_scrape)
     monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match())
     monkeypatch.setattr(m, "log_to_sheets_crm", lambda p, **kw: True)
     monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
@@ -5220,11 +5342,13 @@ def test_ingest_scrapes_non_linkedin_careers_pages(monkeypatch):
         captured[p["target_code"]] = p
         return True
 
-    def _scrape(url, timeout=12):
+    def _scrape(url, timeout=12, extra_urls=None):
         scraped.append(url)
-        return ("Foreign Exchange Ops Analyst 2", "Huntington", "Settle FX trades.")
+        return ("Foreign Exchange Ops Analyst 2", "Huntington", "Settle FX trades.", False)
 
-    monkeypatch.setattr(m, "scrape_job_page", _scrape)
+    # Patched on scrape_job_page_detailed, not scrape_job_page: the latter is now a back-compat
+    # wrapper that the ingest path no longer calls, so stubbing it would silently test nothing.
+    monkeypatch.setattr(m, "scrape_job_page_detailed", _scrape)
     monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: _fake_match())
     monkeypatch.setattr(m, "log_to_sheets_crm", _write)
     monkeypatch.setattr(m, "send_telegram_card", lambda *a, **kw: None)
@@ -5242,7 +5366,7 @@ def test_ingest_scrapes_non_linkedin_careers_pages(monkeypatch):
 
 
 def test_ingest_blocked_message_does_not_blame_linkedin_for_other_hosts(monkeypatch):
-    monkeypatch.setattr(m, "scrape_job_page", lambda url, timeout=12: ("", "", ""))
+    monkeypatch.setattr(m, "scrape_job_page_detailed", lambda url, timeout=12, extra_urls=None: ("", "", "", False))
 
     ok, message = m.ingest_manual_job(url="https://careers.example.com/job/123")
 
