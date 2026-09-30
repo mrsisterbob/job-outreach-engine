@@ -1190,7 +1190,10 @@ def test_second_click_redirects_to_the_same_draft_without_a_telegram_ping(monkey
     class Created:
         status_code = 200
         def json(self):
-            return {"id": "draft-42"}
+            # The real drafts.create payload: a draft id AND a nested message id. They differ,
+            # and only the message id resolves in a #drafts/<id> URL. The mock carries both so a
+            # regression back to payload["id"] fails here instead of only in Kevin's inbox.
+            return {"id": "draft-42", "message": {"id": "msg-42", "threadId": "t-42"}}
     monkeypatch.setattr(m.requests, "post", lambda url, **kw: posts.append(url) or Created())
     # No prior conversation. Stubbed rather than left to the real requests.get: unstubbed, the
     # thread lookup makes a LIVE call to Gmail, which 401s on the fake token and lands on this same
@@ -1203,7 +1206,7 @@ def test_second_click_redirects_to_the_same_draft_without_a_telegram_ping(monkey
     first = _click("cc-0")
     second = _click("cc-0")
 
-    assert first[:2] == (302, "https://mail.google.com/mail/u/0/#drafts/draft-42")
+    assert first[:2] == (302, "https://mail.google.com/mail/u/0/#drafts/msg-42")
     assert second[:2] == first[:2]
     assert len(posts) == 1
     assert pings == []
@@ -1221,7 +1224,7 @@ def _thread_env(monkeypatch):
     class Created:
         status_code = 200
         def json(self):
-            return {"id": "draft-99"}
+            return {"id": "draft-99", "message": {"id": "msg-99", "threadId": "t-99"}}
 
     def fake_post(url, **kw):
         posts.append(kw.get("json") or {})
@@ -1248,7 +1251,7 @@ def test_followup_draft_threads_into_the_existing_conversation(monkeypatch):
 
     status, location, _ = _click("cc-0")
 
-    assert (status, location) == (302, "https://mail.google.com/mail/u/0/#drafts/draft-99")
+    assert (status, location) == (302, "https://mail.google.com/mail/u/0/#drafts/msg-99")
     assert posts[0]["message"]["threadId"] == "t-500"
     sent = _sent_message(posts[0])
     assert "In-Reply-To: <abc@mail>" in sent
@@ -1284,7 +1287,7 @@ def test_first_touch_never_threads(monkeypatch):
         to_email="pat@acme.com", company_name="Nliven", job_title="Analyst",
         custom_body="First hello.")
 
-    assert (ok, draft_id) == (True, "draft-99")
+    assert (ok, draft_id) == (True, "msg-99")
     assert "threadId" not in posts[0]["message"]
 
 
@@ -1299,7 +1302,7 @@ def test_repeat_click_on_a_threaded_draft_does_not_create_a_second(monkeypatch):
     first = _click("cc-0")
     second = _click("cc-0")
 
-    assert first[:2] == second[:2] == (302, "https://mail.google.com/mail/u/0/#drafts/draft-99")
+    assert first[:2] == second[:2] == (302, "https://mail.google.com/mail/u/0/#drafts/msg-99")
     assert len(posts) == 1
 
 
@@ -2465,6 +2468,42 @@ def test_resume_pdf_filename_omits_company_when_unresolved():
 
 # ---- /draft Gmail MIME attachment correctness ----
 
+def test_draft_id_is_the_message_id_not_the_draft_resource_id(monkeypatch):
+    """The 2026-09-30 regression. drafts.create returns two ids: payload["id"] (the draft
+    resource, for API calls) and payload["message"]["id"] (the message). Only the message id
+    resolves in mail.google.com/#drafts/<id>; the draft id lands the user on the generic mailbox.
+    Every "Open Draft in Gmail" link was built from the wrong one, and it passed every test
+    because the mocks returned {"id": ...} with no message key - the same wrong assumption as
+    the code. Asserted on what create_gmail_draft RETURNS, because that value is what every
+    caller interpolates into a URL."""
+    for var, val in (("GMAIL_CLIENT_ID", "cid"), ("GMAIL_CLIENT_SECRET", "cs"),
+                     ("GMAIL_REFRESH_TOKEN", "rt"), ("GMAIL_USER", "me@example.com")):
+        monkeypatch.setenv(var, val)
+    monkeypatch.setattr(m, "check_existing_gmail_draft", lambda to_email, subject: None)
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: "token")
+    stored = []
+    monkeypatch.setattr(m, "save_gmail_draft_record",
+                        lambda to_email, subject, draft_id: stored.append(draft_id))
+
+    class Created:
+        status_code = 200
+        def json(self):
+            return {"id": "r-DRAFT-side", "message": {"id": "18f2c9MESSAGEside", "threadId": "t-1"}}
+
+    monkeypatch.setattr(m.requests, "post", lambda *a, **kw: Created())
+
+    ok, _, draft_id = m.create_gmail_draft(
+        to_email="pat@acme.com", company_name="Acme", job_title="Analyst",
+        custom_body="Hello.")
+
+    assert ok is True
+    assert draft_id == "18f2c9MESSAGEside"
+    assert draft_id != "r-DRAFT-side"
+    # The dedup record must hold the same id the URL uses, or a repeat click rebuilds a link
+    # from one namespace while the pre-check reads the other.
+    assert stored == ["18f2c9MESSAGEside"]
+
+
 def test_create_gmail_draft_attaches_pdf_with_correct_filename(monkeypatch):
     monkeypatch.setenv("GMAIL_CLIENT_ID", "cid")
     monkeypatch.setenv("GMAIL_CLIENT_SECRET", "csecret")
@@ -2479,6 +2518,8 @@ def test_create_gmail_draft_attaches_pdf_with_correct_filename(monkeypatch):
     class FakeDraftResponse:
         status_code = 200
         def json(self):
+            # Deliberately payload-only, with no nested message: this doubles as the fallback
+            # case, where a malformed response still yields the draft id so dedup keeps working.
             return {"id": "draft-99"}
 
     def fake_post(url, headers=None, json=None, timeout=None):

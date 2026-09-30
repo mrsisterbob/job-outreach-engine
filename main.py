@@ -5457,7 +5457,15 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
             draft_message["threadId"] = thread["thread_id"]
         res = requests.post(draft_url, headers=headers, json={"message": draft_message}, timeout=10)
         if res.status_code in [200, 201]:
-            draft_id = res.json().get("id", "")
+            payload = res.json()
+            # Two different ids come back and they are NOT interchangeable. payload["id"] is the
+            # DRAFT resource id (API calls); payload["message"]["id"] is the MESSAGE id, and only
+            # the latter resolves in a mail.google.com/#drafts/<id> URL. Handing the draft id to
+            # that URL silently drops the user on the generic mailbox instead of the draft, which
+            # is what every "Open Draft in Gmail" link did before 2026-09-30. Prefer the message
+            # id; fall back to the draft id so a malformed payload still dedups.
+            message_id = (payload.get("message") or {}).get("id") or ""
+            draft_id = message_id or payload.get("id", "")
             save_gmail_draft_record(clean_to_email, subject, draft_id)
             log_metric_event("gmail_draft_staged")
             return True, "Success", draft_id
