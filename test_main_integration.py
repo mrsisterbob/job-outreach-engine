@@ -88,6 +88,7 @@ def test_crm_outbox_marks_failed_after_max_retries(monkeypatch):
         )
         conn.commit()
     monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload, max_retries=1, **kw: False)
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: True)
     m.process_crm_outbox_batch(inter_job_sleep=0)
     with m.get_db_conn() as conn:
         row = conn.execute("SELECT retry_count, status FROM crm_outbox").fetchone()
@@ -97,8 +98,10 @@ def test_crm_outbox_marks_failed_after_max_retries(monkeypatch):
 # ---- Outbox alert timing: back-off is not news, abandonment is ----
 
 def _capture_alerts(monkeypatch):
+    """Stub send_health_alert as a DELIVERED alert. It must return True: the outbox treats a falsy
+    return as 'Telegram did not take it' and re-sends the give-up alert on the next pass."""
     alerts = []
-    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg) or True)
     return alerts
 
 
@@ -154,6 +157,72 @@ def test_outbox_alerts_once_when_it_gives_up(monkeypatch):
     # ...and having gone FAILED, it is no longer selected, so it cannot alert again.
     m.process_crm_outbox_batch(inter_job_sleep=0)
     assert len(alerts) == 1
+
+
+def test_outbox_give_up_alert_survives_telegram_outage(monkeypatch):
+    """Regression: the row was committed FAILED before the alert went out, and FAILED rows are never
+    selected again - so a give-up alert sent while Telegram was down was lost forever and the
+    abandoned write was never reported. Drives the REAL send_health_alert; only the HTTP is stubbed."""
+    _fail_crm(monkeypatch)
+    monkeypatch.setattr(m, "TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
+    telegram = {"up": False}
+    delivered = []
+
+    class _Ok:
+        status_code = 200
+
+    def fake_post(url, json=None, **kw):
+        if not telegram["up"]:
+            raise m.requests.exceptions.ConnectionError("telegram unreachable")
+        delivered.append(json["text"])
+        return _Ok()
+
+    monkeypatch.setattr(m.requests, "post", fake_post)
+    with m.get_db_conn() as conn:
+        conn.execute(
+            "INSERT INTO crm_outbox (payload_json, status, retry_count) VALUES (?, 'PENDING', 9)",
+            (json.dumps({"action": "update_status", "sheet_uuid": "lost-uuid-77"}),)
+        )
+        conn.commit()
+
+    m.process_crm_outbox_batch(inter_job_sleep=0)  # gives up while Telegram is down
+    assert delivered == []
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT status, retry_count FROM crm_outbox").fetchone() == ("FAILED_UNALERTED", 10)
+
+    telegram["up"] = True
+    for _ in range(3):
+        m.process_crm_outbox_batch(inter_job_sleep=0)
+
+    assert len(delivered) == 1, f"expected exactly one late give-up alert, got {delivered}"
+    assert "lost-uuid-77" in delivered[0] and "Giving up after 10 retries" in delivered[0]
+    with m.get_db_conn() as conn:
+        # Alert-only retry: the payload was not re-dispatched, so retry_count did not move.
+        assert conn.execute("SELECT status, retry_count FROM crm_outbox").fetchone() == ("FAILED", 10)
+
+
+def test_outbox_give_up_alert_retries_on_telegram_http_error(monkeypatch):
+    """A 429/5xx from Telegram is not a delivery either - the row must stay FAILED_UNALERTED."""
+    _fail_crm(monkeypatch)
+    monkeypatch.setattr(m, "TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
+
+    class _TooMany:
+        status_code = 429
+
+    monkeypatch.setattr(m.requests, "post", lambda *a, **kw: _TooMany())
+    with m.get_db_conn() as conn:
+        conn.execute(
+            "INSERT INTO crm_outbox (payload_json, status, retry_count) VALUES (?, 'PENDING', 9)",
+            (json.dumps({"action": "update_status", "sheet_uuid": "x"}),)
+        )
+        conn.commit()
+
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT status FROM crm_outbox").fetchone()[0] == "FAILED_UNALERTED"
 
 
 def test_direct_caller_still_alerts_on_exhaustion(monkeypatch):

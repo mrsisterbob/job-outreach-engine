@@ -3790,17 +3790,22 @@ def send_health_alert(error_msg):
     quote=False is deliberate. Telegram's HTML mode only requires &, < and >, and it does NOT
     decode &#x27; - html.escape's default turns every apostrophe into literal '&#x27;' on
     screen, which is how "'Unauthorized' means..." reached Kevin as "&#x27;Unauthorized&#x27;".
+
+    Returns True only when Telegram answered 2xx. False covers an unset token/chat id, a network
+    error AND a 429/5xx - a caller that must not lose its alert (the outbox give-up) retries on False.
     """
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        text = f"⚠️ <b>Pipeline Operational Warning</b>\n\n{html.escape(str(error_msg), quote=False)}"
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-                timeout=5
-            )
-        except Exception:
-            pass
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    text = f"⚠️ <b>Pipeline Operational Warning</b>\n\n{html.escape(str(error_msg), quote=False)}"
+    try:
+        res = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=5
+        )
+        return 200 <= res.status_code < 300
+    except Exception:
+        return False
 
 def send_status_update(chat_id, text):
     if TELEGRAM_BOT_TOKEN and chat_id:
@@ -8363,10 +8368,43 @@ def enqueue_crm_payload(payload):
         logging.error(f"CRM Outbox Enqueue Error: {e}")
         return False
 
+def _crm_outbox_giveup_alert_text(payload):
+    return (
+        crm_failure_alert_text(payload, 10)
+        + " Giving up after 10 retries - it is NOT in the sheet. "
+        "Anything it carried (status move, follow-up date, note) must be set by hand."
+    )
+
+def _retry_crm_outbox_giveup_alerts():
+    """Re-send the give-up alert for rows abandoned while Telegram was unreachable.
+
+    A row is committed as FAILED_UNALERTED when the outbox gives up and only flips to FAILED once
+    send_health_alert confirms delivery, so a Telegram outage delays the alert instead of losing it.
+    The payload is NOT re-dispatched to Sheets - only the alert retries. Stops at the first failed
+    send: Telegram is still down, and hammering it once per row every 5s gains nothing.
+    """
+    with get_db_conn() as conn:
+        unalerted = conn.execute(
+            "SELECT id, payload_json FROM crm_outbox WHERE status = 'FAILED_UNALERTED' ORDER BY id ASC LIMIT 5"
+        ).fetchall()
+
+    for job_id, payload_str in unalerted:
+        try:
+            payload = json.loads(payload_str)
+        except Exception:
+            payload = {}
+        if not send_health_alert(_crm_outbox_giveup_alert_text(payload)):
+            return
+        with get_db_conn() as conn:
+            conn.execute("UPDATE crm_outbox SET status = 'FAILED' WHERE id = ?", (job_id,))
+            conn.commit()
+
 def process_crm_outbox_batch(inter_job_sleep=1.0):
     """One outbox drain pass (<=5 pending rows): dispatch each to Sheets, delete on success or bump
     retry_count/status on failure. Split out from crm_outbox_worker_loop so a single pass is unit-testable.
     """
+    _retry_crm_outbox_giveup_alerts()
+
     with get_db_conn() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -8407,20 +8445,21 @@ def process_crm_outbox_batch(inter_job_sleep=1.0):
                     UPDATE crm_outbox
                     SET retry_count = retry_count + 1,
                         last_attempt = CURRENT_TIMESTAMP,
-                        status = CASE WHEN retry_count + 1 >= 10 THEN 'FAILED' ELSE 'PENDING' END
+                        status = CASE WHEN retry_count + 1 >= 10 THEN 'FAILED_UNALERTED' ELSE 'PENDING' END
                     WHERE id = ?
                 """, (job_id,))
             conn.commit()
 
         # The outbox owns the retry budget, so it also owns the "this will never land" alert - fired
-        # once, at the pass that gives up, instead of on every pass that merely backs off.
+        # once, at the pass that gives up, instead of on every pass that merely backs off. The row
+        # was committed FAILED_UNALERTED above; it becomes FAILED only once Telegram confirms, and
+        # _retry_crm_outbox_giveup_alerts re-sends it on later passes until then.
         if not (success or permanent) and retries + 1 >= 10:
             logging.error(f"CRM Outbox abandoning payload #{job_id} after 10 attempts")
-            send_health_alert(
-                crm_failure_alert_text(payload, 10)
-                + " Giving up after 10 retries - it is NOT in the sheet. "
-                "Anything it carried (status move, follow-up date, note) must be set by hand."
-            )
+            if send_health_alert(_crm_outbox_giveup_alert_text(payload)):
+                with get_db_conn() as conn:
+                    conn.execute("UPDATE crm_outbox SET status = 'FAILED' WHERE id = ?", (job_id,))
+                    conn.commit()
         if inter_job_sleep:
             time.sleep(inter_job_sleep)
 

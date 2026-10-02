@@ -1,0 +1,18 @@
+{
+  "crossSessionInbound": "accept",
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/verify_suites.py\"",
+            "timeout": 330,
+            "statusMessage": "Checking both test suites before ending the turn..."
+          }
+        ]
+      }
+    ]
+  }
+}
