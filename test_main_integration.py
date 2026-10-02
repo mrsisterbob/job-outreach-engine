@@ -8932,6 +8932,81 @@ def test_rejected_read_alerts_only_once_per_process(monkeypatch):
     assert len(alerts) == 1
 
 
+def test_rejection_alerts_again_after_a_successful_read(monkeypatch):
+    """THE BUG: the latch was once per process, so a secret fixed mid-process and then broken
+    again was logged but never alerted - every tab read back empty with nothing on screen.
+    Drives the real read path: reject, healthy read, reject again."""
+    alerts = _crm_read(monkeypatch, {})
+    rejected = {"status": "error", "message": "Unauthorized"}
+    healthy = {"status": "success", "followups": [{"company": "Acme"}]}
+    current = {"body": rejected}
+
+    class _R:
+        status_code = 200
+        def json(self):
+            return current["body"]
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _R())
+
+    assert m.fetch_networking_cards("TC", qty=None) == []
+    assert len(alerts) == 1
+
+    current["body"] = healthy
+    assert len(m.fetch_networking_cards("TC", qty=None)) == 1
+
+    current["body"] = rejected
+    assert m.fetch_networking_cards("TC", qty=None) == []
+    assert len(alerts) == 2, "a fresh outage after a healthy read must alert again"
+
+    # Within one outage the latch still holds: no healthy read, no new alert.
+    for _ in range(5):
+        m.fetch_networking_cards("TC", qty=None)
+    assert len(alerts) == 2
+
+
+def test_only_a_success_body_rearms_the_rejection_alert(monkeypatch):
+    """A non-200 or a status-less body is not evidence the CRM recovered."""
+    alerts = _crm_read(monkeypatch, {})
+    current = {"body": {"status": "error", "message": "Unauthorized"}, "code": 200}
+
+    class _R:
+        @property
+        def status_code(self):
+            return current["code"]
+        def json(self):
+            return current["body"]
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _R())
+
+    m.fetch_networking_cards("TC", qty=None)
+    current.update(body={"followups": [{"company": "Acme"}]})
+    m.fetch_networking_cards("TC", qty=None)
+    current.update(body={}, code=500)
+    m.fetch_networking_cards("TC", qty=None)
+    current.update(body={"status": "error", "message": "Unauthorized"}, code=200)
+    m.fetch_networking_cards("TC", qty=None)
+    assert len(alerts) == 1
+
+
+def test_a_lock_timeout_between_healthy_reads_does_not_alert(monkeypatch):
+    """Apps Script answers {"status":"error","message":"Lock timeout - server busy"} whenever
+    the outbox worker holds the script lock. With the latch re-armed by every healthy read, a
+    transient busy lock would otherwise page an 'every tab is EMPTY' alert on each occurrence."""
+    alerts = _crm_read(monkeypatch, {})
+    current = {"body": {"status": "success", "followups": []}}
+
+    class _R:
+        status_code = 200
+        def json(self):
+            return current["body"]
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _R())
+
+    for _ in range(3):
+        current["body"] = {"status": "success", "followups": []}
+        m.fetch_networking_cards("TC", qty=None)
+        current["body"] = {"status": "error", "message": "Lock timeout - server busy"}
+        assert m.fetch_networking_cards("TC", qty=None) == []
+    assert alerts == []
+
+
 def test_a_genuinely_empty_tab_does_not_alert(monkeypatch):
     """An empty tab is a normal state - only a REJECTION is newsworthy."""
     alerts = _crm_read(monkeypatch, {"status": "success", "followups": []})

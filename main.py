@@ -8447,8 +8447,10 @@ def fetch_networking_cards(target_code="CW", qty=2):
     2026-09-21 that made /links check report "Checked 0 links" against a sheet holding dozens of
     rows, reading as a clean result when the CRM was entirely unreachable.
 
-    So a rejection is logged loudly and, once per process, alerted - silence here means callers
-    (the link sweep, the sequencer, the tracked-role gate) quietly act on an empty world.
+    So a rejection is logged loudly and, once per outage, alerted - silence here means callers
+    (the link sweep, the sequencer, the tracked-role gate) quietly act on an empty world. A read
+    whose body actually says "success" re-arms the alert, so a secret that is fixed and then
+    breaks again alerts a second time instead of being swallowed by the first outage's latch.
     """
     res = crm_post({"action": "get_followups", "tab": target_code})
     if not res:
@@ -8466,8 +8468,16 @@ def fetch_networking_cards(target_code="CW", qty=2):
         if status and status != "success":
             message = str(body.get("message", ""))
             logging.error(f"[CRM] get_followups({target_code}) REJECTED: {message}")
-            _alert_crm_read_rejection(message)
+            # A lock timeout is Apps Script busy serving the outbox worker, not an outage. Now that
+            # a healthy read re-arms the alert, letting it through would page Kevin with "every tab
+            # is EMPTY" each time a busy lock landed between two good reads.
+            if "lock timeout" not in message.lower():
+                _alert_crm_read_rejection(message)
             return []
+        if status == "success":
+            # Only a body that SAID success is evidence the CRM is healthy - a missing status,
+            # a non-200 or a non-dict body proves nothing, so none of those re-arm the alert.
+            _CRM_READ_REJECTION_ALERTED.clear()
         leads = body.get("followups", [])
         return leads if qty is None else leads[:qty]
     except Exception as e:
@@ -8475,8 +8485,9 @@ def fetch_networking_cards(target_code="CW", qty=2):
     return []
 
 
-# One alert per process for a rejected CRM read. Every caller of fetch_networking_cards would
-# otherwise fire its own, and the sweep alone calls it three times per pass.
+# One alert per outage for a rejected CRM read. Every caller of fetch_networking_cards would
+# otherwise fire its own, and the sweep alone calls it three times per pass. A successful read in
+# fetch_networking_cards clears this, so the next outage alerts again.
 _CRM_READ_REJECTION_ALERTED = threading.Event()
 
 
