@@ -3779,8 +3779,20 @@ Evaluate the job description and respond ONLY with a JSON object containing:
 }}"""
 
 def send_health_alert(error_msg):
+    """Telegram alert for an operational failure.
+
+    The body is NOT wrapped in <code>. Every caller passes prose - a diagnosis and a fix - not
+    machine output, and a monospace block renders it as an unreadable wall that ignores the
+    newlines the message structures itself with. Escaping stays: a CRM error carrying a bare
+    '<' or '&' would otherwise fail Telegram's HTML parse and drop the entire alert silently,
+    which is the one outcome worse than an ugly one.
+
+    quote=False is deliberate. Telegram's HTML mode only requires &, < and >, and it does NOT
+    decode &#x27; - html.escape's default turns every apostrophe into literal '&#x27;' on
+    screen, which is how "'Unauthorized' means..." reached Kevin as "&#x27;Unauthorized&#x27;".
+    """
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        text = f"⚠️ <b>Pipeline Operational Warning</b>\n<code>{html.escape(str(error_msg))}</code>"
+        text = f"⚠️ <b>Pipeline Operational Warning</b>\n\n{html.escape(str(error_msg), quote=False)}"
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -8479,17 +8491,25 @@ def _alert_crm_read_rejection(message):
         # an unset one), a CRM_SHARED_SECRET missing from Render so no secret is sent at all, or a
         # deployment serving an older version of the script. Naming only the first sent Kevin to
         # re-check a secret that already matched, so list what it actually could be.
+        #
+        # The checklist carries its own newlines. send_health_alert wraps the whole message in
+        # <code>, and Telegram renders that as one monospace block - without breaks a four-step
+        # list word-wraps into an unreadable slab, which is how this arrived on 2026-10-02.
         hint = (
-            " 'Unauthorized' means the secret Apps Script received did not equal the one in its "
-            "Script Properties. Check, in order: (1) CRM_SHARED_SECRET is set on RENDER - if it is "
-            "missing the bot sends no secret at all; (2) the Script Property exists and is not "
-            "blank; (3) both sides have no trailing whitespace; (4) the deployment was republished "
-            "after the property was set (Deploy > Manage deployments > New version) - an edited "
-            "property does not reach the live web app until then."
+            "\n\n'Unauthorized' means the secret Apps Script received did not equal the one in "
+            "its Script Properties. Check, in order:"
+            "\n  1. CRM_SHARED_SECRET is set on RENDER - if it is missing the bot sends no "
+            "secret at all."
+            "\n  2. The Script Property exists and is not blank."
+            "\n  3. Neither side has trailing whitespace."
+            "\n  4. The deployment was republished after the property was set "
+            "(Deploy > Manage deployments > New version) - an edited property does not reach "
+            "the live web app until then."
         )
     send_health_alert(
         f"CRM READS are being rejected - every tab is coming back EMPTY, so the link sweep, the "
-        f"sequencer and the duplicate gate are all seeing a blank sheet. {message}{hint}"
+        f"sequencer and the duplicate gate are all seeing a blank sheet."
+        f"\n\nCRM said: {message}{hint}"
     )
 
 def get_overdue_followups():

@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import tempfile
 import time
+import types
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes
@@ -9000,6 +9001,75 @@ def test_probe_handles_no_response(monkeypatch):
     monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://fake")
     monkeypatch.setattr(m, "crm_post", lambda p, **k: None)
     assert "No response at all" in m.probe_crm_read()
+
+
+# ---- What actually reaches Telegram, not what we hand send_health_alert ----
+
+def _telegram_payload(monkeypatch):
+    """Capture the real sendMessage body. The tests above assert on the string passed INTO
+    send_health_alert, which is why two rendering bugs survived them: the body was wrapped in
+    <code> and html.escape turned every apostrophe into a literal &#x27;."""
+    sent = {}
+
+    def fake_post(url, json=None, timeout=None):
+        sent.update(json)
+        class _R:
+            status_code = 200
+        return _R()
+
+    monkeypatch.setattr(m, "requests", types.SimpleNamespace(post=fake_post))
+    monkeypatch.setattr(m, "TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
+    return sent
+
+
+def test_health_alert_is_not_a_monospace_wall(monkeypatch):
+    """THE BUG: the whole body went inside <code>, so the four-step Unauthorized checklist
+    rendered as one unreadable monospace slab in Telegram."""
+    sent = _telegram_payload(monkeypatch)
+    m._CRM_READ_REJECTION_ALERTED.clear()
+
+    m._alert_crm_read_rejection("Unauthorized")
+
+    assert "<code>" not in sent["text"], "prose must not render as monospace"
+    body = sent["text"].split("\n", 1)[1]
+    assert body.count("\n") >= 5, "the checklist must keep its line breaks"
+
+
+def test_health_alert_renders_apostrophes_literally(monkeypatch):
+    """THE BUG: html.escape escapes quotes by default, and Telegram HTML does not decode
+    &#x27; - so "'Unauthorized' means..." arrived on screen as "&#x27;Unauthorized&#x27;"."""
+    sent = _telegram_payload(monkeypatch)
+    m._CRM_READ_REJECTION_ALERTED.clear()
+
+    m._alert_crm_read_rejection("Unauthorized")
+
+    assert "&#x27;" not in sent["text"] and "&quot;" not in sent["text"]
+    assert "'Unauthorized' means" in sent["text"]
+
+
+def test_health_alert_still_escapes_markup(monkeypatch):
+    """Dropping <code> must not drop escaping: an unescaped '<' fails Telegram's HTML parse and
+    the alert is silently never delivered - worse than an ugly one."""
+    sent = _telegram_payload(monkeypatch)
+
+    m.send_health_alert("bad <b>tag</b> & 5 < 9")
+
+    assert "&lt;b&gt;tag&lt;/b&gt;" in sent["text"] and "&amp; 5 &lt; 9" in sent["text"]
+    assert sent["parse_mode"] == "HTML"
+
+
+def test_unauthorized_alert_still_names_every_cause(monkeypatch):
+    """Reformatting must not cost content - all four causes stay, since naming only the
+    mismatched secret sent Kevin to re-check a secret that already matched."""
+    sent = _telegram_payload(monkeypatch)
+    m._CRM_READ_REJECTION_ALERTED.clear()
+
+    m._alert_crm_read_rejection("Unauthorized")
+
+    text = sent["text"]
+    assert "CRM_SHARED_SECRET" in text and "RENDER" in text
+    assert "blank" in text and "whitespace" in text and "Manage deployments" in text
 
 
 def test_get_followups_contract_covers_what_the_sweep_reads():
