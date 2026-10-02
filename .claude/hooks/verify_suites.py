@@ -63,6 +63,7 @@ def main():
         return
 
     if result.returncode == 0:
+        refresh_function_index(cwd)
         return
 
     tail = failure_summary(result.stdout or result.stderr or "")
@@ -74,6 +75,40 @@ def main():
         "If the change is genuinely correct and the test encodes the old behavior, say so "
         "explicitly and explain why - do not delete or skip a test to get to green."
     )
+
+
+def refresh_function_index(cwd):
+    """Rewrite FUNCTION_INDEX.md when a turn changed what is in it.
+
+    The index is what CLAUDE.md's anti-duplication rule reads: before writing a helper you
+    grep it, and a duplicate never fails a test. Nothing regenerated it, so it drifted 221
+    lines behind - two functions a worker added were simply missing, which means the grep
+    that is supposed to prevent a duplicate could not see them.
+
+    This runs on the Stop hook rather than PostToolUse on purpose. PostToolUse fires on
+    every edit, including a one-line comment, and would churn a 565-line file all day. Here
+    it runs once per turn, only after the suites are green, and only when a tracked source
+    file actually changed - so a turn that edited nothing but markdown rewrites nothing.
+
+    It never blocks. A stale index is a problem; a turn that cannot end because an indexer
+    hiccuped is a worse one.
+    """
+    try:
+        changed = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "*.py"],
+            cwd=cwd, capture_output=True, text=True, timeout=15,
+        )
+        touched = [f for f in changed.stdout.split()
+                   if f.endswith(".py") and not f.startswith(".claude/")]
+        if not touched:
+            return
+
+        subprocess.run(
+            [sys.executable, "build_function_index.py"],
+            cwd=cwd, capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return
 
 
 def failure_summary(output, max_lines=30):
