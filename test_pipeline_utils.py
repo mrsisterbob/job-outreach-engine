@@ -2434,3 +2434,123 @@ def test_ladder_progress_past_the_end_is_not_clamped():
 def test_ladder_progress_without_an_anchor_renders_nothing():
     assert pu.ladder_progress(None, date(2026, 10, 3), 21) is None
     assert pu.format_ladder_progress(None) == ""
+
+
+# ---- open_followups.collect_open_followups (every follow-up still owed) ----
+
+import open_followups  # noqa: E402
+
+_OF_TODAY = date(2026, 10, 3)
+
+
+def _of_entry(i, run_date, attempt=1, day=4, next_followup=None, email=None):
+    """One Carmen followups_ready entry with the keys run_followup_sequencer writes."""
+    return {
+        "company": f"Co{i}", "role": "Ops Analyst", "short_id": None, "sheet_uuid": f"uuid-{i}",
+        "attempt": attempt, "draft_text": f"rung-{attempt} text for Pat{i}",
+        "sheet_tab": "Carmen Cold", "ladder_day": 4 if attempt == 1 else 11,
+        "final_rung": attempt == 2, "progress": (day, 21), "track": "cold",
+        "name": f"Pat{i}", "email": email if email is not None else f"Pat{i}@Co{i}.com",
+        "company_raw": f"Co{i}", "next_followup": next_followup or run_date,
+        "new_next_followup": "2026-10-20", "title": "Ops Analyst", "note": "",
+    }
+
+
+def _of_snapshots(by_date):
+    """{run_date: [entries]} -> snapshots exactly as they come back through json.loads."""
+    return {
+        d: json.loads(json.dumps({"run_date": d, "followups_ready": entries,
+                                  "applications_quiet": []}, default=str))
+        for d, entries in by_date.items()
+    }
+
+
+def _of_live(*uuids, notes=None):
+    notes = notes or {}
+    return {u: {"sheet_uuid": u, "note": notes.get(u, ""), "next_followup": "2026-10-20"}
+            for u in uuids}
+
+
+def test_open_followups_five_skipped_mornings_all_listed_oldest_first_with_todays_day():
+    days = [(date(2026, 9, 28) + timedelta(days=i)).isoformat() for i in range(5)]  # 09-28..10-02
+    by_date = {d: [_of_entry(i, d)] for i, d in enumerate(days)}
+    items = open_followups.collect_open_followups(
+        _of_snapshots(by_date), _of_live(*[f"uuid-{i}" for i in range(5)]), {}, _OF_TODAY)
+    assert [x["name"] for x in items] == ["Pat0", "Pat1", "Pat2", "Pat3", "Pat4"]
+    # Each was day 4 on its own morning; shifted to today. The progress list is a tuple again.
+    assert [x["progress"] for x in items] == [(9, 21), (8, 21), (7, 21), (6, 21), (5, 21)]
+    assert items[0]["owed_since"] == "2026-09-28" and items[0]["days_owed"] == 5
+    assert all(x["sent_checked"] is True and x["listings"] == 1 for x in items)
+
+
+def test_open_followups_rung1_skipped_rung2_listed_appears_once_with_rung2_draft():
+    snaps = _of_snapshots({
+        "2026-09-22": [_of_entry(1, "2026-09-22", attempt=1, day=4)],
+        "2026-09-29": [_of_entry(1, "2026-09-29", attempt=2, day=11)],
+    })
+    items = open_followups.collect_open_followups(snaps, _of_live("uuid-1"), {}, _OF_TODAY)
+    assert len(items) == 1
+    item = items[0]
+    assert item["draft_text"] == "rung-2 text for Pat1" and item["attempt"] == 2
+    assert item["run_date"] == "2026-09-29"          # the draft link's snapshot date
+    assert item["owed_since"] == "2026-09-22"        # owed since the skipped rung 1
+    assert item["due"] == "2026-09-22"
+    assert item["listings"] == 2
+    assert item["progress"] == (15, 21)              # 11 on 09-29, plus 4 days
+
+
+def test_open_followups_same_day_send_satisfies_but_earlier_send_does_not():
+    snaps = _of_snapshots({
+        "2026-09-30": [_of_entry(1, "2026-09-30"), _of_entry(2, "2026-09-30")],
+    })
+    # Pat1 nudged the same day it was listed (case/space differences ignored); Pat2's last
+    # message went out the day BEFORE the listing, so it does not count as the nudge.
+    sent = {" PAT1@co1.com ": date(2026, 9, 30), "pat2@co2.com": date(2026, 9, 29)}
+    items = open_followups.collect_open_followups(
+        snaps, _of_live("uuid-1", "uuid-2"), sent, _OF_TODAY)
+    assert [x["name"] for x in items] == ["Pat2"]
+
+
+def test_open_followups_send_satisfies_rung1_only_rung2_still_owed():
+    snaps = _of_snapshots({
+        "2026-09-22": [_of_entry(1, "2026-09-22", attempt=1)],
+        "2026-09-29": [_of_entry(1, "2026-09-29", attempt=2, day=11)],
+    })
+    sent = {"pat1@co1.com": date(2026, 9, 23)}
+    items = open_followups.collect_open_followups(snaps, _of_live("uuid-1"), sent, _OF_TODAY)
+    assert len(items) == 1
+    assert items[0]["owed_since"] == "2026-09-29" and items[0]["listings"] == 1
+
+
+def test_open_followups_unchecked_sent_drops_nothing_and_says_so():
+    snaps = _of_snapshots({"2026-09-30": [_of_entry(1, "2026-09-30")]})
+    live = _of_live("uuid-1")
+    unchecked = open_followups.collect_open_followups(snaps, live, None, _OF_TODAY)
+    checked = open_followups.collect_open_followups(snaps, live, {}, _OF_TODAY)
+    assert [x["sent_checked"] for x in unchecked] == [False]
+    assert [x["sent_checked"] for x in checked] == [True]
+
+
+def test_open_followups_killed_moved_and_replied_contacts_drop():
+    snaps = _of_snapshots({"2026-09-29": [_of_entry(i, "2026-09-29") for i in range(1, 5)]})
+    notes = {
+        "uuid-2": "[2026-09-30] Inbound reply received - thanks, let's talk",
+        # A reply from BEFORE the listing is old news: the contact is still owed.
+        "uuid-3": "[2026-09-20] Inbound reply received - earlier thread",
+    }
+    # uuid-4 is gone from the live read: killed to the ghost tab or promoted to Carmen Hot.
+    items = open_followups.collect_open_followups(
+        snaps, _of_live("uuid-1", "uuid-2", "uuid-3", notes=notes), {}, _OF_TODAY)
+    assert [x["name"] for x in items] == ["Pat1", "Pat3"]
+
+
+def test_open_followups_skips_quiet_apps_missing_uuid_and_falls_back_on_sentinel_due():
+    entry_no_uuid = _of_entry(5, "2026-09-30")
+    entry_no_uuid["sheet_uuid"] = ""
+    sentinel = _of_entry(6, "2026-09-30", next_followup="1970-01-01")
+    snaps = _of_snapshots({"2026-09-30": [entry_no_uuid, sentinel]})
+    snaps["2026-09-30"]["applications_quiet"] = [{"sheet_uuid": "uuid-7", "company": "Co7"}]
+    items = open_followups.collect_open_followups(
+        snaps, _of_live("uuid-5", "uuid-6", "uuid-7"), {}, _OF_TODAY)
+    assert [x["sheet_uuid"] for x in items] == ["uuid-6"]
+    assert items[0]["due"] == "2026-09-30"

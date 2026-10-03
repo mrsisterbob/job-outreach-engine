@@ -19,6 +19,7 @@ import uuid
 from xml.etree import ElementTree
 from datetime import datetime, timezone, timedelta, time as dt_time
 from email.message import EmailMessage
+from email.utils import getaddresses
 import requests
 from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -30,6 +31,7 @@ from track_registry import (
 )
 from response_schema import GeminiJobScreenerResponse
 from command_help import lookup_command_help
+from open_followups import collect_open_followups
 from pipeline_utils import (
     ladder_progress, format_ladder_progress, carmen_terminal_gap,
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
@@ -7612,6 +7614,82 @@ def capture_contacts_from_sent_mail(lookback_hours=None, max_messages=25, dry_ru
     return captured
 
 
+# Addresses per Gmail search. A {to:a to:b ...} OR group keeps ~70 contacts to a handful of list
+# calls without pushing one query string past what Gmail's search will accept.
+SENT_LOOKUP_CHUNK = 20
+
+
+def latest_sent_dates_by_recipient(emails, since_date):
+    """{email_lower: date of the most recent Sent message To/Cc that address} since since_date.
+
+    Read-only. Returns None, never {}, when the Sent folder could not be checked: missing Gmail
+    env vars, no access token, any non-200 or an exception. {} means "checked, nobody emailed",
+    and an outage that returned it would read as "nobody has been nudged" - a clean zero.
+    An address with no Sent message in the window is simply absent from the result.
+    """
+    wanted = sorted({str(e or "").strip().lower() for e in emails or () if "@" in str(e or "")})
+    missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
+    if missing_vars:
+        return None
+    if not wanted:
+        return {}
+    access_token = get_gmail_access_token()
+    if not access_token:
+        return None
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    # after: is a whole day and Gmail reads it in its own timezone, so start one day early. The
+    # dates returned are exact, and the caller compares them against each listing's run_date.
+    after = (since_date - timedelta(days=1)).strftime("%Y/%m/%d")
+    wanted_set = set(wanted)
+    latest = {}
+    try:
+        message_ids = []
+        for i in range(0, len(wanted), SENT_LOOKUP_CHUNK):
+            chunk = wanted[i:i + SENT_LOOKUP_CHUNK]
+            query = f"in:sent after:{after} {{{' '.join(f'to:{a} cc:{a}' for a in chunk)}}}"
+            page_token = None
+            while True:
+                params = {"q": query, "maxResults": 500}
+                if page_token:
+                    params["pageToken"] = page_token
+                res = requests.get(
+                    "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                    headers=headers, params=params, timeout=10,
+                )
+                if res.status_code != 200:
+                    logging.error(f"[SENT] Sent lookup list error: {res.status_code}")
+                    return None
+                body = res.json()
+                message_ids.extend(m["id"] for m in body.get("messages", []) or [])
+                page_token = body.get("nextPageToken")
+                if not page_token:
+                    break
+
+        for msg_id in dict.fromkeys(message_ids):
+            detail = requests.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                headers=headers,
+                params={"format": "metadata", "metadataHeaders": ["To", "Cc"]},
+                timeout=10,
+            )
+            if detail.status_code != 200:
+                logging.error(f"[SENT] Sent lookup metadata error: {detail.status_code}")
+                return None
+            message = detail.json()
+            sent_on = datetime.fromtimestamp(int(message["internalDate"]) / 1000).date()
+            header_list = (message.get("payload") or {}).get("headers", [])
+            recipients = ", ".join(_gmail_header_value(header_list, h) for h in ("To", "Cc"))
+            for _name, address in getaddresses([recipients]):
+                key = address.strip().lower()
+                if key in wanted_set and (key not in latest or sent_on > latest[key]):
+                    latest[key] = sent_on
+    except Exception as e:
+        logging.error(f"[SENT] Sent lookup exception: {e}")
+        return None
+    return latest
+
+
 def get_job_rows_with_guessed_email():
     """Every live JOBS row whose Contact Email is still a pipeline guess.
 
@@ -8478,7 +8556,15 @@ def start_crm_outbox_worker():
     threading.Thread(target=crm_outbox_worker_loop, daemon=True).start()
 
 def fetch_networking_cards(target_code="CW", qty=2):
-    """Rows from one CRM tab, or [] when the read failed.
+    """Rows from one CRM tab, or [] when the read failed. See fetch_networking_cards_checked()."""
+    return fetch_networking_cards_checked(target_code, qty)[0]
+
+
+def fetch_networking_cards_checked(target_code="CW", qty=2):
+    """(rows, ok) for one CRM tab. `ok` is True only when the body said status "success".
+
+    fetch_networking_cards() drops `ok` and returns [] on failure, which is the same value as an
+    empty tab. A caller that reports a COUNT must use this form, or a failed read shows as zero.
 
     HTTP 200 IS NOT SUCCESS. An Apps Script web app answers 200 for everything it handles,
     including its own {"status":"error"} bodies - an unset or mismatched CRM_SHARED_SECRET makes
@@ -8495,15 +8581,15 @@ def fetch_networking_cards(target_code="CW", qty=2):
     res = crm_post({"action": "get_followups", "tab": target_code})
     if not res:
         logging.error(f"[CRM] get_followups({target_code}): no response from the webhook")
-        return []
+        return [], False
     try:
         if res.status_code != 200:
             logging.error(f"[CRM] get_followups({target_code}): HTTP {res.status_code}")
-            return []
+            return [], False
         body = res.json()
         if not isinstance(body, dict):
             logging.error(f"[CRM] get_followups({target_code}): non-dict body")
-            return []
+            return [], False
         status = str(body.get("status", "")).lower()
         if status and status != "success":
             message = str(body.get("message", ""))
@@ -8513,16 +8599,16 @@ def fetch_networking_cards(target_code="CW", qty=2):
             # is EMPTY" each time a busy lock landed between two good reads.
             if "lock timeout" not in message.lower():
                 _alert_crm_read_rejection(message)
-            return []
+            return [], False
         if status == "success":
             # Only a body that SAID success is evidence the CRM is healthy - a missing status,
             # a non-200 or a non-dict body proves nothing, so none of those re-arm the alert.
             _CRM_READ_REJECTION_ALERTED.clear()
         leads = body.get("followups", [])
-        return leads if qty is None else leads[:qty]
+        return (leads if qty is None else leads[:qty]), status == "success"
     except Exception as e:
         logging.error(f"Error fetching networking cards: {e}")
-    return []
+    return [], False
 
 
 # One alert per outage for a rejected CRM read. Every caller of fetch_networking_cards would
@@ -9930,6 +10016,43 @@ def load_followup_queue_snapshot(run_date):
     except Exception as e:
         logging.error(f"[SEQUENCER] Snapshot load failed ({run_date}): {e}")
         return None
+
+
+def build_open_followups(today=None):
+    """Every follow-up still owed across the saved queues: the shared source for /owed and
+    GET /followups/open. Read-only - no sequencer run, no CRM write, no draft, no send.
+
+    Returns {"crm_ok", "crm_failed_tab", "items", "sent_checked"}. When any scan tab fails to
+    read, crm_ok is False and items is empty: collect_open_followups() reads an absent row as
+    killed or moved, so a failed read would otherwise report "0 owed" - a clean zero.
+    """
+    today = today or datetime.now().date()
+    snapshots = {}
+    for back in range(FOLLOWUP_SNAPSHOT_RETENTION_DAYS + 1):
+        run_date = (today - timedelta(days=back)).strftime("%Y-%m-%d")
+        snapshot = load_followup_queue_snapshot(run_date)
+        if snapshot is not None:
+            snapshots[run_date] = snapshot
+    if not any(e.get("sheet_uuid") for s in snapshots.values() for e in s.get("followups_ready") or []):
+        return {"crm_ok": True, "crm_failed_tab": None, "items": [], "sent_checked": True}
+
+    # The same read the sequencer does, over the same tabs. A row it killed or promoted has moved
+    # off these tabs, which is how the merge knows to drop it.
+    live_rows = {}
+    for code, tab_name in SEQUENCER_SCAN_TABS:
+        rows, ok = fetch_networking_cards_checked(code, qty=None)
+        if not ok:
+            return {"crm_ok": False, "crm_failed_tab": tab_name, "items": [], "sent_checked": False}
+        for rec in rows:
+            if rec.get("sheet_uuid"):
+                live_rows[rec["sheet_uuid"]] = rec
+
+    emails = {e.get("email") for s in snapshots.values() for e in s.get("followups_ready") or []
+              if e.get("sheet_uuid") in live_rows}
+    since = datetime.strptime(min(snapshots), "%Y-%m-%d").date()
+    last_sent = latest_sent_dates_by_recipient(emails, since)
+    items = collect_open_followups(snapshots, live_rows, last_sent, today)
+    return {"crm_ok": True, "crm_failed_tab": None, "items": items, "sent_checked": last_sent is not None}
 
 # Pacing for the nightly link sweep. The sequencer and the digest share this window, so the
 # sweep is capped rather than allowed to run until it finishes - a slow host must never delay
@@ -12729,6 +12852,20 @@ def process_webhook_payload_async(data):
             send_overdue_digest(chat_id, get_overdue_followups(), limit=None)
             return
 
+        if text == "/owed":
+            # Count + one link, nothing else: the list lives on the page. Already off the webhook's
+            # request thread (one daemon thread per update), so the CRM + Gmail reads run inline.
+            owed = build_open_followups()
+            if not owed["crm_ok"]:
+                send_telegram_message(chat_id, "⚠️ CRM read failed - open follow-ups unknown.")
+                return
+            lines = [f"<b>{_open_followups_count_label(len(owed['items']))}</b>",
+                     f"<a href='{BASE_URL}/followups/open'>Open list</a>"]
+            if not owed["sent_checked"]:
+                lines.append("Gmail Sent not checked - may include people already nudged.")
+            send_telegram_message(chat_id, "\n".join(lines))
+            return
+
         if text == "/outcomes":
             send_telegram_message(chat_id, format_outcome_metrics_message())
             return
@@ -13857,7 +13994,8 @@ def process_webhook_payload_async(data):
                 "<b>TUESDAY BATCH HUB:</b>\n"
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
                 "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"
-                "/overdue - Full overdue list (the morning digest shows only the 10 most overdue)\n\n"
+                "/overdue - Full overdue list (the morning digest shows only the 10 most overdue)\n"
+                "/owed - Every follow-up still owed (last 14 days), count + link\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
@@ -14086,6 +14224,47 @@ def _queue_date_query(run_date):
     return f"?date={urllib.parse.quote(str(run_date))}" if run_date else ""
 
 
+def _followup_person_block(e, field_id, date_q, meta_html):
+    """One person on a follow-up page: "who — company", the caller's meta line, the full draft
+    and the LinkedIn / Copy / Open in Gmail buttons. Shared by GET /followups and
+    GET /followups/open. `date_q` must name the snapshot the draft came from:
+    followup_draft_on_demand() looks the entry up in that date's queue, so a wrong date 404s.
+    `meta_html` is escaped by the caller."""
+    who = str(e.get("role") or e.get("name") or "—")
+    company = str(e.get("company") or "—")
+    links = (
+        f'<button class="btn btn-secondary" onclick="copyField(\'{field_id}\')" '
+        f'style="border: none; cursor: pointer;">📋 Copy Draft</button>'
+    )
+    # LinkedIn lookup, sitting ABOVE the draft on purpose: the workflow is look them up →
+    # copy their About section → regenerate the email with {their_desk} filled. That one
+    # concrete detail about the RECIPIENT's desk is what separates the two best emails in
+    # the Sent folder from the generic "Given how much of this sits under you" fallback.
+    # A site: query rather than LinkedIn's own search, which demands a login.
+    lookup_terms = " ".join(t for t in (str(e.get("name") or ""), company) if t and t != "—").strip()
+    if lookup_terms:
+        lookup_url = html.escape(
+            "https://www.google.com/search?q=" + urllib.parse.quote(f'site:linkedin.com/in "{lookup_terms}"'),
+            quote=True)
+        links = (f'<a class="btn btn-secondary" href="{lookup_url}" target="_blank">🔎 Look up on LinkedIn</a>'
+                 + links)
+    no_address_note = ""
+    if e.get("sheet_uuid") and _sequencer_draft_recipient(e):
+        open_url = html.escape(
+            f"/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}{date_q}", quote=True)
+        links += f'<a class="btn btn-primary" href="{open_url}" target="_blank">✉️ Open in Gmail</a>'
+    else:
+        no_address_note = "<p class='meta'><i>No verified address on file - copy the draft and send it by hand.</i></p>"
+    return (
+        f"<h3 style='margin-top: 24px;'>{html.escape(who)} — {html.escape(company)}</h3>"
+        f"<p class='meta'>{meta_html}</p>"
+        f'<textarea id="{field_id}" rows="10" style="width: 100%;" readonly>'
+        f"{html.escape(str(e.get('draft_text') or ''))}</textarea>"
+        f'<div style="margin-top: 10px;">{links}</div>'
+        f"{no_address_note}"
+    )
+
+
 @app.route("/followups", methods=["GET"])
 def followup_queue_view():
     """The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail
@@ -14123,34 +14302,8 @@ def followup_queue_view():
     if ready:
         parts.append(f"<h3 style='margin-top: 24px;'>✉️ Nudge These People ({len(ready)})</h3>")
         for i, e in enumerate(ready):
-            who = str(e.get("role") or e.get("name") or "—")
-            company = str(e.get("company") or "—")
             due = _followup_date_label(e.get("next_followup"))
             step = _next_step_label(e)
-            field_id = f"draft-{i}"
-            links = (
-                f'<button class="btn btn-secondary" onclick="copyField(\'{field_id}\')" '
-                f'style="border: none; cursor: pointer;">📋 Copy Draft</button>'
-            )
-            # LinkedIn lookup, sitting ABOVE the draft on purpose: the workflow is look them up →
-            # copy their About section → regenerate the email with {their_desk} filled. That one
-            # concrete detail about the RECIPIENT's desk is what separates the two best emails in
-            # the Sent folder from the generic "Given how much of this sits under you" fallback.
-            # A site: query rather than LinkedIn's own search, which demands a login.
-            lookup_terms = " ".join(t for t in (str(e.get("name") or ""), company) if t and t != "—").strip()
-            if lookup_terms:
-                lookup_url = html.escape(
-                    "https://www.google.com/search?q=" + urllib.parse.quote(f'site:linkedin.com/in "{lookup_terms}"'),
-                    quote=True)
-                links = (f'<a class="btn btn-secondary" href="{lookup_url}" target="_blank">🔎 Look up on LinkedIn</a>'
-                         + links)
-            no_address_note = ""
-            if e.get("sheet_uuid") and _sequencer_draft_recipient(e):
-                open_url = html.escape(
-                    f"/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}{date_q}", quote=True)
-                links += f'<a class="btn btn-primary" href="{open_url}" target="_blank">✉️ Open in Gmail</a>'
-            else:
-                no_address_note = "<p class='meta'><i>No verified address on file - copy the draft and send it by hand.</i></p>"
             # Auto-send verdict, stated plainly. A row that will NOT dispatch on its own is the
             # one Kevin has to act on, so the reason is spelled out rather than implied by absence.
             if e.get("autosend"):
@@ -14166,16 +14319,11 @@ def followup_queue_view():
                 verdict = "✋ Manual"
             day_label = format_ladder_progress(e.get("progress"))
             day_part = f"<b>{html.escape(day_label)}</b> · " if day_label else ""
-            parts.append(
-                f"<h3 style='margin-top: 24px;'>{html.escape(who)} — {html.escape(company)}</h3>"
-                f"<p class='meta'>{day_part}Follow-up #{html.escape(str(e.get('attempt', 1)))} · "
+            parts.append(_followup_person_block(e, f"draft-{i}", date_q, (
+                f"{day_part}Follow-up #{html.escape(str(e.get('attempt', 1)))} · "
                 f"due {html.escape(due)} → {html.escape(step)} · "
-                f"🆔 <code>{html.escape(_seq_id_tag(e))}</code><br>{verdict}</p>"
-                f'<textarea id="{field_id}" rows="10" style="width: 100%;" readonly>'
-                f"{html.escape(str(e.get('draft_text') or ''))}</textarea>"
-                f'<div style="margin-top: 10px;">{links}</div>'
-                f"{no_address_note}"
-            )
+                f"🆔 <code>{html.escape(_seq_id_tag(e))}</code><br>{verdict}"
+            )))
 
     if quiet:
         rows_html = []
@@ -14204,6 +14352,54 @@ def followup_queue_view():
             + "".join(rows_html) + "</table>"
         )
     return _followups_page(title, "".join(parts)), 200
+
+def _open_followups_count_label(n):
+    return f"{n} open follow-up{'' if n == 1 else 's'}"
+
+
+@app.route("/followups/open", methods=["GET"])
+def open_followups_view():
+    """/owed's target: every follow-up still owed across the saved queues, oldest-due first.
+
+    Read-only, like GET /followups. Each "Open in Gmail" link carries the date of the snapshot its
+    draft came from, because followup_draft_on_demand() drafts from that day's queue.
+    """
+    title = "Open Follow-ups"
+    owed = build_open_followups()
+    if not owed["crm_ok"]:
+        # No count at all: a number here would read as real when the CRM said nothing.
+        return _followups_page(title, (
+            f"<h2>{html.escape(title)}</h2>"
+            f"<p class='meta'>⚠️ Could not read the CRM ({html.escape(str(owed['crm_failed_tab']))}), so "
+            "the open follow-ups are unknown. Try again once the CRM is answering.</p>"
+        )), 502
+
+    items = owed["items"]
+    heading = _open_followups_count_label(len(items))
+    parts = [
+        f"<h2>{html.escape(heading)}</h2>",
+        f"<p class='meta'>Everyone listed as due in the last {FOLLOWUP_SNAPSHOT_RETENTION_DAYS} days of "
+        "queues who has not replied, been killed or moved, or been emailed since. Each shows how many "
+        "days you have owed them.</p>",
+    ]
+    if not owed["sent_checked"]:
+        parts.append(
+            "<p class='meta' style='background:#fff3cd; padding:10px; border-radius:6px;'>⚠️ Gmail Sent "
+            "was not checked, so this list may include people you already nudged.</p>")
+    if not items:
+        parts.append("<p class='meta'>✅ Nothing owed.</p>")
+        return _followups_page(title, "".join(parts)), 200
+
+    for i, e in enumerate(items):
+        day_label = format_ladder_progress(e.get("progress"))
+        day_part = f"<b>{html.escape(day_label)}</b> · " if day_label else ""
+        days = e["days_owed"]
+        parts.append(_followup_person_block(e, f"draft-{i}", _queue_date_query(e["run_date"]), (
+            f"{day_part}owed {days} day{'' if days == 1 else 's'} (since {html.escape(e['owed_since'])}) · "
+            f"due {html.escape(e['due'])} · Follow-up #{html.escape(str(e.get('attempt') or 1))}"
+        )))
+    return _followups_page(title, "".join(parts)), 200
+
 
 def _followup_copy_page(title, reason, draft_text, status):
     """The fallback for an on-demand draft that could not be created: the reason, and the text to

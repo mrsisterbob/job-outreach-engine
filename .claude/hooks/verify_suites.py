@@ -23,6 +23,7 @@ hook that cannot parse its input fails open - which looks exactly like a passing
 """
 
 import json
+import os
 import subprocess
 import sys
 
@@ -42,7 +43,10 @@ def main():
     if payload.get("stop_hook_active"):
         return
 
-    cwd = payload.get("cwd") or "."
+    # The repo root, from this file's own location (.claude/hooks/ -> two levels up) - NOT the
+    # payload's cwd. That is the shell's current directory, so one `cd .queue/inbox` mid-turn
+    # made pytest collect nothing and the hook reported a false red ("no tests ran").
+    cwd = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     try:
         result = subprocess.run(
