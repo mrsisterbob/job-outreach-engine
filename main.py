@@ -9110,9 +9110,9 @@ def promote_job_card_contact(chat_id, token, extra):
 _SENT_NAME_CACHE = {}
 _SENT_NAME_CACHE_LOCK = threading.Lock()
 SENT_NAME_MISS_TTL = timedelta(hours=1)
-# Oldest-first scan depth: the first touch is the message Kevin hand-addressed, and a contact rarely
-# has more than a handful of messages in Sent.
-SENT_NAME_MAX_MESSAGES = 5
+# Oldest-first scan depth: the first touch is the message Kevin hand-addressed, so it almost always
+# answers alone. Kept at 2 because every extra fetch is paid per person on each page render.
+SENT_NAME_MAX_MESSAGES = 2
 
 
 def first_name_from_sent_mail(to_email):
@@ -14502,15 +14502,40 @@ def _open_followups_count_label(n):
     return f"{n} open follow-up{'' if n == 1 else 's'}"
 
 
+# The open list renders this many people per page. Each person costs Sent-mail lookups for the
+# greeting (rerender_followup_drafts), and the whole list at once - 68 people on 2026-10-03 - ran
+# the single gunicorn worker past its 120s timeout: a 502, with Telegram unanswered meanwhile.
+OPEN_FOLLOWUPS_PAGE_SIZE = 20
+# Pages 2+ reuse page 1's list for this long, so paging does not redo the CRM + Sent scan. Page 1
+# always reads fresh, so reloading it is how Kevin sees a send he just made drop off.
+OPEN_FOLLOWUPS_CACHE_TTL = timedelta(minutes=10)
+_OPEN_FOLLOWUPS_CACHE = {"owed": None, "at": None}
+
+
+def _open_followups_page_number():
+    try:
+        return max(1, int(request.args.get("page", "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
 @app.route("/followups/open", methods=["GET"])
 def open_followups_view():
-    """/owed's target: every follow-up still owed across the saved queues, oldest-due first.
+    """/owed's target: every follow-up still owed across the saved queues, oldest-due first,
+    OPEN_FOLLOWUPS_PAGE_SIZE per page (?page=N).
 
     Read-only, like GET /followups. Each "Open in Gmail" link carries the date of the snapshot its
     draft came from, because followup_draft_on_demand() drafts from that day's queue.
     """
     title = "Open Follow-ups"
-    owed = build_open_followups()
+    page = _open_followups_page_number()
+    cached, cached_at = _OPEN_FOLLOWUPS_CACHE["owed"], _OPEN_FOLLOWUPS_CACHE["at"]
+    if page > 1 and cached is not None and datetime.now() - cached_at < OPEN_FOLLOWUPS_CACHE_TTL:
+        owed = cached
+    else:
+        owed = build_open_followups()
+        if owed["crm_ok"]:
+            _OPEN_FOLLOWUPS_CACHE.update(owed=owed, at=datetime.now())
     if not owed["crm_ok"]:
         # No count at all: a number here would read as real when the CRM said nothing.
         return _followups_page(title, (
@@ -14519,11 +14544,26 @@ def open_followups_view():
             "the open follow-ups are unknown. Try again once the CRM is answering.</p>"
         )), 502
 
+    all_items = owed["items"]
+    pages = max(1, -(-len(all_items) // OPEN_FOLLOWUPS_PAGE_SIZE))
+    page = min(page, pages)
+    start = (page - 1) * OPEN_FOLLOWUPS_PAGE_SIZE
     # Re-rendered, not replayed: a snapshot up to 14 days old carries that day's template and name.
-    items = rerender_followup_drafts(owed["items"])
-    heading = _open_followups_count_label(len(items))
+    # Only THIS page's slice, and on copies, so the cached list keeps its original entries.
+    items = rerender_followup_drafts(
+        [dict(e) for e in all_items[start:start + OPEN_FOLLOWUPS_PAGE_SIZE]])
+    heading = _open_followups_count_label(len(all_items))
+    nav = ""
+    if pages > 1:
+        links = [f"<b>{start + 1}–{start + len(items)}</b> of {len(all_items)}"]
+        if page > 1:
+            links.insert(0, f'<a class="btn btn-secondary" href="/followups/open?page={page - 1}">← Prev 20</a>')
+        if page < pages:
+            links.append(f'<a class="btn btn-primary" href="/followups/open?page={page + 1}">Next 20 →</a>')
+        nav = f"<div class='meta' style='margin: 12px 0;'>Page {page} of {pages} · {' '.join(links)}</div>"
     parts = [
         f"<h2>{html.escape(heading)}</h2>",
+        nav,
         f"<p class='meta'>Everyone listed as due in the last {FOLLOWUP_SNAPSHOT_RETENTION_DAYS} days of "
         "queues who has not replied, been killed or moved, or been emailed since. Each shows how many "
         "days you have owed them.</p>",
@@ -14544,6 +14584,7 @@ def open_followups_view():
             f"{day_part}owed {days} day{'' if days == 1 else 's'} (since {html.escape(e['owed_since'])}) · "
             f"due {html.escape(e['due'])} · Follow-up #{html.escape(str(e.get('attempt') or 1))}"
         )))
+    parts.append(nav)
     return _followups_page(title, "".join(parts)), 200
 
 

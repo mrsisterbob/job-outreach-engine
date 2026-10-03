@@ -52,6 +52,7 @@ def clean_tables():
         conn.commit()
     # Module-global name cache: a Sent lookup in one test must not answer for the next.
     m._SENT_NAME_CACHE.clear()
+    m._OPEN_FOLLOWUPS_CACHE.update(owed=None, at=None)
     yield
 
 
@@ -1651,6 +1652,37 @@ def test_open_followups_lists_five_skipped_mornings_oldest_first_and_every_draft
             res = client.get(href)
             assert res.status_code == 302 and "mail.google.com" in res.headers["Location"]
     assert enqueued == []
+
+
+def test_open_followups_pages_render_only_their_slice_and_reuse_the_list(monkeypatch):
+    """68 people at once ran the one gunicorn worker past its 120s timeout - a 502. Each page must
+    look up only its own people, and paging must not redo the CRM + Sent scan."""
+    monkeypatch.setattr(m, "OPEN_FOLLOWUPS_PAGE_SIZE", 2)
+    today, run_dates, live = _seed_skipped_mornings(monkeypatch)
+    _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live)
+    _gmail_sent(monkeypatch)
+    looked_up, builds = [], []
+    monkeypatch.setattr(m, "first_name_from_sent_mail", lambda email: looked_up.append(email) or None)
+    real_build = m.build_open_followups
+    monkeypatch.setattr(m, "build_open_followups", lambda *a, **k: builds.append(1) or real_build(*a, **k))
+
+    with m.app.test_client() as client:
+        first = client.get("/followups/open").get_data(as_text=True)
+        assert "5 open follow-ups" in first and "Page 1 of 3" in first
+        assert "— Co0</h3>" in first and "— Co1</h3>" in first and "— Co2</h3>" not in first
+        assert 'href="/followups/open?page=2">Next 20 →' in first
+        # A set: the stub has no cache, so the prefetch and the render each call it once.
+        assert set(looked_up) == {_owed_email(k) for k in (0, 1)}
+
+        last = client.get("/followups/open?page=3").get_data(as_text=True)
+        assert "— Co4</h3>" in last and "— Co0</h3>" not in last and "Next 20" not in last
+        # Clamped, not an empty page.
+        assert "— Co4</h3>" in client.get("/followups/open?page=99").get_data(as_text=True)
+
+    assert len(builds) == 1, "pages 2+ must reuse page 1's list"
+    hrefs = re.findall(r'href="(/followups/draft/[^"]+)"', last)
+    assert hrefs == [f"/followups/draft/cc-4?date={run_dates[4]}"]
 
 
 def test_open_followups_drops_the_nudged_the_replied_and_the_moved(monkeypatch):

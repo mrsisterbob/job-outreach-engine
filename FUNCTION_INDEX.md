@@ -38,7 +38,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 193 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 208 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
-## `main.py` — 344 defs, 15,438 lines
+## `main.py` — 345 defs, 15,479 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -353,39 +353,40 @@ grep -i "contact" FUNCTION_INDEX.md
 | 14371 | `_followup_person_block` | One person on a follow-up page: "who — company", the caller's meta line, the full draft |
 | 14413 | `followup_queue_view` | The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail |
 | 14501 | `_open_followups_count_label` | _(no docstring)_ |
-| 14506 | `open_followups_view` | /owed's target: every follow-up still owed across the saved queues, oldest-due first. |
-| 14550 | `_followup_copy_page` | The fallback for an on-demand draft that could not be created: the reason, and the text to |
-| 14563 | `followup_draft_on_demand` | Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it. |
-| 14619 | `morning_brief_view` | One page holding everything the morning used to dump into Telegram as four messages. |
-| 14716 | `desktop_stage_view` | Desktop review page - the card's "Full Card" target. Everything the Telegram card used to |
-| 14834 | `desktop_stage_pdf` | Serves raw PDF bytes for browser preview and download. |
-| 14856 | `desktop_ingest` | Secure endpoint for desktop bookmarklet ingestion of manual job links/text. |
-| 14930 | `_public_stats_days_running` | Whole days from PUBLIC_STATS_START_DATE to today, floored at 0. |
-| 14937 | `build_public_stats` | Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable. |
-| 15000 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
-| 15049 | `analytics_enabled` | ANALYTICS_ENABLED (default true). Read per call, so flipping it needs no code change. |
-| 15054 | `_analytics_own_hosts` | _(no docstring)_ |
-| 15059 | `_analytics_ignore_ips` | _(no docstring)_ |
-| 15063 | `visitor_salt_for` | Today's random salt. Asking for a new day replaces (and so forgets) the previous one. |
-| 15072 | `_visit_timestamp` | The site's UTC pageview time as 'YYYY-MM-DD HH:MM:SS' (CURRENT_TIMESTAMP's format), or None |
-| 15081 | `record_site_visits` | Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and |
-| 15110 | `prune_site_visits` | Delete pageviews older than the retention window. Returns rows removed. |
-| 15122 | `_maybe_prune_site_visits` | Prune at most hourly, riding on ingest traffic - no scheduled job of its own. |
-| 15135 | `analytics_ingest` | Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN. |
-| 15153 | `get_site_visit_rows` | READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises |
-| 15163 | `site_visitor_standup_line` | The standup's analytics line, or '' when analytics is switched off. Never raises: a failed |
-| 15185 | `record_inbound_lead` | Commit one validated lead (see validate_lead). Returns the new row id. |
-| 15196 | `get_recent_leads` | READ-ONLY. (id, received_at, source, name, email, message), newest first. |
-| 15206 | `leads_ingest` | One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN. |
-| 15256 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
-| 15269 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
-| 15278 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
-| 15289 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
-| 15299 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
-| 15336 | `_cached_drafting_timing` | _(no docstring)_ |
-| 15354 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
-| 15389 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
-| 15396 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
+| 14515 | `_open_followups_page_number` | _(no docstring)_ |
+| 14523 | `open_followups_view` | /owed's target: every follow-up still owed across the saved queues, oldest-due first, |
+| 14591 | `_followup_copy_page` | The fallback for an on-demand draft that could not be created: the reason, and the text to |
+| 14604 | `followup_draft_on_demand` | Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it. |
+| 14660 | `morning_brief_view` | One page holding everything the morning used to dump into Telegram as four messages. |
+| 14757 | `desktop_stage_view` | Desktop review page - the card's "Full Card" target. Everything the Telegram card used to |
+| 14875 | `desktop_stage_pdf` | Serves raw PDF bytes for browser preview and download. |
+| 14897 | `desktop_ingest` | Secure endpoint for desktop bookmarklet ingestion of manual job links/text. |
+| 14971 | `_public_stats_days_running` | Whole days from PUBLIC_STATS_START_DATE to today, floored at 0. |
+| 14978 | `build_public_stats` | Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable. |
+| 15041 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
+| 15090 | `analytics_enabled` | ANALYTICS_ENABLED (default true). Read per call, so flipping it needs no code change. |
+| 15095 | `_analytics_own_hosts` | _(no docstring)_ |
+| 15100 | `_analytics_ignore_ips` | _(no docstring)_ |
+| 15104 | `visitor_salt_for` | Today's random salt. Asking for a new day replaces (and so forgets) the previous one. |
+| 15113 | `_visit_timestamp` | The site's UTC pageview time as 'YYYY-MM-DD HH:MM:SS' (CURRENT_TIMESTAMP's format), or None |
+| 15122 | `record_site_visits` | Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and |
+| 15151 | `prune_site_visits` | Delete pageviews older than the retention window. Returns rows removed. |
+| 15163 | `_maybe_prune_site_visits` | Prune at most hourly, riding on ingest traffic - no scheduled job of its own. |
+| 15176 | `analytics_ingest` | Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN. |
+| 15194 | `get_site_visit_rows` | READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises |
+| 15204 | `site_visitor_standup_line` | The standup's analytics line, or '' when analytics is switched off. Never raises: a failed |
+| 15226 | `record_inbound_lead` | Commit one validated lead (see validate_lead). Returns the new row id. |
+| 15237 | `get_recent_leads` | READ-ONLY. (id, received_at, source, name, email, message), newest first. |
+| 15247 | `leads_ingest` | One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN. |
+| 15297 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
+| 15310 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
+| 15319 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
+| 15330 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
+| 15340 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
+| 15377 | `_cached_drafting_timing` | _(no docstring)_ |
+| 15395 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
+| 15430 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
+| 15437 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
 
 ## `open_followups.py` — 3 defs, 110 lines
 
@@ -587,4 +588,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**513 definitions across 11 files + Code.gs.**
+**514 definitions across 11 files + Code.gs.**
