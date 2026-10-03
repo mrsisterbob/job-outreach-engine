@@ -46,7 +46,7 @@ def clean_tables():
                       "seen_content_hashes", "jd_term_yield", "job_link_status",
                       # died_roles is permanent by design, so a row left behind by one test would
                       # silently suppress a role in every later one.
-                      "died_roles",
+                      "died_roles", "owed_dismissals",
                       "command_usage"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
@@ -1743,6 +1743,66 @@ def test_owed_sends_one_link_per_page_and_the_links_skip_the_rescan(monkeypatch,
         page = client.get("/followups/open?page=2").get_data(as_text=True)
     assert "— Co2</h3>" in page and "— Co3</h3>" in page and "Page 2 of 3" in page
     assert "refresh=1" in page
+
+
+# ---- /owedx: dismiss the open follow-ups without touching the CRM ----
+
+def test_owedx_clears_owed_writes_nothing_to_the_crm_and_undo_restores(monkeypatch, capture_sent):
+    _, _, live = _seed_skipped_mornings(monkeypatch)
+    enqueued = _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live)
+    _gmail_sent(monkeypatch)
+
+    _dispatch("/owed")
+    assert "<b>5 open follow-ups</b>" in capture_sent[-1] and "/owedx" in capture_sent[-1]
+
+    _dispatch("/owedx")
+    assert "Dismissed 5 open follow-ups" in capture_sent[-1]
+    assert enqueued == [], "dismissing must never write to the CRM"
+
+    _dispatch("/owed")
+    assert "<b>0 open follow-ups</b>" in capture_sent[-1]
+    with m.app.test_client() as client:
+        assert "0 open follow-ups" in client.get("/followups/open").get_data(as_text=True)
+
+    _dispatch("/owedx undo")
+    assert "Restored 5" in capture_sent[-1]
+    _dispatch("/owed")
+    assert "<b>5 open follow-ups</b>" in capture_sent[-1]
+    assert enqueued == []
+
+
+def test_a_dismissed_contact_is_off_the_morning_card_but_its_ladder_still_moves(monkeypatch):
+    enqueued, drafts = _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0)])
+    m.dismiss_owed_followups(["cc-0"], on_date=_SEQ_TODAY)
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert result["followups_ready"] == []
+    assert "cc-0" not in m.render_followup_needs_card(result)
+    assert drafts == []
+    # Still snoozed along its ladder, so it retires on the normal schedule.
+    assert any(p["action"] == "update_snooze" and p["sheet_uuid"] == "cc-0" for p in enqueued)
+    assert not any(p["action"] == "update_status" for p in enqueued), "never moved to Killed"
+
+
+def test_a_reply_after_the_dismissal_brings_the_contact_back(monkeypatch):
+    replied = {**_due_person(0), "note": f"[{_SEQ_TODAY.isoformat()}] {m.INBOUND_REPLY_NOTE_MARKER} - sure"}
+    _mock_followup_rows(monkeypatch, cc_rows=[replied])
+    m.dismiss_owed_followups(["cc-0"], on_date=_SEQ_TODAY - timedelta(days=1))
+
+    assert m._is_dismissed(replied, m.load_owed_dismissals()) is False
+
+
+def test_dismissed_contacts_are_off_overdue_too(monkeypatch):
+    overdue_row = {**_due_person(0), "next_followup": (_SEQ_TODAY - timedelta(days=3)).isoformat()}
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(overdue_row)] if code == "CC" else [])
+    assert [r["sheet_uuid"] for r in m.get_overdue_followups()] == ["cc-0"]
+
+    m.dismiss_owed_followups(["cc-0"])
+
+    assert m.get_overdue_followups() == []
 
 
 def test_open_followups_drops_the_nudged_the_replied_and_the_moved(monkeypatch):

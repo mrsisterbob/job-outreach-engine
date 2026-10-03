@@ -1541,6 +1541,22 @@ def carmen_reply_anchor(note):
     return _latest_marker_date(note, INBOUND_REPLY_NOTE_MARKER)
 
 
+def followup_dismissed(dismissed_on, note=""):
+    """True while an /owedx dismissal stands for a contact.
+
+    /owedx means "I am not sending these follow-ups" - it hides the contact from /owed, the
+    morning card, /followups, /overdue and auto-send, and writes nothing to the CRM. It lapses the
+    moment the contact writes back (an inbound reply dated on or after the dismissal): a reply is a
+    live conversation, which is exactly what Kevin dismissed the list in order to focus on.
+    """
+    try:
+        dismissed = datetime.strptime(str(dismissed_on or "").strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    replied = carmen_reply_anchor(note)
+    return replied is None or replied < dismissed
+
+
 def carmen_restart_anchor(note):
     """The date the sequencer last restarted this row's ladder, or None."""
     return _latest_marker_date(note, LADDER_RESTART_NOTE_MARKER)

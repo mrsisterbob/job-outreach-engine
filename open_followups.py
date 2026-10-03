@@ -9,7 +9,7 @@ The caller (main.py) does the reads and passes the results in, including `today`
 """
 from datetime import datetime
 
-from pipeline_utils import carmen_reply_anchor, is_followup_unscheduled
+from pipeline_utils import carmen_reply_anchor, followup_dismissed, is_followup_unscheduled
 
 
 def _parse_date(value):
@@ -27,15 +27,18 @@ def _norm_email(value):
     return str(value or "").strip().lower()
 
 
-def collect_open_followups(snapshots, live_rows, last_sent, today):
+def collect_open_followups(snapshots, live_rows, last_sent, today, dismissed=None):
     """
     snapshots: {run_date "YYYY-MM-DD": result dict as saved by save_followup_queue_snapshot}
     live_rows: {sheet_uuid: rec} from a FRESH read of the sequencer's scan tabs
     last_sent: {email_lower: datetime.date of the most recent Sent message to that address},
                or None when the Sent folder could not be checked
     today:     datetime.date
+    dismissed: {sheet_uuid: "YYYY-MM-DD"} from /owedx; a listing on or before that date is dropped
+               while the dismissal stands (see followup_dismissed)
     returns:   list of dicts, oldest-due first
     """
+    dismissed = dismissed or {}
     sent_checked = last_sent is not None
     sent = {}
     for address, sent_on in (last_sent or {}).items():
@@ -58,6 +61,11 @@ def collect_open_followups(snapshots, live_rows, last_sent, today):
                 continue
             # Killed (moved to the ghost tab) or promoted to Carmen Hot: off the scanned tabs.
             if uuid not in live_rows:
+                continue
+            # /owedx. Only listings up to the dismissal: one from a later queue is new and shows.
+            dismissed_on = _parse_date(dismissed.get(uuid))
+            if (dismissed_on is not None and run_date <= dismissed_on
+                    and followup_dismissed(dismissed.get(uuid), live_rows[uuid].get("note"))):
                 continue
             sent_on = sent.get(_norm_email(entry.get("email")))
             # Same-day counts: listed at 07:30, sent at 10:00.

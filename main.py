@@ -46,7 +46,7 @@ from pipeline_utils import (
     is_guessed_contact_email, resolve_sent_email_backfill,
     sanitize_job_title, is_clean_job_title, classify_outreach_track,
     is_role_mailbox, is_automated_sender, inbound_sender_screen_reason, company_domain_of, name_from_email_local_part, parse_email_recipient,
-    is_email_derived_name, greeting_name_from_body,
+    is_email_derived_name, greeting_name_from_body, followup_dismissed,
     match_email_to_crm_company, shape_public_dashboard,
     daily_visitor_id, normalize_referrer_host, visit_bot_flag, summarize_visits, format_visitor_line,
     plan_carmen_ladder, carmen_reply_anchor, carmen_linkedin_anchor, CARMEN_LADDER_DAYS,
@@ -1253,6 +1253,15 @@ def init_db():
             company TEXT,
             title TEXT,
             buried_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        # /owedx: "I am not sending these follow-ups." One row per contact. Hides the contact from
+        # /owed, the morning card, /followups, /overdue and auto-send while followup_dismissed()
+        # holds. Writes NOTHING to the CRM - no tab move, no status - and lapses on its own when
+        # the contact replies.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS owed_dismissals (
+            sheet_uuid TEXT PRIMARY KEY,
+            dismissed_on TEXT
         )""")
         # The inbound tray: one row per Gmail THREAD, not per message.
         #
@@ -8688,10 +8697,14 @@ def get_overdue_followups():
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
     overdue = []
+    # /owedx'd contacts are off this list too - it feeds the digest, /overdue and /sendall.
+    dismissals = load_owed_dismissals()
     for target_code, tab_name in (("CC", "Carmen Cold"), ("CW", "Carmen Warm"), ("TC", "Tetiana Cold")):
         for record in fetch_networking_cards(target_code, qty=None):
             next_followup = str(record.get("next_followup") or "")
             if is_followup_unscheduled(next_followup):
+                continue
+            if _is_dismissed(record, dismissals):
                 continue
             if next_followup <= today_str:
                 overdue.append({**record, "sheet_tab": tab_name})
@@ -9534,6 +9547,9 @@ def run_followup_sequencer(today=None, dry_run=False):
     buries_suppressed = 0
     kills_written = 0
     kills_suppressed = 0
+    # /owedx'd contacts still walk their ladder (snoozes and markers are written as usual, so they
+    # retire on schedule) - they are just never listed, drafted or auto-sent.
+    dismissals = load_owed_dismissals()
 
     for rec in records:
         # Carmen Cold runs the 4/11/21 people ladder instead of the JOBS +4/+9/+16 windows: these
@@ -9637,13 +9653,16 @@ def run_followup_sequencer(today=None, dry_run=False):
                 continue
 
             attempt = int(ladder_action.rsplit("_", 1)[1])
+            # /owedx: not listed, drafted or auto-sent - but the ladder still advances below.
+            dismissed = _is_dismissed(rec, dismissals)
             entry = {
                 "company": rec.get("company") or "N/A",
                 "role": rec.get("title") or "",
                 "short_id": get_short_id_by_sheet_uuid(sheet_uuid) if sheet_uuid else None,
                 "sheet_uuid": sheet_uuid,
                 "attempt": attempt,
-                "draft_text": build_followup_bump_draft(rec, attempt),
+                # Skipped when dismissed: the greeting lookup can cost Gmail calls.
+                "draft_text": "" if dismissed else build_followup_bump_draft(rec, attempt),
                 "sheet_tab": rec.get("sheet_tab"),
                 # Read from the row's OWN ladder, not the module constant: a cold row walks
                 # (4, 11), so indexing the engaged tuple would report the wrong day and never
@@ -9668,7 +9687,8 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "title": rec.get("title") or "",
                 "note": note_text,
             }
-            result["followups_ready"].append(entry)
+            if not dismissed:
+                result["followups_ready"].append(entry)
             if dry_run or not sheet_uuid or _sequencer_already_actioned(sheet_uuid, run_date):
                 continue
             if ladder_next is not None:
@@ -9753,7 +9773,9 @@ def run_followup_sequencer(today=None, dry_run=False):
                 # Gate inputs - see the matching comment on the Carmen entry above.
                 "title": rec.get("title") or "", "note": rec.get("note") or "",
             }
-            result["followups_ready"].append(entry)
+            # /owedx: same rule as the Carmen branch - the snooze below still advances.
+            if not _is_dismissed(rec, dismissals):
+                result["followups_ready"].append(entry)
             if dry_run or already or not sheet_uuid:
                 continue
             enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=new_nf))
@@ -10162,6 +10184,49 @@ def load_followup_queue_snapshot(run_date):
         return None
 
 
+def load_owed_dismissals():
+    """{sheet_uuid: 'YYYY-MM-DD'} for every /owedx dismissal. {} on any error - a failed read
+    shows the follow-ups rather than hiding them."""
+    try:
+        with get_db_conn() as conn:
+            return {uuid: day for uuid, day in conn.execute(
+                "SELECT sheet_uuid, dismissed_on FROM owed_dismissals").fetchall()}
+    except Exception as e:
+        logging.error(f"[OWEDX] Dismissal read failed: {e}")
+        return {}
+
+
+def dismiss_owed_followups(sheet_uuids, on_date=None):
+    """/owedx: dismiss these contacts as of on_date (default today). Returns how many were written.
+    Re-dismissing moves the date forward, so a contact dismissed again covers its newer listings."""
+    day = (on_date or datetime.now().date()).strftime("%Y-%m-%d")
+    uuids = sorted({str(u) for u in sheet_uuids or () if u})
+    if not uuids:
+        return 0
+    with get_db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany(
+            "INSERT INTO owed_dismissals (sheet_uuid, dismissed_on) VALUES (?, ?) "
+            "ON CONFLICT(sheet_uuid) DO UPDATE SET dismissed_on = excluded.dismissed_on",
+            [(u, day) for u in uuids])
+        conn.commit()
+    return len(uuids)
+
+
+def undo_owed_dismissals(on_date=None):
+    """/owedx undo: drop every dismissal made on on_date (default today). Returns the count."""
+    day = (on_date or datetime.now().date()).strftime("%Y-%m-%d")
+    with get_db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        removed = conn.execute("DELETE FROM owed_dismissals WHERE dismissed_on = ?", (day,)).rowcount
+        conn.commit()
+    return removed
+
+
+def _is_dismissed(record, dismissals):
+    return followup_dismissed(dismissals.get(record.get("sheet_uuid")), record.get("note") or "")
+
+
 def build_open_followups(today=None):
     """Every follow-up still owed across the saved queues: the shared source for /owed and
     GET /followups/open. Read-only - no sequencer run, no CRM write, no draft, no send.
@@ -10195,7 +10260,7 @@ def build_open_followups(today=None):
               if e.get("sheet_uuid") in live_rows}
     since = datetime.strptime(min(snapshots), "%Y-%m-%d").date()
     last_sent = latest_sent_dates_by_recipient(emails, since)
-    items = collect_open_followups(snapshots, live_rows, last_sent, today)
+    items = collect_open_followups(snapshots, live_rows, last_sent, today, dismissed=load_owed_dismissals())
     return {"crm_ok": True, "crm_failed_tab": None, "items": items, "sent_checked": last_sent is not None}
 
 # Pacing for the nightly link sweep. The sequencer and the digest share this window, so the
@@ -12996,6 +13061,27 @@ def process_webhook_payload_async(data):
             send_overdue_digest(chat_id, get_overdue_followups(), limit=None)
             return
 
+        if text in ("/owedx", "/owedx undo"):
+            # Dismiss, never kill: nothing is written to the CRM. Each contact simply stops showing
+            # on /owed, the morning card, /followups, /overdue and auto-send until they reply.
+            if text == "/owedx undo":
+                n = undo_owed_dismissals()
+                _OPEN_FOLLOWUPS_CACHE.update(owed=None, at=None)
+                send_telegram_message(chat_id, f"↩️ Restored {n} follow-up{'' if n == 1 else 's'} dismissed today.")
+                return
+            owed = build_open_followups()
+            if not owed["crm_ok"]:
+                send_telegram_message(chat_id, "⚠️ CRM read failed - nothing dismissed.")
+                return
+            n = dismiss_owed_followups(e.get("sheet_uuid") for e in owed["items"])
+            _OPEN_FOLLOWUPS_CACHE.update(owed=None, at=None)
+            send_telegram_message(chat_id, (
+                f"🧹 <b>Dismissed {n} open follow-up{'' if n == 1 else 's'}.</b>\n"
+                "Off /owed, the morning card, /followups and /overdue. Nothing moved in the CRM, "
+                "and anyone who replies comes back on their own.\n"
+                "<i>Mistake? /owedx undo</i>"))
+            return
+
         if text == "/owed":
             # Count + one link per page of 20, nothing else: the list lives on the pages. Already
             # off the webhook's request thread (one daemon thread per update), so the CRM + Gmail
@@ -13010,6 +13096,8 @@ def process_webhook_payload_async(data):
                      " · ".join(_open_followups_page_links(len(owed["items"])))]
             if not owed["sent_checked"]:
                 lines.append("Gmail Sent not checked - may include people already nudged.")
+            if owed["items"]:
+                lines.append("<i>Not sending these? /owedx dismisses them all (CRM untouched).</i>")
             send_telegram_message(chat_id, "\n".join(lines))
             # AFTER the reply, on this same thread: look up every greeting now, so each page link
             # renders from the name cache instead of doing 20 people's Gmail reads on tap.
@@ -14145,7 +14233,8 @@ def process_webhook_payload_async(data):
                 "/sendall - Draft bumps + queue eligible overdue records to +14 days\n"
                 "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"
                 "/overdue - Full overdue list (the morning digest shows only the 10 most overdue)\n"
-                "/owed - Every follow-up still owed (last 14 days), count + link\n\n"
+                "/owed - Every follow-up still owed (last 14 days), count + links\n"
+                "/owedx - Dismiss every open follow-up (CRM untouched; /owedx undo restores)\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"

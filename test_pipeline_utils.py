@@ -1093,6 +1093,15 @@ def test_sent_capture_takes_real_people_at_tracked_job_companies():
     assert pu.build_sent_contact("Jen <jen@mail.crain.com>", _SENT_CRM_COMPANIES)["company"] == "Crain Communications"
 
 
+def test_followup_dismissed_holds_until_a_reply_on_or_after_the_dismissal():
+    marker = pu.INBOUND_REPLY_NOTE_MARKER
+    assert pu.followup_dismissed("2026-10-03")
+    assert pu.followup_dismissed("2026-10-03", f"[2026-10-01] {marker} - earlier reply")
+    assert not pu.followup_dismissed("2026-10-03", f"[2026-10-03] {marker} - wrote back today")
+    assert not pu.followup_dismissed("2026-10-03", f"[2026-10-05] {marker} - wrote back later")
+    assert not pu.followup_dismissed(None) and not pu.followup_dismissed("garbage")
+
+
 def test_a_single_token_address_yields_no_name_rather_than_a_surname():
     """'squillen@' is initial + surname; deriving 'Squillen' put "Hi Squillen," on her follow-up."""
     for address in ("squillen@petsuppliesplus.com", "alarson@junipersquare.com", "jhang3@x.com"):
