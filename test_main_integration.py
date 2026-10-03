@@ -1519,6 +1519,219 @@ def test_blank_company_is_blocked_by_the_placeholder_guard(monkeypatch):
     assert status == 502 and "placeholder company name" in page
 
 
+# ---- GET /followups/open and /owed (every follow-up still owed across saved queues) ----
+
+def _owed_email(i):
+    return f"pat{i}@co{i}.com"
+
+
+def _seed_skipped_mornings(monkeypatch, n=5):
+    """Drive the REAL sequencer + snapshot save for n past mornings, one contact due each morning,
+    none ever nudged. Returns (today, run_dates, live_rows) where live_rows is what the CRM reads
+    back afterwards: every row snoozed into the future by the sequencer's own update_snooze."""
+    today = m.datetime.now().date()
+    run_dates = []
+    for k in range(n):
+        d = today - timedelta(days=n - k)
+        _mock_followup_rows(monkeypatch, cc_rows=[_due_person(k, email=_owed_email(k), today=d)])
+        assert m.save_followup_queue_snapshot(d.strftime("%Y-%m-%d"), m.run_followup_sequencer(today=d))
+        run_dates.append(d.strftime("%Y-%m-%d"))
+    pushed = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+    live = [{**_due_person(k, email=_owed_email(k), today=today - timedelta(days=n - k)),
+             "next_followup": pushed} for k in range(n)]
+    return today, run_dates, live
+
+
+def _owed_read_only(monkeypatch):
+    """After seeding: the sequencer may not run again, and nothing may be written to the CRM."""
+    _no_recompute(monkeypatch)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    return enqueued
+
+
+def _live_crm(monkeypatch, cc_rows, reject_code=None):
+    """Answer get_followups through crm_post, so fetch_networking_cards' real request path runs.
+    `reject_code` answers that tab the way Apps Script rejects a bad secret: 200 + status error."""
+    class _R:
+        status_code = 200
+        def __init__(self, body):
+            self._body = body
+        def json(self):
+            return self._body
+
+    def fake_crm_post(payload, **kw):
+        assert payload.get("action") == "get_followups", f"unexpected CRM call: {payload}"
+        if payload.get("tab") == reject_code:
+            return _R({"status": "error", "message": "Unauthorized"})
+        rows = [dict(r) for r in cc_rows] if payload.get("tab") == "CC" else []
+        return _R({"status": "success", "followups": rows})
+
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", fake_crm_post)
+    m._CRM_READ_REJECTION_ALERTED.clear()
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+
+
+def _gmail_sent(monkeypatch, sent=None, token="token"):
+    """Gmail env + the two Sent endpoints latest_sent_dates_by_recipient() calls, for real.
+    `sent` maps address -> date of a Sent message to it. Returns the list queries made."""
+    sent = sent or {}
+    for var, val in (("GMAIL_CLIENT_ID", "cid"), ("GMAIL_CLIENT_SECRET", "cs"),
+                     ("GMAIL_REFRESH_TOKEN", "rt"), ("GMAIL_USER", "me@example.com")):
+        monkeypatch.setenv(var, val)
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: token)
+    queries = []
+
+    class _Res:
+        status_code = 200
+        def __init__(self, body):
+            self._body = body
+        def json(self):
+            return self._body
+
+    def fake_get(url, params=None, **kw):
+        if url.endswith("/messages"):
+            q = (params or {}).get("q", "")
+            queries.append(q)
+            return _Res({"messages": [{"id": f"m-{a}"} for a in sent if f"to:{a}" in q]})
+        address = url.rsplit("/m-", 1)[1]
+        noon = m.datetime.combine(sent[address], m.datetime.min.time()) + timedelta(hours=12)
+        # Upper-cased in the header on purpose: the match must be case-insensitive.
+        return _Res({"internalDate": str(int(noon.timestamp() * 1000)),
+                     "payload": {"headers": [{"name": "To", "value": f"Pat <{address.upper()}>"}]}})
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    return queries
+
+
+def _get_open_page():
+    with m.app.test_client() as client:
+        res = client.get("/followups/open")
+        return res.status_code, res.get_data(as_text=True)
+
+
+def test_open_followups_lists_five_skipped_mornings_oldest_first_and_every_draft_link_works(monkeypatch):
+    """THE BUG: each 7:30 run snoozes everyone it lists, so a contact not nudged that morning
+    vanishes from /followups, /queue and /overdue. Five mornings, five people, none nudged ->
+    all five come back here, oldest first, each "day N of 21" counted to TODAY."""
+    today, run_dates, live = _seed_skipped_mornings(monkeypatch)
+    enqueued = _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live)
+    queries = _gmail_sent(monkeypatch)
+
+    status, page = _get_open_page()
+
+    assert status == 200
+    assert "5 open follow-ups" in page
+    positions = [page.index(f"— Co{k}</h3>") for k in range(5)]
+    assert positions == sorted(positions), "oldest-due first"
+    total = m.carmen_terminal_gap(m.CARMEN_LADDER_DAYS_COLD)
+    for k in range(5):
+        assert f"<b>day {m.CARMEN_LADDER_DAYS_COLD[0] + 5 - k} of {total}</b>" in page
+    assert "was not checked" not in page
+    assert queries, "the Sent folder must actually be read"
+
+    hrefs = re.findall(r'href="(/followups/draft/[^"]+)"', page)
+    assert hrefs == [f"/followups/draft/cc-{k}?date={run_dates[k]}" for k in range(5)]
+    with m.app.test_client() as client:
+        for href in hrefs:
+            res = client.get(href)
+            assert res.status_code == 302 and "mail.google.com" in res.headers["Location"]
+    assert enqueued == []
+
+
+def test_open_followups_drops_the_nudged_the_replied_and_the_moved(monkeypatch):
+    today, run_dates, live = _seed_skipped_mornings(monkeypatch)
+    _owed_read_only(monkeypatch)
+    # Pat2 replied after its listing (read from the LIVE note, not the snapshot).
+    live[2]["note"] = f"[{(today - timedelta(days=1)).isoformat()}] {m.INBOUND_REPLY_NOTE_MARKER} - sure, Tuesday?"
+    # Pat3 was killed or promoted: gone from the scanned tabs.
+    _live_crm(monkeypatch, [r for r in live if r["sheet_uuid"] != "cc-3"])
+    # Pat1 nudged the same day it was listed (listed at 07:30, sent later that morning).
+    _gmail_sent(monkeypatch, sent={_owed_email(1): date.fromisoformat(run_dates[1])})
+
+    status, page = _get_open_page()
+
+    assert status == 200 and "2 open follow-ups" in page
+    assert "— Co0</h3>" in page and "— Co4</h3>" in page
+    for gone in (1, 2, 3):
+        assert f"— Co{gone}</h3>" not in page
+
+
+def test_owed_command_sends_the_count_and_one_link_only(monkeypatch, capture_sent):
+    _, _, live = _seed_skipped_mornings(monkeypatch)
+    enqueued = _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live)
+    _gmail_sent(monkeypatch)
+
+    _dispatch("/owed")
+
+    assert len(capture_sent) == 1
+    msg = capture_sent[0]
+    assert "<b>5 open follow-ups</b>" in msg
+    assert msg.count("<a ") == 1 and f"href='{m.BASE_URL}/followups/open'" in msg
+    assert "Pat" not in msg and "Co0" not in msg
+    assert "not checked" not in msg
+    assert enqueued == []
+
+
+def test_open_followups_without_a_gmail_token_lists_everyone_and_says_so(monkeypatch, capture_sent):
+    """An unchecked Sent folder must not read as a clean count: nobody is dropped, and both
+    surfaces say the number is an upper bound."""
+    _, _, live = _seed_skipped_mornings(monkeypatch)
+    _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live)
+    _gmail_sent(monkeypatch, token=None)
+    monkeypatch.setattr(m.requests, "get", lambda *a, **k: pytest.fail("no Gmail call without a token"))
+
+    status, page = _get_open_page()
+    _dispatch("/owed")
+
+    assert status == 200 and "5 open follow-ups" in page
+    assert "Gmail Sent was not checked" in page
+    assert len(capture_sent) == 1
+    assert "5 open follow-ups" in capture_sent[0] and "not checked" in capture_sent[0]
+
+
+def test_open_followups_checked_and_nobody_emailed_shows_no_banner(monkeypatch, capture_sent):
+    """{} (checked, nobody emailed) and None (not checked) must render differently."""
+    _, _, live = _seed_skipped_mornings(monkeypatch)
+    _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live)
+    queries = _gmail_sent(monkeypatch, sent={})
+
+    assert m.latest_sent_dates_by_recipient([_owed_email(0)], m.datetime.now().date()) == {}
+    status, page = _get_open_page()
+    _dispatch("/owed")
+
+    assert queries
+    assert status == 200 and "5 open follow-ups" in page
+    assert "was not checked" not in page
+    assert "not checked" not in capture_sent[0]
+
+
+def test_open_followups_rejected_crm_read_is_an_error_not_a_zero(monkeypatch, capture_sent):
+    """fetch_networking_cards() returns [] for a rejected read, the same value as an empty tab, and
+    the merge reads a missing row as killed. Without the checked read this showed "0 open"."""
+    _, _, live = _seed_skipped_mornings(monkeypatch)
+    _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live, reject_code="TC")
+    _gmail_sent(monkeypatch)
+
+    status, page = _get_open_page()
+    _dispatch("/owed")
+
+    assert status == 502
+    assert "Could not read the CRM" in page
+    assert not re.search(r"\d+ open follow-up", page)
+    assert len(capture_sent) == 1
+    assert "CRM read failed" in capture_sent[0]
+    assert not re.search(r"\d+ open follow-up", capture_sent[0])
+    # The existing wrapper is unchanged for every other caller: [] on a rejection.
+    assert m.fetch_networking_cards("TC", qty=None) == []
+
+
 # ---- Carmen Cold in the follow-up cadence (sequencer scan + overdue + roleless bumps) ----
 
 def test_carmen_cold_is_in_the_sequencer_scan_and_gets_followups_drafted(monkeypatch):
