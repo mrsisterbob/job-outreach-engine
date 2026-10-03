@@ -37,7 +37,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 193 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 208 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
-## `main.py` — 333 defs, 15,064 lines
+## `main.py` — 335 defs, 15,095 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -291,89 +291,91 @@ grep -i "contact" FUNCTION_INDEX.md
 | 9668 | `_next_step_label` | What follows this nudge: the next rung's date, or - after the last rung - the triage date |
 | 9676 | `_silence_dot` | Severity dot for an application's silence, on the job card's fit-dot idiom. The bands |
 | 9689 | `render_followup_needs_card` | Render the single 'needs you today' Telegram message from a run_followup_sequencer() result. |
-| 9881 | `_send_telegram_card_chunked` | Send a long HTML card as newline-split chunks so it never trips Telegram's length cap. |
-| 9894 | `save_followup_queue_snapshot` | Persist one run's full result under its run_date for GET /followups, and prune snapshots |
-| 9919 | `load_followup_queue_snapshot` | The saved result for run_date, or None when there is none (or it cannot be read). |
-| 9947 | `fetch_job_link_state` | GET a job posting and return (status_code, final_url, text, error). Never raises. |
-| 9958 | `check_job_links` | Sweep live JOBS rows, classify each Job Link, record the verdict and retire the safe ones. |
-| 10067 | `_dead_since_label` | "2026-09-22 (today)" / "2026-09-19 (3d ago)" for a first_dead_at timestamp, or "date unknown". |
-| 10089 | `get_dead_job_links` | Dead links recorded by the sweep, newest first. |
-| 10123 | `_older_unretired_dead_count` | How many un-retired dead rows sit OUTSIDE the 24h report window. |
-| 10136 | `mark_dead_links_notified` | Flag these as already surfaced so the digest reports each death once. |
-| 10154 | `scheduled_job_link_check` | APScheduler target: nightly link sweep, after the sequencer and before the digest. |
-| 10163 | `scheduled_followup_sequencer_job` | APScheduler target: nightly follow-up sequencer pass (07:30 local, before the digest). |
-| 10185 | `start_followup_sequencer` | Register the nightly sequencer on the shared background scheduler (07:30 local, one hour |
-| 10204 | `start_job_link_checker` | Register the nightly job-link sweep at 07:45 local - after the sequencer's 07:30 pass so |
-| 10220 | `edit_telegram_message` | Edit an existing Telegram message in-place instead of sending a redundant new one. |
-| 10239 | `send_telegram_message` | Send a plain-text Telegram message (no inline keyboards - pure text-based swipe-reply CLI). |
-| 10278 | `send_telegram_card` | Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only. |
-| 10378 | `send_warm_radar_card` | Lean /w warm-radar card: no AI fit score, no fit reason, no tailored outreach copy - just |
-| 10430 | `_fetch_jsearch_page_with_retry` | GETs one JSearch page with exponential backoff on timeout/429/5xx. |
-| 10461 | `fetch_single_query_jobs` | Worker function for parallel JSearch API query execution. |
-| 10497 | `fetch_greenhouse_jobs` | Pull unauthenticated postings from a Greenhouse job board for a company slug. |
-| 10537 | `fetch_lever_jobs` | Pull unauthenticated postings from a Lever job board for a company slug. |
-| 10578 | `fetch_workday_jobs` | Pull postings from one Workday tenant's public CXS API. |
-| 10661 | `fetch_ashby_jobs` | Pull unauthenticated postings from an Ashby job board for a company slug. |
-| 10739 | `apply_search_gear` | Write one gear's settings into the filter store. Returns the applied gear dict. |
-| 10756 | `current_search_gear` | The gear the filters are actually in, not merely the last one set. |
-| 10774 | `describe_search_gear` | Telegram-ready summary of the current breadth, including the live source counts. |
-| 10800 | `_strip_html_to_text` | Board descriptions arrive as HTML. The AI prompt and the CRM both want plain text. |
-| 10813 | `fetch_remoteok_jobs` | RemoteOK public JSON. Element 0 is a legal/metadata stub, not a posting - skip it. |
-| 10841 | `fetch_himalayas_jobs` | Himalayas public JSON. pubDate is a unix epoch string, not ISO. |
-| 10872 | `fetch_remotive_jobs` | Remotive public JSON. |
-| 10908 | `fetch_weworkremotely_jobs` | WeWorkRemotely RSS. Titles arrive as 'Company: Role', so the employer is split off the |
-| 10942 | `fetch_remote_feed_jobs` | Pull every keyless remote feed in parallel. One dead feed never blocks the others. |
-| 10956 | `fetch_ats_jobs` | Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in |
-| 10999 | `auto_expand_ats_slug` | Silent Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its |
-| 11039 | `resolve_warm_company_ats_slugs` | Resolves an ATS board slug for every unique Carmen Warm CRM company: prefers the |
-| 11069 | `dispatch_tier1_matches` | Land a set of scored matches in the CRM, then card the ones whose row actually wrote. |
-| 11225 | `scrape_job_page` | Best-effort server-side fetch of ANY job posting page -> (title, company, description). |
-| 11252 | `_scrape_one_url` | Fetch and parse ONE url -> (title, company, description, expired). Never raises. |
-| 11273 | `scrape_job_page_detailed` | scrape_job_page() plus an `expired` flag -> (title, company, description, expired). |
-| 11336 | `ingest_manual_job` | Run one hand-picked posting through the exact Stage 2 path /t uses, then land it in the CRM. |
-| 11477 | `run_job_pipeline` | Job search pipeline with two-stage architecture: |
-| 11722 | `run_warm_radar_scan` | /w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen |
-| 11826 | `process_webhook_payload_async` | Executes heavy workloads in background worker threads so HTTP return is instant. |
-| 13884 | `_is_oneshot_invocation` | True when this process was launched as `python main.py --once` (the CI batch entrypoint). |
-| 13910 | `health_check` | Return JSON health status in <5ms. |
-| 13931 | `_run_pipeline_and_notify` | Background thread target for /t: runs the heavy pipeline off the request thread, |
-| 13942 | `_run_overdue_batch_and_notify` | Background target for the Tuesday batch-hub commands so webhook acknowledgement remains instant. |
-| 13968 | `telegram_webhook` | Instant non-blocking execution (<0.05s return). Validates Telegram's secret token header, |
-| 13996 | `format_ats_plaintext` | Builds a plain-text ATS-safe fallback block (identity/experience/education/bullets) for the |
-| 14030 | `_followups_page` | Wrap /followups content in the /stage page's shell: same CSS, same copyField() script. |
-| 14067 | `followup_queue_view` | The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail |
-| 14177 | `_followup_copy_page` | The fallback for an on-demand draft that could not be created: the reason, and the text to |
-| 14190 | `followup_draft_on_demand` | Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it. |
-| 14245 | `morning_brief_view` | One page holding everything the morning used to dump into Telegram as four messages. |
-| 14342 | `desktop_stage_view` | Desktop review page - the card's "Full Card" target. Everything the Telegram card used to |
-| 14460 | `desktop_stage_pdf` | Serves raw PDF bytes for browser preview and download. |
-| 14482 | `desktop_ingest` | Secure endpoint for desktop bookmarklet ingestion of manual job links/text. |
-| 14556 | `_public_stats_days_running` | Whole days from PUBLIC_STATS_START_DATE to today, floored at 0. |
-| 14563 | `build_public_stats` | Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable. |
-| 14626 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
-| 14675 | `analytics_enabled` | ANALYTICS_ENABLED (default true). Read per call, so flipping it needs no code change. |
-| 14680 | `_analytics_own_hosts` | _(no docstring)_ |
-| 14685 | `_analytics_ignore_ips` | _(no docstring)_ |
-| 14689 | `visitor_salt_for` | Today's random salt. Asking for a new day replaces (and so forgets) the previous one. |
-| 14698 | `_visit_timestamp` | The site's UTC pageview time as 'YYYY-MM-DD HH:MM:SS' (CURRENT_TIMESTAMP's format), or None |
-| 14707 | `record_site_visits` | Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and |
-| 14736 | `prune_site_visits` | Delete pageviews older than the retention window. Returns rows removed. |
-| 14748 | `_maybe_prune_site_visits` | Prune at most hourly, riding on ingest traffic - no scheduled job of its own. |
-| 14761 | `analytics_ingest` | Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN. |
-| 14779 | `get_site_visit_rows` | READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises |
-| 14789 | `site_visitor_standup_line` | The standup's analytics line, or '' when analytics is switched off. Never raises: a failed |
-| 14811 | `record_inbound_lead` | Commit one validated lead (see validate_lead). Returns the new row id. |
-| 14822 | `get_recent_leads` | READ-ONLY. (id, received_at, source, name, email, message), newest first. |
-| 14832 | `leads_ingest` | One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN. |
-| 14882 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
-| 14895 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
-| 14904 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
-| 14915 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
-| 14925 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
-| 14962 | `_cached_drafting_timing` | _(no docstring)_ |
-| 14980 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
-| 15015 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
-| 15022 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
+| 9884 | `_send_telegram_card_chunked` | Send a long HTML card as newline-split chunks so it never trips Telegram's length cap. |
+| 9897 | `save_followup_queue_snapshot` | Persist one run's full result under its run_date for GET /followups, and prune snapshots |
+| 9922 | `load_followup_queue_snapshot` | The saved result for run_date, or None when there is none (or it cannot be read). |
+| 9950 | `fetch_job_link_state` | GET a job posting and return (status_code, final_url, text, error). Never raises. |
+| 9961 | `check_job_links` | Sweep live JOBS rows, classify each Job Link, record the verdict and retire the safe ones. |
+| 10070 | `_dead_since_label` | "2026-09-22 (today)" / "2026-09-19 (3d ago)" for a first_dead_at timestamp, or "date unknown". |
+| 10092 | `get_dead_job_links` | Dead links recorded by the sweep, newest first. |
+| 10126 | `_older_unretired_dead_count` | How many un-retired dead rows sit OUTSIDE the 24h report window. |
+| 10139 | `mark_dead_links_notified` | Flag these as already surfaced so the digest reports each death once. |
+| 10157 | `scheduled_job_link_check` | APScheduler target: nightly link sweep, after the sequencer and before the digest. |
+| 10166 | `scheduled_followup_sequencer_job` | APScheduler target: nightly follow-up sequencer pass (07:30 local, before the digest). |
+| 10188 | `start_followup_sequencer` | Register the nightly sequencer on the shared background scheduler (07:30 local, one hour |
+| 10207 | `start_job_link_checker` | Register the nightly job-link sweep at 07:45 local - after the sequencer's 07:30 pass so |
+| 10223 | `edit_telegram_message` | Edit an existing Telegram message in-place instead of sending a redundant new one. |
+| 10242 | `send_telegram_message` | Send a plain-text Telegram message (no inline keyboards - pure text-based swipe-reply CLI). |
+| 10281 | `send_telegram_card` | Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only. |
+| 10381 | `send_warm_radar_card` | Lean /w warm-radar card: no AI fit score, no fit reason, no tailored outreach copy - just |
+| 10433 | `_fetch_jsearch_page_with_retry` | GETs one JSearch page with exponential backoff on timeout/429/5xx. |
+| 10464 | `fetch_single_query_jobs` | Worker function for parallel JSearch API query execution. |
+| 10500 | `fetch_greenhouse_jobs` | Pull unauthenticated postings from a Greenhouse job board for a company slug. |
+| 10540 | `fetch_lever_jobs` | Pull unauthenticated postings from a Lever job board for a company slug. |
+| 10581 | `fetch_workday_jobs` | Pull postings from one Workday tenant's public CXS API. |
+| 10664 | `fetch_ashby_jobs` | Pull unauthenticated postings from an Ashby job board for a company slug. |
+| 10742 | `apply_search_gear` | Write one gear's settings into the filter store. Returns the applied gear dict. |
+| 10759 | `current_search_gear` | The gear the filters are actually in, not merely the last one set. |
+| 10777 | `describe_search_gear` | Telegram-ready summary of the current breadth, including the live source counts. |
+| 10803 | `_strip_html_to_text` | Board descriptions arrive as HTML. The AI prompt and the CRM both want plain text. |
+| 10816 | `fetch_remoteok_jobs` | RemoteOK public JSON. Element 0 is a legal/metadata stub, not a posting - skip it. |
+| 10844 | `fetch_himalayas_jobs` | Himalayas public JSON. pubDate is a unix epoch string, not ISO. |
+| 10875 | `fetch_remotive_jobs` | Remotive public JSON. |
+| 10911 | `fetch_weworkremotely_jobs` | WeWorkRemotely RSS. Titles arrive as 'Company: Role', so the employer is split off the |
+| 10945 | `fetch_remote_feed_jobs` | Pull every keyless remote feed in parallel. One dead feed never blocks the others. |
+| 10959 | `fetch_ats_jobs` | Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in |
+| 11002 | `auto_expand_ats_slug` | Silent Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its |
+| 11042 | `resolve_warm_company_ats_slugs` | Resolves an ATS board slug for every unique Carmen Warm CRM company: prefers the |
+| 11072 | `dispatch_tier1_matches` | Land a set of scored matches in the CRM, then card the ones whose row actually wrote. |
+| 11228 | `scrape_job_page` | Best-effort server-side fetch of ANY job posting page -> (title, company, description). |
+| 11255 | `_scrape_one_url` | Fetch and parse ONE url -> (title, company, description, expired). Never raises. |
+| 11276 | `scrape_job_page_detailed` | scrape_job_page() plus an `expired` flag -> (title, company, description, expired). |
+| 11339 | `ingest_manual_job` | Run one hand-picked posting through the exact Stage 2 path /t uses, then land it in the CRM. |
+| 11480 | `run_job_pipeline` | Job search pipeline with two-stage architecture: |
+| 11725 | `run_warm_radar_scan` | /w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen |
+| 11829 | `process_webhook_payload_async` | Executes heavy workloads in background worker threads so HTTP return is instant. |
+| 13887 | `_is_oneshot_invocation` | True when this process was launched as `python main.py --once` (the CI batch entrypoint). |
+| 13913 | `health_check` | Return JSON health status in <5ms. |
+| 13934 | `_run_pipeline_and_notify` | Background thread target for /t: runs the heavy pipeline off the request thread, |
+| 13945 | `_run_overdue_batch_and_notify` | Background target for the Tuesday batch-hub commands so webhook acknowledgement remains instant. |
+| 13971 | `telegram_webhook` | Instant non-blocking execution (<0.05s return). Validates Telegram's secret token header, |
+| 13999 | `format_ats_plaintext` | Builds a plain-text ATS-safe fallback block (identity/experience/education/bullets) for the |
+| 14033 | `_followups_page` | Wrap /followups content in the /stage page's shell: same CSS, same copyField() script. |
+| 14069 | `_requested_queue_date` | The queue date a /followups link asks for via ?date=YYYY-MM-DD, else today. |
+| 14084 | `_queue_date_query` | '?date=YYYY-MM-DD' for a link back into run_date's queue, or '' when there is no date. |
+| 14090 | `followup_queue_view` | The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail |
+| 14208 | `_followup_copy_page` | The fallback for an on-demand draft that could not be created: the reason, and the text to |
+| 14221 | `followup_draft_on_demand` | Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it. |
+| 14276 | `morning_brief_view` | One page holding everything the morning used to dump into Telegram as four messages. |
+| 14373 | `desktop_stage_view` | Desktop review page - the card's "Full Card" target. Everything the Telegram card used to |
+| 14491 | `desktop_stage_pdf` | Serves raw PDF bytes for browser preview and download. |
+| 14513 | `desktop_ingest` | Secure endpoint for desktop bookmarklet ingestion of manual job links/text. |
+| 14587 | `_public_stats_days_running` | Whole days from PUBLIC_STATS_START_DATE to today, floored at 0. |
+| 14594 | `build_public_stats` | Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable. |
+| 14657 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
+| 14706 | `analytics_enabled` | ANALYTICS_ENABLED (default true). Read per call, so flipping it needs no code change. |
+| 14711 | `_analytics_own_hosts` | _(no docstring)_ |
+| 14716 | `_analytics_ignore_ips` | _(no docstring)_ |
+| 14720 | `visitor_salt_for` | Today's random salt. Asking for a new day replaces (and so forgets) the previous one. |
+| 14729 | `_visit_timestamp` | The site's UTC pageview time as 'YYYY-MM-DD HH:MM:SS' (CURRENT_TIMESTAMP's format), or None |
+| 14738 | `record_site_visits` | Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and |
+| 14767 | `prune_site_visits` | Delete pageviews older than the retention window. Returns rows removed. |
+| 14779 | `_maybe_prune_site_visits` | Prune at most hourly, riding on ingest traffic - no scheduled job of its own. |
+| 14792 | `analytics_ingest` | Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN. |
+| 14810 | `get_site_visit_rows` | READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises |
+| 14820 | `site_visitor_standup_line` | The standup's analytics line, or '' when analytics is switched off. Never raises: a failed |
+| 14842 | `record_inbound_lead` | Commit one validated lead (see validate_lead). Returns the new row id. |
+| 14853 | `get_recent_leads` | READ-ONLY. (id, received_at, source, name, email, message), newest first. |
+| 14863 | `leads_ingest` | One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN. |
+| 14913 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
+| 14926 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
+| 14935 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
+| 14946 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
+| 14956 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
+| 14993 | `_cached_drafting_timing` | _(no docstring)_ |
+| 15011 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
+| 15046 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
+| 15053 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
 
 ## `pipeline_utils.py` — 98 defs, 2,642 lines
 
@@ -565,4 +567,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**496 definitions across 10 files + Code.gs.**
+**498 definitions across 10 files + Code.gs.**

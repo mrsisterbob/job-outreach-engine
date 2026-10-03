@@ -9727,6 +9727,9 @@ def render_followup_needs_card(result, on_demand=False):
         lines.append("<i>Set the date and Status in Carmen Hot; nothing here is auto-sent.</i>")
 
     ready = result.get("followups_ready", [])
+    # Every link carries this run's date, so an old card opens the queue it listed rather than
+    # today's. The /queue preview saves no snapshot, so it has no dated queue to point at.
+    date_q = "" if on_demand else _queue_date_query(result.get("run_date"))
     if ready:
         lines.append(f"\n▶ <b>Nudge these people ({len(ready)})</b>")
         for e in ready:
@@ -9745,7 +9748,7 @@ def render_followup_needs_card(result, on_demand=False):
             draft_link = ""
             if e.get("sheet_uuid") and _sequencer_draft_recipient(e):
                 draft_url = html.escape(
-                    f"{BASE_URL}/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}",
+                    f"{BASE_URL}/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}{date_q}",
                     quote=True)
                 draft_link = f" · <a href='{draft_url}'>✉️</a>"
             day_label = format_ladder_progress(e.get("progress"))
@@ -9756,7 +9759,7 @@ def render_followup_needs_card(result, on_demand=False):
             )
         # Draft text and the full per-person controls live on /followups - this card stays a
         # scannable list. The ✉️ above is the one-tap path; no draft exists until one is clicked.
-        queue_url = html.escape(f"{BASE_URL}/followups", quote=True)
+        queue_url = html.escape(f"{BASE_URL}/followups{date_q}", quote=True)
         lines.append(f"📋 <a href='{queue_url}'>Open Follow-up Queue</a>")
         # No full-sheet_uuid 🆔 line and no swipe legend: this card holds N entries in one message,
         # and _parse_sheet_uuid_from_card_text takes the first UUID it finds, so a swipe-reply would
@@ -14063,6 +14066,26 @@ def _followups_page(title, body_html):
     </html>
     """
 
+def _requested_queue_date():
+    """The queue date a /followups link asks for via ?date=YYYY-MM-DD, else today.
+
+    Every morning card links to ITS OWN run's snapshot. A bare /followups link from the Sep 26
+    card used to open today's queue, so every old card showed the same two people."""
+    raw = str(request.args.get("date") or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        try:
+            datetime.strptime(raw, "%Y-%m-%d")
+            return raw
+        except ValueError:
+            pass
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _queue_date_query(run_date):
+    """'?date=YYYY-MM-DD' for a link back into run_date's queue, or '' when there is no date."""
+    return f"?date={urllib.parse.quote(str(run_date))}" if run_date else ""
+
+
 @app.route("/followups", methods=["GET"])
 def followup_queue_view():
     """The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail
@@ -14073,12 +14096,15 @@ def followup_queue_view():
     writes nothing; its "Open in Gmail" links go to followup_draft_on_demand(), which does.
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
-    title = f"Follow-up Queue · {today_str}"
-    result = load_followup_queue_snapshot(today_str)
+    run_date = _requested_queue_date()
+    title = f"Follow-up Queue · {run_date}"
+    result = load_followup_queue_snapshot(run_date)
     if result is None:
+        why = ("No queue for today yet — the sequencer runs at 7:30." if run_date == today_str else
+               f"No saved queue for {run_date} — queues are kept {FOLLOWUP_SNAPSHOT_RETENTION_DAYS} days.")
         return _followups_page(title, (
             f"<h2>{html.escape(title)}</h2>"
-            "<p class='meta'>No queue for today yet — the sequencer runs at 7:30.</p>"
+            f"<p class='meta'>{html.escape(why)}</p>"
         )), 200
 
     ready = result.get("followups_ready") or []
@@ -14090,6 +14116,10 @@ def followup_queue_view():
         )), 200
 
     parts = [f"<h2>{html.escape(title)}</h2>"]
+    if run_date != today_str:
+        parts.append(f"<p class='meta'><i>An earlier day's queue. Today's is "
+                     f"<a href='/followups'>here</a>.</i></p>")
+    date_q = _queue_date_query(run_date)
     if ready:
         parts.append(f"<h3 style='margin-top: 24px;'>✉️ Nudge These People ({len(ready)})</h3>")
         for i, e in enumerate(ready):
@@ -14116,7 +14146,8 @@ def followup_queue_view():
                          + links)
             no_address_note = ""
             if e.get("sheet_uuid") and _sequencer_draft_recipient(e):
-                open_url = html.escape(f"/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}", quote=True)
+                open_url = html.escape(
+                    f"/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}{date_q}", quote=True)
                 links += f'<a class="btn btn-primary" href="{open_url}" target="_blank">✉️ Open in Gmail</a>'
             else:
                 no_address_note = "<p class='meta'><i>No verified address on file - copy the draft and send it by hand.</i></p>"
@@ -14195,15 +14226,15 @@ def followup_draft_on_demand(sheet_uuid):
     refused before anything reaches Gmail, and a repeat click finds the draft the first click made
     and redirects to it rather than creating another. It never sends.
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    result = load_followup_queue_snapshot(today_str) or {}
+    run_date = _requested_queue_date()
+    result = load_followup_queue_snapshot(run_date) or {}
     entry = next((e for e in result.get("followups_ready") or []
                   if e.get("sheet_uuid") and e.get("sheet_uuid") == sheet_uuid), None)
     if entry is None:
         return _followups_page("Follow-up not found", (
             "<h2>Follow-up not found</h2>"
-            "<p class='meta'>That follow-up is not in today's queue. Links only work on the day "
-            "the 7:30 sequencer listed them.</p>"
+            f"<p class='meta'>That follow-up is not in the {html.escape(run_date)} queue. Queues are "
+            f"kept {FOLLOWUP_SNAPSHOT_RETENTION_DAYS} days.</p>"
             '<a class="btn btn-secondary" href="/followups">← Back to queue</a>'
         )), 404
 

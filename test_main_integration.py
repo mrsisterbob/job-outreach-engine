@@ -1142,7 +1142,7 @@ def test_followups_page_renders_the_saved_run_read_only(monkeypatch):
     assert "Hello &lt;b&gt;there&lt;/b&gt; " + "y" * 1200 in page  # full text, escaped, untruncated
     assert page.count("📋 Copy Draft") == 3
     assert page.count("✉️ Open in Gmail") == 1
-    assert 'href="/followups/draft/cc-0"' in page
+    assert f'href="/followups/draft/cc-0?date={real_now.strftime("%Y-%m-%d")}"' in page
     assert page.count("No verified address on file") == 2
     assert "mail.google.com" not in page  # no draft exists until a link is clicked
     assert "Applications Going Quiet (1)" in page and "Acme0" in page
@@ -1236,12 +1236,40 @@ def test_draft_link_for_an_unknown_uuid_404s_without_recomputing(monkeypatch):
     _no_recompute(monkeypatch)
 
     status, _, page = _click("cc-0")  # no snapshot at all
-    assert status == 404 and "not in today's queue" in page
+    assert status == 404 and f"not in the {m.datetime.now().strftime('%Y-%m-%d')} queue" in page
 
     _save_today([_ready_entry("cc-0")])
     status, _, page = _click("nope")
-    assert status == 404 and "not in today's queue" in page
+    assert status == 404 and f"not in the {m.datetime.now().strftime('%Y-%m-%d')} queue" in page
     assert calls == []
+
+
+def test_an_old_cards_links_open_that_days_queue_not_todays(monkeypatch):
+    """Every card used to link a bare /followups, so the Sep 26 card opened Oct 3's two people.
+    Drive the real path: the job saves a past run, its card's links carry that date, and following
+    them reads that run's snapshot - the page and the ✉️ draft alike."""
+    past = (m.datetime.now().date() - timedelta(days=3))
+    past_str = past.strftime("%Y-%m-%d")
+    _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0, today=past)], jobs_rows=[])
+    result = m.run_followup_sequencer(today=past)
+    assert m.save_followup_queue_snapshot(past_str, result)
+    _save_today([_ready_entry("cc-today", name="Todayperson")])
+
+    card = m.render_followup_needs_card(result)
+    assert f"{m.BASE_URL}/followups?date={past_str}'>Open Follow-up Queue" in card
+    assert f"{m.BASE_URL}/followups/draft/cc-0?date={past_str}'>✉️" in card
+
+    _no_recompute(monkeypatch)
+    with m.app.test_client() as client:
+        page = client.get(f"/followups?date={past_str}").get_data(as_text=True)
+        assert f"Follow-up Queue · {past_str}" in page
+        assert "Pat0" in page and "Todayperson" not in page
+        assert "An earlier day's queue" in page
+        res = client.get(f"/followups/draft/cc-0?date={past_str}")
+        # Found in the past run's snapshot and sent to Gmail; today's-only lookup was a 404.
+        assert res.status_code == 302 and "mail.google.com" in res.headers.get("Location", "")
+        # And without the date, the same uuid is not in today's queue.
+        assert client.get("/followups/draft/cc-0").status_code == 404
 
 
 @pytest.mark.parametrize("email", ["", "   ", "x@y.com [⚠️ Fallback Email]", None])
