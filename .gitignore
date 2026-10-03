@@ -16,3 +16,6 @@ Job_Outreach_CRM*.xlsx
 # In-flight tasks are local state - committing them would put queue churn in every
 # diff you review, and the worker's code changes are what you actually want to see.
 .queue/*/*.md
+
+# Worker worktrees (.worktrees/TASK-n): each task runs in its own checkout on branch task/TASK-n.
+.worktrees/

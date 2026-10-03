@@ -43,10 +43,7 @@ def main():
     if payload.get("stop_hook_active"):
         return
 
-    # The repo root, from this file's own location (.claude/hooks/ -> two levels up) - NOT the
-    # payload's cwd. That is the shell's current directory, so one `cd .queue/inbox` mid-turn
-    # made pytest collect nothing and the hook reported a false red ("no tests ran").
-    cwd = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    cwd = tree_under_test(payload.get("cwd"))
 
     try:
         result = subprocess.run(
@@ -79,6 +76,34 @@ def main():
         "If the change is genuinely correct and the test encodes the old behavior, say so "
         "explicitly and explain why - do not delete or skip a test to get to green."
     )
+
+
+def tree_under_test(session_cwd):
+    """The root of the git tree this session is actually working in.
+
+    The session's shell directory, resolved to its git toplevel. A worker cd'd into
+    .worktrees/TASK-7/ gets its own worktree tested, so a half-finished edit there never
+    blocks the planner or the chat, and theirs never block it. A shell sitting in a
+    subfolder of the main tree (`cd .queue/inbox`) still resolves to the main root - testing
+    the raw cwd made pytest collect nothing and report a false red ("no tests ran").
+
+    Falls back to the repo this hook file lives in when the cwd is missing, outside any git
+    tree, or a tree without the suites - a hook that cannot find the tests must test the
+    main repo, never silently test nothing.
+    """
+    fallback = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if not session_cwd:
+        return fallback
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=session_cwd, capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+    except Exception:
+        return fallback
+    if top and all(os.path.isfile(os.path.join(top, s)) for s in SUITES):
+        return top
+    return fallback
 
 
 def refresh_function_index(cwd):

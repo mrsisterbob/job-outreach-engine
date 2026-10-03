@@ -1659,6 +1659,35 @@ def test_open_followups_drops_the_nudged_the_replied_and_the_moved(monkeypatch):
         assert f"— Co{gone}</h3>" not in page
 
 
+def test_open_followups_tagged_address_is_searched_clean_and_still_drops_once_sent(monkeypatch):
+    """A Fallback-tagged address is exactly the contact the page says to send by hand. Searching
+    Gmail for the raw tagged string matched most of Sent on its loose words, and the clean
+    address read back from To: never equalled it - so the contact never dropped."""
+    today, run_dates, live = _seed_skipped_mornings(monkeypatch)
+    _owed_read_only(monkeypatch)
+    tagged = f"{_owed_email(1)} [⚠️ Fallback Email]"
+    with m.get_db_conn() as conn:  # the snapshot as saved, with the tag the CRM row carried
+        payload = json.loads(conn.execute("SELECT payload_json FROM followup_queue_snapshot "
+                                          "WHERE run_date = ?", (run_dates[1],)).fetchone()[0])
+    payload["followups_ready"][0]["email"] = tagged
+    assert m.save_followup_queue_snapshot(run_dates[1], payload)
+    live[1]["email"] = tagged
+    _live_crm(monkeypatch, live)
+    queries = _gmail_sent(monkeypatch, sent={_owed_email(1): today})
+
+    status, page = _get_open_page()
+
+    assert status == 200 and "4 open follow-ups" in page and "— Co1</h3>" not in page
+    assert queries and not any("fallback" in q.lower() for q in queries)
+
+
+def test_open_followups_sent_lookup_over_the_cap_is_unchecked_not_partial(monkeypatch):
+    monkeypatch.setattr(m, "SENT_LOOKUP_MAX_MESSAGES", 2)
+    today = m.datetime.now().date()
+    _gmail_sent(monkeypatch, sent={_owed_email(k): today for k in range(3)})
+    assert m.latest_sent_dates_by_recipient([_owed_email(k) for k in range(3)], today) is None
+
+
 def test_owed_command_sends_the_count_and_one_link_only(monkeypatch, capture_sent):
     _, _, live = _seed_skipped_mornings(monkeypatch)
     enqueued = _owed_read_only(monkeypatch)

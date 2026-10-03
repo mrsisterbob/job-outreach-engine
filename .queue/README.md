@@ -95,8 +95,29 @@ them after five minutes - the worker would look like it was ignoring the planner
 
 `/queue-status` in either terminal shows the whole queue without changing anything.
 
-## The worker does not commit
+## The worker works in its own worktree, and you merge
 
-It leaves changes in the working tree for review. Two agents sharing one git index
-fight over it, and an autonomous `git reset --hard` would wipe whatever the other
-terminal (or you, by hand) had uncommitted. Review and commit yourself.
+Each claimed task gets its own checkout: `.worktrees/TASK-n/` on branch `task/TASK-n`,
+started from `main`. The worker edits, tests and commits there, never on `main`.
+
+Why: with one shared folder, every agent's Stop hook tested every other agent's
+half-finished edits. On 2026-10-03 the worker's mid-save `main.py` turned the chat's hook
+red with a 500 that had nothing to do with the chat. The hook now tests the git tree the
+session's shell is in, so each session only answers for its own work.
+
+Your review step is the merge, from the main folder:
+
+```bash
+git diff main...task/TASK-n          # read it
+git merge task/TASK-n && git worktree remove .worktrees/TASK-n && git branch -d task/TASK-n
+```
+
+Two consequences to know:
+- **A task can only build on merged work.** The worktree starts from `main`, so if TASK-4
+  needs TASK-3, merge TASK-3 first - the worker checks and waits rather than starting blind.
+- **The worker never touches `main`** - no commit, merge, push, reset or stash there.
+  Your uncommitted work in the main folder is never in its reach.
+
+Known gap: one test (`test_main_integration.py`, the montelattice-site check) looks for that
+repo *beside* this one, so inside `.worktrees/` it skips instead of running. It still runs
+on `main` after the merge.

@@ -7617,6 +7617,9 @@ def capture_contacts_from_sent_mail(lookback_hours=None, max_messages=25, dry_ru
 # Addresses per Gmail search. A {to:a to:b ...} OR group keeps ~70 contacts to a handful of list
 # calls without pushing one query string past what Gmail's search will accept.
 SENT_LOOKUP_CHUNK = 20
+# Metadata fetches per lookup. The page and /owed build on a request thread, and gunicorn runs one
+# sync worker; ~70 contacts nudged at most a few times each in 15 days sits well under this.
+SENT_LOOKUP_MAX_MESSAGES = 200
 
 
 def latest_sent_dates_by_recipient(emails, since_date):
@@ -7627,7 +7630,16 @@ def latest_sent_dates_by_recipient(emails, since_date):
     and an outage that returned it would read as "nobody has been nudged" - a clean zero.
     An address with no Sent message in the window is simply absent from the result.
     """
-    wanted = sorted({str(e or "").strip().lower() for e in emails or () if "@" in str(e or "")})
+    # A CRM address can carry a UI tag ("user@x.com [⚠️ Fallback Email]"). Gmail is searched for
+    # the clean address only - the tag's loose words would match most of Sent - and each date is
+    # returned under every spelling the caller passed, since that is the key it will look up.
+    spellings = {}
+    for raw in emails or ():
+        key = str(raw or "").strip().lower()
+        clean = key.split(" [")[0].strip()
+        if "@" in clean and " " not in clean:
+            spellings.setdefault(clean, set()).add(key)
+    wanted = sorted(spellings)
     missing_vars = [v for v in ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"] if not os.environ.get(v)]
     if missing_vars:
         return None
@@ -7641,7 +7653,6 @@ def latest_sent_dates_by_recipient(emails, since_date):
     # after: is a whole day and Gmail reads it in its own timezone, so start one day early. The
     # dates returned are exact, and the caller compares them against each listing's run_date.
     after = (since_date - timedelta(days=1)).strftime("%Y/%m/%d")
-    wanted_set = set(wanted)
     latest = {}
     try:
         message_ids = []
@@ -7666,7 +7677,13 @@ def latest_sent_dates_by_recipient(emails, since_date):
                 if not page_token:
                     break
 
-        for msg_id in dict.fromkeys(message_ids):
+        message_ids = list(dict.fromkeys(message_ids))
+        if len(message_ids) > SENT_LOOKUP_MAX_MESSAGES:
+            # Each message is one more 10s-timeout call on the request thread. Past the cap, say
+            # "unchecked" rather than return a partial answer that would read as complete.
+            logging.error(f"[SENT] Sent lookup matched {len(message_ids)} messages - over the cap, unchecked")
+            return None
+        for msg_id in message_ids:
             detail = requests.get(
                 f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
                 headers=headers,
@@ -7681,9 +7698,9 @@ def latest_sent_dates_by_recipient(emails, since_date):
             header_list = (message.get("payload") or {}).get("headers", [])
             recipients = ", ".join(_gmail_header_value(header_list, h) for h in ("To", "Cc"))
             for _name, address in getaddresses([recipients]):
-                key = address.strip().lower()
-                if key in wanted_set and (key not in latest or sent_on > latest[key]):
-                    latest[key] = sent_on
+                for key in spellings.get(address.strip().lower(), ()):
+                    if key not in latest or sent_on > latest[key]:
+                        latest[key] = sent_on
     except Exception as e:
         logging.error(f"[SENT] Sent lookup exception: {e}")
         return None

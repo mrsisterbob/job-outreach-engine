@@ -32,6 +32,26 @@ those is the thing this setup exists to prevent.
    On `NOT CLAIMED`, go back to step 1 and try the next task. Never claim by copying,
    rewriting, or `cp`-then-`rm` - only the single `mv` is atomic.
 
+4. **Dependencies.** If the task's Notes say it depends on another task, that task's work
+   must already be on `main`: `git merge-base --is-ancestor task/<DEP> main` (or the
+   dependency's files are already committed). If not, move the task back to `inbox/`, say
+   which merge it is waiting on, and stop. Your worktree starts from `main`, so unmerged
+   work from an earlier task is invisible to you - building on top of it is impossible.
+
+5. **Open your worktree** - your own checkout, on its own branch:
+
+   ```bash
+   git worktree add .worktrees/<TASK-id> -b task/<TASK-id> main && cd .worktrees/<TASK-id>
+   ```
+
+   **Stay in that directory for the rest of the task.** Every edit, test run and commit
+   happens there. The Stop hook tests whichever git tree your shell is in, so this is what
+   makes it check YOUR change - and what keeps your half-finished edits from blocking the
+   planner or Kevin, who are working in the main folder at the same time.
+
+   The queue files are not in the worktree (they are untracked): reach them from there as
+   `../../.queue/`. Run Python as `../../.venv/Scripts/python` - the worktree has no venv.
+
 ## Execute
 
 Read the task. Then read the files in `scope` before editing them.
@@ -63,9 +83,11 @@ else broke.
 they are and say plainly that the task is blocked and the tree has partial work in it.
 
 Do **not** run `git reset`, `git checkout --`, `git stash`, or any other command that
-discards uncommitted changes. Another terminal and Kevin both have unreviewed work in
-this tree; wiping it is unrecoverable and is not yours to do. Leaving a half-finished
-change for review is the correct failure.
+discards uncommitted changes - not in your worktree, and never in the main folder, where
+Kevin and the planner have unreviewed work. (`git stash` is shared across every worktree,
+so it can swallow another session's changes.) Leaving a half-finished change for review is
+the correct failure; on a block, also commit it to your branch as `WIP <TASK-id>: blocked`
+so the work survives the worktree.
 
 ## Review before calling it done
 
@@ -90,9 +112,20 @@ you deliberately skipped and why.
 On success:
 1. Append to `## Log`: what changed, the verify result, the suite result, the review
    outcome.
-2. `mv .queue/active/<file> .queue/done/<file>`
-3. Report: task id, files changed, test counts, review findings. Then **stop** - do not
-   pick up the next task, and do not commit. Kevin reviews and commits.
-4. If a planner session is running, message it one line: task id, done or blocked, and
+2. Commit **in your worktree, to your branch only**:
+   `git add <scope files> && git commit -m "<TASK-id>: <one-line target>"`. Stage the
+   scope files by name, never `git add -A`. Never commit to `main`, never merge, never
+   push - merging into `main` is Kevin's review step.
+3. `mv ../../.queue/active/<file> ../../.queue/done/<file>`
+4. Report: task id, branch `task/<TASK-id>`, files changed, test counts, review findings,
+   and the merge commands for Kevin to run from the main folder once he has read the diff
+   (`git diff main...task/<TASK-id>`):
+
+   ```bash
+   git merge task/<TASK-id> && git worktree remove .worktrees/<TASK-id> && git branch -d task/<TASK-id>
+   ```
+
+   Then **stop** - do not pick up the next task.
+5. If a planner session is running, message it one line: task id, done or blocked, and
    anything it got wrong about the code. If the task was blocked, that message is how the
    plan gets fixed - say what you actually found, not that it failed.
