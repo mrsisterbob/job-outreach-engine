@@ -46,6 +46,7 @@ from pipeline_utils import (
     is_guessed_contact_email, resolve_sent_email_backfill,
     sanitize_job_title, is_clean_job_title, classify_outreach_track,
     is_role_mailbox, is_automated_sender, inbound_sender_screen_reason, company_domain_of, name_from_email_local_part, parse_email_recipient,
+    is_email_derived_name, greeting_name_from_body,
     match_email_to_crm_company, shape_public_dashboard,
     daily_visitor_id, normalize_referrer_host, visit_bot_flag, summarize_visits, format_visitor_line,
     plan_carmen_ladder, carmen_reply_anchor, carmen_linkedin_anchor, CARMEN_LADDER_DAYS,
@@ -8718,7 +8719,7 @@ def process_overdue_batch(mode, snooze_days=7):
                 company_name=record.get("company") or "Target Firm",
                 job_title=record.get("title") or "",
                 custom_body=generate_bump_email(
-                    first_name_for_greeting(record.get("name") or ""),
+                    resolve_bump_first_name(record),
                     job_title=record.get("title") or "",
                     company_name=record.get("company") or "",
                 ),
@@ -9104,6 +9105,131 @@ def promote_job_card_contact(chat_id, token, extra):
     return True
 
 
+# email -> (first_name, looked_up_at). Positive hits are kept for the process lifetime; a miss is
+# retried after this window so a first touch Kevin sends later is picked up.
+_SENT_NAME_CACHE = {}
+_SENT_NAME_CACHE_LOCK = threading.Lock()
+SENT_NAME_MISS_TTL = timedelta(hours=1)
+# Oldest-first scan depth: the first touch is the message Kevin hand-addressed, and a contact rarely
+# has more than a handful of messages in Sent.
+SENT_NAME_MAX_MESSAGES = 5
+
+
+def first_name_from_sent_mail(to_email):
+    """The first name Kevin actually used for `to_email`, read from Gmail. Returns:
+      "Anna" - found, from the "Hi Anna," line of his OWN earliest sent message to them, or failing
+               that from the display name on a message THEY sent ("Stefanie Quillen <squillen@>")
+      ""     - Gmail was checked and holds no usable name
+      None   - Gmail could not be checked (no env, no token, HTTP error) - the caller keeps its
+               existing name rather than treating an outage as "no name"
+
+    Why this exists: /e takes only an address, so a contact it captures has no name in the CRM -
+    Kevin types "Hi Anna," into the Gmail draft by hand. The CRM used to fill the gap with the
+    address's local part, which is how "Hi Alarson," "Hi Jhang," and "Hi Squillen," reached the
+    follow-ups. The sent message is the one place the real name is written down.
+
+    His own greeting outranks their display name on purpose: it is what he calls them, nickname
+    included. A greeting that is itself email-derived (a bump that already went out as "Hi
+    Squillen,") is skipped, so a past mistake cannot launder itself into the answer.
+    """
+    clean = str(to_email or "").split(" [")[0].strip().lower()
+    if "@" not in clean:
+        return ""
+    if any(not os.environ.get(v) for v in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN")):
+        return None
+    now = datetime.now()
+    with _SENT_NAME_CACHE_LOCK:
+        cached = _SENT_NAME_CACHE.get(clean)
+    if cached is not None and (cached[0] or now - cached[1] < SENT_NAME_MISS_TTL):
+        return cached[0]
+    access_token = get_gmail_access_token()
+    if not access_token:
+        return None
+    headers = {"Authorization": f"Bearer {access_token}"}
+    base = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+
+    def _list(query, limit):
+        res = requests.get(base, headers=headers, params={"q": query, "maxResults": limit}, timeout=10)
+        if res.status_code != 200:
+            raise RuntimeError(f"list HTTP {res.status_code}")
+        return [m_["id"] for m_ in (res.json().get("messages") or []) if m_.get("id")]
+
+    found = ""
+    try:
+        # Newest-first from the API; reversed so the hand-addressed first touch is read first.
+        for message_id in reversed(_list(f"in:sent to:{clean}", 20)[-SENT_NAME_MAX_MESSAGES:]):
+            res = requests.get(f"{base}/{message_id}", headers=headers, params={"format": "full"}, timeout=10)
+            if res.status_code != 200:
+                continue
+            name = greeting_name_from_body(extract_plain_body(res.json().get("payload") or {}))
+            if name and not is_email_derived_name(name, clean):
+                found = name
+                break
+        if not found:
+            for message_id in _list(f"from:{clean}", 1):
+                res = requests.get(f"{base}/{message_id}", headers=headers,
+                                   params={"format": "metadata", "metadataHeaders": ["From"]}, timeout=10)
+                if res.status_code != 200:
+                    continue
+                display, _addr = parse_email_recipient(
+                    _gmail_header_value((res.json().get("payload") or {}).get("headers"), "From"))
+                name = first_name_for_greeting(display)
+                if name and not is_email_derived_name(name, clean):
+                    found = name
+    except Exception as e:
+        logging.error(f"[NAME] Sent-mail name lookup failed for {clean}: {e}")
+        return None
+    with _SENT_NAME_CACHE_LOCK:
+        _SENT_NAME_CACHE[clean] = (found, now)
+    return found
+
+
+def resolve_bump_first_name(record):
+    """The first name a follow-up greets with. The CRM name wins when it is a real name; when it
+    is blank or just the address's local part (see is_email_derived_name), the name Kevin used in
+    Sent wins instead. If Gmail cannot be checked, the CRM first name stands - an outage is not
+    evidence the name is wrong."""
+    crm_name = str(record.get("name") or "").strip()
+    first = first_name_for_greeting(crm_name)
+    email = _sequencer_draft_recipient(record)
+    if not email or (first and not is_email_derived_name(crm_name, email)):
+        return first
+    from_sent = first_name_from_sent_mail(email)
+    if from_sent is None:
+        return first
+    return from_sent
+
+
+def rerender_followup_drafts(entries):
+    """Rebuild each entry's draft_text from the CURRENT template bank and name resolution.
+
+    The pages and the "Open in Gmail" route used to replay the text frozen into the saved queue
+    snapshot, so a snapshot from before a template or greeting fix kept serving the old copy for
+    its whole 14-day retention - "Hi Chaunta Marshall," and "in case it got buried" both outlived
+    the code that wrote them. Drafting is template + name, no LLM, so re-rendering is cheap; the
+    Sent lookups run in parallel because the open list can be dozens of people.
+    """
+    entries = list(entries or [])
+    emails = {_sequencer_draft_recipient(e) for e in entries} - {""}
+    if emails:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(first_name_from_sent_mail, emails))
+    for e in entries:
+        record = {
+            "name": e.get("name") or "",
+            "email": e.get("email") or "",
+            "company": e.get("company_raw") or e.get("company") or "",
+            # "title" is the raw value the sequencer stored; "role" is the display copy of it.
+            "title": e.get("title") if e.get("title") is not None else (e.get("role") or ""),
+        }
+        try:
+            attempt = int(e.get("attempt") or 1)
+        except (TypeError, ValueError):
+            attempt = 1
+        e["draft_text"] = build_followup_bump_draft(record, attempt)
+    return entries
+
+
 def build_followup_bump_draft(record, attempt):
     """Draft the follow-up text from the followup_bumps template bank via the existing
     resolve_template_text + interpolate_template path. No LLM, no prose authored in Python.
@@ -9124,10 +9250,11 @@ def build_followup_bump_draft(record, attempt):
         fallback_text = fallback_pool[idx] if idx < len(fallback_pool) else fallback_pool[0]
         template = resolve_template_text(pool, idx, fallback_text)
     # The greeting is the FIRST name: "Hi Chaunta Marshall," is the tell that a machine addressed
-    # you. The roled/roleless split above is about the body, so this applies to both.
+    # you. The roled/roleless split above is about the body, so this applies to both. A CRM name
+    # that is just the address's local part is replaced by the name Kevin used in Sent.
     return interpolate_template(
         template,
-        name=first_name_for_greeting(record.get("name") or ""),
+        name=resolve_bump_first_name(record),
         company=record.get("company") or "",
         job_title=title,
         # Keyed off whether a title is present at all, which is exactly the JOBS/PEOPLE schema
@@ -14303,7 +14430,8 @@ def followup_queue_view():
             f"<p class='meta'>{html.escape(why)}</p>"
         )), 200
 
-    ready = result.get("followups_ready") or []
+    # Re-rendered, not replayed: see rerender_followup_drafts().
+    ready = rerender_followup_drafts(result.get("followups_ready") or [])
     quiet = result.get("applications_quiet") or []
     if not ready and not quiet:
         return _followups_page(title, (
@@ -14391,7 +14519,8 @@ def open_followups_view():
             "the open follow-ups are unknown. Try again once the CRM is answering.</p>"
         )), 502
 
-    items = owed["items"]
+    # Re-rendered, not replayed: a snapshot up to 14 days old carries that day's template and name.
+    items = rerender_followup_drafts(owed["items"])
     heading = _open_followups_count_label(len(items))
     parts = [
         f"<h2>{html.escape(heading)}</h2>",
@@ -14453,7 +14582,8 @@ def followup_draft_on_demand(sheet_uuid):
 
     who = str(entry.get("name") or entry.get("role") or entry.get("company") or "this follow-up")
     title = f"Follow-up draft · {who}"
-    draft_text = str(entry.get("draft_text") or "")
+    # Same re-render the pages do, so Gmail holds exactly the text the page just showed.
+    draft_text = str(rerender_followup_drafts([dict(entry)])[0].get("draft_text") or "")
     record = {
         "sheet_uuid": sheet_uuid,
         "email": entry.get("email"),

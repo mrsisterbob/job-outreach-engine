@@ -1202,11 +1202,63 @@ def match_email_to_crm_company(email, crm_companies):
 def name_from_email_local_part(email):
     """Fall back to a display name derived from the address ('eina.assali@x' -> 'Eina Assali')
     when the To: header carried no display name.
+
+    Returns "" for a single-token local part. 'squillen@' is initial + surname far more often
+    than a first name, and deriving "Squillen" from it put "Hi Squillen," on every follow-up to
+    Stefanie Quillen - the CRM stored the guess as her name and every bump trusted it. A blank
+    name is honest: the bump path then reads the real one off the Sent thread
+    (first_name_from_sent_mail in main.py), and autosend refuses a nameless row.
     """
     local = str(email or "").split("@")[0].strip()
     local = re.sub(r'\d+$', '', local)
     words = [w for w in re.split(r'[._\-+]+', local) if w]
-    return " ".join(w.capitalize() for w in words) if words else ""
+    if len(words) < 2:
+        return ""
+    return " ".join(w.capitalize() for w in words)
+
+
+def is_email_derived_name(name, email):
+    """True when `name` is just the address's single-token local part ('Squillen' for
+    squillen@, 'Pat' for pat3@) - i.e. a guess the old name_from_email_local_part() made, not a
+    name anyone typed. Rows captured before that function stopped guessing still carry these.
+
+    A dotted/dashed local part ('eina.assali') is NOT flagged: splitting it yields a real first
+    name, so the derived "Eina Assali" greets correctly.
+    """
+    local = re.sub(r'\d+$', '', str(email or "").split("@")[0].strip().lower())
+    if not local or re.search(r'[._\-+]', local):
+        return False
+    squashed = re.sub(r'[^a-z]', '', str(name or "").lower())
+    return bool(squashed) and squashed == re.sub(r'[^a-z]', '', local)
+
+
+# Salutations that open Kevin's emails. Anything else on the first line is not a greeting.
+_GREETING_RE = re.compile(
+    r"^\s*(?:hi|hello|hey|dear|good\s+(?:morning|afternoon|evening))\s+"
+    r"([A-Za-z][A-Za-z'\-]*)\s*[,!:.\-]?\s*$",
+    re.IGNORECASE,
+)
+_NON_NAME_GREETINGS = frozenset({"there", "team", "all", "everyone", "folks", "hiring", "recruiting", "sir", "madam"})
+
+
+def greeting_name_from_body(body):
+    """The name in the opening "Hi Anna," line of an email body, or "" when it has none.
+
+    This is where the real first name lives for any contact captured by /e: /e takes only an
+    address, and Kevin types the name into the Gmail draft by hand before sending. The sent
+    message is therefore the one record of what he actually calls this person.
+    """
+    for line in str(body or "").splitlines():
+        if not line.strip():
+            continue
+        match = _GREETING_RE.match(line)
+        if not match:
+            return ""
+        name = match.group(1).strip("'-")
+        if len(name) < 2 or name.lower() in _NON_NAME_GREETINGS:
+            return ""
+        return name[0].upper() + name[1:]
+    return ""
 
 
 def build_sent_contact(to_header, crm_companies):

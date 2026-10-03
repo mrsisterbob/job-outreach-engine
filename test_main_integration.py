@@ -50,6 +50,8 @@ def clean_tables():
                       "command_usage"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
+    # Module-global name cache: a Sent lookup in one test must not answer for the next.
+    m._SENT_NAME_CACHE.clear()
     yield
 
 
@@ -1212,7 +1214,7 @@ def _gmail_calls(monkeypatch, result=(True, "Success", "draft-1")):
 
 
 def test_draft_link_creates_the_draft_from_the_snapshot_and_redirects(monkeypatch):
-    _save_today([_ready_entry("cc-0", text="Exact card text."),
+    _save_today([_ready_entry("cc-0", text="Stale text from an old template."),
                  _ready_entry("cc-1", company="Acme", role="Ops Analyst")])
     calls = _gmail_calls(monkeypatch)
     _no_recompute(monkeypatch)
@@ -1221,12 +1223,17 @@ def test_draft_link_creates_the_draft_from_the_snapshot_and_redirects(monkeypatc
 
     assert status == 302
     assert location == "https://mail.google.com/mail/u/0/#drafts/draft-1"
+    # The body is RE-RENDERED from today's bank, never the snapshot's frozen text: a snapshot is
+    # kept 14 days, and replaying it is how "Hi Chaunta Marshall," outlived the first-name fix.
+    expected = m.build_followup_bump_draft(
+        {"name": "Pat", "email": "pat@acme.com", "company": "Nliven", "title": ""}, 1)
     # thread_reply=True is asserted here, not merely tolerated: a follow-up that silently stops
     # threading is invisible in Gmail's own UI (the draft still looks right) and only shows up as a
     # bare "Re:" with no quoted history in the RECIPIENT's inbox.
     assert calls == [{"to_email": "pat@acme.com", "company_name": "Nliven", "job_title": "",
-                      "custom_body": "Exact card text.", "custom_subject": "Re: Nliven",
+                      "custom_body": expected, "custom_subject": "Re: Nliven",
                       "thread_reply": True}]
+    assert "Stale text" not in expected
     _click("cc-1")
     assert calls[1]["custom_subject"] == "Re: Ops Analyst @ Acme"
 
@@ -1287,7 +1294,8 @@ def test_draft_link_without_a_usable_address_shows_the_copy_page(monkeypatch, em
     assert status == 200 and location is None
     assert calls == []
     assert "No verified address on file" in page
-    assert "Copy &lt;me&gt; by hand</textarea>" in page and "📋 Copy Draft" in page
+    rendered = m.build_followup_bump_draft({"name": "Pat", "company": "Nliven", "title": ""}, 1)
+    assert f"{html.escape(rendered)}</textarea>" in page and "📋 Copy Draft" in page
 
 
 def test_second_click_redirects_to_the_same_draft_without_a_telegram_ping(monkeypatch):
@@ -1503,7 +1511,9 @@ def test_gmail_failure_renders_the_reason_and_the_text(monkeypatch, failure):
 
     assert status == 502 and location is None
     assert reason in page
-    assert "Fallback text</textarea>" in page and "📋 Copy Draft" in page
+    rendered = m.build_followup_bump_draft(
+        {"name": "Pat", "email": "pat@acme.com", "company": "Nliven", "title": ""}, 1)
+    assert f"{html.escape(rendered)}</textarea>" in page and "📋 Copy Draft" in page
 
 
 def test_blank_company_is_blocked_by_the_placeholder_guard(monkeypatch):
@@ -1512,6 +1522,8 @@ def test_blank_company_is_blocked_by_the_placeholder_guard(monkeypatch):
     for var in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_USER"):
         monkeypatch.setenv(var, "x")
     monkeypatch.setattr(m.requests, "post", lambda *a, **k: pytest.fail("must not reach Gmail"))
+    # The greeting's Sent-mail READ is not the draft write this test guards.
+    monkeypatch.setattr(m, "first_name_from_sent_mail", lambda email: None)
     _save_today([_ready_entry("cc-0", company="")])
 
     status, _, page = _click("cc-0")
@@ -1679,6 +1691,134 @@ def test_open_followups_tagged_address_is_searched_clean_and_still_drops_once_se
 
     assert status == 200 and "4 open follow-ups" in page and "— Co1</h3>" not in page
     assert queries and not any("fallback" in q.lower() for q in queries)
+
+
+# ---- Follow-up greetings come from the name Kevin used, not the address ----
+
+def _gmail_names(monkeypatch, sent_bodies=None, inbound_from=None):
+    """Gmail as first_name_from_sent_mail() reads it. sent_bodies: {address: [body, ...] oldest
+    first}; inbound_from: {address: From header of a message THEY sent}. Returns the queries."""
+    sent_bodies, inbound_from = sent_bodies or {}, inbound_from or {}
+    for var, val in (("GMAIL_CLIENT_ID", "cid"), ("GMAIL_CLIENT_SECRET", "cs"),
+                     ("GMAIL_REFRESH_TOKEN", "rt"), ("GMAIL_USER", "me@example.com")):
+        monkeypatch.setenv(var, val)
+    monkeypatch.setattr(m, "get_gmail_access_token", lambda: "token")
+    queries = []
+
+    class _Res:
+        status_code = 200
+        def __init__(self, body):
+            self._body = body
+        def json(self):
+            return self._body
+
+    def fake_get(url, params=None, **kw):
+        q = (params or {}).get("q", "")
+        if "/messages/" in url:
+            kind, addr, idx = url.rsplit("/", 1)[1].split("|")
+            if kind == "s":
+                data = base64.urlsafe_b64encode(sent_bodies[addr][int(idx)].encode()).decode().rstrip("=")
+                return _Res({"payload": {"mimeType": "text/plain", "body": {"data": data}}})
+            return _Res({"payload": {"headers": [{"name": "From", "value": inbound_from[addr]}]}})
+        if url.endswith("/messages"):
+            queries.append(q)
+            if q.startswith("in:sent to:"):
+                addr = q.split("to:", 1)[1]
+                # The API answers newest-first.
+                n = len(sent_bodies.get(addr, []))
+                return _Res({"messages": [{"id": f"s|{addr}|{i}"} for i in reversed(range(n))]})
+            if q.startswith("from:"):
+                addr = q[len("from:"):]
+                return _Res({"messages": [{"id": f"f|{addr}|0"}]} if addr in inbound_from else {})
+        return _Res({})
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    return queries
+
+
+def _due_contact(name, email, company):
+    return {**_due_person(0, email=email), "name": name, "company": company}
+
+
+def test_bump_greets_with_the_name_kevin_typed_not_the_address(monkeypatch):
+    """THE BUG: /e takes only an address, so the CRM stored 'Alarson' for alarson@ and every bump
+    opened "Hi Alarson,". Kevin's own first email says "Hi Anna," - that is the name. A later bump
+    that already went out wrong must not be read back as the answer."""
+    _mock_followup_rows(monkeypatch, cc_rows=[
+        _due_contact("Alarson", "alarson@junipersquare.com", "Juniper Square")])
+    _gmail_names(monkeypatch, sent_bodies={"alarson@junipersquare.com": [
+        "Hi Anna,\n\nI applied for the Customer Support Specialist role at Juniper Square recently.",
+        "Hi Alarson,\n\nCircling back on my earlier note to Juniper Square in case it got buried.",
+    ]})
+
+    draft = m.run_followup_sequencer(today=_SEQ_TODAY)["followups_ready"][0]["draft_text"]
+
+    assert draft.startswith("Hi Anna,\n")
+    assert "Alarson" not in draft
+
+
+def test_bump_falls_back_to_their_own_display_name_when_kevins_email_had_none(monkeypatch):
+    _mock_followup_rows(monkeypatch, cc_rows=[
+        _due_contact("Squillen", "squillen@petsuppliesplus.com", "Pet Supplies Plus")])
+    _gmail_names(monkeypatch,
+                 sent_bodies={"squillen@petsuppliesplus.com": ["Hi,\n\nI have been keeping an eye on..."]},
+                 inbound_from={"squillen@petsuppliesplus.com": "Stefanie Quillen <squillen@petsuppliesplus.com>"})
+
+    draft = m.run_followup_sequencer(today=_SEQ_TODAY)["followups_ready"][0]["draft_text"]
+
+    assert draft.startswith("Hi Stefanie,\n")
+
+
+def test_bump_with_no_name_anywhere_says_hi_never_the_address(monkeypatch):
+    _mock_followup_rows(monkeypatch, cc_rows=[
+        _due_contact("Jhang", "jhang@junipersquare.com", "Juniper Square")])
+    _gmail_names(monkeypatch)
+
+    draft = m.run_followup_sequencer(today=_SEQ_TODAY)["followups_ready"][0]["draft_text"]
+
+    assert draft.startswith("Hi,\n") and "Jhang" not in draft
+
+
+def test_a_real_crm_name_is_trusted_without_touching_gmail(monkeypatch):
+    _mock_followup_rows(monkeypatch, cc_rows=[
+        _due_contact("Chaunta Marshall", "cmarshall@trinity-health.org", "Trinity Health MI")])
+    _gmail_names(monkeypatch)
+    monkeypatch.setattr(m.requests, "get", lambda *a, **k: pytest.fail("a real name needs no lookup"))
+
+    draft = m.run_followup_sequencer(today=_SEQ_TODAY)["followups_ready"][0]["draft_text"]
+
+    assert draft.startswith("Hi Chaunta,\n")
+
+
+def test_followup_pages_rerender_a_stale_snapshot_and_gmail_gets_the_same_text(monkeypatch):
+    """The open list replayed draft text frozen up to 14 days earlier, so "Hi Jhang, ... in case it
+    got buried" kept coming back after both were fixed. The page and the ✉️ draft must agree."""
+    _save_today([_ready_entry("cc-0", email="jhang@junipersquare.com", company="Juniper Square",
+                              name="Jhang",
+                              text="Hi Jhang,\n\nCircling back on my earlier note in case it got buried.")])
+    _gmail_names(monkeypatch, sent_bodies={"jhang@junipersquare.com": ["Hi Joann,\n\nI applied..."]})
+    monkeypatch.setattr(m, "check_recent_gmail_draft_to", lambda email: None)
+    calls = _gmail_calls(monkeypatch)
+    _no_recompute(monkeypatch)
+
+    with m.app.test_client() as client:
+        page = client.get("/followups").get_data(as_text=True)
+    status, _, _ = _click("cc-0")
+
+    assert "Hi Joann," in page and "Hi Jhang" not in page and "got buried" not in page
+    assert status == 302 and calls[0]["custom_body"].startswith("Hi Joann,\n")
+
+
+def test_e_capture_no_longer_invents_a_name_from_the_address(monkeypatch):
+    """The source of every bad greeting: /e logged 'Squillen' as the contact's name."""
+    payloads = []
+    monkeypatch.setattr(m, "is_logged_person_contact", lambda email: False)
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda p, **kw: payloads.append(p) or True)
+    monkeypatch.setattr(m, "record_captured_contact", lambda **kw: None)
+
+    assert m.log_addressed_contact_to_carmen_cold("squillen@petsuppliesplus.com", company="Pet Supplies Plus")
+
+    assert payloads[0]["name"] == ""
 
 
 def test_open_followups_sent_lookup_over_the_cap_is_unchecked_not_partial(monkeypatch):

@@ -1093,6 +1093,29 @@ def test_sent_capture_takes_real_people_at_tracked_job_companies():
     assert pu.build_sent_contact("Jen <jen@mail.crain.com>", _SENT_CRM_COMPANIES)["company"] == "Crain Communications"
 
 
+def test_a_single_token_address_yields_no_name_rather_than_a_surname():
+    """'squillen@' is initial + surname; deriving 'Squillen' put "Hi Squillen," on her follow-up."""
+    for address in ("squillen@petsuppliesplus.com", "alarson@junipersquare.com", "jhang3@x.com"):
+        assert pu.name_from_email_local_part(address) == "", address
+    assert pu.name_from_email_local_part("eina.assali@affirm.com") == "Eina Assali"
+
+
+def test_is_email_derived_name_flags_only_the_old_local_part_guess():
+    assert pu.is_email_derived_name("Squillen", "squillen@petsuppliesplus.com")
+    assert pu.is_email_derived_name("Pat", "pat3@co3.com")
+    assert not pu.is_email_derived_name("Stefanie Quillen", "squillen@petsuppliesplus.com")
+    assert not pu.is_email_derived_name("Eina Assali", "eina.assali@affirm.com")
+    assert not pu.is_email_derived_name("", "squillen@petsuppliesplus.com")
+
+
+def test_greeting_name_from_body_reads_the_salutation_line_only():
+    assert pu.greeting_name_from_body("Hi Anna,\n\nI applied for...") == "Anna"
+    assert pu.greeting_name_from_body("\n  Hello joann,\nBody") == "Joann"
+    assert pu.greeting_name_from_body("Dear Stefanie:\n") == "Stefanie"
+    for body in ("Hi,\n\nI applied", "Hi there,\n", "Hi team,\n", "I applied for the role.\nHi Anna,", ""):
+        assert pu.greeting_name_from_body(body) == "", body
+
+
 def test_sent_capture_skips_everything_that_is_not_a_tracked_person():
     """Role mailboxes are the job pipeline's own targets and already exist as job rows; consumer
     and ATS domains carry no employer; an untracked company means the email was not job outreach."""
