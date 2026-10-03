@@ -1357,6 +1357,22 @@ def carmen_terminal_gap(ladder):
     return ladder[-1] + CARMEN_KILL_GRACE_DAYS
 
 
+def ladder_progress(anchor, today, total_days):
+    """(day, total) for "day 11 of 21": days since the ladder's anchor, against its full length.
+
+    Day is not clamped at total on purpose - a row reading "day 23 of 21" is overdue for its kill
+    and stuck, which is exactly what the label should expose. None when there is no anchor.
+    """
+    if anchor is None or not total_days:
+        return None
+    return max(0, (today - anchor).days), int(total_days)
+
+
+def format_ladder_progress(progress):
+    """'day 11 of 21', or '' when progress is None."""
+    return f"day {progress[0]} of {progress[1]}" if progress else ""
+
+
 # The engaged ladder's terminal gap, kept as a module constant because plan_carmen_ladder() uses
 # it as the widest gap any ladder can legitimately write - the bound on "this row is mid-ladder"
 # when deciding whether a stale anchor is a revival. Must stay the MAX across both ladders.

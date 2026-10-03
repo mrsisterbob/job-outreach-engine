@@ -31,6 +31,7 @@ from track_registry import (
 from response_schema import GeminiJobScreenerResponse
 from command_help import lookup_command_help
 from pipeline_utils import (
+    ladder_progress, format_ladder_progress, carmen_terminal_gap,
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
     resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
@@ -9419,6 +9420,9 @@ def run_followup_sequencer(today=None, dry_run=False):
                 # flag its real final rung.
                 "ladder_day": plan.ladder[attempt - 1] if attempt <= len(plan.ladder) else plan.ladder[-1],
                 "final_rung": attempt == len(plan.ladder),
+                # "day 11 of 21": the whole ladder, nudge plus kill grace, from the same anchor
+                # plan_carmen_ladder() just used - so the count restarts when a reply does.
+                "progress": ladder_progress(plan.anchor, today, carmen_terminal_gap(plan.ladder)),
                 "track": "engaged" if plan.replied else "cold",
                 "name": rec.get("name") or "",
                 # Recipient fields for the on-demand draft route (raw company, not the "N/A" label).
@@ -9512,6 +9516,7 @@ def run_followup_sequencer(today=None, dry_run=False):
                 "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
                 "attempt": attempt, "draft_text": build_followup_bump_draft(rec, attempt),
                 "sheet_tab": rec.get("sheet_tab"),
+                "progress": ladder_progress(anchor, today, FOLLOWUP_BURY_DAYS),
                 "name": rec.get("name") or "",
                 "next_followup": rec.get("next_followup") or "", "new_next_followup": new_nf,
                 "email": rec.get("email") or "", "company_raw": rec.get("company") or "",
@@ -9743,8 +9748,10 @@ def render_followup_needs_card(result, on_demand=False):
                     f"{BASE_URL}/followups/draft/{urllib.parse.quote(str(e['sheet_uuid']), safe='')}",
                     quote=True)
                 draft_link = f" · <a href='{draft_url}'>✉️</a>"
+            day_label = format_ladder_progress(e.get("progress"))
+            day_part = f" · <b>{html.escape(day_label)}</b>" if day_label else ""
             lines.append(
-                f"💼 <b>{who}</b> — {company} · #{html.escape(str(e.get('attempt', 1)))} · due {due} → {step}"
+                f"💼 <b>{who}</b> — {company}{day_part} · #{html.escape(str(e.get('attempt', 1)))} · due {due} → {step}"
                 f" · 🆔 <code>{html.escape(_seq_id_tag(e))}</code>{draft_link}"
             )
         # Draft text and the full per-person controls live on /followups - this card stays a
@@ -14126,9 +14133,11 @@ def followup_queue_view():
                            + html.escape(AUTOSEND_BLOCK_REASONS.get(e["autosend_block"], e["autosend_block"])))
             else:
                 verdict = "✋ Manual"
+            day_label = format_ladder_progress(e.get("progress"))
+            day_part = f"<b>{html.escape(day_label)}</b> · " if day_label else ""
             parts.append(
                 f"<h3 style='margin-top: 24px;'>{html.escape(who)} — {html.escape(company)}</h3>"
-                f"<p class='meta'>Follow-up #{html.escape(str(e.get('attempt', 1)))} · "
+                f"<p class='meta'>{day_part}Follow-up #{html.escape(str(e.get('attempt', 1)))} · "
                 f"due {html.escape(due)} → {html.escape(step)} · "
                 f"🆔 <code>{html.escape(_seq_id_tag(e))}</code><br>{verdict}</p>"
                 f'<textarea id="{field_id}" rows="10" style="width: 100%;" readonly>'

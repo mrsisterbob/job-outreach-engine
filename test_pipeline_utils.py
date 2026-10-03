@@ -2417,3 +2417,20 @@ def test_leads_messages_split_between_entries_and_stay_under_the_limit():
     assert all(len(m) <= 4096 for m in msgs)
     assert sum(m.count("<b>&amp;") for m in msgs) == 50  # no entry lost or cut in half
     assert all(m.count("<i>") == m.count("</i>") for m in msgs)
+
+
+# ---- ladder_progress / format_ladder_progress ("day 11 of 21") ----
+
+def test_ladder_progress_counts_days_since_the_anchor():
+    assert pu.ladder_progress(date(2026, 9, 22), date(2026, 10, 3), 21) == (11, 21)
+    assert pu.format_ladder_progress((11, 21)) == "day 11 of 21"
+
+
+def test_ladder_progress_past_the_end_is_not_clamped():
+    # A stuck row reading "day 23 of 21" is the signal, not a display bug.
+    assert pu.ladder_progress(date(2026, 9, 10), date(2026, 10, 3), 21) == (23, 21)
+
+
+def test_ladder_progress_without_an_anchor_renders_nothing():
+    assert pu.ladder_progress(None, date(2026, 10, 3), 21) is None
+    assert pu.format_ladder_progress(None) == ""

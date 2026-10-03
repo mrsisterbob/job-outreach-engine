@@ -1148,6 +1148,19 @@ def test_followups_page_renders_the_saved_run_read_only(monkeypatch):
     assert "Applications Going Quiet (1)" in page and "Acme0" in page
     assert 'href="/stage/sid-app0"' in page
     assert drafts == []
+    # "day N of 21" survives the snapshot's JSON round trip (the tuple comes back a list) and
+    # reads from the same anchor the ladder used: a contact on its first rung is day 4.
+    total = m.carmen_terminal_gap(m.CARMEN_LADDER_DAYS_COLD)
+    assert page.count(f"<b>day {m.CARMEN_LADDER_DAYS_COLD[0]} of {total}</b>") == 3
+
+
+def test_needs_card_shows_how_far_through_the_ladder_each_person_is(monkeypatch):
+    """The morning card carries the same "day N of 21" the queue page does, driven through the
+    real sequencer rather than a hand-built entry."""
+    _mock_followup_rows(monkeypatch, cc_rows=[_due_person(0)], jobs_rows=[])
+    card = m.render_followup_needs_card(m.run_followup_sequencer(today=_SEQ_TODAY, dry_run=True))
+    total = m.carmen_terminal_gap(m.CARMEN_LADDER_DAYS_COLD)
+    assert f"<b>Pat0</b> — Co0 · <b>day {m.CARMEN_LADDER_DAYS_COLD[0]} of {total}</b> · #1" in card
 
 
 def test_followups_page_with_an_empty_snapshot_is_a_clear_queue(monkeypatch):
