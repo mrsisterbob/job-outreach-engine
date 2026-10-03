@@ -1685,6 +1685,32 @@ def test_open_followups_pages_render_only_their_slice_and_reuse_the_list(monkeyp
     assert hrefs == [f"/followups/draft/cc-4?date={run_dates[4]}"]
 
 
+def test_owed_sends_one_link_per_page_and_the_links_skip_the_rescan(monkeypatch, capture_sent):
+    """One link for 68 people was a 19s page. /owed must hand out a link per 20, and since it
+    already did the scan, tapping one must not redo it - nor redo the greeting lookups."""
+    monkeypatch.setattr(m, "OPEN_FOLLOWUPS_PAGE_SIZE", 2)
+    _, _, live = _seed_skipped_mornings(monkeypatch)
+    _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live)
+    _gmail_names(monkeypatch)
+
+    _dispatch("/owed")
+
+    msg = capture_sent[0]
+    assert "<b>5 open follow-ups</b>" in msg
+    for p, label in ((1, "1–2"), (2, "3–4"), (3, "5–5")):
+        assert f"href='{m.BASE_URL}/followups/open?page={p}'>{label}</a>" in msg
+    # The prewarm cached every greeting: pat0..pat4 are email-derived names, so each was looked up.
+    assert {_owed_email(k) for k in range(5)} <= set(m._SENT_NAME_CACHE)
+
+    monkeypatch.setattr(m, "build_open_followups", lambda *a, **k: pytest.fail("page must use /owed's scan"))
+    monkeypatch.setattr(m.requests, "get", lambda *a, **k: pytest.fail("greetings must come from the cache"))
+    with m.app.test_client() as client:
+        page = client.get("/followups/open?page=2").get_data(as_text=True)
+    assert "— Co2</h3>" in page and "— Co3</h3>" in page and "Page 2 of 3" in page
+    assert "refresh=1" in page
+
+
 def test_open_followups_drops_the_nudged_the_replied_and_the_moved(monkeypatch):
     today, run_dates, live = _seed_skipped_mornings(monkeypatch)
     _owed_read_only(monkeypatch)

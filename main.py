@@ -12997,17 +12997,23 @@ def process_webhook_payload_async(data):
             return
 
         if text == "/owed":
-            # Count + one link, nothing else: the list lives on the page. Already off the webhook's
-            # request thread (one daemon thread per update), so the CRM + Gmail reads run inline.
+            # Count + one link per page of 20, nothing else: the list lives on the pages. Already
+            # off the webhook's request thread (one daemon thread per update), so the CRM + Gmail
+            # reads run inline.
             owed = build_open_followups()
             if not owed["crm_ok"]:
                 send_telegram_message(chat_id, "⚠️ CRM read failed - open follow-ups unknown.")
                 return
+            # The pages read this instead of rescanning - the scan alone measured ~19s live.
+            _OPEN_FOLLOWUPS_CACHE.update(owed=owed, at=datetime.now())
             lines = [f"<b>{_open_followups_count_label(len(owed['items']))}</b>",
-                     f"<a href='{BASE_URL}/followups/open'>Open list</a>"]
+                     " · ".join(_open_followups_page_links(len(owed["items"])))]
             if not owed["sent_checked"]:
                 lines.append("Gmail Sent not checked - may include people already nudged.")
             send_telegram_message(chat_id, "\n".join(lines))
+            # AFTER the reply, on this same thread: look up every greeting now, so each page link
+            # renders from the name cache instead of doing 20 people's Gmail reads on tap.
+            _prewarm_followup_names(owed["items"])
             return
 
         if text == "/outcomes":
@@ -14506,10 +14512,32 @@ def _open_followups_count_label(n):
 # greeting (rerender_followup_drafts), and the whole list at once - 68 people on 2026-10-03 - ran
 # the single gunicorn worker past its 120s timeout: a 502, with Telegram unanswered meanwhile.
 OPEN_FOLLOWUPS_PAGE_SIZE = 20
-# Pages 2+ reuse page 1's list for this long, so paging does not redo the CRM + Sent scan. Page 1
-# always reads fresh, so reloading it is how Kevin sees a send he just made drop off.
+# Every page reuses the last scan (from /owed or an earlier page) for this long, so a page tap does
+# not redo the CRM + Sent scan - that scan alone measured ~19s live on 2026-10-03. ?refresh=1 forces
+# a rescan, which is how Kevin sees a send he just made drop off.
 OPEN_FOLLOWUPS_CACHE_TTL = timedelta(minutes=10)
 _OPEN_FOLLOWUPS_CACHE = {"owed": None, "at": None}
+
+
+def _open_followups_page_links(total):
+    """One Telegram link per page: "1–20 · 21–40 · …", each opening its own slice."""
+    size = OPEN_FOLLOWUPS_PAGE_SIZE
+    pages = max(1, -(-total // size))
+    if total <= size:
+        return [f"<a href='{BASE_URL}/followups/open'>Open list</a>"]
+    return [f"<a href='{BASE_URL}/followups/open?page={p}'>{(p - 1) * size + 1}–{min(p * size, total)}</a>"
+            for p in range(1, pages + 1)]
+
+
+def _prewarm_followup_names(items):
+    """Resolve every item's greeting into _SENT_NAME_CACHE. Only rows whose CRM name is blank or
+    email-derived touch Gmail (resolve_bump_first_name decides). Never raises."""
+    records = [{"name": e.get("name") or "", "email": e.get("email") or ""} for e in items or []]
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(resolve_bump_first_name, records))
+    except Exception as e:
+        logging.error(f"[OWED] Name prewarm failed: {e}")
 
 
 def _open_followups_page_number():
@@ -14530,7 +14558,8 @@ def open_followups_view():
     title = "Open Follow-ups"
     page = _open_followups_page_number()
     cached, cached_at = _OPEN_FOLLOWUPS_CACHE["owed"], _OPEN_FOLLOWUPS_CACHE["at"]
-    if page > 1 and cached is not None and datetime.now() - cached_at < OPEN_FOLLOWUPS_CACHE_TTL:
+    refresh = request.args.get("refresh") == "1"
+    if not refresh and cached is not None and datetime.now() - cached_at < OPEN_FOLLOWUPS_CACHE_TTL:
         owed = cached
     else:
         owed = build_open_followups()
@@ -14553,14 +14582,17 @@ def open_followups_view():
     items = rerender_followup_drafts(
         [dict(e) for e in all_items[start:start + OPEN_FOLLOWUPS_PAGE_SIZE]])
     heading = _open_followups_count_label(len(all_items))
-    nav = ""
+    refresh_link = (f'<a class="btn btn-secondary" href="/followups/open?page={page}&refresh=1">↻ Refresh</a>')
+    as_of = (_OPEN_FOLLOWUPS_CACHE["at"] or datetime.now()).strftime("%H:%M")
+    nav = f"<div class='meta' style='margin: 12px 0;'>List as of {as_of} · {refresh_link}</div>"
     if pages > 1:
         links = [f"<b>{start + 1}–{start + len(items)}</b> of {len(all_items)}"]
         if page > 1:
             links.insert(0, f'<a class="btn btn-secondary" href="/followups/open?page={page - 1}">← Prev 20</a>')
         if page < pages:
             links.append(f'<a class="btn btn-primary" href="/followups/open?page={page + 1}">Next 20 →</a>')
-        nav = f"<div class='meta' style='margin: 12px 0;'>Page {page} of {pages} · {' '.join(links)}</div>"
+        nav = (f"<div class='meta' style='margin: 12px 0;'>Page {page} of {pages} · {' '.join(links)}"
+               f" · as of {as_of} · {refresh_link}</div>")
     parts = [
         f"<h2>{html.escape(heading)}</h2>",
         nav,
