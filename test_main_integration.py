@@ -53,7 +53,15 @@ def clean_tables():
     # Module-global name cache: a Sent lookup in one test must not answer for the next.
     m._SENT_NAME_CACHE.clear()
     m._OPEN_FOLLOWUPS_CACHE.update(owed=None, at=None)
+    m._OPEN_FOLLOWUPS_BUILD.update(running=False, error=None)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _inline_background_builds(monkeypatch):
+    """The open-follow-ups scan runs on a thread in production; inline here, so a page request
+    sees the finished build and no thread outlives the test's monkeypatches."""
+    monkeypatch.setattr(m, "_spawn_background", lambda fn: fn())
 
 
 def teardown_module(module):
@@ -1663,6 +1671,8 @@ def test_open_followups_pages_render_only_their_slice_and_reuse_the_list(monkeyp
     _live_crm(monkeypatch, live)
     _gmail_sent(monkeypatch)
     looked_up, builds = [], []
+    # The background prewarm resolves EVERY name by design; this test is about the page render.
+    monkeypatch.setattr(m, "_prewarm_followup_names", lambda items: None)
     monkeypatch.setattr(m, "first_name_from_sent_mail", lambda email: looked_up.append(email) or None)
     real_build = m.build_open_followups
     monkeypatch.setattr(m, "build_open_followups", lambda *a, **k: builds.append(1) or real_build(*a, **k))
@@ -1683,6 +1693,30 @@ def test_open_followups_pages_render_only_their_slice_and_reuse_the_list(monkeyp
     assert len(builds) == 1, "pages 2+ must reuse page 1's list"
     hrefs = re.findall(r'href="(/followups/draft/[^"]+)"', last)
     assert hrefs == [f"/followups/draft/cc-4?date={run_dates[4]}"]
+
+
+def test_open_followups_never_scans_on_the_request_thread(monkeypatch):
+    """One sync gunicorn worker: a page that scanned inline was killed mid-request (WORKER TIMEOUT)
+    and left Telegram unanswered. A cold page answers at once, builds in the background, reloads."""
+    _, _, live = _seed_skipped_mornings(monkeypatch)
+    _owed_read_only(monkeypatch)
+    _live_crm(monkeypatch, live)
+    _gmail_sent(monkeypatch)
+    spawned = []
+    monkeypatch.setattr(m, "_spawn_background", spawned.append)  # build queued, not run
+
+    with m.app.test_client() as client:
+        res = client.get("/followups/open")
+        again = client.get("/followups/open?page=2")
+    page = res.get_data(as_text=True)
+    assert res.status_code == 200 and "Building the list" in page and "location.replace" in page
+    assert again.status_code == 200
+    assert len(spawned) == 1, "a second request joins the running build"
+
+    spawned[0]()  # the background thread finishing
+    with m.app.test_client() as client:
+        done = client.get("/followups/open").get_data(as_text=True)
+    assert "5 open follow-ups" in done and "Building the list" not in done
 
 
 def test_owed_sends_one_link_per_page_and_the_links_skip_the_rescan(monkeypatch, capture_sent):

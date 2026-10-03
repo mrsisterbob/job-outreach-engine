@@ -14547,6 +14547,48 @@ def _open_followups_page_number():
         return 1
 
 
+_OPEN_FOLLOWUPS_BUILD_LOCK = threading.Lock()
+_OPEN_FOLLOWUPS_BUILD = {"running": False, "error": None}
+
+
+def _spawn_background(fn):
+    """Run fn on a daemon thread. A seam so tests can run it inline."""
+    threading.Thread(target=fn, daemon=True).start()
+
+
+def _build_open_followups_cache():
+    """The ~19s CRM + Sent scan, then the greeting prewarm, OFF the request thread.
+
+    gunicorn runs ONE sync worker. A page that scanned inline held it for the whole scan: Telegram
+    went unanswered meanwhile, and on 2026-10-03 the worker was killed mid-request (WORKER TIMEOUT
+    -> SIGKILL) three times in ten minutes. A CRM failure is recorded for the page to report once;
+    the old list is left in place rather than replaced with an empty one.
+    """
+    try:
+        owed = build_open_followups()
+        if owed["crm_ok"]:
+            _OPEN_FOLLOWUPS_CACHE.update(owed=owed, at=datetime.now())
+            _OPEN_FOLLOWUPS_BUILD["error"] = None
+            _prewarm_followup_names(owed["items"])
+        else:
+            _OPEN_FOLLOWUPS_BUILD["error"] = str(owed.get("crm_failed_tab") or "unknown tab")
+    except Exception as e:
+        logging.error(f"[OWED] Open follow-ups build failed: {e}")
+        _OPEN_FOLLOWUPS_BUILD["error"] = str(e)
+    finally:
+        with _OPEN_FOLLOWUPS_BUILD_LOCK:
+            _OPEN_FOLLOWUPS_BUILD["running"] = False
+
+
+def _start_open_followups_build():
+    """Kick off one background build; a second request while one runs joins it, not doubles it."""
+    with _OPEN_FOLLOWUPS_BUILD_LOCK:
+        if _OPEN_FOLLOWUPS_BUILD["running"]:
+            return
+        _OPEN_FOLLOWUPS_BUILD["running"] = True
+    _spawn_background(_build_open_followups_cache)
+
+
 @app.route("/followups/open", methods=["GET"])
 def open_followups_view():
     """/owed's target: every follow-up still owed across the saved queues, oldest-due first,
@@ -14557,21 +14599,34 @@ def open_followups_view():
     """
     title = "Open Follow-ups"
     page = _open_followups_page_number()
+    if request.args.get("refresh") == "1":
+        # Drop the old list so the reload below waits for the rescan instead of showing it again.
+        _OPEN_FOLLOWUPS_CACHE.update(owed=None, at=None)
     cached, cached_at = _OPEN_FOLLOWUPS_CACHE["owed"], _OPEN_FOLLOWUPS_CACHE["at"]
-    refresh = request.args.get("refresh") == "1"
-    if not refresh and cached is not None and datetime.now() - cached_at < OPEN_FOLLOWUPS_CACHE_TTL:
-        owed = cached
-    else:
-        owed = build_open_followups()
-        if owed["crm_ok"]:
-            _OPEN_FOLLOWUPS_CACHE.update(owed=owed, at=datetime.now())
-    if not owed["crm_ok"]:
-        # No count at all: a number here would read as real when the CRM said nothing.
+    if cached is None or datetime.now() - cached_at >= OPEN_FOLLOWUPS_CACHE_TTL:
+        # Never scan on the request thread - see _build_open_followups_cache().
+        _start_open_followups_build()
+        cached, cached_at = _OPEN_FOLLOWUPS_CACHE["owed"], _OPEN_FOLLOWUPS_CACHE["at"]
+    error = _OPEN_FOLLOWUPS_BUILD["error"]
+    if error and (cached is None or datetime.now() - cached_at >= OPEN_FOLLOWUPS_CACHE_TTL):
+        # Reported once; the next load retries. No count: a number here would read as real when
+        # the CRM said nothing.
+        _OPEN_FOLLOWUPS_BUILD["error"] = None
         return _followups_page(title, (
             f"<h2>{html.escape(title)}</h2>"
-            f"<p class='meta'>⚠️ Could not read the CRM ({html.escape(str(owed['crm_failed_tab']))}), so "
+            f"<p class='meta'>⚠️ Could not read the CRM ({html.escape(error)}), so "
             "the open follow-ups are unknown. Try again once the CRM is answering.</p>"
         )), 502
+    if cached is None or datetime.now() - cached_at >= OPEN_FOLLOWUPS_CACHE_TTL:
+        # Still building. The page answers instantly and reloads itself; the worker stays free.
+        back = f"/followups/open?page={page}"
+        return _followups_page(title, (
+            f"<h2>{html.escape(title)}</h2>"
+            "<p class='meta'>⏳ Building the list from the CRM and Gmail Sent - about 20 seconds. "
+            "This page reloads itself.</p>"
+            f"<script>setTimeout(function () {{ location.replace({json.dumps(back)}); }}, 5000);</script>"
+        )), 200
+    owed = cached
 
     all_items = owed["items"]
     pages = max(1, -(-len(all_items) // OPEN_FOLLOWUPS_PAGE_SIZE))
