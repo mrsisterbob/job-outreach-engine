@@ -8235,6 +8235,17 @@ class PermanentCRMRejection(Exception):
         super().__init__(f"CRM '{action}' permanently rejected: {message}")
 
 
+class CRMAuthRejected(Exception):
+    """Apps Script answered "Unauthorized": the shared secret does not match, so EVERY write is
+    refused until a human fixes the Render env var or the Script Property.
+
+    This is an outage of the whole channel, not a fault in one payload, so it must not spend that
+    payload's retry budget. On 2026-10-07 the secret broke at ~13:00; Kevin's /warm and /x at 15:38
+    each burned 10 retries in under a minute, went FAILED, and would never have replayed after the
+    fix - while the bot had already told him "Moved to Warm" and "Archived to Died".
+    """
+
+
 # Per-row outcomes from the most recent batch_add_rows, keyed by the uuid that was SENT.
 #
 # log_to_sheets_crm() returns a single bool for a whole batch, and nine callers depend on that
@@ -8309,7 +8320,8 @@ def crm_failure_alert_text(payload, attempts, reason=""):
     return " ".join(bits)
 
 
-def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on_exhaustion=True):
+def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on_exhaustion=True,
+                      raise_on_unauthorized=False):
     """Log to Google Sheets CRM. Payload may include row UUID and note timestamp.
     Support apps script bottom-to-top search loops via rowOperationOrder: 'DESC'.
 
@@ -8433,12 +8445,19 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on
                     logging.error(f"CRM '{action}' rejected by Apps Script: {message}")
                     last_failure = message or "rejected with no message"
                     if "unauthorized" in message.lower():
-                        send_health_alert(
-                            "CRM webhook is rejecting every write as Unauthorized - rows are NOT "
-                            "reaching the sheet. Set the CRM_SHARED_SECRET Script Property in the "
-                            "Apps Script project to match Render's CRM_SHARED_SECRET, then redeploy "
-                            "the web app (Deploy > Manage deployments > New version)."
-                        )
+                        # Hourly at most: the outbox now holds these writes and re-tries them every
+                        # pass until the secret is fixed, so an unthrottled alert would fire every 5s.
+                        if should_send_alert("crm_write_unauthorized", cooldown_hours=1):
+                            send_health_alert(
+                                "CRM webhook is rejecting every write as Unauthorized - rows are NOT "
+                                "reaching the sheet yet. They are HELD in the outbox and will land on "
+                                "their own once this is fixed. Set the CRM_SHARED_SECRET Script "
+                                "Property in the Apps Script project to match Render's "
+                                "CRM_SHARED_SECRET, then redeploy the web app (Deploy > Manage "
+                                "deployments > New version). /crazy shows what is waiting."
+                            )
+                        if raise_on_unauthorized:
+                            raise CRMAuthRejected(message)
                         return False
                     # A deterministic rejection will answer identically forever, so retrying it
                     # only burns the backoff and - via the outbox, which re-dispatches every 5s
@@ -8453,7 +8472,7 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on
                         # Default bool contract, for the callers that only branch on success:
                         # still stop retrying, since the answer cannot change.
                         return False
-        except PermanentCRMRejection:
+        except (PermanentCRMRejection, CRMAuthRejected):
             raise  # never retried, and never swallowed by the transient handler below
         except Exception as e:
             logging.error(f"CRM Webhook Attempt {attempt+1} Failed: {e}")
@@ -8510,10 +8529,21 @@ def _retry_crm_outbox_giveup_alerts():
             conn.execute("UPDATE crm_outbox SET status = 'FAILED' WHERE id = ?", (job_id,))
             conn.commit()
 
+_CRM_AUTH_BACKOFF_SECONDS = 60
+_CRM_AUTH_BACKOFF = {"until": 0.0}
+
+
 def process_crm_outbox_batch(inter_job_sleep=1.0):
     """One outbox drain pass (<=5 pending rows): dispatch each to Sheets, delete on success or bump
     retry_count/status on failure. Split out from crm_outbox_worker_loop so a single pass is unit-testable.
+
+    An "Unauthorized" answer is the exception to the retry budget: it means the secret is wrong
+    for every write, so the row is left exactly as it was (PENDING, retry_count untouched), the
+    pass stops, and the outbox waits _CRM_AUTH_BACKOFF_SECONDS before asking again. The queued
+    writes then land in their original order the moment the secret is fixed.
     """
+    if time.time() < _CRM_AUTH_BACKOFF["until"]:
+        return
     _retry_crm_outbox_giveup_alerts()
 
     with get_db_conn() as conn:
@@ -8531,8 +8561,16 @@ def process_crm_outbox_batch(inter_job_sleep=1.0):
         permanent = None
         try:
             success = log_to_sheets_crm(
-                payload, max_retries=1, raise_on_permanent=True, alert_on_exhaustion=False
+                payload, max_retries=1, raise_on_permanent=True, alert_on_exhaustion=False,
+                raise_on_unauthorized=True,
             )
+        except CRMAuthRejected:
+            logging.warning(
+                f"CRM Outbox holding payload #{job_id} and {len(pending_jobs) - 1} other(s): "
+                f"secret rejected, retrying in {_CRM_AUTH_BACKOFF_SECONDS}s without spending retries"
+            )
+            _CRM_AUTH_BACKOFF["until"] = time.time() + _CRM_AUTH_BACKOFF_SECONDS
+            return
         except PermanentCRMRejection as e:
             # Impossible to satisfy by retrying (e.g. the row's sheet_uuid is not in any tab), so
             # drop it instead of requeueing. Alert ONCE here rather than on all 10 retry passes.
@@ -12941,6 +12979,28 @@ def process_webhook_payload_async(data):
                 for (action, uuid8), v in sorted(tally.items())
             )
 
+            # The opposite of go: put writes that gave up back in line. For an outage that is now
+            # fixed - a broken secret, Sheets down - where the payloads were always valid and only
+            # the channel failed. Retry count resets so each gets a full budget again.
+            if arg == "retry":
+                try:
+                    with get_db_conn() as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        requeued = conn.execute(
+                            "UPDATE crm_outbox SET status = 'PENDING', retry_count = 0 "
+                            "WHERE status IN ('FAILED', 'FAILED_UNALERTED')"
+                        ).rowcount
+                        conn.commit()
+                except Exception as e:
+                    send_telegram_message(chat_id, f"⚠️ <b>/crazy retry failed:</b> {html.escape(str(e))}")
+                    return
+                _CRM_AUTH_BACKOFF["until"] = 0.0
+                send_telegram_message(chat_id, (
+                    f"🔁 <b>Re-queued {requeued} failed write(s).</b> They go to the sheet in their "
+                    "original order on the next outbox pass.\n\n"
+                    f"{summary}"))
+                return
+
             # Dry run by default: deleting queued CRM writes is not reversible, so the destructive
             # form is opt-in via an explicit argument, exactly like /unbury go.
             if arg not in ("go", "force"):
@@ -12948,7 +13008,8 @@ def process_webhook_payload_async(data):
                     f"🛑 <b>/crazy - {len(rows)} payload(s) stuck in the outbox</b>\n\n"
                     f"{summary}\n\n"
                     "These are being retried every 5s, and each failed pass fires a health alert.\n"
-                    "Nothing was deleted. Run <code>/crazy go</code> to clear the queue and stop the alerts."
+                    "Nothing was deleted. Run <code>/crazy go</code> to clear the queue and stop the alerts, "
+                    "or <code>/crazy retry</code> to send writes that gave up again once the cause is fixed."
                 ))
                 return
 
@@ -14278,7 +14339,7 @@ def process_webhook_payload_async(data):
                 "/efficiency - View Input to Interview Golden Ratio\n"
                 "/funnel - View pipeline conversion funnel\n"
                 "/unbury - Preview buried-listing cleanup (add 'go' to clear)\n"
-                "/crazy - Stop a CRM retry/alert storm (add 'go' to clear the outbox)\n"
+                "/crazy - Stop a CRM retry/alert storm (add 'go' to clear the outbox, 'retry' to resend failed writes)\n"
                 "/queries - Per-query yield: which search phrases earn their slot\n"
                 "/links - Dead job postings · <code>/links check</code> dry run · <code>/links go</code> retires\n"
                 "/linksx - Archive every dead-link row you applied to straight to Died\n"

@@ -11684,3 +11684,96 @@ def test_refs_add_with_a_bad_email_saves_nothing(monkeypatch):
     assert "Email looks wrong" in sent[-1]
     assert sheet_writes == []
     assert m.get_filter(pipeline_utils.REFERENCES_FILTER_KEY) is None
+
+
+# ==============================================================================
+# Outbox under a broken CRM secret: hold the writes, do not burn them
+# ==============================================================================
+
+def _crm_answers(monkeypatch, body):
+    """Point the REAL log_to_sheets_crm at a webhook that answers 200 with `body`, the way Apps
+    Script answers everything - including its own Unauthorized."""
+    class _Resp:
+        status_code = 200
+        text = json.dumps(body)
+        def json(self):
+            return body
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _Resp())
+    monkeypatch.setattr(m.time, "sleep", lambda *_a, **_k: None)
+
+
+def _outbox_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT retry_count, status FROM crm_outbox ORDER BY id").fetchall()
+
+
+@pytest.fixture
+def _auth_reset():
+    m._CRM_AUTH_BACKOFF["until"] = 0.0
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'crm_write_unauthorized'")
+        conn.commit()
+    yield
+    m._CRM_AUTH_BACKOFF["until"] = 0.0
+
+
+def test_a_broken_secret_holds_writes_and_they_land_once_it_is_fixed(monkeypatch, _auth_reset):
+    """2026-10-07: the secret broke around 13:00, Kevin's /warm and /x at 15:38 each burned 10
+    retries inside a minute and went FAILED - never to replay - while the bot had already said
+    "Moved to Warm". Drives the real outbox pass and the real log_to_sheets_crm through 15 passes
+    of Unauthorized, then fixes the secret and checks the same writes reach the sheet."""
+    alerts = _capture_alerts(monkeypatch)
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "u-sun", "new_tab": "Tetiana Warm"})
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "u-apex", "new_tab": "Died"})
+
+    _crm_answers(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    for _ in range(15):
+        m._CRM_AUTH_BACKOFF["until"] = 0.0  # skip the 60s wait between passes
+        m.process_crm_outbox_batch(inter_job_sleep=0)
+    assert _outbox_rows() == [(0, "PENDING"), (0, "PENDING")], "an auth outage spent the retry budget"
+    assert len([a for a in alerts if "Unauthorized" in a]) == 1, "the held writes re-alerted every pass"
+
+    _crm_answers(monkeypatch, {"status": "success"})
+    m._CRM_AUTH_BACKOFF["until"] = 0.0
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+    assert _outbox_rows() == [], "the held writes did not land after the secret was fixed"
+
+
+def test_an_auth_rejection_backs_off_instead_of_hammering_apps_script(monkeypatch, _auth_reset):
+    _capture_alerts(monkeypatch)
+    calls = []
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"status": "error", "message": "Unauthorized"}
+    monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "https://script.google.com/fake")
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: calls.append(payload) or _Resp())
+    monkeypatch.setattr(m.time, "sleep", lambda *_a, **_k: None)
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "a"})
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "b"})
+
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+    m.process_crm_outbox_batch(inter_job_sleep=0)  # inside the 60s back-off
+    assert len(calls) == 1, "one rejected secret should stop the pass and pause the next one"
+
+
+def test_crazy_retry_requeues_writes_that_already_gave_up(monkeypatch, _auth_reset):
+    """The rows lost before this fix shipped are FAILED on Render's disk. /crazy retry is how
+    they come back once the secret is right."""
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO crm_outbox (payload_json, status, retry_count) VALUES (?, 'FAILED', 10)",
+                     ('{"action": "update_status", "sheet_uuid": "u-sun"}',))
+        conn.execute("INSERT INTO crm_outbox (payload_json, status, retry_count) VALUES (?, 'FAILED_UNALERTED', 10)",
+                     ('{"action": "update_status", "sheet_uuid": "u-apex"}',))
+        conn.commit()
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+
+    _dispatch("/crazy retry")
+    assert "Re-queued 2" in sent[-1]
+    assert _outbox_rows() == [(0, "PENDING"), (0, "PENDING")]
+
+    _crm_answers(monkeypatch, {"status": "success"})
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+    assert _outbox_rows() == []
