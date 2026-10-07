@@ -4668,7 +4668,11 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
     pool_key = TRACK_BULLET_POOL_KEYS.get(track_key, TRACK_BULLET_POOL_KEYS["a"])
 
     clean_company = clean_company_for_copy(company)
-    role = job_title or "this role"
+    # The CRM Role column carries board noise - "Customer Site Service Rep (CSSR I), Wayne, MI" -
+    # and the opener then appends job_location, so a real letter read "...(CSSR I), Wayne, MI
+    # position at Surventis in Southfield, Michigan": two cities in one sentence. Same cleaner the
+    # outreach emails use; fall back to the raw title only if cleaning leaves nothing.
+    role = sanitize_job_title(job_title) or job_title or "this role"
 
     idx = letter_index if isinstance(letter_index, int) and letter_index >= 0 else 0
 

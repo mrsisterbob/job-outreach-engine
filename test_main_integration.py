@@ -385,15 +385,20 @@ def test_died_suppression_survives_a_sheets_outage_that_clears_the_live_set(monk
 
 
 def _seed_dead_link(sheet_uuid, company, role, status, retired=0):
-    """One row in job_link_status as the nightly sweep records it."""
+    """One row in job_link_status as the nightly sweep records it.
+
+    first_dead_at is CURRENT_TIMESTAMP (UTC), exactly as the sweep writes it. A bare local
+    date.today() sorts before the UTC 24h cutoff from 8pm Eastern onward, so /linksx went red
+    every evening and green again at midnight.
+    """
     with m.get_db_conn() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO job_link_status "
             "(sheet_uuid, company, role, job_link, status, verdict, reason, retired, notified, "
             " first_dead_at) "
-            "VALUES (?, ?, ?, ?, ?, 'dead', 'page says no longer available', ?, 0, ?)",
-            (sheet_uuid, company, role, "https://example.com/job", status, retired,
-             date.today().isoformat()))
+            "VALUES (?, ?, ?, ?, ?, 'dead', 'page says no longer available', ?, 0, "
+            " CURRENT_TIMESTAMP)",
+            (sheet_uuid, company, role, "https://example.com/job", status, retired))
         conn.commit()
 
 
@@ -5321,6 +5326,65 @@ def test_cover_letter_paragraphs_vary_sentence_length():
             if len(lens) < 3:
                 continue
             assert max(lens) - min(lens) >= 8, f"{key}[{i}] sentence lengths too uniform: {lens}"
+
+
+def test_cover_letter_bank_is_positive_only():
+    """Kevin, 2026-10-06: negative language gets an application kicked on sight. The bank used to
+    concede on purpose ("I haven't worked a transportation network", "I'm not applying as a
+    software engineer"), and a Surventis letter shipped opening paragraph 2 that way. Every banked
+    entry is checked, not just the routed ones, because Gemini can route to any index."""
+    bank = m.load_cover_letter_templates()
+    offenders = []
+    for key, pool in bank.items():
+        if key.startswith("_"):
+            continue
+        for i, entry in enumerate(pool):
+            hits = pipeline_utils.negative_language_hits(entry)
+            if hits:
+                offenders.append(f"{key}[{i}] {hits}")
+    assert offenders == [], "negative language in the letter bank:\n" + "\n".join(offenders)
+
+
+def test_every_rendered_letter_is_positive_only():
+    """The rendered letter, not just the bank: the frame and the fill-ins are part of what a
+    recruiter reads, so the whole string is screened for every routed combination."""
+    for track, tone, idx in _all_letter_combos():
+        letter = m.generate_cover_letter("Rivian", "Operations Analyst", track, idx, "Detroit, MI", tone)
+        assert pipeline_utils.negative_language_hits(letter) == [], f"track={track} tone={tone} idx={idx}"
+
+
+def test_negative_language_hits_flags_concessions_and_passes_work_descriptions():
+    """Pins what the gate means. Kevin describing a problem he FIXED is positive; Kevin
+    describing himself by what he lacks is not."""
+    flagged = [
+        "Most of my analysis has been part of an operations role, not a dedicated analyst seat.",
+        "I haven't worked a transportation network.",
+        "I'd rather say so plainly than let a job title do it for me.",
+        "I'd be the least formally trained person on the team.",
+        "Chasing it was tedious.",
+    ]
+    for text in flagged:
+        assert pipeline_utils.negative_language_hits(text), text
+    clean = [
+        "I resolved each mismatch before it reached anyone else.",
+        "Most transfer issues come down to one missing signature.",
+        "I know how much that accuracy matters to the wider business.",
+    ]
+    for text in clean:
+        assert pipeline_utils.negative_language_hits(text) == [], text
+
+
+def test_letter_drops_the_city_the_crm_baked_into_the_role():
+    """The shipped Surventis letter read "...(CSSR I), Wayne, MI position at Surventis in
+    Southfield, Michigan", because the CRM Role column carried the posting's city and the opener
+    then appended job_location. Driven through resolve_letter_for_job - the function /letter, /e
+    and /eh all render through - with the job dict shaped the way the cache hands it over."""
+    job = {"job_title": "Customer Site Service Rep (CSSR I), Wayne, MI", "track": "f",
+           "bullet_indices": [0], "job_city": "Southfield", "job_state": "Michigan",
+           "tone_mode": "conservative"}
+    letter, _track = m.resolve_letter_for_job(job, {}, "Surventis")
+    assert "Wayne" not in letter
+    assert "Customer Site Service Rep (CSSR I) position at Surventis in Southfield, Michigan." in letter
 
 
 # ==============================================================================

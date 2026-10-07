@@ -37,9 +37,9 @@ Everything in this skill exists to reproduce its register.
 
 Why it works, in priority order:
 
-1. **It leads with adjacency, not expertise.** "I sit on the same floor as our billing
-   department" concedes he has not run billing. That concession is what makes the rest
-   credible. Ninety percent of the value is here.
+1. **It leads with adjacency, stated positively.** "I sit on the same floor as our billing
+   department" says what he HAS seen, and lets the reader infer the rest. It never says what he
+   has not done. Ninety percent of the value is here.
 2. **One claim per sentence.** No sentence carries three tools and a metric.
 3. **It explains rather than asserts.** "I understand the mechanics behind reconciling accounts"
    beats "Expert in account reconciliation."
@@ -54,18 +54,24 @@ imposes. When they conflict, the lower number wins.
 
 **Structure and stance**
 
-1. **Concede before you claim.** Lead with what you have *not* done, then what you have seen from
-   next to it. "I sit on the same floor as our billing department" earns every sentence after it.
-   A letter that opens by asserting expertise has nothing left to prove and reads like everyone
-   else's.
+1. **Positive language only. Lead with adjacency, never with the gap.** Kevin, 2026-10-06: a
+   negative phrase ("not a dedicated analyst seat", "I haven't worked a transportation network")
+   gets an application kicked on sight. So never name what he has not done. State the most
+   relevant real work ("I sit on the same floor as our billing department"), then close on
+   readiness ("I'm excited to learn your operation"). No not/never/n't/rather/instead/only, and no
+   self-deprecation (tedious, least, gap, honest, pretend). `negative_language_hits()` in
+   `pipeline_utils.py` is the gate, and `test_cover_letter_bank_is_positive_only` runs it over
+   every entry. Describing a problem he FIXED ("resolved each mismatch") is fine.
 2. **Explain the mechanism, don't assert the skill.** "I understand the mechanics behind
    reconciling accounts and ensuring data parity before invoices go out" shows the knowledge.
    "Expert in reconciliation" only claims it. Anyone can claim.
 3. **Say why you want it, not just that you can do it.** "I am looking to bring this background
    directly into a dedicated billing role" tells them this is a deliberate move. Ambition that
    names its direction is more credible than enthusiasm.
-4. **Write slightly under your level.** These are 1-3 year postings. Sounding like you have
-   already mastered the job reads as either a lie or as someone who will leave in six months.
+4. **Write slightly under your level, through ambition, not apology.** These are 1-3 year
+   postings. Sounding like you have already mastered the job reads as either a lie or as someone
+   who will leave in six months. Express it as wanting to grow into the work ("I'm looking to
+   bring this into a dedicated role"), never as a shortcoming.
 5. **One concrete anchor per paragraph, and make it physical.** A floor, a desk, a queue, a
    morning. "I sit on the same floor" beats "I have exposure to billing operations" because a
    reader can picture it.
@@ -114,7 +120,9 @@ imposes. When they conflict, the lower number wins.
     are used by every track. A word like "billing" or "invoice" belongs in a track pool or behind
     the title gate in `generate_cover_letter()`.
 
-Rules 6, 7, 10, 17, 18, 19 and 20 are enforced by tests. The rest are judgment, which is why
+Rules 1 (positive-only), 6, 7, 10, 17, 18, 19 and 20 are enforced by tests. The job title is
+cleaned with `sanitize_job_title()` before it is interpolated, so a CRM Role like "Rep (CSSR I),
+Wayne, MI" renders as "Rep (CSSR I)". The rest are judgment, which is why
 step 4 of the workflow below is reading the letter aloud.
 
 ## How the file is structured

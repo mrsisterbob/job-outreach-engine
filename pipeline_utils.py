@@ -498,6 +498,33 @@ _CONTRACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Candidate-facing copy that is screened before a person reads it - cover letters, application
+# screener answers - is positive-only. Kevin, 2026-10-06: a phrase like "not a dedicated analyst
+# seat" gets an application kicked on sight, and the old letter bank opened paragraph 2 with "I
+# haven't worked a transportation network". So: no negation, no contrastive hedge ("rather than",
+# "instead of", "only"), and no self-deprecation ("tedious", "least formally trained"). A gap is
+# answered with the most relevant real work plus readiness, never by naming the gap.
+_NEGATIVE_LANGUAGE_RE = re.compile(
+    r"\b(?:not|no|never|nobody|nothing|none|nor|neither|without|cannot|instead|rather|only|"
+    r"least|gaps?|limit(?:s|ed|ation)?|fail\w*|pretend\w*|overstat\w*|scratch|unglamorous|"
+    r"tedious|dull|annoy\w*|impatien\w*|liability|warning|mistakes?|wrong|trouble|merely|"
+    r"honest(?:ly)?|admit\w*|closest)\b"
+    r"|\b\w+n['’]t\b",
+    re.IGNORECASE,
+)
+
+
+def negative_language_hits(text):
+    """Every negative or self-undercutting word in `text`, in order; empty when it is all positive.
+
+    The gate for cover letter bank copy (enforced over every pool by the suite) and the check to
+    run on any screener answer before it is handed over. Describing the work is fine - "resolved
+    each mismatch", "a missing signature" - because those are the problems Kevin fixed. What is
+    flagged is Kevin describing HIMSELF negatively or conceding what he has not done.
+    """
+    return [m.group(0) for m in _NEGATIVE_LANGUAGE_RE.finditer(str(text or ""))]
+
+
 # Raised from 75 to 100 deliberately. The deferential register used for senior contacts -
 # naming the application, crediting the recipient's vantage point, then asking - does not fit in
 # 75 words, and the hand-written email this bank is modeled on runs 79. The cap exists to stop a
