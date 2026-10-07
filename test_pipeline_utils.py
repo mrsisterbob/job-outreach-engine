@@ -2586,3 +2586,48 @@ def test_open_followups_skips_quiet_apps_missing_uuid_and_falls_back_on_sentinel
         snaps, _of_live("uuid-5", "uuid-6", "uuid-7"), {}, _OF_TODAY)
     assert [x["sheet_uuid"] for x in items] == ["uuid-6"]
     assert items[0]["due"] == "2026-09-30"
+
+
+# ==============================================================================
+# /refs - job application references
+# ==============================================================================
+
+def test_parse_reference_reads_every_pipe_field():
+    ref, err = pu.parse_reference_args(
+        " Dana Reed | dana@acme.com | 313-555-0100 | personal | 2 | Acme | Detroit, Michigan ")
+    assert err is None
+    assert ref == {"name": "Dana Reed", "email": "dana@acme.com", "phone": "313-555-0100",
+                   "kind": "Personal", "years": "2", "org": "Acme", "city": "Detroit, Michigan"}
+
+
+def test_parse_reference_defaults_kind_to_work_and_optional_fields_to_blank():
+    ref, err = pu.parse_reference_args("Dana Reed | dana@acme.com | +1 313 555 0100")
+    assert err is None
+    assert ref["kind"] == "Work" and ref["years"] == "" and ref["org"] == "" and ref["city"] == ""
+
+
+@pytest.mark.parametrize("raw,fragment", [
+    ("| dana@acme.com | 313-555-0100", "Name"),
+    ("Dana Reed | dana-at-acme | 313-555-0100", "Email"),
+    ("Dana Reed | dana@acme.com | 555-0100", "Phone"),
+    ("a | b@c.de | 3135550100 | Work | 1 | x | y | z", "Too many"),
+])
+def test_parse_reference_rejects_what_a_form_would_reject(raw, fragment):
+    """Every form Kevin has hit marks name, email and phone required - a reference saved without
+    one is a reference he cannot use, so it is refused at /refs add rather than at the form."""
+    ref, err = pu.parse_reference_args(raw)
+    assert ref is None and fragment in err
+
+
+def test_references_card_puts_each_field_in_its_own_copy_span_and_escapes():
+    card = pu.format_references_card([
+        {"name": "Dana <Reed>", "email": "dana@acme.com", "phone": "313-555-0100",
+         "kind": "Work", "years": "1", "org": "A&B", "city": ""}])
+    assert "<code>Dana &lt;Reed&gt;</code>" in card
+    assert "<code>dana@acme.com</code>" in card and "<code>313-555-0100</code>" in card
+    assert "A&amp;B" in card and "1 yr" in card and "1 yrs" not in card
+
+
+def test_references_card_with_nothing_saved_says_how_to_add():
+    card = pu.format_references_card([])
+    assert "No references saved" in card and "/refs add" in card

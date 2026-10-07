@@ -11611,3 +11611,76 @@ def test_leads_command_on_an_empty_store(leads_env, monkeypatch):
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
     m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/leads"}})
     assert sent == ["📥 <b>Leads</b>\n\nNo leads received yet."]
+
+
+# ==============================================================================
+# /refs - job application references
+# ==============================================================================
+
+def _refs_env(monkeypatch):
+    """Clean slate for the references row, plus capture of what /refs writes to System_Config.
+    search_filters is not truncated by clean_tables, so the row is removed here."""
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM search_filters WHERE key = ?", (pipeline_utils.REFERENCES_FILTER_KEY,))
+        conn.commit()
+    sent, sheet_writes = [], []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: sheet_writes.append(payload))
+    return sent, sheet_writes
+
+
+def test_refs_add_then_refs_reads_it_back(monkeypatch):
+    sent, _ = _refs_env(monkeypatch)
+    _dispatch("/refs add Dana Reed | dana@acme.com | 313-555-0100 | Work | 2 | Acme | Detroit, Michigan")
+    _dispatch("/refs")
+    assert "<code>dana@acme.com</code>" in sent[-1]
+    assert "<code>313-555-0100</code>" in sent[-1]
+    assert "Acme" in sent[-1] and "Detroit, Michigan" in sent[-1]
+
+
+def test_refs_survive_a_redeploy_that_wipes_the_disk(monkeypatch):
+    """Render's disk is not durable across a fresh deploy, and the references are deliberately
+    absent from the repo. So the System_Config row /refs writes IS the copy that matters. Feed
+    exactly that written value back through the boot-time hydration path, with the local row
+    gone, and /refs must still print it."""
+    sent, sheet_writes = _refs_env(monkeypatch)
+    _dispatch("/refs add Dana Reed | dana@acme.com | 313-555-0100")
+    written = [p for p in sheet_writes if p.get("action") == "update_system_config"
+               and p.get("key") == pipeline_utils.REFERENCES_FILTER_KEY]
+    assert written, "/refs add never reached the System_Config sheet"
+
+    with m.get_db_conn() as conn:  # the redeploy
+        conn.execute("DELETE FROM search_filters WHERE key = ?", (pipeline_utils.REFERENCES_FILTER_KEY,))
+        conn.commit()
+
+    class _SheetResp:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"filters": {pipeline_utils.REFERENCES_FILTER_KEY: written[-1]["value"]}}
+    monkeypatch.setattr(m, "crm_get", lambda params, **kw: _SheetResp())
+    m.hydrate_filters_from_sheets()
+
+    _dispatch("/refs")
+    assert "<code>dana@acme.com</code>" in sent[-1]
+
+
+def test_refs_add_with_the_same_name_replaces_and_remove_drops_by_number(monkeypatch):
+    sent, _ = _refs_env(monkeypatch)
+    _dispatch("/refs add Dana Reed | dana@acme.com | 313-555-0100")
+    _dispatch("/refs add Lee Park | lee@acme.com | 313-555-0101")
+    _dispatch("/refs add dana reed | dana@newco.com | 313-555-0199")  # corrected details
+    _dispatch("/refs")
+    assert "dana@acme.com" not in sent[-1] and "dana@newco.com" in sent[-1]
+    assert "References (2)" in sent[-1]
+
+    _dispatch("/refs remove 1")  # Lee is #1 now - the corrected Dana was re-appended
+    assert "lee@acme.com" not in sent[-1] and "dana@newco.com" in sent[-1]
+
+
+def test_refs_add_with_a_bad_email_saves_nothing(monkeypatch):
+    sent, sheet_writes = _refs_env(monkeypatch)
+    _dispatch("/refs add Dana Reed | not-an-email | 313-555-0100")
+    assert "Email looks wrong" in sent[-1]
+    assert sheet_writes == []
+    assert m.get_filter(pipeline_utils.REFERENCES_FILTER_KEY) is None

@@ -2735,3 +2735,65 @@ def format_leads_messages(rows, limit, max_chars=4096):
             current += "\n\n" + entry
     messages.append(current)
     return messages
+
+
+# ==============================================================================
+# /refs - job application references
+# ==============================================================================
+# Third parties' phone numbers, so they never live in the repo (public on GitHub) or in
+# evidence_bank.json (shipped to Gemini by build_evidence_context_block). main.py keeps them in
+# the private System_Config sheet under REFERENCES_FILTER_KEY via set_filter(); these two
+# functions are the pure halves either side of that storage.
+REFERENCES_FILTER_KEY = "job_references"
+REFERENCE_FIELDS = ("name", "email", "phone", "kind", "years", "org", "city")
+REFERENCES_ADD_USAGE = "/refs add Name | email | phone | Work | years | Org | City"
+
+
+def parse_reference_args(raw):
+    """`Name | email | phone | Work | years | Org | City` -> (reference dict, None) or (None, error).
+
+    Pipe-separated because names, orgs and cities all contain spaces and commas ("Detroit,
+    Michigan"). Name, email and phone are required, since every application form marks them so.
+    The rest are optional and default to "" except kind, which defaults to "Work" - the answer on
+    every form Kevin has filled so far. A kind of "personal" in any case is normalized to
+    "Personal"; anything else is "Work", so a typo can never leave the dropdown answer blank.
+    """
+    parts = [p.strip() for p in str(raw or "").split("|")]
+    parts += [""] * (len(REFERENCE_FIELDS) - len(parts))
+    if len(parts) > len(REFERENCE_FIELDS):
+        return None, f"Too many fields - expected at most {len(REFERENCE_FIELDS)}."
+    ref = dict(zip(REFERENCE_FIELDS, parts))
+    if not ref["name"]:
+        return None, "Name is required."
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", ref["email"]):
+        return None, f"Email looks wrong: {ref['email'] or '(blank)'}"
+    if len(re.sub(r"\D", "", ref["phone"])) < 10:
+        return None, f"Phone needs at least 10 digits: {ref['phone'] or '(blank)'}"
+    ref["kind"] = "Personal" if ref["kind"].lower().startswith("personal") else "Work"
+    return ref, None
+
+
+def format_references_card(refs):
+    """The /refs reply: one block per reference, every form field in its own <code> span so a
+    tap copies exactly that value into the form. Empty optional fields are skipped rather than
+    printed as blanks."""
+    refs = [r for r in (refs or []) if isinstance(r, dict) and r.get("name")]
+    if not refs:
+        return ("📇 <b>No references saved.</b>\n"
+                f"Add one:\n<code>{html.escape(REFERENCES_ADD_USAGE)}</code>")
+    blocks = [f"📇 <b>References ({len(refs)})</b> <i>- tap any value to copy</i>"]
+    for i, r in enumerate(refs, 1):
+        esc = lambda k: html.escape(str(r.get(k) or ""))
+        head = f"<b>{i}. {esc('name')}</b>" + (f" · {esc('org')}" if r.get("org") else "")
+        lines = [head, f"<code>{esc('name')}</code>", f"<code>{esc('email')}</code>",
+                 f"<code>{esc('phone')}</code>"]
+        detail = [esc("kind") or "Work"]
+        if r.get("years"):
+            detail.append(f"{esc('years')} yr" + ("" if str(r.get("years")).strip() == "1" else "s"))
+        if r.get("city"):
+            detail.append(esc("city"))
+        lines.append(" · ".join(detail))
+        blocks.append("\n".join(lines))
+    blocks.append(f"<i>Add: <code>{html.escape(REFERENCES_ADD_USAGE)}</code>\n"
+                  "Remove: <code>/refs remove 2</code></i>")
+    return "\n\n".join(blocks)

@@ -44,6 +44,12 @@ HELP = {
         "Compiles the tailored resume PDF for this card. /resume does the same thing.",
         "reply /cv to a job card\n-> PDF with the track's bullets",
     ),
+    "/refs": (
+        "Prints your saved references with every field tap-to-copy, for the References section "
+        "of an application form. Kept in the private CRM sheet, never in the code.",
+        "/refs\n/refs add Dana Reed | dana@acme.com | 313-555-0100 | Work | 2 | Acme | Detroit, Michigan\n"
+        "/refs remove 2",
+    ),
 
     # ---- Pulling work in ----
     "/t": (

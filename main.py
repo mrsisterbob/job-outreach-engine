@@ -63,6 +63,7 @@ from pipeline_utils import (
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
     REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
     validate_lead, format_leads_messages,
+    parse_reference_args, format_references_card, REFERENCES_FILTER_KEY, REFERENCES_ADD_USAGE,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -13065,6 +13066,38 @@ def process_webhook_payload_async(data):
             send_overdue_digest(chat_id, get_overdue_followups(), limit=None)
             return
 
+        if text == "/refs" or text.startswith("/refs "):
+            # Application-form references. Stored with set_filter, which writes SQLite AND the
+            # private System_Config sheet row, so a Render redeploy that wipes the disk gets them
+            # back from hydrate_filters_from_sheets() on boot. Never the repo, never the evidence
+            # bank - see the note above REFERENCES_FILTER_KEY in pipeline_utils.py.
+            refs = [r for r in safe_list(get_filter(REFERENCES_FILTER_KEY, [])) if isinstance(r, dict)]
+            arg = text[len("/refs"):].strip()
+            if arg.lower().startswith("add"):
+                ref, err = parse_reference_args(arg[3:])
+                if err:
+                    send_telegram_message(chat_id, (
+                        f"⚠️ {html.escape(err)}\n<code>{html.escape(REFERENCES_ADD_USAGE)}</code>"))
+                    return
+                # Same name replaces rather than duplicates, so a corrected phone is one command.
+                refs = [r for r in refs if str(r.get("name", "")).lower() != ref["name"].lower()]
+                refs.append(ref)
+                set_filter(REFERENCES_FILTER_KEY, refs)
+            elif arg.lower().startswith("remove"):
+                n = safe_int(arg[len("remove"):].strip(), 0)
+                if not 1 <= n <= len(refs):
+                    send_telegram_message(chat_id, f"⚠️ No reference #{n}. You have {len(refs)}.")
+                    return
+                refs.pop(n - 1)
+                set_filter(REFERENCES_FILTER_KEY, refs)
+            elif arg:
+                send_telegram_message(chat_id, (
+                    "⚠️ Use <code>/refs</code>, <code>/refs add ...</code> or "
+                    "<code>/refs remove N</code>."))
+                return
+            send_telegram_message(chat_id, format_references_card(refs))
+            return
+
         if text in ("/owedx", "/owedx undo"):
             # Dismiss, never kill: nothing is written to the CRM. Each contact simply stops showing
             # on /owed, the morning card, /followups, /overdue and auto-send until they reply.
@@ -14225,6 +14258,7 @@ def process_webhook_payload_async(data):
                 "/prep - Interview talking points & reverse questions\n"
                 "/pitch - 30-second elevator pitch\n"
                 "/letter - Cover letter (same track as the resume)\n"
+                "/refs - Your references, tap-to-copy for application forms (/refs add, /refs remove)\n"
                 "/gear - Search breadth 1-5 (one dial for all sources)\n"
                 "/ats - Company board watchlist (on/off/add/remove)\n"
                 "/remote - Keyless remote feeds (on/off)\n"
