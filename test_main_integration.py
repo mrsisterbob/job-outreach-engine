@@ -6230,6 +6230,14 @@ def test_strict_filter_rejects_an_aggregator_relist_at_the_gate(monkeypatch):
     assert trace2.reasons.get("aggregator_link") is None
 
 
+def test_parked_a2zcareers_subdomain_posing_as_ups_is_a_relist():
+    """A 'ups.' subdomain of a parked for-sale domain scored 100 as a UPS role on 2026-10-08.
+    The subdomain is the disguise, so the match has to be on the registrable domain."""
+    assert m.is_aggregator_relist("https://ups.a2zcareers.com/jobs/supply-chain-analyst")
+    assert m.is_aggregator_relist("https://a2zcareers.com/x")
+    assert not m.is_aggregator_relist("https://www.jobs-ups.com/job/brownstown/supply-chain-analyst")
+
+
 def test_hard_ban_keywords_reject_commission_pay_not_commission_reporting(monkeypatch):
     """Bare "commission" used to reject ops roles that merely report on commissions. Uses the shipped
     defaults so a regression in DEFAULT_SEARCH_FILTERS itself is caught."""

@@ -4812,7 +4812,10 @@ def _passes_remote_filter(job):
 AGGREGATOR_RELIST_DOMAINS = tuple(d.strip().lower() for d in os.environ.get(
     "AGGREGATOR_RELIST_DOMAINS",
     "learn4good.com,jobrapido.com,jobs2careers.com,neuvoo.com,talent.com,"
-    "trabajo.org,whatjobs.com,jobsora.com,jobilize.com,careerjet.com"
+    "trabajo.org,whatjobs.com,jobsora.com,jobilize.com,careerjet.com,"
+    # a2zcareers.com is a parked for-sale domain; its "ups." subdomain served a 100-scored
+    # "Supply Chain Analyst Opening | Hiring" card on 2026-10-08 with no valid TLS cert.
+    "a2zcareers.com"
 ).split(",") if d.strip())
 
 
