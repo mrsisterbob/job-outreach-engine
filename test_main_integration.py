@@ -11785,3 +11785,161 @@ def test_crazy_retry_requeues_writes_that_already_gave_up(monkeypatch, _auth_res
     _crm_answers(monkeypatch, {"status": "success"})
     m.process_crm_outbox_batch(inter_job_sleep=0)
     assert _outbox_rows() == []
+
+
+# ---- /track: re-route a card's resume track ----
+
+_TRACK_UUID = "3f2b8c1e-5a4d-4e6f-9b7a-1c2d3e4f5a6b"
+
+
+def _u16(s):
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _entity_text(text, entity):
+    """The substring an entity covers, measured the way Telegram measures it (UTF-16 units)."""
+    raw = text.encode("utf-16-le")
+    start = entity["offset"] * 2
+    return raw[start:start + entity["length"] * 2].decode("utf-16-le")
+
+
+def _track_card():
+    """A card as Telegram hands it back in reply_to_message: plain text plus entities, with
+    astral-plane emoji (2 UTF-16 units each) ahead of the tag so offset math is actually tested."""
+    head = "💼 MMF: NextEnergy\n🏢 CEDAM\n🆔 "
+    tag_prefix = f"{_TRACK_UUID} · Tetiana Cold · 🧭 "
+    tag = "f|conservative|0,1,2|6"
+    tail = "\n\n🔥 Notes after the tag"
+    text = head + tag_prefix + tag + tail
+    entities = [
+        {"type": "bold", "offset": _u16("💼 "), "length": _u16("MMF: NextEnergy")},
+        {"type": "code", "offset": _u16(head), "length": _u16(_TRACK_UUID)},
+        {"type": "code", "offset": _u16(head + tag_prefix), "length": _u16(tag)},
+        {"type": "bold", "offset": _u16(head + tag_prefix + tag + "\n\n🔥 "), "length": _u16("Notes")},
+    ]
+    return text, entities
+
+
+def _cache_track_job(track="f", bullet_indices=(0, 1, 2), outreach_template_id=6):
+    job = {"employer_name": "CEDAM", "job_title": "MMF: NextEnergy", "track": track,
+           "bullet_indices": list(bullet_indices), "tone_mode": "conservative",
+           "outreach_template_id": outreach_template_id}
+    m.save_job_to_cache("trk001", job, sheet_uuid=_TRACK_UUID)
+    return job
+
+
+def _track_env(monkeypatch):
+    sent, edits = [], []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text: sent.append(text))
+    monkeypatch.setattr(m, "edit_telegram_message_entities",
+                        lambda cid, mid, text, entities: edits.append((mid, text, entities)) or True)
+    return sent, edits
+
+
+def test_track_command_reroutes_what_the_next_cv_and_letter_read(monkeypatch):
+    """Gemini routed the CEDAM/NextEnergy card to track F (queue and SLA bullets) when the role
+    is a research post whose headline duty is a funding web scraper. /track h must change what
+    the NEXT /cv and /letter build, not just what /track replies with."""
+    _cache_track_job()
+    sent, edits = _track_env(monkeypatch)
+    card_text, entities = _track_card()
+
+    _dispatch("/track h 9,3,4,0", reply_to_message={"message_id": 77, "text": card_text, "entities": entities})
+
+    job = m.get_job_by_sheet_uuid(_TRACK_UUID)
+    assert job["track"] == "h"
+    assert job["bullet_indices"] == [9, 3, 4, 0]
+    assert job["outreach_template_id"] == track_registry.coerce_outreach_template_id("h", 6)
+    assert "Track F → H" in sent[-1]
+
+    # The next /letter: the shared resolver reads the cache.
+    _, letter_track = m.resolve_letter_for_job(job, {"sheet_uuid": _TRACK_UUID}, "CEDAM")
+    assert letter_track == "h"
+
+    # The next /cv, driven through the real dispatcher.
+    compiled = []
+    monkeypatch.setattr(m, "compile_resume_pdf",
+                        lambda comp, track, bullet_indices, tone_mode: compiled.append((track, bullet_indices)) or b"%PDF")
+    monkeypatch.setattr(m, "send_telegram_document", lambda *a, **k: True)
+    _dispatch("/cv", reply_to_message={"message_id": 77, "text": card_text, "entities": entities})
+    assert compiled == [("h", [9, 3, 4, 0])]
+
+
+def test_track_command_rewrites_the_card_so_a_deploy_cannot_revert_it(monkeypatch):
+    """A deploy wipes the jobs cache and /draft, /e rebuild from the card's 🧭 tag. If /track only
+    wrote the cache, the next deploy would silently put the card back on track F."""
+    _cache_track_job()
+    _, edits = _track_env(monkeypatch)
+    card_text, entities = _track_card()
+
+    _dispatch("/track h 9,3,4,0", reply_to_message={"message_id": 77, "text": card_text, "entities": entities})
+
+    assert len(edits) == 1
+    message_id, new_text, new_entities = edits[0]
+    assert message_id == 77
+    routed = m._parse_routing_from_card_text(new_text)
+    assert routed["track"] == "h" and routed["bullet_indices"] == [9, 3, 4, 0]
+    rebuilt, recovered = m.rebuild_job_from_card({}, new_text)
+    assert recovered and rebuilt["track"] == "h"
+
+    # Every span still covers the same words: the title, the uuid, the whole new tag, and the
+    # bold word AFTER the tag, whose offset had to move by the tag's length change.
+    covered = [_entity_text(new_text, e) for e in new_entities]
+    assert covered[0] == "MMF: NextEnergy"
+    assert covered[1] == _TRACK_UUID
+    assert covered[2] == new_text.split("🧭 ")[1].split("\n")[0]
+    assert covered[3] == "Notes"
+
+
+def test_track_without_bullets_drops_the_old_tracks_indices(monkeypatch):
+    """Gemini's indices were chosen from track F's pool. Carried into track H they would pick
+    arbitrary bullets, so a bare /track h resets them and shows the pool to choose from."""
+    _cache_track_job(bullet_indices=(5, 6, 7))
+    sent, _ = _track_env(monkeypatch)
+    card_text, entities = _track_card()
+
+    _dispatch("/track h", reply_to_message={"message_id": 77, "text": card_text, "entities": entities})
+
+    assert m.get_job_by_sheet_uuid(_TRACK_UUID)["bullet_indices"] is None
+    assert "/track h 9,3,4,0" in sent[-1]
+
+
+@pytest.mark.parametrize("command", ["/track z", "/track h 99", "/track h 1,99"])
+def test_track_rejects_a_bad_letter_or_bullet_without_writing_anything(monkeypatch, command):
+    _cache_track_job()
+    sent, edits = _track_env(monkeypatch)
+    card_text, entities = _track_card()
+
+    _dispatch(command, reply_to_message={"message_id": 77, "text": card_text, "entities": entities})
+
+    job = m.get_job_by_sheet_uuid(_TRACK_UUID)
+    assert job["track"] == "f" and job["bullet_indices"] == [0, 1, 2]
+    assert edits == []
+    assert sent and "⚠️" in sent[-1]
+
+
+def test_bare_track_shows_the_current_track_without_changing_it(monkeypatch):
+    _cache_track_job()
+    sent, edits = _track_env(monkeypatch)
+    card_text, entities = _track_card()
+
+    _dispatch("/track", reply_to_message={"message_id": 77, "text": card_text, "entities": entities})
+
+    assert "Track F" in sent[-1] and "← current" in sent[-1]
+    assert m.get_job_by_sheet_uuid(_TRACK_UUID)["track"] == "f"
+    assert edits == []
+
+
+def test_cv_accepts_tracks_f_through_h(monkeypatch):
+    """The /cv regex was [a-e], so `/cv h` matched no handler and did nothing at all."""
+    _cache_track_job()
+    compiled = []
+    monkeypatch.setattr(m, "compile_resume_pdf",
+                        lambda comp, track, bullet_indices, tone_mode: compiled.append(track) or b"%PDF")
+    monkeypatch.setattr(m, "send_telegram_document", lambda *a, **k: True)
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: None)
+    card_text, entities = _track_card()
+
+    _dispatch("/cv h", reply_to_message={"message_id": 77, "text": card_text, "entities": entities})
+
+    assert compiled == ["h"]

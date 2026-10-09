@@ -2631,3 +2631,12 @@ def test_references_card_puts_each_field_in_its_own_copy_span_and_escapes():
 def test_references_card_with_nothing_saved_says_how_to_add():
     card = pu.format_references_card([])
     assert "No references saved" in card and "/refs add" in card
+
+
+def test_retag_card_routing_leaves_a_card_without_a_tag_alone():
+    assert pu.retag_card_routing("💼 Analyst\n🏢 Acme", [], "h", [1], 0) is None
+
+
+def test_retag_card_routing_keeps_tone_and_writes_an_empty_index_list():
+    text, _ = pu.retag_card_routing("🧭 f|tech|0,1,2|6", [], "h", None, 3)
+    assert text == "🧭 h|tech||3"

@@ -44,6 +44,14 @@ HELP = {
         "Compiles the tailored resume PDF for this card. /resume does the same thing.",
         "reply /cv to a job card\n-> PDF with the track's bullets",
     ),
+    "/track": (
+        "Switches the resume track on a job card when Gemini routed it wrong, so /cv, /letter and /e "
+        "all rebuild on the new track. Rewrites the card's compass tag too, so the change survives a "
+        "deploy. Add bullet numbers to pick which bullets the resume uses.",
+        "reply /track to a job card\n-> current track and the list\n"
+        "reply /track h\n-> track H, with its numbered bullet pool\n"
+        "reply /track h 9,3,4,0\n-> track H with those four bullets",
+    ),
     "/refs": (
         "Prints your saved references with every field tap-to-copy, for the References section "
         "of an application form. Kept in the private CRM sheet, never in the code.",

@@ -28,6 +28,7 @@ from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_a
 from track_registry import (
     TRACK_PROMPT_LINE, TRACK_TRIGGER_GUIDANCE, normalize_track, pool_key_for,
     allowed_outreach_template_ids, coerce_outreach_template_id, override_track_for_title, TRACKS,
+    TRACK_LETTERS, TRACK_REGISTRY,
 )
 from response_schema import GeminiJobScreenerResponse
 from command_help import lookup_command_help
@@ -59,7 +60,7 @@ from pipeline_utils import (
     parse_job_command, parse_job_command_urls, parse_job_page_html, build_ingest_job_dict,
     is_expired_job_redirect, title_company_from_linkedin_slug, extract_jd_terms,
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
-    strip_tracking_params, strip_html_to_text,
+    strip_tracking_params, strip_html_to_text, retag_card_routing,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
     REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
     validate_lead, format_leads_messages,
@@ -1611,6 +1612,25 @@ def get_sheet_uuid_by_short_id(short_id):
     except Exception as e:
         logging.error(f"DB Read Error (sheet_uuid lookup): {e}")
         return None
+
+def update_cached_job_by_sheet_uuid(sheet_uuid, job_dict):
+    """Overwrite the cached job JSON for this sheet row in place. True only if a row was updated.
+
+    Keyed on sheet_uuid rather than short_id because that is what a swipe-reply resolves to, and
+    a cached job dict does not reliably carry its own short_id.
+    """
+    if not sheet_uuid:
+        return False
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute("UPDATE jobs SET job_json = ? WHERE sheet_uuid = ?",
+                                  (json.dumps(job_dict), sheet_uuid))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"DB Update Error (job by sheet_uuid {sheet_uuid}): {e}")
+        return False
 
 def get_short_id_by_sheet_uuid(sheet_uuid):
     """Reverse of get_sheet_uuid_by_short_id: the cached job's short_id for a sheet_uuid, or None.
@@ -10617,6 +10637,31 @@ def edit_telegram_message(chat_id, message_id, text):
         logging.error(f"editMessageText error: {e}")
         return False
 
+def edit_telegram_message_entities(chat_id, message_id, text, entities):
+    """Edit a message in place from plain text + entities rather than HTML.
+
+    For rewriting a card the bot only has back as a reply_to_message, which arrives as text plus
+    entities. Re-sending that text with parse_mode=HTML would drop every bold and <code> span.
+    """
+    if not (TELEGRAM_BOT_TOKEN and chat_id and message_id):
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "entities": entities or [],
+        "disable_web_page_preview": True,
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code != 200:
+            logging.error(f"editMessageText (entities) failed {res.status_code}: {res.text[:200]}")
+        return res.status_code == 200
+    except Exception as e:
+        logging.error(f"editMessageText (entities) error: {e}")
+        return False
+
 def send_telegram_message(chat_id, text):
     """Send a plain-text Telegram message (no inline keyboards - pure text-based swipe-reply CLI).
     Returns the sent message's telegram_message_id, or None on failure.
@@ -13829,6 +13874,89 @@ def process_webhook_payload_async(data):
                 )
             return
 
+        # /track [letter] [indices] - re-route a card that Gemini sent down the wrong resume track.
+        # Writes BOTH copies of the routing: the jobs cache (what /cv, /letter and /e read now) and
+        # the card's 🧭 tag (what they rebuild from after a deploy wipes the cache). Writing only
+        # the cache would silently revert to the old track on the next deploy.
+        track_match = re.match(r"^/track(?:\s+([a-zA-Z]))?(?:\s+([0-9][0-9,\s]*))?\s*$", text, re.IGNORECASE)
+        if track_match:
+            mapping = resolve_reply_mapping(msg, chat_id, "/track")
+            if not mapping:
+                return
+            reply_msg = msg.get("reply_to_message") or {}
+            card_text = reply_msg.get("text", "")
+            job = get_job_by_sheet_uuid(mapping["sheet_uuid"])
+            routed = _parse_routing_from_card_text(card_text)
+            current = str(job.get("track") or routed.get("track") or "a").lower()[:1]
+            letter = (track_match.group(1) or "").lower()
+            menu = "\n".join(
+                f"<code>{key}</code> {html.escape(entry['subtitle'])}" + ("  ← current" if key == current else "")
+                for key, entry in TRACK_REGISTRY.items()
+            )
+            if not letter:
+                send_telegram_message(
+                    chat_id,
+                    f"🧭 <b>Track {current.upper()}</b>\n\n{menu}\n\n"
+                    "Reply <code>/track h</code> to switch, or <code>/track h 9,3,4,0</code> to pick the bullets too."
+                )
+                return
+            if letter not in TRACK_LETTERS:
+                send_telegram_message(chat_id, f"⚠️ No track <code>{html.escape(letter)}</code>.\n\n{menu}")
+                return
+
+            pool = load_resume_bullet_tracks().get(pool_key_for(letter), [])
+            indices = None
+            if track_match.group(2):
+                indices = [int(i) for i in re.split(r"[,\s]+", track_match.group(2).strip()) if i]
+                out_of_range = [i for i in indices if i >= len(pool)]
+                if out_of_range or not indices:
+                    send_telegram_message(
+                        chat_id,
+                        f"⚠️ Track {letter.upper()} has bullets 0-{len(pool) - 1}. "
+                        f"Out of range: <code>{html.escape(str(out_of_range))}</code>"
+                    )
+                    return
+            # Gemini's indices were picked from the OLD track's pool, so they mean nothing in the new
+            # one. Without explicit indices, None makes filter_ats_bullets use the pool's lead bullets.
+            old_template_id = job.get("outreach_template_id", routed.get("outreach_template_id"))
+            template_id = coerce_outreach_template_id(letter, old_template_id)
+            tone_mode = job.get("tone_mode") or routed.get("tone_mode") or "conservative"
+
+            cache_updated = False
+            if job.get("employer_name"):
+                job.update({"track": letter, "bullet_indices": indices, "outreach_template_id": template_id})
+                cache_updated = update_cached_job_by_sheet_uuid(mapping["sheet_uuid"], job)
+            retagged = retag_card_routing(card_text, reply_msg.get("entities"), letter, indices, template_id)
+            card_updated = bool(retagged) and edit_telegram_message_entities(
+                chat_id, reply_msg.get("message_id"), *retagged)
+
+            if not (cache_updated or card_updated):
+                send_telegram_message(
+                    chat_id,
+                    "⚠️ <b>Track not changed.</b> The jobs cache has no entry for this card and the card "
+                    "carries no <code>🧭</code> tag to rewrite. Reply <code>/t</code> or <code>/c</code> "
+                    "for a fresh card."
+                )
+                return
+
+            chosen = filter_ats_bullets(letter, indices, tone_mode)
+            lines = [
+                f"🧭 <b>Track {current.upper()} → {letter.upper()}</b> · {html.escape(TRACK_REGISTRY[letter]['subtitle'])}",
+                f"Cache {'✅' if cache_updated else '➖ (empty, card only)'} · Card tag {'✅' if card_updated else '⚠️ not rewritten'}",
+                "",
+                "<b>Resume bullets now:</b>",
+            ]
+            lines += [f"• {html.escape(b)}" for b in chosen]
+            if indices is None:
+                lines += ["", f"<b>Track {letter.upper()} pool</b> - pick with <code>/track {letter} 9,3,4,0</code>"]
+                lines += [
+                    f"<code>{i}</code> {html.escape(e.get('text', '') if isinstance(e, dict) else str(e))}"
+                    for i, e in enumerate(pool)
+                ]
+            lines += ["", "Run <code>/cv</code> and <code>/letter</code> on the card to rebuild them."]
+            send_telegram_message(chat_id, "\n".join(lines))
+            return
+
         if text == "/letter":
             mapping = resolve_reply_mapping(msg, chat_id, "/letter")
             if not mapping:
@@ -13849,7 +13977,8 @@ def process_webhook_payload_async(data):
             send_cover_letter_pdf_async(chat_id, letter, comp, track, "/letter")
             return
 
-        cv_match = re.match(r"^/(cv|resume)(?:\s+([a-eA-E]))?$", text, re.IGNORECASE)
+        # [a-h], not [a-e]: the pattern predated tracks f/g/h, so "/cv h" matched nothing at all.
+        cv_match = re.match(r"^/(cv|resume)(?:\s+([a-hA-H]))?$", text, re.IGNORECASE)
         if cv_match:
             requested_track = (cv_match.group(2) or "").lower()
             mapping = resolve_reply_mapping(msg, chat_id, cv_match.group(0).split()[0])
@@ -14322,6 +14451,7 @@ def process_webhook_payload_async(data):
                 "/prep - Interview talking points & reverse questions\n"
                 "/pitch - 30-second elevator pitch\n"
                 "/letter - Cover letter (same track as the resume)\n"
+                "/track [a-h] [bullets] - Switch a card's resume track (bare /track shows the list)\n"
                 "/refs - Your references, tap-to-copy for application forms (/refs add, /refs remove)\n"
                 "/gear - Search breadth 1-5 (one dial for all sources)\n"
                 "/ats - Company board watchlist (on/off/add/remove)\n"

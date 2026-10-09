@@ -2797,3 +2797,55 @@ def format_references_card(refs):
     blocks.append(f"<i>Add: <code>{html.escape(REFERENCES_ADD_USAGE)}</code>\n"
                   "Remove: <code>/refs remove 2</code></i>")
     return "\n\n".join(blocks)
+
+
+# ==============================================================================
+# /track - re-route a card's resume track
+# ==============================================================================
+
+# The routing tag a job card carries after its 🧭 marker: "track|tone|bullet,indices|template_id".
+# Same shape main._parse_routing_from_card_text() reads; keep the two in sync.
+_CARD_ROUTING_TAG_RE = re.compile(r"🧭\s*([a-z]\|(?:conservative|tech)\|[0-9,]*\|\d+)")
+
+
+def _utf16_len(text):
+    """Telegram measures entity offsets in UTF-16 code units, not Python characters."""
+    return len(str(text).encode("utf-16-le")) // 2
+
+
+def retag_card_routing(text, entities, track, bullet_indices, outreach_template_id):
+    """The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag.
+
+    The tag is the durable copy of the routing: a deploy wipes the jobs cache, and from then on
+    /draft and /e rebuild the job from the card itself. Changing the track only in the cache would
+    hold until the next deploy and then silently revert to the old track.
+
+    Entities are carried rather than re-rendering HTML, because the bot only gets the card back as
+    plain text plus entities. Every entity after the tag shifts by the tag's length change, and the
+    <code> entity wrapping the tag grows or shrinks with it, so the bold title and the tap-to-copy
+    🆔 survive the edit.
+    """
+    text = str(text or "")
+    match = _CARD_ROUTING_TAG_RE.search(text)
+    if not match:
+        return None
+    old_tag = match.group(1)
+    tone = old_tag.split("|")[1]
+    indices = ",".join(str(int(i)) for i in (bullet_indices or []))
+    new_tag = f"{str(track).lower()[:1]}|{tone}|{indices}|{int(outreach_template_id or 0)}"
+    new_text = text[:match.start(1)] + new_tag + text[match.end(1):]
+
+    tag_start = _utf16_len(text[:match.start(1)])
+    tag_end = tag_start + _utf16_len(old_tag)
+    delta = _utf16_len(new_tag) - _utf16_len(old_tag)
+    new_entities = []
+    for entity in entities or []:
+        entity = dict(entity)
+        start = int(entity.get("offset", 0))
+        end = start + int(entity.get("length", 0))
+        if start >= tag_end:
+            entity["offset"] = start + delta
+        elif start <= tag_start and end >= tag_end:
+            entity["length"] = int(entity.get("length", 0)) + delta
+        new_entities.append(entity)
+    return new_text, new_entities
