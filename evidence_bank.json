@@ -223,7 +223,7 @@
       "repo": "github.com/mrsisterbob/job-outreach-engine",
       "location": "Detroit, MI",
       "start": "07/2026",
-      "end": "08/2026",
+      "end": "Present",
       "bullets": [
         "Built a Telegram-triggered Python pipeline that pulls postings from job-board REST APIs, scores them through a deterministic Gemini layer and drafts the tailored PDF and Gmail follow-up.",
         "Wrote 1,100+ lines of Google Apps Script that run a Google Sheets CRM, auto-populating and routing every record as the pipeline updates it.",

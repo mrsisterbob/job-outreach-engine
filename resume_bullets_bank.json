@@ -172,7 +172,7 @@
   ],
   "track_h_technical_systems": [
     "Cut 15 hours a week of manual lookup by writing Python scrapers with pandas.",
-    "Traced a broken integration between two systems and identified the failure points that were dropping feed updates.",
+    "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Cleaned and reformatted 1,500+ legacy records to match an updated database schema.",
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
