@@ -28,7 +28,7 @@ TRACK_REGISTRY = {
         "prompt_label": "wealth operations",
         "subtitle": "Financial Systems & Operations",
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
-        "summary": "I reconcile custodial accounts across 500+ client files and automate onboarding paperwork with Python and Salesforce.",
+        "summary": "I reconcile custodial accounts across 2,000+ client files and automate onboarding paperwork with Python and Salesforce.",
         "skills": [
             ("Core Operations", "Custodial Cashiering & Reconciliations, Ticketing Queue Management, RIA Audits, Automation."),
             ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Python, SQL, Excel.")
@@ -54,10 +54,10 @@ TRACK_REGISTRY = {
         "prompt_label": "risk & regulatory compliance",
         "subtitle": "Risk & Regulatory Compliance",
         "keywords": ("Regulatory Compliance", "SEC/FinCEN Filings", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
-        "summary": "I audit onboarding files across 500+ accounts and draft SEC Form D filings to catch compliance risks before execution.",
+        "summary": "I audit onboarding files across 2,000+ accounts and draft SEC Form D filings to catch compliance risks before execution.",
         "skills": [
             ("Compliance & Risk", "SEC & FinCEN Filings, Suitability Reviews, Custodial Exception Audits, Form D."),
-            ("Systems & Controls", "Salesforce Queue Routing, DocuSign API, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
+            ("Systems & Controls", "Salesforce Queue Routing, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
         ],
     },
     "d": {
@@ -70,7 +70,7 @@ TRACK_REGISTRY = {
         "summary": "I write SQL and build Power BI dashboards that reconcile institutional custody accounts and surface the variances behind each break.",
         "skills": [
             ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Advanced Excel Modeling."),
-            ("Systems & Data", "Salesforce Reports, bSwift, Schwab Advisor Center, Fidelity Wealthscape, Python (pandas).")
+            ("Systems & Data", "Power Query, Power Automate, Salesforce Reports, bSwift, Schwab Advisor Center, Python (pandas).")
         ],
     },
     "e": {
@@ -129,7 +129,7 @@ TRACK_REGISTRY = {
         "keywords": ("Process Automation", "Python", "SQL", "REST APIs", "Data Reconciliation", "SQLite"),
         "skills": [
             ("Automation & Data", "Process Automation, Data Reconciliation, Schema Validation, Webhook Integrations."),
-            ("Systems & Tools", "Python, SQL, SQLite, Flask, Typst, REST APIs, Salesforce.")
+            ("Systems & Tools", "Python, SQL, SQLite, Flask, Google Apps Script, Power Automate, Power Query, REST APIs, Salesforce.")
         ],
     },
 }

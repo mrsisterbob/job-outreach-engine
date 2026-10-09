@@ -1,6 +1,6 @@
 {
   "track_a_wealth_ops": [
-    "Audited onboarding paperwork for 500+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
+    "Audited onboarding paperwork for 2,000+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
     "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
     "Managed Salesforce ticketing queues and worked with custodians to resolve advisor requests within 1 to 2 hour SLAs.",
     "Fixed margin errors and cash distribution mismatches across clearing feeds with zero service breaches.",
@@ -17,25 +17,37 @@
     "Chased documentation hold-ups with partner firms so an onboarding exception on a prospective client file never sat unresolved."
   ],
   "track_b_engineering": [
-    "Built a Python and Flask backend with SQLite in WAL mode to handle live Telegram webhook updates without dropped records.",
-    "Wrote nightly Python reconciliation scripts that flag mismatches between custodial ledgers and internal records.",
-    "Wired a headless Typst compiler into the pipeline to generate tailored 1-page PDF documents on demand.",
-    "Created two-way webhook synchronization between HubSpot CRM tables and local SQLite databases.",
-    "Cleaned and reformatted 1,500+ legacy account records across internal databases to match updated database schemas.",
-    "Wrote strict JSON schema validation models in Python to block invalid payloads on REST API endpoints.",
-    "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
     "Wrote automated Python data scrapers using pandas, saving 15 hours of manual lookup time each week.",
-    "Set up recurring reporting pipelines linking REST APIs to internal database tables for daily metrics.",
-    "Built automated DocuSign API scripts that check account packages and trigger follow-up alerts for missing signatures.",
-    "Put explicit write locks on a SQLite database in WAL mode so concurrent workers processed live data without corrupting a row.",
-    "Built a WebSocket feed that reconciles live market data against stored state, plus a backtester to replay the same logic over history.",
-    "Wired the Gemini API into the screening step so inbound records get scored against a structured content bank instead of read by hand.",
-    "Kept every output line sourced from banked copy, so the model routes and scores but never writes the sentence that ships.",
-    "Scripted the recurring supporting schedules so the variance reports built off one agreed source every month instead of a fresh workbook."
+    "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
+    "Cleaned and reformatted 1,500+ legacy account records across internal databases to match updated database schemas.",
+    "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
+    "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
+    "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
+    "Audited onboarding paperwork for 2,000+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
+    "Reconciled advisory agreements and account records against custodial data during an offboarding, so active client files handed off clean.",
+    "Verified licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
+    "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
+    "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
+    "Scripted the recurring supporting schedules so the variance reports built off one agreed source every month instead of a fresh workbook.",
+    {
+      "text": "Built structured audit checklists to cross-reference payroll data across 70+ manufacturing facilities, catching recurring deduction errors.",
+      "source_job": 3,
+      "replaces": 1
+    },
+    {
+      "text": "Set up compliance intake checkpoints so every incoming investor file cleared the same review before it moved forward.",
+      "source_job": 1,
+      "replaces": 1
+    },
+    {
+      "text": "Tracked paperwork exceptions across prospective client files so documentation hold-ups cleared before transfer.",
+      "source_job": 2,
+      "replaces": 2
+    }
   ],
   "track_c_risk_compliance": [
     "Found a Salesforce ticket conflict between trading and service queues, presenting findings to leadership to stop ticket misrouting.",
-    "Audited client paperwork across 500+ onboarding accounts to enforce SEC and FinCEN identity standards.",
+    "Audited client paperwork across 2,000+ onboarding accounts to enforce SEC and FinCEN identity standards.",
     {
       "text": "Took private placements from draft to filed, writing the SEC Form D and Regulation Crowdfunding paperwork behind each offering.",
       "source_job": 1,
@@ -65,7 +77,7 @@
   "track_d_business_intelligence": [
     "Wrote SQL against internal reporting tables to reconcile institutional custody accounts and surface the variances behind each break.",
     {
-      "text": "Chased down the 401(k) and healthcare deduction mismatches across 500+ employee accounts in bSwift and Excel until every ledger agreed.",
+      "text": "Chased down the 401(k) and healthcare deduction mismatches across 2,000+ employee accounts in bSwift and Excel until every ledger agreed.",
       "source_job": 3,
       "replaces": 0
     },
@@ -77,10 +89,10 @@
       "replaces": 2
     },
     "Monitored Salesforce service queues to catch routing errors and eliminate miscategorized tickets.",
-    "Ran SQL variance checks on 500+ ledger accounts to prepare recurring internal financial reports.",
+    "Ran SQL variance checks on 2,000+ ledger accounts to prepare recurring internal financial reports.",
     "Pulled unstructured API data into relational database tables to track historical volume trends.",
     {
-      "text": "Built Excel lookup and macro templates for recurring 401(k) and healthcare deduction reconciliation across 500+ accounts.",
+      "text": "Built Excel lookup and macro templates for recurring 401(k) and healthcare deduction reconciliation across 2,000+ accounts.",
       "source_job": 3,
       "replaces": 0
     },
@@ -99,13 +111,13 @@
     "Set up automated DocuSign workflows in Salesforce for 150+ advisors, cutting packet review from 60 to 20 minutes.",
     "Fixed a Salesforce queue collision between trading and service desks, preventing 10 critical SLA breaches.",
     "Mapped account workflows from initial Salesforce submission through execution in Orion Eclipse.",
-    "Built a custom contact pipeline in Python connected to SQLite and Telegram to manage 500+ records end to end.",
+    "Managed Salesforce ticketing queues and worked with custodians to resolve advisor requests within 1 to 2 hour SLAs.",
     "Set up standardized escalation paths for custodial account transfers, cutting turnaround time by 25%.",
     "Cleaned multi-source CRM records into a single pipeline view to remove duplicate contact entries.",
     "Automated the recurring compliance checks on advisor account packages so the weekly backlog cleared without manual review.",
-    "Built two-way webhook integrations to connect external form submissions with internal CRM databases.",
+    "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
     "Documented end-to-end service desk workflows to standardize how operations analysts handle ticket queues.",
-    "Designed schema validation rules on REST API intake forms to maintain data integrity across client records.",
+    "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
     "Coordinated with custodians directly to move transfer paperwork along instead of waiting for a queue to clear itself.",
     "Gave every onboarding documentation hold-up an owner and a next step, tracked with the partner firm until it closed.",
     "Ran the licensing and training checks for 600+ partner RIAs across 20 insurance carriers on a recurring cycle.",
@@ -151,7 +163,7 @@
     },
     "Cut 15 hours a week of manual lookup by scripting the recurring data pulls in Python with pandas.",
     "Built Power BI dashboards to track daily volume, response times and pipeline metrics in one place.",
-    "Ran SQL variance checks across 500+ accounts to prepare the recurring internal reports.",
+    "Ran SQL variance checks across 2,000+ accounts to prepare the recurring internal reports.",
     "Documented the reconciliation workflow end to end so the same checks ran the same way regardless of who ran them.",
     "Turned reporting requirements into a step-by-step checklist and wrote it down for the analysts who came after.",
     "Tracked exceptions with partner organizations so a documentation hold-up had an owner and a next step.",
@@ -159,20 +171,32 @@
     "Wrote down the escalation path for stalled handoffs instead of leaving it to whoever picked up the ticket, cutting turnaround 25%."
   ],
   "track_h_technical_systems": [
-    "Put explicit write locks on a SQLite database in WAL mode so concurrent workers processed live data without corrupting a row.",
-    "Built a WebSocket feed that reconciles live data against stored state, plus a backtester to replay the same logic over history.",
-    "Designed the screening layer so the model only routes and scores, and every line that ships comes from banked copy.",
-    "Wired the Gemini API in as a classifier, scoring inbound records against a structured content bank instead of reading them by hand.",
-    "Stood up the backend that runs my own pipeline, a Flask service on SQLite that takes webhook updates without losing a record.",
-    "Wired a headless Typst compiler into the pipeline to compile tailored 1-page PDFs on demand.",
-    "Wrote strict JSON schema validation in Python so a malformed payload is rejected at the API boundary, not after it lands.",
-    "Wrote nightly Python reconciliation scripts that flag mismatches between two systems before anyone opens a spreadsheet.",
-    "Created two-way webhook synchronization between a CRM and a local SQLite database so neither side drifted.",
     "Cut 15 hours a week of manual lookup by writing Python scrapers with pandas.",
-    "Cleaned and reformatted 1,500+ legacy records to match an updated database schema.",
     "Traced a broken integration between two systems and identified the failure points that were dropping feed updates.",
-    "Set up recurring reporting pipelines linking REST APIs to internal database tables for daily metrics.",
-    "Built automated DocuSign API scripts that check packages and raise an alert when a signature is missing.",
-    "Built a contact pipeline in Python on SQLite and Telegram to manage 500+ records end to end."
+    "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
+    "Cleaned and reformatted 1,500+ legacy records to match an updated database schema.",
+    "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
+    "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
+    "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
+    "Wrote down the escalation path for custodial transfers, cutting request turnaround by 25%.",
+    "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
+    "Audited onboarding paperwork for 2,000+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
+    "Verified licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
+    "Reconciled advisory agreements and account records against custodial data during an offboarding, so active client files handed off clean.",
+    {
+      "text": "Set up compliance intake checkpoints so every incoming investor file cleared the same review before it moved forward.",
+      "source_job": 1,
+      "replaces": 1
+    },
+    {
+      "text": "Tracked paperwork exceptions across prospective client files so documentation hold-ups cleared before transfer.",
+      "source_job": 2,
+      "replaces": 2
+    },
+    {
+      "text": "Built structured audit checklists to cross-reference payroll data across 70+ manufacturing facilities, catching recurring deduction errors.",
+      "source_job": 3,
+      "replaces": 1
+    }
   ]
 }

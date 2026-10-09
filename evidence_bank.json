@@ -18,7 +18,7 @@
       "start": "05/2026",
       "end": "08/2026",
       "bullets": [
-        "Audited onboarding paperwork for 500+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
+        "Audited onboarding paperwork for 2,000+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
         "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
         "Managed Salesforce ticketing queues and engaged directly with custodians to resolve urgent advisor requests within 1 to 2 hour SLAs.",
         "Reconciled IAA agreements and account records against custodial data during offboarding to ensure clean handoff of active client files.",
@@ -64,7 +64,7 @@
       "start": "05/2024",
       "end": "08/2024",
       "bullets": [
-        "Reconciled employee 401(k) and healthcare deduction variances across 500+ accounts in bSwift and Excel.",
+        "Reconciled employee 401(k) and healthcare deduction variances across 2,000+ accounts in bSwift and Excel.",
         "Built structured audit checklists to cross-reference multi-plant payroll data, catching recurring 401(k) deduction errors across 70+ manufacturing facilities.",
         "Prepared and maintained supporting schedules for variance analysis and recurring internal financial reports."
       ]
@@ -88,7 +88,8 @@
   "activities": [
     "Secretary, Student Political Organization",
     "Member, Economic Club of Grand Rapids",
-    "Varsity Cross Country & Track (2 years)"
+    "Varsity Cross Country & Track (2 years)",
+    "Taught peers to host their own websites at no cost"
   ],
   "athletics": [
     {
@@ -142,7 +143,7 @@
         }
       },
       {
-        "value": "500+",
+        "value": "2,000+",
         "label": "Accounts audited under SEC rules",
         "source": {
           "company": "Signal Advisors",
@@ -224,9 +225,10 @@
       "start": "07/2026",
       "end": "08/2026",
       "bullets": [
-        "Built a Python and Flask backend with SQLite to track pipeline records and sync live status updates over webhooks.",
-        "Integrated the Gemini API to screen inbound records against a structured content bank and compile tailored 1-page PDFs on demand using Typst.",
-        "Designed the screening layer as a deterministic template engine, so the model routes and scores while every output line comes from banked copy rather than generated text."
+        "Built a Telegram-triggered Python pipeline that pulls postings from job-board REST APIs, scores them through a deterministic Gemini layer and drafts the tailored PDF and Gmail follow-up.",
+        "Wrote 1,100+ lines of Google Apps Script that run a Google Sheets CRM, auto-populating and routing every record as the pipeline updates it.",
+        "Scheduled nightly Python jobs that check every tracked posting for a dead link and queue each day's follow-up emails.",
+        "Wired live build statistics into montelattice.com, a self-updating portfolio site hosted at no cost."
       ]
     },
     {
@@ -257,7 +259,11 @@
     "Typst",
     "Flask",
     "SQLite",
-    "bSwift"
+    "bSwift",
+    "Power Query",
+    "Power Automate",
+    "Google Apps Script",
+    "Google Sheets"
   ],
   "banned_words": [
     "leveraging",

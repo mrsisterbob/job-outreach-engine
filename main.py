@@ -313,7 +313,7 @@ _FALLBACK_LINKEDIN_TEMPLATES = {
 # generate_cover_letter().
 _FALLBACK_COVER_LETTER_TEMPLATES = {
     "openers": ["I'm writing to apply for the {job_title} position at {company}."],
-    "track_a_wealth_ops": ["Most of my work is daily transaction intake, account maintenance, and the documentation exceptions that stall them. At Signal Advisors I audited onboarding paperwork across 500+ accounts, processed cashiering and ACAT transfers through Schwab Advisor Center and Fidelity Wealthscape, and cleared advisor requests inside 1-to-2 hour SLAs."],
+    "track_a_wealth_ops": ["Most of my work is daily transaction intake, account maintenance, and the documentation exceptions that stall them. At Signal Advisors I audited onboarding paperwork across 2,000+ accounts, processed cashiering and ACAT transfers through Schwab Advisor Center and Fidelity Wealthscape, and cleared advisor requests inside 1-to-2 hour SLAs."],
     "closers": ["Clean records, clear handoffs, and exceptions caught before they reach anyone downstream are what I'm actually good at. I'd welcome a conversation about the {job_title} role at {company}."]
 }
 

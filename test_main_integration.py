@@ -10501,7 +10501,29 @@ def test_a_routed_bullet_never_sits_beside_the_static_it_restates():
             assert resume_engine.bullet_text(entry) in rendered, f"{pool}[{i}] did not render"
             assert superseded not in rendered, f"{pool}[{i}] rendered beside the static it restates"
             checked += 1
-    assert checked == 10, f"expected 10 authored substitutions, found {checked}"
+    # 16 since 2026-10-09: tracks h and b each gained one tagged substitution for 40 Acres,
+    # Northwestern Mutual and ABC when their personal-project bullets were moved off Signal Advisors.
+    assert checked == 16, f"expected 16 authored substitutions, found {checked}"
+
+
+def test_no_pool_puts_personal_project_work_under_signal_advisors():
+    """Tracks b, e and h carried the job-search system and trading engine (SQLite write locks, the
+    WebSocket backtester, the Gemini classifier, webhooks, REST API pipelines) as bare pool strings.
+    Untagged pool bullets render under job 0, so every resume on those tracks claimed that work as
+    Signal Advisors work. Kevin, 2026-10-09: none of it was done for an employer. It lives in the
+    evidence bank's projects, which render under Technical Projects. The DocuSign API scripts
+    exist in no repo at all and were removed outright."""
+    evidence = m.load_evidence_bank()
+    project_terms = ("WAL", "WebSocket", "backtester", "Gemini", "Typst", "Telegram", "Flask",
+                     "banked copy", "my own pipeline", "webhook", "JSON schema", "DocuSign API",
+                     "REST API", "nightly", "contact pipeline", "HubSpot")
+    for pool, entries in resume_engine.load_resume_bullets_bank().items():
+        for i, entry in enumerate(entries):
+            if resume_engine.bullet_source_job(entry, evidence) != 0:
+                continue
+            text = resume_engine.bullet_text(entry)
+            hits = [t for t in project_terms if t.lower() in text.lower()]
+            assert hits == [], f"{pool}[{i}] puts project work under Signal Advisors: {hits}"
 
 
 def test_every_track_still_compiles_to_one_page():
