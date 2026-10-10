@@ -2640,3 +2640,165 @@ def test_retag_card_routing_leaves_a_card_without_a_tag_alone():
 def test_retag_card_routing_keeps_tone_and_writes_an_empty_index_list():
     text, _ = pu.retag_card_routing("🧭 f|tech|0,1,2|6", [], "h", None, 3)
     assert text == "🧭 h|tech||3"
+
+
+# ---- role_funnel.compute_role_funnel (one role, counted once, at its highest stage) ----
+
+import role_funnel  # noqa: E402
+
+_RF_REPLY_NOTE = "[2026-10-01] Inbound reply received - routed to Carmen Cold"
+
+
+def _rf_row(uuid, tab, status, schema="JOBS", note=""):
+    return {"sheet_uuid": uuid, "tab": tab, "schema": schema, "status": status, "note": note}
+
+
+def _rf_assert_nested(result):
+    """Nesting is the whole fix: every rate is bounded and every persona block sums to overall."""
+    for name, value in result["rates"].items():
+        assert value is None or 0 <= value <= 100, (name, value)
+    for key in ("matched", "applied", "replied", "interviewed", "offers", "rejected"):
+        assert sum(p[key] for p in result["by_persona"].values()) == result[key], key
+    assert (result["offers"] <= result["interviewed"] <= result["replied"]
+            <= result["applied"] <= result["matched"])
+
+
+def test_role_funnel_2026_10_08_shape_never_exceeds_100_percent():
+    # Kevin's /funnel read Matched->Applied 254.2%: most rows sitting at Applied, few left at
+    # Matched. An applied role still counts as matched, so the rate is bounded.
+    rows = [_rf_row(f"a{i}", "Tetiana Cold", "Applied") for i in range(61)]
+    rows += [_rf_row(f"m{i}", "Tetiana Cold", "Matched") for i in range(24)]
+    rows += [_rf_row(f"c{i}", "Clavicular", "applied 9/30") for i in range(5)]
+    result = role_funnel.compute_role_funnel(rows, [], set())
+    assert result["matched"] == 90
+    assert result["applied"] == 66
+    assert result["rates"]["matched_to_applied"] == round(100 * 66 / 90, 1)
+    assert result["replied"] == 0
+    assert result["rates"]["replied_to_interviewed"] is None
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_sqlite_interview_events_count_on_rows_still_at_applied():
+    rows = [_rf_row("u1", "Tetiana Warm", "Applied"), _rf_row("u2", "Tetiana Warm", "Applied")]
+    events = [("u1", "applied"), ("u1", "interview"), ("u2", "interview")]
+    result = role_funnel.compute_role_funnel(rows, events, {"u1", "u2"})
+    assert result["interviewed"] == 2
+    assert result["replied"] >= 2
+    assert result["applied"] == 2 and result["matched"] == 2
+    assert result["by_persona"]["Tetiana"]["interviewed"] == 2
+    assert result["rates"]["replied_to_interviewed"] == 100.0
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_job_row_in_carmen_counts_but_a_pure_contact_never_does():
+    rows = [
+        # A job row that a GENERAL reply moved into Carmen Hot, since set to Interview.
+        _rf_row("job1", "Carmen Hot", "Interview", schema="PEOPLE", note=_RF_REPLY_NOTE),
+        # Networking contacts: PEOPLE rows whose uuid is not a role. Never counted, whatever status.
+        _rf_row("person1", "Carmen Hot", "Interview", schema="PEOPLE", note=_RF_REPLY_NOTE),
+        _rf_row("person2", "Carmen Cold", "Phone Screen", schema="PEOPLE"),
+        _rf_row("", "Carmen Hot", "Interview", schema="PEOPLE"),
+    ]
+    result = role_funnel.compute_role_funnel(rows, [("job1", "applied")], {"job1"})
+    assert result["matched"] == 1
+    assert result["interviewed"] == 1
+    assert result["replied"] == 1
+    assert result["by_persona"]["Other"]["interviewed"] == 1
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_people_statuses_skip_the_jobs_canonicalizer():
+    # canonicalizeStatus would read "Cold Lead" as Matched but "Interview call" as Interviewing.
+    # On a PEOPLE row only the exact words Phone Screen / Interview lift a role.
+    rows = [_rf_row("j1", "Carmen Cold", "Networking Call", schema="PEOPLE"),
+            _rf_row("j2", "Carmen Cold", "Interview call", schema="PEOPLE"),
+            _rf_row("j3", "Carmen Hot", "  phone SCREEN ", schema="PEOPLE")]
+    result = role_funnel.compute_role_funnel(rows, [], {"j1", "j2", "j3"})
+    assert result["matched"] == 3
+    assert result["interviewed"] == 1
+    assert result["applied"] == 1
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_died_applied_counts_and_died_matched_is_excluded():
+    rows = [_rf_row("d1", "Died", "Applied"), _rf_row("d2", "Died", "Matched"),
+            _rf_row("d3", "Died", ""), _rf_row("live", "Clavicular", "Matched")]
+    # Every Died row is in the jobs cache (it was carded); that must not rescue a never-applied one.
+    result = role_funnel.compute_role_funnel(rows, [("d3", "dead_link")], {"d1", "d2", "d3", "live"})
+    assert result["matched"] == 2
+    assert result["applied"] == 1
+    assert result["by_persona"]["Other"] == {"matched": 1, "applied": 1, "replied": 0,
+                                             "interviewed": 0, "offers": 0, "rejected": 0}
+    assert result["by_persona"]["Clavicular"]["matched"] == 1
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_rejection_is_applied_and_rejected_not_replied():
+    rows = [_rf_row("r1", "Tetiana Cold", "Applied"), _rf_row("r2", "Tetiana Cold", "Rejected")]
+    result = role_funnel.compute_role_funnel(rows, [("r1", "rejection")], set())
+    assert result["applied"] == 2
+    assert result["rejected"] == 2
+    assert result["replied"] == 0
+    assert result["rates"]["applied_to_replied"] == 0.0
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_zero_applied_rates_are_none_not_zero():
+    result = role_funnel.compute_role_funnel([_rf_row("m1", "Tetiana Cold", "Matched")], [], set())
+    assert result["matched"] == 1
+    assert result["rates"] == {"matched_to_applied": 0.0, "applied_to_replied": None,
+                               "replied_to_interviewed": None, "interviewed_to_offer": None}
+    empty = role_funnel.compute_role_funnel([], [], set())
+    assert empty["matched"] == 0
+    assert all(v is None for v in empty["rates"].values())
+    assert set(empty["by_persona"]) == {"Tetiana", "Clavicular", "Other"}
+    _rf_assert_nested(empty)
+
+
+def test_role_funnel_evidence_sources_merge_to_the_max_stage():
+    rows = [
+        # Same uuid on a live JOBS tab and on Died: persona comes from the non-Died tab.
+        _rf_row("x1", "Died", "Applied"),
+        _rf_row("x1", "Tetiana Warm", "Matched", note=_RF_REPLY_NOTE),
+        _rf_row("x2", "Clavicular", "Offer"),
+        # Blank-uuid JOBS rows: each its own role.
+        _rf_row("", "Tetiana Cold", "Applied"),
+        _rf_row("", "Tetiana Cold", "Applied"),
+    ]
+    events = [("o1", "offer"), ("x2", "withdrawn"), ("x2", "bogus_status"), ("", "interview")]
+    result = role_funnel.compute_role_funnel(rows, events, {"t1"})
+    # Roles: x1 (replied), x2 (offer), two blank-uuid rows (applied), o1 (offer, event-only),
+    # t1 (matched, cache-only). The blank-uuid event joins nothing.
+    assert result["matched"] == 6
+    assert result["applied"] == 5
+    assert result["replied"] == 3
+    assert result["interviewed"] == 2
+    assert result["offers"] == 2
+    assert result["by_persona"]["Tetiana"]["replied"] == 1
+    assert result["by_persona"]["Tetiana"]["applied"] == 3
+    assert result["by_persona"]["Clavicular"]["offers"] == 1
+    assert result["by_persona"]["Other"]["offers"] == 1
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_canonicalizer_mirrors_code_gs():
+    cases = {"": "Matched", None: "Matched", "Lead": "Matched", "Applied 9/30": "Applied",
+             "email sent": "Applied", "Responded": "Replied", "Screening": "Screening",
+             "Interviewing": "Interviewing", "OFFER": "Offer", "declined": "Rejected",
+             "Rejected": "Rejected", "zzz": None}
+    for raw, expected in cases.items():
+        assert role_funnel.canonicalize_status(raw) == expected, raw
+    # An unmapped JOBS status buckets as matched, like funnel_stats' `|| "Matched"`.
+    result = role_funnel.compute_role_funnel([_rf_row("z", "Clavicular", "zzz")], [], set())
+    assert result["matched"] == 1 and result["applied"] == 0
+
+
+def test_role_funnel_canonicalizer_rules_match_code_gs_text():
+    # No shared schema between Code.gs and Python: pin the port to the source so an edit to one
+    # side's regex list fails here instead of bucketing the same Status two different ways.
+    with open(os.path.join(os.path.dirname(__file__), "Code.gs"), encoding="utf-8") as f:
+        source = f.read()
+    body = source[source.index("function canonicalizeStatus("):]
+    body = body[:body.index("\n}\n")]
+    gs_rules = re.findall(r'/([^/]+)/\.test\(s\)\) return "(\w+)"', body)
+    assert gs_rules == list(role_funnel._CANON_RULES)
