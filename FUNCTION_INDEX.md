@@ -554,6 +554,22 @@ grep -i "contact" FUNCTION_INDEX.md
 | 536 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
 | 604 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
 
+## `role_funnel.py` — 11 defs, 199 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 62 | `canonicalize_status` | Python port of Code.gs canonicalizeStatus(): the canonical JOBS Status for any free-text / |
+| 74 | `persona_for_tab` | The persona a JOBS tab belongs to: Tetiana, Clavicular, or Other. |
+| 83 | `_empty_counts` | _(no docstring)_ |
+| 89 | `_rate` | _(no docstring)_ |
+| 93 | `_Role` | _(no docstring)_ |
+| 96 | `_Role.__init__` | _(no docstring)_ |
+| 102 | `_Role.lift` | _(no docstring)_ |
+| 106 | `_Role.add_row` | _(no docstring)_ |
+| 118 | `_Role.persona` | _(no docstring)_ |
+| 122 | `_Role.excluded` | Kevin's call: a role that never got past matched and whose only CRM presence is the |
+| 129 | `compute_role_funnel` | crm_rows:       list of dicts, one per CRM row on EVERY tab: |
+
 ## `scripts/clean_crm_contacts.py` — 2 defs, 95 lines
 
 | Line | Name | Summary |
@@ -606,4 +622,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**532 definitions across 11 files + Code.gs.**
+**543 definitions across 12 files + Code.gs.**
