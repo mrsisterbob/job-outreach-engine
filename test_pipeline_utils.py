@@ -2898,3 +2898,121 @@ def test_build_log_wrong_key_set_raises_instead_of_dropping_lines(counts):
 def test_build_log_rejects_counts_that_would_print_a_different_number(bad, error):
     with pytest.raises(error):
         build_log.compose_build_log({**_BL_TYPICAL, "applied": bad})
+
+
+# ---- site_profile copy rules (montelattice.com homepage copy lives in evidence_bank.json) ----
+
+_SP_METADATA_KEYS = {"_note", "photo", "alt", "live", "source", "role_bullets"}
+# Measured 2026-10-11 before the cut: 602 visible words. A third is about 200.
+_SP_BASELINE_WORDS = 602
+# The figure "4" (systems built, running in production) is Kevin's own count of the systems the
+# site itself presents; no bank section carries it, so the "number appears elsewhere in the bank"
+# rule cannot cover it. Allowed by name so a NEW unbanked number still fails the rule.
+_SP_UNBANKED_FIGURE_VALUES = {"4"}
+
+
+@pytest.fixture(scope="module")
+def _sp_bank():
+    path = os.path.join(os.path.dirname(__file__), "evidence_bank.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _sp_strings(node, key=None, skip=_SP_METADATA_KEYS):
+    """Every string value the page can show (metadata keys and role_bullets excluded)."""
+    if key in skip:
+        return
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            yield from _sp_strings(v, k, skip)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _sp_strings(v, key, skip)
+
+
+def _sp_visible(bank):
+    return list(_sp_strings(bank["site_profile"]))
+
+
+_SP_NUMBER_RE = re.compile(r"\$?\d(?:[\d,]*\d)?(?:\.\d+)?[+%B]?")
+
+
+def test_site_profile_copy_has_no_negative_language(_sp_bank):
+    for text in _sp_visible(_sp_bank):
+        assert pu.negative_language_hits(text) == [], text
+
+
+def test_site_profile_copy_has_no_banned_words(_sp_bank):
+    banned = [w.lower() for w in _sp_bank["banned_words"]]
+    assert banned
+    for text in _sp_visible(_sp_bank):
+        for word in banned:
+            assert not re.search(r"" + re.escape(word) + r"", text, re.IGNORECASE), (word, text)
+
+
+def test_site_profile_copy_is_about_a_third_of_the_602_word_baseline(_sp_bank):
+    # 602 was measured 2026-10-11; a third is about 200, so the live band is 170-230.
+    words = sum(len(t.split()) for t in _sp_visible(_sp_bank))
+    assert 170 <= words <= 230, words
+
+
+def test_site_profile_copy_every_number_is_in_the_bank_and_150_is_only_about_advisors(_sp_bank):
+    others = [s for k, v in _sp_bank.items() if k != "site_profile" for s in _sp_strings(v, None, set())]
+    for text in _sp_visible(_sp_bank):
+        for token in _SP_NUMBER_RE.findall(text):
+            if token in _SP_UNBANKED_FIGURE_VALUES:
+                continue
+            pattern = r"(?<![\w.,$])" + re.escape(token) + r"(?![\w,])"
+            assert any(re.search(pattern, s) for s in others), (token, text)
+    # The trap: 150 exists in the bank only as "150+ advisors" (DocuSign packet workflows). It is
+    # not a count of anything else, so any visible 150 has to be talking about advisors.
+    for text in _sp_visible(_sp_bank):
+        if re.search(r"\b150\b", text):
+            assert "advisor" in text.lower(), text
+    figure_values = {f.get("value") for f in _sp_bank["site_profile"]["figures"] if "value" in f}
+    assert _SP_UNBANKED_FIGURE_VALUES >= (figure_values - {"$2.5B", "2,000+"}), figure_values
+
+
+def test_site_profile_copy_never_prints_a_personal_best(_sp_bank):
+    times = [pb["time"] for a in _sp_bank["athletics"] for pb in a.get("personal_bests", [])]
+    assert times
+    blob = json.dumps(_sp_bank["site_profile"], ensure_ascii=False)
+    for t in times:
+        assert t not in blob, t
+
+
+def test_site_profile_copy_claim_is_four_to_eight_words_without_a_negation(_sp_bank):
+    claim = _sp_bank["site_profile"]["claim"]
+    assert 4 <= len(claim.split()) <= 8, claim
+    assert not re.search(r"\bnot\b", claim, re.IGNORECASE)
+
+
+def test_site_profile_copy_story_lines_start_with_i_stay_short_and_explain_the_series_65(_sp_bank):
+    story = _sp_bank["site_profile"]["story"]
+    assert story
+    for item in story:
+        text = item["text"]
+        assert text.split()[0] == "I", text
+        assert len(text.split()) <= 20, text
+        if "Series 65" in text:
+            assert "investment adviser representative license" in text, text
+    joined = " ".join(i["text"] for i in story)
+    for topic in ("Signal Advisors", "Series 65", "tokenization", "40 Acres", "build"):
+        assert topic in joined, topic
+
+
+def test_site_profile_copy_signal_role_note_is_one_line_and_names_the_nda(_sp_bank):
+    note = _sp_bank["site_profile"]["role_notes"]["Signal Advisors"]
+    assert "\n" not in note and note.strip()
+    assert "NDA" in note
+
+
+def test_site_profile_copy_first_figure_label_matches_its_source_bullet(_sp_bank):
+    fig = _sp_bank["site_profile"]["figures"][0]
+    exp = next(e for e in _sp_bank["experience"] if e["company"] == fig["source"]["company"])
+    bullet = exp["bullets"][fig["source"]["bullet"]]
+    assert fig["value"] in bullet
+    assert "onboarding throughput" in bullet and "onboarding throughput" in fig["label"]
+    assert "ran operations" not in fig["label"]
