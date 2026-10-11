@@ -11725,6 +11725,8 @@ def test_leads_command_reads_back_what_the_route_wrote(leads_env, monkeypatch):
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
     _post_lead({**_GOOD_LEAD, "name": "<script>alert(1)</script>"})
     _post_lead({**_GOOD_LEAD, "name": "Second Lead", "email": "two@firm.com"})
+    assert len(sent) == 2          # one new-lead alert per post (see the lead_alert tests)
+    sent.clear()
     m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/leads"}})
     assert len(sent) == 1
     text = sent[0]
@@ -12319,3 +12321,119 @@ def test_weekly_build_log_registers_sunday_1800_local_on_the_shared_scheduler(mo
     assert kwargs["trigger"] == "cron"
     assert kwargs["day_of_week"] == "sun" and kwargs["hour"] == 18
     assert kwargs["max_instances"] == 1 and kwargs["coalesce"] is True
+
+
+# ---- /leads/ingest Telegram alert: one message per NEWLY committed lead ----
+
+def test_lead_alert_new_lead_sends_exactly_one_message_with_every_field(leads_env, capture_sent):
+    resp = _post_lead(_GOOD_LEAD)
+
+    assert resp.status_code == 200
+    assert len(_lead_rows()) == 1
+    assert len(capture_sent) == 1
+    text = capture_sent[0]
+    for part in ("Dana Ruiz", "dana@firm.com", "montelattice.com/docfiler", "40k PDFs"):
+        assert part in text, part
+
+
+def test_lead_alert_a_resubmission_is_one_row_one_message_and_a_200(leads_env, capture_sent):
+    first = _post_lead(_GOOD_LEAD)
+    again = _post_lead(dict(_GOOD_LEAD, email="DANA@firm.com"))   # email is compared case-insensitively
+
+    assert first.status_code == 200 and again.status_code == 200
+    body = again.get_json()
+    assert body["status"] == "ok" and body["duplicate"] is True
+    assert body["id"] == first.get_json()["id"]
+    assert "duplicate" not in first.get_json()
+    assert len(_lead_rows()) == 1
+    assert len(capture_sent) == 1
+
+
+def test_lead_alert_same_email_with_a_different_message_is_a_new_lead(leads_env, capture_sent):
+    _post_lead(_GOOD_LEAD)
+    second = _post_lead(dict(_GOOD_LEAD, message="Different question entirely"))
+    other_source = _post_lead(dict(_GOOD_LEAD, source="montelattice.com/contact"))
+
+    assert second.get_json().get("duplicate") is None
+    assert other_source.get_json().get("duplicate") is None
+    assert len(_lead_rows()) == 3
+    assert len(capture_sent) == 3
+
+
+def test_lead_alert_a_day_old_identical_lead_is_new_again(leads_env, capture_sent):
+    _post_lead(_GOOD_LEAD)
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE inbound_leads SET received_at = datetime('now', '-2 days')")
+        conn.commit()
+
+    again = _post_lead(_GOOD_LEAD)
+
+    assert again.get_json().get("duplicate") is None
+    assert len(_lead_rows()) == 2 and len(capture_sent) == 2
+
+
+def test_lead_alert_rejected_leads_send_nothing(leads_env, capture_sent, monkeypatch):
+    assert _post_lead(_GOOD_LEAD, headers={"X-Lead-Token": "wrong"}).status_code == 403
+    assert _post_lead(_GOOD_LEAD, headers={}).status_code == 403
+    assert _post_lead({"name": "No Email"}).status_code == 400
+    assert _post_lead({"name": "Bad", "email": "not-an-email"}).status_code == 400
+
+    monkeypatch.setattr(m, "record_inbound_lead", lambda lead: (_ for _ in ()).throw(RuntimeError("disk full")))
+    assert _post_lead(_GOOD_LEAD).status_code == 500
+
+    monkeypatch.delenv("LEAD_INGEST_TOKEN")
+    assert _post_lead(_GOOD_LEAD).status_code == 503
+
+    assert capture_sent == []
+    assert _lead_rows() == []
+
+
+@pytest.mark.parametrize("filler", ["&", '"', "<", "x"], ids=["amp", "quote", "lt", "plain"])
+def test_lead_alert_hostile_name_and_huge_message_stay_under_the_telegram_cap(leads_env, capture_sent, filler):
+    long_name = "<script>alert(1)</script>" + "&" * 150
+    resp = _post_lead(dict(_GOOD_LEAD, name=long_name, message=filler * 5000))
+
+    assert resp.status_code == 200
+    assert len(_lead_rows()) == 1
+    text = capture_sent[0]
+    assert len(text) < 4096
+    assert "<script>" not in text
+    assert "&lt;script&gt;" in text
+    # Every & left in the text opens a complete entity: nothing was cut mid-entity.
+    assert re.findall(r"&(?!amp;|lt;|gt;)", text) == []
+    assert text.rstrip().endswith("/leads")
+    assert "…" in text                                  # the long message was cut, and says so
+
+
+def test_lead_alert_a_failed_telegram_send_still_returns_200_with_the_row_committed(leads_env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: calls.append(text) or None)
+
+    resp = _post_lead(_GOOD_LEAD)
+
+    assert resp.status_code == 200 and resp.get_json()["status"] == "ok"
+    assert len(_lead_rows()) == 1
+    assert len(calls) == 1
+
+
+def test_lead_alert_a_raising_telegram_send_still_returns_200(leads_env, monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("telegram down")
+    monkeypatch.setattr(m, "send_telegram_message", _boom)
+
+    resp = _post_lead(_GOOD_LEAD)
+
+    assert resp.status_code == 200
+    assert len(_lead_rows()) == 1
+
+
+def test_lead_alert_is_sent_off_the_request_thread(leads_env, monkeypatch, capture_sent):
+    spawned = []
+    monkeypatch.setattr(m, "_spawn_background", spawned.append)   # queued, not run
+
+    resp = _post_lead(_GOOD_LEAD)
+
+    assert resp.status_code == 200
+    assert capture_sent == [] and len(spawned) == 1                # the route itself never sent
+    spawned[0]()
+    assert len(capture_sent) == 1

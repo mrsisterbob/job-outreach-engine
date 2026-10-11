@@ -65,7 +65,7 @@ from pipeline_utils import (
     strip_tracking_params, strip_html_to_text, retag_card_routing,
     FOLLOWUP_1_DAYS, FOLLOWUP_2_DAYS, FOLLOWUP_BURY_DAYS, STALE_HOT_DAYS,
     REPLY_FOLLOWUP_DAYS, MAX_AUTO_BURIES_PER_RUN,
-    validate_lead, format_leads_messages,
+    validate_lead, format_leads_messages, format_lead_alert,
     parse_reference_args, format_references_card, REFERENCES_FILTER_KEY, REFERENCES_ADD_USAGE,
 )
 
@@ -15812,15 +15812,44 @@ LEADS_DEFAULT_LIMIT = 10
 LEADS_MAX_LIMIT = 50
 
 
+LEAD_DUPLICATE_WINDOW_HOURS = 24
+
+
 def record_inbound_lead(lead):
-    """Commit one validated lead (see validate_lead). Returns the new row id."""
+    """Commit one validated lead (see validate_lead). Returns (lead_id, is_new).
+
+    A lead with the same source, email (case-insensitive) and message as a row received in the
+    last 24 hours is a resubmission - the site gives up after 6s and tells the person it failed, so
+    they send it again - and is not stored a second time: (existing_id, False). The check and the
+    insert share one BEGIN IMMEDIATE transaction, so two simultaneous double-click POSTs cannot
+    both pass the check and both insert."""
     with get_db_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT id FROM inbound_leads WHERE source = ? AND lower(email) = lower(?) "
+            "AND COALESCE(message, '') = ? AND received_at >= datetime('now', ?) "
+            "ORDER BY id LIMIT 1",
+            (lead["source"], lead["email"], lead["message"] or "",
+             f"-{int(LEAD_DUPLICATE_WINDOW_HOURS)} hours")).fetchone()
+        if existing:
+            conn.rollback()
+            return existing[0], False
         cur = conn.execute(
             "INSERT INTO inbound_leads (source, name, email, message) VALUES (?, ?, ?, ?)",
             (lead["source"], lead["name"], lead["email"], lead["message"]))
         conn.commit()
-        return cur.lastrowid
+        return cur.lastrowid, True
+
+
+def _send_lead_alert(lead_id, lead):
+    """Tell Kevin about a committed lead. Runs off the request thread (send_telegram_message can
+    take 5s plus a 429 retry, past the site's 6s limit) and can never change the response: the
+    lead is already committed, so a failure here is only logged."""
+    try:
+        if not send_telegram_message(TELEGRAM_CHAT_ID, format_lead_alert(lead_id, lead)):
+            logging.error(f"[LEADS] alert for lead #{lead_id} was not delivered to Telegram")
+    except Exception as e:
+        logging.error(f"[LEADS] alert for lead #{lead_id} failed: {e}")
 
 
 def get_recent_leads(limit=LEADS_DEFAULT_LIMIT):
@@ -15837,7 +15866,9 @@ def leads_ingest():
     """One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN.
 
     Returns 200 {"status": "ok", "id": N} only after the row is committed - the site treats
-    anything else as a failed submission and tells the person so."""
+    anything else as a failed submission and tells the person so. A resubmission of the same
+    source, email and message within 24h returns 200 {"status": "ok", "id": <the first row's id>,
+    "duplicate": true}: nothing is stored and no alert is sent."""
     token = os.environ.get("LEAD_INGEST_TOKEN", "")
     if not token:
         logging.warning("[CONFIG WARNING] LEAD_INGEST_TOKEN is unset - refusing an inbound lead.")
@@ -15849,11 +15880,17 @@ def leads_ingest():
     if error:
         return jsonify({"status": "invalid", "error": error}), 400
     try:
-        lead_id = record_inbound_lead(lead)
+        lead_id, is_new = record_inbound_lead(lead)
     except Exception as e:
         logging.error(f"[LEADS] write failed for {lead['source']} lead: {e}")
         return jsonify({"status": "error"}), 500
+    if not is_new:
+        # 200, not an error: the earlier submission IS committed, and anything else makes the
+        # site tell the person it failed, which prompts yet another resubmission.
+        logging.info(f"[LEADS] duplicate of lead #{lead_id} from {lead['source']} - nothing stored")
+        return jsonify({"status": "ok", "id": lead_id, "duplicate": True}), 200
     logging.info(f"[LEADS] stored lead #{lead_id} from {lead['source']}")
+    _spawn_background(lambda: _send_lead_alert(lead_id, dict(lead)))
     return jsonify({"status": "ok", "id": lead_id}), 200
 
 

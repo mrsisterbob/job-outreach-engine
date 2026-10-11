@@ -2737,6 +2737,40 @@ def format_leads_messages(rows, limit, max_chars=4096):
     return messages
 
 
+LEAD_ALERT_MESSAGE_CAP = 1500
+
+
+def format_lead_alert(lead_id, lead, max_chars=4096):
+    """The one Telegram message sent when a lead is committed. Pure.
+
+    Every field is submitter-controlled, so each is escaped before it reaches HTML. Telegram's HTML
+    mode needs only < > & escaped (quote=False): html.escape's default turns an apostrophe into a
+    numeric entity Telegram prints literally. The message is the only unbounded field, so it is
+    cut BEFORE escaping, a character at a time, until its escaped form fits what is left of
+    max_chars - slicing the escaped text could cut an entity such as &amp; in half."""
+    esc = lambda s: html.escape(str(s or ""), quote=False)
+    head = (f"📥 <b>New lead #{int(lead_id)}</b>\n"
+            f"<b>{esc(lead.get('name'))}</b> · <code>{esc(lead.get('email'))}</code>\n"
+            f"{esc(lead.get('source'))}")
+    tail = "\n\nFull text and history: /leads"
+    message = str(lead.get("message") or "").strip()
+    if not message:
+        return head + tail
+    # -1 for the "…" appended on a cut, -1 more so the total stays strictly under max_chars.
+    room = max_chars - len(head) - len(tail) - len("\n\n<i></i>") - 2
+    kept, used = [], 0
+    for ch in message[:LEAD_ALERT_MESSAGE_CAP]:
+        cost = len(esc(ch))
+        if used + cost > room:
+            break
+        kept.append(ch)
+        used += cost
+    text = "".join(kept).rstrip()
+    if len(text) < len(message):
+        text += "…"
+    return head + f"\n\n<i>{esc(text)}</i>" + tail
+
+
 # ==============================================================================
 # /refs - job application references
 # ==============================================================================
