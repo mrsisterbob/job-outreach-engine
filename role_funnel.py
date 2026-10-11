@@ -32,6 +32,14 @@ _CANON_RULES = (
     (r"reject|declin|pass|no thanks", "Rejected"),
 )
 
+# Kevin's own decision NOT to apply, typed into the sheet by hand (nothing in main.py writes
+# these): Pass / Decline / No thanks. Code.gs canonicalizeStatus() buckets them as "Rejected", and
+# _CANON_RULES must keep mirroring it, so the distinction is made here, in _Role.add_row, on the
+# raw status. This is deliberately Python-only: the Code.gs buckets (public stats) are unchanged.
+# \bpass keeps "bypass" out. An employer's "Rejected" is not this and stays (APPLIED, True).
+_OWN_DECISION_RE = re.compile(r"declin|\bpass(?:ed)?\b|no thanks", re.IGNORECASE)
+_EMPLOYER_REJECTION_RE = re.compile(r"reject", re.IGNORECASE)
+
 # Canonical JOBS Status -> (stage, rejected flag).
 _JOBS_STAGE = {
     "Matched": (MATCHED, False),
@@ -109,7 +117,15 @@ class _Role:
         self.tabs.append(tab)
         if schema == "JOBS":
             self.jobs_tabs.append(tab)
-            self.lift(*_JOBS_STAGE[canonicalize_status(row.get("status")) or "Matched"])
+            raw = str(row.get("status") or "")
+            canonical = canonicalize_status(raw) or "Matched"
+            if (canonical == "Rejected" and _OWN_DECISION_RE.search(raw)
+                    and not _EMPLOYER_REJECTION_RE.search(raw)):
+                # Kevin passed on or declined it: matched, never applied, never rejected. Any
+                # applied/interview/offer event in application_outcomes still lifts it.
+                self.lift(MATCHED, False)
+            else:
+                self.lift(*_JOBS_STAGE[canonical])
         elif str(row.get("status") or "").strip().lower() in _PEOPLE_INTERVIEW_STATUSES:
             self.lift(INTERVIEWED)
         if carmen_reply_anchor(row.get("note")) is not None:
@@ -138,13 +154,20 @@ def compute_role_funnel(crm_rows, outcome_events, tracked_uuids):
                         "replied_to_interviewed", "interviewed_to_offer": float 1dp or None},
               "by_persona": {"Tetiana"|"Clavicular"|"Other": {same six counts}}}
 
-    A sheet_uuid is a role if it has a JOBS-schema row, is in tracked_uuids, or has any outcome
-    event. PEOPLE rows only add evidence to an existing role; a PEOPLE row whose uuid is none of
+    A sheet_uuid is a role if it has a JOBS-schema row, is in tracked_uuids, or has an outcome
+    event with a known status. A JOBS row Kevin passed on or declined (Pass / Decline / No
+    thanks) is Matched, not Applied and not Rejected; an applied/interview/offer event still
+    lifts it, so a role he applied to and later declined shows as applied only when SQLite says
+    so. PEOPLE rows only add evidence to an existing role; a PEOPLE row whose uuid is none of
     those is a networking contact and never counts. A JOBS row with a blank uuid is a role of its
     own that cannot be joined to any other evidence.
     """
     crm_rows = list(crm_rows or [])
-    events = [(str(u or "").strip(), str(s or "").strip().lower()) for u, s in (outcome_events or [])]
+    # Only an event with a known status is evidence. An unknown one (a typo, a future event type)
+    # neither conjures a role nor lifts one, so it is dropped here, once, for both loops below.
+    events = [(u, s) for u, s in (
+        (str(u or "").strip(), str(s or "").strip().lower()) for u, s in (outcome_events or []))
+        if u and s in _EVENT_STAGE]
 
     roles = {}
     for uuid in tracked_uuids or ():
@@ -152,8 +175,7 @@ def compute_role_funnel(crm_rows, outcome_events, tracked_uuids):
         if uuid:
             roles.setdefault(uuid, _Role())
     for uuid, _status in events:
-        if uuid:
-            roles.setdefault(uuid, _Role())
+        roles.setdefault(uuid, _Role())
     for row in crm_rows:
         uuid = str(row.get("sheet_uuid") or "").strip()
         if uuid and str(row.get("schema") or "").upper() == "JOBS":
@@ -171,8 +193,7 @@ def compute_role_funnel(crm_rows, outcome_events, tracked_uuids):
             unkeyed.append(role)
 
     for uuid, status in events:
-        if uuid and status in _EVENT_STAGE:
-            roles[uuid].lift(*_EVENT_STAGE[status])
+        roles[uuid].lift(*_EVENT_STAGE[status])
 
     overall = _empty_counts()
     by_persona = {p: _empty_counts() for p in PERSONAS}

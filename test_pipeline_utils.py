@@ -3016,3 +3016,70 @@ def test_site_profile_copy_first_figure_label_matches_its_source_bullet(_sp_bank
     assert fig["value"] in bullet
     assert "onboarding throughput" in bullet and "onboarding throughput" in fig["label"]
     assert "ran operations" not in fig["label"]
+
+
+# ---- role_funnel: Kevin's own passes, and unknown outcome events ----
+
+@pytest.mark.parametrize("status", ["Pass", "Declined", "No thanks", "passed on it", "DECLINE"])
+def test_role_funnel_kevin_pass_counts_as_matched_not_applied_or_rejected(status):
+    result = role_funnel.compute_role_funnel([_rf_row("p1", "Clavicular", status)], [], set())
+
+    assert result["matched"] == 1
+    assert result["applied"] == 0 and result["rejected"] == 0
+    assert result["by_persona"]["Clavicular"]["applied"] == 0
+    assert result["rates"]["matched_to_applied"] == 0.0
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_kevin_pass_leaves_an_employer_rejection_alone():
+    for status in ("Rejected", "rejected - declined by employer"):
+        result = role_funnel.compute_role_funnel([_rf_row("r1", "Clavicular", status)], [], set())
+        assert result["applied"] == 1 and result["rejected"] == 1, status
+        _rf_assert_nested(result)
+
+
+def test_role_funnel_kevin_pass_does_not_match_inside_other_words_or_other_statuses():
+    # "bypass" is not Kevin passing (pass): it keeps the Code.gs bucket, Rejected -> applied+rejected.
+    for status in ("bypass review", "password reset", "passport copy"):
+        result = role_funnel.compute_role_funnel([_rf_row("w1", "Tetiana Cold", status)], [], set())
+        assert result["applied"] == 1 and result["rejected"] == 1, status
+    # A status that canonicalizes to Applied is never reinterpreted, whatever else the text says.
+    for status in ("Applied", "applied, then declined"):
+        result = role_funnel.compute_role_funnel([_rf_row("w2", "Tetiana Cold", status)], [], set())
+        assert result["applied"] == 1 and result["rejected"] == 0, status
+
+
+def test_role_funnel_kevin_pass_row_with_an_applied_event_still_counts_as_applied():
+    rows = [_rf_row("d1", "Tetiana Warm", "Declined")]
+    result = role_funnel.compute_role_funnel(rows, [("d1", "applied")], {"d1"})
+
+    assert result["applied"] == 1
+    assert result["rejected"] == 0
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_kevin_pass_canonicalizer_is_untouched():
+    # The Code.gs mirror still buckets "declined" as Rejected; the distinction lives in add_row.
+    assert role_funnel.canonicalize_status("Declined") == "Rejected"
+    assert role_funnel.canonicalize_status("No thanks") == "Rejected"
+
+
+def test_role_funnel_unknown_event_alone_does_not_create_a_role():
+    result = role_funnel.compute_role_funnel([], [("u1", "typo_status")], set())
+
+    assert result["matched"] == 0
+    assert result["by_persona"]["Other"]["matched"] == 0
+
+
+def test_role_funnel_unknown_event_with_a_known_one_still_makes_the_role():
+    result = role_funnel.compute_role_funnel([], [("u1", "typo_status"), ("u1", "applied")], set())
+
+    assert result["matched"] == 1 and result["applied"] == 1
+    _rf_assert_nested(result)
+
+
+def test_role_funnel_unknown_event_on_an_existing_role_changes_nothing():
+    rows = [_rf_row("x1", "Tetiana Cold", "Applied")]
+    result = role_funnel.compute_role_funnel(rows, [("x1", "bogus_status")], set())
+
+    assert result["matched"] == 1 and result["applied"] == 1
