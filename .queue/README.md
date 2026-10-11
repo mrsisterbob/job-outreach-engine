@@ -136,6 +136,8 @@ git status --porcelain                         # must print nothing, on branch m
 .venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q   # baseline: green before
 git merge --no-ff task/TASK-n -m "Merge TASK-n: ..."
 .venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q   # green after
+.venv/Scripts/python build_function_index.py   # only if the merge changed a .py file or Code.gs;
+                                               # commit FUNCTION_INDEX.md by name when it changed
 git worktree remove .worktrees/TASK-n && git branch -d task/TASK-n   # only once main is green
 rmdir .queue/merge.lock
 ```
@@ -167,9 +169,11 @@ To re-land it, move the task back to `inbox/`: the worker resumes on the branch,
 into it, runs `git revert <revert-sha>` there to bring the work back as new commits, and fixes
 what was red on top. By hand, the equivalent on `main` is `git revert <revert-sha>`.
 
-What the worker does on `main`, and nothing else: a `--no-ff` merge and, when the suites go
-red, a revert. It never pushes, never commits there directly, never resets and never stashes,
-and it holds every merge while the main folder has uncommitted work - your unreviewed changes
+What the worker does on `main`, and nothing else: a `--no-ff` merge, when the suites go
+red a revert, and - once `main` is green - a commit of the regenerated `FUNCTION_INDEX.md`
+(only when the merge changed a `.py` file or `Code.gs`, and only when the file changed).
+Those are its only writes there: it never pushes, never commits anything else on `main`,
+never resets and never stashes, and it holds every merge while the main folder has uncommitted work - your unreviewed changes
 are never mixed into a merge. You review after the fact: `git log --merges` on `main`, and
 `git show <merge>` for any one of them.
 
