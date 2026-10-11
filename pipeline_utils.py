@@ -2725,7 +2725,7 @@ def format_leads_messages(rows, limit, max_chars=4096):
             snippet = snippet[:280].rstrip() + "…"
         entries.append(
             f"<b>{esc(name)}</b> · <code>{esc(email)}</code>\n"
-            f"{esc(str(received_at or "")[:16])} · {esc(source)}"
+            f"{esc(str(received_at or '')[:16])} · {esc(source)}"
             + (f"\n<i>{esc(snippet)}</i>" if snippet else "")
         )
     messages, current = [], header
