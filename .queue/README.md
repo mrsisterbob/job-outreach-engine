@@ -119,8 +119,17 @@ them after five minutes - the worker would look like it was ignoring the planner
 
 ## The worker works in its own worktree, then merges it itself
 
+Each task is **built in a fresh subagent** (`general-purpose`, started with an empty context),
+not in the worker's own session. Why: Kevin is on Pro, and a worker that built every task itself
+would carry every task's reads, edits and test output through the whole `/queue-run` loop, with
+no way to `/clear` mid-loop. The worker's context now gains about one line per task. The worker
+still claims, re-checks the subagent's result, reviews, commits and merges - a subagent cannot
+start another agent, so `/code-review` has to run from the worker. This takes effect on the next
+`/queue-run`: a loop already running has the old text loaded.
+
 Each claimed task gets its own checkout: `.worktrees/TASK-n/` on branch `task/TASK-n`,
-started from `main`. The worker edits, tests and commits there.
+started from `main`. The build agent edits and tests there; the worker commits it from the
+main folder with `git -C`.
 
 Why: with one shared folder, every agent's Stop hook tested every other agent's
 half-finished edits. On 2026-10-03 the worker's mid-save `main.py` turned the chat's hook
@@ -133,9 +142,9 @@ the main folder and moves on to the next inbox task, until the inbox is empty:
 ```bash
 mkdir .queue/merge.lock                        # one merging worker at a time
 git status --porcelain                         # must print nothing, on branch main
-.venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q   # baseline: green before
+.venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q -p no:cacheprovider 2>&1 | tail -n 15   # baseline: green before
 git merge --no-ff task/TASK-n -m "Merge TASK-n: ..."
-.venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q   # green after
+.venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q -p no:cacheprovider 2>&1 | tail -n 15   # green after
 .venv/Scripts/python build_function_index.py   # only if the merge changed a .py file or Code.gs;
                                                # commit FUNCTION_INDEX.md by name when it changed
 git worktree remove .worktrees/TASK-n && git branch -d task/TASK-n   # only once main is green
