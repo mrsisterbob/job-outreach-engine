@@ -3644,21 +3644,18 @@ def test_status_short_id_command_unknown_id_reports_not_found_and_enqueues_nothi
     assert any("Record Not Found" in line for line in sent)
 
 
-# ---- /funnel Telegram command (reads the funnel_stats GET action) ----
+# ---- /funnel Telegram command (reads funnel_stats `rows`, counts per role) ----
 
-_FUNNEL_OK = {
-    "status": "success",
-    "overall": {"Matched": 12, "Applied": 8, "Replied": 4, "Screening": 2,
-                "Interviewing": 3, "Offer": 1, "Rejected": 5},
-    "by_persona": {
-        "Tetiana": {"Matched": 10, "Applied": 6, "Replied": 3, "Screening": 1,
-                    "Interviewing": 2, "Offer": 1, "Rejected": 4},
-        "Clavicular": {"Matched": 2, "Applied": 2, "Replied": 1, "Screening": 1,
-                       "Interviewing": 1, "Offer": 0, "Rejected": 1},
-    },
-    "rates": {"matched_to_applied": 66.7, "applied_to_reply": 50.0,
-              "reply_to_interview": 75.0, "interview_to_offer": 33.3},
-}
+def _frow(uuid, tab, status, schema="JOBS", note=""):
+    return {"sheet_uuid": uuid, "tab": tab, "schema": schema, "status": status, "note": note}
+
+
+def _funnel_payload(rows):
+    # `overall`/`by_persona`/`rates` are what the old handler rendered; they are kept in the
+    # payload on purpose - Code.gs still sends them and the new /funnel must ignore them.
+    return {"status": "success", "rows": rows,
+            "overall": {"Matched": 12, "Applied": 8, "Replied": 0, "Interviewing": 0},
+            "by_persona": {}, "rates": {"matched_to_applied": 254.2}}
 
 
 class _FakeResp:
@@ -3669,42 +3666,153 @@ class _FakeResp:
         return self._body
 
 
-def test_funnel_command_calls_funnel_stats_and_renders_personas(monkeypatch):
-    calls = []
-    monkeypatch.setattr(m, "crm_get", lambda params, *a, **k: calls.append(params) or _FakeResp(_FUNNEL_OK))
-    sent = []
-    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+@pytest.fixture
+def funnel_env(monkeypatch):
+    """/funnel with a fakeable CRM payload, real SQLite, and captured Telegram output."""
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM application_outcomes")
+        conn.commit()
+    box = {"payload": None, "sent": [], "calls": []}
+    monkeypatch.setattr(
+        m, "crm_get",
+        lambda params, *a, **k: box["calls"].append(params) or (
+            None if box["payload"] is None else _FakeResp(box["payload"])))
+    monkeypatch.setattr(m, "send_telegram_message",
+                        lambda chat_id, text, *a, **k: box["sent"].append(text) or 1)
+    yield box
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM application_outcomes")
+        conn.commit()
 
+
+def _funnel_text(box, payload):
+    box["payload"] = payload
     _dispatch("/funnel")
+    assert len(box["sent"]) == 1
+    return box["sent"][0]
 
-    assert calls == [{"action": "funnel_stats"}]
-    assert len(sent) == 1
-    body = sent[0]
+
+def test_funnel_command_role_funnel_renders_overall_and_personas(funnel_env):
+    rows = ([_frow(f"t{i}", "Tetiana Cold", "Applied") for i in range(3)]
+            + [_frow("c1", "Clavicular", "Matched")])
+    body = _funnel_text(funnel_env, _funnel_payload(rows))
+
+    assert funnel_env["calls"] == [{"action": "funnel_stats"}]
     assert "OVERALL" in body and "TETIANA" in body and "CLAVICULAR" in body
-    assert "Matched 12" in body and "Interviewing 3" in body and "Rejected 5" in body
-    assert "66.7%" in body and "33.3%" in body
+    assert "Matched 4 | Applied 3 | Replied 0" in body
+    assert "Interviewed 0 | Offer 0 | Rejected 0" in body
+    assert "Matched→Applied 75.0%" in body
+    assert "Applied→Replied 0.0%" in body        # 3 applied, 0 replied: a real zero
+    assert "Replied→Interviewed —" in body       # 0 replied: no rate, a dash and never 0.0%
+    assert "Interviewed→Offer —" in body
 
 
-def test_funnel_command_handles_webhook_unreachable(monkeypatch):
-    monkeypatch.setattr(m, "crm_get", lambda *a, **k: None)
-    sent = []
-    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+def test_role_funnel_2026_10_08_shape_shows_no_percent_above_100(funnel_env):
+    # Kevin's /funnel read Matched→Applied 254.2%: far more rows at Applied than at Matched.
+    rows = ([_frow(f"a{i}", "Tetiana Cold", "Applied") for i in range(61)]
+            + [_frow(f"m{i}", "Tetiana Cold", "Matched") for i in range(24)]
+            + [_frow(f"c{i}", "Clavicular", "applied 9/30") for i in range(5)])
+    body = _funnel_text(funnel_env, _funnel_payload(rows))
 
+    assert "Matched 90 | Applied 66" in body
+    pcts = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)%", body)]
+    assert pcts and max(pcts) <= 100, body
+    assert "254" not in body
+
+
+def test_role_funnel_sqlite_interviews_count_on_rows_still_at_applied(funnel_env):
+    rows = [_frow("tw1", "Tetiana Warm", "Applied"), _frow("tw2", "Tetiana Warm", "Applied")]
+    for uuid in ("tw1", "tw2"):
+        assert m.record_application_outcome(uuid, "applied", company="Acme")
+        assert m.record_application_outcome(uuid, "interview", company="Acme")
+    body = _funnel_text(funnel_env, _funnel_payload(rows))
+
+    assert "Interviewed 2" in body
+    assert "Replied→Interviewed 100.0%" in body
+
+
+def test_role_funnel_counts_applied_on_died_but_not_matched_on_died(funnel_env):
+    rows = [_frow("d1", "Died", "Applied"), _frow("d2", "Died", "Matched"),
+            _frow("t1", "Tetiana Cold", "Matched")]
+    body = _funnel_text(funnel_env, _funnel_payload(rows))
+
+    assert "Matched 2 | Applied 1" in body       # d1 (applied) + t1; the Died Matched row is out
+
+
+def test_role_funnel_payload_missing_rows_says_redeploy_and_renders_no_counts(funnel_env):
+    payload = _funnel_payload([])
+    del payload["rows"]
+    body = _funnel_text(funnel_env, payload)
+
+    assert "Redeploy" in body and "Manage deployments" in body
+    assert "Matched" not in body and "OVERALL" not in body
+
+
+def test_role_funnel_rows_null_is_also_the_redeploy_message_not_zeros(funnel_env):
+    payload = _funnel_payload([])
+    payload["rows"] = None
+    body = _funnel_text(funnel_env, payload)
+
+    assert "Redeploy" in body and "OVERALL" not in body
+
+
+def test_role_funnel_empty_rows_is_a_real_empty_crm_and_renders_zeros(funnel_env):
+    body = _funnel_text(funnel_env, _funnel_payload([]))
+
+    assert "OVERALL" in body and "Matched 0 | Applied 0 | Replied 0" in body
+    assert "Redeploy" not in body
+
+
+def test_role_funnel_sqlite_read_failure_reports_unavailable_not_a_funnel(funnel_env, monkeypatch):
+    def _boom():
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(m, "read_funnel_sqlite_evidence", _boom)
+    body = _funnel_text(funnel_env, _funnel_payload([_frow("a", "Tetiana Cold", "Applied")]))
+
+    assert "unavailable" in body.lower()
+    assert "OVERALL" not in body
+
+
+def test_funnel_command_handles_webhook_unreachable(funnel_env):
+    funnel_env["payload"] = None
     _dispatch("/funnel")
 
-    assert len(sent) == 1
-    assert "unavailable" in sent[0].lower()
+    assert len(funnel_env["sent"]) == 1
+    assert "unavailable" in funnel_env["sent"][0].lower()
 
 
-def test_funnel_command_handles_error_status_response(monkeypatch):
-    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _FakeResp({"status": "error", "message": "Unauthorized"}))
-    sent = []
-    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+def test_funnel_command_handles_error_status_response(funnel_env):
+    body = _funnel_text(funnel_env, {"status": "error", "message": "Unauthorized"})
 
-    _dispatch("/funnel")
+    assert "unavailable" in body.lower()
 
-    assert len(sent) == 1
-    assert "unavailable" in sent[0].lower()
+
+def test_funnel_stats_contract_code_gs_emits_every_row_with_the_keys_python_reads():
+    """Code.gs and main.py share no schema: a key Code.gs stops sending reads as a clean zero.
+    Pin the `rows` block of funnel_stats to the five keys role_funnel reads, and to the rule that
+    it covers every tab - no persona or JOBS-only filter (Python decides membership)."""
+    import pathlib
+    gs = (pathlib.Path(m.__file__).parent / "Code.gs").read_text(encoding="utf-8")
+    block = gs[gs.index('if (action === "funnel_stats")'):]
+    block = block[:block.index('return respondJSON({ status: "error", message: "Unsupported GET request" })')]
+
+    assert re.search(r"^\s*rows:\s*rows,", block, re.M), "funnel_stats must return `rows`"
+    start = block.index("const rows = [];")
+    rows_block = block[start:block.index("const overall = emptyBuckets();")]
+    push = rows_block[rows_block.index("rows.push({"):]
+    push = push[:push.index("});")]
+    keys = set(re.findall(r"^\s*([a-z_]+):", push, re.M))
+    assert keys == {"sheet_uuid", "tab", "schema", "status", "note"}
+
+    assert "personaFor" not in rows_block
+    assert 'TAB_MAP[tabName] !== "JOBS"' not in rows_block
+    assert "ALL_TABS.forEach" in rows_block
+    assert rows_block.count("getRange(") == 1     # one read per tab, not per row
+
+    import role_funnel
+    py = pathlib.Path(role_funnel.__file__).read_text(encoding="utf-8")
+    for key in keys:
+        assert f'"{key}"' in py, f"role_funnel never reads {key}"
 
 
 # ---- /edit voice lint: warn, never block ----
