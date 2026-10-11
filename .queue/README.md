@@ -89,6 +89,13 @@ Nothing watches the `inbox/` directory; no file appearing there triggers anythin
 message is what wakes the worker, not the file. If messaging is off or the planner is not
 running, `/queue-run` typed by hand does the same thing.
 
+A montelattice-site request (pages, layout, CSS, templates, site routes) typed into this
+planner is not queued here: `/queue-add` forwards it word for word to the `site-planner`
+session, and queues only the engine half of a mixed request. `site-planner` must be running
+(`/rename site-planner` in a montelattice-site terminal), or the planner prints the request
+back as **NOT forwarded** for you to paste there. A request the site forwards in is queued
+here and never sent back.
+
 This needs `crossSessionInbound: "accept"`, already set in `.claude/settings.local.json`.
 Without it, a bypass-permissions session holds incoming messages for approval and drops
 them after five minutes - the worker would look like it was ignoring the planner.

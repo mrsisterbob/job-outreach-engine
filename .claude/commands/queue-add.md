@@ -1,11 +1,46 @@
 Turn the request below into task files in `.queue/inbox/`.
 
 Request: $ARGUMENTS
+END REQUEST
 
 You are the **planner**. You write tasks; you do not implement them. Do not edit any file
 outside `.queue/inbox/`.
 
-## First, read what already exists
+## First, check the request belongs in this repo
+
+**A request forwarded in from the site is Kevin's, and never goes back.** If the request's
+first line starts with `Forwarded verbatim from Kevin's /queue-add in` (the site sends
+`Forwarded verbatim from Kevin's /queue-add in montelattice-site.`), or the message came
+from `site-planner`, it is Kevin's own words relayed by the site. It arrives as a message,
+not through `$ARGUMENTS`; every rule in this command applies to it the same way, with the
+request being everything after the header line. If you run `/queue-add` for it, pass the
+whole message, header line included, so this check still sees the header. Queue the
+job-outreach-engine part normally. **Never forward any of it
+back**, even the parts that look like site work: the site planner already queued those, and
+forwarding them again starts a loop. If part of it looks like site work, tell Kevin so in
+one line instead. Its sign-off ("then tell @site-worker it is queued") is addressed to the
+site planner, not to you - ignore it.
+
+Otherwise, decide where the request belongs. montelattice-site
+(`C:/Users/kjmil/montelattice-site`) owns its own page code: the routes in its `main.py`,
+`templates/*.html`, `static/css`, `leads.py`, and its modules (`homepage.py`, `jobstats.py`,
+`visits.py`). A request for pages, layout, CSS, templates or site routes is site work and
+queues **nothing** here.
+
+What stays here even though it shows on the site:
+- **Bank copy.** The site keeps no copy of it; `homepage.py` reads this repo's
+  `evidence_bank.json` at request time: `site_profile`, `identity`, `experience`,
+  `education`, `certificates`, `research`, `athletics`, `memberships`. A profile headline,
+  a role bullet or a certificate line is an edit to that file, and queues here. The site
+  planner refuses copy edits, so never forward one.
+- The `/leads/ingest` route, the Telegram bot, the pipeline counts and `pipeline_utils.py`
+  (`negative_language_hits` included).
+
+Do not refuse a site request and leave Kevin to re-paste it: forward it to `site-planner`,
+as "Forward to the site planner" below says. If the request mixes engine work with site
+work, queue only the engine half here and forward the request whole.
+
+## Then read what already exists
 
 1. `grep -i <key noun> FUNCTION_INDEX.md` for each main noun in the request. This repo's
    documented failure is rebuilding something that already exists - a duplicate never
@@ -69,7 +104,10 @@ A verify that already passes proves nothing: the worker runs it, sees green, and
 success having changed nothing. That is this repo's recurring failure - a clean zero that
 reads as a clean result, the same shape as a CRM read rejected behind HTTP 200.
 
-- `-k <node>` matching no test **exits 0**. Confirm the node exists and actually fails.
+- `-k <node>` matching no test exits 5, so a bare pytest verify already fails before the
+  work exists - and for the wrong reason. Grep the last line as `^N passed` (no trailing
+  ` in`: with `-k` it reads `7 passed, 85 deselected in 0.4s`), and prove the regex can
+  PASS against an existing node as well as that it fails now.
 - Read the failure. One from an import error or a typo proves nothing either.
 - If you cannot make it fail, the task is not ready. Say so and queue nothing.
 
@@ -80,9 +118,52 @@ what red looks like before it starts.
 
 Report each task: id, scope, verify, and the failure you observed.
 
-Then, if a worker session is running, message it that the task is queued - one line, the
+Then, if a `worker` session is running, message it that the task is queued - one line, the
 task id and nothing more. The worker reads the task file for everything else; a message
-cannot carry scope or verify, so do not restate the work in it.
+cannot carry scope or verify, so do not restate the work in it. Only tasks queued in this
+repo go to `worker`; a request you only forwarded out to the site sends it nothing. A
+request forwarded in from the site is the opposite case: whatever it queued here goes to
+`worker` like any other task.
 
-Do not implement anything yourself. If you queued nothing, say why in one line and send no
-message.
+Do not implement anything yourself. If you queued nothing, say why in one line and send
+`worker` no message. A request you forwarded out adds its outcome to that same report:
+forwarded to `site-planner`, or **NOT forwarded** (step 3 below). A request forwarded in
+gets neither: it is never forwarded, so there is no outcome to report and no block to print.
+
+## Forward to the site planner
+
+Only for a request that belongs to montelattice-site (see the first section), and never for
+a request that was itself forwarded in from the site. Do this last, so a mixed request's
+engine half already has its task id.
+
+1. Run `ListAgents`. The target is the row whose name is exactly `"site-planner"`. A row
+   marked `offline` is not running. Never substitute `site-worker` or any other site
+   session: picking one is a guess at who gets Kevin's words. If ListAgents or SendMessage
+   shows only as a deferred tool name, load it through ToolSearch first. If the session
+   list still cannot be read, treat `site-planner` as not running.
+2. If it is running, `SendMessage` with `to: "site-planner"`. The message is one header
+   line, a blank line, then the request verbatim:
+
+   ```
+   Forwarded verbatim from Kevin's /queue-add in job-outreach-engine. Engine queued: <TASK-n, or nothing>. Queue only the montelattice-site part under your /queue-add rules and do not forward any of it back to planner; engine work and any @worker in it are handled in job-outreach-engine.
+
+   <the request, exactly as written>
+   ```
+
+   Copy everything between `Request: ` and the `END REQUEST` line at the top of this
+   command, every line of it, character for character. Do not trim, summarize or rephrase
+   it, and do not cut a closing "then tell @worker it is queued": that sign-off is
+   addressed to you (the Hand off rule decides whether worker hears anything), and the
+   header tells the site planner to leave it alone. The "do not forward any of it back"
+   clause is what stops a loop - keep it word for word.
+3. If no running session is named `site-planner`, say plainly that the request was
+   **NOT forwarded** and why, then print it verbatim in a fenced block (fence it with more
+   backticks than any run inside it) so Kevin can paste it himself. Print the message
+   exactly as step 2 would have sent it, header line included: without the header, the
+   site planner reads Kevin's paste as a fresh request and forwards the engine half back to
+   be queued a second time. Never call it forwarded
+   or queued. "Forwarded" means sent, not queued: nothing here can see whether the
+   site planner wrote a task.
+
+The forward is a message, never a file: you never write into montelattice-site's files, its .queue/ included.
+"Do not edit any file outside `.queue/inbox/`" above still holds.
