@@ -685,6 +685,30 @@ function doGet(e) {
         return null; // Died archive / anything else - no persona, excluded from the funnel
       };
 
+      // `rows`: one entry per data row on EVERY tab (JOBS and PEOPLE, Died and Killed included),
+      // read with one getRange per tab. Python (role_funnel.compute_role_funnel) decides which
+      // rows are roles, so this loop is deliberately not filtered by persona or schema.
+      const rows = [];
+      ALL_TABS.forEach(tabName => {
+        const sheet = ss.getSheetByName(tabName);
+        if (!sheet || sheet.getLastRow() < 2) return;
+        const schema = TAB_MAP[tabName] || "PEOPLE";
+        // getRange throws past the sheet's last column, so a tab narrower than the UUID column
+        // must not take the whole funnel down: read what exists, a missing cell reads as "".
+        const width = Math.min(UUID_COL, sheet.getLastColumn());
+        if (width < 1) return;
+        const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
+        for (let i = 0; i < values.length; i++) {
+          rows.push({
+            sheet_uuid: (values[i][UUID_COL - 1] || "").toString().trim(),
+            tab: tabName,
+            schema: schema,
+            status: (values[i][STATUS_COL - 1] || "").toString(),
+            note: (values[i][NOTES_COL - 1] || "").toString()
+          });
+        }
+      });
+
       const overall = emptyBuckets();
       const byPersona = {};
       ALL_TABS.forEach(tabName => {
@@ -708,6 +732,7 @@ function doGet(e) {
         status: "success",
         overall: overall,
         by_persona: byPersona,
+        rows: rows,
         rates: {
           matched_to_applied: rate(overall.Applied, overall.Matched),
           applied_to_reply: rate(overall.Replied, overall.Applied),

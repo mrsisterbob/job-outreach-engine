@@ -33,6 +33,7 @@ from track_registry import (
 from response_schema import GeminiJobScreenerResponse
 from command_help import lookup_command_help
 from open_followups import collect_open_followups
+from role_funnel import compute_role_funnel
 from pipeline_utils import (
     ladder_progress, format_ladder_progress, carmen_terminal_gap,
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
@@ -1822,6 +1823,18 @@ def record_application_outcome(sheet_uuid, status, company=None, role=None, sour
     except Exception as e:
         logging.error(f"Application Outcome Record Error ({sheet_uuid}, {status}): {e}")
         return False
+
+def read_funnel_sqlite_evidence():
+    """(outcome_events, tracked_uuids) for role_funnel.compute_role_funnel: every
+    (sheet_uuid, status) row of application_outcomes, and the set of sheet_uuids in the jobs
+    cache. Raises on a database error - the /funnel handler reports that, it never renders a
+    funnel on half its evidence."""
+    with get_db_conn() as conn:
+        events = [(r[0], r[1]) for r in conn.execute(
+            "SELECT sheet_uuid, status FROM application_outcomes")]
+        tracked = {r[0] for r in conn.execute(
+            "SELECT sheet_uuid FROM jobs WHERE sheet_uuid IS NOT NULL AND sheet_uuid != ''")}
+    return events, tracked
 
 def get_posted_hours_at_card(sheet_uuid):
     """The posting's age in hours at the moment its card was sent, or None if it cannot be derived.
@@ -13133,29 +13146,42 @@ def process_webhook_payload_async(data):
             if not payload or payload.get("status") != "success":
                 send_telegram_message(chat_id, "⚠️ <b>Funnel unavailable:</b> couldn't read the CRM funnel endpoint.")
                 return
+            if not isinstance(payload.get("rows"), list):
+                # Code.gs and main.py share no schema: a deployed Apps Script that predates the
+                # `rows` field would otherwise render as a clean, confident funnel of zeros.
+                send_telegram_message(
+                    chat_id,
+                    "⚠️ <b>Funnel unavailable:</b> the CRM endpoint is out of date. Redeploy the "
+                    "Apps Script (Apps Script → Manage deployments) so funnel_stats returns every row.")
+                return
+            try:
+                events, tracked = read_funnel_sqlite_evidence()
+            except Exception as e:
+                logging.error(f"/funnel SQLite read failed: {e}")
+                send_telegram_message(chat_id, "⚠️ <b>Funnel unavailable:</b> couldn't read the local application history.")
+                return
+            funnel = compute_role_funnel(payload.get("rows") or [], events, tracked)
 
-            def _fmt_buckets(b):
-                b = b or {}
+            def _fmt_counts(c):
                 return (
-                    f"Matched {b.get('Matched', 0)} | Applied {b.get('Applied', 0)} | Replied {b.get('Replied', 0)}\n"
-                    f"Screening {b.get('Screening', 0)} | Interviewing {b.get('Interviewing', 0)} | "
-                    f"Offer {b.get('Offer', 0)} | Rejected {b.get('Rejected', 0)}"
+                    f"Matched {c['matched']} | Applied {c['applied']} | Replied {c['replied']}\n"
+                    f"Interviewed {c['interviewed']} | Offer {c['offers']} | Rejected {c['rejected']}"
                 )
 
-            rates = payload.get("rates", {})
-            _pct = lambda key: f"{float(rates.get(key) or 0):.1f}"
+            rates = funnel["rates"]
+            _pct = lambda key: "—" if rates.get(key) is None else f"{rates[key]:.1f}%"
             funnel_lines = [
                 "📊 <b>CRM Pipeline Funnel</b>\n",
                 "<b>OVERALL</b>",
-                _fmt_buckets(payload.get("overall", {})),
-                (f"<b>Rates:</b> Matched→Applied {_pct('matched_to_applied')}% · "
-                 f"Applied→Replied {_pct('applied_to_reply')}% · "
-                 f"Replied→Interviewing {_pct('reply_to_interview')}% · "
-                 f"Interviewing→Offer {_pct('interview_to_offer')}%"),
+                _fmt_counts(funnel),
+                (f"<b>Rates:</b> Matched→Applied {_pct('matched_to_applied')} · "
+                 f"Applied→Replied {_pct('applied_to_replied')} · "
+                 f"Replied→Interviewed {_pct('replied_to_interviewed')} · "
+                 f"Interviewed→Offer {_pct('interviewed_to_offer')}"),
             ]
-            for persona, buckets in (payload.get("by_persona") or {}).items():
+            for persona, counts in funnel["by_persona"].items():
                 funnel_lines.append(f"\n<b>{html.escape(str(persona)).upper()}</b>")
-                funnel_lines.append(_fmt_buckets(buckets))
+                funnel_lines.append(_fmt_counts(counts))
             # Supply comes from the local SQLite metrics, not the CRM payload above, so it renders
             # even when Sheets is the thing that is slow.
             funnel_lines.append(format_market_supply_message(get_market_supply()))
