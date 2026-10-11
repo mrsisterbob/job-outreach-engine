@@ -12073,3 +12073,119 @@ def test_cv_accepts_tracks_f_through_h(monkeypatch):
     _dispatch("/cv h", reply_to_message={"message_id": 77, "text": card_text, "entities": entities})
 
     assert compiled == ["h"]
+
+
+# ---- JSearch direct apply link (normalized once, at the fetch boundary) ----
+
+_DAL_LINKEDIN = "https://www.linkedin.com/jobs/view/3900000001"
+_DAL_EMPLOYER = "https://careers.acmefab.com/jobs/ops-analyst-441"
+
+
+def _dal_fetch(monkeypatch, raw_jobs):
+    """Push raw JSearch-shaped dicts through the real fetch_single_query_jobs boundary."""
+    monkeypatch.setattr(m, "_fetch_jsearch_page_with_retry",
+                        lambda api_url, headers, params, query, page: (list(raw_jobs), True))
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: 45 if key == "radius_miles" else default)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    return m.fetch_single_query_jobs(("Operations Analyst Troy MI", "http://x", {}))
+
+
+def _dal_job(**over):
+    job = {"job_id": "j1", "employer_name": "Acme Fabrication", "job_title": "Operations Analyst",
+           "job_apply_link": _DAL_LINKEDIN, "job_apply_is_direct": False,
+           "employer_website": "https://www.acmefab.com"}
+    job.update(over)
+    return job
+
+
+def test_direct_apply_link_replaces_a_relist_with_the_flagged_employer_option(monkeypatch):
+    job = _dal_job(apply_options=[
+        {"publisher": "LinkedIn", "apply_link": _DAL_LINKEDIN, "is_direct": False},
+        {"publisher": "Acme", "apply_link": _DAL_EMPLOYER, "is_direct": True},
+    ])
+    out = _dal_fetch(monkeypatch, [job])[0]
+
+    assert out["job_apply_link"] == _DAL_EMPLOYER
+    assert out["job_relist_link"] == _DAL_LINKEDIN
+
+
+def test_direct_apply_link_keeps_a_link_jsearch_already_marked_direct(monkeypatch):
+    job = _dal_job(job_apply_link=_DAL_EMPLOYER, job_apply_is_direct=True, apply_options=[
+        {"publisher": "Other", "apply_link": "https://other.example.com/x", "is_direct": True}])
+    out = _dal_fetch(monkeypatch, [job])[0]
+
+    assert out["job_apply_link"] == _DAL_EMPLOYER
+    assert "job_relist_link" not in out
+
+
+def test_direct_apply_link_falls_back_to_an_option_on_the_employer_website_domain(monkeypatch):
+    job = _dal_job(apply_options=[
+        {"publisher": "BeBee", "apply_link": "https://bebee.com/job/abc", "is_direct": False},
+        {"publisher": "Acme", "apply_link": "https://jobs.acmefab.com/req/9", "is_direct": False},
+    ])
+    out = _dal_fetch(monkeypatch, [job])[0]
+
+    assert out["job_apply_link"] == "https://jobs.acmefab.com/req/9"
+    assert out["job_relist_link"] == _DAL_LINKEDIN
+
+
+def test_direct_apply_link_a_lookalike_domain_is_not_the_employer(monkeypatch):
+    job = _dal_job(apply_options=[
+        {"publisher": "x", "apply_link": "https://notacmefab.com/req/9", "is_direct": False}])
+    out = _dal_fetch(monkeypatch, [job])[0]
+
+    assert out["job_apply_link"] == _DAL_LINKEDIN
+
+
+@pytest.mark.parametrize("options", [
+    "not-a-list", None, 7, [], [None, "x", 3],
+    [{"apply_link": "https://bebee.com/a", "is_direct": False}],          # no direct, no employer host
+    [{"apply_link": None, "is_direct": True}, {"is_direct": True}],       # direct but no link
+    [{"apply_link": "acmefab.com/jobs", "is_direct": True}],              # not an http(s) link
+], ids=["string", "none", "int", "empty", "junk-entries", "all-relists", "no-link", "not-http"])
+def test_direct_apply_link_malformed_or_useless_options_leave_the_job_untouched(monkeypatch, options):
+    job = _dal_job(apply_options=options)
+    before = dict(job)
+    out = _dal_fetch(monkeypatch, [job])[0]
+
+    assert out == before
+    assert "job_relist_link" not in out
+
+
+def test_direct_apply_link_missing_options_key_and_odd_types_do_not_raise(monkeypatch):
+    jobs = [_dal_job(), _dal_job(job_apply_link=None, apply_options=[
+        {"apply_link": _DAL_EMPLOYER, "is_direct": True}]), _dal_job(employer_website=42)]
+    out = _dal_fetch(monkeypatch, jobs)
+
+    assert len(out) == 3
+    assert out[0]["job_apply_link"] == _DAL_LINKEDIN
+    assert out[1]["job_apply_link"] == _DAL_EMPLOYER and "job_relist_link" not in out[1]
+
+
+def test_direct_apply_link_never_picks_an_aggregator_relist_even_when_flagged_direct(monkeypatch):
+    relist = "https://www.learn4good.com/jobs/view/55"
+    job = _dal_job(apply_options=[{"publisher": "L4G", "apply_link": relist, "is_direct": True}])
+    out = _dal_fetch(monkeypatch, [job])[0]
+
+    assert out["job_apply_link"] == _DAL_LINKEDIN
+    assert "job_relist_link" not in out
+
+
+def test_direct_apply_link_rescued_relist_job_clears_the_aggregator_link_gate(monkeypatch):
+    relist = "https://www.learn4good.com/jobs/view/55"
+    raw = _dal_job(job_apply_link=relist, apply_options=[
+        {"publisher": "learn4good", "apply_link": relist, "is_direct": False},
+        {"publisher": "Acme", "apply_link": _DAL_EMPLOYER, "is_direct": True}])
+    control = dict(raw, apply_options=[{"publisher": "learn4good", "apply_link": relist, "is_direct": False}])
+
+    rescued = _dal_fetch(monkeypatch, [raw])[0]
+    stuck = _dal_fetch(monkeypatch, [control])[0]
+
+    trace_stuck = m.FunnelTrace()
+    m.passes_strict_filter(stuck, trace_stuck)
+    assert "aggregator_link" in trace_stuck.reasons        # the gate does fire on the bare relist
+
+    trace_rescued = m.FunnelTrace()
+    m.passes_strict_filter(rescued, trace_rescued)
+    assert rescued["job_apply_link"] == _DAL_EMPLOYER and rescued["job_relist_link"] == relist
+    assert "aggregator_link" not in trace_rescued.reasons

@@ -41,7 +41,7 @@ from pipeline_utils import (
     resolve_smart_target_tab, enforce_sentence_limit, get_fit_score_indicator,
     generate_dedup_hash, normalize_dedup_key, generate_short_key, parse_posted_hours, get_age_badge,
     extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall,
-    derive_job_source, is_unverified_email, status_rank, STATUS_VOCAB,
+    derive_job_source, job_link_host, is_unverified_email, status_rank, STATUS_VOCAB,
     followup_action, followup_anchor, is_followup_unscheduled,
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
@@ -4865,6 +4865,69 @@ def is_aggregator_relist(apply_link):
     if not host:
         return False
     return any(host == d or host.endswith("." + d) for d in AGGREGATOR_RELIST_DOMAINS)
+
+
+def _link_host(link):
+    """Host of an http(s) link (pipeline_utils.job_link_host), or "" for anything else - a bare
+    domain, a mailto:, a non-string."""
+    if not isinstance(link, str) or not re.match(r"\s*https?://", link, re.IGNORECASE):
+        return ""
+    return job_link_host(link)
+
+
+def pick_direct_apply_link(job):
+    """The employer's own apply link for a JSearch result, or None to leave the job as it is.
+
+    JSearch's job_apply_link is whatever publisher ranked first, often a one-click relist
+    (LinkedIn, beBee, Adzuna); the employer's page, when JSearch has one, is in apply_options.
+    Order (decided in TASK-7): the job's own link if job_apply_is_direct; else the first option
+    flagged is_direct; else the first option on the employer_website's host; else None. An option
+    that is_aggregator_relist is never picked. Any field may be missing or the wrong type - this
+    returns None rather than raising into the fetch.
+    """
+    try:
+        if not isinstance(job, dict):
+            return None
+        current = job.get("job_apply_link")
+        if job.get("job_apply_is_direct") is True and isinstance(current, str) and current.strip():
+            return None
+        options = job.get("apply_options")
+        if not isinstance(options, list):
+            return None
+        usable = []
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            link = opt.get("apply_link")
+            if not _link_host(link) or is_aggregator_relist(link):
+                continue
+            usable.append((opt, link.strip()))
+        for opt, link in usable:
+            if opt.get("is_direct") is True:
+                return link
+        employer_host = _link_host(job.get("employer_website"))
+        if employer_host:
+            for _opt, link in usable:
+                host = _link_host(link)
+                if host == employer_host or host.endswith("." + employer_host):
+                    return link
+    except Exception as e:
+        logging.warning(f"pick_direct_apply_link skipped a malformed JSearch result: {e}")
+    return None
+
+
+def apply_direct_link(job):
+    """Swap a JSearch job's job_apply_link for the employer's direct link when one is on offer,
+    keeping the relist link in job["job_relist_link"]. Done once, at the JSearch boundary, so the
+    relist gate, the cards, the CRM rows and the jobs cache all read the same field. A job that
+    is not swapped is left exactly as it arrived."""
+    picked = pick_direct_apply_link(job)
+    if picked and picked != job.get("job_apply_link"):
+        original = job.get("job_apply_link")
+        job["job_apply_link"] = picked
+        if original:
+            job["job_relist_link"] = original
+    return job
 
 
 FUNNEL_REJECTION_LABELS = {
@@ -10926,7 +10989,7 @@ def fetch_single_query_jobs(query_args):
         time.sleep(0.3)  # stagger outbound requests to avoid slamming JSearch concurrently
         page_jobs, should_stop = _fetch_jsearch_page_with_retry(api_url, headers, params, query, page)
         if page_jobs:
-            all_jobs.extend(page_jobs)
+            all_jobs.extend(apply_direct_link(j) for j in page_jobs)
         if should_stop or not page_jobs:
             break  # no more results or retries exhausted, stop paging early
     if is_remote_query:
