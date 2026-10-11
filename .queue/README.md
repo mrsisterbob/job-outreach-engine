@@ -102,6 +102,15 @@ session, and queues only the engine half of a mixed request. `site-planner` must
 back as **NOT forwarded** for you to paste there. A request the site forwards in is queued
 here and never sent back.
 
+Each command checks the session's name before doing anything. `/queue-add` typed in any
+session not named `planner`, or `/queue-run` typed in one not named `worker`, does no work
+there: it forwards the command word for word to the session with the right name, tells you in
+one line, and stops (or prints it back as **NOT forwarded** when that session is not running).
+So both sessions must be `/rename`d exactly `planner` and `worker`. If a session's name cannot
+be read, the command does nothing and asks for the `/rename`. `/queue-status` is read-only and
+has no guard: it works in any session. A forwarded `/queue-run` arrives as text, and the worker
+runs it because its guard says to, so "forwarded" means sent, not necessarily running.
+
 This needs `crossSessionInbound: "accept"`, already set in `.claude/settings.local.json`.
 Without it, a bypass-permissions session holds incoming messages for approval and drops
 them after five minutes - the worker would look like it was ignoring the planner.

@@ -2,6 +2,46 @@ Claim the next task from `.queue/inbox/` and execute it.
 
 Optional argument (a task id, e.g. `TASK-003`) picks that task instead of the oldest: $ARGUMENTS
 
+## Which session is this
+
+This command is the worker's. Before anything else - before reading the queue, claiming a
+task or opening a worktree - find out which session you are in.
+
+1. Run `ListAgents`. Its first line reads `This session is <name> [<ref>] - ...`; that
+   `<name>` is this session's name. If `ListAgents` or `SendMessage` shows only as a deferred
+   tool name, load it through ToolSearch first. If the name cannot be read (tool missing, no
+   such line), **do nothing**: no claim, no file read of the queue, no worktree. Say so in one
+   line and suggest Kevin `/rename worker` here, or type the command in the worker terminal.
+   Building in a session of unknown name is the bug this guard exists to stop.
+2. **Named exactly `worker`: this is the right session.** Carry on with the rest of this file.
+   A message whose first line starts with `Forwarded verbatim from Kevin's /queue-run in` is
+   Kevin's own command, relayed by another session: the line after the blank line is the
+   command Kevin typed. Drop its leading `/queue-run` token and invoke the `queue-run` skill
+   (Skill tool) with whatever follows it as the arguments - nothing, or a task id such as
+   `TASK-14` - exactly as if Kevin had typed it. A cross-session message does not execute as a slash command, so this rule is what makes
+   it one. Never forward it again.
+3. **Any other name: do no queue work in this session.** Find the `ListAgents` row named
+   exactly `worker`; a row marked `offline` is not running. Never substitute another session.
+   - Running: `SendMessage` with `to: "worker"`. The message is one header line, a blank line,
+     then the command exactly as Kevin typed it, `/queue-run` followed by the arguments in the
+     line above, character for character (nothing after it if he typed no argument):
+
+     ```
+     Forwarded verbatim from Kevin's /queue-run in <this session's name>. Run it here as typed.
+
+     /queue-run <arguments>
+     ```
+
+   - Not running: say plainly that the command was **NOT forwarded** because `worker` is not
+     running, and print `/queue-run <arguments>` so Kevin can type it in the worker terminal.
+
+   Either way, tell Kevin in one line where it went, then **stop**: claim nothing, move no
+   queue file, open no worktree, edit nothing. "Forwarded" means sent, not run: nothing here can
+   see whether the worker started. A forwarded message is acted on only by the session named
+   `worker`, and that session never forwards it on.
+
+(`/queue-status` only reads the queue and has no such guard.)
+
 You are the **worker**. You implement one task at a time, verify it, merge it into `main`,
 and go back for the next one, until the inbox is empty or nothing left in it can run (see
 "When the loop ends" at the bottom). Never push.
