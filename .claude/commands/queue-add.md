@@ -79,12 +79,47 @@ Do not refuse a site request and leave Kevin to re-paste it: forward it to `site
 as "Forward to the site planner" below says. If the request mixes engine work with site
 work, queue only the engine half here and forward the request whole.
 
+## Keep context small
+
+Kevin is on Pro and this command burns his usage when it pulls too much into context. Three
+rules:
+
+1. **Grep first, read line ranges.** `grep -n <symbol>` (or Grep with `-n`) finds the lines,
+   then Read with `offset` and `limit` around them. Never Read `main.py` (16,114 lines),
+   `test_main_integration.py` (12,563), `test_pipeline_utils.py` (3,085), `pipeline_utils.py`
+   (2,885) or any file over ~500 lines whole; `Code.gs` is 1,224. `FUNCTION_INDEX.md` (641) is
+   grepped, never read whole. Short files (queue command files, task files, small modules)
+   can be read whole. (`wc -l` on 2026-10-11 at 1dd425e.)
+2. **A passing command shows only its last line; a failing one shows its last 60.** Capture
+   to a temp file and print based on the exit code:
+   ```bash
+   out=$(mktemp); <command> >"$out" 2>&1; rc=$?
+   if [ $rc -eq 0 ]; then tail -n 1 "$out"; else tail -n 60 "$out"; fi
+   rm -f "$out"; echo "exit=$rc"
+   ```
+   Use it for every pytest run and every task `verify`. A verify may contain single quotes,
+   so never wrap it in `bash -c '...'`: put its text in a variable (`V=$(sed -n 's/^verify:
+   //p' <task file>)`) and run `bash -c "$V"` as the `<command>`.
+   For the planner that includes the pass-regex proof run below.
+   Read the printed `exit=` line, not the tool status: the wrapper itself always exits 0. A
+   red run keeps the FAILED names, which sit at the end, so the Log gets the real failure
+   output. Don't use `exit $rc`: it ends the shell.
+3. **Never re-read an unchanged file.** If a file, or that line range, was already read this
+   task and nothing has edited it since, use what you have. After your own Edit, the tool
+   already holds the file's state, so don't read it back to check. Re-read only what changed
+   (a file another session or agent edited, or a range you haven't seen) or what is no longer
+   in your context (after a resume, a compaction, or a SendMessage retry).
+
+Only *passing* output shrinks. The observed failure still goes in `## Proof it is needed`, and
+a proof-of-failure run is *expected* to fail, so it prints in full.
+
 ## Then read what already exists
 
 1. `grep -i <key noun> FUNCTION_INDEX.md` for each main noun in the request. This repo's
    documented failure is rebuilding something that already exists - a duplicate never
    fails a test. If the function is already there, say so and write no task.
-2. Read the actual code you intend to change. A task written from a guess about what a
+2. Read the actual code you intend to change - grep for the lines, then read that range (see
+   "Keep context small"). A task written from a guess about what a
    function does sends the worker into a file that does not look like the plan.
 3. `ls .queue/inbox .queue/active` - do not queue something already queued or in flight.
 
@@ -151,7 +186,8 @@ reads as a clean result, the same shape as a CRM read rejected behind HTTP 200.
 - If you cannot make it fail, the task is not ready. Say so and queue nothing.
 
 Put the observed failure in the task's `## Proof it is needed` section so the worker knows
-what red looks like before it starts.
+what red looks like before it starts. The proof run is expected to fail, so it prints in full;
+the run that proves the pass-regex can PASS should show one line (see "Keep context small").
 
 ## Hand off
 
