@@ -12459,6 +12459,225 @@ def test_lead_alert_is_sent_off_the_request_thread(leads_env, monkeypatch, captu
     assert len(capture_sent) == 1
 
 
+# ---- /leads/ingest re-alerts a duplicate whose first alert never arrived (TASK-24) ----
+
+def _lead_alert_state():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT alerted_at, alert_attempted_at FROM inbound_leads ORDER BY id").fetchall()
+
+
+def test_lead_realert_failed_first_send_is_resent_once_on_resubmission(leads_env, monkeypatch):
+    sent = []
+    results = iter([False, True, True])
+    monkeypatch.setattr(m, "send_telegram_message",
+                        lambda chat_id, text, *a, **k: sent.append(text) or next(results))
+
+    first = _post_lead(_GOOD_LEAD)
+    assert len(sent) == 1 and _lead_alert_state()[0][0] is None       # undelivered, attempt cleared
+    again = _post_lead(_GOOD_LEAD)
+    third = _post_lead(_GOOD_LEAD)
+
+    assert again.status_code == 200 and again.get_json()["duplicate"] is True
+    assert again.get_json()["id"] == first.get_json()["id"]
+    assert third.get_json()["duplicate"] is True
+    assert len(_lead_rows()) == 1
+    assert len(sent) == 2                                              # one re-alert, not two
+    assert "Dana Ruiz" in sent[1]
+    assert _lead_alert_state()[0][0] is not None
+
+
+def test_lead_realert_raising_first_send_is_resent_once(leads_env, monkeypatch):
+    sent = []
+
+    def _send(chat_id, text, *a, **k):
+        sent.append(text)
+        if len(sent) == 1:
+            raise RuntimeError("telegram down")
+        return 1
+    monkeypatch.setattr(m, "send_telegram_message", _send)
+
+    _post_lead(_GOOD_LEAD)
+    again = _post_lead(_GOOD_LEAD)
+    _post_lead(_GOOD_LEAD)
+
+    assert again.status_code == 200 and again.get_json()["duplicate"] is True
+    assert len(_lead_rows()) == 1
+    assert len(sent) == 2
+
+
+def test_lead_realert_delivered_first_send_keeps_a_resubmission_silent(leads_env, capture_sent):
+    _post_lead(_GOOD_LEAD)
+    state = _lead_alert_state()[0]
+    again = _post_lead(_GOOD_LEAD)
+
+    assert state[0] is not None                                        # alerted_at is on the row
+    assert again.get_json()["duplicate"] is True
+    assert len(capture_sent) == 1
+
+
+def test_lead_realert_in_flight_stays_silent_until_the_attempt_is_two_minutes_old(leads_env, capture_sent):
+    _post_lead(_GOOD_LEAD)
+    with m.get_db_conn() as conn:                                      # a send started now, no result
+        conn.execute("UPDATE inbound_leads SET alerted_at = NULL, alert_attempted_at = datetime('now')")
+        conn.commit()
+    capture_sent.clear()
+
+    _post_lead(_GOOD_LEAD)
+    assert capture_sent == []
+
+    with m.get_db_conn() as conn:                                      # that send was killed 3 min ago
+        conn.execute("UPDATE inbound_leads SET alert_attempted_at = datetime('now', '-3 minutes')")
+        conn.commit()
+    _post_lead(_GOOD_LEAD)
+    assert len(capture_sent) == 1
+    _post_lead(_GOOD_LEAD)
+    assert len(capture_sent) == 1                                      # and now it is delivered
+    assert len(_lead_rows()) == 1
+
+
+def test_lead_realert_a_resubmission_during_the_first_send_does_not_double_alert(leads_env, monkeypatch):
+    sent = []
+    spawned = []
+    monkeypatch.setattr(m, "_spawn_background", spawned.append)       # the first send has not run yet
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+
+    _post_lead(_GOOD_LEAD)
+    _post_lead(_GOOD_LEAD)                                             # resubmitted while in flight
+
+    assert len(spawned) == 1
+    spawned[0]()
+    assert len(sent) == 1
+
+
+def test_lead_realert_migration_adds_the_columns_to_an_old_table_and_keeps_the_row(leads_env, monkeypatch):
+    with m.get_db_conn() as conn:
+        conn.execute("DROP TABLE inbound_leads")
+        conn.execute("""CREATE TABLE inbound_leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            source TEXT NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, message TEXT)""")
+        conn.execute("INSERT INTO inbound_leads (source, name, email, message) VALUES (?,?,?,?)",
+                     ("montelattice.com/docfiler", "Old Lead", "old@firm.com", "hello"))
+        conn.commit()
+
+    m.init_db()
+    m.init_db()                                                        # idempotent on every boot
+
+    with m.get_db_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(inbound_leads)")}
+        rows = conn.execute("SELECT name, alerted_at FROM inbound_leads").fetchall()
+    assert {"alerted_at", "alert_attempted_at"} <= cols
+    assert rows[0][0] == "Old Lead" and rows[0][1] is not None      # predates the column: backfilled
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    resp = _post_lead(_GOOD_LEAD)
+    assert resp.status_code == 200 and len(sent) == 1
+    assert len(_lead_rows()) == 2
+
+
+def test_lead_realert_a_slow_failed_send_does_not_clear_a_newer_claim(leads_env, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(m, "_spawn_background", spawned.append)
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: None)   # always fails
+    stamps = iter(["2026-10-11 10:00:00", "2026-10-11 10:03:00"])
+    monkeypatch.setattr(m, "_lead_attempt_stamp", lambda: next(stamps))
+
+    _post_lead(_GOOD_LEAD)                                  # claim A, thread queued not run
+    with m.get_db_conn() as conn:                           # A's send was presumed dead...
+        conn.execute("UPDATE inbound_leads SET alert_attempted_at = datetime('now', '-3 minutes')")
+        conn.commit()
+    _post_lead(_GOOD_LEAD)                                  # ...so a resubmission claims B
+    assert len(spawned) == 2
+    with m.get_db_conn() as conn:
+        b_stamp = conn.execute("SELECT alert_attempted_at FROM inbound_leads").fetchone()[0]
+    assert b_stamp is not None
+
+    spawned[0]()                                            # A finally fails, after B's claim
+
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT alert_attempted_at FROM inbound_leads").fetchone()[0] == b_stamp
+
+
+def test_lead_realert_a_null_message_row_re_alerts_without_raising(leads_env, monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO inbound_leads (source, name, email, message) VALUES (?,?,?,NULL)",
+                     ("montelattice.com/docfiler", "Dana Ruiz", "dana@firm.com"))
+        conn.commit()
+
+    resp = _post_lead(dict(_GOOD_LEAD, message=""))
+
+    assert resp.status_code == 200 and resp.get_json()["duplicate"] is True
+    assert len(sent) == 1 and "Dana Ruiz" in sent[0]
+    assert len(_lead_rows()) == 1
+
+
+def test_lead_realert_migration_backfills_old_rows_so_they_do_not_re_alert(leads_env, capture_sent):
+    with m.get_db_conn() as conn:
+        conn.execute("DROP TABLE inbound_leads")
+        conn.execute("""CREATE TABLE inbound_leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            source TEXT NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, message TEXT)""")
+        conn.execute("INSERT INTO inbound_leads (source, name, email, message) VALUES (?,?,?,?)",
+                     ("montelattice.com/docfiler", "Dana Ruiz", "dana@firm.com", "40k PDFs"))
+        conn.commit()
+
+    m.init_db()
+
+    with m.get_db_conn() as conn:
+        alerted = conn.execute("SELECT alerted_at, received_at FROM inbound_leads").fetchone()
+    assert alerted[0] is not None and alerted[0] == alerted[1]
+    resp = _post_lead(_GOOD_LEAD)
+    assert resp.get_json()["duplicate"] is True
+    assert capture_sent == []
+    # a later boot must not backfill again: an undelivered row stays undelivered
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE inbound_leads SET alerted_at = NULL")
+        conn.commit()
+    m.init_db()
+    assert _lead_alert_state()[0][0] is None
+
+
+def test_lead_realert_a_spawn_failure_releases_the_claim_and_still_returns_200(leads_env, monkeypatch):
+    def _no_thread(fn):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(m, "_spawn_background", _no_thread)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+
+    resp = _post_lead(_GOOD_LEAD)
+
+    assert resp.status_code == 200 and resp.get_json()["status"] == "ok"
+    assert _lead_alert_state() == [(None, None)]            # claim released, not held for 2 minutes
+    monkeypatch.setattr(m, "_spawn_background", lambda fn: fn())
+    assert _post_lead(_GOOD_LEAD).get_json()["duplicate"] is True
+    assert len(sent) == 1
+
+
+def test_lead_realert_a_failed_delivered_write_is_retried_once(leads_env, monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    real = m.get_db_conn
+    calls = {"n": 0}
+
+    @contextlib.contextmanager
+    def _flaky():
+        calls["n"] += 1
+        if calls["n"] == 2:                                 # call 1 = record, call 2 = first alerted_at write
+            raise sqlite3.OperationalError("database is locked")
+        with real() as conn:
+            yield conn
+    monkeypatch.setattr(m, "get_db_conn", _flaky)
+
+    _post_lead(_GOOD_LEAD)
+
+    monkeypatch.setattr(m, "get_db_conn", real)
+    assert calls["n"] == 3
+    assert _lead_alert_state()[0][0] is not None
+
+
 # ---- public stats read the same per-role funnel as /funnel (TASK-20) ----
 
 @pytest.fixture

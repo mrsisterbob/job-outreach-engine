@@ -1365,9 +1365,22 @@ def init_db():
             source TEXT NOT NULL,
             name TEXT NOT NULL,
             email TEXT NOT NULL,
-            message TEXT
+            message TEXT,
+            alerted_at TIMESTAMP,
+            alert_attempted_at TIMESTAMP
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_leads_time ON inbound_leads(received_at)")
+        # Delivery tracking arrived after inbound_leads already held rows on Render, so these are
+        # ALTERs (CREATE TABLE IF NOT EXISTS is a no-op there), PRAGMA-guarded like posted_hours
+        # above. Existing rows get NULL alerted_at and are treated as never delivered.
+        lead_columns = {row[1] for row in conn.execute("PRAGMA table_info(inbound_leads)")}
+        for lead_col in ("alerted_at", "alert_attempted_at"):
+            if lead_col not in lead_columns:
+                conn.execute(f"ALTER TABLE inbound_leads ADD COLUMN {lead_col} TIMESTAMP")
+        if "alerted_at" not in lead_columns:
+            # Once, in the branch that adds the column: leads that predate it were already seen,
+            # and leaving them NULL would re-alert each one that is resubmitted inside 24h.
+            conn.execute("UPDATE inbound_leads SET alerted_at = received_at WHERE alerted_at IS NULL")
 
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM search_filters")
@@ -15822,43 +15835,112 @@ LEADS_MAX_LIMIT = 50
 
 
 LEAD_DUPLICATE_WINDOW_HOURS = 24
+# A send that started more than this long ago and never recorded a result is presumed dead (a
+# Render recycle kills the background thread without clearing its attempt), so a resubmission may
+# send again. Shorter than a human's retry, longer than send_telegram_message's worst case.
+LEAD_ALERT_INFLIGHT_MINUTES = 2
+
+
+def _lead_attempt_stamp():
+    """Now as an explicit UTC 'YYYY-MM-DD HH:MM:SS' (the format datetime('now') writes, so the
+    SQL comparisons still work). Known to Python so the sender can prove a claim is still its own."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def record_inbound_lead(lead):
-    """Commit one validated lead (see validate_lead). Returns (lead_id, is_new).
+    """Commit one validated lead (see validate_lead). Returns (lead_id, is_new, alert_lead).
 
     A lead with the same source, email (case-insensitive) and message as a row received in the
     last 24 hours is a resubmission - the site gives up after 6s and tells the person it failed, so
-    they send it again - and is not stored a second time: (existing_id, False). The check and the
-    insert share one BEGIN IMMEDIATE transaction, so two simultaneous double-click POSTs cannot
-    both pass the check and both insert."""
+    they send it again - and is not stored a second time: (existing_id, False, ...). The check and
+    the insert share one BEGIN IMMEDIATE transaction, so two simultaneous double-click POSTs cannot
+    both pass the check and both insert.
+
+    alert_lead is the dict to send a Telegram alert for, or None when no alert is owed. A new lead
+    is always owed one (its INSERT marks the send as attempted). A duplicate is owed one only when
+    the first alert was never delivered (alerted_at NULL) and no send is in flight
+    (alert_attempted_at NULL or older than LEAD_ALERT_INFLIGHT_MINUTES); that is claimed by one
+    UPDATE inside the same transaction, so two resubmissions cannot both send. The stored row is
+    what gets re-alerted."""
     with get_db_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        attempt = _lead_attempt_stamp()
         existing = conn.execute(
-            "SELECT id FROM inbound_leads WHERE source = ? AND lower(email) = lower(?) "
+            "SELECT id, source, name, email, message FROM inbound_leads "
+            "WHERE source = ? AND lower(email) = lower(?) "
             "AND COALESCE(message, '') = ? AND received_at >= datetime('now', ?) "
             "ORDER BY id LIMIT 1",
             (lead["source"], lead["email"], lead["message"] or "",
              f"-{int(LEAD_DUPLICATE_WINDOW_HOURS)} hours")).fetchone()
         if existing:
-            conn.rollback()
-            return existing[0], False
+            claimed = conn.execute(
+                "UPDATE inbound_leads SET alert_attempted_at = ? "
+                "WHERE id = ? AND alerted_at IS NULL AND (alert_attempted_at IS NULL "
+                "OR alert_attempted_at < datetime('now', ?))",
+                (attempt, existing[0], f"-{int(LEAD_ALERT_INFLIGHT_MINUTES)} minutes")).rowcount
+            conn.commit()
+            if claimed != 1:
+                return existing[0], False, None
+            return existing[0], False, {"source": existing[1], "name": existing[2],
+                                        "email": existing[3], "message": existing[4],
+                                        "_attempt": attempt}
         cur = conn.execute(
-            "INSERT INTO inbound_leads (source, name, email, message) VALUES (?, ?, ?, ?)",
-            (lead["source"], lead["name"], lead["email"], lead["message"]))
+            "INSERT INTO inbound_leads (source, name, email, message, alert_attempted_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (lead["source"], lead["name"], lead["email"], lead["message"], attempt))
         conn.commit()
-        return cur.lastrowid, True
+        return cur.lastrowid, True, dict(lead, _attempt=attempt)
+
+
+def _record_lead_alert_result(lead_id, delivered, attempt=None):
+    """Write a send's outcome on the row. Delivered: alerted_at is set regardless of who owns the
+    claim (the person was told; retried once if the write fails). Not delivered: clear
+    alert_attempted_at ONLY if it is still the stamp this sender wrote, so a slow failed send
+    cannot erase a newer sender's claim and let a third one through. Own connection; a failure is
+    logged and never raised."""
+    for tries_left in (1, 0):
+        try:
+            with get_db_conn() as conn:
+                if delivered:
+                    conn.execute("UPDATE inbound_leads SET alerted_at = datetime('now') "
+                                 "WHERE id = ?", (lead_id,))
+                else:
+                    conn.execute("UPDATE inbound_leads SET alert_attempted_at = NULL "
+                                 "WHERE id = ? AND alerted_at IS NULL AND alert_attempted_at = ?",
+                                 (lead_id, attempt))
+                conn.commit()
+            return
+        except Exception as e:
+            if delivered and tries_left:
+                continue
+            logging.error(f"[LEADS] could not record alert result for lead #{lead_id}: {e}")
+            return
 
 
 def _send_lead_alert(lead_id, lead):
     """Tell Kevin about a committed lead. Runs off the request thread (send_telegram_message can
     take 5s plus a 429 retry, past the site's 6s limit) and can never change the response: the
-    lead is already committed, so a failure here is only logged."""
+    lead is already committed, so a failure here is only logged. The outcome is written on the
+    row (alerted_at / alert_attempted_at) so a resubmission can re-alert a lead never delivered.
+    lead["_attempt"] is the claim stamp this send owns (format_lead_alert ignores the key)."""
+    delivered = False
     try:
-        if not send_telegram_message(TELEGRAM_CHAT_ID, format_lead_alert(lead_id, lead)):
+        delivered = bool(send_telegram_message(TELEGRAM_CHAT_ID, format_lead_alert(lead_id, lead)))
+        if not delivered:
             logging.error(f"[LEADS] alert for lead #{lead_id} was not delivered to Telegram")
     except Exception as e:
         logging.error(f"[LEADS] alert for lead #{lead_id} failed: {e}")
+    _record_lead_alert_result(lead_id, delivered, lead.get("_attempt"))
+
+
+def _start_lead_alert(lead_id, alert_lead):
+    """Queue the alert. If the thread cannot be started the claim made for it is released (only
+    if still ours), so the alert is not suppressed for LEAD_ALERT_INFLIGHT_MINUTES. Never raises."""
+    try:
+        _spawn_background(lambda: _send_lead_alert(lead_id, alert_lead))
+    except Exception as e:
+        logging.error(f"[LEADS] could not start the alert for lead #{lead_id}: {e}")
+        _record_lead_alert_result(lead_id, False, alert_lead.get("_attempt"))
 
 
 def get_recent_leads(limit=LEADS_DEFAULT_LIMIT):
@@ -15877,7 +15959,8 @@ def leads_ingest():
     Returns 200 {"status": "ok", "id": N} only after the row is committed - the site treats
     anything else as a failed submission and tells the person so. A resubmission of the same
     source, email and message within 24h returns 200 {"status": "ok", "id": <the first row's id>,
-    "duplicate": true}: nothing is stored and no alert is sent."""
+    "duplicate": true}: nothing is stored. The alert is re-sent (once, in the background) only if
+    the first one was never delivered and none is in flight; the response is the same either way."""
     token = os.environ.get("LEAD_INGEST_TOKEN", "")
     if not token:
         logging.warning("[CONFIG WARNING] LEAD_INGEST_TOKEN is unset - refusing an inbound lead.")
@@ -15889,17 +15972,20 @@ def leads_ingest():
     if error:
         return jsonify({"status": "invalid", "error": error}), 400
     try:
-        lead_id, is_new = record_inbound_lead(lead)
+        lead_id, is_new, alert_lead = record_inbound_lead(lead)
     except Exception as e:
         logging.error(f"[LEADS] write failed for {lead['source']} lead: {e}")
         return jsonify({"status": "error"}), 500
     if not is_new:
         # 200, not an error: the earlier submission IS committed, and anything else makes the
         # site tell the person it failed, which prompts yet another resubmission.
-        logging.info(f"[LEADS] duplicate of lead #{lead_id} from {lead['source']} - nothing stored")
+        logging.info(f"[LEADS] duplicate of lead #{lead_id} from {lead['source']} - nothing stored"
+                     f"{'; re-sending its undelivered alert' if alert_lead else ''}")
+        if alert_lead:
+            _start_lead_alert(lead_id, alert_lead)
         return jsonify({"status": "ok", "id": lead_id, "duplicate": True}), 200
     logging.info(f"[LEADS] stored lead #{lead_id} from {lead['source']}")
-    _spawn_background(lambda: _send_lead_alert(lead_id, dict(lead)))
+    _start_lead_alert(lead_id, alert_lead)
     return jsonify({"status": "ok", "id": lead_id}), 200
 
 
