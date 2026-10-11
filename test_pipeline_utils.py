@@ -3047,10 +3047,10 @@ def test_site_profile_copy_story_lines_start_with_i_stay_short_and_explain_the_s
         assert topic in joined, topic
 
 
-def test_site_profile_copy_signal_role_note_is_one_line_and_names_the_nda(_sp_bank):
-    note = _sp_bank["site_profile"]["role_notes"]["Signal Advisors"]
-    assert "\n" not in note and note.strip()
-    assert "NDA" in note
+def test_site_profile_copy_has_no_role_notes(_sp_bank):
+    # Kevin, 2026-10-11: the Signal Advisors work is not under an NDA; no role shows a note.
+    assert "role_notes" not in _sp_bank["site_profile"]
+    assert "NDA" not in json.dumps(_sp_bank, ensure_ascii=False)
 
 
 def test_site_profile_copy_first_figure_label_matches_its_source_bullet(_sp_bank):
