@@ -423,7 +423,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 26 | `_norm_email` | _(no docstring)_ |
 | 30 | `collect_open_followups` | snapshots: {run_date "YYYY-MM-DD": result dict as saved by save_followup_queue_snapshot} |
 
-## `pipeline_utils.py` — 107 defs, 2,885 lines
+## `pipeline_utils.py` — 107 defs, 2,887 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -529,11 +529,11 @@ grep -i "contact" FUNCTION_INDEX.md
 | 2651 | `format_visitor_line` | The standup's one analytics line. Referrers lead - they are the signal; the raw count is |
 | 2689 | `validate_lead` | (lead_dict, None) or (None, error_message) for one submitted lead. |
 | 2710 | `format_leads_messages` | The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are |
-| 2743 | `format_lead_alert` | The one Telegram message sent when a lead is committed. Pure. |
-| 2786 | `parse_reference_args` | `Name \| email \| phone \| Work \| years \| Org \| City` -> (reference dict, None) or (None, error). |
-| 2810 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
-| 2845 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
-| 2850 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
+| 2745 | `format_lead_alert` | The one Telegram message sent when a lead is committed. Pure. |
+| 2788 | `parse_reference_args` | `Name \| email \| phone \| Work \| years \| Org \| City` -> (reference dict, None) or (None, error). |
+| 2812 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
+| 2847 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
+| 2852 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
 
 ## `response_schema.py` — 4 defs, 46 lines
 
