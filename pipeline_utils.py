@@ -2710,21 +2710,23 @@ def validate_lead(payload):
 def format_leads_messages(rows, limit, max_chars=4096):
     """The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are
     (id, received_at, source, name, email, message), newest first. Every field is
-    submitter-controlled, so all of it is escaped before it reaches HTML, and messages split only
+    submitter-controlled, so all of it is escaped (< > & only, quote=False: Telegram prints an
+    apostrophe entity literally) before it reaches HTML, and messages split only
     between leads - slicing mid-entry could cut an HTML tag in half. One entry is bounded well under
     4096 even fully escaped (name 200, email 254, snippet 280)."""
     if not rows:
         return ["📥 <b>Leads</b>\n\nNo leads received yet."]
     header = f"📥 <b>Leads</b> - latest {len(rows)} (of up to {limit}), times UTC"
+    esc = lambda s: html.escape(str(s or ""), quote=False)
     entries = []
     for _id, received_at, source, name, email, message in rows:
         snippet = (message or "").replace("\n", " ").strip()
         if len(snippet) > 280:
             snippet = snippet[:280].rstrip() + "…"
         entries.append(
-            f"<b>{html.escape(name or '')}</b> · <code>{html.escape(email or '')}</code>\n"
-            f"{html.escape(str(received_at or ''))[:16]} · {html.escape(source or '')}"
-            + (f"\n<i>{html.escape(snippet)}</i>" if snippet else "")
+            f"<b>{esc(name)}</b> · <code>{esc(email)}</code>\n"
+            f"{esc(str(received_at or '')[:16])} · {esc(source)}"
+            + (f"\n<i>{esc(snippet)}</i>" if snippet else "")
         )
     messages, current = [], header
     for entry in entries:

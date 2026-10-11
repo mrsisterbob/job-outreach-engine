@@ -2451,6 +2451,50 @@ def test_leads_messages_split_between_entries_and_stay_under_the_limit():
     assert all(m.count("<i>") == m.count("</i>") for m in msgs)
 
 
+def test_leads_messages_keep_apostrophes_and_quotes_literal():
+    row = (1, "2026-09-27 12:00:00", "it's the site", "O'Brien", "o'brien@x.co", "don't \"quote\" me")
+    out = "\n".join(pu.format_leads_messages([row], 1))
+    assert "O'Brien" in out and "o'brien@x.co" in out and "it's the site" in out
+    assert "don't" in out and '"quote"' in out
+    assert "&#x27;" not in out and "&quot;" not in out
+
+
+def test_leads_messages_keep_apostrophes_but_still_escape_angle_brackets_and_ampersand():
+    row = (1, "2026-09-27 12:00:00", "s", "O'Brien", "a@x.co", "<b>x</b> & y")
+    out = "\n".join(pu.format_leads_messages([row], 1))
+    assert "&lt;b&gt;x&lt;/b&gt; &amp; y" in out
+    assert "<b>x</b>" not in out
+
+
+def test_leads_messages_keep_apostrophes_slice_received_at_before_escaping():
+    """Slicing the escaped string could cut an entity such as &amp; in half."""
+    row = (1, "&&&&&&&&&&&&&&&&&&&&", "s", "n", "a@x.co", "")
+    out = pu.format_leads_messages([row], 1)[0]
+    stamp_line = out.split("\n")[-1].split(" · ")[0]
+    assert stamp_line == "&amp;" * 16
+    assert "&amp" not in stamp_line.replace("&amp;", "")
+
+
+def test_leads_messages_keep_apostrophes_end_to_end_through_ingest_and_telegram(monkeypatch):
+    m.init_db()  # idempotent; the table may not exist when another suite owns the DB file
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_leads")
+        conn.commit()
+    monkeypatch.setenv("LEAD_INGEST_TOKEN", "tok-apos")
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    with m.app.test_client() as client:
+        r = client.post("/leads/ingest", headers={"X-Lead-Token": "tok-apos"}, json={
+            "name": "O'Brien", "email": "ob@firm.com", "message": "don't lose my files",
+            "source": "montelattice.com/docfiler"})
+    assert r.status_code < 300
+    sent.clear()
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/leads"}})
+    assert len(sent) == 1
+    assert "O'Brien" in sent[0] and "don't lose my files" in sent[0]
+    assert "&#x27;" not in sent[0]
+
+
 # ---- ladder_progress / format_ladder_progress ("day 11 of 21") ----
 
 def test_ladder_progress_counts_days_since_the_anchor():
