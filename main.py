@@ -1828,14 +1828,56 @@ def record_application_outcome(sheet_uuid, status, company=None, role=None, sour
 def read_funnel_sqlite_evidence():
     """(outcome_events, tracked_uuids) for role_funnel.compute_role_funnel: every
     (sheet_uuid, status) row of application_outcomes, and the set of sheet_uuids in the jobs
-    cache. Raises on a database error - the /funnel handler reports that, it never renders a
-    funnel on half its evidence."""
-    with get_db_conn() as conn:
-        events = [(r[0], r[1]) for r in conn.execute(
-            "SELECT sheet_uuid, status FROM application_outcomes")]
-        tracked = {r[0] for r in conn.execute(
-            "SELECT sheet_uuid FROM jobs WHERE sheet_uuid IS NOT NULL AND sheet_uuid != ''")}
+    cache. Raises on a database error - load_role_funnel turns that into a reason, and nothing
+    renders a funnel on half its evidence.
+
+    Opens SQLite read-only (mode=ro): this runs on the public, unauthenticated stats path, where a
+    write must fail at the database rather than depend on every helper happening not to write."""
+    with read_only_db():
+        with get_db_conn() as conn:
+            events = [(r[0], r[1]) for r in conn.execute(
+                "SELECT sheet_uuid, status FROM application_outcomes")]
+            tracked = {r[0] for r in conn.execute(
+                "SELECT sheet_uuid FROM jobs WHERE sheet_uuid IS NOT NULL AND sheet_uuid != ''")}
     return events, tracked
+
+
+FUNNEL_CRM_UNREADABLE = "crm"            # CRM down, non-200, non-JSON or status != success
+FUNNEL_CRM_OUT_OF_DATE = "out_of_date"   # payload has no `rows` list: Apps Script not redeployed
+FUNNEL_SQLITE_UNREADABLE = "sqlite"      # local application history could not be read
+
+
+def load_role_funnel(timeout=10):
+    """The one read path for the per-role funnel: CRM funnel_stats `rows` plus the SQLite
+    application_outcomes events and jobs-cache uuids, through role_funnel.compute_role_funnel.
+    /funnel and the public stats both go through here, so they cannot disagree.
+
+    Returns (funnel, None) or (None, reason) with reason one of the FUNNEL_* constants - the
+    caller decides what to say, because /funnel words each failure differently. A payload with no
+    `rows` list is NOT an empty funnel: it is a deployed Apps Script that predates the field, and
+    rendering it would be a clean, confident zero."""
+    res = crm_get({"action": "funnel_stats"}, timeout=timeout)
+    if res is None or getattr(res, "status_code", 200) != 200:
+        return None, FUNNEL_CRM_UNREADABLE
+    try:
+        payload = res.json()
+    except Exception as e:
+        logging.error(f"Role funnel: funnel_stats returned non-JSON: {e}")
+        return None, FUNNEL_CRM_UNREADABLE
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        logging.error("Role funnel: funnel_stats did not report success: "
+                      f"{payload.get('message') if isinstance(payload, dict) else payload!r}")
+        return None, FUNNEL_CRM_UNREADABLE
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        return None, FUNNEL_CRM_OUT_OF_DATE
+    try:
+        events, tracked = read_funnel_sqlite_evidence()
+    except Exception as e:
+        logging.error(f"Role funnel: SQLite read failed: {e}")
+        return None, FUNNEL_SQLITE_UNREADABLE
+    return compute_role_funnel(rows, events, tracked), None
+
 
 def get_posted_hours_at_card(sheet_uuid):
     """The posting's age in hours at the moment its card was sent, or None if it cannot be derived.
@@ -8115,8 +8157,9 @@ def get_weekly_build_log_counts(days=7):
     A read that fails leaves the keys it covers as None - never 0 - so compose_build_log drops
     those lines instead of publishing a number the database never gave. (get_rolling_metric_counts
     returns 0 for every key on a failed read, which is why it is not reused here.) A read that
-    succeeds and finds nothing is a real 0. Replies exclude auto-rejections, as build_public_stats
-    does: counting them would inflate the number in the flattering direction.
+    succeeds and finds nothing is a real 0. Replies exclude auto-rejections: counting them would
+    inflate the number in the flattering direction. (They come from inbound_threads, not from the
+    per-role funnel the public stats use, so the two can differ.)
     """
     counts = {key: None for key in BUILD_LOG_METRIC_EVENTS}
     counts["replies"] = None
@@ -13290,17 +13333,11 @@ def process_webhook_payload_async(data):
             send_telegram_message(chat_id, f"📈 <b>Golden Ratio:</b> {ratio:.1f}% ({interviews_set} interviews / {messages_sent} sent)")
             return
         if text == "/funnel":
-            res = crm_get({"action": "funnel_stats"})
-            payload = {}
-            if res is not None:
-                try:
-                    payload = res.json()
-                except Exception:
-                    payload = {}
-            if not payload or payload.get("status") != "success":
+            funnel, why = load_role_funnel()
+            if why == FUNNEL_CRM_UNREADABLE:
                 send_telegram_message(chat_id, "⚠️ <b>Funnel unavailable:</b> couldn't read the CRM funnel endpoint.")
                 return
-            if not isinstance(payload.get("rows"), list):
+            if why == FUNNEL_CRM_OUT_OF_DATE:
                 # Code.gs and main.py share no schema: a deployed Apps Script that predates the
                 # `rows` field would otherwise render as a clean, confident funnel of zeros.
                 send_telegram_message(
@@ -13308,13 +13345,12 @@ def process_webhook_payload_async(data):
                     "⚠️ <b>Funnel unavailable:</b> the CRM endpoint is out of date. Redeploy the "
                     "Apps Script (Apps Script → Manage deployments) so funnel_stats returns every row.")
                 return
-            try:
-                events, tracked = read_funnel_sqlite_evidence()
-            except Exception as e:
-                logging.error(f"/funnel SQLite read failed: {e}")
+            if why == FUNNEL_SQLITE_UNREADABLE:
                 send_telegram_message(chat_id, "⚠️ <b>Funnel unavailable:</b> couldn't read the local application history.")
                 return
-            funnel = compute_role_funnel(payload.get("rows") or [], events, tracked)
+            if funnel is None:  # a reason this handler does not know: never fall through to funnel[...]
+                send_telegram_message(chat_id, "⚠️ <b>Funnel unavailable:</b> couldn't build the funnel.")
+                return
 
             def _fmt_counts(c):
                 return (
@@ -15565,61 +15601,34 @@ def _public_stats_days_running(now=None):
 
 
 def build_public_stats(now=None):
-    """Aggregate the CRM funnel into public counts, or return None if the CRM is unreachable.
+    """Public pipeline counts from the per-role funnel, or None when it cannot be read.
 
-    Bucket semantics matter here, because funnel_stats reports each row's CURRENT status, not
-    its history. A row sitting in Interviewing was necessarily applied to and necessarily
-    replied to, so each count rolls up every stage at or past it:
+    Same read path as /funnel (load_role_funnel), so the public page and /funnel cannot disagree.
+    Each role is counted once at the highest stage any evidence says it reached, and reaching a
+    stage counts it in every earlier one, so the counts are nested:
 
-      applications_logged - every row past Matched (Matched means sourced but not yet applied)
-      replies             - rows that drew a human response that moved them forward
-      interviews          - Screening, Interviewing and Offer (a recruiter screen is an interview)
+      applications_logged - roles that reached Applied or past it
+      replies             - roles that drew a human response (every interview is one)
+      interviews          - roles that reached a screen or an interview
+      still_sourcing      - matched roles not yet applied to
 
-    Rejected is reported on its own line rather than folded into replies. A rejection is
-    terminal, and the bucket cannot tell an auto-reject from a post-interview no - counting
-    those as "replies" would inflate the reply rate in exactly the direction that flatters.
+    Rejected is its own line, never folded into replies: an auto-reject counted as a reply would
+    inflate the reply rate in exactly the direction that flatters. ANY failure - CRM down, an Apps
+    Script that predates `rows`, SQLite unreadable - returns None; falling back to the old
+    current-status buckets would bring back the two-numbers problem.
     """
-    res = crm_get({"action": "funnel_stats"}, timeout=15)
-    if res is None or res.status_code != 200:
+    funnel, why = load_role_funnel(timeout=15)
+    if funnel is None:
+        logging.error(f"Public stats: role funnel unavailable ({why})")
         return None
-    try:
-        data = res.json()
-    except Exception as e:
-        logging.error(f"Public stats: funnel_stats returned non-JSON: {e}")
-        return None
-    if data.get("status") != "success":
-        logging.error(f"Public stats: funnel_stats error: {data.get('message')}")
-        return None
-
-    overall = data.get("overall") or {}
-    if not isinstance(overall, dict) or not overall:
-        return None
-
-    def n(key):
-        try:
-            return int(overall.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    matched = n("Matched")
-    applied = n("Applied")
-    replied = n("Replied")
-    screening = n("Screening")
-    interviewing = n("Interviewing")
-    offer = n("Offer")
-    rejected = n("Rejected")
-
-    interviews = screening + interviewing + offer
-    replies = replied + interviews
-    applications_logged = applied + replies + rejected
 
     return {
-        "applications_logged": applications_logged,
-        "replies": replies,
-        "interviews": interviews,
-        "offers": offer,
-        "rejections": rejected,
-        "still_sourcing": matched,
+        "applications_logged": funnel["applied"],
+        "replies": funnel["replied"],
+        "interviews": funnel["interviewed"],
+        "offers": funnel["offers"],
+        "rejections": funnel["rejected"],
+        "still_sourcing": funnel["matched"] - funnel["applied"],
         "days_running": _public_stats_days_running(now),
         "start_date": PUBLIC_STATS_START_DATE,
         "as_of": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d"),
@@ -15643,7 +15652,7 @@ def public_stats():
             cached = _public_stats_cache["payload"]
         if cached is not None:
             return jsonify(dict(cached, status="ok", cached=True, stale=True)), 200
-        return jsonify({"status": "unavailable", "message": "CRM unreachable; no counts to report"}), 503
+        return jsonify({"status": "unavailable", "message": "Pipeline counts unavailable (CRM unreachable, out of date, or local history unreadable); no counts to report"}), 503
 
     with _public_stats_lock:
         _public_stats_cache["payload"] = payload

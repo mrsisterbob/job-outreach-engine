@@ -7,6 +7,7 @@ init_db() builds its schema there instead of touching the real jobs_cache.db, an
 worker, morning digest, backup scheduler) so nothing races against these tests' assertions.
 """
 import base64
+import contextlib
 import difflib
 import html
 import io
@@ -8144,11 +8145,27 @@ def test_decoys_report_does_not_claim_a_decoy_rate_before_any_dead_mark(clean_ou
 
 # ---- /public/stats (counts-only aggregate for the portfolio site) ----
 
-def _funnel_response(overall, status="success"):
+def _rows_from_buckets(overall, prefix="r"):
+    """One JOBS row per unit in each status bucket: the per-role funnel's input for a fixture
+    written as bucket counts (Matched 40, Applied 30, ...)."""
+    return [{"sheet_uuid": f"{prefix}-{status}-{i}", "tab": "Tetiana Cold", "schema": "JOBS",
+             "status": status, "note": ""}
+            for status, count in overall.items() for i in range(count)]
+
+
+def _funnel_response(overall, status="success", rows="from_overall"):
+    """A funnel_stats payload: the legacy `overall` buckets plus the per-role `rows`.
+    rows=None omits the key, which is what an Apps Script that was never redeployed returns."""
+    body = {"status": status, "overall": overall}
+    if rows == "from_overall":
+        rows = _rows_from_buckets(overall)
+    if rows is not None:
+        body["rows"] = rows
+
     class _Res:
         status_code = 200
         def json(self):
-            return {"status": status, "overall": overall}
+            return body
     return _Res()
 
 
@@ -8165,9 +8182,10 @@ def _clear_public_stats_cache():
     m._public_stats_cache["fetched_at"] = 0.0
 
 
-def test_public_stats_rolls_current_status_buckets_forward(monkeypatch):
-    """A row in Interviewing was applied to and replied to, so every count includes the
-    stages past it. Rejected counts as an application but never as a reply."""
+def test_public_stats_role_funnel_rolls_every_stage_into_the_ones_before_it(monkeypatch):
+    """(Rewritten for TASK-20 from the old current-status-bucket math.) A role that reached
+    Interviewing was applied to and replied to, so every count includes the stages past it.
+    Rejected counts as an application but never as a reply."""
     monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL))
     with m.app.test_client() as client:
         res = client.get("/public/stats")
@@ -11346,7 +11364,9 @@ def test_public_dashboard_reports_none_not_zero_when_the_database_is_unreadable(
     for key in ("roles_screened", "documents_compiled", "live_conversations", "dead_links",
                 "median_fit_score", "drafting"):
         assert body[key] is None, key
-    assert body["applications_sent"] == 51  # the CRM half still reports
+    # The per-role funnel needs the SQLite evidence too, so an unreadable database makes the CRM
+    # half unreadable as well: None, never a count built from half the evidence (TASK-20).
+    assert body["applications_sent"] is None
 
 
 def test_compiled_resume_is_counted_and_read_back_by_the_dashboard(dashboard_env):
@@ -12437,3 +12457,107 @@ def test_lead_alert_is_sent_off_the_request_thread(leads_env, monkeypatch, captu
     assert capture_sent == [] and len(spawned) == 1                # the route itself never sent
     spawned[0]()
     assert len(capture_sent) == 1
+
+
+# ---- public stats read the same per-role funnel as /funnel (TASK-20) ----
+
+@pytest.fixture
+def role_funnel_env(monkeypatch):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM application_outcomes")
+        conn.execute("DELETE FROM pipeline_metrics")
+        conn.execute("DELETE FROM inbound_threads")
+        conn.commit()
+    for cache, keys in ((m._public_dashboard_cache, ("payload", "fetched_at")),
+                        (m._drafting_timing_cache, ("result", "measured_at"))):
+        cache[keys[0]] = None
+        cache[keys[1]] = 0.0
+    yield
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM application_outcomes")
+        conn.commit()
+    m._public_dashboard_cache["payload"] = None
+    m._drafting_timing_cache["result"] = None
+
+
+def _interviewed_in_funnel_command(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+    _dispatch("/funnel")
+    assert len(sent) == 1
+    match = re.search(r"Interviewed (\d+)", sent[0])
+    assert match, sent[0]
+    return int(match.group(1))
+
+
+def test_public_stats_role_funnel_counts_an_sqlite_interview_and_matches_funnel(role_funnel_env, monkeypatch):
+    # Two roles whose CRM rows still read Applied; one has an interview recorded only in SQLite.
+    rows = [{"sheet_uuid": "ap1", "tab": "Tetiana Cold", "schema": "JOBS", "status": "Applied", "note": ""},
+            {"sheet_uuid": "ap2", "tab": "Tetiana Cold", "schema": "JOBS", "status": "Applied", "note": ""}]
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response({}, rows=rows))
+    assert m.record_application_outcome("ap1", "interview", company="Acme")
+
+    with m.app.test_client() as client:
+        body = client.get("/public/stats").get_json()
+
+    assert body["interviews"] == 1
+    assert body["replies"] == 1 and body["applications_logged"] == 2
+    assert body["still_sourcing"] == 0
+    assert _interviewed_in_funnel_command(monkeypatch) == body["interviews"]
+
+
+def test_public_stats_role_funnel_overall_without_rows_is_a_503_never_counts(role_funnel_env, monkeypatch):
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL, rows=None))
+
+    with m.app.test_client() as client:
+        res = client.get("/public/stats")
+
+    assert res.status_code == 503
+    assert res.get_json()["status"] == "unavailable"
+    assert "applications_logged" not in res.get_json()
+
+
+def test_public_stats_role_funnel_sqlite_failure_is_a_503_not_the_old_buckets(role_funnel_env, monkeypatch):
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL))
+
+    def _boom():
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(m, "read_funnel_sqlite_evidence", _boom)
+
+    with m.app.test_client() as client:
+        res = client.get("/public/stats")
+
+    assert res.status_code == 503
+
+
+def test_public_stats_role_funnel_dashboard_carries_the_same_numbers(role_funnel_env, monkeypatch):
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL))
+    monkeypatch.setenv("PUBLIC_FUNNEL_STATS", "true")
+    assert m.record_application_outcome("r-Applied-0", "interview", company="Acme")
+
+    with m.app.test_client() as client:
+        stats = client.get("/public/stats").get_json()
+    dashboard = m.build_public_dashboard()             # runs inside read_only_db()
+    funnel = dashboard["funnel"]
+
+    assert funnel["interviews"] == stats["interviews"] == 7     # 6 in the buckets + 1 from SQLite
+    assert funnel["replies"] == stats["replies"]
+    assert funnel["offers"] == stats["offers"] == 1
+    assert dashboard["applications_sent"] == stats["applications_logged"]
+
+
+def test_public_stats_role_funnel_reads_sqlite_read_only(role_funnel_env, monkeypatch):
+    """The public path must open the database mode=ro: a write here has to fail at SQLite."""
+    monkeypatch.setattr(m, "crm_get", lambda *a, **k: _funnel_response(_FUNNEL))
+    seen = []
+    real = m.get_db_conn
+
+    @contextlib.contextmanager
+    def _spy():
+        seen.append(getattr(m._db_read_only, "active", False))
+        with real() as conn:
+            yield conn
+    monkeypatch.setattr(m, "get_db_conn", _spy)
+
+    assert m.build_public_stats() is not None
+    assert seen and all(seen), seen
