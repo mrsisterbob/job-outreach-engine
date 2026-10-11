@@ -31,6 +31,12 @@ grep -i "contact" FUNCTION_INDEX.md
 | 134 | `build_index` | _(no docstring)_ |
 | 188 | `main` | _(no docstring)_ |
 
+## `build_log.py` — 1 defs, 63 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 40 | `compose_build_log` | The week's build-log draft as plain text, or None when every count is None. |
+
 ## `command_help.py` — 2 defs, 241 lines
 
 | Line | Name | Summary |
@@ -622,4 +628,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**543 definitions across 12 files + Code.gs.**
+**544 definitions across 13 files + Code.gs.**
