@@ -2802,3 +2802,99 @@ def test_role_funnel_canonicalizer_rules_match_code_gs_text():
     body = body[:body.index("\n}\n")]
     gs_rules = re.findall(r'/([^/]+)/\.test\(s\)\) return "(\w+)"', body)
     assert gs_rules == list(role_funnel._CANON_RULES)
+
+
+# ---- build_log.compose_build_log (weekly LinkedIn draft: every digit is a count) ----
+
+import build_log  # noqa: E402
+
+_BL_TYPICAL = {"discovered": 412, "screened": 97, "documents": 18, "drafts_staged": 9,
+               "applied": 14, "replies": 3, "interviews": 2}
+_BL_ZEROS = {"discovered": 40, "screened": 12, "documents": 0, "drafts_staged": 0,
+             "applied": 0, "replies": 0, "interviews": 0}
+_BL_ONES = {key: 1 for key in build_log.BUILD_LOG_KEYS}
+_BL_SOME_NONE = {"discovered": 55, "screened": None, "documents": 7, "drafts_staged": None,
+                 "applied": 5, "replies": None, "interviews": 0}
+_BL_LARGE = {"discovered": 123456, "screened": 98765, "documents": 4321, "drafts_staged": 1000,
+             "applied": 777, "replies": 101, "interviews": 10}
+
+
+def _bl_digits_are_the_counts(text, counts):
+    return (sorted(map(int, re.findall(r"\d+", text)))
+            == sorted(v for v in counts.values() if v is not None))
+
+
+@pytest.mark.parametrize("counts", [_BL_TYPICAL, _BL_ZEROS, _BL_ONES, _BL_SOME_NONE, _BL_LARGE],
+                         ids=["typical", "zeros", "ones", "some_none", "large"])
+def test_build_log_every_digit_is_a_count_and_the_text_is_positive(counts):
+    text = build_log.compose_build_log(counts)
+    assert text
+    assert _bl_digits_are_the_counts(text, counts), text
+    assert pu.negative_language_hits(text) == [], text
+    assert not any(ch in text for ch in "<>&"), text
+
+
+def test_build_log_typical_week_has_one_line_per_count_in_funnel_order():
+    text = build_log.compose_build_log(_BL_TYPICAL)
+    lines = text.splitlines()
+    assert "this week" in lines[0]
+    for phrase in ("412 roles discovered", "97 roles screened", "18 application documents compiled",
+                   "9 outreach emails drafted", "14 applications sent", "3 new replies",
+                   "2 interviews set"):
+        assert sum(phrase in line for line in lines) == 1, phrase
+    positions = [text.index(p) for p in ("discovered", "screened", "compiled", "drafted",
+                                         "applications", "replies", "interviews")]
+    assert positions == sorted(positions)
+
+
+def test_build_log_real_zeros_keep_their_lines():
+    text = build_log.compose_build_log(_BL_ZEROS)
+    for phrase in ("0 application documents compiled", "0 outreach emails drafted",
+                   "0 applications sent", "0 new replies", "0 interviews set"):
+        assert phrase in text, phrase
+
+
+def test_build_log_ones_are_singular():
+    text = build_log.compose_build_log(_BL_ONES)
+    for phrase in ("1 role discovered", "1 role screened", "1 application document compiled",
+                   "1 outreach email drafted", "1 application sent", "1 new reply",
+                   "1 interview set"):
+        assert phrase in text, phrase
+    count_lines = "\n".join(line for line in text.splitlines() if line.startswith("- "))
+    for plural in ("roles", "documents", "emails", "applications", "replies", "interviews"):
+        assert plural not in count_lines, plural
+
+
+def test_build_log_none_drops_the_line_and_never_prints_zero_or_a_missing_word():
+    text = build_log.compose_build_log(_BL_SOME_NONE)
+    assert "screened" not in text
+    assert "drafted" not in text
+    assert "repl" not in text
+    # The interviews 0 is real and stays; it is the only zero in the text.
+    assert "0 interviews set" in text
+    assert re.findall(r"\b0\b", text) == ["0"]
+    for word in ("unavailable", "missing", "unknown", "n/a", "error"):
+        assert word not in text.lower(), word
+
+
+def test_build_log_all_none_returns_none():
+    assert build_log.compose_build_log({key: None for key in build_log.BUILD_LOG_KEYS}) is None
+
+
+@pytest.mark.parametrize("counts", [
+    {**_BL_TYPICAL, "interview_set": 2},                                   # an extra key
+    {k: v for k, v in _BL_TYPICAL.items() if k != "replies"},              # a missing key
+    {("listing_discovered" if k == "discovered" else k): v for k, v in _BL_TYPICAL.items()},
+    {},
+], ids=["extra", "missing", "event_name", "empty"])
+def test_build_log_wrong_key_set_raises_instead_of_dropping_lines(counts):
+    # The reader keying by metric event name would otherwise read as a failed read: line gone.
+    with pytest.raises(ValueError):
+        build_log.compose_build_log(counts)
+
+
+@pytest.mark.parametrize("bad, error", [(2.9, TypeError), (True, TypeError), ("5", TypeError),
+                                        ((5,), TypeError), (-3, ValueError)])
+def test_build_log_rejects_counts_that_would_print_a_different_number(bad, error):
+    with pytest.raises(error):
+        build_log.compose_build_log({**_BL_TYPICAL, "applied": bad})
