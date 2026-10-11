@@ -52,6 +52,40 @@ tell you what to build. If the message asks for something with no task file behi
 so and queue nothing: the task file is what carries scope and verify, and work without
 those is the thing this setup exists to prevent.
 
+## Keep context small
+
+Kevin is on Pro and this loop burns his usage when too much lands in context: whole-file reads
+of `main.py`, full test output on green runs, files read again. Three rules, for this session
+and for every build agent (the prompt below carries them):
+
+1. **Grep first, read line ranges.** `grep -n <symbol>` (or Grep with `-n`) finds the lines,
+   then Read with `offset` and `limit` around them. Never Read `main.py` (16,114 lines),
+   `test_main_integration.py` (12,563), `test_pipeline_utils.py` (3,085), `pipeline_utils.py`
+   (2,885) or any file over ~500 lines whole; `Code.gs` is 1,224. `FUNCTION_INDEX.md` (641) is
+   grepped, never read whole. Short files (queue command files, task files, small modules)
+   can be read whole. (`wc -l` on 2026-10-11 at 1dd425e.)
+2. **A passing command shows only its last line; a failing one shows its last 60.** Capture
+   to a temp file and print based on the exit code:
+   ```bash
+   out=$(mktemp); <command> >"$out" 2>&1; rc=$?
+   if [ $rc -eq 0 ]; then tail -n 1 "$out"; else tail -n 60 "$out"; fi
+   rm -f "$out"; echo "exit=$rc"
+   ```
+   Use it for every pytest run and every task `verify`. A verify may contain single quotes,
+   so never wrap it in `bash -c '...'`: put its text in a variable (`V=$(sed -n 's/^verify:
+   //p' <task file>)`) and run `bash -c "$V"` as the `<command>`.
+   For the worker that includes the re-check, the merge baseline and the post-merge
+   suite runs. Read the printed `exit=` line, not the tool status: the wrapper itself always
+   exits 0. A red run keeps the FAILED names, which sit at the end, so the Log gets
+   the real failure output. Don't use `exit $rc`: it ends the shell.
+3. **Never re-read an unchanged file.** If a file, or that line range, was already read this
+   task and nothing has edited it since, use what you have. After your own Edit, the tool
+   already holds the file's state, so don't read it back to check. Re-read only what changed
+   (a file another session or agent edited, or a range you haven't seen) or what is no longer
+   in your context (after a resume, a compaction, or a SendMessage retry).
+
+Only *passing* output shrinks. The Log still gets the actual failure output, not a summary.
+
 ## Claim
 
 1. `ls .queue/active/` first. For each task already in flight, read its `scope`.
@@ -155,13 +189,28 @@ Start EVERY Bash command with: cd "<absolute worktree path>" &&   (the shell's c
 persist). Never write anything in the main folder EXCEPT appending to the task file's `## Log`
 (that file is in .queue/active/ and is yours to append to). Use the Bash tool.
 
+0. KEEP CONTEXT SMALL (Kevin is on Pro). (a) Grep first, then Read with offset and limit
+   around the lines. Never Read main.py (16,114 lines), test_main_integration.py (12,563) or
+   any file over ~500 lines whole; FUNCTION_INDEX.md is grepped, never read whole. (b) A passing
+   command shows only its last line, a failing one its last 60:
+     out=$(mktemp); <command> >"$out" 2>&1; rc=$?
+     if [ $rc -eq 0 ]; then tail -n 1 "$out"; else tail -n 60 "$out"; fi
+     rm -f "$out"; echo "exit=$rc"
+   Use it for every pytest run and every task verify. A verify may contain single quotes, so
+   put its text in a variable and run it as bash -c "$V" inside the wrapper, never bash -c
+   '...'. Read the printed exit= line, not the tool status (the wrapper always exits 0). (c)
+   Never re-read a file, or a line range, that is unchanged since you read it, and don't read
+   a file back after your own Edit - unless it is no longer in your context (after a resume,
+   a compaction or a SendMessage retry).
 1. Read the task file, then read every file in its `scope` before editing it.
 2. Touch only files listed in `scope`. If the task genuinely cannot be done within its scope,
    append why to the task's `## Log` and reply "TASK-n: blocked - scope: <why>".
 3. Before adding any function, run `grep -i <noun> FUNCTION_INDEX.md`. A duplicate never fails a
    test. Follow CLAUDE.md: new subsystems go in new modules, not main.py.
-4. Run the task's `verify` command, then the full suite:
-   <python> -m pytest test_main_integration.py test_pipeline_utils.py -q -p no:cacheprovider
+4. Run the task's `verify` command through the quiet wrapper in step 0, then the full suite
+   through the same wrapper, with <python> -m pytest test_main_integration.py
+   test_pipeline_utils.py -q -p no:cacheprovider as its <command>. Judge each by the printed
+   `exit=` line, not the tool status (the wrapper makes the tool call itself exit 0).
    Both must be green; a task is not done because its own verify passed while something else broke.
 5. On failure fix and retry, up to 3 attempts TOTAL. Append every attempt to the task's `## Log`:
    what you tried and the real failure output, not a summary.
@@ -187,14 +236,18 @@ nothing deterministic checks the agent's work: the re-check is the gate. When th
 leaves the main folder, with quiet output:
 
 ```bash
-(cd .worktrees/<TASK-id> && ../../.venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q -p no:cacheprovider 2>&1 | tail -n 15)
+out=$(mktemp)
+(cd .worktrees/<TASK-id> && ../../.venv/Scripts/python -m pytest \
+  test_main_integration.py test_pipeline_utils.py -q -p no:cacheprovider) >"$out" 2>&1; rc=$?
+if [ $rc -eq 0 ]; then tail -n 1 "$out"; else tail -n 60 "$out"; fi
+rm -f "$out"; echo "exit=$rc"
 ```
 
-`tail -n` keeps a green run to a line and a red one still shows the FAILED names (keep enough
-lines for those; the Log needs them). Judge the result by the LAST line alone: green only if it
-reads `N passed` (a `skipped` count is fine) with no `failed` or `error` in it; anything else,
-including a collection error or no summary line, is red. The pipe hides pytest's exit code, so
-never infer green from the absence of output. A red re-check is one more failed attempt: send it back to
+This is the "Keep context small" pattern: a green run is one line (`tail -n 1`) and a red
+one prints its last 60 lines, FAILED names included (the Log needs them). Judge the result by
+the printed `exit=` line and the last line: green only if `exit=0` and it reads `N passed` (a
+`skipped` count is fine); anything else, including a collection error or no summary line,
+is red. A red re-check is one more failed attempt: send it back to
 the same agent with `SendMessage` (its context is intact). The 3-attempt limit counts the
 agent's own attempts and these together.
 
@@ -261,8 +314,14 @@ On success - verify, both suites and the review all green:
    ```bash
    git status --porcelain
    git symbolic-ref --short HEAD
-   .venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q -p no:cacheprovider 2>&1 | tail -n 15
+   out=$(mktemp)
+   .venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q \
+     -p no:cacheprovider >"$out" 2>&1; rc=$?
+   if [ $rc -eq 0 ]; then tail -n 1 "$out"; else tail -n 60 "$out"; fi
+   rm -f "$out"; echo "exit=$rc"
    ```
+
+   (The "Keep context small" pattern: green is one line, red its last 60.)
 
    - If `git status --porcelain` prints anything, or the branch is not `main`, **do not
      merge.** That output is Kevin's or the planner's unreviewed work, and a merge on top of
@@ -292,7 +351,7 @@ On success - verify, both suites and the review all green:
      because someone edited the main folder after step 3): nothing was merged and there is nothing
      to abort. Treat it as a held merge (step 3, first bullet) and stop the loop.
 6. **Re-run both suites on `main`, from the main folder** (same command as the baseline,
-   quiet output included).
+   quiet output included, per "Keep context small").
    This is also the first run of the montelattice-site test, which skips inside a worktree.
    **If anything is red, first run `git status --porcelain` again.** If it prints anything,
    someone edited the main folder during the run, and the red cannot be pinned on your
