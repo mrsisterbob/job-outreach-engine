@@ -34,6 +34,7 @@ from response_schema import GeminiJobScreenerResponse
 from command_help import lookup_command_help
 from open_followups import collect_open_followups
 from role_funnel import compute_role_funnel
+from build_log import compose_build_log
 from pipeline_utils import (
     ladder_progress, format_ladder_progress, carmen_terminal_gap,
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
@@ -8094,6 +8095,96 @@ def start_backup_scheduler():
     )
     logging.info("[BACKUP] Weekly SQLite backup scheduled: Sundays 03:00 local")
 
+
+# Weekly LinkedIn build-log draft. Maps each build_log key to the pipeline_metrics event whose
+# count in the window feeds it. message_sent is deliberately absent: send_telegram_message logs
+# it on every bot message, so it counts Telegram traffic, not outreach.
+BUILD_LOG_METRIC_EVENTS = {
+    "discovered": "listing_discovered",
+    "screened": "ai_screened",
+    "documents": DOCUMENT_COMPILED_EVENT,
+    "drafts_staged": "gmail_draft_staged",
+    "applied": "applied",
+    "interviews": "interview_set",
+}
+
+
+def get_weekly_build_log_counts(days=7):
+    """The trailing `days` of engine counts, keyed exactly as build_log.BUILD_LOG_KEYS.
+
+    A read that fails leaves the keys it covers as None - never 0 - so compose_build_log drops
+    those lines instead of publishing a number the database never gave. (get_rolling_metric_counts
+    returns 0 for every key on a failed read, which is why it is not reused here.) A read that
+    succeeds and finds nothing is a real 0. Replies exclude auto-rejections, as build_public_stats
+    does: counting them would inflate the number in the flattering direction.
+    """
+    counts = {key: None for key in BUILD_LOG_METRIC_EVENTS}
+    counts["replies"] = None
+    window = f"-{int(days)} days"
+    events = tuple(BUILD_LOG_METRIC_EVENTS.values())
+    try:
+        with read_only_db():
+            with get_db_conn() as conn:
+                found = dict(conn.execute(
+                    "SELECT event_type, COUNT(*) FROM pipeline_metrics "
+                    f"WHERE timestamp >= datetime('now', ?) AND event_type IN ({','.join('?' * len(events))}) "
+                    "GROUP BY event_type", (window, *events)).fetchall())
+        for key, event in BUILD_LOG_METRIC_EVENTS.items():
+            counts[key] = int(found.get(event, 0))
+    except Exception as e:
+        logging.error(f"Build Log Metric Read Error ({days}d): {e}")
+    try:
+        with read_only_db():
+            with get_db_conn() as conn:
+                counts["replies"] = int(conn.execute(
+                    "SELECT COUNT(*) FROM inbound_threads WHERE first_seen >= datetime('now', ?) "
+                    "AND COALESCE(status_label, '') != 'REJECTION'", (window,)).fetchone()[0])
+    except Exception as e:
+        logging.error(f"Build Log Reply Read Error ({days}d): {e}")
+    return counts
+
+
+def scheduled_weekly_build_log_job():
+    """Sundays 18:00 local: send Kevin ONE Telegram message holding the week's build-log draft.
+
+    Posts nowhere else. If every count failed to read there is nothing to draft, so Kevin gets a
+    short plain alert instead - never a draft built on zeros.
+    """
+    draft = None
+    try:
+        draft = compose_build_log(get_weekly_build_log_counts(7))
+    except Exception:
+        logging.exception("[BUILD LOG] could not compose the weekly draft")
+    if draft is None:
+        sent = send_telegram_message(
+            TELEGRAM_CHAT_ID,
+            "⚠️ <b>Build-log draft unavailable:</b> couldn't read this week's engine counts, so "
+            "there is no draft this week.")
+    else:
+        sent = send_telegram_message(
+            TELEGRAM_CHAT_ID,
+            "✍️ <b>Weekly build-log draft</b> - edit before you post it anywhere:\n\n" + draft)
+    if not sent:
+        # send_telegram_message returns a falsy value on a missing token, timeout or non-200.
+        logging.error("[BUILD LOG] weekly message was not delivered to Telegram")
+
+
+def start_weekly_build_log():
+    """Register the weekly build-log draft on the existing scheduler (Sundays 18:00 America/Detroit)."""
+    EMAIL_POLL_SCHEDULER.add_job(
+        scheduled_weekly_build_log_job,
+        trigger="cron",
+        day_of_week="sun",
+        hour=18,
+        id="weekly_build_log",
+        max_instances=1,
+        coalesce=True,
+        # Render restarts on every deploy; the default 1s grace would drop the week's run if one
+        # landed within a second of 18:00, and the 7-day window is never recovered.
+        misfire_grace_time=3600
+    )
+    logging.info("[BUILD LOG] Weekly build-log draft scheduled: Sundays 18:00 local")
+
 PERSISTENCE_WATCH_TABLES = ("seen_jobs", "pipeline_metrics", "application_outcomes", "daily_activity")
 
 def count_backup_snapshots(backup_dir):
@@ -14600,6 +14691,7 @@ if not os.environ.get("PYTEST_CURRENT_TEST") and not _is_oneshot_invocation():
     start_crm_outbox_worker()
     start_morning_digest()
     start_backup_scheduler()
+    start_weekly_build_log()
     start_followup_sequencer()
     start_job_link_checker()
 

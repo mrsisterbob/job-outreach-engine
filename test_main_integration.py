@@ -12189,3 +12189,133 @@ def test_direct_apply_link_rescued_relist_job_clears_the_aggregator_link_gate(mo
     m.passes_strict_filter(rescued, trace_rescued)
     assert rescued["job_apply_link"] == _DAL_EMPLOYER and rescued["job_relist_link"] == relist
     assert "aggregator_link" not in trace_rescued.reasons
+
+
+# ---- weekly build-log draft (Sundays 18:00 local, Telegram only) ----
+
+@pytest.fixture
+def build_log_env(monkeypatch, capture_sent):
+    """Clean pipeline_metrics and inbound_threads (clean_tables does not truncate either), and
+    make any outbound HTTP a test failure: the weekly job may only call send_telegram_message."""
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM pipeline_metrics")
+        conn.execute("DELETE FROM inbound_threads")
+        conn.commit()
+
+    def _no_http(*a, **k):
+        pytest.fail("the weekly build-log job made an HTTP call")
+    monkeypatch.setattr(m.requests, "post", _no_http)
+    monkeypatch.setattr(m.requests, "get", _no_http)
+    yield capture_sent
+    # Teardown runs while this test's monkeypatches (a bad DB_PATH, a failing get_db_conn) are
+    # still active, so clean through a direct connection to the real test database.
+    conn = sqlite3.connect(_TMP_DB_PATH)
+    try:
+        conn.execute("DELETE FROM pipeline_metrics")
+        conn.execute("DELETE FROM inbound_threads")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_week(counts, stale=0):
+    """counts: {event_type: n}. Every event gets n in-window rows and `stale` rows 10 days old."""
+    with m.get_db_conn() as conn:
+        for event, n in counts.items():
+            for _ in range(n):
+                conn.execute("INSERT INTO pipeline_metrics (event_type, timestamp) "
+                             "VALUES (?, datetime('now', '-1 days'))", (event,))
+            for _ in range(stale):
+                conn.execute("INSERT INTO pipeline_metrics (event_type, timestamp) "
+                             "VALUES (?, datetime('now', '-10 days'))", (event,))
+        conn.commit()
+
+
+def _seed_thread(thread_id, label, days_ago):
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO inbound_threads (thread_id, status_label, state, first_seen) "
+                     "VALUES (?, ?, 'open', datetime('now', ?))", (thread_id, label, f"-{days_ago} days"))
+        conn.commit()
+
+
+_BL_WEEK = {"listing_discovered": 37, "ai_screened": 23, m.DOCUMENT_COMPILED_EVENT: 11,
+            "gmail_draft_staged": 6, "applied": 4, "interview_set": 2}
+
+
+def test_weekly_build_log_sends_one_draft_whose_digits_are_the_in_window_counts(build_log_env):
+    _seed_week(_BL_WEEK, stale=5)
+    _seed_week({"message_sent": 9})                 # every Telegram message logs this: not outreach
+    for i in range(3):
+        _seed_thread(f"t{i}", "INTERVIEW" if i else "GENERAL", 1)
+    _seed_thread("rej", "REJECTION", 1)             # auto-reject in window: not a reply
+    _seed_thread("old", "GENERAL", 10)              # outside the window
+
+    m.scheduled_weekly_build_log_job()
+
+    assert len(build_log_env) == 1
+    text = build_log_env[0]
+    assert text.startswith("✍️")
+    assert sorted(map(int, re.findall(r"\d+", text))) == sorted([37, 23, 11, 6, 4, 2, 3])
+    assert pipeline_utils.negative_language_hits(text) == []
+
+
+def test_weekly_build_log_a_real_zero_week_keeps_its_zero_lines(build_log_env):
+    m.scheduled_weekly_build_log_job()
+
+    assert len(build_log_env) == 1
+    assert re.findall(r"\d+", build_log_env[0]) == ["0"] * 7
+
+
+def test_weekly_build_log_unreadable_database_sends_the_alert_and_no_draft(build_log_env, monkeypatch):
+    monkeypatch.setattr(m, "DB_PATH", os.path.join(os.path.dirname(_TMP_DB_PATH), "no_such_dir", "x.db"))
+
+    m.scheduled_weekly_build_log_job()
+
+    assert len(build_log_env) == 1
+    text = build_log_env[0]
+    assert "unavailable" in text.lower()
+    assert re.findall(r"\d", text) == []
+    assert "Build log:" not in text
+
+
+def test_weekly_build_log_a_failed_read_leaves_the_key_none_not_zero(build_log_env, monkeypatch):
+    import build_log
+    _seed_week(_BL_WEEK)
+
+    ok = m.get_weekly_build_log_counts()
+    assert set(ok) == set(build_log.BUILD_LOG_KEYS)
+    assert ok["applied"] == 4 and ok["replies"] == 0     # a read that finds nothing is a real 0
+
+    class _Boom:
+        def __enter__(self):
+            raise sqlite3.OperationalError("simulated read failure")
+
+        def __exit__(self, *exc):
+            return False
+    monkeypatch.setattr(m, "get_db_conn", lambda: _Boom())
+    failed = m.get_weekly_build_log_counts()
+    assert set(failed) == set(build_log.BUILD_LOG_KEYS)
+    assert all(v is None for v in failed.values())
+
+
+def test_weekly_build_log_posts_to_telegram_only(build_log_env):
+    # build_log_env turns requests.post/get into pytest.fail; the job must still complete.
+    _seed_week({"applied": 1})
+    m.scheduled_weekly_build_log_job()
+
+    assert len(build_log_env) == 1
+
+
+def test_weekly_build_log_registers_sunday_1800_local_on_the_shared_scheduler(monkeypatch):
+    calls = []
+    monkeypatch.setattr(m.EMAIL_POLL_SCHEDULER, "add_job", lambda *a, **k: calls.append((a, k)))
+
+    m.start_weekly_build_log()
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] is m.scheduled_weekly_build_log_job
+    assert kwargs["id"] == "weekly_build_log"
+    assert kwargs["trigger"] == "cron"
+    assert kwargs["day_of_week"] == "sun" and kwargs["hour"] == 18
+    assert kwargs["max_instances"] == 1 and kwargs["coalesce"] is True
