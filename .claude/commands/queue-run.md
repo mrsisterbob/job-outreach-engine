@@ -250,8 +250,49 @@ On success - verify, both suites and the review all green:
    again - its commits are already in `main`'s history - which is why the sha goes in the
    Log: Claim step 5 uses it to re-land the work. If `main` is **still** red after the revert,
    stop the loop and tell Kevin with the output - do not attempt a second fix.
+6a. **Regenerate the function index** - still inside the merge lock, and only now that `main`
+   is proven green (a reverted merge never reaches this). The duplicate check greps
+   `FUNCTION_INDEX.md`, so it has to list what just landed.
+
+   ```bash
+   git diff --name-only <merge-sha>^1 <merge-sha> -- '*.py' Code.gs
+   ```
+
+   If that prints nothing, skip this step. `Code.gs` is included on purpose: the index also
+   lists every CRM action `Code.gs` handles. Otherwise, from the main folder:
+
+   ```bash
+   .venv/Scripts/python build_function_index.py
+   git status --porcelain
+   ```
+
+   - If `git status --porcelain` lists only `FUNCTION_INDEX.md`, commit it by name:
+     `git add FUNCTION_INDEX.md && git commit -m "Regenerate FUNCTION_INDEX.md after <TASK-id> merge"`.
+     If nothing changed, commit nothing. The first run after a gap also catches up earlier
+     drift; the message still names the task that triggered it.
+   - If **any other path** shows up, someone edited the main folder: commit nothing, leave the
+     file as it is, tell Kevin, and stop the loop - the same as the step 6 dirty case. Never
+     stage anything else.
+   - If the indexer itself fails, the merge is green and stays. Append the error to the Log,
+     tell Kevin, leave `main` clean (at most an unstaged `FUNCTION_INDEX.md`; say so), and stop
+     the loop.
+
+   Either stop still finishes the task first: the merge is on `main` and green, so do step 7
+   (remove the worktree - never with `--force` here, since `main` may not have the fresh index;
+   if it refuses over the index alone, keep the worktree and say so - then move the task to
+   `done/` and `rmdir .queue/merge.lock`) before you stop. Otherwise the lock is
+   left held and a merged task sits in `active/`.
 7. **Green on `main`:** only now remove the worktree and branch, mark the task done, and
-   release the lock:
+   release the lock. The Stop hook regenerates `FUNCTION_INDEX.md` inside the worktree when a
+   turn changed `.py` files, and task scopes never include it, so check the worktree first:
+
+   ```bash
+   git -C .worktrees/<TASK-id> status --porcelain
+   ```
+
+   If the only change is `FUNCTION_INDEX.md`, that is generated output and `main` now has the
+   fresh copy, so use `git worktree remove --force`. If anything else is dirty, do not force:
+   tell Kevin and keep the worktree.
 
    ```bash
    git worktree remove .worktrees/<TASK-id> && git branch -d task/<TASK-id>
@@ -270,7 +311,8 @@ On success - verify, both suites and the review all green:
 The same shape for every guard: what happened, the task id, and where the work is (branch
 `task/<TASK-id>`).
 
-**The only git writes on `main` are a `--no-ff` merge and a `git revert`.** Never push.
+**The only git writes on `main` are three: a `--no-ff` merge, a `git revert`, and the
+`FUNCTION_INDEX.md` regeneration commit (step 6a).** Never push.
 Never commit there directly, never reset, never stash - the paragraph under Verify still
 holds in both folders.
 
@@ -283,7 +325,8 @@ them in the final report.
 
 A "TASK-n queued" message from the planner that arrives mid-loop needs no action - the loop
 already reads the inbox. The loop also stops early at a held merge (steps 3 and 5), at a
-red it cannot pin on its own merge, or at a `main` that stays red after a revert (step 6).
+red it cannot pin on its own merge, at a `main` that stays red after a revert (step 6), or at
+either stop in step 6a (a stray path in the main folder, or the indexer failing).
 
 **Where you end the turn.** The Stop hook tests the git tree your shell is in. End in the
 main folder only if `git status --porcelain` is empty there - then the hook tests exactly
