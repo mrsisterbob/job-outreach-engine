@@ -3,15 +3,54 @@ Turn the request below into task files in `.queue/inbox/`.
 Request: $ARGUMENTS
 END REQUEST
 
+## Which session is this
+
+This command is the planner's. Before anything else - before reading code, the index or the
+queue, and before writing any file - find out which session you are in.
+
+1. Run `ListAgents`. Its first line reads `This session is <name> [<ref>] - ...`; that
+   `<name>` is this session's name. If `ListAgents` or `SendMessage` shows only as a deferred
+   tool name, load it through ToolSearch first. If the name cannot be read (tool missing, no
+   such line), **do nothing**: write no task file. Say so in one line and suggest Kevin
+   `/rename planner` here, or type the request in the planner terminal. Writing tasks from a
+   session of unknown name is the bug this guard exists to stop.
+2. **Named exactly `planner`: this is the right session.** Carry on with the rest of this
+   file. A message whose first line starts with `Forwarded verbatim from Kevin's /queue-add in`
+   and does not end in `montelattice-site.` is Kevin's own request relayed by another engine
+   session: treat everything after the blank line as the request, under the rules below.
+3. **Any other name: write no task here.** Find the `ListAgents` row named exactly `planner`;
+   a row marked `offline` is not running. Never substitute another session.
+   - Running: `SendMessage` with `to: "planner"`. The message is one header line, a blank line,
+     then the request verbatim:
+
+     ```
+     Forwarded verbatim from Kevin's /queue-add in <this session's name>. Queue it under your /queue-add rules.
+
+     <the request, exactly as written>
+     ```
+
+     Copy everything between `Request: ` and the `END REQUEST` line above, every line,
+     character for character. Keep a closing "then tell @worker it is queued": the planner's
+     Hand off rule decides what the worker hears.
+   - Not running: say plainly that the request was **NOT forwarded** because `planner` is not
+     running, and print it verbatim in a fenced block (more backticks than any run inside it)
+     so Kevin can paste it in the planner terminal.
+
+   Either way, tell Kevin in one line where it went, then **stop**: write no file, in
+   `.queue/inbox/` or anywhere else. "Forwarded" means sent, not queued. A forwarded message is
+   acted on only by the session named `planner`, and that session never forwards it on.
+
 You are the **planner**. You write tasks; you do not implement them. Do not edit any file
 outside `.queue/inbox/`.
 
 ## First, check the request belongs in this repo
 
 **A request forwarded in from the site is Kevin's, and never goes back.** If the request's
-first line starts with `Forwarded verbatim from Kevin's /queue-add in` (the site sends
-`Forwarded verbatim from Kevin's /queue-add in montelattice-site.`), or the message came
-from `site-planner`, it is Kevin's own words relayed by the site. It arrives as a message,
+first line starts with `Forwarded verbatim from Kevin's /queue-add in montelattice-site`
+(the site's exact header is `Forwarded verbatim from Kevin's /queue-add in montelattice-site.`),
+or the message came from `site-planner`, it is Kevin's own words relayed by the site. (A header
+naming any other session, such as `... in worker.`, is an ordinary request from Kevin relayed
+inside the engine: its site half still goes to `site-planner`, under the rules below.) It arrives as a message,
 not through `$ARGUMENTS`; every rule in this command applies to it the same way, with the
 request being everything after the header line. If you run `/queue-add` for it, pass the
 whole message, header line included, so this check still sees the header. Queue the
