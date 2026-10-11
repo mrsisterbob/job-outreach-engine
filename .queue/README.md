@@ -1,16 +1,22 @@
 # The task queue
 
 A mailbox between two Claude Code terminals: a **planner** (plan mode) that writes tasks,
-and a **worker** (bypass permissions) that executes them one at a time.
+and a **worker** (bypass permissions) that executes them one at a time and merges each into `main`.
 
 ## State is the directory, not a field
 
 ```
 inbox/    queued, nobody has claimed it      planner writes here
 active/   a worker is on it right now        worker only
-done/     verify passed                      worker only
-blocked/  verify failed 3x, or scope clash   worker only
+done/     merged into main, suites green     worker only
+blocked/  stopped; the Log says why          worker only
 ```
+
+`done/` means merged, not just verified: a task moves there only after its merge passes both
+suites on `main`, which is what dependency checks rely on. `blocked/` covers verify failing 3
+times, a scope clash, a held merge, a merge conflict and a merge reverted for turning `main`
+red. In every case but a scope clash the work survives on branch `task/TASK-n` - finished,
+or as a `WIP` commit when verify failed.
 
 One task is one file, and the directory it sits in IS its state. Claiming a task is a
 single `mv -n`, an atomic rename: two workers cannot both claim the same task, because
@@ -102,28 +108,69 @@ them after five minutes - the worker would look like it was ignoring the planner
 
 `/queue-status` in either terminal shows the whole queue without changing anything.
 
-## The worker works in its own worktree, and you merge
+## The worker works in its own worktree, then merges it itself
 
 Each claimed task gets its own checkout: `.worktrees/TASK-n/` on branch `task/TASK-n`,
-started from `main`. The worker edits, tests and commits there, never on `main`.
+started from `main`. The worker edits, tests and commits there.
 
 Why: with one shared folder, every agent's Stop hook tested every other agent's
 half-finished edits. On 2026-10-03 the worker's mid-save `main.py` turned the chat's hook
 red with a 500 that had nothing to do with the chat. The hook now tests the git tree the
 session's shell is in, so each session only answers for its own work.
 
-Your review step is the merge, from the main folder:
+When the task's verify, both suites and `/code-review` are green, the worker merges it from
+the main folder and moves on to the next inbox task, until the inbox is empty:
 
 ```bash
-git diff main...task/TASK-n          # read it
-git merge task/TASK-n && git worktree remove .worktrees/TASK-n && git branch -d task/TASK-n
+mkdir .queue/merge.lock                        # one merging worker at a time
+git status --porcelain                         # must print nothing, on branch main
+.venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q   # baseline: green before
+git merge --no-ff task/TASK-n -m "Merge TASK-n: ..."
+.venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q   # green after
+git worktree remove .worktrees/TASK-n && git branch -d task/TASK-n   # only once main is green
+rmdir .queue/merge.lock
 ```
 
+If a worker dies holding the lock, later merges wait on it; `rmdir .queue/merge.lock` clears it.
+The baseline run is what keeps a `main` that was already red from being blamed on - and
+reverting - whichever task merges next.
+
+`--no-ff` is what makes a bad merge undoable: it always leaves one merge commit, which
+`git revert -m 1` can take back as a single new commit.
+
+Three guards, each of which tells you in the worker's output and in its message to the planner:
+- **Main folder not clean** (anything from `git status --porcelain`, or not on `main`), or
+  **`main` already red before the merge**: no merge. The task goes to `blocked/` as "merge
+  held", its branch stays, and the loop stops. Commit or move your own work (or fix `main`),
+  then merge that branch by hand or move the task back to `inbox/` - the worker resumes on
+  the existing branch.
+- **Merge conflict:** `git merge --abort`, the task goes to `blocked/`, its branch stays, and
+  the loop moves on to the next task.
+- **Suites red on `main` after the merge:** `git revert -m 1` of that merge (never a reset),
+  the task goes to `blocked/` with the revert's sha in its Log, its branch stays, and the loop
+  moves on. If `main` is still red after the revert, the loop stops. If the main folder changed
+  during the suite run, the worker cannot tell whose red it is, so it reverts nothing, leaves
+  the merge in place and stops.
+
+**A reverted task cannot be re-landed by merging its branch again.** Its commits are already
+in `main`'s history, so `git merge task/TASK-n` says "Already up to date" and changes nothing.
+To re-land it, move the task back to `inbox/`: the worker resumes on the branch, merges `main`
+into it, runs `git revert <revert-sha>` there to bring the work back as new commits, and fixes
+what was red on top. By hand, the equivalent on `main` is `git revert <revert-sha>`.
+
+What the worker does on `main`, and nothing else: a `--no-ff` merge and, when the suites go
+red, a revert. It never pushes, never commits there directly, never resets and never stashes,
+and it holds every merge while the main folder has uncommitted work - your unreviewed changes
+are never mixed into a merge. You review after the fact: `git log --merges` on `main`, and
+`git show <merge>` for any one of them.
+
 Two consequences to know:
-- **A task can only build on merged work.** The worktree starts from `main`, so if TASK-4
-  needs TASK-3, merge TASK-3 first - the worker checks and waits rather than starting blind.
-- **The worker never touches `main`** - no commit, merge, push, reset or stash there.
-  Your uncommitted work in the main folder is never in its reach.
+- **A task can only build on merged work, and `done/` means merged.** The worktree starts from
+  `main`, and a task moves to `done/` only after its merge passes the suites there. So if
+  TASK-4 needs TASK-3, the worker checks that TASK-3 is in `done/`; if it is not, TASK-4 waits
+  in the inbox and the worker tries the next task instead.
+- **The loop ends** when the inbox is empty, or when everything left in it collides in scope
+  or waits on a task that is not in `done/`. The final report says what is left and why.
 
 Known gap: one test (`test_main_integration.py`, the montelattice-site check) looks for that
 repo *beside* this one, so inside `.worktrees/` it skips instead of running. It still runs
