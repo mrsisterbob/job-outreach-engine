@@ -11379,6 +11379,31 @@ def test_compiled_resume_is_counted_and_read_back_by_the_dashboard(dashboard_env
     assert body["documents_since"] == m.datetime.now(m.timezone.utc).strftime("%Y-%m-%d")
 
 
+def test_public_dashboard_screened_locations_counts_cities(dashboard_env):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM jobs")
+    rows = [("loc1", {"job_city": "Detroit", "job_state": "MI"}),
+            ("loc2", {"job_city": "Detroit, MI", "job_state": ""}),
+            ("loc3", {"job_city": "Troy", "job_state": "MI"}),
+            ("loc4", {"job_city": "", "job_state": "", "job_is_remote": True}),
+            ("loc5", {"job_city": "", "job_state": ""})]
+    for key, loc in rows:
+        m.save_job_to_cache(key, dict(_CARD_JOB, track="a", bullet_indices=[0], fit_score=80,
+                                      tone_mode="conservative", outreach_template_id=0, **loc),
+                            sheet_uuid="uuid-" + key)
+    with m.app.test_client() as client:
+        body = client.get("/public/dashboard").get_json()
+    loc = body["screened_locations"]
+    assert loc["places"] == [{"city": "Detroit", "state": "MI", "roles": 2},
+                             {"city": "Troy", "state": "MI", "roles": 1}]
+    assert loc["remote"] == 1 and loc["unknown"] == 1
+
+
+def test_public_dashboard_screened_locations_none_when_unreadable(dashboard_env, monkeypatch):
+    monkeypatch.setattr(m, "DB_PATH", os.path.join(os.path.dirname(_TMP_DB_PATH), "no_such_dir", "x.db"))
+    assert m.build_public_dashboard()["screened_locations"] is None
+
+
 def test_public_dashboard_live_conversations_exclude_rejections(dashboard_env):
     with m.get_db_conn() as conn:
         conn.executemany(
