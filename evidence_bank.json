@@ -132,7 +132,8 @@
   "site_profile": {
     "_note": "Copy for the montelattice.com homepage, rendered at request time by montelattice-site (homepage.py). Nothing on the job engine reads this block. A figure with a `source` is shown only while that bullet still contains its value.",
     "eyebrow": "Detroit, Michigan",
-    "claim": "The **integrator** who makes tools work together.",
+    "claim": "Wealth operations, and I build the tools to run it.",
+    "subline": "Series 65 in progress. Python, SQL and AI in daily production use.",
     "figures": [
       {
         "value": "$2.5B",

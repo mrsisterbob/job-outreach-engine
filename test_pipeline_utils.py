@@ -3027,9 +3027,10 @@ def test_site_profile_copy_never_prints_a_personal_best(_sp_bank):
         assert t not in blob, t
 
 
-def test_site_profile_copy_claim_is_four_to_eight_words_without_a_negation(_sp_bank):
+def test_site_profile_copy_claim_is_four_to_ten_words_without_a_negation(_sp_bank):
+    # Widened from eight to ten on 2026-10-13: Kevin chose the ten-word hero claim (option C).
     claim = _sp_bank["site_profile"]["claim"]
-    assert 4 <= len(claim.split()) <= 8, claim
+    assert 4 <= len(claim.split()) <= 10, claim
     assert not re.search(r"\bnot\b", claim, re.IGNORECASE)
 
 
