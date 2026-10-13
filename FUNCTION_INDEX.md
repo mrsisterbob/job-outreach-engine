@@ -426,7 +426,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 26 | `_norm_email` | _(no docstring)_ |
 | 30 | `collect_open_followups` | snapshots: {run_date "YYYY-MM-DD": result dict as saved by save_followup_queue_snapshot} |
 
-## `pipeline_utils.py` — 107 defs, 2,887 lines
+## `pipeline_utils.py` — 108 defs, 2,904 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -522,21 +522,22 @@ grep -i "contact" FUNCTION_INDEX.md
 | 2413 | `week_start` | Monday of the ISO week containing `day` (a date). |
 | 2418 | `weekly_volume_series` | Bucket (YYYY-MM-DD, event_type, count) rows into the trailing `weeks` Monday-start weeks. |
 | 2454 | `funnel_rates` | Reply / interview / offer rates as percentages of applications, 1dp. None when a count is |
-| 2465 | `shape_public_dashboard` | Arrange build_public_dashboard()'s raw readings into the public payload. |
-| 2551 | `classify_visit` | What kind of pageview this is: None for a person, else 'self' / 'preview' / 'health' / |
-| 2570 | `visit_bot_flag` | The stored bot column: None for a person, else classify_visit()'s kind, with the unfurling |
-| 2587 | `normalize_referrer_host` | Bare external host of a Referer header, or '' for none / same-site / unparseable. |
-| 2614 | `is_job_market_referrer` | _(no docstring)_ |
-| 2619 | `daily_visitor_id` | 16-hex HMAC-SHA256 of ip\|user-agent under today's salt. Same visitor, same day -> same id; |
-| 2626 | `summarize_visits` | rows: (visitor_id, path, referrer, bot) for one window. Returns counts by DISTINCT visitor: |
-| 2651 | `format_visitor_line` | The standup's one analytics line. Referrers lead - they are the signal; the raw count is |
-| 2689 | `validate_lead` | (lead_dict, None) or (None, error_message) for one submitted lead. |
-| 2710 | `format_leads_messages` | The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are |
-| 2745 | `format_lead_alert` | The one Telegram message sent when a lead is committed. Pure. |
-| 2788 | `parse_reference_args` | `Name \| email \| phone \| Work \| years \| Org \| City` -> (reference dict, None) or (None, error). |
-| 2812 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
-| 2847 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
-| 2852 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
+| 2465 | `public_followup_ladder` | The sequencer's follow-up offsets for the public site's date planner. |
+| 2481 | `shape_public_dashboard` | Arrange build_public_dashboard()'s raw readings into the public payload. |
+| 2568 | `classify_visit` | What kind of pageview this is: None for a person, else 'self' / 'preview' / 'health' / |
+| 2587 | `visit_bot_flag` | The stored bot column: None for a person, else classify_visit()'s kind, with the unfurling |
+| 2604 | `normalize_referrer_host` | Bare external host of a Referer header, or '' for none / same-site / unparseable. |
+| 2631 | `is_job_market_referrer` | _(no docstring)_ |
+| 2636 | `daily_visitor_id` | 16-hex HMAC-SHA256 of ip\|user-agent under today's salt. Same visitor, same day -> same id; |
+| 2643 | `summarize_visits` | rows: (visitor_id, path, referrer, bot) for one window. Returns counts by DISTINCT visitor: |
+| 2668 | `format_visitor_line` | The standup's one analytics line. Referrers lead - they are the signal; the raw count is |
+| 2706 | `validate_lead` | (lead_dict, None) or (None, error_message) for one submitted lead. |
+| 2727 | `format_leads_messages` | The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are |
+| 2762 | `format_lead_alert` | The one Telegram message sent when a lead is committed. Pure. |
+| 2805 | `parse_reference_args` | `Name \| email \| phone \| Work \| years \| Org \| City` -> (reference dict, None) or (None, error). |
+| 2829 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
+| 2864 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
+| 2869 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
 
 ## `response_schema.py` — 4 defs, 46 lines
 
@@ -641,4 +642,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**557 definitions across 13 files + Code.gs.**
+**558 definitions across 13 files + Code.gs.**
