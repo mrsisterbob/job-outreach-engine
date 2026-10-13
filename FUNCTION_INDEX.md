@@ -44,7 +44,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 207 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 222 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
-## `main.py` — 369 defs, 16,200 lines
+## `main.py` — 370 defs, 16,210 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -411,12 +411,13 @@ grep -i "contact" FUNCTION_INDEX.md
 | 16018 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
 | 16031 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
 | 16040 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
-| 16051 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
-| 16061 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
-| 16098 | `_cached_drafting_timing` | _(no docstring)_ |
-| 16116 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
-| 16151 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
-| 16158 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
+| 16051 | `get_cached_job_locations` | READ-ONLY. (job_city, job_state, job_is_remote) for every cached job. Screened roles only. |
+| 16060 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
+| 16070 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
+| 16107 | `_cached_drafting_timing` | _(no docstring)_ |
+| 16125 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
+| 16161 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
+| 16168 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
 
 ## `open_followups.py` — 3 defs, 118 lines
 
@@ -426,7 +427,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 26 | `_norm_email` | _(no docstring)_ |
 | 30 | `collect_open_followups` | snapshots: {run_date "YYYY-MM-DD": result dict as saved by save_followup_queue_snapshot} |
 
-## `pipeline_utils.py` — 108 defs, 2,904 lines
+## `pipeline_utils.py` — 109 defs, 2,937 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -523,21 +524,22 @@ grep -i "contact" FUNCTION_INDEX.md
 | 2418 | `weekly_volume_series` | Bucket (YYYY-MM-DD, event_type, count) rows into the trailing `weeks` Monday-start weeks. |
 | 2454 | `funnel_rates` | Reply / interview / offer rates as percentages of applications, 1dp. None when a count is |
 | 2465 | `public_followup_ladder` | The sequencer's follow-up offsets for the public site's date planner. |
-| 2481 | `shape_public_dashboard` | Arrange build_public_dashboard()'s raw readings into the public payload. |
-| 2568 | `classify_visit` | What kind of pageview this is: None for a person, else 'self' / 'preview' / 'health' / |
-| 2587 | `visit_bot_flag` | The stored bot column: None for a person, else classify_visit()'s kind, with the unfurling |
-| 2604 | `normalize_referrer_host` | Bare external host of a Referer header, or '' for none / same-site / unparseable. |
-| 2631 | `is_job_market_referrer` | _(no docstring)_ |
-| 2636 | `daily_visitor_id` | 16-hex HMAC-SHA256 of ip\|user-agent under today's salt. Same visitor, same day -> same id; |
-| 2643 | `summarize_visits` | rows: (visitor_id, path, referrer, bot) for one window. Returns counts by DISTINCT visitor: |
-| 2668 | `format_visitor_line` | The standup's one analytics line. Referrers lead - they are the signal; the raw count is |
-| 2706 | `validate_lead` | (lead_dict, None) or (None, error_message) for one submitted lead. |
-| 2727 | `format_leads_messages` | The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are |
-| 2762 | `format_lead_alert` | The one Telegram message sent when a lead is committed. Pure. |
-| 2805 | `parse_reference_args` | `Name \| email \| phone \| Work \| years \| Org \| City` -> (reference dict, None) or (None, error). |
-| 2829 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
-| 2864 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
-| 2869 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
+| 2481 | `public_location_counts` | Aggregate (city, state, is_remote) rows into the public screened_locations block. |
+| 2512 | `shape_public_dashboard` | Arrange build_public_dashboard()'s raw readings into the public payload. |
+| 2601 | `classify_visit` | What kind of pageview this is: None for a person, else 'self' / 'preview' / 'health' / |
+| 2620 | `visit_bot_flag` | The stored bot column: None for a person, else classify_visit()'s kind, with the unfurling |
+| 2637 | `normalize_referrer_host` | Bare external host of a Referer header, or '' for none / same-site / unparseable. |
+| 2664 | `is_job_market_referrer` | _(no docstring)_ |
+| 2669 | `daily_visitor_id` | 16-hex HMAC-SHA256 of ip\|user-agent under today's salt. Same visitor, same day -> same id; |
+| 2676 | `summarize_visits` | rows: (visitor_id, path, referrer, bot) for one window. Returns counts by DISTINCT visitor: |
+| 2701 | `format_visitor_line` | The standup's one analytics line. Referrers lead - they are the signal; the raw count is |
+| 2739 | `validate_lead` | (lead_dict, None) or (None, error_message) for one submitted lead. |
+| 2760 | `format_leads_messages` | The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are |
+| 2795 | `format_lead_alert` | The one Telegram message sent when a lead is committed. Pure. |
+| 2838 | `parse_reference_args` | `Name \| email \| phone \| Work \| years \| Org \| City` -> (reference dict, None) or (None, error). |
+| 2862 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
+| 2897 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
+| 2902 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
 
 ## `response_schema.py` — 4 defs, 46 lines
 
@@ -642,4 +644,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**558 definitions across 13 files + Code.gs.**
+**560 definitions across 13 files + Code.gs.**
