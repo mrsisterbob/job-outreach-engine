@@ -2478,6 +2478,37 @@ def public_followup_ladder():
     }
 
 
+def public_location_counts(rows):
+    """Aggregate (city, state, is_remote) rows into the public screened_locations block.
+
+    Pure. Some feeds put the whole location in city ("Detroit, MI") and leave state blank, so a
+    trailing ", XX" is split off. Groups case-insensitively and shows the first-seen casing. A
+    remote row counts toward `remote` only; a row with no usable city counts toward `unknown`.
+    Returns {"places": [{"city", "state", "roles"}] sorted by roles desc then city, "remote", "unknown"}.
+    """
+    groups = {}
+    remote = unknown = 0
+    for city, state, is_remote in rows or []:
+        if is_remote in (True, 1, "1", "true", "True"):
+            remote += 1
+            continue
+        city = str(city or "").strip()
+        state = str(state or "").strip()
+        if not state:
+            m = re.match(r"^(.*\S)\s*,\s*([A-Za-z]{2})$", city)
+            if m:
+                city, state = m.group(1).strip(), m.group(2).strip()
+        if not city or city.lower() in ("remote", "unknown", "n/a", "none", "null"):
+            unknown += 1
+            continue
+        key = (city.lower(), state.lower())
+        if key not in groups:
+            groups[key] = {"city": city, "state": state.upper() if len(state) == 2 else state, "roles": 0}
+        groups[key]["roles"] += 1
+    places = sorted(groups.values(), key=lambda g: (-g["roles"], g["city"].lower()))
+    return {"places": places, "remote": remote, "unknown": unknown}
+
+
 def shape_public_dashboard(raw):
     """Arrange build_public_dashboard()'s raw readings into the public payload.
 
@@ -2485,7 +2516,8 @@ def shape_public_dashboard(raw):
     crm (build_public_stats() dict or None), open_threads (list of inbound thread dicts),
     dead_links (list of rows: retired at index 6, first_dead_at at index 7), median_fit,
     scored_roles, tracks_total, tracks_used, documents_compiled, documents_since,
-    daily_volume (rows for weekly_volume_series), drafting (dict or None), today (date).
+    daily_volume (rows for weekly_volume_series), drafting (dict or None), today (date),
+    screened_locations (public_location_counts() dict or None).
     """
     crm = raw.get("crm")
     threads = raw.get("open_threads")
@@ -2532,6 +2564,7 @@ def shape_public_dashboard(raw):
         "drafting": raw.get("drafting"),
         "funnel": funnel,
         "followup_ladder": public_followup_ladder(),
+        "screened_locations": raw.get("screened_locations"),
         "as_of": today.isoformat(),
     }
 

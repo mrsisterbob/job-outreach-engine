@@ -50,7 +50,7 @@ from pipeline_utils import (
     sanitize_job_title, is_clean_job_title, classify_outreach_track,
     is_role_mailbox, is_automated_sender, inbound_sender_screen_reason, company_domain_of, name_from_email_local_part, parse_email_recipient,
     is_email_derived_name, greeting_name_from_body, followup_dismissed,
-    match_email_to_crm_company, shape_public_dashboard,
+    match_email_to_crm_company, shape_public_dashboard, public_location_counts,
     daily_visitor_id, normalize_referrer_host, visit_bot_flag, summarize_visits, format_visitor_line,
     plan_carmen_ladder, carmen_reply_anchor, carmen_linkedin_anchor, CARMEN_LADDER_DAYS,
     CARMEN_LADDER_DAYS_COLD, CARMEN_LADDER_DAYS_ENGAGED, carmen_ladder_for,
@@ -16048,6 +16048,15 @@ def get_cached_job_scoring():
         ).fetchall()
 
 
+def get_cached_job_locations():
+    """READ-ONLY. (job_city, job_state, job_is_remote) for every cached job. Screened roles only."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT json_extract(job_json, '$.job_city'), json_extract(job_json, '$.job_state'), "
+            "       json_extract(job_json, '$.job_is_remote') FROM jobs"
+        ).fetchall()
+
+
 def get_latest_cached_job():
     """READ-ONLY. The most recently cached job dict, or None."""
     with get_db_conn() as conn:
@@ -16139,6 +16148,7 @@ def build_public_dashboard(today=None):
                 raw["scored_roles"] = len(fits)
                 raw["tracks_used"] = len({normalize_track(t) for _, t in scoring if t})
                 raw["daily_volume"] = get_daily_metric_counts(("listing_discovered", "ai_screened"))
+                raw["screened_locations"] = public_location_counts(get_cached_job_locations())
             except Exception as e:
                 logging.error(f"Public dashboard: read failed: {e}")
             raw["drafting"] = _cached_drafting_timing()
