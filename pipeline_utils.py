@@ -2462,6 +2462,22 @@ def funnel_rates(applications, replies, interviews, offers):
             "offer_rate_pct": pct(offers)}
 
 
+def public_followup_ladder():
+    """The sequencer's follow-up offsets for the public site's date planner.
+
+    Reads the module globals at CALL time so a retune of the constants shows up in the payload
+    with no second copy to drift. FOLLOWUP_2_DAYS is a retired rung and is deliberately absent.
+    """
+    return {
+        "application": {"bumps": [FOLLOWUP_1_DAYS], "ends": FOLLOWUP_BURY_DAYS},
+        "contact_cold": {"bumps": list(CARMEN_LADDER_DAYS_COLD),
+                         "ends": carmen_terminal_gap(CARMEN_LADDER_DAYS_COLD)},
+        "contact_engaged": {"bumps": list(CARMEN_LADDER_DAYS_ENGAGED),
+                            "ends": carmen_terminal_gap(CARMEN_LADDER_DAYS_ENGAGED)},
+        "after_reply_days": REPLY_FOLLOWUP_DAYS,
+    }
+
+
 def shape_public_dashboard(raw):
     """Arrange build_public_dashboard()'s raw readings into the public payload.
 
@@ -2515,6 +2531,7 @@ def shape_public_dashboard(raw):
         "timeline": weekly_volume_series(raw.get("daily_volume"), 12, today),
         "drafting": raw.get("drafting"),
         "funnel": funnel,
+        "followup_ladder": public_followup_ladder(),
         "as_of": today.isoformat(),
     }
 
