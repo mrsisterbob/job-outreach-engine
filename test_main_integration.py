@@ -11401,6 +11401,35 @@ def test_public_dashboard_funnel_carries_offers_and_rates(dashboard_env, monkeyp
     assert funnel["reply_rate_pct"] == round(100 * 12 / 51, 1)
 
 
+def _expected_followup_ladder():
+    pu = pipeline_utils
+    return {
+        "application": {"bumps": [pu.FOLLOWUP_1_DAYS], "ends": pu.FOLLOWUP_BURY_DAYS},
+        "contact_cold": {"bumps": list(pu.CARMEN_LADDER_DAYS_COLD),
+                         "ends": pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_COLD)},
+        "contact_engaged": {"bumps": list(pu.CARMEN_LADDER_DAYS_ENGAGED),
+                            "ends": pu.carmen_terminal_gap(pu.CARMEN_LADDER_DAYS_ENGAGED)},
+        "after_reply_days": pu.REPLY_FOLLOWUP_DAYS,
+    }
+
+
+def test_public_dashboard_followup_ladder_matches_the_sequencer(dashboard_env):
+    resp = m.app.test_client().get("/public/dashboard")
+    assert resp.status_code == 200
+    assert resp.get_json()["followup_ladder"] == _expected_followup_ladder()
+
+
+def test_public_dashboard_followup_ladder_follows_a_retune(dashboard_env, monkeypatch):
+    monkeypatch.setattr(pipeline_utils, "FOLLOWUP_1_DAYS", 9)
+    monkeypatch.setattr(pipeline_utils, "CARMEN_LADDER_DAYS_COLD", (3, 6))
+    resp = m.app.test_client().get("/public/dashboard")
+    block = resp.get_json()["followup_ladder"]
+    assert block["application"]["bumps"] == [9]
+    assert block["contact_cold"]["bumps"] == [3, 6]
+    assert block["contact_cold"]["ends"] == 6 + pipeline_utils.CARMEN_KILL_GRACE_DAYS
+    assert block == _expected_followup_ladder()
+
+
 # ==============================================================================
 # Site visitor analytics - privacy, bots, retention, and what the NEXT standup reads back
 # ==============================================================================
