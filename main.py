@@ -229,13 +229,25 @@ def build_evidence_context_block(mode="eval"):
         f"- {job.get('title')} at {job.get('company')} ({job.get('start')} - {job.get('end')})"
         for job in evidence_bank.get("experience", [])
     )
-    skills_line = ", ".join(evidence_bank.get("technical_skills", []))
+    technical_skills = evidence_bank.get("technical_skills", [])
+    employer_systems = evidence_bank.get("employer_systems", [])
+    if employer_systems:
+        # Two lines so personal-project tools are never read as employer work.
+        employer_set = {str(t).lower() for t in employer_systems}
+        personal_skills = [t for t in technical_skills if str(t).lower() not in employer_set]
+        skills_block = (
+            f"TOOLS USED IN EMPLOYER ROLES: {', '.join(employer_systems)}\n"
+            "SKILLS FROM PERSONAL PROJECTS (name them as his own projects, never as employer work): "
+            f"{', '.join(personal_skills)}\n"
+        )
+    else:
+        skills_block = f"VERIFIED TECHNICAL SKILLS: {', '.join(technical_skills)}\n"
     tone = evidence_bank.get("voice_and_tone", {})
     tone_lines = "\n".join(f"- {g}" for g in tone.get("guidance", []))
     block = (
         f"CANDIDATE: {identity.get('name', 'Kevin Miller')} ({identity.get('location', 'Detroit, MI')})\n"
         f"VERIFIED EXPERIENCE:\n{experience_lines}\n"
-        f"VERIFIED TECHNICAL SKILLS: {skills_line}\n"
+        f"{skills_block}"
         f"VOICE & TONE ({tone.get('tone', 'professional, grounded, low-pressure')}):\n{tone_lines}"
     )
     if mode == "eval":

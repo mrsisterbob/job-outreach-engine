@@ -12834,3 +12834,20 @@ def test_public_stats_role_funnel_reads_sqlite_read_only(role_funnel_env, monkey
 
     assert m.build_public_stats() is not None
     assert seen and all(seen), seen
+
+
+def test_evidence_block_keeps_personal_tools_off_employer():
+    bank = m.load_evidence_bank()
+    employer = bank["employer_systems"]
+    assert employer
+    for mode in ("email", "eval"):
+        block = m.build_evidence_context_block(mode)
+        emp_line = next(l for l in block.splitlines() if l.startswith("TOOLS USED IN EMPLOYER ROLES:"))
+        pers_line = next(l for l in block.splitlines() if l.startswith("SKILLS FROM PERSONAL PROJECTS"))
+        assert "VERIFIED TECHNICAL SKILLS" not in block
+        assert block.index("VERIFIED EXPERIENCE") < block.index(emp_line)
+        for tool in employer:
+            assert tool in emp_line
+        for tool in ("Claude Code", "Tableau", "Gemini", "Looker Studio"):
+            assert tool in pers_line
+            assert tool not in emp_line
