@@ -556,7 +556,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 40 | `GeminiJobScreenerResponse._normalize_track` | _(no docstring)_ |
 | 45 | `GeminiJobScreenerResponse._normalize_tone_mode` | _(no docstring)_ |
 
-## `resume_engine.py` — 24 defs, 741 lines
+## `resume_engine.py` — 24 defs, 751 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -580,10 +580,10 @@ grep -i "contact" FUNCTION_INDEX.md
 | 431 | `_rendered_bullets` | _(no docstring)_ |
 | 435 | `_unescape_typst` | _(no docstring)_ |
 | 439 | `_reconcile_summary_figures` | Make every figure the summary quotes have a bullet behind it on the same page. |
-| 506 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
-| 664 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
-| 669 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
-| 737 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
+| 510 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
+| 674 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
+| 679 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
+| 747 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
 
 ## `resume_side_projects.py` — 1 defs, 45 lines
 
@@ -614,7 +614,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 23 | `call_gemini` | _(no docstring)_ |
 | 42 | `clean_crm_contacts` | _(no docstring)_ |
 
-## `skills_footer.py` — 4 defs, 73 lines
+## `skills_footer.py` — 5 defs, 97 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -622,6 +622,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 27 | `_first_pos` | _(no docstring)_ |
 | 36 | `_line_index` | _(no docstring)_ |
 | 44 | `surface_banked_skills` | Return base_lines [(label, desc)] with banked skills named in job_text appended. |
+| 76 | `fit_one_line` | Flatten [(label, desc)] pairs into ONE line of skill names no longer than max_chars. |
 
 ## `summary_figures.py` — 4 defs, 51 lines
 
@@ -677,4 +678,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**573 definitions across 17 files + Code.gs.**
+**574 definitions across 17 files + Code.gs.**
