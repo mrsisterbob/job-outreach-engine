@@ -28,7 +28,7 @@ TRACK_REGISTRY = {
         "prompt_label": "wealth operations",
         "subtitle": "Financial Systems & Operations",
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
-        "summary": "I reconcile custodial accounts across 2,000+ client files and automate onboarding paperwork with Python and Salesforce.",
+        "summary": "I match custodial accounts across 2,000+ client files and work onboarding paperwork through Salesforce.",
         "skills": [
             ("Core Operations", "Custodial Cashiering & Reconciliations, Ticketing Queue Management, RIA Audits, Automation."),
             ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Python, SQL, Excel.")
@@ -67,7 +67,7 @@ TRACK_REGISTRY = {
         "prompt_label": "business intelligence & analytics",
         "subtitle": "Business Intelligence & Analytics",
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
-        "summary": "I write SQL and build Power BI dashboards that reconcile institutional custody accounts and surface the variances behind each break.",
+        "summary": "I audit onboarding paperwork for 2,000+ accounts, work custodial platforms like Schwab Advisor Center and Fidelity Wealthscape, built audit checklists that cross-reference multi-plant payroll data, and work Salesforce queues.",
         "skills": [
             ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Excel."),
             ("Systems & Data", "Power Query, Power Automate, Salesforce Reports, bSwift, Schwab Advisor Center, Python.")
