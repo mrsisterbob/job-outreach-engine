@@ -3493,3 +3493,20 @@ def test_employer_dates_and_counts_single_source():
     for fname in ("resume_engine.py", "track_registry.py"):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), encoding="utf-8") as f:
             assert not re.search(r"\b\d{2}/20\d{2}\b", f.read()), fname
+
+
+def test_letters_name_no_securities_filings():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "templates", "cover_letter_templates.json")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    pat = re.compile(r"drafted|securities filing|form d|crowdfund", re.IGNORECASE)
+    checked = 0
+    for pool, entries in data.items():
+        if not (isinstance(entries, list) and entries and all(isinstance(e, str) for e in entries)):
+            continue
+        for i, s in enumerate(entries):
+            checked += 1
+            assert not pat.search(s), f"{pool}[{i}] claims securities filings: {s!r}"
+            assert not pu.negative_language_hits(s), f"{pool}[{i}] has negations"
+    assert checked > 0
