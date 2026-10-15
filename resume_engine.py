@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import typst
-from skills_footer import surface_banked_skills
+from skills_footer import surface_banked_skills, fit_one_line
 from render_gate import banned_hits
 from summary_figures import figure_supported, figure_supported_by, summary_figures
 from resume_side_projects import side_projects_for_track
@@ -503,6 +503,10 @@ def _reconcile_summary_figures(track_key: str, tone_key: str, selected: list, ev
     return selected, block_of(selected), None
 
 
+# d (business intelligence), h (technical systems), b (engineering): skills row under SUMMARY.
+SKILLS_ROW_TRACKS = ("d", "h", "b")
+
+
 def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative", job_text: str = "") -> str:
     """Builds single-page Typst markup for the selected persona track, sourcing every factual
     claim (experience, education, certificates) from the centralized JSON banks (hot-reloaded
@@ -566,13 +570,16 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 
     projects_block = _render_projects_block(evidence, tone_mode=tone_key, track=track_key)
     education_credentials_block = _render_education_credentials_block(evidence)
-    footer_pairs = track_data["skills"]
+    base_pairs = track_data["skills"]
+    footer_pairs = base_pairs
     if job_text:
         # Width cap = the longest base line already shipping, so the footer stays two lines.
         widest = max(len(f"{l}: {d}") for t in TRACKS.values() for l, d in t["skills"])
         footer_pairs = surface_banked_skills(
             job_text, evidence.get("technical_skills", []), footer_pairs,
             max_added=6, max_line_chars=widest)
+    skills_up_top = track_key in SKILLS_ROW_TRACKS
+    skills_row = escape_typst(fit_one_line(footer_pairs, base_pairs))
     skills_lines = " \\\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in footer_pairs)
 
     # Gate: every visible string, checked before it reaches the compiler. Scaffolding and
@@ -590,6 +597,13 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
             gate_hits.append(f"{w!r} in {where}")
     if gate_hits:
         raise ValueError("banned words in resume: " + "; ".join(gate_hits))
+
+    skills_top_block = f"#v(3pt)\n*Skills:* {skills_row}" if skills_up_top else ""
+    skills_footer_block = "" if skills_up_top else f"""
+// --- SKILLS & SYSTEMS ---
+#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SKILLS & SYSTEMS]
+#v(2pt)
+{skills_lines}"""
 
     markup = f"""
 #set document(
@@ -622,7 +636,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 #text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
 #v(2pt)
 {summary}
-
+{skills_top_block}
 #v(6.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
 #v(3.8pt)
@@ -653,11 +667,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 #v(6.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
 #v(3.8pt)
-
-// --- SKILLS & SYSTEMS ---
-#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SKILLS & SYSTEMS]
-#v(2pt)
-{skills_lines}
+{skills_footer_block}
 """
     return markup.strip()
 
