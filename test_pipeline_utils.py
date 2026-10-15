@@ -3336,3 +3336,24 @@ def test_forty_acres_bank_advises_not_files():
         assert not acts, f"{s!r} claims act {acts}"
         assert ok.search(s), f"{s!r} lacks advising verb"
         assert not pu.negative_language_hits(s), f"{s!r} has negations"
+
+
+def test_forty_acres_registry_no_filing_claims():
+    """No track claims SEC/FinCEN filings as performed work; Form D is planned, never drafted."""
+    import track_registry as _tr
+    texts = []
+    for letter, t in _tr.TRACK_REGISTRY.items():
+        texts.append(t["summary"])
+        texts.extend(t.get("keywords", ()))
+        for label, line in t.get("skills", []):
+            texts.extend([label, line])
+    texts.extend(_tr.CAPABILITY_TERMS)
+    for s in texts:
+        assert "SEC & FinCEN Filings" not in s and "SEC/FinCEN Filings" not in s, s
+    act = re.compile(r"\b(draft|drafted|wrote|filed)\b", re.I)
+    for letter, t in _tr.TRACK_REGISTRY.items():
+        s = t["summary"]
+        if "Form D" in s:
+            assert not re.search(r"\b(draft|drafted|wrote|filed)\b[^.]{0,30}Form D|Form D[^.]{0,30}\b(draft|drafted|wrote|filed)\b", s, re.I), s
+    assert not pu.negative_language_hits(_tr.TRACK_REGISTRY["c"]["summary"])
+    assert "SEC & FinCEN Identity Standards" in _tr.TRACK_REGISTRY["c"]["skills"][0][1]

@@ -53,10 +53,10 @@ TRACK_REGISTRY = {
         "aliases": ("risk_compliance", "compliance", "risk"),
         "prompt_label": "risk & regulatory compliance",
         "subtitle": "Risk & Regulatory Compliance",
-        "keywords": ("Regulatory Compliance", "SEC/FinCEN Filings", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
-        "summary": "I audit onboarding files across 2,000+ accounts and draft SEC Form D filings to catch compliance risks before execution.",
+        "keywords": ("Regulatory Compliance", "SEC & FinCEN Identity Standards", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
+        "summary": "I audit onboarding files across 2,000+ accounts and plan SEC Form D filings, catching compliance risks before execution.",
         "skills": [
-            ("Compliance & Risk", "SEC & FinCEN Filings, Suitability Reviews, Custodial Exception Audits, Form D."),
+            ("Compliance & Risk", "SEC & FinCEN Identity Standards, Suitability Reviews, Custodial Exception Audits, Form D."),
             ("Systems & Controls", "Salesforce Queue Routing, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
         ],
     },
@@ -239,7 +239,7 @@ TRACK_TRIGGER_GUIDANCE = """Picking the track: a, c and e are finance-framed and
 CAPABILITY_TERMS = frozenset({
     "Custodial Cashiering & Reconciliations", "Ticketing Queue Management", "RIA Audits", "Automation",
     "REST APIs", "Webhook Integrations", "Data Reconciliation",
-    "SEC & FinCEN Filings", "Suitability Reviews", "Custodial Exception Audits", "Form D",
+    "SEC & FinCEN Identity Standards", "Suitability Reviews", "Custodial Exception Audits", "Form D",
     "Variance Analysis",
     "Queue Routing Optimization", "SLA Escalation Controls", "CRM Pipeline Management", "Process Design",
     "Queue & SLA Management", "Exception Handling", "Escalation Paths", "Process Documentation",
