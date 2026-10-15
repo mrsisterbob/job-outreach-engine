@@ -10430,10 +10430,11 @@ def test_footer_surfaces_banked_skills_in_two_lines():
     posting = "We use Looker Studio, Tableau and XLOOKUP daily."
     base = resume_engine.render_typst_markup("Acme", "d")
     out = resume_engine.render_typst_markup("Acme", "d", job_text=posting)
-    block = _footer_block(out)
+    # Track d prints a one-line skills row under the summary, no footer.
+    block = out.split("*Skills:*")[1].split("#v(6.5pt)")[0]
     for skill in ("Looker Studio", "Tableau", "XLOOKUP"):
         assert skill in block
-    assert len(block.split("\n")) == 2
+    assert len(block.strip().splitlines()) == 1
     assert resume_engine.render_typst_markup("Acme", "d", job_text="") == base
 
 
@@ -10442,6 +10443,8 @@ def test_footer_surfaces_banked_skills_compiles_to_one_page():
     bank = resume_engine.load_evidence_bank()["technical_skills"]
     posting = " ".join(bank[:10] + ["Tableau", "Looker Studio", "XLOOKUP", "Git", "Flask"])
     for letter in resume_engine.TRACKS:
+        if letter in ("d", "h", "b"):
+            continue  # skills row under summary, no footer
         pdf = resume_engine.compile_resume_pdf("Acme", letter, job_text=posting)
         assert len(re.findall(rb"/Type\s*/Page(?!s)", pdf)) == 1, letter
         assert len(_footer_block(resume_engine.render_typst_markup(

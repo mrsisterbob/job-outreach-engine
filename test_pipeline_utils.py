@@ -3238,6 +3238,43 @@ def test_skills_footer_real_bank_skills():
     assert "Tableau" in joined and "Power BI" in joined
 
 
+def test_skills_row_under_summary_for_d_h_b():
+    import io
+    import re
+    import pypdf
+    import resume_engine as re_
+    job = "We use Tableau and Power BI daily"
+    def pos(mk, s):
+        return mk.find(s)
+    footer_hits = 0
+    for tr in ("d", "h", "b", "a", "c", "e", "f", "g"):
+        mk = re_.render_typst_markup("Acme", tr, job_text=job)
+        i_sum = mk.index("[SUMMARY]")
+        i_exp = mk.index("[PROFESSIONAL EXPERIENCE]")
+        i_edu = mk.index("[EDUCATION & CREDENTIALS]")
+        if tr in ("d", "h", "b"):
+            assert mk.count("Tableau") == 1, tr
+            i_sk = mk.index("Tableau")
+            assert i_sum < i_sk < i_exp, tr
+            assert "SKILLS & SYSTEMS" not in mk, tr
+        else:
+            # Footer keeps the per-line width cap, so a full track may not take the skill.
+            assert mk.count("Tableau") <= 1, tr
+            assert "SKILLS & SYSTEMS" in mk, tr
+            assert mk.index("SKILLS & SYSTEMS") > i_edu, tr
+            if "Tableau" in mk:
+                assert mk.index("Tableau") > i_edu, tr
+                footer_hits += 1
+        pdf = re_.compile_resume_pdf("Acme", tr, job_text=job)
+        reader = pypdf.PdfReader(io.BytesIO(pdf))
+        assert len(reader.pages) == 1, tr
+        if tr in ("d", "h", "b"):
+            lines = reader.pages[0].extract_text().splitlines()
+            row = [l for l in lines if "Tableau" in l]
+            assert len(row) == 1 and "Skills:" in row[0], (tr, row)
+    assert footer_hits >= 1
+
+
 # --- resume_side_projects ---------------------------------------------------
 
 import resume_side_projects as _rsp

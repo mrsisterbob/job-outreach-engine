@@ -71,3 +71,27 @@ def surface_banked_skills(job_text, banked_skills, base_lines, max_added=6, max_
         descs[i] = cand
         added += 1
     return list(zip(labels, descs))
+
+
+def fit_one_line(pairs, base_pairs, max_chars=105, sep=", "):
+    """Flatten [(label, desc)] pairs into ONE line of skill names no longer than max_chars.
+
+    Skills present in pairs but not in base_pairs (posting-named) sort first so they survive
+    the cut; the lowest-priority tail items are dropped until the line fits.
+    """
+    def items(ps):
+        out = []
+        for _, d in ps:
+            out.extend(s.strip().rstrip(".").strip() for s in d.split(",") if s.strip().rstrip(".").strip())
+        return out
+    base = {s.lower() for s in items(base_pairs)}
+    allitems = items(pairs)
+    ordered = [s for s in allitems if s.lower() not in base] + [s for s in allitems if s.lower() in base]
+    kept, size = [], 0
+    for s in ordered:
+        add = len(s) + (len(sep) if kept else 0)
+        if size + add > max_chars:
+            continue
+        kept.append(s)
+        size += add
+    return sep.join(kept)
