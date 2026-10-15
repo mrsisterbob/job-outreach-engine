@@ -17,6 +17,7 @@ import re
 import typst
 from skills_footer import surface_banked_skills
 from render_gate import banned_hits
+from summary_figures import figure_supported, figure_supported_by, summary_figures
 from resume_side_projects import side_projects_for_track
 
 # The track taxonomy lives in exactly one place now (track_registry.py). TRACK_BULLET_POOL_KEYS and
@@ -422,6 +423,81 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative", trac
             lines.append(f"- {escape_typst(apply_tone_filter(b, tone_key, track))}")
     return "\n".join(lines)
 
+def _rendered_bullets(experience_block: str) -> list:
+    return [ln[2:] for ln in experience_block.splitlines() if ln.startswith("- ")]
+
+
+def _unescape_typst(text: str) -> str:
+    return re.sub(r"\\(.)", r"\1", text)
+
+
+def _reconcile_summary_figures(track_key: str, tone_key: str, selected: list, evidence: dict, summary: str):
+    """Make every figure the summary quotes have a bullet behind it on the same page.
+
+    Returns (selected_entries, experience_block, summary_to_print). A missing figure is first
+    repaired by swapping a pool bullet that carries it in for the last routed bullet that carries
+    no summary figure (never growing the rendered bullet count); when none can be placed the
+    track's `summary_plain` prints instead. Never invents a figure.
+    """
+    selected = list(selected)
+
+    def block_of(entries):
+        return _render_experience_block(evidence, dynamic_bullets=entries)
+
+    def rendered(entries):
+        return [_unescape_typst(b) for b in _rendered_bullets(block_of(entries))]
+
+    figures = summary_figures(summary)
+    if not figures:
+        return selected, block_of(selected), summary
+
+    pool = (load_resume_bullets_bank().get(pool_key_for(track_key))
+            or load_resume_bullets_bank().get(TRACK_BULLET_POOL_KEYS[DEFAULT_TRACK], []))
+    banned = [str(w).lower() for w in evidence.get("banned_words", [])]
+    forbidden = TRACK_TONE_CONSTRAINTS.get((track_key, tone_key), [])
+    targets_cache = {}
+
+    def clean(entry) -> bool:
+        text = bullet_text(entry)
+        if not text or any(bw in text.lower() for bw in banned):
+            return False
+        src = bullet_source_job(entry, evidence)
+        if src not in targets_cache:
+            targets_cache[src] = _duplicate_check_targets(evidence, src)
+        return not _is_duplicate_of_other_job(text, targets_cache[src])
+
+    def carries_figure(entry) -> bool:
+        return any(figure_supported_by(f, bullet_text(entry)) for f in figures)
+
+    for fig in figures:
+        if figure_supported(fig, rendered(selected)):
+            continue
+        before = len(_rendered_bullets(block_of(selected)))
+        candidates = [
+            e for i, e in enumerate(pool)
+            if i not in forbidden and e not in selected
+            and figure_supported_by(fig, bullet_text(e)) and clean(e)
+        ]
+        # Job 0 first: its routed bullets replace statics, so the swap never adds a line.
+        candidates.sort(key=lambda e: bullet_source_job(e, evidence) != 0)
+        placed = False
+        for cand in candidates:
+            for pos in range(len(selected) - 1, -1, -1):
+                if carries_figure(selected[pos]):
+                    continue
+                trial = selected[:pos] + [cand] + selected[pos + 1:]
+                if len(_rendered_bullets(block_of(trial))) <= before and figure_supported(fig, rendered(trial)):
+                    selected, placed = trial, True
+                    break
+            if placed:
+                break
+
+    final = rendered(selected)
+    if all(figure_supported(f, final) for f in figures):
+        return selected, block_of(selected), summary
+    return selected, block_of(selected), None
+
+
 def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative", job_text: str = "") -> str:
     """Builds single-page Typst markup for the selected persona track, sourcing every factual
     claim (experience, education, certificates) from the centralized JSON banks (hot-reloaded
@@ -453,7 +529,12 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     selected_bullets = filter_ats_bullet_entries(track_key, bullet_indices, tone_key)
 
     keywords_tuple = ", ".join(f'"{kw}"' for kw in track_data["keywords"])
-    summary = escape_typst(apply_tone_filter(track_data["summary"], tone_key, track_key))
+    summary_raw = apply_tone_filter(track_data["summary"], tone_key, track_key)
+    selected_bullets, experience_block, kept_summary = _reconcile_summary_figures(
+        track_key, tone_key, selected_bullets, evidence, summary_raw)
+    if kept_summary is None:
+        summary_raw = apply_tone_filter(track_data.get("summary_plain") or track_data["summary"], tone_key, track_key)
+    summary = escape_typst(summary_raw)
 
     name = escape_typst(identity.get("name", "Kevin Miller"))
     email = escape_typst(identity.get("email", ""))
@@ -478,7 +559,6 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
         contact_fields.append(f'#link("https://{github_raw}")[GitHub]')
     contact_line = " • ".join(contact_fields)
 
-    experience_block = _render_experience_block(evidence, dynamic_bullets=selected_bullets)
     projects_block = _render_projects_block(evidence, tone_mode=tone_key, track=track_key)
     education_credentials_block = _render_education_credentials_block(evidence)
     footer_pairs = track_data["skills"]
@@ -493,7 +573,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     # Gate: every visible string, checked before it reaches the compiler. Scaffolding and
     # keywords_tuple are not checked.
     visible = {
-        "summary": apply_tone_filter(track_data["summary"], tone_key, track_key),
+        "summary": summary_raw,
         "subtitle": track_data["subtitle"],
         "experience": experience_block,
         "projects": projects_block,
