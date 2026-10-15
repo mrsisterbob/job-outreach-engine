@@ -16,6 +16,7 @@ import os
 import re
 import typst
 from skills_footer import surface_banked_skills
+from resume_side_projects import side_projects_for_track
 
 # The track taxonomy lives in exactly one place now (track_registry.py). TRACK_BULLET_POOL_KEYS and
 # TRACKS are re-exported here because main.py and the suite already import them from this module.
@@ -373,6 +374,11 @@ def _render_education_credentials_block(evidence: dict) -> str:
 
     return "\n".join(lines)
 
+SIDE_PROJECT_BULLET_CAP = {"d": 0}  # bullets per side project by track (default 1); d has 1 spare line on its heaviest routing
+SIDE_PROJECT_BULLET_DEFAULT = 1  # one-page budget, measured per track in the TASK-56 log
+SIDE_PROJECT_LIMIT = 1
+
+
 def _render_projects_block(evidence: dict, tone_mode: str = "conservative", track=None) -> str:
     """Renders the Technical Projects section - name/location/dates header line per project,
     followed by its bullets. `tone_mode` scrubs crypto/Web3 phrasing for conservative firms,
@@ -401,6 +407,18 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative", trac
         for b in bullets:
             clean_b = apply_tone_filter(b, tone_key, track)
             lines.append(f"- {escape_typst(clean_b)}")
+    # Side projects that fit the track print after the engine projects, same section.
+    for side in side_projects_for_track(evidence.get("side_projects"), track, limit=SIDE_PROJECT_LIMIT):
+        lines.append("#v(6.0pt)")
+        status = str(side.get("status", "") or "").strip().lower()
+        right = "In progress" if status == "in progress" else ""
+        lines.append(f"*{escape_typst(side.get('name', ''))}* #h(1fr) {right}".rstrip())
+        tools = side.get("tools")
+        if isinstance(tools, list) and tools:
+            lines.append("Tools: " + ", ".join(escape_typst(str(t)) for t in tools))
+            continue
+        for b in side.get("bullets", [])[:SIDE_PROJECT_BULLET_CAP.get(str(track), SIDE_PROJECT_BULLET_DEFAULT)]:
+            lines.append(f"- {escape_typst(apply_tone_filter(b, tone_key, track))}")
     return "\n".join(lines)
 
 def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative", job_text: str = "") -> str:
@@ -418,6 +436,8 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     crypto/Web3 language from the summary for conservative firms (RIAs, banks, custodians). The
     Skills & Systems footer renders the track's own 2-line category blocks, plus any banked
     skills `job_text` names (still two lines; empty `job_text` leaves it unchanged).
+    Technical Projects lists the engine projects, then any side projects that fit the track
+    (resume_side_projects.SIDE_PROJECT_FIT; tracks b, d, h only).
     """
     track_key = normalize_track(track)
     track_data = TRACKS[track_key]
