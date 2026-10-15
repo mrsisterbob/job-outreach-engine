@@ -16,6 +16,7 @@ import os
 import re
 import typst
 from skills_footer import surface_banked_skills
+from render_gate import banned_hits
 from resume_side_projects import side_projects_for_track
 
 # The track taxonomy lives in exactly one place now (track_registry.py). TRACK_BULLET_POOL_KEYS and
@@ -488,6 +489,22 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
             job_text, evidence.get("technical_skills", []), footer_pairs,
             max_added=6, max_line_chars=widest)
     skills_lines = " \\\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in footer_pairs)
+
+    # Gate: every visible string, checked before it reaches the compiler. Scaffolding and
+    # keywords_tuple are not checked.
+    visible = {
+        "summary": apply_tone_filter(track_data["summary"], tone_key, track_key),
+        "subtitle": track_data["subtitle"],
+        "experience": experience_block,
+        "projects": projects_block,
+        "skills": " | ".join(f"{l}: {d}" for l, d in footer_pairs),
+    }
+    gate_hits = []
+    for where, txt in visible.items():
+        for w in banned_hits(txt, evidence.get("banned_words", [])):
+            gate_hits.append(f"{w!r} in {where}")
+    if gate_hits:
+        raise ValueError("banned words in resume: " + "; ".join(gate_hits))
 
     markup = f"""
 #set document(
