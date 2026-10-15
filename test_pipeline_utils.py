@@ -3404,3 +3404,47 @@ def test_bank_renders_no_banned_or_tell_words():
                 hits.append((loc, m_.group(0)))
     assert texts
     assert hits == [], hits
+
+
+def test_resume_render_blocks_banned_words(monkeypatch):
+    import copy
+    import resume_engine as re_
+
+    real = re_.load_evidence_bank()
+    tracks = list("abcdefgh")
+
+    def dirty_bank(mutate):
+        bank = copy.deepcopy(real)
+        mutate(bank)
+        return bank
+
+    # (a) write path: a banned word planted in each visible source raises for every track.
+    def exp(b):
+        # every static of job 1, so a routed bullet superseding one cannot hide the plant
+        b["experience"][1]["bullets"] = [x + " ensure accuracy" for x in b["experience"][1]["bullets"]]
+
+    def proj(b):
+        b["projects"][0]["bullets"][0] += " ensure accuracy"
+
+    for mutate in (exp, proj):
+        bank = dirty_bank(mutate)
+        monkeypatch.setattr(re_, "load_evidence_bank", lambda bank=bank: bank)
+        for t in tracks:
+            with pytest.raises(ValueError, match="banned words in resume"):
+                re_.render_typst_markup("Acme", track=t, tone_mode="tech")
+
+    # track summary
+    monkeypatch.setattr(re_, "load_evidence_bank", lambda: real)
+    patched = copy.deepcopy(re_.TRACKS)
+    for k in patched:
+        patched[k]["summary"] = patched[k]["summary"] + " We ensure results."
+    monkeypatch.setattr(re_, "TRACKS", patched)
+    for t in tracks:
+        with pytest.raises(ValueError, match="banned words in resume"):
+            re_.render_typst_markup("Acme", track=t)
+    monkeypatch.undo()
+
+    # (b) real banks render clean for every track and tone mode.
+    for t in tracks:
+        for tone in ("conservative", "tech"):
+            assert re_.render_typst_markup("Acme", track=t, tone_mode=tone)
