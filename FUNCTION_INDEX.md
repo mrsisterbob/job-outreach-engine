@@ -541,6 +541,12 @@ grep -i "contact" FUNCTION_INDEX.md
 | 2897 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
 | 2902 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
 
+## `render_gate.py` — 1 defs, 21 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 10 | `banned_hits` | Returns the sorted unique banned words/phrases found in text (lowercased); empty if clean. |
+
 ## `response_schema.py` — 4 defs, 46 lines
 
 | Line | Name | Summary |
@@ -659,4 +665,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**565 definitions across 15 files + Code.gs.**
+**566 definitions across 16 files + Code.gs.**
