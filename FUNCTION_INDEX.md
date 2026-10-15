@@ -556,7 +556,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 40 | `GeminiJobScreenerResponse._normalize_track` | _(no docstring)_ |
 | 45 | `GeminiJobScreenerResponse._normalize_tone_mode` | _(no docstring)_ |
 
-## `resume_engine.py` — 24 defs, 736 lines
+## `resume_engine.py` — 24 defs, 741 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -577,13 +577,13 @@ grep -i "contact" FUNCTION_INDEX.md
 | 301 | `_render_experience_block` | Renders the Professional Experience section entirely from Evidence Bank data - every |
 | 351 | `_render_education_credentials_block` | Renders the combined Education & Credentials section - degrees from evidence_bank's |
 | 384 | `_render_projects_block` | Renders the Technical Projects section - name/location/dates header line per project, |
-| 426 | `_rendered_bullets` | _(no docstring)_ |
-| 430 | `_unescape_typst` | _(no docstring)_ |
-| 434 | `_reconcile_summary_figures` | Make every figure the summary quotes have a bullet behind it on the same page. |
-| 501 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
-| 659 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
-| 664 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
-| 732 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
+| 431 | `_rendered_bullets` | _(no docstring)_ |
+| 435 | `_unescape_typst` | _(no docstring)_ |
+| 439 | `_reconcile_summary_figures` | Make every figure the summary quotes have a bullet behind it on the same page. |
+| 506 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
+| 664 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
+| 669 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
+| 737 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
 
 ## `resume_side_projects.py` — 1 defs, 45 lines
 
