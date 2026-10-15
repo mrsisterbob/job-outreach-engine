@@ -3659,3 +3659,27 @@ def test_signal_title_carries_intern():
                 assert not re.search(r"Wealth Operations Specialist(?! Intern)", mk), (tr, tone)
                 pdf = re_.compile_resume_pdf("Acme", tr, tone_mode=tone, job_text=job)
                 assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (tr, tone, bool(job))
+
+
+def test_track_summaries_read_as_experience_and_looking_for():
+    import re
+    import resume_engine as re_
+    import summary_figures as sf
+    for track in "abcdefgh":
+        for tone in ("conservative", "tech"):
+            mk = re_.render_typst_markup("Acme", track=track, tone_mode=tone)
+            if "// --- SUMMARY ---" not in mk:
+                # Cut track: heading and block both omitted (the Log names it).
+                assert "[SUMMARY]" not in mk, (track, tone)
+                continue
+            block = mk[mk.index("[SUMMARY]"):mk.index("// --- PROFESSIONAL EXPERIENCE ---")]
+            text = block.split("#v(2pt)\n", 1)[1].split("\n#v(", 1)[0]
+            text = text.split("\n*Skills:*")[0].replace("\\", "")
+            assert "I have experience in" in text, (track, tone, text)
+            assert "I am looking for" in text, (track, tone, text)
+            assert sf.summary_figures(text) == [], (track, tone, text)
+            assert not re.search(r"\d", text), (track, tone, text)
+            assert not pu.negative_language_hits(text), (track, tone, text)
+            for sentence in re.split(r"(?<=[.!?])\s+", text):
+                if re.search(r"\b(Python|SQL|SQLite)\b", sentence):
+                    assert "own project" in sentence or "outreach engine" in sentence, (track, tone, sentence)
