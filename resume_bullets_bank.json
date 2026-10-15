@@ -1,18 +1,18 @@
 {
   "track_a_wealth_ops": [
-    "Audited onboarding paperwork for 2,000+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
+    "Audited onboarding paperwork for 2,000+ accounts, checking investment advisory agreements and risk profiles against SEC rules.",
     "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
     "Managed Salesforce ticketing queues and worked with custodians to resolve advisor requests within 1 to 2 hour SLAs.",
     "Fixed margin errors and cash distribution mismatches across clearing feeds with zero service breaches.",
     "Standardized transfer checklists for Schwab and Fidelity, cutting rejected paperwork resubmissions by 40%.",
-    "Cleaned and updated 1,500+ legacy account files in internal databases to ensure compliance with custodial guidelines.",
+    "Cleaned and updated 1,500+ legacy account files in internal databases to meet custodial guidelines.",
     "Trained new operations analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
     "Audited advisor billing and fee schedules across Salesforce to eliminate recurring monthly invoicing errors.",
-    "Checked training records across 20 insurance carriers to verify licensing for 600+ partner RIAs.",
+    "Checked training records across 20 insurance carriers to confirm licensing for 600+ partner RIAs.",
     "Worked ACAT transfer exceptions across Schwab and Fidelity, clearing documentation holds before they aged past SLA.",
-    "Reconciled advisory agreements against custodial records during an offboarding so the firm handed off active client files without a gap.",
+    "Matched advisory agreements to custodial records during an offboarding, handing off every active client file.",
     "Wrote down the escalation path for custodial transfers instead of leaving it to whoever picked up the ticket, cutting turnaround 25%.",
-    "Reconciled institutional custody account records against internal reporting tables with SQL, clearing the variances that blocked month-end sign-off.",
+    "Matched institutional custody account records to internal reporting tables with SQL, clearing the variances that blocked month-end sign-off.",
     "Tracked onboarding throughput across a $2.5B AUM advisor platform to find the paperwork stages where client files were actually stalling.",
     "Chased documentation hold-ups with partner firms so an onboarding exception on a prospective client file never sat unresolved."
   ],
@@ -23,9 +23,9 @@
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
     "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
-    "Audited onboarding paperwork for 2,000+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
-    "Reconciled advisory agreements and account records against custodial data during an offboarding, so active client files handed off clean.",
-    "Verified licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
+    "Audited onboarding paperwork for 2,000+ accounts, checking advisory agreements and risk profiles against SEC rules.",
+    "Matched advisory agreements and account records to custodial data during an offboarding, so active client files handed off clean.",
+    "Checked licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
     "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
     "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
     "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
@@ -59,13 +59,13 @@
     "Checked advisor commission splits to keep internal accounting aligned with RIA compliance controls.",
     "Set up compliance checkpoints in Salesforce for advisor onboarding and account opening workflows.",
     "Turned SEC and FinCEN identity requirements into a step-by-step onboarding checklist and documented it for future analysts.",
-    "Reviewed identity verification and suitability forms for incoming client accounts prior to trade execution.",
+    "Reviewed identity and suitability forms for incoming client accounts prior to trade execution.",
     {
       "text": "Reviewed title records and property documentation so custodial data stayed consistent across active offerings rather than drifting per deal.",
       "source_job": 1,
       "replaces": 2
     },
-    "Verified licensing and training records for 600+ partner RIAs across 20 insurance carriers before any of them could write business.",
+    "Checked licensing and training records for 600+ partner RIAs across 20 insurance carriers before any of them could write business.",
     {
       "text": "Ran suitability reviews on 15+ prospecting files so every recommendation was documented against the client's actual profile.",
       "source_job": 2,
@@ -75,7 +75,7 @@
     "Handled the offboarding cutover on active client files, checking agreements against custodial data so nothing transferred half-finished."
   ],
   "track_d_business_intelligence": [
-    "Wrote SQL against internal reporting tables to reconcile institutional custody accounts and surface the variances behind each break.",
+    "Wrote SQL against internal reporting tables to match institutional custody accounts and surface the variances behind each break.",
     {
       "text": "Chased down the 401(k) and healthcare deduction mismatches across 2,000+ employee accounts in bSwift and Excel until every ledger agreed.",
       "source_job": 3,
@@ -92,11 +92,11 @@
     "Ran SQL variance checks on 2,000+ ledger accounts to prepare recurring internal financial reports.",
     "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
     {
-      "text": "Built Excel lookup and macro templates for recurring 401(k) and healthcare deduction reconciliation across 2,000+ accounts.",
+      "text": "Built Excel lookup and macro templates for recurring 401(k) and healthcare deduction matching across 2,000+ accounts.",
       "source_job": 3,
       "replaces": 0
     },
-    "Reconciled carrier funding promises and cashiering payouts against internal banking records.",
+    "Matched carrier funding promises and cashiering payouts to internal banking records.",
     {
       "text": "Built the audit checklists that cross-referenced payroll across 70+ manufacturing facilities, surfacing a deduction error that kept recurring.",
       "source_job": 3,
@@ -136,7 +136,7 @@
     "Built DocuSign and Salesforce packet workflows for 150+ users, cutting packet review from 60 minutes to 20.",
     "Monitored Salesforce service queues to catch routing errors, so a miscategorized request did not quietly sit unworked.",
     "Trained incoming operations analysts on DocuSign and Salesforce, shortening onboarding ramp from 3 weeks to 10 days.",
-    "Documented the service desk workflow end to end so the queue was handled the same way regardless of who was on it.",
+    "Documented the service desk workflow step by step so every person on the queue handled it the same way.",
     "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
     "Cleaned and revalidated 1,500+ legacy account records during an internal database migration so downstream reporting matched.",
     "Tracked onboarding throughput across the platform to find the stages where files were actually stalling rather than guessing."
@@ -147,9 +147,9 @@
       "source_job": 3,
       "replaces": 1
     },
-    "Reconciled data from separate sites against one agreed source so recurring reporting came out right the first time.",
+    "Matched data from separate sites to one agreed source so recurring reporting came out right the first time.",
     "Resolved urgent custodian requests inside 1 to 2 hour SLAs by managing the Salesforce ticketing queues.",
-    "Reconciled institutional account records against internal reporting tables with SQL until the balances agreed.",
+    "Matched institutional account records to internal reporting tables with SQL until the balances agreed.",
     {
       "text": "Reviewed title records and supporting documentation so data stayed consistent across active sites rather than drifting site by site.",
       "source_job": 1,
@@ -164,7 +164,7 @@
     "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
     "Built Power BI dashboards to track daily volume, response times and pipeline metrics in one place.",
     "Ran SQL variance checks across 2,000+ accounts to prepare the recurring internal reports.",
-    "Documented the reconciliation workflow end to end so the same checks ran the same way regardless of who ran them.",
+    "Documented the account matching workflow step by step so each person ran the same checks.",
     "Turned reporting requirements into a step-by-step checklist and wrote it down for the analysts who came after.",
     "Tracked exceptions with partner organizations so a documentation hold-up had an owner and a next step.",
     "Standardized the checklists that kept coming back rejected, cutting resubmissions by 40%.",
@@ -180,9 +180,9 @@
     "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
     "Wrote down the escalation path for custodial transfers, cutting request turnaround by 25%.",
     "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
-    "Audited onboarding paperwork for 2,000+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
-    "Verified licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
-    "Reconciled advisory agreements and account records against custodial data during an offboarding, so active client files handed off clean.",
+    "Audited onboarding paperwork for 2,000+ accounts, checking advisory agreements and risk profiles against SEC rules.",
+    "Checked licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
+    "Matched advisory agreements and account records to custodial data during an offboarding, so active client files handed off clean.",
     {
       "text": "Set up compliance intake checkpoints so every incoming investor file cleared the same review before it moved forward.",
       "source_job": 1,
