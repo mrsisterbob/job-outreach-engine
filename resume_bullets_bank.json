@@ -77,7 +77,7 @@
   "track_d_business_intelligence": [
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
     {
-      "text": "Chased down the 401(k) and healthcare deduction mismatches across 2,000+ employee accounts in bSwift and Excel until every ledger agreed.",
+      "text": "Chased down the 401(k) and healthcare deduction mismatches across 500+ employee accounts in bSwift and Excel until every ledger agreed.",
       "source_job": 3,
       "replaces": 0
     },
@@ -92,7 +92,7 @@
     "Checked licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
     "Tracked onboarding throughput across a $2.5B AUM advisor platform in Wealthscape and the Schwab client portal to locate where files stalled.",
     {
-      "text": "Matched recurring 401(k) and healthcare deduction records across 2,000+ accounts in Excel with VLOOKUPs and basic formulas.",
+      "text": "Matched recurring 401(k) and healthcare deduction records across 500+ accounts in Excel with VLOOKUPs and basic formulas.",
       "source_job": 3,
       "replaces": 0
     },

@@ -3448,3 +3448,48 @@ def test_resume_render_blocks_banned_words(monkeypatch):
     for t in tracks:
         for tone in ("conservative", "tech"):
             assert re_.render_typst_markup("Acme", track=t, tone_mode=tone)
+
+
+def test_employer_dates_and_counts_single_source():
+    """Dates on every rendered header come from evidence_bank.json; ABC never claims 2,000+ accounts."""
+    import resume_engine as _re
+    import track_registry as _tr
+    bank = _re.load_evidence_bank()
+    for track in "abcdefgh":
+        for tone in ("conservative", "tech"):
+            markup = _re.render_typst_markup("Acme", track, tone_mode=tone)
+            header_lines = [ln for ln in markup.splitlines() if "#h(1fr)" in ln]
+            for entry in bank["experience"]:
+                needle = f"| {entry['start']} -- {entry['end']}"
+                hits = [ln for ln in header_lines
+                        if entry["company"] in ln and needle in ln]
+                assert len(hits) == 1, (track, tone, entry["company"], len(hits))
+            for proj in bank.get("projects", []):
+                if proj.get("name", "") in markup:
+                    needle = f"| {proj['start']} -- {proj['end']}"
+                    hits = [ln for ln in header_lines if proj["name"] in ln and needle in ln]
+                    assert len(hits) == 1, (track, tone, proj["name"], len(hits))
+            for ln in header_lines:
+                assert "06/2026" not in ln and "09/2026" not in ln
+                assert "07/2026 -- 08/2026" not in ln
+    abc_words = ("401(k)", "deduction", "bswift", "payroll", "variance", "ledger")
+    texts = []
+    for entry in bank["experience"]:
+        if entry["company"].startswith("ABC"):
+            texts += entry["bullets"]
+    pools = _re.load_resume_bullets_bank()
+    for pool in pools.values():
+        if not isinstance(pool, list):
+            continue
+        for item in pool:
+            if isinstance(item, dict) and item.get("source_job") == 3:
+                texts.append(item.get("text", ""))
+    for track in _tr.TRACKS.values():
+        texts.append(track.get("summary", ""))
+    for t in texts:
+        for clause in t.split(","):
+            if "2,000+" in clause:
+                assert not any(w.lower() in clause.lower() for w in abc_words), t
+    for fname in ("resume_engine.py", "track_registry.py"):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), encoding="utf-8") as f:
+            assert not re.search(r"\b\d{2}/20\d{2}\b", f.read()), fname
