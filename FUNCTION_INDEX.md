@@ -576,6 +576,12 @@ grep -i "contact" FUNCTION_INDEX.md
 | 547 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
 | 615 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
 
+## `resume_side_projects.py` — 1 defs, 45 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 17 | `side_projects_for_track` | Return the side_projects entries (dicts, unchanged) that fit `track`, at most `limit`. |
+
 ## `role_funnel.py` — 11 defs, 220 lines
 
 | Line | Name | Summary |
@@ -653,4 +659,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**564 definitions across 14 files + Code.gs.**
+**565 definitions across 15 files + Code.gs.**
