@@ -12877,3 +12877,50 @@ def test_evidence_block_keeps_personal_tools_off_employer():
         for tool in ("Claude Code", "Tableau", "Gemini", "Looker Studio"):
             assert tool in pers_line
             assert tool not in emp_line
+
+
+# ---- TASK-53: the resume footer gets the job's description on the real compile path ----
+
+def test_resume_footer_gets_job_description_via_resilient_and_fallback(monkeypatch):
+    """Write path: compile_resume_pdf_resilient forwards job_text to the primary compile AND to
+    the fixed-track fallback retry."""
+    calls = []
+
+    def fake_compile(comp, track="a", bullet_indices=None, tone_mode="conservative", job_text=""):
+        calls.append((track, job_text))
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return b"%PDF-"
+
+    monkeypatch.setattr(m, "compile_resume_pdf", fake_compile)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **k: None)
+    pdf = m.compile_resume_pdf_resilient(1, "Acme", "e", [0, 1], "/e", job_text="needs Excel and SQL")
+    assert pdf
+    assert calls == [("e", "needs Excel and SQL"), ("a", "needs Excel and SQL")]
+
+
+def test_resume_footer_gets_job_description_from_stage_outreach_draft(monkeypatch):
+    """Drives the real draft sender: the job's description reaches compile_resume_pdf."""
+    seen = {}
+
+    def fake_compile(comp, track="a", bullet_indices=None, tone_mode="conservative", job_text=""):
+        seen["job_text"] = job_text
+        return b"%PDF-"
+
+    monkeypatch.setattr(m, "compile_resume_pdf", fake_compile)
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **k: None)
+    monkeypatch.setattr(m, "create_gmail_draft", lambda **kw: (True, "ok", "draft-1"))
+    monkeypatch.setattr(m, "log_daily_activity", lambda *a, **k: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: None)
+    monkeypatch.setattr(m, "send_telegram_document", lambda *a, **k: True)
+    before = set(threading.enumerate())
+    job = {"employer_name": "Atwell", "job_title": "Operations Analyst", "track": "e",
+           "bullet_indices": [0, 1, 2], "tone_mode": "conservative",
+           "job_description": "Must know Salesforce and Excel."}
+    mapping = {"sheet_uuid": "uuid-e", "sheet_tab": "Tetiana Cold",
+               "contact_name": "", "contact_company": "Atwell"}
+    m.stage_outreach_draft(1, mapping, job, "Atwell", "Operations Analyst", False,
+                           "dana@atwell.com", "hdr", "/e")
+    for t in set(threading.enumerate()) - before:
+        t.join(timeout=5)
+    assert seen["job_text"] == "Must know Salesforce and Excel."

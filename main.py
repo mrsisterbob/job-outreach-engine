@@ -5675,13 +5675,13 @@ def create_gmail_draft(to_email, company_name, job_title, is_warm=False, custom_
     except Exception as e:
         return False, str(e), None
 
-def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label, tone_mode="conservative"):
+def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label, tone_mode="conservative", job_text=""):
     """Compiles the tailored resume PDF with a fallback retry (track 'a', bullet_indices [0,1,2])
     if the first attempt raises or returns empty bytes. Sends a Telegram warning on final failure
     so a broken attachment is never silent. Returns pdf_bytes, or None if both attempts failed.
     """
     try:
-        pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode)
+        pdf_bytes = compile_resume_pdf(comp, track=track, bullet_indices=bullet_indices, tone_mode=tone_mode, job_text=job_text)
         if pdf_bytes:
             log_metric_event(DOCUMENT_COMPILED_EVENT, source="resume")
             return pdf_bytes
@@ -5689,7 +5689,7 @@ def compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_l
     except Exception as e:
         logging.error(f"{command_label} resume compilation failed for {comp} (track={track}): {e} - retrying with fallback track 'a'")
         try:
-            pdf_bytes = compile_resume_pdf(comp, track="a", bullet_indices=[0, 1, 2], tone_mode=tone_mode)
+            pdf_bytes = compile_resume_pdf(comp, track="a", bullet_indices=[0, 1, 2], tone_mode=tone_mode, job_text=job_text)
             if pdf_bytes:
                 log_metric_event(DOCUMENT_COMPILED_EVENT, source="resume")
                 return pdf_bytes
@@ -5795,7 +5795,7 @@ def stage_outreach_draft(chat_id, mapping, job, comp, title, is_warm, target, he
     bullet_indices = job.get("bullet_indices")
     tone_mode = job.get("tone_mode", "conservative")
     pdf_filename = resume_pdf_filename(comp)
-    pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label, tone_mode=tone_mode)
+    pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, command_label, tone_mode=tone_mode, job_text=str(job.get("job_description") or ""))
 
     raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
     # pdf_bytes is still compiled above and still posted to Telegram below - only the OUTBOUND
@@ -13704,7 +13704,7 @@ def process_webhook_payload_async(data):
             bullet_indices = job.get("bullet_indices")
             tone_mode = job.get("tone_mode", "conservative")
             pdf_filename = resume_pdf_filename(comp)
-            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft", tone_mode=tone_mode)
+            pdf_bytes = compile_resume_pdf_resilient(chat_id, comp, track, bullet_indices, "/draft", tone_mode=tone_mode, job_text=str(job.get("job_description") or ""))
             logging.info(f"/draft command: staging Gmail draft for {comp} <{target}> (chat_id={chat_id})")
             raw_email_text = resolve_outreach_body(job, mapping, title, comp, is_warm)
             # Same gate as stage_outreach_draft: the PDF still reaches Telegram, not the email.
