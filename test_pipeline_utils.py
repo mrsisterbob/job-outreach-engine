@@ -3306,3 +3306,33 @@ def test_side_projects_for_track_real_bank_names_exist():
         for n in names:
             assert n in have, f"track {track}: {n!r} missing from evidence_bank side_projects"
         assert len(_rsp.side_projects_for_track(sp, track, limit=10)) == len(names)
+
+
+def test_forty_acres_bank_advises_not_files():
+    """Form D / Crowdfunding lines say planned/advised/explained, never drafted/filed."""
+    root = os.path.dirname(os.path.abspath(pu.__file__))
+    found = []
+
+    def walk(o):
+        if isinstance(o, str):
+            if "Form D" in o or "Crowdfunding" in o:
+                found.append(o)
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    for fn in ("evidence_bank.json", "resume_bullets_bank.json"):
+        with open(os.path.join(root, fn), encoding="utf-8") as f:
+            walk(json.load(f))
+    assert found
+    banned = re.compile(r"\b(drafted|wrote|writing|written|prepared|preparing|filed|filing|submitted)\b", re.I)
+    ok = re.compile(r"\b(planned|advised|explained|walked)\b", re.I)
+    for s in found:
+        # "filings" as the object being planned/explained is allowed; the act verbs are not.
+        acts = [m_.group(0) for m_ in banned.finditer(s) if m_.group(0).lower() != "filing"]
+        assert not acts, f"{s!r} claims act {acts}"
+        assert ok.search(s), f"{s!r} lacks advising verb"
+        assert not pu.negative_language_hits(s), f"{s!r} has negations"
