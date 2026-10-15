@@ -3357,3 +3357,14 @@ def test_forty_acres_registry_no_filing_claims():
             assert not re.search(r"\b(draft|drafted|wrote|filed)\b[^.]{0,30}Form D|Form D[^.]{0,30}\b(draft|drafted|wrote|filed)\b", s, re.I), s
     assert not pu.negative_language_hits(_tr.TRACK_REGISTRY["c"]["summary"])
     assert "SEC & FinCEN Identity Standards" in _tr.TRACK_REGISTRY["c"]["skills"][0][1]
+
+
+def test_bridges_track_d_analytics_belong_to_projects():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "cover_letter_templates.json"), encoding="utf-8") as f:
+        pool = json.load(f)["bridges_track_d_business_intelligence"]
+    assert len(pool) == 4
+    t = pool[3]
+    assert "project" in t.lower() or "job-search tool" in t.lower()
+    for bad in ("on the job", "at work", "in my role"):
+        assert bad not in t.lower()
+    assert pu.negative_language_hits(t) == []
