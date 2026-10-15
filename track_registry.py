@@ -36,7 +36,7 @@ TRACK_REGISTRY = {
     },
     "b": {
         "pool_key": "track_b_engineering",
-        "fallback_bullet": "Designed and scripted ETL pipelines and schema validation logic to automate high-volume data reconciliation.",
+        "fallback_bullet": "Reconciled employee deduction variances across 500+ accounts in bSwift and Excel.",
         "aliases": ("engineering", "data_systems", "data systems"),
         "prompt_label": "data/systems engineering",
         "subtitle": "Data & Systems Engineering",
@@ -62,7 +62,7 @@ TRACK_REGISTRY = {
     },
     "d": {
         "pool_key": "track_d_business_intelligence",
-        "fallback_bullet": "Built reporting pipelines to translate raw operational data into executive insights.",
+        "fallback_bullet": "Prepared supporting schedules for variance analysis and recurring internal financial reports.",
         "aliases": ("business_intelligence", "bi", "analytics"),
         "prompt_label": "business intelligence & analytics",
         "subtitle": "Business Intelligence & Analytics",
@@ -75,7 +75,7 @@ TRACK_REGISTRY = {
     },
     "e": {
         "pool_key": "track_e_bizops",
-        "fallback_bullet": "Automated routine data extraction and workflow tasks to reduce manual administrative overhead.",
+        "fallback_bullet": "Tracked onboarding throughput across an advisor platform to locate the paperwork stages where files stalled.",
         "aliases": ("bizops", "business_operations", "business operations", "crm"),
         "prompt_label": "business operations & CRM systems",
         "subtitle": "Business Operations & CRM Systems",
@@ -118,7 +118,7 @@ TRACK_REGISTRY = {
     },
     "h": {
         "pool_key": "track_h_technical_systems",
-        "fallback_bullet": "Automated recurring reconciliation and document assembly in Python, replacing work that had been done by hand.",
+        "fallback_bullet": "Reconciled recurring deduction variances and assembled supporting documents by hand across 500+ accounts.",
         "aliases": ("technical_systems", "technical", "automation", "systems"),
         "prompt_label": "technical systems & automation",
         "subtitle": "Operations Automation & Systems",

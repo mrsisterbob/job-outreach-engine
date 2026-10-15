@@ -3659,7 +3659,7 @@ def get_current_role_blurb():
     """
     experience = load_evidence_bank().get("experience", [])
     if not experience:
-        return "wealth operations and process automation", "I am currently working in wealth operations and process automation."
+        return "wealth operations", "I am currently working in wealth operations."
     current = experience[0]
     title = current.get("title", "")
     company = current.get("company", "")
@@ -3669,7 +3669,7 @@ def get_current_role_blurb():
     clean_domain = re.sub(r'\b(specialist|intern|lead|analyst|manager|associate|coordinator)\b', '', title, flags=re.IGNORECASE).strip().lower()
     clean_domain = re.sub(r'\s+', ' ', clean_domain)
 
-    core_exp = f"{clean_domain} and process automation" if clean_domain else "wealth operations and process automation"
+    core_exp = clean_domain if clean_domain else "wealth operations"
     sentence = f"I am currently working as a {title} at {company}" + (f" in {location}" if location else "") + "."
     return core_exp, sentence
 
@@ -4657,9 +4657,9 @@ def generate_interview_prep(company, job_title, job_description=""):
     """3 talking points + 2 reverse questions tailored to a role; safe static fallback if Gemini is unavailable."""
     fallback = {
         "talking_points": [
-            f"My experience automating reporting workflows with Python and SQL directly maps to the operational efficiency {company or 'this team'} is likely optimizing for.",
+            f"My own Python and SQL projects, including the outreach engine, show how I work with data, and that maps to the operational efficiency {company or 'this team'} is likely optimizing for.",
             f"In wealth ops, I've reconciled data across custodial platforms - the same rigor applies to {job_title or 'this role'}'s process ownership.",
-            "I like building lightweight automation that removes manual steps without adding fragile complexity."
+            "In my own projects I build small tools that remove manual steps without adding fragile complexity."
         ],
         "reverse_questions": [
             "What does a successful first 90 days look like for this role from an operations standpoint?",
@@ -4696,7 +4696,7 @@ def generate_elevator_pitch(company, job_title):
     """Tight 3-sentence elevator pitch tailored to a company/role; safe static fallback if Gemini is unavailable."""
     core_exp, _ = get_current_role_blurb()
     fallback = (
-        f"Hi, I'm Kevin - I work in {core_exp}, building Python and SQL tools that cut manual reconciliation time. "
+        f"Hi, I'm Kevin - I work in {core_exp}, and I build Python and SQL tools in my own projects, like the outreach engine. "
         f"I've been following {company or 'your team'} and think my background lines up well with {job_title or 'the operations work'} you're doing. "
         "Would love to grab 15 minutes to see where I could help."
     )

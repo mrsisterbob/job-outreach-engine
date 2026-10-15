@@ -12959,3 +12959,19 @@ def test_side_projects_render_tracks_d_b_h_fit_one_page():
             pdf = resume_engine.compile_resume_pdf("Acme", track, indices, tone)
             pages = len(PdfReader(io.BytesIO(pdf)).pages)
             assert pages == 1, f"track={track} tone={tone} indices={indices} -> {pages} pages"
+
+
+def test_fallback_copy_attributes_no_scripting_to_employer(monkeypatch):
+    """Fallback bullets, prep points and the pitch never credit an employer with scripting or Python/SQL."""
+    banned = re.compile(r"script|automat|ETL|pipeline|Python|SQL|macro", re.IGNORECASE)
+    for letter, spec in track_registry.TRACK_REGISTRY.items():
+        assert not banned.search(spec["fallback_bullet"]), (letter, spec["fallback_bullet"])
+    monkeypatch.setattr(m, "GEMINI_API_KEY", "")
+    points = m.generate_interview_prep("Acme", "Analyst")["talking_points"]
+    pitch = m.generate_elevator_pitch("Acme", "Analyst")
+    texts = list(points) + [pitch]
+    for text in texts:
+        assert not re.search(r"automat|reconciliation time", text, re.IGNORECASE), text
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            if re.search(r"Python|SQL", sentence):
+                assert "own" in sentence or "outreach engine" in sentence, sentence
