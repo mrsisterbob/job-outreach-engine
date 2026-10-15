@@ -3518,3 +3518,55 @@ def test_side_project_header_needs_a_bullet_empty_bullets_drops_header():
     for track in "bdh":
         out = _re._render_projects_block(evidence, "conservative", track)
         assert "Budget tracker" not in out
+
+
+def test_letters_name_no_securities_filings():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "templates", "cover_letter_templates.json")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    pat = re.compile(r"drafted|securities filing|form d|crowdfund", re.IGNORECASE)
+    checked = 0
+    for pool, entries in data.items():
+        if not (isinstance(entries, list) and entries and all(isinstance(e, str) for e in entries)):
+            continue
+        for i, s in enumerate(entries):
+            checked += 1
+            assert not pat.search(s), f"{pool}[{i}] claims securities filings: {s!r}"
+            assert not pu.negative_language_hits(s), f"{pool}[{i}] has negations"
+    assert checked > 0
+
+
+def test_summary_figures_have_supporting_bullet():
+    import resume_engine as re_
+    import summary_figures as sf
+    import track_registry as tr_
+
+    assert sf.summary_figures("a 2,000+ b 60 minutes to 20 c 1-to-2-hour d 70+") == [
+        "2,000+", "60 minutes to 20", "1-to-2-hour", "70+"]
+    for variant in ("cut from 60 minutes to 20.", "cut from 60 to 20 minutes.", "landing it at 20 minutes from 60."):
+        assert sf.figure_supported("60 minutes to 20", [variant])
+    assert not sf.figure_supported("2,000+", ["Audited 200+ accounts"])
+
+    pools = re_.load_resume_bullets_bank()
+    for track in "abcdefgh":
+        data = tr_.TRACKS[track]
+        figs = sf.summary_figures(data["summary"])
+        pool = pools[tr_.pool_key_for(track)]
+        figureless = [i for i, e in enumerate(pool)
+                      if not any(sf.figure_supported_by(f, re_.bullet_text(e)) for f in figs)]
+        routings = [[0, 1, 2], [0], figureless[:3]]
+        for tone in ("conservative", "tech"):
+            for idx in routings:
+                if not idx:
+                    continue
+                markup = re_.render_typst_markup("Acme", track=track, bullet_indices=idx, tone_mode=tone)
+                bullets = [ln[2:].replace("\\", "") for ln in markup.split("\n") if ln.startswith("- ")]
+                full = re_.escape_typst(re_.apply_tone_filter(data["summary"], tone, track))
+                plain = re_.escape_typst(re_.apply_tone_filter(data["summary_plain"], tone, track))
+                if figs and full in markup:
+                    for f in figs:
+                        assert sf.figure_supported(f, bullets), (track, tone, idx, f)
+                else:
+                    assert plain in markup, (track, tone, idx)
+                    assert not sf.summary_figures(data["summary_plain"])
