@@ -10422,6 +10422,32 @@ def test_skills_footers_only_name_banked_systems():
     assert unbanked == [], f"footer names a system not in evidence_bank: {unbanked}"
 
 
+def _footer_block(markup):
+    return markup.split("[SKILLS & SYSTEMS]")[1].split("#v(2pt)\n", 1)[1].strip()
+
+
+def test_footer_surfaces_banked_skills_in_two_lines():
+    posting = "We use Looker Studio, Tableau and XLOOKUP daily."
+    base = resume_engine.render_typst_markup("Acme", "d")
+    out = resume_engine.render_typst_markup("Acme", "d", job_text=posting)
+    block = _footer_block(out)
+    for skill in ("Looker Studio", "Tableau", "XLOOKUP"):
+        assert skill in block
+    assert len(block.split("\n")) == 2
+    assert resume_engine.render_typst_markup("Acme", "d", job_text="") == base
+
+
+def test_footer_surfaces_banked_skills_compiles_to_one_page():
+    import re
+    bank = resume_engine.load_evidence_bank()["technical_skills"]
+    posting = " ".join(bank[:10] + ["Tableau", "Looker Studio", "XLOOKUP", "Git", "Flask"])
+    for letter in resume_engine.TRACKS:
+        pdf = resume_engine.compile_resume_pdf("Acme", letter, job_text=posting)
+        assert len(re.findall(rb"/Type\s*/Page(?!s)", pdf)) == 1, letter
+        assert len(_footer_block(resume_engine.render_typst_markup(
+            "Acme", letter, job_text=posting)).split("\n")) == 2
+
+
 def test_edit_addresses_every_new_pool():
     """/edit slot codes were T[A-E]; TF0 and TH14 returned None, so the three new pools were
     unreachable from Telegram."""
