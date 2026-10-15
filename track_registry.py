@@ -41,7 +41,7 @@ TRACK_REGISTRY = {
         "prompt_label": "data/systems engineering",
         "subtitle": "Data & Systems Engineering",
         "keywords": ("Python", "SQL", "REST APIs", "ETL", "Schema Architecture", "Process Automation"),
-        "summary": "I build Python and SQL tools that cut manual reporting work, including a pipeline that cleaned 1,500+ legacy account records.",
+        "summary": "I build Python and SQL tools that cut manual reporting work.",
         "skills": [
             ("Engineering & Data", "Python, SQL, REST APIs, Webhook Integrations, SQLite WAL, Data Reconciliation."),
             ("Platforms & Stack", "Salesforce, HubSpot CRM, Flask, Typst, Schwab Advisor Center, Fidelity Wealthscape.")
