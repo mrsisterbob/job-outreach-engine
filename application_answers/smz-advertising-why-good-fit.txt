@@ -1,13 +1,13 @@
-The part of this posting that fits me best is moving data from many sources into one place where a team can trust it. I have built that on my own projects and done the checking side of it at work.
+The part of this posting that fits me best is moving data from many sources into one place where a team can trust it. I have built that on my own project, and I bring a checking habit from operations work.
 
-My outreach engine is a Python and SQLite system I wrote. It connects to 16 external services, including the Gmail API, Telegram, seven job sources, three email lookup APIs and a Google Apps Script bridge that writes to a Google Sheets CRM. Each service returns data in a different shape, so I wrote the mapping and cleanup that turns them into one consistent record. When a feed changes a field, I trace it back to the source and correct the mapping. That is the same loop your posting describes: connect the feed, normalize it, confirm it matches.
+My outreach engine is a Python and SQLite system that I wrote myself. It connects to 16 external services, including the Gmail API, Telegram, seven job sources, three email lookup APIs and a Google Apps Script bridge that writes to a Google Sheets CRM. Each service returns data in a different shape, so I wrote the mapping and cleanup that turns them into one consistent record. The rest of the system then reads from that one record, whatever service it came from. The records are stored in SQLite, so the data stays in one place. That is the connect-and-normalize work your posting describes.
 
-The checking side comes from my operations work at an investment advisory firm. I wrote SQL against internal reporting tables to match institutional custody account records until the balances agreed, which cleared the variances that held up month-end sign-off. I also ran SQL variance checks across 2,000+ ledger accounts to prepare recurring internal reports. That work taught me to ask where a number came from before anyone builds a chart on it, which is the discipline data QA and reconciliation depend on.
+I did operations work at an investment advisory firm. There I handled client onboarding, worked in custodian portals, and used Salesforce and DocuSign. That work taught me to ask where a number came from before anyone relies on it.
 
-I have built Power BI dashboards that tracked daily ticket volume, response times and team pipeline metrics, and I work comfortably in Excel and Google Sheets with lookups and formulas.
+At the same time, I taught myself Claude Code and autonomous agents. I run automation through prompt queues in a multi-terminal setup, and I have used Claude Code with a headless browser to move across browser tabs. This is my own learning.
 
-Explaining findings clearly is a habit I keep. I found a Salesforce ticket conflict between two desks, wrote up what I saw and presented it to leadership, and requests now reach the correct queue.
+I work comfortably in Excel and Google Sheets with lookups and formulas. I have also researched supplier ads for a friend, and I wrote up plainly what the ads showed.
 
-On the media side, I have looked at supplier ads for a friend and studied what the ads showed. I am studying warehouse concepts and the AWS business intelligence course so I can grow into your BigQuery and ad platform data structures.
+On the platform side, I am studying warehouse concepts and the AWS business intelligence course so I can grow into your BigQuery and ad platform data structures.
 
 I would like to bring this combination of connecting data, checking it and explaining it to the marketing teams at SMZ.
