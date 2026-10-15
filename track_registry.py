@@ -28,8 +28,8 @@ TRACK_REGISTRY = {
         "prompt_label": "wealth operations",
         "subtitle": "Financial Systems & Operations",
         "keywords": ("Wealth Operations", "Process Automation", "Python", "SQL", "Salesforce", "Reconciliation"),
-        "summary": "I match custodial accounts across 2,000+ client files and work onboarding paperwork through Salesforce.",
-        "summary_plain": "I match custodial accounts across client files and work onboarding paperwork through Salesforce.",
+        "summary": "I have experience in custodial account operations and advisor onboarding paperwork, and I am looking for wealth operations and financial systems roles.",
+        "summary_plain": "I have experience in custodial account operations and advisor onboarding paperwork, and I am looking for wealth operations and financial systems roles.",
         "skills": [
             ("Core Operations", "Custodial Cashiering & Reconciliations, Ticketing Queue Management, RIA Audits, Automation."),
             ("Systems & Tools", "Salesforce, Schwab Advisor Center, Fidelity Wealthscape, DocuSign, Python, SQL, Excel.")
@@ -42,7 +42,8 @@ TRACK_REGISTRY = {
         "prompt_label": "data/systems engineering",
         "subtitle": "Data & Systems Engineering",
         "keywords": ("Python", "SQL", "REST APIs", "ETL", "Schema Architecture", "Process Automation"),
-        "summary": "I build Python and SQL tools that cut manual reporting work.",
+        "summary": "I have experience in tracing broken Salesforce data connections and in Python and SQL tools in my own projects, and I am looking for data and systems engineering roles.",
+        "summary_plain": "I have experience in tracing broken Salesforce data connections and in Python and SQL tools in my own projects, and I am looking for data and systems engineering roles.",
         "skills": [
             ("Engineering & Data", "Python, SQL, REST APIs, Webhook Integrations, SQLite WAL, Data Reconciliation."),
             ("Platforms & Stack", "Salesforce, HubSpot CRM, Flask, Typst, Schwab Advisor Center, Fidelity Wealthscape.")
@@ -55,8 +56,8 @@ TRACK_REGISTRY = {
         "prompt_label": "risk & regulatory compliance",
         "subtitle": "Risk & Regulatory Compliance",
         "keywords": ("Regulatory Compliance", "SEC & FinCEN Identity Standards", "Risk Management", "DocuSign", "Salesforce", "Audit Controls"),
-        "summary": "I audit onboarding files across 2,000+ accounts and plan SEC Form D filings, catching compliance risks before execution.",
-        "summary_plain": "I audit onboarding files across client accounts and plan SEC Form D filings, catching compliance risks before execution.",
+        "summary": "I have experience in auditing onboarding files against SEC identity standards and in explaining Form D filing requirements, and I am looking for risk and regulatory compliance roles.",
+        "summary_plain": "I have experience in auditing onboarding files against SEC identity standards and in explaining Form D filing requirements, and I am looking for risk and regulatory compliance roles.",
         "skills": [
             ("Compliance & Risk", "SEC & FinCEN Identity Standards, Suitability Reviews, Custodial Exception Audits, Form D."),
             ("Systems & Controls", "Salesforce Queue Routing, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Excel.")
@@ -69,8 +70,8 @@ TRACK_REGISTRY = {
         "prompt_label": "business intelligence & analytics",
         "subtitle": "Business Intelligence & Analytics",
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
-        "summary": "I audit onboarding paperwork for 2,000+ accounts, work custodial platforms like Schwab Advisor Center and Fidelity Wealthscape, built audit checklists that cross-reference multi-plant payroll data, and work Salesforce queues.",
-        "summary_plain": "I audit onboarding paperwork for client accounts, work custodial platforms like Schwab Advisor Center and Fidelity Wealthscape, built audit checklists that cross-reference multi-plant payroll data, and work Salesforce queues.",
+        "summary": "I have experience in Excel schedules for recurring reports and in onboarding throughput analysis, and I am looking for business intelligence and analytics roles.",
+        "summary_plain": "I have experience in Excel schedules for recurring reports and in onboarding throughput analysis, and I am looking for business intelligence and analytics roles.",
         "skills": [
             ("Analytics & Modeling", "SQL, Power BI, Tableau, Looker Studio, Excel."),
             ("Systems & Data", "Power Query, Power Automate, Salesforce Reports, bSwift, Schwab Advisor Center, Python.")
@@ -83,8 +84,8 @@ TRACK_REGISTRY = {
         "prompt_label": "business operations & CRM systems",
         "subtitle": "Business Operations & CRM Systems",
         "keywords": ("Business Operations", "Salesforce", "HubSpot CRM", "Process Automation", "Ticket Routing", "Python"),
-        "summary": "I design Salesforce queues and DocuSign workflows that cut advisor packet review from 60 minutes to 20.",
-        "summary_plain": "I design Salesforce queues and DocuSign workflows that shorten advisor packet review.",
+        "summary": "I have experience in Salesforce queues and DocuSign workflows for advisors, and I am looking for business operations and CRM systems roles.",
+        "summary_plain": "I have experience in Salesforce queues and DocuSign workflows for advisors, and I am looking for business operations and CRM systems roles.",
         "skills": [
             ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management, Process Design."),
             ("Systems & Tools", "Salesforce, HubSpot CRM, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Python.")
@@ -101,8 +102,8 @@ TRACK_REGISTRY = {
         "prompt_label": "operations & logistics",
         "subtitle": "Operations & Service Delivery",
         "keywords": ("Operations", "SLA Management", "Exception Handling", "Salesforce", "Process Automation", "Excel"),
-        "summary": "I work intake queues on a 1-to-2-hour turnaround, clearing exceptions before stalled handoffs leave anyone waiting.",
-        "summary_plain": "I work intake queues on a fast turnaround, clearing exceptions before stalled handoffs leave anyone waiting.",
+        "summary": "I have experience in working intake queues on a service window and in clearing documentation exceptions, and I am looking for operations and service delivery roles.",
+        "summary_plain": "I have experience in working intake queues on a service window and in clearing documentation exceptions, and I am looking for operations and service delivery roles.",
         "skills": [
             ("Operations & Service", "Queue & SLA Management, Exception Handling, Escalation Paths, Process Documentation."),
             ("Systems & Tools", "Salesforce, DocuSign, Excel, SQL, Python, HubSpot CRM.")
@@ -115,8 +116,8 @@ TRACK_REGISTRY = {
         "prompt_label": "supply chain & multi-site ops",
         "subtitle": "Multi-Site Operations & Data Controls",
         "keywords": ("Multi-Site Reconciliation", "Audit Controls", "Excel", "SQL", "Variance Analysis", "Recurring Reporting"),
-        "summary": "I reconcile data across 70+ manufacturing sites and build the audit checklists that catch the errors nobody was flagging, so recurring reporting comes out right the first time.",
-        "summary_plain": "I reconcile data across manufacturing sites and build the audit checklists that catch the errors nobody was flagging, so recurring reporting comes out right the first time.",
+        "summary": "I have experience in audit checklists that cross-reference payroll data across manufacturing sites, and I am looking for multi-site operations and data controls roles.",
+        "summary_plain": "I have experience in audit checklists that cross-reference payroll data across manufacturing sites, and I am looking for multi-site operations and data controls roles.",
         "skills": [
             ("Controls & Reconciliation", "Multi-Site Data Reconciliation, Audit Checklist Design, Variance Analysis, Recurring Reporting."),
             ("Systems & Tools", "Excel, SQL, Power BI, Salesforce, Python, bSwift.")
@@ -131,7 +132,8 @@ TRACK_REGISTRY = {
         # Deliberately not an engineering claim: main.build_system_prompt scores engineer-titled
         # reqs 1-24 on purpose, and the evidence says "operations person who automates his own
         # work", not "software engineer".
-        "summary": "I automate the operations work I used to do by hand, building Python and SQLite tools that reconcile records and compile documents instead of assembling them one at a time.",
+        "summary": "I have experience in tracing broken data connections and in writing Python and SQLite tools in my own projects, and I am looking for technical systems and operations automation roles.",
+        "summary_plain": "I have experience in tracing broken data connections and in writing Python and SQLite tools in my own projects, and I am looking for technical systems and operations automation roles.",
         "keywords": ("Process Automation", "Python", "SQL", "REST APIs", "Data Reconciliation", "SQLite"),
         "skills": [
             ("Automation & Data", "Process Automation, Data Reconciliation, Schema Validation, Webhook Integrations."),

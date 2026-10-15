@@ -541,9 +541,16 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     summary_raw = apply_tone_filter(track_data["summary"], tone_key, track_key)
     selected_bullets, experience_block, kept_summary = _reconcile_summary_figures(
         track_key, tone_key, selected_bullets, evidence, summary_raw)
-    if kept_summary is None:
-        summary_raw = apply_tone_filter(track_data.get("summary_plain") or track_data["summary"], tone_key, track_key)
+    if kept_summary is None and track_data["summary"]:
+        # `or` would resurrect an empty summary_plain from `summary`; only fall back on a missing key.
+        plain = track_data.get("summary_plain")
+        summary_raw = apply_tone_filter(track_data["summary"] if plain is None else plain, tone_key, track_key)
     summary = escape_typst(summary_raw)
+    summary_block = f"""// --- SUMMARY ---
+#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
+#v(2pt)
+{summary}
+""" if summary.strip() else ""
 
     name = escape_typst(identity.get("name", "Kevin Miller"))
     email = escape_typst(identity.get("email", ""))
@@ -632,11 +639,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 #line(length: 100%, stroke: 0.7pt + rgb("#CCCCCC"))
 #v(3.8pt)
 
-// --- SUMMARY ---
-#text(size: 8.5pt, weight: "bold", tracking: 1.1pt, fill: rgb("#374151"))[SUMMARY]
-#v(2pt)
-{summary}
-{skills_top_block}
+{summary_block}{skills_top_block}
 #v(6.5pt)
 #line(length: 100%, stroke: 0.5pt + rgb("#E5E7EB"))
 #v(3.8pt)
