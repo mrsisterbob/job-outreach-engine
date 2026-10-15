@@ -625,7 +625,7 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
   #text(size: 18pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
   #text(size: 10pt, weight: "medium", fill: rgb("#4B5563"))[{escape_typst(track_data["subtitle"])}] \\
   #v(2pt)
-  #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
+  #text(size: 9.4pt, fill: rgb("#1F2937"))[{contact_line}]
 ]
 
 #v(6.5pt)
@@ -733,7 +733,7 @@ def render_cover_letter_markup(letter_text: str, company_name: str = "") -> str:
 #align(center)[
   #text(size: 18pt, weight: "bold", fill: rgb("#000000"))[{name}] \\
   #v(2pt)
-  #text(size: 8.8pt, fill: rgb("#6B7280"))[{contact_line}]
+  #text(size: 9.4pt, fill: rgb("#1F2937"))[{contact_line}]
 ]
 
 #v(7pt)

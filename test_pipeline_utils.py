@@ -3607,3 +3607,36 @@ def test_summary_figures_have_supporting_bullet():
                 else:
                     assert plain in markup, (track, tone, idx)
                     assert not sf.summary_figures(data["summary_plain"])
+
+
+def test_contact_line_legible_on_resume_and_letter():
+    import io
+    import re
+    import pypdf
+    import resume_engine as re_
+    def lum(h):
+        r, g, b = (int(h[i:i + 2], 16) for i in (1, 3, 5))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    floor = lum("#374151")
+    long_job = "We use Tableau and Power BI daily. " * 40
+    for tr in "abcdefgh":
+        for tone in ("conservative", "aggressive"):
+            for job in ("", long_job):
+                mk = re_.render_typst_markup("Acme", tr, tone_mode=tone, job_text=job)
+                hdr = mk[mk.index("// --- HEADER ---"):mk.index("// --- SUMMARY ---")]
+                m_ = re.search(r'size: ([0-9.]+)pt, fill: rgb\("(#[0-9A-Fa-f]{6})"\)\)\[(?:#link|[^\]]*@)', hdr)
+                assert m_, tr
+                assert float(m_.group(1)) >= 9.0, tr
+                assert lum(m_.group(2)) <= floor, tr
+                pdf = re_.compile_resume_pdf("Acme", tr, tone_mode=tone, job_text=job)
+                reader = pypdf.PdfReader(io.BytesIO(pdf))
+                assert len(reader.pages) == 1, (tr, tone)
+                text = reader.pages[0].extract_text().splitlines()
+                assert any("@" in l and "GitHub" in l for l in text), (tr, tone)
+    cl = re_.render_cover_letter_markup("Dear team,\n\nHello.\n\nKevin", "Acme")
+    head = cl[cl.index("LETTERHEAD"):]
+    m_ = re.search(r'size: ([0-9.]+)pt, fill: rgb\("(#[0-9A-Fa-f]{6})"\)\)\[[^\]]*@', head)
+    assert m_
+    assert float(m_.group(1)) >= 9.0 and lum(m_.group(2)) <= floor
+    assert len(pypdf.PdfReader(io.BytesIO(re_.compile_cover_letter_pdf(
+        "Dear team,\n\nHello.\n\nKevin", "Acme"))).pages) == 1
