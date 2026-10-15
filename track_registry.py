@@ -87,7 +87,7 @@ TRACK_REGISTRY = {
         "summary": "I have experience in Salesforce queues and DocuSign workflows for advisors, and I am looking for business operations and CRM systems roles.",
         "summary_plain": "I have experience in Salesforce queues and DocuSign workflows for advisors, and I am looking for business operations and CRM systems roles.",
         "skills": [
-            ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management, Process Design."),
+            ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management."),
             ("Systems & Tools", "Salesforce, HubSpot CRM, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Python.")
         ],
     },
