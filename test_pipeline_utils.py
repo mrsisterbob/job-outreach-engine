@@ -3183,3 +3183,56 @@ def test_bank_lint_pool_and_experience_sizes():
     pools = _bank_lint_load("resume_bullets_bank.json")
     assert {k: len(v) for k, v in pools.items() if len(v) != 15} == {}
     assert len(_bank_lint_load("evidence_bank.json")["experience"][0]["bullets"]) == 13
+
+
+# ---- skills_footer: banked skills a posting names surface in the footer ----
+_SF_BASE = [
+    ("Core Operations", "Custodial Cashiering & Reconciliations, Automation."),
+    ("Systems & Tools", "Salesforce, Python, SQL, Excel."),
+]
+_SF_BANK = ["Python", "SQL", "Excel", "Tableau", "Looker Studio", "XLOOKUP", "Git", "Render", "R"]
+
+
+def test_skills_footer_surfaces_named_banked_skills():
+    from skills_footer import surface_banked_skills
+    out = surface_banked_skills("Build Looker Studio dashboards, Tableau and XLOOKUP.", _SF_BANK, _SF_BASE)
+    assert [l for l, _ in out] == [l for l, _ in _SF_BASE]
+    joined = " ".join(d for _, d in out)
+    for s in ("Looker Studio", "Tableau", "XLOOKUP"):
+        assert s in joined
+    assert out[1][1].startswith("Salesforce, Python, SQL, Excel")
+
+
+def test_skills_footer_unbanked_and_substring_add_nothing():
+    from skills_footer import surface_banked_skills
+    assert surface_banked_skills("Experience with SAP required", _SF_BANK, _SF_BASE) == _SF_BASE
+    assert surface_banked_skills("digital marketing, rendering, Rust", _SF_BANK, _SF_BASE) == _SF_BASE
+
+
+def test_skills_footer_empty_text_unchanged():
+    from skills_footer import surface_banked_skills
+    assert surface_banked_skills("", _SF_BANK, _SF_BASE) == _SF_BASE
+    assert surface_banked_skills(None, _SF_BANK, _SF_BASE) == _SF_BASE
+
+
+def test_skills_footer_cap_and_line_budget():
+    from skills_footer import surface_banked_skills
+    text = "Tableau Looker Studio XLOOKUP Git Render"
+    capped = surface_banked_skills(text, _SF_BANK, _SF_BASE, max_added=2)
+    base_len = sum(len(d) for _, d in _SF_BASE)
+    assert sum(len(d) for _, d in capped) <= base_len + 2 * 20
+    assert "Git" not in " ".join(d for _, d in capped)
+    limit = min(len(f"{l}: {d}") for l, d in _SF_BASE)
+    tight = surface_banked_skills(text, _SF_BANK, _SF_BASE, max_line_chars=limit)
+    assert tight == _SF_BASE
+
+
+def test_skills_footer_real_bank_skills():
+    import json, os
+    from skills_footer import surface_banked_skills
+    path = os.path.join(os.path.dirname(__file__), "evidence_bank.json")
+    with open(path, encoding="utf-8") as f:
+        bank = json.load(f)["technical_skills"]
+    out = surface_banked_skills("We use Tableau and Power BI daily", bank, _SF_BASE)
+    joined = " ".join(d for _, d in out)
+    assert "Tableau" in joined and "Power BI" in joined
