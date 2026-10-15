@@ -264,7 +264,27 @@
     "Google Apps Script",
     "Google Sheets",
     "Tableau",
-    "Looker Studio"
+    "Looker Studio",
+    "XLOOKUP",
+    "VLOOKUP",
+    "Google Ads",
+    "Meta Ads",
+    "Claude Code",
+    "Gmail API",
+    "Telegram",
+    "Git",
+    "GitHub",
+    "Render",
+    "WebSockets",
+    "Gemini"
+  ],
+  "employer_systems": [
+    "Salesforce",
+    "Schwab Advisor Center",
+    "Fidelity Wealthscape",
+    "DocuSign",
+    "bSwift",
+    "Excel"
   ],
   "banned_words": [
     "leveraging",
