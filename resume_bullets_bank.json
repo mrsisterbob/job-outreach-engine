@@ -5,7 +5,7 @@
     "Managed Salesforce ticketing queues and worked with custodians to resolve advisor requests within 1 to 2 hour SLAs.",
     "Fixed margin errors and cash distribution mismatches across clearing feeds with zero service breaches.",
     "Standardized transfer checklists for Schwab and Fidelity, cutting rejected paperwork resubmissions by 40%.",
-    "Cleaned and updated 1,500+ legacy account files in internal databases to meet custodial guidelines.",
+    "Moved, renamed, and organized 2,000+ legacy account records from Google Drive into Salesforce by hand to meet custodial guidelines.",
     "Trained new operations analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
     "Audited advisor billing and fee schedules across Salesforce to eliminate recurring monthly invoicing errors.",
     "Checked training records across 20 insurance carriers to confirm licensing for 600+ partner RIAs.",
@@ -19,7 +19,7 @@
   "track_b_engineering": [
     "Established escalation paths for custodial account transfers, cutting request turnaround time by 25%.",
     "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
-    "Cleaned and reformatted 1,500+ legacy account records across internal databases to match updated database schemas.",
+    "Hand-organized 2,000+ legacy account records, renaming each file and moving it from Google Drive into Salesforce.",
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
     "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
@@ -53,7 +53,7 @@
       "source_job": 1,
       "replaces": 0
     },
-    "Audited and cleaned 1,500+ legacy account files to make sure required legal advisory agreements were on record.",
+    "Moved and renamed 2,000+ legacy account records by hand from Google Drive into Salesforce, confirming required legal advisory agreements were on record.",
     "Resolved margin discrepancies and paperwork exceptions across 600+ partner RIAs to reduce custodial risk.",
     "Handled urgent ticket escalations to prevent 10 critical SLA breaches and avoid client penalty payouts.",
     "Checked advisor commission splits to keep internal accounting aligned with RIA compliance controls.",
@@ -138,7 +138,7 @@
     "Trained incoming operations analysts on DocuSign and Salesforce, shortening onboarding ramp from 3 weeks to 10 days.",
     "Documented the service desk workflow step by step so every person on the queue handled it the same way.",
     "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
-    "Cleaned and revalidated 1,500+ legacy account records during an internal database migration so downstream reporting matched.",
+    "Moved, renamed, and organized 2,000+ legacy account records by hand from Google Drive into Salesforce.",
     "Tracked onboarding throughput across the platform to find the stages where files were actually stalling rather than guessing."
   ],
   "track_g_supply_chain": [
@@ -155,7 +155,7 @@
       "source_job": 1,
       "replaces": 2
     },
-    "Cleaned and revalidated 1,500+ legacy records during an internal database migration so downstream reporting matched.",
+    "Hand-moved and renamed 2,000+ legacy account records from Google Drive into Salesforce.",
     {
       "text": "Audited payout and benefit schedules across 70+ plants in Excel, working from pivot tables rather than site-by-site spot checks.",
       "source_job": 3,
@@ -174,7 +174,7 @@
     "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
     "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
-    "Cleaned and reformatted 1,500+ legacy records to match an updated database schema.",
+    "Organized 2,000+ legacy account records by hand, renaming and moving them from Google Drive into Salesforce.",
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
     "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
     "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
