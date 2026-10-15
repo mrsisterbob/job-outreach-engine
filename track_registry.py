@@ -69,7 +69,7 @@ TRACK_REGISTRY = {
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
         "summary": "I write SQL and build Power BI dashboards that reconcile institutional custody accounts and surface the variances behind each break.",
         "skills": [
-            ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Advanced Excel Modeling."),
+            ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Excel."),
             ("Systems & Data", "Power Query, Power Automate, Salesforce Reports, bSwift, Schwab Advisor Center, Python (pandas).")
         ],
     },

@@ -84,7 +84,7 @@
     "Built Power BI dashboards to track daily ticket volume, response times, and team pipeline metrics.",
     "Analyzed onboarding speeds across a $2.5B AUM portfolio in Schwab Advisor Center and Fidelity Wealthscape to pinpoint paperwork bottlenecks.",
     {
-      "text": "Audited payroll and benefit payout schedules across 70+ manufacturing plants using Excel pivot tables.",
+      "text": "Cross-referenced multi-plant payroll data to catch recurring deduction errors across 70+ manufacturing plants.",
       "source_job": 3,
       "replaces": 2
     },
@@ -92,7 +92,7 @@
     "Ran SQL variance checks on 2,000+ ledger accounts to prepare recurring internal financial reports.",
     "Tracked onboarding throughput across a $2.5B AUM advisor platform in Wealthscape and the Schwab client portal to locate where files stalled.",
     {
-      "text": "Built Excel lookup and macro templates for recurring 401(k) and healthcare deduction matching across 2,000+ accounts.",
+      "text": "Matched recurring 401(k) and healthcare deduction records across 2,000+ accounts in Excel with VLOOKUPs and basic formulas.",
       "source_job": 3,
       "replaces": 0
     },
@@ -157,7 +157,7 @@
     },
     "Hand-moved and renamed 2,000+ legacy account records from Google Drive into Salesforce.",
     {
-      "text": "Audited payout and benefit schedules across 70+ plants in Excel, working from pivot tables rather than site-by-site spot checks.",
+      "text": "Audited payout and benefit schedules across 70+ plants in Excel with VLOOKUPs and basic formulas rather than site-by-site spot checks.",
       "source_job": 3,
       "replaces": 2
     },
