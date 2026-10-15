@@ -34,7 +34,7 @@
   ],
   "track_d_business_intelligence": [
     "I worked in operations and spent most of my time reconciling records and building the reporting that sat on top of them. In an earlier role I matched benefit deductions across several hundred employee accounts, and the checklist I built for it surfaced a recurring error early. I like the moment the numbers finally agree, and I've built my habits around reaching it.",
-    "Working in operations meant I saw the reporting from underneath, which is a useful place to stand. I wrote SQL checks and built dashboards so a team could see variances at a glance, and I spent just as much time on the records feeding them. I've learned that strong reporting always starts with clean records.",
+    "Working in operations meant I saw the reporting from underneath, which is a useful place to stand. I compared records by hand against custodial data and kept the Excel checks that let a team see variances at a glance, and I spent just as much time on the records feeding them. I've learned that strong reporting always starts with clean records.",
     "I worked between raw records and the reports that depend on them at an advisory firm. That meant moving, renaming and organizing 2,000+ legacy account records from Google Drive into Salesforce by hand and maintaining the schedules behind recurring internal reports. I take real satisfaction in doing it properly.",
     "My day was data integrity work at an investment advisory firm, close enough to the reporting to see how it holds together. I've reconciled deduction variances across several hundred accounts and built the audit checklists that caught a recurring issue across dozens of facilities. Spotting that kind of pattern is the skill I'd bring to you."
   ],
@@ -103,7 +103,7 @@
     "I'd be the operations hire who writes code, and I think that combination is useful on a team like yours. The outreach engine I built removed a whole recurring task from my week, and each project I built started with a need I saw firsthand."
   ],
   "bridges_track_d_business_intelligence": [
-    "I've built dashboards and I'm eager to grow on the modelling side. The part I'm most confident in is the layer underneath, where every number gets reconciled against its source before anyone charts it. A chart built on a reconciled figure is one people can trust.",
+    "I'm eager to grow on the modelling side. The part I'm most confident in is the layer underneath, where every number gets reconciled against its source before anyone charts it. A chart built on a reconciled figure is one people can trust.",
     "Most of my reporting served an operations desk, and I'm looking forward to presenting to a wider audience. Building the check that feeds a report is familiar ground, and I'd been the person the team asked when two reports disagreed.",
     "I'm excited to learn your reporting stack and the way your team uses it. What I've done repeatedly is take a figure the team questioned and trace it back through the reports to the record that produced it. That trace takes patience, and it's the step that settles the question for good.",
     "My analytics came from needing real answers on the job. I'd be the person confirming the underlying accounts agree before anyone builds a dashboard on top of them, and I've seen how much that order matters to the final result."
