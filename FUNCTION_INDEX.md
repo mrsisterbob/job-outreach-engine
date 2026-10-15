@@ -599,6 +599,15 @@ grep -i "contact" FUNCTION_INDEX.md
 | 23 | `call_gemini` | _(no docstring)_ |
 | 42 | `clean_crm_contacts` | _(no docstring)_ |
 
+## `skills_footer.py` — 4 defs, 73 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 23 | `_pattern` | _(no docstring)_ |
+| 27 | `_first_pos` | _(no docstring)_ |
+| 36 | `_line_index` | _(no docstring)_ |
+| 44 | `surface_banked_skills` | Return base_lines [(label, desc)] with banked skills named in job_text appended. |
+
 ## `track_registry.py` — 6 defs, 358 lines
 
 | Line | Name | Summary |
@@ -644,4 +653,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**560 definitions across 13 files + Code.gs.**
+**564 definitions across 14 files + Code.gs.**
