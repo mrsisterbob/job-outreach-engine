@@ -69,7 +69,7 @@ TRACK_REGISTRY = {
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
         "summary": "I audit onboarding paperwork for 2,000+ accounts, work custodial platforms like Schwab Advisor Center and Fidelity Wealthscape, built audit checklists that cross-reference multi-plant payroll data, and work Salesforce queues.",
         "skills": [
-            ("Analytics & Modeling", "SQL Aggregations, Variance Analysis, Power BI Dashboards, Excel."),
+            ("Analytics & Modeling", "SQL, Power BI, Tableau, Looker Studio, Excel."),
             ("Systems & Data", "Power Query, Power Automate, Salesforce Reports, bSwift, Schwab Advisor Center, Python.")
         ],
     },
