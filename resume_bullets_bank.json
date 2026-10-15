@@ -12,7 +12,7 @@
     "Worked ACAT transfer exceptions across Schwab and Fidelity, clearing documentation holds before they aged past SLA.",
     "Matched advisory agreements to custodial records during an offboarding, handing off every active client file.",
     "Wrote down the escalation path for custodial transfers instead of leaving it to whoever picked up the ticket, cutting turnaround 25%.",
-    "Matched institutional custody account records to internal reporting tables with SQL, clearing the variances that blocked month-end sign-off.",
+    "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Tracked onboarding throughput across a $2.5B AUM advisor platform to find the paperwork stages where client files were actually stalling.",
     "Chased documentation hold-ups with partner firms so an onboarding exception on a prospective client file never sat unresolved."
   ],
@@ -22,7 +22,7 @@
     "Hand-organized 2,000+ legacy account records, renaming each file and moving it from Google Drive into Salesforce.",
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
-    "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
+    "Learned Claude Code and autonomous agents, running automation through prompt queues in a multi-terminal setup.",
     "Audited onboarding paperwork for 2,000+ accounts, checking advisory agreements and risk profiles against SEC rules.",
     "Matched advisory agreements and account records to custodial data during an offboarding, so active client files handed off clean.",
     "Checked licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
@@ -75,13 +75,13 @@
     "Handled the offboarding cutover on active client files, checking agreements against custodial data so nothing transferred half-finished."
   ],
   "track_d_business_intelligence": [
-    "Wrote SQL against internal reporting tables to match institutional custody accounts and surface the variances behind each break.",
+    "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
     {
       "text": "Chased down the 401(k) and healthcare deduction mismatches across 2,000+ employee accounts in bSwift and Excel until every ledger agreed.",
       "source_job": 3,
       "replaces": 0
     },
-    "Built Power BI dashboards to track daily ticket volume, response times, and team pipeline metrics.",
+    "Managed Salesforce ticketing queues and worked with custodians to resolve advisor requests within 1 to 2 hour SLAs.",
     "Analyzed onboarding speeds across a $2.5B AUM portfolio in Schwab Advisor Center and Fidelity Wealthscape to pinpoint paperwork bottlenecks.",
     {
       "text": "Cross-referenced multi-plant payroll data to catch recurring deduction errors across 70+ manufacturing plants.",
@@ -89,7 +89,7 @@
       "replaces": 2
     },
     "Monitored Salesforce service queues to catch routing errors and eliminate miscategorized tickets.",
-    "Ran SQL variance checks on 2,000+ ledger accounts to prepare recurring internal financial reports.",
+    "Checked licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
     "Tracked onboarding throughput across a $2.5B AUM advisor platform in Wealthscape and the Schwab client portal to locate where files stalled.",
     {
       "text": "Matched recurring 401(k) and healthcare deduction records across 2,000+ accounts in Excel with VLOOKUPs and basic formulas.",
@@ -149,7 +149,7 @@
     },
     "Matched data from separate sites to one agreed source so recurring reporting came out right the first time.",
     "Resolved urgent custodian requests inside 1 to 2 hour SLAs by managing the Salesforce ticketing queues.",
-    "Matched institutional account records to internal reporting tables with SQL until the balances agreed.",
+    "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
     {
       "text": "Reviewed title records and supporting documentation so data stayed consistent across active sites rather than drifting site by site.",
       "source_job": 1,
@@ -162,8 +162,8 @@
       "replaces": 2
     },
     "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
-    "Built Power BI dashboards to track daily volume, response times and pipeline metrics in one place.",
-    "Ran SQL variance checks across 2,000+ accounts to prepare the recurring internal reports.",
+    "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
+    "Audited onboarding paperwork for 2,000+ accounts, checking advisory agreements and risk profiles against SEC rules.",
     "Documented the account matching workflow step by step so each person ran the same checks.",
     "Turned reporting requirements into a step-by-step checklist and wrote it down for the analysts who came after.",
     "Tracked exceptions with partner organizations so a documentation hold-up had an owner and a next step.",
@@ -176,7 +176,7 @@
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Organized 2,000+ legacy account records by hand, renaming and moving them from Google Drive into Salesforce.",
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
-    "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
+    "Learned Claude Code and autonomous agents, running automation through prompt queues in a multi-terminal setup.",
     "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
     "Wrote down the escalation path for custodial transfers, cutting request turnaround by 25%.",
     "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
