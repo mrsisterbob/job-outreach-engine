@@ -3236,3 +3236,73 @@ def test_skills_footer_real_bank_skills():
     out = surface_banked_skills("We use Tableau and Power BI daily", bank, _SF_BASE)
     joined = " ".join(d for _, d in out)
     assert "Tableau" in joined and "Power BI" in joined
+
+
+# --- resume_side_projects ---------------------------------------------------
+
+import resume_side_projects as _rsp
+
+
+def _sp(name, bullets=("x",), **kw):
+    d = {"name": name, "category": "personal", "bullets": list(bullets)}
+    d.update(kw)
+    return d
+
+
+def _side_proj_entries():
+    return [_sp(n) for n in (
+        "Budget tracker", "Spotify playlist project", "Montelattice site",
+        "Dropshipping site for a friend's China-based business", "Personal tools")]
+
+
+def test_side_projects_for_track_mapped_tracks():
+    bank = _side_proj_entries()
+    names = lambda t, **k: [e["name"] for e in _rsp.side_projects_for_track(bank, t, **k)]
+    assert names("d") == ["Budget tracker", "Personal tools"]
+    assert names("b") == ["Budget tracker", "Montelattice site"]
+    assert names("h") == ["Montelattice site",
+                          "Dropshipping site for a friend's China-based business"]
+
+
+def test_side_projects_for_track_unmapped_and_spotify_never():
+    bank = _side_proj_entries()
+    for t in "acefg":
+        assert _rsp.side_projects_for_track(bank, t) == []
+    for t in "abcdefgh":
+        got = _rsp.side_projects_for_track(bank, t, limit=10)
+        assert all(e["name"] != "Spotify playlist project" for e in got)
+
+
+def test_side_projects_for_track_limit_and_missing_name():
+    bank = [e for e in _side_proj_entries() if e["name"] != "Budget tracker"]
+    assert [e["name"] for e in _rsp.side_projects_for_track(bank, "d")] == ["Personal tools"]
+    assert len(_rsp.side_projects_for_track(_side_proj_entries(), "h", limit=1)) == 1
+    assert _rsp.side_projects_for_track(_side_proj_entries(), "h", limit=0) == []
+
+
+def test_side_projects_for_track_bad_shapes_degrade():
+    assert _rsp.side_projects_for_track(None, "d") == []
+    assert _rsp.side_projects_for_track({"a": 1}, "d") == []
+    bad = ["junk", None, {"name": "Budget tracker"},
+           {"name": "Personal tools", "bullets": "nope"},
+           _sp("Personal tools", ["ok"])]
+    got = _rsp.side_projects_for_track(bad, "d")
+    assert [e["name"] for e in got] == ["Personal tools"]
+    assert got[0]["bullets"] == ["ok"]
+
+
+def test_side_projects_for_track_tools_entry_unchanged():
+    tools = _sp("Personal tools", ["one line"], category="tools", tools=["a"])
+    got = _rsp.side_projects_for_track([tools], "d")
+    assert got == [tools] and got[0] is tools
+
+
+def test_side_projects_for_track_real_bank_names_exist():
+    bank_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
+    with open(bank_path, encoding="utf-8") as f:
+        sp = json.load(f)["side_projects"]
+    have = {e.get("name") for e in sp}
+    for track, names in _rsp.SIDE_PROJECT_FIT.items():
+        for n in names:
+            assert n in have, f"track {track}: {n!r} missing from evidence_bank side_projects"
+        assert len(_rsp.side_projects_for_track(sp, track, limit=10)) == len(names)
