@@ -3494,6 +3494,31 @@ def test_employer_dates_and_counts_single_source():
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), encoding="utf-8") as f:
             assert not re.search(r"\b\d{2}/20\d{2}\b", f.read()), fname
 
+def test_side_project_header_needs_a_bullet_every_track_and_tone():
+    import resume_engine as _re
+    bank = _re.load_evidence_bank()
+    names = {_re.escape_typst(sp["name"]) for sp in bank.get("side_projects", [])}
+    seen = 0
+    for track in "abcdefgh":
+        for tone in ("conservative", "tech"):
+            lines = _re.render_typst_markup("Acme", track, tone_mode=tone).splitlines()
+            for i, ln in enumerate(lines):
+                if not any(ln.startswith(f"*{n}*") for n in names):
+                    continue
+                seen += 1
+                nxt = next((x for x in lines[i + 1:] if x.strip()), "")
+                assert nxt.startswith("- ") or nxt.startswith("Tools:"), (track, tone, ln, nxt)
+    assert seen > 0
+
+
+def test_side_project_header_needs_a_bullet_empty_bullets_drops_header():
+    import resume_engine as _re
+    evidence = {"projects": [], "side_projects": [
+        {"name": "Budget tracker", "category": "personal", "bullets": []}]}
+    for track in "bdh":
+        out = _re._render_projects_block(evidence, "conservative", track)
+        assert "Budget tracker" not in out
+
 
 def test_letters_name_no_securities_filings():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)),

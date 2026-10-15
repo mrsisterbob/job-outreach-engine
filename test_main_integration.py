@@ -12940,7 +12940,7 @@ def test_side_projects_render_under_technical_projects_for_mapped_tracks():
     1 spare line on the heaviest d routing, measured."""
     import resume_side_projects as sp
     all_names = {n for names in sp.SIDE_PROJECT_FIT.values() for n in names}
-    first = {"d": "Budget tracker", "b": "Budget tracker", "h": "Montelattice site"}
+    first = {"d": "Document Automation Pipeline", "b": "Budget tracker", "h": "Montelattice site"}
     for tone in ("conservative", "tech"):
         for track, name in first.items():
             markup = resume_engine.render_typst_markup("Acme", track, [0, 1, 2, 3], tone)
