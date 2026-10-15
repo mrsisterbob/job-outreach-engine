@@ -3128,3 +3128,58 @@ def test_role_funnel_unknown_event_on_an_existing_role_changes_nothing():
     result = role_funnel.compute_role_funnel(rows, [("x1", "bogus_status")], set())
 
     assert result["matched"] == 1 and result["applied"] == 1
+
+
+# --- bank lint: banned claims / robotic phrases must not creep back into the bullet bank ---
+_BANK_LINT_DIR = os.path.dirname(os.path.abspath(__file__))
+_BANK_LINT_CLAIMS = re.compile(r"pandas|scraper|15 hours|pivot|macro|1,500", re.I)
+_BANK_LINT_ROBOTIC = re.compile(r"reconcil|verif|end to end|regardless of who|so the same|ensur", re.I)
+_BANK_LINT_REGISTRY = re.compile(r"pandas|Advanced Excel", re.I)
+
+
+def _bank_lint_load(name):
+    with open(os.path.join(_BANK_LINT_DIR, name), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _bank_lint_pool_lines():
+    out = []
+    for pool, items in _bank_lint_load("resume_bullets_bank.json").items():
+        for i, item in enumerate(items):
+            text = item.get("text", "") if isinstance(item, dict) else item
+            out.append((f"{pool}[{i}]", text))
+    return out
+
+
+def _bank_lint_static_lines():
+    out = []
+    for e, exp in enumerate(_bank_lint_load("evidence_bank.json")["experience"]):
+        for i, b in enumerate(exp.get("bullets", [])):
+            text = b.get("text", "") if isinstance(b, dict) else b
+            out.append((f"experience[{e}].bullets[{i}]", text))
+    return out
+
+
+def test_bank_lint_no_banned_claims_in_pool_or_static_bullets():
+    hits = [(where, text) for where, text in _bank_lint_pool_lines() + _bank_lint_static_lines()
+            if _BANK_LINT_CLAIMS.search(text)]
+    assert hits == []
+
+
+def test_bank_lint_no_robotic_phrases_in_pool_bullets():
+    hits = [(where, text) for where, text in _bank_lint_pool_lines()
+            if _BANK_LINT_ROBOTIC.search(text)]
+    assert hits == []
+
+
+def test_bank_lint_track_registry_has_no_banned_skill_claims():
+    with open(os.path.join(_BANK_LINT_DIR, "track_registry.py"), encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    hits = [(n, ln) for n, ln in enumerate(lines, 1) if _BANK_LINT_REGISTRY.search(ln)]
+    assert hits == []
+
+
+def test_bank_lint_pool_and_experience_sizes():
+    pools = _bank_lint_load("resume_bullets_bank.json")
+    assert {k: len(v) for k, v in pools.items() if len(v) != 15} == {}
+    assert len(_bank_lint_load("evidence_bank.json")["experience"][0]["bullets"]) == 13
