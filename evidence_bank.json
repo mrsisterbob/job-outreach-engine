@@ -30,7 +30,7 @@
         "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
         "Verified licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
         "Trained incoming operations analysts on DocuSign and Salesforce, shortening onboarding ramp from 3 weeks to 10 days.",
-        "Wrote Python scrapers with pandas to pull recurring account data, saving 15 hours of manual lookup each week."
+        "Moved account transfers from request to custodial confirmation across Schwab Advisor Center and Fidelity Wealthscape, with escalation paths in place."
       ]
     },
     {

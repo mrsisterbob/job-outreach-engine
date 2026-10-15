@@ -17,7 +17,7 @@
     "Chased documentation hold-ups with partner firms so an onboarding exception on a prospective client file never sat unresolved."
   ],
   "track_b_engineering": [
-    "Wrote automated Python data scrapers using pandas, saving 15 hours of manual lookup time each week.",
+    "Established escalation paths for custodial account transfers, cutting request turnaround time by 25%.",
     "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
     "Cleaned and reformatted 1,500+ legacy account records across internal databases to match updated database schemas.",
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
@@ -90,7 +90,7 @@
     },
     "Monitored Salesforce service queues to catch routing errors and eliminate miscategorized tickets.",
     "Ran SQL variance checks on 2,000+ ledger accounts to prepare recurring internal financial reports.",
-    "Pulled unstructured API data into relational database tables to track historical volume trends.",
+    "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
     {
       "text": "Built Excel lookup and macro templates for recurring 401(k) and healthcare deduction reconciliation across 2,000+ accounts.",
       "source_job": 3,
@@ -103,7 +103,7 @@
       "replaces": 1
     },
     "Maintained the schedules behind recurring internal reports so variance analysis ran off one agreed source instead of four workbooks.",
-    "Cut 15 hours a week of manual lookup by scripting the recurring data pulls in Python with pandas.",
+    "Cleaned and revalidated 1,500+ legacy account records against custodial guidelines during an internal database migration.",
     "Measured packet review before and after the DocuSign workflow went in for 150+ advisors, landing it at 20 minutes from 60.",
     "Reported resubmission rates on custodial transfers until the checklist change showed up as a 40% drop."
   ],
@@ -121,7 +121,7 @@
     "Coordinated with custodians directly to move transfer paperwork along instead of waiting for a queue to clear itself.",
     "Gave every onboarding documentation hold-up an owner and a next step, tracked with the partner firm until it closed.",
     "Ran the licensing and training checks for 600+ partner RIAs across 20 insurance carriers on a recurring cycle.",
-    "Scripted the recurring data pulls that had been eating 15 hours a week, so weekly reporting arrived without anyone assembling it.",
+    "Established escalation paths for custodial account transfers, cutting request turnaround time by 25%.",
     "Owned the offboarding cutover on active client files so agreements and custodial records agreed before the handoff."
   ],
   "track_f_operations_logistics": [
@@ -137,7 +137,7 @@
     "Monitored Salesforce service queues to catch routing errors, so a miscategorized request did not quietly sit unworked.",
     "Trained incoming operations analysts on DocuSign and Salesforce, shortening onboarding ramp from 3 weeks to 10 days.",
     "Documented the service desk workflow end to end so the queue was handled the same way regardless of who was on it.",
-    "Cut 15 hours a week of manual lookup by scripting the recurring data pulls in Python with pandas.",
+    "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
     "Cleaned and revalidated 1,500+ legacy account records during an internal database migration so downstream reporting matched.",
     "Tracked onboarding throughput across the platform to find the stages where files were actually stalling rather than guessing."
   ],
@@ -161,7 +161,7 @@
       "source_job": 3,
       "replaces": 2
     },
-    "Cut 15 hours a week of manual lookup by scripting the recurring data pulls in Python with pandas.",
+    "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
     "Built Power BI dashboards to track daily volume, response times and pipeline metrics in one place.",
     "Ran SQL variance checks across 2,000+ accounts to prepare the recurring internal reports.",
     "Documented the reconciliation workflow end to end so the same checks ran the same way regardless of who ran them.",
@@ -171,7 +171,7 @@
     "Wrote down the escalation path for stalled handoffs instead of leaving it to whoever picked up the ticket, cutting turnaround 25%."
   ],
   "track_h_technical_systems": [
-    "Cut 15 hours a week of manual lookup by writing Python scrapers with pandas.",
+    "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
     "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Cleaned and reformatted 1,500+ legacy records to match an updated database schema.",
