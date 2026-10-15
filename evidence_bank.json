@@ -226,7 +226,8 @@
         "Built a Telegram-triggered Python pipeline that pulls postings from job-board REST APIs, scores them through a deterministic Gemini layer and drafts the tailored PDF and Gmail follow-up.",
         "Wrote 1,100+ lines of Google Apps Script that run a Google Sheets CRM, auto-populating and routing every record as the pipeline updates it.",
         "Scheduled nightly Python jobs that check every tracked posting for a dead link and queue each day's follow-up emails.",
-        "Wired live build statistics into montelattice.com, a self-updating portfolio site hosted at no cost."
+        "Wired live build statistics into montelattice.com, a self-updating portfolio site hosted at no cost.",
+        "Uses SQL through Python's sqlite3 module to read and write a SQLite job database."
       ]
     },
     {
@@ -261,7 +262,9 @@
     "Power Query",
     "Power Automate",
     "Google Apps Script",
-    "Google Sheets"
+    "Google Sheets",
+    "Tableau",
+    "Looker Studio"
   ],
   "banned_words": [
     "leveraging",
@@ -274,5 +277,67 @@
     "utilizing",
     "dynamic",
     "robust"
+  ],
+  "side_projects": [
+    {
+      "name": "Budget tracker",
+      "category": "personal",
+      "status": "personal project",
+      "bullets": [
+        "Built a Flask app that imports a bank statement CSV.",
+        "Sorted each transaction into necessary, discretionary, income and transfer buckets with editable keyword rules.",
+        "Designed a dark dashboard with an income trend, a spending donut, a merchant leaderboard and a recurring-charge detector."
+      ]
+    },
+    {
+      "name": "Spotify playlist project",
+      "category": "personal",
+      "status": "personal project",
+      "start": "2013",
+      "end": "2013",
+      "bullets": [
+        "Personal playlist project from 2013."
+      ]
+    },
+    {
+      "name": "Montelattice site",
+      "category": "personal",
+      "status": "personal project",
+      "bullets": [
+        "Designed and built the montelattice.com portfolio site myself, from marketing pages to the Console.",
+        "Added a strip of live counts on the landing page, fed by a Flask summary endpoint on the job engine.",
+        "Embedded a short video demo of the systems running on the profile page."
+      ]
+    },
+    {
+      "name": "Dropshipping site for a friend's China-based business",
+      "category": "personal",
+      "status": "in progress",
+      "end": "Present",
+      "bullets": [
+        "Building the site to replace Shopify for a friend's China-based business.",
+        "Adding Stripe to the checkout to reduce international and local payment fees."
+      ]
+    },
+    {
+      "name": "Personal tools",
+      "category": "tools",
+      "status": "personal project",
+      "tools": [
+        "Power BI",
+        "Tableau",
+        "Power Query",
+        "Power Automate",
+        "Looker Studio",
+        "Excel",
+        "SQL (SQLite)",
+        "Python"
+      ],
+      "bullets": [
+        "Learned these tools on my own and used them on personal projects, including the budget tracker dashboards.",
+        "Use Excel for VLOOKUP and basic formulas.",
+        "Use SQL on the outreach engine and my side projects."
+      ]
+    }
   ]
 }
