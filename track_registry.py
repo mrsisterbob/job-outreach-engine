@@ -86,7 +86,7 @@ TRACK_REGISTRY = {
         "summary": "I design Salesforce queues and DocuSign workflows that cut advisor packet review from 60 minutes to 20.",
         "summary_plain": "I design Salesforce queues and DocuSign workflows that shorten advisor packet review.",
         "skills": [
-            ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management, Process Design."),
+            ("Operations & Workflow", "Queue Routing Optimization, SLA Escalation Controls, CRM Pipeline Management."),
             ("Systems & Tools", "Salesforce, HubSpot CRM, DocuSign, Schwab Advisor Center, Fidelity Wealthscape, Python.")
         ],
     },

@@ -1,7 +1,7 @@
 {
   "track_a_wealth_ops": [
     "Audited onboarding paperwork for 2,000+ accounts, checking investment advisory agreements and risk profiles against SEC rules.",
-    "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
+    "Processed cashiering, ACAT transfers, and account upkeep across Schwab Advisor Center and Fidelity Wealthscape.",
     "Managed Salesforce ticketing queues and worked with custodians to resolve advisor requests within 1 to 2 hour SLAs.",
     "Fixed margin errors and cash distribution mismatches across clearing feeds with zero service breaches.",
     "Standardized transfer checklists for Schwab and Fidelity, cutting rejected paperwork resubmissions by 40%.",
@@ -18,7 +18,7 @@
   ],
   "track_b_engineering": [
     "Established escalation paths for custodial account transfers, cutting request turnaround time by 25%.",
-    "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
+    "Traced broken Salesforce-to-Orion Eclipse data connections and found where trading feed updates dropped.",
     "Hand-organized 2,000+ legacy account records, renaming each file and moving it from Google Drive into Salesforce.",
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
@@ -28,7 +28,7 @@
     "Checked licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
     "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
     "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
-    "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
+    "Processed cashiering, ACAT transfers, and account upkeep across Schwab Advisor Center and Fidelity Wealthscape.",
     {
       "text": "Built structured audit checklists to cross-reference payroll data across 70+ manufacturing facilities, catching recurring deduction errors.",
       "source_job": 3,
@@ -46,10 +46,10 @@
     }
   ],
   "track_c_risk_compliance": [
-    "Found a Salesforce ticket conflict between trading and service queues, presenting findings to leadership to stop ticket misrouting.",
+    "Found a Salesforce ticket conflict between trading and service queues and took it to leadership to stop misrouting.",
     "Audited client paperwork across 2,000+ onboarding accounts to enforce SEC and FinCEN identity standards.",
     {
-      "text": "Advised on the plan for private placement filings under SEC Form D and Regulation Crowdfunding, explaining what each requires.",
+      "text": "Advised on the plan for SEC Form D and Regulation Crowdfunding filings, explaining what each requires.",
       "source_job": 1,
       "replaces": 0
     },
@@ -96,7 +96,7 @@
       "source_job": 3,
       "replaces": 0
     },
-    "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
+    "Processed cashiering, ACAT transfers, and account upkeep across Schwab Advisor Center and Fidelity Wealthscape.",
     {
       "text": "Built Excel audit checklists with VLOOKUP lookups to review total rewards packages across 70+ manufacturing plants.",
       "source_job": 3,
@@ -126,7 +126,7 @@
   ],
   "track_f_operations_logistics": [
     "Ran the intake queue on a 1 to 2 hour service window, resolving requests or escalating them before the clock ran out.",
-    "Cleared the documentation exceptions that stall a transfer, working holds down before they aged past their service window.",
+    "Cleared the documentation exceptions that stall a transfer before they aged past their service window.",
     "Found a ticket routing conflict between two desks in Salesforce and took it to leadership, which stopped requests landing in the wrong queue.",
     "Wrote down the escalation path for account transfers instead of leaving it to whoever picked up the ticket, cutting turnaround 25%.",
     "Handled urgent escalations personally to prevent 10 critical SLA breaches and the penalty payouts attached to them.",
@@ -172,7 +172,7 @@
   ],
   "track_h_technical_systems": [
     "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
-    "Traced broken Salesforce-to-Orion Eclipse data connections and identified the failure points dropping trading feed updates.",
+    "Traced broken Salesforce-to-Orion Eclipse data connections and found where trading feed updates dropped.",
     "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
     "Organized 2,000+ legacy account records by hand, renaming and moving them from Google Drive into Salesforce.",
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
