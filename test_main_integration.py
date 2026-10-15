@@ -12924,3 +12924,38 @@ def test_resume_footer_gets_job_description_from_stage_outreach_draft(monkeypatc
     for t in set(threading.enumerate()) - before:
         t.join(timeout=5)
     assert seen["job_text"] == "Must know Salesforce and Excel."
+
+
+def _technical_projects_block(markup):
+    """The text between the TECHNICAL PROJECTS heading and the next section marker."""
+    start = markup.index("[TECHNICAL PROJECTS]")
+    nxt = markup.find("// ---", start)
+    return markup[start:nxt if nxt != -1 else len(markup)]
+
+
+def test_side_projects_render_under_technical_projects_for_mapped_tracks():
+    """Drives the real renderer: the first fitting side project prints inside TECHNICAL PROJECTS
+    on d, b and h, and every unmapped track prints none of them (no Montelattice or Budget
+    tracker on finance resumes). Only the first project prints: the one-page budget leaves
+    1 spare line on the heaviest d routing, measured."""
+    import resume_side_projects as sp
+    all_names = {n for names in sp.SIDE_PROJECT_FIT.values() for n in names}
+    first = {"d": "Budget tracker", "b": "Budget tracker", "h": "Montelattice site"}
+    for tone in ("conservative", "tech"):
+        for track, name in first.items():
+            markup = resume_engine.render_typst_markup("Acme", track, [0, 1, 2, 3], tone)
+            assert name in _technical_projects_block(markup), f"track={track} tone={tone}"
+            assert name not in markup.split("[TECHNICAL PROJECTS]")[0]
+        for track in ("a", "c", "e", "f", "g"):
+            markup = resume_engine.render_typst_markup("Acme", track, [0, 1, 2, 3], tone)
+            for n in all_names:
+                assert n not in markup, f"{n} leaked onto track {track}"
+
+
+def test_side_projects_render_tracks_d_b_h_fit_one_page():
+    from pypdf import PdfReader
+    for track, indices in (("d", [0, 1, 2, 3]), ("d", [1, 4, 8, 10]), ("b", [0, 1, 2, 3]), ("h", [0, 1, 2, 3])):
+        for tone in ("conservative", "tech"):
+            pdf = resume_engine.compile_resume_pdf("Acme", track, indices, tone)
+            pages = len(PdfReader(io.BytesIO(pdf)).pages)
+            assert pages == 1, f"track={track} tone={tone} indices={indices} -> {pages} pages"
