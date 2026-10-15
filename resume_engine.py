@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import typst
+from skills_footer import surface_banked_skills
 
 # The track taxonomy lives in exactly one place now (track_registry.py). TRACK_BULLET_POOL_KEYS and
 # TRACKS are re-exported here because main.py and the suite already import them from this module.
@@ -402,7 +403,7 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative", trac
             lines.append(f"- {escape_typst(clean_b)}")
     return "\n".join(lines)
 
-def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> str:
+def render_typst_markup(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative", job_text: str = "") -> str:
     """Builds single-page Typst markup for the selected persona track, sourcing every factual
     claim (experience, education, certificates) from the centralized JSON banks (hot-reloaded
     fresh on every call), assembled into 4 sections: Summary, Professional Experience,
@@ -411,9 +412,12 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     the header summary, the leading achievement bullet, and skill emphasis all key off the
     same `track` value, so no live job-description text is required at render time - the
     resume still compiles correctly even from a bare "a" default with no cached job.
+    `job_text` is optional: when given, banked skills the posting names are appended to the
+    footer (see skills_footer.surface_banked_skills).
     `tone_mode` ("conservative" | "tech") is the Company Conservatism & Culture Filter: it scrubs
     crypto/Web3 language from the summary for conservative firms (RIAs, banks, custodians). The
-    Skills & Systems footer always renders the track's own 2-line category blocks unchanged.
+    Skills & Systems footer renders the track's own 2-line category blocks, plus any banked
+    skills `job_text` names (still two lines; empty `job_text` leaves it unchanged).
     """
     track_key = normalize_track(track)
     track_data = TRACKS[track_key]
@@ -456,7 +460,14 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
     experience_block = _render_experience_block(evidence, dynamic_bullets=selected_bullets)
     projects_block = _render_projects_block(evidence, tone_mode=tone_key, track=track_key)
     education_credentials_block = _render_education_credentials_block(evidence)
-    skills_lines = " \\\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in track_data["skills"])
+    footer_pairs = track_data["skills"]
+    if job_text:
+        # Width cap = the longest base line already shipping, so the footer stays two lines.
+        widest = max(len(f"{l}: {d}") for t in TRACKS.values() for l, d in t["skills"])
+        footer_pairs = surface_banked_skills(
+            job_text, evidence.get("technical_skills", []), footer_pairs,
+            max_added=6, max_line_chars=widest)
+    skills_lines = " \\\n".join(f"*{escape_typst(label)}:* {escape_typst(desc)}" for label, desc in footer_pairs)
 
     markup = f"""
 #set document(
@@ -528,9 +539,9 @@ def render_typst_markup(company_name: str, track: str = "a", bullet_indices: lis
 """
     return markup.strip()
 
-def compile_resume_pdf(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> bytes:
+def compile_resume_pdf(company_name: str, track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative", job_text: str = "") -> bytes:
     """Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track."""
-    markup = render_typst_markup(company_name, track, bullet_indices, tone_mode)
+    markup = render_typst_markup(company_name, track, bullet_indices, tone_mode, job_text=job_text)
     return typst.compile(markup.encode("utf-8"))
 
 def render_cover_letter_markup(letter_text: str, company_name: str = "") -> str:
