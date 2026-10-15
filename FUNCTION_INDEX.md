@@ -550,31 +550,31 @@ grep -i "contact" FUNCTION_INDEX.md
 | 40 | `GeminiJobScreenerResponse._normalize_track` | _(no docstring)_ |
 | 45 | `GeminiJobScreenerResponse._normalize_tone_mode` | _(no docstring)_ |
 
-## `resume_engine.py` — 21 defs, 619 lines
+## `resume_engine.py` — 21 defs, 639 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 38 | `should_scrub_crypto` | True when crypto/Web3 phrasing has to come off this resume. |
-| 52 | `apply_tone_filter` | Scrubs crypto/Web3 keywords to institutional-safe phrasing when should_scrub_crypto() says |
-| 60 | `escape_typst` | Escapes Typst markup reserved characters to prevent compilation syntax exceptions. |
-| 90 | `load_json` | Generic JSON bank loader with a safe try/except fallback: logs an error and returns the |
-| 103 | `load_evidence_bank` | _(no docstring)_ |
-| 106 | `load_resume_bullets_bank` | _(no docstring)_ |
-| 122 | `bullet_text` | The prose of a bullet bank entry, whether it is a bare string or a {"text", "source_job"} dict. |
-| 137 | `bullet_source_job` | Which `evidence["experience"]` index a bullet's claim actually belongs to. Defaults to 0. |
-| 156 | `bullet_replaces_static` | Which of its own job's static bullets a routed bullet restates, or -1 for none. |
-| 185 | `_duplicate_check_targets` | Bullets a routed pool entry must not duplicate, given the job it will render under. |
-| 204 | `_bullets_of_other_jobs` | Back-compat shim for the source_job 0 case. See _duplicate_check_targets(). |
-| 209 | `_is_duplicate_of_other_job` | _(no docstring)_ |
-| 217 | `filter_ats_bullets` | The bullet STRINGS for a track + routed indices - the shape three non-renderer call sites |
-| 225 | `filter_ats_bullet_entries` | Resolves the actual bullet entries for a track + list of pool indices. Gemini only ever |
-| 298 | `_render_experience_block` | Renders the Professional Experience section entirely from Evidence Bank data - every |
-| 348 | `_render_education_credentials_block` | Renders the combined Education & Credentials section - degrees from evidence_bank's |
-| 376 | `_render_projects_block` | Renders the Technical Projects section - name/location/dates header line per project, |
-| 406 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
-| 542 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
-| 547 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
-| 615 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
+| 39 | `should_scrub_crypto` | True when crypto/Web3 phrasing has to come off this resume. |
+| 53 | `apply_tone_filter` | Scrubs crypto/Web3 keywords to institutional-safe phrasing when should_scrub_crypto() says |
+| 61 | `escape_typst` | Escapes Typst markup reserved characters to prevent compilation syntax exceptions. |
+| 91 | `load_json` | Generic JSON bank loader with a safe try/except fallback: logs an error and returns the |
+| 104 | `load_evidence_bank` | _(no docstring)_ |
+| 107 | `load_resume_bullets_bank` | _(no docstring)_ |
+| 123 | `bullet_text` | The prose of a bullet bank entry, whether it is a bare string or a {"text", "source_job"} dict. |
+| 138 | `bullet_source_job` | Which `evidence["experience"]` index a bullet's claim actually belongs to. Defaults to 0. |
+| 157 | `bullet_replaces_static` | Which of its own job's static bullets a routed bullet restates, or -1 for none. |
+| 186 | `_duplicate_check_targets` | Bullets a routed pool entry must not duplicate, given the job it will render under. |
+| 205 | `_bullets_of_other_jobs` | Back-compat shim for the source_job 0 case. See _duplicate_check_targets(). |
+| 210 | `_is_duplicate_of_other_job` | _(no docstring)_ |
+| 218 | `filter_ats_bullets` | The bullet STRINGS for a track + routed indices - the shape three non-renderer call sites |
+| 226 | `filter_ats_bullet_entries` | Resolves the actual bullet entries for a track + list of pool indices. Gemini only ever |
+| 299 | `_render_experience_block` | Renders the Professional Experience section entirely from Evidence Bank data - every |
+| 349 | `_render_education_credentials_block` | Renders the combined Education & Credentials section - degrees from evidence_bank's |
+| 382 | `_render_projects_block` | Renders the Technical Projects section - name/location/dates header line per project, |
+| 424 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
+| 562 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
+| 567 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
+| 635 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
 
 ## `resume_side_projects.py` — 1 defs, 45 lines
 
