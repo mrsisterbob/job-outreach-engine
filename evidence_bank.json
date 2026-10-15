@@ -21,7 +21,7 @@
         "Audited onboarding paperwork for 2,000+ accounts to verify investment advisory agreements and risk profiles under SEC rules.",
         "Processed daily cashiering, ACAT transfers, and account maintenance across Schwab Advisor Center and Fidelity Wealthscape.",
         "Managed Salesforce ticketing queues and engaged directly with custodians to resolve urgent advisor requests within 1 to 2 hour SLAs.",
-        "Reconciled IAA agreements and account records against custodial data during offboarding to ensure clean handoff of active client files.",
+        "Moved IAA agreements and account records from custodial systems into clean client files during offboarding.",
         "Moved, renamed, and organized 2,000+ legacy account records by hand from Google Drive into Salesforce to meet custodial guidelines.",
         "Tracked onboarding throughput across a $2.5B AUM advisor platform to locate the paperwork stages where files stalled.",
         "Built DocuSign and Salesforce packet workflows for 150+ advisors, cutting packet review from 60 minutes to 20.",
@@ -42,7 +42,7 @@
       "bullets": [
         "Planned the approach to SEC Form D and Regulation Crowdfunding filings and explained what each one covers.",
         "Set up compliance intake checkpoints and suitability reviews for incoming platform investors.",
-        "Reviewed property documentation and title records to ensure custodial data parity across active offerings."
+        "Read property documentation and title records and explained which custodial fields applied to each offering."
       ]
     },
     {
@@ -296,7 +296,11 @@
     "spearheaded",
     "utilizing",
     "dynamic",
-    "robust"
+    "robust",
+    "ensure",
+    "streamline",
+    "end-to-end",
+    "orchestration"
   ],
   "side_projects": [
     {

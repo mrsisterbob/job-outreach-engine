@@ -116,7 +116,7 @@
     "Cleaned multi-source CRM records into a single pipeline view to remove duplicate contact entries.",
     "Automated the recurring compliance checks on advisor account packages so the weekly backlog cleared without manual review.",
     "Trained incoming analysts on DocuSign and Salesforce, cutting onboarding ramp from 3 weeks to 10 days.",
-    "Documented end-to-end service desk workflows to standardize how operations analysts handle ticket queues.",
+    "Documented how service desk tickets move through each queue so operations analysts follow one process.",
     "Tracked onboarding throughput across a $2.5B advisor platform to find the stages where files stalled.",
     "Coordinated with custodians directly to move transfer paperwork along instead of waiting for a queue to clear itself.",
     "Gave every onboarding documentation hold-up an owner and a next step, tracked with the partner firm until it closed.",

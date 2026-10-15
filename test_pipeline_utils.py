@@ -3368,3 +3368,39 @@ def test_bridges_track_d_analytics_belong_to_projects():
     for bad in ("on the job", "at work", "in my role"):
         assert bad not in t.lower()
     assert pu.negative_language_hits(t) == []
+
+
+def test_bank_renders_no_banned_or_tell_words():
+    import resume_engine
+    import track_registry
+    root = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(root, "evidence_bank.json"), encoding="utf-8") as fh:
+        ev = json.load(fh)
+    with open(os.path.join(root, "resume_bullets_bank.json"), encoding="utf-8") as fh:
+        pools = json.load(fh)
+    texts = []
+    for i, job in enumerate(ev["experience"]):
+        for j, b in enumerate(job["bullets"]):
+            texts.append((f"experience[{i}].bullets[{j}]", b))
+    for pool, entries in pools.items():
+        if isinstance(entries, list):
+            for j, e in enumerate(entries):
+                texts.append((f"{pool}[{j}]", resume_engine.bullet_text(e)))
+    for i, proj in enumerate(ev.get("projects", [])):
+        for j, b in enumerate(proj.get("bullets", [])):
+            texts.append((f"projects[{i}].bullets[{j}]", b))
+    for key, track in track_registry.TRACKS.items():
+        texts.append((f"TRACKS[{key}].summary", track.get("summary", "")))
+        for j, s in enumerate(track.get("skills", [])):
+            texts.append((f"TRACKS[{key}].skills[{j}]", s if isinstance(s, str) else json.dumps(s)))
+    stems = [r"\bensur\w*", r"\bstreamlin\w*", r"\bend[- ]to[- ]end\b", r"\borchestrat\w*",
+             r"\butiliz\w*", r"\bleverag\w*", r"\bspearhead\w*"]
+    stems += [r"\b" + re.escape(w) + r"\w*" for w in ev["banned_words"]]
+    hits = []
+    for loc, text in texts:
+        for pat in stems:
+            m_ = re.search(pat, text or "", re.IGNORECASE)
+            if m_:
+                hits.append((loc, m_.group(0)))
+    assert texts
+    assert hits == [], hits
