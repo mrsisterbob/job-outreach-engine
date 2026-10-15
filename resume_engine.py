@@ -375,7 +375,7 @@ def _render_education_credentials_block(evidence: dict) -> str:
 
     return "\n".join(lines)
 
-SIDE_PROJECT_BULLET_CAP = {"d": 0}  # bullets per side project by track (default 1); d has 1 spare line on its heaviest routing
+SIDE_PROJECT_BULLET_CAP = {"d": 0}  # bullets per side project by track (default 1); d stays 0: TASK-66 measured header+1 bullet = 2 pages on d [1,4,8,10], so d prints no side-project block
 SIDE_PROJECT_BULLET_DEFAULT = 1  # one-page budget, measured per track in the TASK-56 log
 SIDE_PROJECT_LIMIT = 1
 
@@ -410,15 +410,20 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative", trac
             lines.append(f"- {escape_typst(clean_b)}")
     # Side projects that fit the track print after the engine projects, same section.
     for side in side_projects_for_track(evidence.get("side_projects"), track, limit=SIDE_PROJECT_LIMIT):
+        tools = side.get("tools")
+        has_tools = isinstance(tools, list) and bool(tools)
+        cap = SIDE_PROJECT_BULLET_CAP.get(str(track), SIDE_PROJECT_BULLET_DEFAULT)
+        side_bullets = [] if has_tools else list(side.get("bullets", []) or [])[:cap]
+        if not has_tools and not side_bullets:
+            continue  # a side-project header never prints without a bullet or Tools line under it
         lines.append("#v(6.0pt)")
         status = str(side.get("status", "") or "").strip().lower()
         right = "In progress" if status == "in progress" else ""
         lines.append(f"*{escape_typst(side.get('name', ''))}* #h(1fr) {right}".rstrip())
-        tools = side.get("tools")
-        if isinstance(tools, list) and tools:
+        if has_tools:
             lines.append("Tools: " + ", ".join(escape_typst(str(t)) for t in tools))
             continue
-        for b in side.get("bullets", [])[:SIDE_PROJECT_BULLET_CAP.get(str(track), SIDE_PROJECT_BULLET_DEFAULT)]:
+        for b in side_bullets:
             lines.append(f"- {escape_typst(apply_tone_filter(b, tone_key, track))}")
     return "\n".join(lines)
 
