@@ -3640,3 +3640,22 @@ def test_contact_line_legible_on_resume_and_letter():
     assert float(m_.group(1)) >= 9.0 and lum(m_.group(2)) <= floor
     assert len(pypdf.PdfReader(io.BytesIO(re_.compile_cover_letter_pdf(
         "Dear team,\n\nHello.\n\nKevin", "Acme"))).pages) == 1
+
+
+def test_signal_title_carries_intern():
+    import io
+    import pypdf
+    import resume_engine as re_
+
+    bank = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json"), encoding="utf-8"))
+    full = "Wealth Operations Specialist Intern"
+    assert bank["experience"][0]["title"] == full
+    long_job = "We use Tableau and Power BI daily. " * 40
+    for tr in "abcdefgh":
+        for tone in ("conservative", "aggressive"):
+            for job in ("", long_job):
+                mk = re_.render_typst_markup("Acme", tr, tone_mode=tone, job_text=job)
+                assert mk.count(full) == 1, (tr, tone)
+                assert not re.search(r"Wealth Operations Specialist(?! Intern)", mk), (tr, tone)
+                pdf = re_.compile_resume_pdf("Acme", tr, tone_mode=tone, job_text=job)
+                assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (tr, tone, bool(job))
