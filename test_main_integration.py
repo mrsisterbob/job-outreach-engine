@@ -13020,3 +13020,45 @@ def test_fallback_copy_attributes_no_scripting_to_employer(monkeypatch):
         for sentence in re.split(r"(?<=[.!?])\s+", text):
             if re.search(r"Python|SQL", sentence):
                 assert "own" in sentence or "outreach engine" in sentence, sentence
+
+
+def test_ups_employer_ban(monkeypatch):
+    from pipeline_utils import is_banned_employer
+    for name in ("UPS", "ups", "UPS Supply Chain Solutions", "United Parcel Service Inc", "The UPS Store"):
+        assert is_banned_employer(name), name
+    for name in ("Groups Inc", "Startups Hub", "Cups Coffee", "Setups LLC", "Upside", "", None):
+        assert not is_banned_employer(name), name
+
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000, "valid_cities": ["farmington", "detroit"],
+        "title_exclusions": [], "company_exclusions": [],
+        "hard_ban_keywords": [], "seniority_exclusions": [],
+    }.get(key, default if default is not None else []))
+    strict = {
+        "employer_name": "Northwind Co", "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL and reporting.",
+        "job_city": "Farmington Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1",
+    }
+    remote = _remote_job()
+    assert m.passes_strict_filter(strict) is True
+    assert m._passes_remote_filter(remote) is True
+    for name in ("UPS", "United Parcel Service", "UPS Supply Chain Solutions"):
+        trace = m.FunnelTrace()
+        assert m.passes_strict_filter({**strict, "employer_name": name}, trace=trace) is False
+        assert trace.reasons.get("banned_employer") == 1
+        assert m._passes_remote_filter({**remote, "employer_name": name}) is False
+    for name in ("Groups Inc", "Startups Hub"):
+        assert m.passes_strict_filter({**strict, "employer_name": name}) is True
+        assert m._passes_remote_filter({**remote, "employer_name": name}) is True
+
+    for url in ("https://a2zcareer.co.com/x", "https://jobslistingtoday.com/y",
+                "https://www.jobslistingtoday.com/y"):
+        assert m.is_aggregator_relist(url), url
+    monkeypatch.setattr(m, "AGGREGATOR_RELIST_DOMAINS", ("example.org",))
+    assert m.is_aggregator_relist("https://a2zcareer.co.com/x")
+    assert m.is_aggregator_relist("https://jobslistingtoday.com/y")
+    assert not m.is_aggregator_relist("https://notjobslistingtoday.com/")

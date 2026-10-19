@@ -2935,3 +2935,19 @@ def retag_card_routing(text, entities, track, bullet_indices, outreach_template_
             entity["length"] = int(entity.get("length", 0)) + delta
         new_entities.append(entity)
     return new_text, new_entities
+
+
+# Employers Kevin has banned outright. Lives in code, not in the System_Config sheet, so a deploy
+# is all it takes to reach production. Whole-word regexes: "ups" must not hit Groups or Startups.
+BANNED_EMPLOYER_PATTERNS = (
+    r"\bups\b",
+    r"\bunited parcel service\b",
+)
+
+
+def is_banned_employer(company):
+    """True when the employer name matches a BANNED_EMPLOYER_PATTERNS whole-word regex."""
+    name = str(company or "").lower()
+    if not name:
+        return False
+    return any(re.search(p, name) for p in BANNED_EMPLOYER_PATTERNS)
