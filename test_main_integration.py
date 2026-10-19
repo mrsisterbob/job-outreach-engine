@@ -13102,3 +13102,56 @@ def test_ups_employer_ban(monkeypatch):
     assert m.is_aggregator_relist("https://a2zcareer.co.com/x")
     assert m.is_aggregator_relist("https://jobslistingtoday.com/y")
     assert not m.is_aggregator_relist("https://notjobslistingtoday.com/")
+
+
+# ---- /health must not call a dead database healthy ----
+
+def _health_reply(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/health"}})
+    return "\n".join(sent)
+
+
+def test_db_health_probe_reports_healthy_and_broken_database(monkeypatch):
+    import shutil as _shutil
+    # (1) healthy
+    probe = m.db_health_probe()
+    assert probe["ok"] is True and probe["error"] is None
+    assert isinstance(probe["disk_free_mb"], float)
+    assert isinstance(probe["db_bytes"], int)
+    reply = _health_reply(monkeypatch)
+    assert "Operational" in reply and probe["db_path"] in reply
+    assert "DATABASE ERROR" not in reply
+    assert probe["journal_mode"] and probe["journal_mode"].upper() in reply
+
+    # (2) get_db_conn raises
+    def _boom():
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(m, "get_db_conn", _boom)
+    bad = m.db_health_probe()
+    assert bad["ok"] is False and "disk I/O error" in bad["error"]
+    assert bad["db_path"] and bad["disk_free_mb"] is not None
+    reply = _health_reply(monkeypatch)
+    assert "DATABASE ERROR" in reply and "disk I/O error" in reply
+    assert bad["db_path"] in reply and "Operational" not in reply
+
+    # (3) disk_usage raising does not raise out of the probe
+    def _no_usage(_p):
+        raise OSError("nope")
+    monkeypatch.setattr(_shutil, "disk_usage", _no_usage)
+    assert m.db_health_probe()["disk_free_mb"] is None
+
+
+def test_db_health_probe_reports_boot_alert_fires_once_only_when_broken(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    monkeypatch.setattr(m, "db_health_probe", lambda: {
+        "ok": True, "error": None, "db_path": "/x/db", "disk_free_mb": 5.0})
+    m.alert_if_db_unhealthy_at_boot()
+    assert alerts == []
+    monkeypatch.setattr(m, "db_health_probe", lambda: {
+        "ok": False, "error": "disk I/O error", "db_path": "/x/db", "disk_free_mb": 5.0})
+    m.alert_if_db_unhealthy_at_boot()
+    assert len(alerts) == 1
+    assert "SQLite is unreadable" in alerts[0] and "disk I/O error" in alerts[0] and "/x/db" in alerts[0]
