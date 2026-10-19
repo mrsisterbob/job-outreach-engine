@@ -164,6 +164,7 @@ def build_jsearch_request_config():
         return {"X-RapidAPI-Key": rapidapi_key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}, "https://jsearch.p.rapidapi.com/search"
     logging.error("[CONFIG ERROR] No JSearch API key found in environment variables.")
     return {}, JSEARCH_URL
+_DB_INIT_ERROR = {"error": None}  # set by init_db_or_record() when SQLite cannot be opened at boot
 DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs_cache.db")  # override lets tests isolate their own SQLite file
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
 
@@ -1091,6 +1092,21 @@ DEFAULT_SEARCH_FILTERS = {
 }
 
 
+def init_db_or_record():
+    """Run init_db() at import time without letting a broken database crash the boot.
+
+    On failure the error text is stored in _DB_INIT_ERROR so the boot alert and /health can
+    report it. Returns True on success, False on failure.
+    """
+    try:
+        init_db()
+        return True
+    except Exception as e:
+        logging.exception("init_db failed at boot; starting degraded")
+        _DB_INIT_ERROR["error"] = str(e) or type(e).__name__
+        return False
+
+
 def init_db():
     """Initializes local SQLite tables with WAL mode enabled for multithreaded concurrency."""
     with get_db_conn() as conn:
@@ -1499,7 +1515,7 @@ def restore_core_sourcing_filters():
         logging.error(f"System_Config dual-write failed (target_queries restore): {e}")
     return True
 
-init_db()
+init_db_or_record()
 
 # ==============================================================================
 # 2. FILTER & DYNAMIC CONFIGURATION HELPERS
@@ -12207,6 +12223,13 @@ def pipeline_refusal_message():
             f"\U0001F534 <b>Pipeline did not run:</b> the database is unreadable ({html.escape(str(error))}). "
             "Nothing was scanned. Check /health."
         )
+    init_error = _DB_INIT_ERROR["error"]
+    if init_error:
+        return (
+            f"\U0001F534 <b>Pipeline did not run:</b> the database failed to initialise at boot "
+            f"({html.escape(str(init_error))}); tables may be missing. Nothing was scanned. "
+            "Check /health and restart once the disk is fixed."
+        )
     if not safe_list(get_filter("target_queries", [])) and not safe_list(get_filter("ats_company_slugs", [])):
         return (
             "\U0001F534 <b>Pipeline did not run:</b> 0 target rules and 0 ATS boards are configured. "
@@ -13427,6 +13450,8 @@ def process_webhook_payload_async(data):
                 headline = "🟢 <b>System Health:</b> Operational\n"
             else:
                 headline = f"🔴 <b>System Health: DATABASE ERROR</b> - {html.escape(str(probe['error']))}\n"
+            if probe.get("init_error"):
+                headline += f"Boot init error: {html.escape(str(probe['init_error']))}\n"
             uptime_str = str(timedelta(seconds=int(time.time() - APP_START_TIME)))
             api_usage = get_monthly_api_usage()
             month_label = datetime.now().strftime("%B %Y")
@@ -14883,6 +14908,7 @@ def db_health_probe():
         "ok": ok,
         "journal_mode": journal_mode,
         "error": error,
+        "init_error": _DB_INIT_ERROR["error"],
         "elapsed_ms": elapsed_ms,
         "db_path": db_path,
         "db_dir_exists": _guard(lambda: os.path.isdir(db_dir), False),
@@ -14900,15 +14926,23 @@ def db_health_probe():
 def alert_if_db_unhealthy_at_boot():
     """Boot-time probe: Telegram Kevin once if SQLite is unreadable. Never retries or repairs."""
     probe = db_health_probe()
-    if not probe["ok"]:
+    init_error = probe.get("init_error")
+    if not probe["ok"] or init_error:
         free = probe["disk_free_mb"]
-        send_health_alert(
-            f"SQLite is unreadable: the pipeline, the CRM outbox and /warm moves cannot run "
-            f"until this is fixed.\n"
-            f"Error: {probe['error']}\n"
-            f"DB path: {probe['db_path']}\n"
-            f"Free disk: {free if free is not None else 'unknown'} MB"
-        )
+        lines = []
+        if not probe["ok"]:
+            lines.append("SQLite is unreadable: the pipeline, the CRM outbox and /warm moves cannot run "
+                         "until this is fixed.")
+            if probe.get("error"):
+                lines.append(f"Error: {probe['error']}")
+            if init_error and init_error != probe.get("error"):
+                lines.append(f"Boot init error: {init_error}")
+        else:
+            lines.append("SQLite schema setup failed at boot; some tables may be missing.")
+            lines.append(f"Error: {init_error}")
+        lines.append(f"DB path: {probe['db_path']}")
+        lines.append(f"Free disk: {free if free is not None else 'unknown'} MB")
+        send_health_alert("\n".join(lines))
     return probe
 
 
@@ -14926,7 +14960,10 @@ def _is_oneshot_invocation():
 # time: pytest (must never poll Gmail or write to the live CRM) and --once (a one-shot batch run -
 # these threads would keep the process alive past the pipeline and could write to the CRM mid-run).
 if not os.environ.get("PYTEST_CURRENT_TEST") and not _is_oneshot_invocation():
-    alert_if_db_unhealthy_at_boot()
+    try:
+        alert_if_db_unhealthy_at_boot()
+    except Exception:
+        logging.exception("boot DB alert failed; continuing to start daemons")
     start_gmail_poller()
     start_crm_outbox_worker()
     start_morning_digest()

@@ -13160,6 +13160,74 @@ def test_db_health_probe_reports_boot_alert_fires_once_only_when_broken(monkeypa
     assert "SQLite is unreadable" in alerts[0] and "disk I/O error" in alerts[0] and "/x/db" in alerts[0]
 
 
+def test_init_db_failure_survives(monkeypatch, tmp_path):
+    import subprocess
+    import sys as _sys
+    # (1) real import with an unopenable database path: exits 0 and records the error
+    env = dict(os.environ, JOBS_DB_PATH=str(tmp_path), PYTEST_CURRENT_TEST="x")
+    repo = os.path.dirname(os.path.abspath(m.__file__))
+    t0 = time.time()
+    r = subprocess.run([_sys.executable, "-I", "-c", "import sys; sys.path.insert(0, %r); import main; print(main._DB_INIT_ERROR['error'])" % repo],
+                       cwd=repo, env=env, capture_output=True, text=True, timeout=120)
+    print("subprocess wall time: %.2fs" % (time.time() - t0))
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "unable to open database file" in r.stdout
+    try:
+        # (2) init_db_or_record swallows and records
+        def _boom():
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(m, "init_db", _boom)
+        assert m.init_db_or_record() is False
+        assert "disk I/O error" in m._DB_INIT_ERROR["error"]
+        # (3) boot alert fires once with the init error and DB path
+        alerts = []
+        monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+        monkeypatch.setattr(m, "db_health_probe", lambda: {
+            "ok": True, "error": None, "init_error": m._DB_INIT_ERROR["error"],
+            "db_path": "/x/db", "disk_free_mb": 5.0})
+        m.alert_if_db_unhealthy_at_boot()
+        assert len(alerts) == 1
+        assert "disk I/O error" in alerts[0] and "DB path" in alerts[0]
+        assert "schema setup failed" in alerts[0] and "unreadable" not in alerts[0]
+        assert "None" not in alerts[0] and alerts[0].count("disk I/O error") == 1
+        # (3b) probe failing too: unreadable sentence, error once, init error only if different
+        alerts.clear()
+        monkeypatch.setattr(m, "db_health_probe", lambda: {
+            "ok": False, "error": "disk I/O error", "init_error": "disk I/O error",
+            "db_path": "/x/db", "disk_free_mb": None})
+        m.alert_if_db_unhealthy_at_boot()
+        assert "SQLite is unreadable" in alerts[0] and "None" not in alerts[0]
+        assert alerts[0].count("disk I/O error") == 1
+        # (4) cleared error and healthy probe: no alert
+        m._DB_INIT_ERROR["error"] = None
+        monkeypatch.setattr(m, "db_health_probe", lambda: {
+            "ok": True, "error": None, "init_error": None, "db_path": "/x/db", "disk_free_mb": 5.0})
+        m.alert_if_db_unhealthy_at_boot()
+        assert len(alerts) == 1
+    finally:
+        m._DB_INIT_ERROR["error"] = None
+
+
+def test_pipeline_refuses_when_init_error_recorded_but_connection_healthy(monkeypatch, sourcing_filters):
+    sent, fetched = [], []
+    monkeypatch.setattr(m, "_LOCAL_ALERT_SENT", {})
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    for name in ("fetch_single_query_jobs", "fetch_ats_jobs", "fetch_greenhouse_jobs", "fetch_lever_jobs",
+                 "fetch_ashby_jobs", "fetch_workday_jobs"):
+        monkeypatch.setattr(m, name, lambda *a, _n=name, **k: fetched.append(_n) or [])
+    assert m.db_is_readable()[0] is True
+    m._DB_INIT_ERROR["error"] = "disk I/O error"
+    try:
+        _dispatch("/t")
+        text = "\n".join(sent)
+        assert "Pipeline did not run" in text and "disk I/O error" in text
+        assert "cards dispatched" not in text and fetched == []
+        assert m.run_job_pipeline(1, top_n=1) is None and fetched == []
+    finally:
+        m._DB_INIT_ERROR["error"] = None
+
+
 # ---- a SQLite failure must never read as an empty configuration ----
 
 def test_pipeline_refuses_on_db_error(monkeypatch, sourcing_filters):
