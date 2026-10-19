@@ -330,7 +330,8 @@
       "bullets": [
         "Designed and built the montelattice.com portfolio site myself, from marketing pages to the Console.",
         "Added a strip of live counts on the landing page, fed by a Flask summary endpoint on the job engine.",
-        "Embedded a short video demo of the systems running on the profile page."
+        "Embedded a short video demo of the systems running on the profile page.",
+        "Built first-party visitor analytics for the site: each pageview is bot-filtered, given a daily hashed visitor ID, tagged with its referrer host and stored in SQLite, then summarized in a daily Telegram report."
       ]
     },
     {
@@ -340,7 +341,8 @@
       "end": "Present",
       "bullets": [
         "Building the site to replace Shopify for a friend's China-based business.",
-        "Adding Stripe to the checkout to reduce international and local payment fees."
+        "Adding Stripe to the checkout to reduce international and local payment fees.",
+        "Researched cost per click and customer acquisition cost on Google and Meta ads and outlined a target audience for the launch."
       ]
     },
     {
@@ -362,6 +364,74 @@
         "Use Excel for VLOOKUP and basic formulas.",
         "Use SQL on the outreach engine and my side projects."
       ]
+    },
+    {
+      "name": "Power BI Music Streaming Dashboard",
+      "category": "personal",
+      "status": "personal project",
+      "bullets": [
+        "Built a Power BI dashboard on Spotify streaming data that ranks the most popular artists, tracks each release year's share of top hits and charts monthly listens for top albums."
+      ]
     }
-  ]
+  ],
+  "interview_facts": {
+    "_note": "Confirmed by Kevin in the 2026-10-19 custom-resume interview (SMZ Advertising) or verified in code. Not rendered by any template. Read before writing custom resumes, letters or screener answers. status: confirmed = Kevin said it; verified = checked in code; hedged = Kevin qualified it, keep off the page unless he overrides for that application.",
+    "facts": [
+      {
+        "status": "confirmed",
+        "where": "ABC Technologies",
+        "fact": "Used VLOOKUP in Excel to find the weekly 401(k) and Roth contribution-total mismatches across 500+ employee accounts, then corrected each one by hand in bSwift."
+      },
+      {
+        "status": "confirmed",
+        "where": "Signal Advisors",
+        "fact": "Onboarding documents could sit in about five places or under different names across DocuSign and Salesforce household accounts. Located where each one was, confirmed whether it existed, and emailed advisor representatives to collect missing paperwork from clients."
+      },
+      {
+        "status": "confirmed",
+        "where": "40 Acres",
+        "fact": "Helped 40 Acres work out compliant wording for outreach to potential investors."
+      },
+      {
+        "status": "verified",
+        "where": "Document Automation Pipeline & Custom CRM",
+        "fact": "The pipeline pulls postings from four job-board REST APIs (JSearch, Greenhouse, Lever, Ashby), converts each into one common job record, stores it in SQLite and writes it to a Google Sheets CRM. Code.gs exposes a doPost web app that receives the pipeline's updates. Checked in main.py (fetch_* functions) and Code.gs:146."
+      },
+      {
+        "status": "verified",
+        "where": "montelattice.com",
+        "fact": "First-party visitor analytics: pageviews forwarded from the site, bot-flagged, hashed to a daily visitor ID, stored with path and referrer host in SQLite, summarized in a daily standup line. No cookie, no third-party script. Kevin does not use Google Analytics. Checked in main.py record_site_visits and montelattice-site/visits.py."
+      },
+      {
+        "status": "confirmed",
+        "where": "personal projects",
+        "fact": "Built a Power BI dashboard on Spotify streaming data (top artists, share of top hits by release year, monthly listens for top albums). The file was not saved, so rebuild before anyone asks to see it. All of Kevin's dashboards are personal projects. He has built none at an employer."
+      },
+      {
+        "status": "confirmed",
+        "where": "self-taught",
+        "fact": "Taught himself Power BI (Power Query, dashboards), Power Automate, Tableau and sending webhooks into Google Sheets through Apps Script while preparing for an earlier technical interview. Strongest in Power BI. Looker Studio is the Google-side tool he knows more lightly, used on personal projects only."
+      },
+      {
+        "status": "confirmed",
+        "where": "friends' sites",
+        "fact": "Helped one friend build and host a website and is helping another friend with an e-commerce site. Dictated, so recheck details before using."
+      },
+      {
+        "status": "hedged",
+        "where": "marketing",
+        "fact": "Researched cost per click and customer acquisition cost on Google and Meta ads for a friend's dropshipping venture and outlined a target age group for a hypothetical ad budget. Ran no campaign and spent no ad money, so keep Google Ads and Meta Ads off the skills line."
+      },
+      {
+        "status": "hedged",
+        "where": "Snowflake",
+        "fact": "Logged into Snowflake once and knows where it fits in a data stack. No hands-on work. Kevin asked for it on the SMZ resume only. Do not add to technical_skills, which would auto-surface it on other applications."
+      },
+      {
+        "status": "hedged",
+        "where": "marketing class",
+        "fact": "The marketing class produced a presentation, with no campaign analysis. Do not cite it as analytics experience."
+      }
+    ]
+  }
 }

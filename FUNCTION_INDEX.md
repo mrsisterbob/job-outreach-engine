@@ -556,7 +556,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 40 | `GeminiJobScreenerResponse._normalize_track` | _(no docstring)_ |
 | 45 | `GeminiJobScreenerResponse._normalize_tone_mode` | _(no docstring)_ |
 
-## `resume_engine.py` — 24 defs, 751 lines
+## `resume_engine.py` — 24 defs, 754 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -581,9 +581,9 @@ grep -i "contact" FUNCTION_INDEX.md
 | 435 | `_unescape_typst` | _(no docstring)_ |
 | 439 | `_reconcile_summary_figures` | Make every figure the summary quotes have a bullet behind it on the same page. |
 | 510 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
-| 674 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
-| 679 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
-| 747 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
+| 677 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
+| 682 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
+| 750 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
 
 ## `resume_side_projects.py` — 1 defs, 45 lines
 
@@ -614,6 +614,14 @@ grep -i "contact" FUNCTION_INDEX.md
 | 23 | `call_gemini` | _(no docstring)_ |
 | 42 | `clean_crm_contacts` | _(no docstring)_ |
 
+## `scripts/custom_resume.py` — 3 defs, 83 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 34 | `_once` | _(no docstring)_ |
+| 40 | `build_markup` | _(no docstring)_ |
+| 52 | `main` | _(no docstring)_ |
+
 ## `skills_footer.py` — 5 defs, 97 lines
 
 | Line | Name | Summary |
@@ -633,16 +641,16 @@ grep -i "contact" FUNCTION_INDEX.md
 | 30 | `figure_supported_by` | True when this one bullet carries the same figure. |
 | 49 | `figure_supported` | True when any rendered bullet carries the figure. |
 
-## `track_registry.py` — 6 defs, 369 lines
+## `track_registry.py` — 6 defs, 371 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 190 | `allowed_outreach_template_ids` | The cold_ops indices `track` may send, snap target first. Never empty. |
-| 195 | `coerce_outreach_template_id` | Gemini's routed cold_ops id if this track is allowed to send it, else the track's default. |
-| 321 | `employer_is_financial_services` | True when the employer's NAME says its own business is financial services. |
-| 331 | `override_track_for_title` | `track`, or the track a high-confidence non-finance job TITLE demands instead. |
-| 350 | `normalize_track` | Any Gemini/Telegram-supplied track value coerced to a letter this registry can resolve. |
-| 367 | `pool_key_for` | The resume_bullets_bank.json / cover_letter_templates.json pool name for a track value. |
+| 192 | `allowed_outreach_template_ids` | The cold_ops indices `track` may send, snap target first. Never empty. |
+| 197 | `coerce_outreach_template_id` | Gemini's routed cold_ops id if this track is allowed to send it, else the track's default. |
+| 323 | `employer_is_financial_services` | True when the employer's NAME says its own business is financial services. |
+| 333 | `override_track_for_title` | `track`, or the track a high-confidence non-finance job TITLE demands instead. |
+| 352 | `normalize_track` | Any Gemini/Telegram-supplied track value coerced to a letter this registry can resolve. |
+| 369 | `pool_key_for` | The resume_bullets_bank.json / cover_letter_templates.json pool name for a track value. |
 
 ## `update_readme_stats.py` — 4 defs, 74 lines
 
@@ -678,4 +686,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**574 definitions across 17 files + Code.gs.**
+**577 definitions across 18 files + Code.gs.**

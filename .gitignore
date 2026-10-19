@@ -19,3 +19,6 @@ Job_Outreach_CRM*.xlsx
 
 # Worker worktrees (.worktrees/TASK-n): each task runs in its own checkout on branch task/TASK-n.
 .worktrees/
+
+# Per-role custom resumes (scripts/custom_resume.py): PDFs and specs carry personal claims, local only
+custom_resumes/
