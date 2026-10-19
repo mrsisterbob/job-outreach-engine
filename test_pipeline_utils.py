@@ -3684,3 +3684,44 @@ def test_track_summaries_read_as_experience_and_looking_for():
             for sentence in re.split(r"(?<=[.!?])\s+", text):
                 if re.search(r"\b(Python|SQL|SQLite)\b", sentence):
                     assert "own project" in sentence or "outreach engine" in sentence, (track, tone, sentence)
+
+
+def test_quality_floor_bank_wording():
+    """The SMZ-grade wording is banked, the old text is gone, and every track still fits one page."""
+    import io
+    import itertools
+    import pypdf
+    import resume_engine as re_
+    ev = re_.load_evidence_bank()
+    pools = re_.load_resume_bullets_bank()
+    abc_new = ("Used VLOOKUP in Excel to find 401(k) and healthcare deduction discrepancies across "
+               "500+ employee accounts, then corrected each in bSwift until every ledger agreed.")
+    proj_new = [
+        "Built a Python pipeline that pulls postings from job-board REST API data feeds, normalizes each into a common record format and loads it into a SQLite database and a Google Sheets CRM.",
+        "Scored each posting with a deterministic Gemini layer; a Telegram command drafts the PDF and Gmail follow-up.",
+    ]
+    site_new = ("Built first-party visitor analytics for montelattice.com: each pageview is bot-filtered, given a daily "
+                "hashed visitor ID, tagged with its referrer host and stored in SQLite, then summarized in a daily Telegram report.")
+    bullets = ev["projects"][0]["bullets"]
+    assert bullets[:2] == proj_new
+    assert site_new in bullets
+    entry = [e for e in pools["track_d_business_intelligence"] if isinstance(e, dict) and e.get("text") == abc_new]
+    assert len(entry) == 1
+    assert entry[0]["source_job"] == 3 and entry[0]["replaces"] == 0 and "500+" in entry[0]["text"]
+    blob = json.dumps(ev) + json.dumps(pools)
+    for old in ("Chased down the 401", "Wired live build", "Telegram-triggered Python"):
+        assert old not in blob, old
+    for t in proj_new + [site_new, abc_new]:
+        assert not pu.negative_language_hits(t), t
+    for tone in ("conservative", "tech"):
+        for tr in "abcdefgh":
+            pool = pools[re_.pool_key_for(tr)]
+            lens = [-(-len(re_.bullet_text(e)) // 105) for e in pool]
+            routings = [[0, 1, 2], [0, 1, 2, 3]]
+            combos = sorted(itertools.combinations(range(len(pool)), 4), key=lambda c: -sum(lens[k] for k in c))
+            routings += [list(c) for c in combos[:8]]
+            if tr == "d":
+                routings += [[1, 4, 8], [3, 7, 13, 14]]
+            for r in routings:
+                pdf = re_.compile_resume_pdf("Acme", tr, r, tone)
+                assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (tr, tone, r)

@@ -77,7 +77,7 @@
   "track_d_business_intelligence": [
     "Resolved a Salesforce queue collision between the trading and service desks, preventing 10 critical SLA breaches.",
     {
-      "text": "Chased down the 401(k) and healthcare deduction mismatches across 500+ employee accounts in bSwift and Excel until every ledger agreed.",
+      "text": "Used VLOOKUP in Excel to find 401(k) and healthcare deduction discrepancies across 500+ employee accounts, then corrected each in bSwift until every ledger agreed.",
       "source_job": 3,
       "replaces": 0
     },
