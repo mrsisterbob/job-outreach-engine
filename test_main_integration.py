@@ -4463,7 +4463,7 @@ def test_hybrid_score_modifier_returns_the_signed_layer1_shift(monkeypatch):
     # word, so it earns the smaller family bonus rather than the +6 entry-level one. It previously
     # scored 0 here - this test's old comment credited a "+6 Analyst entry-level title" that never
     # fired, since the entry-level branch matches "analyst i" and not a bare "analyst".
-    assert layer1_bonus == 40
+    assert layer1_bonus == 42  # 40 + the dateless 48h bucket now earns +10 (was +8)
     # 100 raw, compressed by soft_cap_score() rather than flattened at the 100 clamp.
     assert final_score == 91
 
@@ -5775,6 +5775,9 @@ def test_t_warns_when_target_queries_is_empty(monkeypatch, sourcing_filters):
     monkeypatch.setattr(m, "run_job_pipeline", lambda chat_id, top_n=2: 0)
     with m.get_db_conn() as conn:
         conn.execute("UPDATE search_filters SET value_json = '[]' WHERE key = 'target_queries'")
+        # one board keeps this the deliberate warn-and-run path; with none, /t now refuses
+        conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('ats_company_slugs', ?)",
+                     (json.dumps(["acme"]),))
         conn.commit()
     _dispatch("/t")
     assert any("target_queries is empty" in s for s in sent)
@@ -6656,17 +6659,17 @@ def test_freshness_scoring_separates_a_fresh_posting_from_a_stale_one():
     it the whole job dict scored every listing as exactly 48h old: the +8 bonus fired on all of
     them and the >=720h -8 penalty could never fire at all.
 
-    Timestamps are built off now() so they cannot rot. Note the 26-day case lands at ~624h, which
-    is past every bonus but short of the 720h penalty line - the -8 branch needs a 31-day posting.
+    Timestamps are built off now() so they cannot rot. The 26-day case lands at ~624h: stale (-6)
+    but short of the 720h dead line - the -25 branch needs a 31-day posting.
     """
     fresh = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
     stale = (datetime.now(timezone.utc) - timedelta(days=26)).isoformat()
     ancient = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
 
     assert m.parse_posted_hours(fresh) != m.parse_posted_hours(stale)
-    assert m.parse_posted_hours(fresh) <= 72        # +8 branch
-    assert 168 < m.parse_posted_hours(stale) < 720  # no freshness modifier at all
-    assert m.parse_posted_hours(ancient) >= 720     # -8 branch
+    assert m.parse_posted_hours(fresh) <= 48        # +10 branch
+    assert 336 <= m.parse_posted_hours(stale) < 720  # -6 branch
+    assert m.parse_posted_hours(ancient) >= 720     # -25 branch
 
     def bonus_for(posted):
         _, layer1_bonus = m.calculate_hybrid_score_modifier(
@@ -6674,8 +6677,8 @@ def test_freshness_scoring_separates_a_fresh_posting_from_a_stale_one():
         return layer1_bonus
 
     # Freshness is the only thing differing between these jobs, so the gaps are the branch deltas.
-    assert bonus_for(fresh) - bonus_for(stale) == 8       # +8 against nothing
-    assert bonus_for(fresh) - bonus_for(ancient) == 16    # +8 against -8
+    assert bonus_for(fresh) - bonus_for(stale) == 16      # +10 against -6
+    assert bonus_for(fresh) - bonus_for(ancient) == 35    # +10 against -25
 
 
 def test_freshness_scoring_fails_open_to_48_hours_without_a_timestamp():
@@ -6690,10 +6693,50 @@ def test_freshness_scoring_fails_open_to_48_hours_without_a_timestamp():
         return layer1_bonus
 
     fresh_bonus = bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=fresh))
-    # 48 lands in the <=72 bucket, so a dateless posting keeps the same +8 a fresh one earns.
+    # 48 lands in the <=48 bucket, so a dateless posting keeps the same +10 a fresh one earns.
     assert bonus_for(dict(_FRESHNESS_BASE_JOB)) == fresh_bonus                                 # key absent
     assert bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc="")) == fresh_bonus  # blank
     assert bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=None)) == fresh_bonus
+
+
+def test_score_age_ladder_steps_and_ordering():
+    now = datetime.now(timezone.utc)
+
+    def l1(days=None, hours=None):
+        posted = (now - timedelta(days=days or 0, hours=hours or 0)).isoformat()
+        return m.calculate_hybrid_score_modifier(
+            dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=posted), 70)[1]
+
+    ages = [l1(hours=5), l1(days=3), l1(days=8), l1(days=12), l1(days=20), l1(days=31)]
+    assert all(a >= b for a, b in zip(ages, ages[1:]))
+    base = ages[3]  # 12d: the 0 bucket
+    assert [a - base for a in ages] == [10, 7, 2, 0, -6, -25]
+    assert ages[0] - base == 10
+    assert base - ages[4] == 6
+    # dateless == 48h bucket
+    assert m.calculate_hybrid_score_modifier(dict(_FRESHNESS_BASE_JOB), 70)[1] == l1(hours=48 - 1) == ages[0]
+    # future-dated feed counts as fresh
+    assert l1(days=-3) == ages[0]
+
+
+def test_score_age_ladder_caps_a_dead_posting_below_tier_two(run_candidate):
+    now = datetime.now(timezone.utc)
+    maxed = {
+        "job_title": "Senior Operations Analyst", "job_city": "troy",
+        "job_description": "python sql automation reconciliation reporting salesforce excel workflow",
+        "job_min_salary": 90000, "job_max_salary": 110000,
+    }
+
+    def run(days):
+        job = dict(maxed, job_posted_at_datetime_utc=(now - timedelta(days=days)).isoformat())
+        _, l1 = m.calculate_hybrid_score_modifier(dict(job), 95)
+        return run_candidate(gemini_base=95, layer1_bonus=l1, **job)
+
+    dead = run(31)
+    assert dead["score"] <= 64
+    assert dead["job"]["fit_score"] == dead["score"]
+    assert dead["score_boost"] >= 0
+    assert run(2)["score"] >= 80
 
 
 # ---- /dead decoy marking + /decoys report ----
@@ -10650,8 +10693,15 @@ def test_a_routed_bullet_never_sits_beside_the_static_it_restates():
             company = evidence["experience"][src]["company"]
             superseded = evidence["experience"][src]["bullets"][sub]
             track = pool.split("_")[1]
+
+            # Companions never form a declared same_claim_as pair with i, or i itself is dropped
+            # (d[8] beside d[1]) and this check would fail for a reason it is not about.
+            def _same_claim(a, b):
+                return any(isinstance(bullets[x], dict) and bullets[x].get("same_claim_as") == y
+                           for x, y in ((a, b), (b, a)))
+            companions = [j for j in (0, 1, 2, 3) if not _same_claim(i, j)][:2]
             blocks = _experience_blocks(
-                resume_engine.render_typst_markup("Acme", track, [i, 0, 1], "tech"))
+                resume_engine.render_typst_markup("Acme", track, [i] + companions, "tech"))
             rendered = blocks[company]
             assert resume_engine.bullet_text(entry) in rendered, f"{pool}[{i}] did not render"
             assert superseded not in rendered, f"{pool}[{i}] rendered beside the static it restates"
@@ -13020,3 +13070,249 @@ def test_fallback_copy_attributes_no_scripting_to_employer(monkeypatch):
         for sentence in re.split(r"(?<=[.!?])\s+", text):
             if re.search(r"Python|SQL", sentence):
                 assert "own" in sentence or "outreach engine" in sentence, sentence
+
+
+def test_ups_employer_ban(monkeypatch):
+    from pipeline_utils import is_banned_employer
+    for name in ("UPS", "ups", "UPS Supply Chain Solutions", "United Parcel Service Inc", "The UPS Store"):
+        assert is_banned_employer(name), name
+    for name in ("Groups Inc", "Startups Hub", "Cups Coffee", "Setups LLC", "Upside", "", None):
+        assert not is_banned_employer(name), name
+
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000, "valid_cities": ["farmington", "detroit"],
+        "title_exclusions": [], "company_exclusions": [],
+        "hard_ban_keywords": [], "seniority_exclusions": [],
+    }.get(key, default if default is not None else []))
+    strict = {
+        "employer_name": "Northwind Co", "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL and reporting.",
+        "job_city": "Farmington Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1",
+    }
+    remote = _remote_job()
+    assert m.passes_strict_filter(strict) is True
+    assert m._passes_remote_filter(remote) is True
+    for name in ("UPS", "United Parcel Service", "UPS Supply Chain Solutions"):
+        trace = m.FunnelTrace()
+        assert m.passes_strict_filter({**strict, "employer_name": name}, trace=trace) is False
+        assert trace.reasons.get("banned_employer") == 1
+        assert m._passes_remote_filter({**remote, "employer_name": name}) is False
+    for name in ("Groups Inc", "Startups Hub"):
+        assert m.passes_strict_filter({**strict, "employer_name": name}) is True
+        assert m._passes_remote_filter({**remote, "employer_name": name}) is True
+
+    for url in ("https://a2zcareer.co.com/x", "https://jobslistingtoday.com/y",
+                "https://www.jobslistingtoday.com/y"):
+        assert m.is_aggregator_relist(url), url
+    monkeypatch.setattr(m, "AGGREGATOR_RELIST_DOMAINS", ("example.org",))
+    assert m.is_aggregator_relist("https://a2zcareer.co.com/x")
+    assert m.is_aggregator_relist("https://jobslistingtoday.com/y")
+    assert not m.is_aggregator_relist("https://notjobslistingtoday.com/")
+
+
+# ---- /health must not call a dead database healthy ----
+
+def _health_reply(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/health"}})
+    return "\n".join(sent)
+
+
+def test_db_health_probe_reports_healthy_and_broken_database(monkeypatch):
+    import shutil as _shutil
+    # (1) healthy
+    probe = m.db_health_probe()
+    assert probe["ok"] is True and probe["error"] is None
+    assert isinstance(probe["disk_free_mb"], float)
+    assert isinstance(probe["db_bytes"], int)
+    reply = _health_reply(monkeypatch)
+    assert "Operational" in reply and probe["db_path"] in reply
+    assert "DATABASE ERROR" not in reply
+    assert probe["journal_mode"] and probe["journal_mode"].upper() in reply
+
+    # (2) get_db_conn raises
+    def _boom():
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(m, "get_db_conn", _boom)
+    bad = m.db_health_probe()
+    assert bad["ok"] is False and "disk I/O error" in bad["error"]
+    assert bad["db_path"] and bad["disk_free_mb"] is not None
+    reply = _health_reply(monkeypatch)
+    assert "DATABASE ERROR" in reply and "disk I/O error" in reply
+    assert bad["db_path"] in reply and "Operational" not in reply
+
+    # (3) disk_usage raising does not raise out of the probe
+    def _no_usage(_p):
+        raise OSError("nope")
+    monkeypatch.setattr(_shutil, "disk_usage", _no_usage)
+    assert m.db_health_probe()["disk_free_mb"] is None
+
+
+def test_db_health_probe_reports_boot_alert_fires_once_only_when_broken(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    monkeypatch.setattr(m, "db_health_probe", lambda: {
+        "ok": True, "error": None, "db_path": "/x/db", "disk_free_mb": 5.0})
+    m.alert_if_db_unhealthy_at_boot()
+    assert alerts == []
+    monkeypatch.setattr(m, "db_health_probe", lambda: {
+        "ok": False, "error": "disk I/O error", "db_path": "/x/db", "disk_free_mb": 5.0})
+    m.alert_if_db_unhealthy_at_boot()
+    assert len(alerts) == 1
+    assert "SQLite is unreadable" in alerts[0] and "disk I/O error" in alerts[0] and "/x/db" in alerts[0]
+
+
+def test_init_db_failure_survives(monkeypatch, tmp_path):
+    import subprocess
+    import sys as _sys
+    # (1) real import with an unopenable database path: exits 0 and records the error
+    env = dict(os.environ, JOBS_DB_PATH=str(tmp_path), PYTEST_CURRENT_TEST="x")
+    repo = os.path.dirname(os.path.abspath(m.__file__))
+    t0 = time.time()
+    r = subprocess.run([_sys.executable, "-I", "-c", "import sys; sys.path.insert(0, %r); import main; print(main._DB_INIT_ERROR['error'])" % repo],
+                       cwd=repo, env=env, capture_output=True, text=True, timeout=120)
+    print("subprocess wall time: %.2fs" % (time.time() - t0))
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "unable to open database file" in r.stdout
+    try:
+        # (2) init_db_or_record swallows and records
+        def _boom():
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(m, "init_db", _boom)
+        assert m.init_db_or_record() is False
+        assert "disk I/O error" in m._DB_INIT_ERROR["error"]
+        # (3) boot alert fires once with the init error and DB path
+        alerts = []
+        monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+        monkeypatch.setattr(m, "db_health_probe", lambda: {
+            "ok": True, "error": None, "init_error": m._DB_INIT_ERROR["error"],
+            "db_path": "/x/db", "disk_free_mb": 5.0})
+        m.alert_if_db_unhealthy_at_boot()
+        assert len(alerts) == 1
+        assert "disk I/O error" in alerts[0] and "DB path" in alerts[0]
+        assert "schema setup failed" in alerts[0] and "unreadable" not in alerts[0]
+        assert "None" not in alerts[0] and alerts[0].count("disk I/O error") == 1
+        # (3b) probe failing too: unreadable sentence, error once, init error only if different
+        alerts.clear()
+        monkeypatch.setattr(m, "db_health_probe", lambda: {
+            "ok": False, "error": "disk I/O error", "init_error": "disk I/O error",
+            "db_path": "/x/db", "disk_free_mb": None})
+        m.alert_if_db_unhealthy_at_boot()
+        assert "SQLite is unreadable" in alerts[0] and "None" not in alerts[0]
+        assert alerts[0].count("disk I/O error") == 1
+        # (4) cleared error and healthy probe: no alert
+        m._DB_INIT_ERROR["error"] = None
+        monkeypatch.setattr(m, "db_health_probe", lambda: {
+            "ok": True, "error": None, "init_error": None, "db_path": "/x/db", "disk_free_mb": 5.0})
+        m.alert_if_db_unhealthy_at_boot()
+        assert len(alerts) == 1
+    finally:
+        m._DB_INIT_ERROR["error"] = None
+
+
+def test_pipeline_refuses_when_init_error_recorded_but_connection_healthy(monkeypatch, sourcing_filters):
+    sent, fetched = [], []
+    monkeypatch.setattr(m, "_LOCAL_ALERT_SENT", {})
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    for name in ("fetch_single_query_jobs", "fetch_ats_jobs", "fetch_greenhouse_jobs", "fetch_lever_jobs",
+                 "fetch_ashby_jobs", "fetch_workday_jobs"):
+        monkeypatch.setattr(m, name, lambda *a, _n=name, **k: fetched.append(_n) or [])
+    assert m.db_is_readable()[0] is True
+    m._DB_INIT_ERROR["error"] = "disk I/O error"
+    try:
+        _dispatch("/t")
+        text = "\n".join(sent)
+        assert "Pipeline did not run" in text and "disk I/O error" in text
+        assert "cards dispatched" not in text and fetched == []
+        assert m.run_job_pipeline(1, top_n=1) is None and fetched == []
+    finally:
+        m._DB_INIT_ERROR["error"] = None
+
+
+# ---- a SQLite failure must never read as an empty configuration ----
+
+def test_pipeline_refuses_on_db_error(monkeypatch, sourcing_filters):
+    sent, alerts, fetched = [], [], []
+    monkeypatch.setattr(m, "_LOCAL_ALERT_SENT", {})
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    for name in ("fetch_single_query_jobs", "fetch_ats_jobs", "fetch_greenhouse_jobs", "fetch_lever_jobs",
+                 "fetch_ashby_jobs", "fetch_workday_jobs"):
+        monkeypatch.setattr(m, name, lambda *a, _n=name, **k: fetched.append(_n) or [])
+
+    # (1) unreadable database: /t refuses, names the error, calls no source, dispatches no cards
+    real_conn = m.get_db_conn
+
+    def _boom():
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(m, "get_db_conn", _boom)
+    _dispatch("/t")
+    text = "\n".join(sent)
+    assert "Pipeline did not run" in text and "disk I/O error" in text
+    assert "cards dispatched" not in text and "Scanning" not in text
+    assert fetched == []
+    # the scheduled / direct entry point refuses too and alerts
+    sent.clear()
+    assert m.run_job_pipeline(1, top_n=1) is None
+    assert any("Pipeline did not run" in s for s in sent) and alerts and fetched == []
+    # the background /t path (and so the scheduled one) must not post "Completed" on a refusal
+    sent.clear()
+    m._run_pipeline_and_notify(1, 2)
+    text = "\n".join(sent)
+    assert "Pipeline did not run" in text and "Completed" not in text and "cards dispatched" not in text
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+
+    # (2) readable database, nothing configured at all
+    sent.clear()
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('target_queries', '[]')")
+        conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('ats_company_slugs', '[]')")
+        conn.commit()
+    _dispatch("/t")
+    text = "\n".join(sent)
+    assert "0 target rules and 0 ATS boards" in text and "cards dispatched" not in text
+    assert fetched == []
+
+    # (3) no queries but one board: the old warning is sent and the run proceeds
+    sent.clear()
+    ran = []
+    monkeypatch.setattr(m, "run_job_pipeline", lambda chat_id, top_n=2: ran.append(top_n) or 0)
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('ats_company_slugs', ?)",
+                     (json.dumps(["acme"]),))
+        conn.commit()
+    _dispatch("/t")
+    assert any("target_queries is empty" in s for s in sent) and ran == [2]
+
+    # (4) get_filter on a failing database: default returned, one db_error alert across two calls
+    alerts.clear()
+    monkeypatch.setattr(m, "get_db_conn", _boom)
+    assert m.get_filter("target_queries", ["dflt"]) == ["dflt"]
+    assert m.get_filter("target_queries", ["dflt"]) == ["dflt"]
+    assert len(alerts) == 1 and "target_queries" in alerts[0] and "disk I/O error" in alerts[0]
+    assert m._DB_LAST_ERROR["error"] and m._DB_LAST_ERROR["at"]
+
+    # (5) enqueue_crm_payload with a failing insert: False, one alert across two calls
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+    alerts.clear()
+
+    class _FailConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(m, "get_db_conn", lambda: _FailConn())
+    assert m.enqueue_crm_payload({"action": "update_status"}) is False
+    assert m.enqueue_crm_payload({"action": "update_status"}) is False
+    assert len(alerts) == 1 and "update_status" in alerts[0] and "disk I/O error" in alerts[0]
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
