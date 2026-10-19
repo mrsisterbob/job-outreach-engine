@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import contextlib
 import hashlib
 import sqlite3
@@ -151,6 +152,7 @@ WILDCARD_BONUS = max(0, int(os.environ.get("WILDCARD_BONUS", "2")))
 # The per-layer min(1, ...)/min(100, ...) clamps stay as a separate safety floor/ceiling. Single
 # tunable knob - raise toward 35 to loosen, drop toward 25 to force more spread.
 BONUS_STACK_CAP = 30
+from score_rules import posted_age_adjustment, is_dead_posting, AGE_DEAD_CEILING
 
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
@@ -162,6 +164,7 @@ def build_jsearch_request_config():
         return {"X-RapidAPI-Key": rapidapi_key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}, "https://jsearch.p.rapidapi.com/search"
     logging.error("[CONFIG ERROR] No JSearch API key found in environment variables.")
     return {}, JSEARCH_URL
+_DB_INIT_ERROR = {"error": None}  # set by init_db_or_record() when SQLite cannot be opened at boot
 DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs_cache.db")  # override lets tests isolate their own SQLite file
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
 
@@ -1089,6 +1092,21 @@ DEFAULT_SEARCH_FILTERS = {
 }
 
 
+def init_db_or_record():
+    """Run init_db() at import time without letting a broken database crash the boot.
+
+    On failure the error text is stored in _DB_INIT_ERROR so the boot alert and /health can
+    report it. Returns True on success, False on failure.
+    """
+    try:
+        init_db()
+        return True
+    except Exception as e:
+        logging.exception("init_db failed at boot; starting degraded")
+        _DB_INIT_ERROR["error"] = str(e) or type(e).__name__
+        return False
+
+
 def init_db():
     """Initializes local SQLite tables with WAL mode enabled for multithreaded concurrency."""
     with get_db_conn() as conn:
@@ -1497,7 +1515,7 @@ def restore_core_sourcing_filters():
         logging.error(f"System_Config dual-write failed (target_queries restore): {e}")
     return True
 
-init_db()
+init_db_or_record()
 
 # ==============================================================================
 # 2. FILTER & DYNAMIC CONFIGURATION HELPERS
@@ -1521,6 +1539,21 @@ def safe_list(val):
         return [v.strip() for v in val.split(",") if v.strip()]
     return []
 
+_DB_LAST_ERROR = {"at": None, "error": None}
+_LOCAL_ALERT_SENT = {}
+
+
+def local_alert_cooldown(key, cooldown_hours=1):
+    """In-process debounce (no DB): should_send_alert fails OPEN when SQLite is dead, which is
+    exactly when these alerts fire. True once per cooldown window per key."""
+    now = time.time()
+    last = _LOCAL_ALERT_SENT.get(key)
+    if last is not None and now - last < cooldown_hours * 3600:
+        return False
+    _LOCAL_ALERT_SENT[key] = now
+    return True
+
+
 def get_filter(key, default_val=None):
     try:
         with get_db_conn() as conn:
@@ -1531,6 +1564,18 @@ def get_filter(key, default_val=None):
                 return json.loads(row[0])
     except Exception as e:
         logging.error(f"Filter Read Error ({key}): {e}")
+        # Still return default_val (callers rely on it), but a failed read must not look like an
+        # empty configuration: record it and raise a debounced alert. Never raises from here.
+        try:
+            _DB_LAST_ERROR["at"] = time.time()
+            _DB_LAST_ERROR["error"] = str(e) or type(e).__name__
+            if local_alert_cooldown("db_error", 1):
+                send_health_alert(
+                    f"\U0001F534 Database read failed for filter '{key}': {_DB_LAST_ERROR['error']}. "
+                    "The default was used instead. Check /health."
+                )
+        except Exception:
+            pass
     return default_val
 
 def set_filter(key, val):
@@ -4220,13 +4265,9 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     # it cannot parse, so handing it the dict silently scored every listing as exactly 48h old -
     # the +8 bonus fired on all of them and the >=720h penalty never once fired.
     posted_hours = parse_posted_hours(job.get("job_posted_at_datetime_utc"))
-    if posted_hours is not None:
-        if posted_hours <= 72:
-            bonus += 8
-        elif posted_hours <= 168:
-            bonus += 4
-        elif posted_hours >= 720:
-            bonus -= 8
+    # Progressive age ladder lives in score_rules.py. A dateless posting fails open to 48h and
+    # therefore earns the fresh bonus (deliberate, see parse_posted_hours).
+    bonus += posted_age_adjustment(posted_hours)
 
     if any(k in desc for k in ["high call volume", "outbound calling", "phone queue", "call center", "inbound calls", "dialer"]):
         bonus -= 20
@@ -5402,6 +5443,11 @@ def process_single_candidate(job, force=False):
         # (clamps permitting), never an inflated phantom from summing raw un-applied boosts.
         score_before_layer2 = max(1, min(100, min(100, gemini_base + min(BONUS_STACK_CAP, l1_pos)) + l1_neg))
         total_boost = score - score_before_layer2
+        # Dead-posting ceiling (30+ days old): applied AFTER the recompute so no keyword stack can
+        # lift it back over the Tier-2 floor. total_boost stays the pre-ceiling stack (never
+        # negative-nonsense); fit_score and the returned score both carry the ceilinged value.
+        if is_dead_posting(parse_posted_hours(job.get("job_posted_at_datetime_utc"))):
+            score = min(score, AGE_DEAD_CEILING)
 
         # Second write, same sheet_uuid: the fit reason, matched skills and final score are all
         # computed/adjusted below the first save, and /stage is now the only place they are shown.
@@ -8764,6 +8810,15 @@ def enqueue_crm_payload(payload):
         return True
     except Exception as e:
         logging.error(f"CRM Outbox Enqueue Error: {e}")
+        try:
+            if local_alert_cooldown("crm_outbox_enqueue_failed", 1):
+                action = payload.get("action") if isinstance(payload, dict) else None
+                send_health_alert(
+                    f"\U0001F534 A Sheets write was NOT queued (action: {action or 'unknown'}): {e}. "
+                    "It is lost unless redone by hand. Check /health."
+                )
+        except Exception:
+            pass
         return False
 
 def _crm_outbox_giveup_alert_text(payload):
@@ -12148,6 +12203,41 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
     return (True, "")
 
 
+def db_is_readable():
+    """(ok, error) from db_health_probe(); never raises."""
+    probe = db_health_probe()
+    return bool(probe.get("ok")), probe.get("error")
+
+
+def pipeline_refusal_message():
+    """Why the pipeline must not run right now, as an HTML message, or None when it may.
+
+    A failing database used to read as an empty configuration (get_filter returns its default),
+    so the pipeline scanned 0 rules and reported a clean zero. Check the database first, then
+    refuse when there is nothing at all to scan. Empty target_queries with ATS boards present is
+    deliberate and is NOT a refusal.
+    """
+    ok, error = db_is_readable()
+    if not ok:
+        return (
+            f"\U0001F534 <b>Pipeline did not run:</b> the database is unreadable ({html.escape(str(error))}). "
+            "Nothing was scanned. Check /health."
+        )
+    init_error = _DB_INIT_ERROR["error"]
+    if init_error:
+        return (
+            f"\U0001F534 <b>Pipeline did not run:</b> the database failed to initialise at boot "
+            f"({html.escape(str(init_error))}); tables may be missing. Nothing was scanned. "
+            "Check /health and restart once the disk is fixed."
+        )
+    if not safe_list(get_filter("target_queries", [])) and not safe_list(get_filter("ats_company_slugs", [])):
+        return (
+            "\U0001F534 <b>Pipeline did not run:</b> 0 target rules and 0 ATS boards are configured. "
+            "Check System_Config."
+        )
+    return None
+
+
 def run_job_pipeline(chat_id=None, top_n=2):
     """Job search pipeline with two-stage architecture:
     Stage 1: Pre-filter candidates (JSearch multi-page + ATS direct-source, strict filters)
@@ -12155,6 +12245,14 @@ def run_job_pipeline(chat_id=None, top_n=2):
     Tiered delivery: Tier-1 (score>=80, top 5) get full interactive cards; Tier-2 (65-79) get a bundled digest.
     """
     logging.info(">>> Starting Job Search Pipeline...")
+    refusal = pipeline_refusal_message()
+    if refusal:
+        logging.error(f"Pipeline refused: {refusal}")
+        if chat_id:
+            send_telegram_message(chat_id, refusal)
+        if local_alert_cooldown("pipeline_refused", 1):
+            send_health_alert(re.sub(r"<[^>]+>", "", html.unescape(refusal)))
+        return None  # None = refused, distinct from a real run that dispatched 0
     # Pre-warm CRM caches synchronously so parallel Stage 2 evaluations never contend for the
     # Google Apps Script lock on their first cache-miss call.
     get_applied_crm_companies()
@@ -12547,6 +12645,10 @@ def process_webhook_payload_async(data):
         if re.match(r"^/t(?:\s+(\d+))?$", text):
             m = re.match(r"^/t(?:\s+(\d+))?$", text)
             qty = safe_int(m.group(1), 2)
+            refusal = pipeline_refusal_message()
+            if refusal:
+                send_telegram_message(chat_id, refusal)
+                return
             target_queries = safe_list(get_filter("target_queries", []))
             ats_slugs = safe_list(get_filter("ats_company_slugs", []))
             if not target_queries:
@@ -12564,7 +12666,8 @@ def process_webhook_payload_async(data):
                 f"🔍 Scanning {len(target_queries)} target rules & {len(ats_slugs)} ATS boards (with live Hope Alumni resolution)..."
             )
             count = run_job_pipeline(chat_id, top_n=qty)
-            send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
+            if count is not None:
+                send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
             return
 
         # 2b. Warm Network Radar (/w): zero-LLM, cache-only scan of warm-contact companies
@@ -13330,15 +13433,25 @@ def process_webhook_payload_async(data):
             return
 
         if text == "/health":
-            db_check_start = time.time()
-            try:
-                with get_db_conn() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("PRAGMA journal_mode")
-                    wal_mode = cursor.fetchone()[0]
-            except Exception as e:
-                wal_mode = f"error: {e}"
-            db_elapsed_ms = round((time.time() - db_check_start) * 1000, 2)
+            probe = db_health_probe()
+            wal_mode = probe["journal_mode"] if probe["ok"] else f"error: {probe['error']}"
+            db_elapsed_ms = probe["elapsed_ms"]
+            def _mb(b):
+                return "missing" if b is None else f"{b / 1048576:.2f} MB"
+            free_mb, total_mb = probe["disk_free_mb"], probe["disk_total_mb"]
+            probe_lines = (
+                f"🗄️ <b>DB path:</b> <code>{html.escape(str(probe['db_path']))}</code>\n"
+                f"  Disk free: {free_mb if free_mb is not None else '?'} / {total_mb if total_mb is not None else '?'} MB"
+                f" | dir exists: {probe['db_dir_exists']} | writable: {probe['db_dir_writable']}\n"
+                f"  DB {_mb(probe['db_bytes'])} | WAL {_mb(probe['wal_bytes'])} | SHM {_mb(probe['shm_bytes'])}"
+                f" | backups {_mb(probe['backup_bytes'])}\n"
+            )
+            if probe["ok"]:
+                headline = "🟢 <b>System Health:</b> Operational\n"
+            else:
+                headline = f"🔴 <b>System Health: DATABASE ERROR</b> - {html.escape(str(probe['error']))}\n"
+            if probe.get("init_error"):
+                headline += f"Boot init error: {html.escape(str(probe['init_error']))}\n"
             uptime_str = str(timedelta(seconds=int(time.time() - APP_START_TIME)))
             api_usage = get_monthly_api_usage()
             month_label = datetime.now().strftime("%B %Y")
@@ -13358,7 +13471,8 @@ def process_webhook_payload_async(data):
                 persistence_lines = f"💽 <b>Persistence:</b> error reading status ({html.escape(str(e))})\n"
             send_telegram_message(
                 chat_id,
-                f"🟢 <b>System Health:</b> Operational\n"
+                f"{headline}"
+                f"{probe_lines}"
                 f"💾 <b>SQLite Mode:</b> {html.escape(str(wal_mode)).upper()} ({db_elapsed_ms}ms)\n"
                 f"⏱️ <b>Uptime:</b> {uptime_str}\n"
                 f"{persistence_lines}"
@@ -14749,6 +14863,89 @@ def process_webhook_payload_async(data):
     except Exception as e:
         logging.error(f"Async Webhook Processing Error: {e}")
 
+def db_health_probe():
+    """Read/write probe for the live SQLite file plus the filesystem facts a diagnosis needs.
+
+    NEVER raises: each field is guarded on its own, so a dead database still reports db_path,
+    free disk and the file sizes. ok is True only when SELECT 1 and PRAGMA journal_mode both
+    succeed through get_db_conn().
+    """
+    start = time.time()
+    ok, error, journal_mode = False, None, None
+    try:
+        with get_db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.execute("PRAGMA journal_mode")
+            journal_mode = cur.fetchone()[0]
+        ok = True
+    except Exception as e:
+        error = str(e) or type(e).__name__
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+
+    def _guard(fn, default=None):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    def _size(path):
+        return _guard(lambda: os.path.getsize(path))
+
+    db_path = _guard(lambda: os.path.abspath(DB_PATH), str(DB_PATH))
+    db_dir = _guard(lambda: os.path.dirname(db_path) or ".", ".")
+
+    def _backup_total():
+        return sum(
+            os.path.getsize(os.path.join(BACKUP_DIR, f))
+            for f in os.listdir(BACKUP_DIR)
+            if os.path.isfile(os.path.join(BACKUP_DIR, f))
+        )
+
+    usage = _guard(lambda: shutil.disk_usage(db_dir))
+    return {
+        "ok": ok,
+        "journal_mode": journal_mode,
+        "error": error,
+        "init_error": _DB_INIT_ERROR["error"],
+        "elapsed_ms": elapsed_ms,
+        "db_path": db_path,
+        "db_dir_exists": _guard(lambda: os.path.isdir(db_dir), False),
+        "db_dir_writable": _guard(lambda: os.access(db_dir, os.W_OK), False),
+        "disk_free_mb": round(usage.free / 1048576, 1) if usage else None,
+        "disk_total_mb": round(usage.total / 1048576, 1) if usage else None,
+        "db_bytes": _size(db_path),
+        "wal_bytes": _size(db_path + "-wal"),
+        "shm_bytes": _size(db_path + "-shm"),
+        "backup_dir": BACKUP_DIR,
+        "backup_bytes": _guard(_backup_total),
+    }
+
+
+def alert_if_db_unhealthy_at_boot():
+    """Boot-time probe: Telegram Kevin once if SQLite is unreadable. Never retries or repairs."""
+    probe = db_health_probe()
+    init_error = probe.get("init_error")
+    if not probe["ok"] or init_error:
+        free = probe["disk_free_mb"]
+        lines = []
+        if not probe["ok"]:
+            lines.append("SQLite is unreadable: the pipeline, the CRM outbox and /warm moves cannot run "
+                         "until this is fixed.")
+            if probe.get("error"):
+                lines.append(f"Error: {probe['error']}")
+            if init_error and init_error != probe.get("error"):
+                lines.append(f"Boot init error: {init_error}")
+        else:
+            lines.append("SQLite schema setup failed at boot; some tables may be missing.")
+            lines.append(f"Error: {init_error}")
+        lines.append(f"DB path: {probe['db_path']}")
+        lines.append(f"Free disk: {free if free is not None else 'unknown'} MB")
+        send_health_alert("\n".join(lines))
+    return probe
+
+
 def _is_oneshot_invocation():
     """True when this process was launched as `python main.py --once` (the CI batch entrypoint).
 
@@ -14763,6 +14960,10 @@ def _is_oneshot_invocation():
 # time: pytest (must never poll Gmail or write to the live CRM) and --once (a one-shot batch run -
 # these threads would keep the process alive past the pipeline and could write to the CRM mid-run).
 if not os.environ.get("PYTEST_CURRENT_TEST") and not _is_oneshot_invocation():
+    try:
+        alert_if_db_unhealthy_at_boot()
+    except Exception:
+        logging.exception("boot DB alert failed; continuing to start daemons")
     start_gmail_poller()
     start_crm_outbox_worker()
     start_morning_digest()
@@ -14803,7 +15004,8 @@ def _run_pipeline_and_notify(chat_id, qty):
     """
     try:
         count = run_job_pipeline(chat_id, top_n=qty)
-        send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
+        if count is not None:  # None = refused; the refusal message already went out
+            send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
     except Exception as e:
         logging.error(f"/t Background Pipeline Error: {e}")
         send_telegram_message(chat_id, f"❌ Pipeline error: {html.escape(str(e)[:200])}")
@@ -16231,6 +16433,9 @@ if __name__ == "__main__":
             logging.error(f"[ONCE] Pipeline run failed: {e}", exc_info=True)
             sys.exit(1)
         # A run that dispatches nothing is a valid outcome (no new matches), not a failure.
+        if dispatched is None:
+            logging.error("[ONCE] Pipeline refused (database unreadable or nothing configured)")
+            sys.exit(1)
         logging.info(f"[ONCE] Pipeline run completed: {dispatched} cards dispatched")
         sys.exit(0)
 
