@@ -563,7 +563,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 40 | `GeminiJobScreenerResponse._normalize_track` | _(no docstring)_ |
 | 45 | `GeminiJobScreenerResponse._normalize_tone_mode` | _(no docstring)_ |
 
-## `resume_engine.py` — 24 defs, 768 lines
+## `resume_engine.py` — 24 defs, 788 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -581,16 +581,16 @@ grep -i "contact" FUNCTION_INDEX.md
 | 212 | `_is_duplicate_of_other_job` | _(no docstring)_ |
 | 220 | `filter_ats_bullets` | The bullet STRINGS for a track + routed indices - the shape three non-renderer call sites |
 | 228 | `filter_ats_bullet_entries` | Resolves the actual bullet entries for a track + list of pool indices. Gemini only ever |
-| 301 | `_render_experience_block` | Renders the Professional Experience section entirely from Evidence Bank data - every |
-| 351 | `_render_education_credentials_block` | Renders the combined Education & Credentials section - degrees from evidence_bank's |
-| 386 | `_render_projects_block` | Renders the Technical Projects section - name/location/dates header line per project, |
-| 445 | `_rendered_bullets` | _(no docstring)_ |
-| 449 | `_unescape_typst` | _(no docstring)_ |
-| 453 | `_reconcile_summary_figures` | Make every figure the summary quotes have a bullet behind it on the same page. |
-| 524 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
-| 691 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
-| 696 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
-| 764 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
+| 321 | `_render_experience_block` | Renders the Professional Experience section entirely from Evidence Bank data - every |
+| 371 | `_render_education_credentials_block` | Renders the combined Education & Credentials section - degrees from evidence_bank's |
+| 406 | `_render_projects_block` | Renders the Technical Projects section - name/location/dates header line per project, |
+| 465 | `_rendered_bullets` | _(no docstring)_ |
+| 469 | `_unescape_typst` | _(no docstring)_ |
+| 473 | `_reconcile_summary_figures` | Make every figure the summary quotes have a bullet behind it on the same page. |
+| 544 | `render_typst_markup` | Builds single-page Typst markup for the selected persona track, sourcing every factual |
+| 711 | `compile_resume_pdf` | Compiles the Typst markup string directly into PDF bytes in memory for the selected persona track. |
+| 716 | `render_cover_letter_markup` | Builds Typst markup for a business-letter PDF from ALREADY-RENDERED letter text. |
+| 784 | `compile_cover_letter_pdf` | Compiles already-rendered cover letter text into PDF bytes in memory. |
 
 ## `resume_side_projects.py` — 1 defs, 45 lines
 
