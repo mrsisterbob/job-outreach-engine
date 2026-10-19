@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import contextlib
 import hashlib
 import sqlite3
@@ -13332,15 +13333,23 @@ def process_webhook_payload_async(data):
             return
 
         if text == "/health":
-            db_check_start = time.time()
-            try:
-                with get_db_conn() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("PRAGMA journal_mode")
-                    wal_mode = cursor.fetchone()[0]
-            except Exception as e:
-                wal_mode = f"error: {e}"
-            db_elapsed_ms = round((time.time() - db_check_start) * 1000, 2)
+            probe = db_health_probe()
+            wal_mode = probe["journal_mode"] if probe["ok"] else f"error: {probe['error']}"
+            db_elapsed_ms = probe["elapsed_ms"]
+            def _mb(b):
+                return "missing" if b is None else f"{b / 1048576:.2f} MB"
+            free_mb, total_mb = probe["disk_free_mb"], probe["disk_total_mb"]
+            probe_lines = (
+                f"🗄️ <b>DB path:</b> <code>{html.escape(str(probe['db_path']))}</code>\n"
+                f"  Disk free: {free_mb if free_mb is not None else '?'} / {total_mb if total_mb is not None else '?'} MB"
+                f" | dir exists: {probe['db_dir_exists']} | writable: {probe['db_dir_writable']}\n"
+                f"  DB {_mb(probe['db_bytes'])} | WAL {_mb(probe['wal_bytes'])} | SHM {_mb(probe['shm_bytes'])}"
+                f" | backups {_mb(probe['backup_bytes'])}\n"
+            )
+            if probe["ok"]:
+                headline = "🟢 <b>System Health:</b> Operational\n"
+            else:
+                headline = f"🔴 <b>System Health: DATABASE ERROR</b> - {html.escape(str(probe['error']))}\n"
             uptime_str = str(timedelta(seconds=int(time.time() - APP_START_TIME)))
             api_usage = get_monthly_api_usage()
             month_label = datetime.now().strftime("%B %Y")
@@ -13360,7 +13369,8 @@ def process_webhook_payload_async(data):
                 persistence_lines = f"💽 <b>Persistence:</b> error reading status ({html.escape(str(e))})\n"
             send_telegram_message(
                 chat_id,
-                f"🟢 <b>System Health:</b> Operational\n"
+                f"{headline}"
+                f"{probe_lines}"
                 f"💾 <b>SQLite Mode:</b> {html.escape(str(wal_mode)).upper()} ({db_elapsed_ms}ms)\n"
                 f"⏱️ <b>Uptime:</b> {uptime_str}\n"
                 f"{persistence_lines}"
@@ -14751,6 +14761,80 @@ def process_webhook_payload_async(data):
     except Exception as e:
         logging.error(f"Async Webhook Processing Error: {e}")
 
+def db_health_probe():
+    """Read/write probe for the live SQLite file plus the filesystem facts a diagnosis needs.
+
+    NEVER raises: each field is guarded on its own, so a dead database still reports db_path,
+    free disk and the file sizes. ok is True only when SELECT 1 and PRAGMA journal_mode both
+    succeed through get_db_conn().
+    """
+    start = time.time()
+    ok, error, journal_mode = False, None, None
+    try:
+        with get_db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.execute("PRAGMA journal_mode")
+            journal_mode = cur.fetchone()[0]
+        ok = True
+    except Exception as e:
+        error = str(e) or type(e).__name__
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+
+    def _guard(fn, default=None):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    def _size(path):
+        return _guard(lambda: os.path.getsize(path))
+
+    db_path = _guard(lambda: os.path.abspath(DB_PATH), str(DB_PATH))
+    db_dir = _guard(lambda: os.path.dirname(db_path) or ".", ".")
+
+    def _backup_total():
+        return sum(
+            os.path.getsize(os.path.join(BACKUP_DIR, f))
+            for f in os.listdir(BACKUP_DIR)
+            if os.path.isfile(os.path.join(BACKUP_DIR, f))
+        )
+
+    usage = _guard(lambda: shutil.disk_usage(db_dir))
+    return {
+        "ok": ok,
+        "journal_mode": journal_mode,
+        "error": error,
+        "elapsed_ms": elapsed_ms,
+        "db_path": db_path,
+        "db_dir_exists": _guard(lambda: os.path.isdir(db_dir), False),
+        "db_dir_writable": _guard(lambda: os.access(db_dir, os.W_OK), False),
+        "disk_free_mb": round(usage.free / 1048576, 1) if usage else None,
+        "disk_total_mb": round(usage.total / 1048576, 1) if usage else None,
+        "db_bytes": _size(db_path),
+        "wal_bytes": _size(db_path + "-wal"),
+        "shm_bytes": _size(db_path + "-shm"),
+        "backup_dir": BACKUP_DIR,
+        "backup_bytes": _guard(_backup_total),
+    }
+
+
+def alert_if_db_unhealthy_at_boot():
+    """Boot-time probe: Telegram Kevin once if SQLite is unreadable. Never retries or repairs."""
+    probe = db_health_probe()
+    if not probe["ok"]:
+        free = probe["disk_free_mb"]
+        send_health_alert(
+            f"SQLite is unreadable: the pipeline, the CRM outbox and /warm moves cannot run "
+            f"until this is fixed.\n"
+            f"Error: {probe['error']}\n"
+            f"DB path: {probe['db_path']}\n"
+            f"Free disk: {free if free is not None else 'unknown'} MB"
+        )
+    return probe
+
+
 def _is_oneshot_invocation():
     """True when this process was launched as `python main.py --once` (the CI batch entrypoint).
 
@@ -14765,6 +14849,7 @@ def _is_oneshot_invocation():
 # time: pytest (must never poll Gmail or write to the live CRM) and --once (a one-shot batch run -
 # these threads would keep the process alive past the pipeline and could write to the CRM mid-run).
 if not os.environ.get("PYTEST_CURRENT_TEST") and not _is_oneshot_invocation():
+    alert_if_db_unhealthy_at_boot()
     start_gmail_poller()
     start_crm_outbox_worker()
     start_morning_digest()
