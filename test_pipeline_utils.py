@@ -3288,14 +3288,15 @@ def _sp(name, bullets=("x",), **kw):
 
 def _side_proj_entries():
     return [_sp(n) for n in (
-        "Budget tracker", "Spotify playlist project", "Montelattice site",
+        "Power BI Music Streaming Dashboard", "Budget tracker", "Spotify playlist project", "Montelattice site",
         "Dropshipping site for a friend's China-based business", "Personal tools")]
 
 
 def test_side_projects_for_track_mapped_tracks():
     bank = _side_proj_entries()
     names = lambda t, **k: [e["name"] for e in _rsp.side_projects_for_track(bank, t, **k)]
-    assert names("d") == ["Budget tracker", "Personal tools"]
+    assert names("d", limit=10) == ["Power BI Music Streaming Dashboard", "Budget tracker", "Personal tools"]
+    assert names("d") == ["Power BI Music Streaming Dashboard", "Budget tracker"]
     assert names("b") == ["Budget tracker", "Montelattice site"]
     assert names("h") == ["Montelattice site",
                           "Dropshipping site for a friend's China-based business"]
@@ -3311,7 +3312,7 @@ def test_side_projects_for_track_unmapped_and_spotify_never():
 
 
 def test_side_projects_for_track_limit_and_missing_name():
-    bank = [e for e in _side_proj_entries() if e["name"] != "Budget tracker"]
+    bank = [e for e in _side_proj_entries() if e["name"] not in ("Budget tracker", "Power BI Music Streaming Dashboard")]
     assert [e["name"] for e in _rsp.side_projects_for_track(bank, "d")] == ["Personal tools"]
     assert len(_rsp.side_projects_for_track(_side_proj_entries(), "h", limit=1)) == 1
     assert _rsp.side_projects_for_track(_side_proj_entries(), "h", limit=0) == []

@@ -12939,11 +12939,11 @@ def _technical_projects_block(markup):
 def test_side_projects_render_under_technical_projects_for_mapped_tracks():
     """Drives the real renderer: the first fitting side project prints inside TECHNICAL PROJECTS
     on d, b and h, and every unmapped track prints none of them (no Montelattice or Budget
-    tracker on finance resumes). Only the first project prints: the one-page budget leaves
-    1 spare line on the heaviest d routing, measured."""
+    tracker on finance resumes). Only the first project prints (SIDE_PROJECT_LIMIT = 1); one-page fit
+    is proved by test_d_prints_power_bi_dashboard_above_market_breakout."""
     import resume_side_projects as sp
     all_names = {n for names in sp.SIDE_PROJECT_FIT.values() for n in names}
-    first = {"d": "Document Automation Pipeline", "b": "Budget tracker", "h": "Montelattice site"}
+    first = {"d": "Power BI Music Streaming Dashboard", "b": "Budget tracker", "h": "Montelattice site"}
     for tone in ("conservative", "tech"):
         for track, name in first.items():
             markup = resume_engine.render_typst_markup("Acme", track, [0, 1, 2, 3], tone)
@@ -12953,6 +12953,46 @@ def test_side_projects_render_under_technical_projects_for_mapped_tracks():
             markup = resume_engine.render_typst_markup("Acme", track, [0, 1, 2, 3], tone)
             for n in all_names:
                 assert n not in markup, f"{n} leaked onto track {track}"
+
+
+def test_d_prints_power_bi_dashboard_above_market_breakout():
+    """Track d prints the Power BI dashboard (header with its personal-project label plus its one
+    bullet) between Document Automation and Market Breakout, in both tones, and stays one page on
+    the heaviest routings. Other tracks never print it."""
+    import itertools
+    from pypdf import PdfReader
+    name = "Power BI Music Streaming Dashboard"
+    import resume_side_projects as sp
+    real = resume_engine.load_evidence_bank()["side_projects"]
+    assert sp.side_projects_for_track(real, "d", limit=1)[0]["name"] == name
+    second = {"conservative": "Market Breakout Alert and Real Time Paper Trading Engine",
+              "tech": "Crypto Breakout Alert and Real Time Paper Trading Engine"}
+    for tone in ("conservative", "tech"):
+        markup = resume_engine.render_typst_markup("Acme", "d", [0, 1, 2, 3], tone)
+        lines = markup.splitlines()
+        hdr = [i for i, ln in enumerate(lines) if ln.startswith(f"*{name}*")]
+        assert len(hdr) == 1, tone
+        assert "| Personal project" in lines[hdr[0]], lines[hdr[0]]
+        nxt = next(ln for ln in lines[hdr[0] + 1:] if ln.strip())
+        assert nxt.startswith("- "), nxt
+        doc = next(i for i, ln in enumerate(lines) if ln.startswith("*Document Automation Pipeline"))
+        mb = next(i for i, ln in enumerate(lines) if ln.startswith(f"*{second[tone]}*"))
+        assert doc < hdr[0] < mb, (tone, doc, hdr[0], mb)
+    for track in ("a", "c", "e", "f", "g"):
+        for tone in ("conservative", "tech"):
+            assert name not in resume_engine.render_typst_markup("Acme", track, [0, 1, 2, 3], tone)
+    # one page: rank every 3- and 4-index routing of the d pool by markup length (no compile),
+    # compile the longest ~60 per tone plus the named routings
+    pool = len(resume_engine.load_resume_bullets_bank()[resume_engine.pool_key_for("d")])
+    named = [[0, 1, 2], [0, 1, 2, 3], [1, 4, 8, 10], [0, 1, 8, 13], [2, 10, 12]]
+    for tone in ("conservative", "tech"):
+        ranked = sorted(
+            (list(c) for n in (3, 4) for c in itertools.combinations(range(pool), n)),
+            key=lambda c: len(resume_engine.render_typst_markup("Acme", "d", c, tone)), reverse=True)
+        for indices in ranked[:60] + named:
+            pdf = resume_engine.compile_resume_pdf("Acme", "d", indices, tone)
+            pages = len(PdfReader(io.BytesIO(pdf)).pages)
+            assert pages == 1, f"tone={tone} indices={indices} -> {pages} pages"
 
 
 def test_side_projects_render_tracks_d_b_h_fit_one_page():
