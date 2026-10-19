@@ -3662,7 +3662,17 @@ def test_signal_title_carries_intern():
                 assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (tr, tone, bool(job))
 
 
+D_SMZ_SUMMARY = ("I reconcile mismatched records across systems, 500+ employee accounts in Excel and bSwift "
+                 "at ABC Technologies, and I built a Python pipeline that pulls job-board REST APIs into "
+                 "SQLite and a Google Sheets CRM.")
+
+
 def test_track_summaries_read_as_experience_and_looking_for():
+    """Tracks a, b, c, e, f, g, h read "I have experience in ... I am looking for ...", figure-free.
+
+    Track d is exempt by Kevin's 2026-10-19 decision: its summary is the SMZ text with the 500+
+    figure, so it asserts that exact text instead.
+    """
     import re
     import resume_engine as re_
     import summary_figures as sf
@@ -3676,6 +3686,10 @@ def test_track_summaries_read_as_experience_and_looking_for():
             block = mk[mk.index("[SUMMARY]"):mk.index("// --- PROFESSIONAL EXPERIENCE ---")]
             text = block.split("#v(2pt)\n", 1)[1].split("\n#v(", 1)[0]
             text = text.split("\n*Skills:*")[0].replace("\\", "")
+            if track == "d":
+                assert re_.escape_typst(D_SMZ_SUMMARY) in mk, (track, tone, text)
+                assert not pu.negative_language_hits(text), (track, tone, text)
+                continue
             assert "I have experience in" in text, (track, tone, text)
             assert "I am looking for" in text, (track, tone, text)
             assert sf.summary_figures(text) == [], (track, tone, text)
@@ -3684,6 +3698,46 @@ def test_track_summaries_read_as_experience_and_looking_for():
             for sentence in re.split(r"(?<=[.!?])\s+", text):
                 if re.search(r"\b(Python|SQL|SQLite)\b", sentence):
                     assert "own project" in sentence or "outreach engine" in sentence, (track, tone, sentence)
+
+
+def test_d_summary_leads_with_proven_thing():
+    """Track d prints the SMZ summary and a bullet backing its 500+ on the same single page.
+
+    The exhaustive proof (every routing, both tones) ran once outside the suite (TASK-76 Log);
+    this keeps the routings that stress the repair path: those lacking the ABC pool bullet
+    (index 1), sampled by a no-render length proxy, plus the fixed stress routings.
+    """
+    import io
+    import itertools
+    import pypdf
+    import resume_engine as re_
+    import summary_figures as sf
+    import track_registry as tr_
+
+    data = tr_.TRACKS["d"]
+    assert data["summary"] == D_SMZ_SUMMARY
+    assert sf.summary_figures(data["summary_plain"]) == []
+    assert not pu.negative_language_hits(data["summary"])
+    assert not pu.negative_language_hits(data["summary_plain"])
+    pool = re_.load_resume_bullets_bank()[tr_.pool_key_for("d")]
+    lens = [-(-len(re_.bullet_text(e)) // 105) for e in pool]
+    lacking = [list(c) for k in (3, 4) for c in itertools.combinations(range(len(pool)), k) if 1 not in c]
+    lacking.sort(key=lambda r: -sum(lens[i] for i in r))
+    step = max(1, len(lacking) // 40)
+    sample = lacking[::step][:40]
+    fixed = [[0, 1, 2], [0, 1, 2, 3], [1, 4, 8, 10], [0, 1, 8, 13], [2, 10, 12]]
+    routings = fixed + [r for r in sample if r not in fixed]
+    longest = sorted(routings, key=lambda r: -sum(lens[i] for i in r))[:15]
+    for tone in ("conservative", "tech"):
+        full = re_.escape_typst(re_.apply_tone_filter(data["summary"], tone, "d"))
+        for idx in routings:
+            mk = re_.render_typst_markup("Acme", track="d", bullet_indices=idx, tone_mode=tone)
+            bullets = [ln[2:].replace("\\", "") for ln in mk.split("\n") if ln.startswith("- ")]
+            assert full in mk, (tone, idx)
+            assert sf.figure_supported("500+", bullets), (tone, idx)
+        for idx in longest:
+            pdf = re_.compile_resume_pdf("Acme", "d", idx, tone)
+            assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (tone, idx)
 
 
 def test_quality_floor_bank_wording():

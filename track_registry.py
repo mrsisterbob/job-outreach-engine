@@ -70,8 +70,8 @@ TRACK_REGISTRY = {
         "prompt_label": "business intelligence & analytics",
         "subtitle": "Business Intelligence & Analytics",
         "keywords": ("Power BI", "SQL", "Data Analytics", "Variance Analysis", "Reporting", "Excel"),
-        "summary": "I have experience in Excel schedules for recurring reports and in onboarding throughput analysis, and I am looking for business intelligence and analytics roles.",
-        "summary_plain": "I have experience in Excel schedules for recurring reports and in onboarding throughput analysis, and I am looking for business intelligence and analytics roles.",
+        "summary": "I reconcile mismatched records across systems, 500+ employee accounts in Excel and bSwift at ABC Technologies, and I built a Python pipeline that pulls job-board REST APIs into SQLite and a Google Sheets CRM.",
+        "summary_plain": "I reconcile mismatched records across systems, employee accounts in Excel and bSwift at ABC Technologies, and I built a Python pipeline that pulls job-board REST APIs into SQLite and a Google Sheets CRM.",
         "skills": [
             ("Analytics & Modeling", "SQL, Power BI, Tableau, Looker Studio, Excel."),
             ("Systems & Data", "Power Query, Power Automate, Salesforce Reports, bSwift, Schwab Advisor Center, Python.")
