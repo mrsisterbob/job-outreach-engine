@@ -12981,14 +12981,16 @@ def test_d_prints_power_bi_dashboard_above_market_breakout():
     for track in ("a", "c", "e", "f", "g"):
         for tone in ("conservative", "tech"):
             assert name not in resume_engine.render_typst_markup("Acme", track, [0, 1, 2, 3], tone)
-    # one page: rank every 3- and 4-index routing of the d pool by markup length (no compile),
-    # compile the longest ~60 per tone plus the named routings
-    pool = len(resume_engine.load_resume_bullets_bank()[resume_engine.pool_key_for("d")])
+    # one page: rank every 3- and 4-index routing of the d pool by a no-render proxy (estimated
+    # printed lines: sum of ceil(len/105) per bullet), compile the longest ~60 per tone plus the named routings
+    entries = resume_engine.load_resume_bullets_bank()[resume_engine.pool_key_for("d")]
+    pool = len(entries)
+    lines_est = [-(-len(resume_engine.bullet_text(e)) // 105) for e in entries]
     named = [[0, 1, 2], [0, 1, 2, 3], [1, 4, 8, 10], [0, 1, 8, 13], [2, 10, 12]]
     for tone in ("conservative", "tech"):
         ranked = sorted(
             (list(c) for n in (3, 4) for c in itertools.combinations(range(pool), n)),
-            key=lambda c: len(resume_engine.render_typst_markup("Acme", "d", c, tone)), reverse=True)
+            key=lambda c: sum(lines_est[i] for i in c), reverse=True)
         for indices in ranked[:60] + named:
             pdf = resume_engine.compile_resume_pdf("Acme", "d", indices, tone)
             pages = len(PdfReader(io.BytesIO(pdf)).pages)
