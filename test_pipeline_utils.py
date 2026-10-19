@@ -3185,6 +3185,87 @@ def test_bank_lint_pool_and_experience_sizes():
     assert len(_bank_lint_load("evidence_bank.json")["experience"][0]["bullets"]) == 13
 
 
+def test_bank_lint_same_claim_as_points_at_a_plain_earlier_entry_in_its_pool():
+    for pool, items in _bank_lint_load("resume_bullets_bank.json").items():
+        for i, item in enumerate(items):
+            if not isinstance(item, dict) or "same_claim_as" not in item:
+                continue
+            t = item["same_claim_as"]
+            assert isinstance(t, int) and not isinstance(t, bool), (pool, i)
+            assert 0 <= t < len(items) and t != i, (pool, i, t)
+            assert not (isinstance(items[t], dict) and "same_claim_as" in items[t]), (pool, i, t)
+
+
+_SAME_CLAIM_PAIRS = [("d", 1, 8), ("d", 3, 7), ("e", 4, 13), ("f", 5, 12)]
+
+
+def test_d_never_prints_the_401k_claim_twice():
+    import io
+    import pypdf
+    import resume_engine as re_
+    import track_registry as tr_
+    bank = re_.load_resume_bullets_bank()
+    sampled = {
+        "d": [[1, 4, 8], [3, 7, 13, 14], [1, 8, 2], [0, 1, 8, 13], [8, 4, 2], [7, 2, 5], [3, 7, 1, 8]],
+        "e": [[4, 13, 0], [4, 13, 1, 2], [13, 0, 1]],
+        "f": [[5, 12, 0], [5, 12, 1, 2], [12, 0, 1]],
+    }
+    for track, early, late in _SAME_CLAIM_PAIRS:
+        pool = bank[tr_.pool_key_for(track)]
+        assert re_.bullet_text(pool[late]) != re_.bullet_text(pool[early])
+        t_early = re_.escape_typst(re_.bullet_text(pool[early]))
+        t_late = re_.escape_typst(re_.bullet_text(pool[late]))
+        for tone in ("conservative", "tech"):
+            for idx in sampled[track]:
+                if track == "d" and not ({early, late} & set(idx)):
+                    continue
+                mk = re_.render_typst_markup("Acme", track=track, bullet_indices=idx, tone_mode=tone)
+                n = (t_early in mk) + (t_late in mk)
+                if early in idx and late in idx:
+                    assert (t_early in mk) and (t_late not in mk), (track, tone, idx)
+                elif late in idx:
+                    assert t_late in mk, (track, tone, idx)
+                elif early in idx:
+                    assert t_early in mk, (track, tone, idx)
+    for track, idx in (("d", [1, 4, 8]), ("d", [3, 7, 13, 14]), ("e", [4, 13, 1]), ("f", [5, 12, 1])):
+        for tone in ("conservative", "tech"):
+            pdf = re_.compile_resume_pdf("Acme", track, idx, tone)
+            assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (track, tone, idx)
+
+
+def _same_claim_mark_unclean(monkeypatch, re_, track, unclean):
+    """Makes the given pool indices fail _is_clean by flagging their text as a duplicate."""
+    import track_registry as tr_
+    pool = re_.load_resume_bullets_bank()[tr_.pool_key_for(track)]
+    bad = {re_.bullet_text(pool[i]) for i in unclean}
+    real = re_._is_duplicate_of_other_job
+    monkeypatch.setattr(re_, "_is_duplicate_of_other_job",
+                        lambda text, targets: text in bad or real(text, targets))
+    return pool
+
+
+def test_d_never_prints_the_401k_claim_twice_unclean_earlier_entry_keeps_the_later(monkeypatch):
+    # d[1] routed with d[8] but d[1] rejected as unclean: the claim must survive as d[8].
+    import resume_engine as re_
+    pool = _same_claim_mark_unclean(monkeypatch, re_, "d", {1})
+    got = re_.filter_ats_bullet_entries("d", [1, 8, 2], "tech")
+    assert pool[8] in got and pool[1] not in got
+    assert len(got) == 3
+
+
+def test_d_never_prints_the_401k_claim_twice_backfill_skips_the_partner(monkeypatch):
+    # d [0, 8, 2] with d[2] unclean: the backfill must not pull in d[1], d[8]'s same-claim partner.
+    import resume_engine as re_
+    pool = _same_claim_mark_unclean(monkeypatch, re_, "d", {2})
+    got = re_.filter_ats_bullet_entries("d", [0, 8, 2], "tech")
+    assert pool[8] in got and pool[1] not in got and pool[2] not in got
+    assert len(got) == 3
+    # And the reverse direction: d[1] kept, backfill never adds d[8].
+    got = re_.filter_ats_bullet_entries("d", [1, 0, 2], "tech")
+    assert pool[1] in got and pool[8] not in got
+    assert len(got) == 3
+
+
 # ---- skills_footer: banked skills a posting names surface in the footer ----
 _SF_BASE = [
     ("Core Operations", "Custodial Cashiering & Reconciliations, Automation."),

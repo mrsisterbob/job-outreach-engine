@@ -90,10 +90,14 @@
     },
     "Monitored Salesforce service queues to catch routing errors and eliminate miscategorized tickets.",
     "Checked licensing and training records for 600+ partner RIAs across 20 insurance carriers.",
-    "Tracked onboarding throughput across a $2.5B AUM advisor platform in Wealthscape and the Schwab client portal to locate where files stalled.",
+    {
+      "text": "Tracked onboarding throughput across a $2.5B AUM advisor platform in Wealthscape and the Schwab client portal to locate where files stalled.",
+      "same_claim_as": 3
+    },
     {
       "text": "Matched recurring 401(k) and healthcare deduction records across 500+ accounts in Excel with VLOOKUPs and basic formulas.",
       "source_job": 3,
+      "same_claim_as": 1,
       "replaces": 0
     },
     "Processed cashiering, ACAT transfers, and account upkeep across Schwab Advisor Center and Fidelity Wealthscape.",
@@ -121,7 +125,10 @@
     "Coordinated with custodians directly to move transfer paperwork along instead of waiting for a queue to clear itself.",
     "Gave every onboarding documentation hold-up an owner and a next step, tracked with the partner firm until it closed.",
     "Ran the licensing and training checks for 600+ partner RIAs across 20 insurance carriers on a recurring cycle.",
-    "Established escalation paths for custodial account transfers, cutting request turnaround time by 25%.",
+    {
+      "text": "Established escalation paths for custodial account transfers, cutting request turnaround time by 25%.",
+      "same_claim_as": 4
+    },
     "Owned the offboarding cutover on active client files so agreements and custodial records agreed before the handoff."
   ],
   "track_f_operations_logistics": [
@@ -137,7 +144,10 @@
     "Monitored Salesforce service queues to catch routing errors, so a miscategorized request did not quietly sit unworked.",
     "Trained incoming operations analysts on DocuSign and Salesforce, shortening onboarding ramp from 3 weeks to 10 days.",
     "Documented the service desk workflow step by step so every person on the queue handled it the same way.",
-    "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
+    {
+      "text": "Standardized custodial transfer checklists, cutting rejected paperwork resubmissions by 40%.",
+      "same_claim_as": 5
+    },
     "Moved, renamed, and organized 2,000+ legacy account records by hand from Google Drive into Salesforce.",
     "Tracked onboarding throughput across the platform to find the stages where files were actually stalling rather than guessing."
   ],
