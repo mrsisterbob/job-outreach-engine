@@ -431,6 +431,36 @@
         "status": "hedged",
         "where": "marketing class",
         "fact": "The marketing class produced a presentation, with no campaign analysis. Do not cite it as analytics experience."
+      },
+      {
+        "status": "confirmed",
+        "where": "ABC Technologies",
+        "fact": "ABC is an automotive manufacturer (Kevin, 2026-10-19). He worked 40 hours a week there."
+      },
+      {
+        "status": "confirmed",
+        "where": "Signal Advisors",
+        "fact": "Kept the document ledger coworkers relied on to confirm each household's paperwork was on file. Systems: Salesforce, DocuSign, Orion. Dictated: recheck the 'about 20 people see it, two rely heavily' counts before using numbers."
+      },
+      {
+        "status": "confirmed",
+        "where": "40 Acres",
+        "fact": "Advised the CEO and directors by explaining SEC Form D and Reg CF requirements to them."
+      },
+      {
+        "status": "verified",
+        "where": "Document Automation Pipeline",
+        "fact": "response_schema.py: strict Pydantic schema on the Gemini screener JSON (score 0-100, tone_mode Literal, template ids bounded); Gemini returns routing keys only, never prose. API keys come from environment variables and .env is gitignored. WAL set at main.py:861."
+      },
+      {
+        "status": "confirmed",
+        "where": "self-study",
+        "fact": "Booked Microsoft Azure AI Fundamentals (AI-901, $99, Pearson VUE, booked 2026-08-07; exam date not recorded) and bought two AWS foundational vouchers (Cloud Practitioner and AI Practitioner, $100 each). Kevin's stated plan on 2026-10-19: AI-901 expected Q4 2026, both AWS exams expected Spring 2027. None passed yet."
+      },
+      {
+        "status": "confirmed",
+        "where": "eligibility",
+        "fact": "US citizen. No clearance held or investigated. Possible future National Guard service: keep off the page."
       }
     ]
   }
