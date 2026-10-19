@@ -376,7 +376,9 @@ def _render_education_credentials_block(evidence: dict) -> str:
 
     return "\n".join(lines)
 
-SIDE_PROJECT_BULLET_CAP = {"d": 0}  # bullets per side project by track (default 1); d stays 0: TASK-66 measured header+1 bullet = 2 pages on d [1,4,8,10], so d prints no side-project block
+SIDE_PROJECT_BULLET_CAP = {}  # bullets per side project by track (default 1). History: TASK-66 measured Budget tracker header+1 bullet = 2 pages on d [1,4,8,10]; TASK-74 re-measured d with the Power BI dashboard (header + a 2-line bullet) between the engine projects
+SIDE_PROJECT_LABEL_TRACKS = {"d"}  # tracks whose side-project header prints "| <status label>"
+SIDE_PROJECT_ABOVE_LAST_TRACKS = {"d"}  # side projects print above the last engine project (Market Breakout) instead of after all of them
 SIDE_PROJECT_BULLET_DEFAULT = 1  # one-page budget, measured per track in the TASK-56 log
 SIDE_PROJECT_LIMIT = 1
 
@@ -389,7 +391,10 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative", trac
     lines = []
     tone_key = str(tone_mode or "conservative").lower()
     projects = evidence.get("projects", [])
+    side_start = None
     for idx, proj in enumerate(projects):
+        if side_start is None and str(track) in SIDE_PROJECT_ABOVE_LAST_TRACKS and idx == len(projects) - 1 and idx > 0:
+            side_start = len(lines)
         # A project name is a proper noun, so it is swapped wholesale via name_conservative rather
         # than run through apply_tone_filter() - the regex turned "Crypto Breakout Alert" into
         # "custodial systems Breakout Alert" on every conservative resume.
@@ -409,7 +414,9 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative", trac
         for b in bullets:
             clean_b = apply_tone_filter(b, tone_key, track)
             lines.append(f"- {escape_typst(clean_b)}")
-    # Side projects that fit the track print after the engine projects, same section.
+    # Side projects that fit the track print after the engine projects, same section
+    # (above the last engine project on tracks in SIDE_PROJECT_ABOVE_LAST_TRACKS).
+    side_lines = []
     for side in side_projects_for_track(evidence.get("side_projects"), track, limit=SIDE_PROJECT_LIMIT):
         tools = side.get("tools")
         has_tools = isinstance(tools, list) and bool(tools)
@@ -417,15 +424,22 @@ def _render_projects_block(evidence: dict, tone_mode: str = "conservative", trac
         side_bullets = [] if has_tools else list(side.get("bullets", []) or [])[:cap]
         if not has_tools and not side_bullets:
             continue  # a side-project header never prints without a bullet or Tools line under it
-        lines.append("#v(6.0pt)")
+        side_lines.append("#v(6.0pt)")
         status = str(side.get("status", "") or "").strip().lower()
-        right = "In progress" if status == "in progress" else ""
-        lines.append(f"*{escape_typst(side.get('name', ''))}* #h(1fr) {right}".rstrip())
+        if str(track) in SIDE_PROJECT_LABEL_TRACKS and status:
+            side_lines.append(f"*{escape_typst(side.get('name', ''))}* | {escape_typst(status[:1].upper() + status[1:])}")
+        else:
+            right = "In progress" if status == "in progress" else ""
+            side_lines.append(f"*{escape_typst(side.get('name', ''))}* #h(1fr) {right}".rstrip())
         if has_tools:
-            lines.append("Tools: " + ", ".join(escape_typst(str(t)) for t in tools))
+            side_lines.append("Tools: " + ", ".join(escape_typst(str(t)) for t in tools))
             continue
         for b in side_bullets:
-            lines.append(f"- {escape_typst(apply_tone_filter(b, tone_key, track))}")
+            side_lines.append(f"- {escape_typst(apply_tone_filter(b, tone_key, track))}")
+    if side_start is not None and side_lines:
+        lines[side_start:side_start] = side_lines
+    else:
+        lines.extend(side_lines)
     return "\n".join(lines)
 
 def _rendered_bullets(experience_block: str) -> list:

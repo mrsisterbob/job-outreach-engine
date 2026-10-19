@@ -8,7 +8,7 @@ side_projects_for_track() and prints whatever it returns.
 # (a, c, e, f, g are finance-framed or operations tracks with no room).
 # "Spotify playlist project" is deliberately in no map.
 SIDE_PROJECT_FIT = {
-    "d": ("Budget tracker", "Personal tools"),
+    "d": ("Power BI Music Streaming Dashboard", "Budget tracker", "Personal tools"),
     "b": ("Budget tracker", "Montelattice site"),
     "h": ("Montelattice site", "Dropshipping site for a friend's China-based business"),
 }
