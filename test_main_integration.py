@@ -5775,6 +5775,9 @@ def test_t_warns_when_target_queries_is_empty(monkeypatch, sourcing_filters):
     monkeypatch.setattr(m, "run_job_pipeline", lambda chat_id, top_n=2: 0)
     with m.get_db_conn() as conn:
         conn.execute("UPDATE search_filters SET value_json = '[]' WHERE key = 'target_queries'")
+        # one board keeps this the deliberate warn-and-run path; with none, /t now refuses
+        conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('ats_company_slugs', ?)",
+                     (json.dumps(["acme"]),))
         conn.commit()
     _dispatch("/t")
     assert any("target_queries is empty" in s for s in sent)
@@ -13155,3 +13158,86 @@ def test_db_health_probe_reports_boot_alert_fires_once_only_when_broken(monkeypa
     m.alert_if_db_unhealthy_at_boot()
     assert len(alerts) == 1
     assert "SQLite is unreadable" in alerts[0] and "disk I/O error" in alerts[0] and "/x/db" in alerts[0]
+
+
+# ---- a SQLite failure must never read as an empty configuration ----
+
+def test_pipeline_refuses_on_db_error(monkeypatch, sourcing_filters):
+    sent, alerts, fetched = [], [], []
+    monkeypatch.setattr(m, "_LOCAL_ALERT_SENT", {})
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
+    for name in ("fetch_single_query_jobs", "fetch_ats_jobs", "fetch_greenhouse_jobs", "fetch_lever_jobs",
+                 "fetch_ashby_jobs", "fetch_workday_jobs"):
+        monkeypatch.setattr(m, name, lambda *a, _n=name, **k: fetched.append(_n) or [])
+
+    # (1) unreadable database: /t refuses, names the error, calls no source, dispatches no cards
+    real_conn = m.get_db_conn
+
+    def _boom():
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(m, "get_db_conn", _boom)
+    _dispatch("/t")
+    text = "\n".join(sent)
+    assert "Pipeline did not run" in text and "disk I/O error" in text
+    assert "cards dispatched" not in text and "Scanning" not in text
+    assert fetched == []
+    # the scheduled / direct entry point refuses too and alerts
+    sent.clear()
+    assert m.run_job_pipeline(1, top_n=1) is None
+    assert any("Pipeline did not run" in s for s in sent) and alerts and fetched == []
+    # the background /t path (and so the scheduled one) must not post "Completed" on a refusal
+    sent.clear()
+    m._run_pipeline_and_notify(1, 2)
+    text = "\n".join(sent)
+    assert "Pipeline did not run" in text and "Completed" not in text and "cards dispatched" not in text
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+
+    # (2) readable database, nothing configured at all
+    sent.clear()
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('target_queries', '[]')")
+        conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('ats_company_slugs', '[]')")
+        conn.commit()
+    _dispatch("/t")
+    text = "\n".join(sent)
+    assert "0 target rules and 0 ATS boards" in text and "cards dispatched" not in text
+    assert fetched == []
+
+    # (3) no queries but one board: the old warning is sent and the run proceeds
+    sent.clear()
+    ran = []
+    monkeypatch.setattr(m, "run_job_pipeline", lambda chat_id, top_n=2: ran.append(top_n) or 0)
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('ats_company_slugs', ?)",
+                     (json.dumps(["acme"]),))
+        conn.commit()
+    _dispatch("/t")
+    assert any("target_queries is empty" in s for s in sent) and ran == [2]
+
+    # (4) get_filter on a failing database: default returned, one db_error alert across two calls
+    alerts.clear()
+    monkeypatch.setattr(m, "get_db_conn", _boom)
+    assert m.get_filter("target_queries", ["dflt"]) == ["dflt"]
+    assert m.get_filter("target_queries", ["dflt"]) == ["dflt"]
+    assert len(alerts) == 1 and "target_queries" in alerts[0] and "disk I/O error" in alerts[0]
+    assert m._DB_LAST_ERROR["error"] and m._DB_LAST_ERROR["at"]
+
+    # (5) enqueue_crm_payload with a failing insert: False, one alert across two calls
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+    alerts.clear()
+
+    class _FailConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(m, "get_db_conn", lambda: _FailConn())
+    assert m.enqueue_crm_payload({"action": "update_status"}) is False
+    assert m.enqueue_crm_payload({"action": "update_status"}) is False
+    assert len(alerts) == 1 and "update_status" in alerts[0] and "disk I/O error" in alerts[0]
+    monkeypatch.setattr(m, "get_db_conn", real_conn)

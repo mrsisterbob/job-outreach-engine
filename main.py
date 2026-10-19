@@ -1523,6 +1523,21 @@ def safe_list(val):
         return [v.strip() for v in val.split(",") if v.strip()]
     return []
 
+_DB_LAST_ERROR = {"at": None, "error": None}
+_LOCAL_ALERT_SENT = {}
+
+
+def local_alert_cooldown(key, cooldown_hours=1):
+    """In-process debounce (no DB): should_send_alert fails OPEN when SQLite is dead, which is
+    exactly when these alerts fire. True once per cooldown window per key."""
+    now = time.time()
+    last = _LOCAL_ALERT_SENT.get(key)
+    if last is not None and now - last < cooldown_hours * 3600:
+        return False
+    _LOCAL_ALERT_SENT[key] = now
+    return True
+
+
 def get_filter(key, default_val=None):
     try:
         with get_db_conn() as conn:
@@ -1533,6 +1548,18 @@ def get_filter(key, default_val=None):
                 return json.loads(row[0])
     except Exception as e:
         logging.error(f"Filter Read Error ({key}): {e}")
+        # Still return default_val (callers rely on it), but a failed read must not look like an
+        # empty configuration: record it and raise a debounced alert. Never raises from here.
+        try:
+            _DB_LAST_ERROR["at"] = time.time()
+            _DB_LAST_ERROR["error"] = str(e) or type(e).__name__
+            if local_alert_cooldown("db_error", 1):
+                send_health_alert(
+                    f"\U0001F534 Database read failed for filter '{key}': {_DB_LAST_ERROR['error']}. "
+                    "The default was used instead. Check /health."
+                )
+        except Exception:
+            pass
     return default_val
 
 def set_filter(key, val):
@@ -8767,6 +8794,15 @@ def enqueue_crm_payload(payload):
         return True
     except Exception as e:
         logging.error(f"CRM Outbox Enqueue Error: {e}")
+        try:
+            if local_alert_cooldown("crm_outbox_enqueue_failed", 1):
+                action = payload.get("action") if isinstance(payload, dict) else None
+                send_health_alert(
+                    f"\U0001F534 A Sheets write was NOT queued (action: {action or 'unknown'}): {e}. "
+                    "It is lost unless redone by hand. Check /health."
+                )
+        except Exception:
+            pass
         return False
 
 def _crm_outbox_giveup_alert_text(payload):
@@ -12151,6 +12187,34 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
     return (True, "")
 
 
+def db_is_readable():
+    """(ok, error) from db_health_probe(); never raises."""
+    probe = db_health_probe()
+    return bool(probe.get("ok")), probe.get("error")
+
+
+def pipeline_refusal_message():
+    """Why the pipeline must not run right now, as an HTML message, or None when it may.
+
+    A failing database used to read as an empty configuration (get_filter returns its default),
+    so the pipeline scanned 0 rules and reported a clean zero. Check the database first, then
+    refuse when there is nothing at all to scan. Empty target_queries with ATS boards present is
+    deliberate and is NOT a refusal.
+    """
+    ok, error = db_is_readable()
+    if not ok:
+        return (
+            f"\U0001F534 <b>Pipeline did not run:</b> the database is unreadable ({html.escape(str(error))}). "
+            "Nothing was scanned. Check /health."
+        )
+    if not safe_list(get_filter("target_queries", [])) and not safe_list(get_filter("ats_company_slugs", [])):
+        return (
+            "\U0001F534 <b>Pipeline did not run:</b> 0 target rules and 0 ATS boards are configured. "
+            "Check System_Config."
+        )
+    return None
+
+
 def run_job_pipeline(chat_id=None, top_n=2):
     """Job search pipeline with two-stage architecture:
     Stage 1: Pre-filter candidates (JSearch multi-page + ATS direct-source, strict filters)
@@ -12158,6 +12222,14 @@ def run_job_pipeline(chat_id=None, top_n=2):
     Tiered delivery: Tier-1 (score>=80, top 5) get full interactive cards; Tier-2 (65-79) get a bundled digest.
     """
     logging.info(">>> Starting Job Search Pipeline...")
+    refusal = pipeline_refusal_message()
+    if refusal:
+        logging.error(f"Pipeline refused: {refusal}")
+        if chat_id:
+            send_telegram_message(chat_id, refusal)
+        if local_alert_cooldown("pipeline_refused", 1):
+            send_health_alert(re.sub(r"<[^>]+>", "", html.unescape(refusal)))
+        return None  # None = refused, distinct from a real run that dispatched 0
     # Pre-warm CRM caches synchronously so parallel Stage 2 evaluations never contend for the
     # Google Apps Script lock on their first cache-miss call.
     get_applied_crm_companies()
@@ -12550,6 +12622,10 @@ def process_webhook_payload_async(data):
         if re.match(r"^/t(?:\s+(\d+))?$", text):
             m = re.match(r"^/t(?:\s+(\d+))?$", text)
             qty = safe_int(m.group(1), 2)
+            refusal = pipeline_refusal_message()
+            if refusal:
+                send_telegram_message(chat_id, refusal)
+                return
             target_queries = safe_list(get_filter("target_queries", []))
             ats_slugs = safe_list(get_filter("ats_company_slugs", []))
             if not target_queries:
@@ -12567,7 +12643,8 @@ def process_webhook_payload_async(data):
                 f"🔍 Scanning {len(target_queries)} target rules & {len(ats_slugs)} ATS boards (with live Hope Alumni resolution)..."
             )
             count = run_job_pipeline(chat_id, top_n=qty)
-            send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
+            if count is not None:
+                send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
             return
 
         # 2b. Warm Network Radar (/w): zero-LLM, cache-only scan of warm-contact companies
@@ -14890,7 +14967,8 @@ def _run_pipeline_and_notify(chat_id, qty):
     """
     try:
         count = run_job_pipeline(chat_id, top_n=qty)
-        send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
+        if count is not None:  # None = refused; the refusal message already went out
+            send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
     except Exception as e:
         logging.error(f"/t Background Pipeline Error: {e}")
         send_telegram_message(chat_id, f"❌ Pipeline error: {html.escape(str(e)[:200])}")
@@ -16318,6 +16396,9 @@ if __name__ == "__main__":
             logging.error(f"[ONCE] Pipeline run failed: {e}", exc_info=True)
             sys.exit(1)
         # A run that dispatches nothing is a valid outcome (no new matches), not a failure.
+        if dispatched is None:
+            logging.error("[ONCE] Pipeline refused (database unreadable or nothing configured)")
+            sys.exit(1)
         logging.info(f"[ONCE] Pipeline run completed: {dispatched} cards dispatched")
         sys.exit(0)
 
