@@ -73,8 +73,8 @@ TRACK_REGISTRY = {
         "summary": "I reconcile mismatched records across systems, 500+ employee accounts in Excel and bSwift at ABC Technologies, and I built a Python pipeline that pulls job-board REST APIs into SQLite and a Google Sheets CRM.",
         "summary_plain": "I reconcile mismatched records across systems, employee accounts in Excel and bSwift at ABC Technologies, and I built a Python pipeline that pulls job-board REST APIs into SQLite and a Google Sheets CRM.",
         "skills": [
-            ("Analytics & Modeling", "SQL, Power BI, Tableau, Looker Studio, Excel."),
-            ("Systems & Data", "Power Query, Power Automate, Salesforce Reports, bSwift, Schwab Advisor Center, Python.")
+            ("BI & Reporting", "Power BI, Looker Studio, Tableau, Power Query, Power Automate, Excel (VLOOKUP), Google Sheets"),
+            ("Data", "SQL, Python, REST APIs, Google Apps Script, Salesforce Reports, bSwift")
         ],
     },
     "e": {

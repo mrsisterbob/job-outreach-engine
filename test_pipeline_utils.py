@@ -3271,7 +3271,7 @@ def test_skills_row_under_summary_for_d_h_b():
         if tr in ("d", "h", "b"):
             lines = reader.pages[0].extract_text().splitlines()
             row = [l for l in lines if "Tableau" in l]
-            assert len(row) == 1 and "Skills:" in row[0], (tr, row)
+            assert len(row) == 1 and ("BI & Reporting:" if tr == "d" else "Skills:") in row[0], (tr, row)
     assert footer_hits >= 1
 
 
@@ -3685,7 +3685,7 @@ def test_track_summaries_read_as_experience_and_looking_for():
                 continue
             block = mk[mk.index("[SUMMARY]"):mk.index("// --- PROFESSIONAL EXPERIENCE ---")]
             text = block.split("#v(2pt)\n", 1)[1].split("\n#v(", 1)[0]
-            text = text.split("\n*Skills:*")[0].replace("\\", "")
+            text = text.split("\n*Skills:*")[0].split("\n#v(3pt)")[0].replace("\\", "")
             if track == "d":
                 assert re_.escape_typst(D_SMZ_SUMMARY) in mk, (track, tone, text)
                 assert not pu.negative_language_hits(text), (track, tone, text)
@@ -3779,3 +3779,45 @@ def test_quality_floor_bank_wording():
             for r in routings:
                 pdf = re_.compile_resume_pdf("Acme", tr, r, tone)
                 assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (tr, tone, r)
+
+
+def test_d_skills_two_labeled_lines():
+    """Track d prints BI & Reporting and Data as two labeled lines between SUMMARY and
+    PROFESSIONAL EXPERIENCE, never the hedged skills, never wrapping, on one page.
+
+    The exhaustive proof (every 3- and 4-index routing, both tones) ran once outside the suite
+    (TASK-77 Log); here the longest routings by a no-render length proxy are compiled.
+    """
+    import io
+    import itertools
+    import pypdf
+    import resume_engine as re_
+    import track_registry as tr_
+
+    hedged = ("Snowflake", "Google Ads", "Meta Ads", "Marketing Metrics")
+    posting = "We use Git, Flask, Google Ads, Meta Ads, Snowflake and Marketing Metrics."
+    pool = re_.load_resume_bullets_bank()[tr_.pool_key_for("d")]
+    lens = [-(-len(re_.bullet_text(e)) // 105) for e in pool]
+    combos = [list(c) for k in (3, 4) for c in itertools.combinations(range(len(pool)), k)]
+    longest = sorted(combos, key=lambda r: -sum(lens[i] for i in r))[:12]
+    routings = [[0, 1, 2], [0, 1, 2, 3], [1, 4, 8, 10], [0, 1, 8, 13]] + longest
+    for tone in ("conservative", "tech"):
+        for jt in ("", posting):
+            mk = re_.render_typst_markup("Acme", "d", tone_mode=tone, job_text=jt)
+            i_sum = mk.index("[SUMMARY]")
+            i_exp = mk.index("[PROFESSIONAL EXPERIENCE]")
+            assert mk.count("*BI & Reporting:*") == 1 and mk.count("*Data:*") == 1, (tone, jt)
+            assert i_sum < mk.index("*BI & Reporting:*") < mk.index("*Data:*") < i_exp, (tone, jt)
+            assert "*Skills:*" not in mk and "SKILLS & SYSTEMS" not in mk, (tone, jt)
+            for h in hedged:
+                assert h not in mk, (tone, jt, h)
+        mk = re_.render_typst_markup("Acme", "d", tone_mode=tone, job_text=posting)
+        data_line = mk.split("*Data:*")[1].split(chr(10))[0]
+        assert "Git" in data_line and "Flask" in data_line, tone
+        for idx in routings:
+            pdf = re_.compile_resume_pdf("Acme", "d", idx, tone, job_text=posting)
+            reader = pypdf.PdfReader(io.BytesIO(pdf))
+            assert len(reader.pages) == 1, (tone, idx)
+            lines = reader.pages[0].extract_text().splitlines()
+            assert sum(1 for l in lines if l.startswith("BI & Reporting:")) == 1, (tone, idx)
+            assert sum(1 for l in lines if l.startswith("Data: SQL")) == 1, (tone, idx)

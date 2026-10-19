@@ -95,3 +95,26 @@ def fit_one_line(pairs, base_pairs, max_chars=105, sep=", "):
         kept.append(s)
         size += add
     return sep.join(kept)
+
+
+def fit_labeled_lines(pairs, base_pairs, max_line_chars, exclude=()):
+    """Keep each (label, desc) pair its own line, none longer than max_line_chars.
+
+    Base items are never reordered or dropped unless the line overflows; then posting-named
+    additions (not in base_pairs) are dropped last-first, never base items. `exclude` skill
+    names (case-insensitive) are removed from additions. Returns [(label, desc)].
+    """
+    def items(d):
+        return [s.strip() for s in d.split(",") if s.strip()]
+    skip = {e.lower() for e in exclude}
+    base_by_label = {l: items(d) for l, d in base_pairs}
+    out = []
+    for label, desc in pairs:
+        base = base_by_label.get(label, [])
+        keep_base = {b.lower() for b in base}
+        extra = [s for s in items(desc) if s.lower() not in keep_base and s.lower() not in skip]
+        line = base + extra
+        while extra and len(f"{label}: " + ", ".join(line)) > max_line_chars:
+            line.remove(extra.pop())
+        out.append((label, ", ".join(line)))
+    return out

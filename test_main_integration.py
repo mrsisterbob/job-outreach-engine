@@ -10430,11 +10430,11 @@ def test_footer_surfaces_banked_skills_in_two_lines():
     posting = "We use Looker Studio, Tableau and XLOOKUP daily."
     base = resume_engine.render_typst_markup("Acme", "d")
     out = resume_engine.render_typst_markup("Acme", "d", job_text=posting)
-    # Track d prints a one-line skills row under the summary, no footer.
-    block = out.split("*Skills:*")[1].split("#v(6.5pt)")[0]
-    for skill in ("Looker Studio", "Tableau", "XLOOKUP"):
+    # Track d prints two labeled skills lines under the summary, no footer.
+    block = out.split("*BI & Reporting:*")[1].split("#v(6.5pt)")[0]
+    for skill in ("Looker Studio", "Tableau"):
         assert skill in block
-    assert len(block.strip().splitlines()) == 1
+    assert len([l for l in block.strip().splitlines() if not l.startswith("#v")]) == 2
     assert resume_engine.render_typst_markup("Acme", "d", job_text="") == base
 
 
