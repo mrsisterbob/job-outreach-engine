@@ -10693,8 +10693,15 @@ def test_a_routed_bullet_never_sits_beside_the_static_it_restates():
             company = evidence["experience"][src]["company"]
             superseded = evidence["experience"][src]["bullets"][sub]
             track = pool.split("_")[1]
+
+            # Companions never form a declared same_claim_as pair with i, or i itself is dropped
+            # (d[8] beside d[1]) and this check would fail for a reason it is not about.
+            def _same_claim(a, b):
+                return any(isinstance(bullets[x], dict) and bullets[x].get("same_claim_as") == y
+                           for x, y in ((a, b), (b, a)))
+            companions = [j for j in (0, 1, 2, 3) if not _same_claim(i, j)][:2]
             blocks = _experience_blocks(
-                resume_engine.render_typst_markup("Acme", track, [i, 0, 1], "tech"))
+                resume_engine.render_typst_markup("Acme", track, [i] + companions, "tech"))
             rendered = blocks[company]
             assert resume_engine.bullet_text(entry) in rendered, f"{pool}[{i}] did not render"
             assert superseded not in rendered, f"{pool}[{i}] rendered beside the static it restates"

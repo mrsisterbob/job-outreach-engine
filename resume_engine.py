@@ -237,6 +237,9 @@ def filter_ats_bullet_entries(track: str = "a", bullet_indices: list = None, ton
     index flagged in TRACK_TONE_CONSTRAINTS for (track, tone_mode) is dropped and backfilled from
     _SAFE_FALLBACK_INDICES, so a conservative-tone resume never surfaces a Web3/crypto bullet even
     if Gemini's routed indices included one.
+    A pool entry carrying `same_claim_as: <earlier index>` restates that entry's claim: when both
+    are selected and clean, the later one is dropped with no backfill, so the result can be
+    SHORTER than the routing. Backfill for unclean entries never adds the partner of a kept entry.
     Returns the raw pool entries - a bare string, or a {"text", "source_job"} dict for a bullet
     whose claim belongs to a later employer. Only the renderer needs that; everything else calls
     filter_ats_bullets() and gets strings.
@@ -285,22 +288,28 @@ def filter_ats_bullet_entries(track: str = "a", bullet_indices: list = None, ton
         return not _is_duplicate_of_other_job(text, targets_cache[src])
 
     # A pool entry may declare same_claim_as: <index> when it says what an earlier entry already
-    # says in other words. When both are routed the later one is dropped - no backfill, since the
-    # point is a shorter page and a backfill would pull in another two-line bullet.
+    # says in other words. The drop runs on the CLEAN set, so an unclean earlier entry never takes
+    # the claim off the page with it, and it is not backfilled - the point is a shorter page, and a
+    # backfill would pull in another two-line bullet. Only unclean drops are backfilled, and the
+    # backfill never adds the partner of a kept entry.
     def _same_claim_target(i):
         entry = pool[i]
         t = entry.get("same_claim_as") if isinstance(entry, dict) else None
-        return t if isinstance(t, int) and not isinstance(t, bool) else None
+        return t if isinstance(t, int) and not isinstance(t, bool) and t != i else None
 
-    indices = [i for i in indices if _same_claim_target(i) is None or _same_claim_target(i) == i
-               or _same_claim_target(i) not in indices]
+    def _same_claim(a, b) -> bool:
+        return _same_claim_target(a) == b or _same_claim_target(b) == a
 
-    target_len = len(indices)
     kept = [i for i in indices if _is_clean(i)]
+    unclean_dropped = len(indices) - len(kept)
+    kept = [i for i in kept if _same_claim_target(i) not in kept]
+    target_len = len(kept) + unclean_dropped
     for fallback_i in range(len(pool)):
         if len(kept) >= target_len:
             break
         if fallback_i in kept or fallback_i in forbidden:
+            continue
+        if any(_same_claim(fallback_i, k) for k in kept):
             continue
         if not _is_clean(fallback_i):
             continue

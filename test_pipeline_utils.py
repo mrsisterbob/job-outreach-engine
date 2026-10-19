@@ -3233,6 +3233,39 @@ def test_d_never_prints_the_401k_claim_twice():
             assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (track, tone, idx)
 
 
+def _same_claim_mark_unclean(monkeypatch, re_, track, unclean):
+    """Makes the given pool indices fail _is_clean by flagging their text as a duplicate."""
+    import track_registry as tr_
+    pool = re_.load_resume_bullets_bank()[tr_.pool_key_for(track)]
+    bad = {re_.bullet_text(pool[i]) for i in unclean}
+    real = re_._is_duplicate_of_other_job
+    monkeypatch.setattr(re_, "_is_duplicate_of_other_job",
+                        lambda text, targets: text in bad or real(text, targets))
+    return pool
+
+
+def test_d_never_prints_the_401k_claim_twice_unclean_earlier_entry_keeps_the_later(monkeypatch):
+    # d[1] routed with d[8] but d[1] rejected as unclean: the claim must survive as d[8].
+    import resume_engine as re_
+    pool = _same_claim_mark_unclean(monkeypatch, re_, "d", {1})
+    got = re_.filter_ats_bullet_entries("d", [1, 8, 2], "tech")
+    assert pool[8] in got and pool[1] not in got
+    assert len(got) == 3
+
+
+def test_d_never_prints_the_401k_claim_twice_backfill_skips_the_partner(monkeypatch):
+    # d [0, 8, 2] with d[2] unclean: the backfill must not pull in d[1], d[8]'s same-claim partner.
+    import resume_engine as re_
+    pool = _same_claim_mark_unclean(monkeypatch, re_, "d", {2})
+    got = re_.filter_ats_bullet_entries("d", [0, 8, 2], "tech")
+    assert pool[8] in got and pool[1] not in got and pool[2] not in got
+    assert len(got) == 3
+    # And the reverse direction: d[1] kept, backfill never adds d[8].
+    got = re_.filter_ats_bullet_entries("d", [1, 0, 2], "tech")
+    assert pool[1] in got and pool[8] not in got
+    assert len(got) == 3
+
+
 # ---- skills_footer: banked skills a posting names surface in the footer ----
 _SF_BASE = [
     ("Core Operations", "Custodial Cashiering & Reconciliations, Automation."),
