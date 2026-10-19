@@ -151,6 +151,7 @@ WILDCARD_BONUS = max(0, int(os.environ.get("WILDCARD_BONUS", "2")))
 # The per-layer min(1, ...)/min(100, ...) clamps stay as a separate safety floor/ceiling. Single
 # tunable knob - raise toward 35 to loosen, drop toward 25 to force more spread.
 BONUS_STACK_CAP = 30
+from score_rules import posted_age_adjustment, is_dead_posting, AGE_DEAD_CEILING
 
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
@@ -4220,13 +4221,9 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     # it cannot parse, so handing it the dict silently scored every listing as exactly 48h old -
     # the +8 bonus fired on all of them and the >=720h penalty never once fired.
     posted_hours = parse_posted_hours(job.get("job_posted_at_datetime_utc"))
-    if posted_hours is not None:
-        if posted_hours <= 72:
-            bonus += 8
-        elif posted_hours <= 168:
-            bonus += 4
-        elif posted_hours >= 720:
-            bonus -= 8
+    # Progressive age ladder lives in score_rules.py. A dateless posting fails open to 48h and
+    # therefore earns the fresh bonus (deliberate, see parse_posted_hours).
+    bonus += posted_age_adjustment(posted_hours)
 
     if any(k in desc for k in ["high call volume", "outbound calling", "phone queue", "call center", "inbound calls", "dialer"]):
         bonus -= 20
@@ -5402,6 +5399,11 @@ def process_single_candidate(job, force=False):
         # (clamps permitting), never an inflated phantom from summing raw un-applied boosts.
         score_before_layer2 = max(1, min(100, min(100, gemini_base + min(BONUS_STACK_CAP, l1_pos)) + l1_neg))
         total_boost = score - score_before_layer2
+        # Dead-posting ceiling (30+ days old): applied AFTER the recompute so no keyword stack can
+        # lift it back over the Tier-2 floor. total_boost stays the pre-ceiling stack (never
+        # negative-nonsense); fit_score and the returned score both carry the ceilinged value.
+        if is_dead_posting(parse_posted_hours(job.get("job_posted_at_datetime_utc"))):
+            score = min(score, AGE_DEAD_CEILING)
 
         # Second write, same sheet_uuid: the fit reason, matched skills and final score are all
         # computed/adjusted below the first save, and /stage is now the only place they are shown.
