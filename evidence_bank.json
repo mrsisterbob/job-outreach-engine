@@ -200,14 +200,11 @@
     },
     "offhours": [
       {
-        "photo": "kevin-dog.jpg",
         "alt": "Kevin with his dog",
         "text": "Detroit based. I ran cross country and track at Hope, where I was an All-American. Running taught me that the consistent version of a thing beats the heroic one, and that is how the systems above got built. The dog supervises."
       },
       {
-        "photo": "kevin-beach.jpg",
         "alt": "Kevin and his girlfriend on the Detroit River",
-        "landscape": true,
         "text": "Outside of work I hike, cook, train, and travel whenever I can. Right now I am compounding the habit of using AI to build real solutions to real problems."
       }
     ],
