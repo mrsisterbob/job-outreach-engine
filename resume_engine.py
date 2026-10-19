@@ -284,6 +284,17 @@ def filter_ats_bullet_entries(track: str = "a", bullet_indices: list = None, ton
             targets_cache[src] = _duplicate_check_targets(evidence_bank, src)
         return not _is_duplicate_of_other_job(text, targets_cache[src])
 
+    # A pool entry may declare same_claim_as: <index> when it says what an earlier entry already
+    # says in other words. When both are routed the later one is dropped - no backfill, since the
+    # point is a shorter page and a backfill would pull in another two-line bullet.
+    def _same_claim_target(i):
+        entry = pool[i]
+        t = entry.get("same_claim_as") if isinstance(entry, dict) else None
+        return t if isinstance(t, int) and not isinstance(t, bool) else None
+
+    indices = [i for i in indices if _same_claim_target(i) is None or _same_claim_target(i) == i
+               or _same_claim_target(i) not in indices]
+
     target_len = len(indices)
     kept = [i for i in indices if _is_clean(i)]
     for fallback_i in range(len(pool)):
