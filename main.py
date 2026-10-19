@@ -36,6 +36,7 @@ from open_followups import collect_open_followups
 from role_funnel import compute_role_funnel
 from build_log import compose_build_log
 from pipeline_utils import (
+    is_banned_employer,
     ladder_progress, format_ladder_progress, carmen_terminal_gap,
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
@@ -4867,6 +4868,8 @@ def _passes_remote_filter(job):
 
     if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
         return False
+    if is_banned_employer(company):
+        return False
     if any(comp in company for comp in get_filter("company_exclusions", [])):
         return False
     if any(trigger in description for trigger in get_filter("hard_ban_keywords", [])):
@@ -4920,6 +4923,11 @@ AGGREGATOR_RELIST_DOMAINS = tuple(d.strip().lower() for d in os.environ.get(
 ).split(",") if d.strip())
 
 
+# Always honoured, even when the AGGREGATOR_RELIST_DOMAINS env var replaces the list above.
+# Spam hosts behind the fake UPS rows (a2zcareer.co.com is the one Kevin's CRM rows link to).
+BANNED_APPLY_DOMAINS = ("a2zcareer.co.com", "a2zcareers.com", "jobslistingtoday.com")
+
+
 def is_aggregator_relist(apply_link):
     """True when a job's apply link points at a reseller that scrapes listings it does not own.
 
@@ -4932,7 +4940,7 @@ def is_aggregator_relist(apply_link):
     host = re.sub(r"^https?://", "", link).split("/")[0].split("?")[0].split(":")[0]
     if not host:
         return False
-    return any(host == d or host.endswith("." + d) for d in AGGREGATOR_RELIST_DOMAINS)
+    return any(host == d or host.endswith("." + d) for d in AGGREGATOR_RELIST_DOMAINS + BANNED_APPLY_DOMAINS)
 
 
 def _link_host(link):
@@ -5160,6 +5168,8 @@ def passes_strict_filter(job, trace=None):
 
     if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
         return reject("title_exclusion")
+    if is_banned_employer(company):
+        return reject("banned_employer")
     if any(comp in company for comp in get_filter("company_exclusions", [])):
         return reject("company_exclusion")
     if any(trigger in description for trigger in get_filter("hard_ban_keywords", [])):
@@ -12055,6 +12065,9 @@ def ingest_manual_job(url="", title="", company="", description="", chat_id=None
             f"<code>/job Foreign Exchange Ops Analyst 2 @ Huntington National Bank {html.escape(str(url or ''))}</code>"
         ))
 
+    if is_banned_employer(final_company):
+        return (False, f"🚫 <b>{html.escape(final_company)} is on the banned-employer list.</b> Not ingested.")
+
     job = build_ingest_job_dict(final_title, final_company, final_desc, url)
 
     # A posting can scrape cleanly from an ATS mirror while the LinkedIn original is already
@@ -12429,6 +12442,8 @@ def run_warm_radar_scan(chat_id=None):
     for job in fetch_ats_jobs(slugs):
         company = job.get("employer_name") or ""
         title = job.get("job_title") or ""
+        if is_banned_employer(company):
+            continue
         job_hash = generate_dedup_hash(company, title)
         # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
         # when the role is already tracked in a job tab - never merely because /t once saw it.
