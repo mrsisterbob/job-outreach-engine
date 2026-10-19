@@ -4463,7 +4463,7 @@ def test_hybrid_score_modifier_returns_the_signed_layer1_shift(monkeypatch):
     # word, so it earns the smaller family bonus rather than the +6 entry-level one. It previously
     # scored 0 here - this test's old comment credited a "+6 Analyst entry-level title" that never
     # fired, since the entry-level branch matches "analyst i" and not a bare "analyst".
-    assert layer1_bonus == 40
+    assert layer1_bonus == 42  # 40 + the dateless 48h bucket now earns +10 (was +8)
     # 100 raw, compressed by soft_cap_score() rather than flattened at the 100 clamp.
     assert final_score == 91
 
@@ -6656,17 +6656,17 @@ def test_freshness_scoring_separates_a_fresh_posting_from_a_stale_one():
     it the whole job dict scored every listing as exactly 48h old: the +8 bonus fired on all of
     them and the >=720h -8 penalty could never fire at all.
 
-    Timestamps are built off now() so they cannot rot. Note the 26-day case lands at ~624h, which
-    is past every bonus but short of the 720h penalty line - the -8 branch needs a 31-day posting.
+    Timestamps are built off now() so they cannot rot. The 26-day case lands at ~624h: stale (-6)
+    but short of the 720h dead line - the -25 branch needs a 31-day posting.
     """
     fresh = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
     stale = (datetime.now(timezone.utc) - timedelta(days=26)).isoformat()
     ancient = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
 
     assert m.parse_posted_hours(fresh) != m.parse_posted_hours(stale)
-    assert m.parse_posted_hours(fresh) <= 72        # +8 branch
-    assert 168 < m.parse_posted_hours(stale) < 720  # no freshness modifier at all
-    assert m.parse_posted_hours(ancient) >= 720     # -8 branch
+    assert m.parse_posted_hours(fresh) <= 48        # +10 branch
+    assert 336 <= m.parse_posted_hours(stale) < 720  # -6 branch
+    assert m.parse_posted_hours(ancient) >= 720     # -25 branch
 
     def bonus_for(posted):
         _, layer1_bonus = m.calculate_hybrid_score_modifier(
@@ -6674,8 +6674,8 @@ def test_freshness_scoring_separates_a_fresh_posting_from_a_stale_one():
         return layer1_bonus
 
     # Freshness is the only thing differing between these jobs, so the gaps are the branch deltas.
-    assert bonus_for(fresh) - bonus_for(stale) == 8       # +8 against nothing
-    assert bonus_for(fresh) - bonus_for(ancient) == 16    # +8 against -8
+    assert bonus_for(fresh) - bonus_for(stale) == 16      # +10 against -6
+    assert bonus_for(fresh) - bonus_for(ancient) == 35    # +10 against -25
 
 
 def test_freshness_scoring_fails_open_to_48_hours_without_a_timestamp():
@@ -6690,10 +6690,50 @@ def test_freshness_scoring_fails_open_to_48_hours_without_a_timestamp():
         return layer1_bonus
 
     fresh_bonus = bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=fresh))
-    # 48 lands in the <=72 bucket, so a dateless posting keeps the same +8 a fresh one earns.
+    # 48 lands in the <=48 bucket, so a dateless posting keeps the same +10 a fresh one earns.
     assert bonus_for(dict(_FRESHNESS_BASE_JOB)) == fresh_bonus                                 # key absent
     assert bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc="")) == fresh_bonus  # blank
     assert bonus_for(dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=None)) == fresh_bonus
+
+
+def test_score_age_ladder_steps_and_ordering():
+    now = datetime.now(timezone.utc)
+
+    def l1(days=None, hours=None):
+        posted = (now - timedelta(days=days or 0, hours=hours or 0)).isoformat()
+        return m.calculate_hybrid_score_modifier(
+            dict(_FRESHNESS_BASE_JOB, job_posted_at_datetime_utc=posted), 70)[1]
+
+    ages = [l1(hours=5), l1(days=3), l1(days=8), l1(days=12), l1(days=20), l1(days=31)]
+    assert all(a >= b for a, b in zip(ages, ages[1:]))
+    base = ages[3]  # 12d: the 0 bucket
+    assert [a - base for a in ages] == [10, 7, 2, 0, -6, -25]
+    assert ages[0] - base == 10
+    assert base - ages[4] == 6
+    # dateless == 48h bucket
+    assert m.calculate_hybrid_score_modifier(dict(_FRESHNESS_BASE_JOB), 70)[1] == l1(hours=48 - 1) == ages[0]
+    # future-dated feed counts as fresh
+    assert l1(days=-3) == ages[0]
+
+
+def test_score_age_ladder_caps_a_dead_posting_below_tier_two(run_candidate):
+    now = datetime.now(timezone.utc)
+    maxed = {
+        "job_title": "Senior Operations Analyst", "job_city": "troy",
+        "job_description": "python sql automation reconciliation reporting salesforce excel workflow",
+        "job_min_salary": 90000, "job_max_salary": 110000,
+    }
+
+    def run(days):
+        job = dict(maxed, job_posted_at_datetime_utc=(now - timedelta(days=days)).isoformat())
+        _, l1 = m.calculate_hybrid_score_modifier(dict(job), 95)
+        return run_candidate(gemini_base=95, layer1_bonus=l1, **job)
+
+    dead = run(31)
+    assert dead["score"] <= 64
+    assert dead["job"]["fit_score"] == dead["score"]
+    assert dead["score_boost"] >= 0
+    assert run(2)["score"] >= 80
 
 
 # ---- /dead decoy marking + /decoys report ----
