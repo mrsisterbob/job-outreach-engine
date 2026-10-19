@@ -220,10 +220,11 @@
       "start": "07/2026",
       "end": "Present",
       "bullets": [
-        "Built a Telegram-triggered Python pipeline that pulls postings from job-board REST APIs, scores them through a deterministic Gemini layer and drafts the tailored PDF and Gmail follow-up.",
+        "Built a Python pipeline that pulls postings from job-board REST API data feeds, normalizes each into a common record format and loads it into a SQLite database and a Google Sheets CRM.",
+        "Scored each posting through a deterministic Gemini layer and drafted the tailored PDF and Gmail follow-up from a Telegram command.",
         "Wrote 1,100+ lines of Google Apps Script that run a Google Sheets CRM, auto-populating and routing every record as the pipeline updates it.",
         "Scheduled nightly Python jobs that check every tracked posting for a dead link and queue each day's follow-up emails.",
-        "Wired live build statistics into montelattice.com, a self-updating portfolio site hosted at no cost.",
+        "Built first-party visitor analytics for montelattice.com: each pageview is bot-filtered, given a daily hashed visitor ID, tagged with its referrer host and stored in SQLite, then summarized in a daily Telegram report.",
         "Uses SQL through Python's sqlite3 module to read and write a SQLite job database."
       ]
     },
