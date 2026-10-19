@@ -3698,7 +3698,7 @@ def test_quality_floor_bank_wording():
                "500+ employee accounts, then corrected each in bSwift until every ledger agreed.")
     proj_new = [
         "Built a Python pipeline that pulls postings from job-board REST API data feeds, normalizes each into a common record format and loads it into a SQLite database and a Google Sheets CRM.",
-        "Scored each posting through a deterministic Gemini layer and drafted the tailored PDF and Gmail follow-up from a Telegram command.",
+        "Scored each posting with a deterministic Gemini layer; a Telegram command drafts the PDF and Gmail follow-up.",
     ]
     site_new = ("Built first-party visitor analytics for montelattice.com: each pageview is bot-filtered, given a daily "
                 "hashed visitor ID, tagged with its referrer host and stored in SQLite, then summarized in a daily Telegram report.")
@@ -3720,6 +3720,8 @@ def test_quality_floor_bank_wording():
             routings = [[0, 1, 2], [0, 1, 2, 3]]
             combos = sorted(itertools.combinations(range(len(pool)), 4), key=lambda c: -sum(lens[k] for k in c))
             routings += [list(c) for c in combos[:8]]
+            if tr == "d":
+                routings += [[1, 4, 8], [3, 7, 13, 14]]
             for r in routings:
                 pdf = re_.compile_resume_pdf("Acme", tr, r, tone)
                 assert len(pypdf.PdfReader(io.BytesIO(pdf)).pages) == 1, (tr, tone, r)
