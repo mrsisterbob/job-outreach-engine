@@ -8801,20 +8801,35 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on
 
 def enqueue_crm_payload(payload):
     """Enqueues an outbound Sheets write to local SQLite atomically (durable outbox pattern)."""
+    return enqueue_crm_payloads([payload])
+
+def enqueue_crm_payloads(payloads):
+    """Enqueue several outbound Sheets writes in ONE transaction: every row in order, or none.
+
+    Returns True only after the commit. A swipe that needs several writes (move + status +
+    follow-up date) must not leave half of them queued when one insert fails.
+    """
+    payloads = list(payloads)
     try:
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO crm_outbox (payload_json, status) VALUES (?, 'PENDING')",
-                (json.dumps(payload),)
-            )
-            conn.commit()
+            try:
+                for payload in payloads:
+                    conn.execute(
+                        "INSERT INTO crm_outbox (payload_json, status) VALUES (?, 'PENDING')",
+                        (json.dumps(payload),)
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return True
     except Exception as e:
         logging.error(f"CRM Outbox Enqueue Error: {e}")
         try:
             if local_alert_cooldown("crm_outbox_enqueue_failed", 1):
-                action = payload.get("action") if isinstance(payload, dict) else None
+                actions = [p.get("action") for p in payloads if isinstance(p, dict) and p.get("action")]
+                action = ", ".join(actions) if actions else None
                 send_health_alert(
                     f"\U0001F534 A Sheets write was NOT queued (action: {action or 'unknown'}): {e}. "
                     "It is lost unless redone by hand. Check /health."
@@ -8895,6 +8910,21 @@ def process_crm_outbox_batch(inter_job_sleep=1.0):
                 f"secret rejected, retrying in {_CRM_AUTH_BACKOFF_SECONDS}s without spending retries"
             )
             _CRM_AUTH_BACKOFF["until"] = time.time() + _CRM_AUTH_BACKOFF_SECONDS
+            # A held outbox is otherwise silent: the bot already said "Moved" and the writes sit
+            # PENDING until the secret is fixed. Alert once per outage (6h debounce in SQLite).
+            try:
+                if should_send_alert("crm_outbox_auth_hold", cooldown_hours=6):
+                    with get_db_conn() as conn:
+                        held = conn.execute(
+                            "SELECT COUNT(*) FROM crm_outbox WHERE status = 'PENDING'"
+                        ).fetchone()[0]
+                    send_health_alert(
+                        f"\U0001F510 CRM secret rejected: {held} queued Sheets write(s) are on hold "
+                        "(moves, statuses, follow-up dates). They will land in order once the "
+                        "Apps Script secret is fixed. Check /health."
+                    )
+            except Exception as e:
+                logging.error(f"CRM auth-hold alert failed: {e}")
             return
         except PermanentCRMRejection as e:
             # Impossible to satisfy by retrying (e.g. the row's sheet_uuid is not in any tab), so
@@ -14502,23 +14532,36 @@ def process_webhook_payload_async(data):
             if starts_ladder:
                 confirm_text += " · Applied (follow-up ladder started)"
 
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
-            send_telegram_message(chat_id, confirm_text)
-            # Auto-ATS Expansion: Carmen-family contacts (Cold or Warm) get monitored for future /t job runs
-            if new_tab.startswith("Carmen") and mapping.get("contact_company"):
-                threading.Thread(target=auto_expand_ats_slug, args=(mapping["contact_company"],), daemon=True).start()
-            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
+            payloads = [build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab)]
             if starts_ladder:
                 # Queued AFTER the move so the row is in its destination tab when the Status write
                 # lands; set_status finds the row by sheet_uuid in whatever tab it now lives in.
-                enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status="Applied"))
+                payloads.append(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status="Applied"))
                 # Re-anchor the follow-up date onto the ladder. Cards are created with a
                 # priority-derived date (calculate_followup_interval(5) = +19d), and
                 # followup_action() hard-skips any row whose Next Followup Date is still in the
                 # future - so without this the row would sit Applied and silently overdue-free for
                 # another two weeks. FOLLOWUP_1_DAYS from today puts it on rung 1.
                 ladder_start = (datetime.now() + timedelta(days=FOLLOWUP_1_DAYS)).strftime("%Y-%m-%d")
-                enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=ladder_start))
+                payloads.append(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=ladder_start))
+
+            # Confirm only once every write is durably queued, all together or none (TASK-91). On
+            # 2026-10-19 a /warm said "Moved" while the row stayed in Tetiana Cold: the old code
+            # confirmed first and ignored a False from the enqueue. The enqueue is a local SQLite
+            # insert (milliseconds), so confirming after it keeps the instant feel.
+            if not enqueue_crm_payloads(payloads):
+                failed_company = mapping.get("contact_company") or "this row"
+                logging.error(f"{text} swipe NOT queued: {sheet_uuid} -> {new_tab} ({failed_company})")
+                send_telegram_message(
+                    chat_id,
+                    f"⚠️ Couldn't queue the move to {html.escape(new_tab)} for "
+                    f"{html.escape(str(failed_company))}. Nothing changed; swipe again.")
+                return
+            send_telegram_message(chat_id, confirm_text)
+            # Auto-ATS Expansion: Carmen-family contacts (Cold or Warm) get monitored for future /t job runs
+            if new_tab.startswith("Carmen") and mapping.get("contact_company"):
+                threading.Thread(target=auto_expand_ats_slug, args=(mapping["contact_company"],), daemon=True).start()
+            if starts_ladder:
                 log_metric_event("applied", sheet_uuid)
                 log_daily_activity("applied_count")
                 company = mapping.get("contact_company")
