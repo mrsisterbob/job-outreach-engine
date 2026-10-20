@@ -44,10 +44,11 @@ def main():
         return
 
     cwd = tree_under_test(payload.get("cwd"))
+    python = suite_python(cwd)
 
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", *SUITES, "-q", "--no-header",
+            [python, "-m", "pytest", *SUITES, "-q", "--no-header",
              "-p", "no:cacheprovider"],
             cwd=cwd,
             capture_output=True,
@@ -64,7 +65,7 @@ def main():
         return
 
     if result.returncode == 0:
-        refresh_function_index(cwd)
+        refresh_function_index(cwd, python)
         return
 
     tail = failure_summary(result.stdout or result.stderr or "")
@@ -72,10 +73,48 @@ def main():
         "The test suites are RED, so this turn is not done.\n\n"
         f"{tail}\n\n"
         "Fix the failures and run "
-        "`python -m pytest test_main_integration.py test_pipeline_utils.py -q` again. "
+        f"`{python} -m pytest test_main_integration.py test_pipeline_utils.py -q` again. "
         "If the change is genuinely correct and the test encodes the old behavior, say so "
         "explicitly and explain why - do not delete or skip a test to get to green."
     )
+
+
+def venv_python_launches(candidate, timeout=20):
+    """True when `candidate` starts and can import pytest.
+
+    A .venv python can exist on disk and still be unusable (its base interpreter was
+    removed or updated, or pytest was never installed in it). Using it would turn every
+    session's Stop hook red, so suite_python probes before trusting one.
+    """
+    try:
+        return subprocess.run(
+            [candidate, "-c", "import pytest"],
+            capture_output=True, timeout=timeout,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
+def suite_python(tree, hook_file=__file__, launches=venv_python_launches):
+    """The interpreter the suites should run under.
+
+    `sys.executable` is whichever `python` is first on PATH when Claude Code launches the
+    hook (the WindowsApps system Python), not the repo's `.venv`. That split already cost a
+    red hook: a test passed under `.venv` and failed under the system Python. Prefer the
+    tree's own `.venv`, then the `.venv` of the repo this hook file lives in (a
+    `.worktrees/TASK-n` tree carries none), else `sys.executable` as before. A candidate
+    that exists but fails `launches(candidate)` is skipped, never returned.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(hook_file))))
+    for root in (tree, repo):
+        if not root:
+            continue
+        for rel in (os.path.join(".venv", "Scripts", "python.exe"),
+                    os.path.join(".venv", "bin", "python")):
+            candidate = os.path.join(root, rel)
+            if os.path.isfile(candidate) and launches(candidate):
+                return candidate
+    return sys.executable
 
 
 def tree_under_test(session_cwd):
@@ -106,7 +145,7 @@ def tree_under_test(session_cwd):
     return fallback
 
 
-def refresh_function_index(cwd):
+def refresh_function_index(cwd, python=None):
     """Rewrite FUNCTION_INDEX.md when a turn changed what is in it.
 
     The index is what CLAUDE.md's anti-duplication rule reads: before writing a helper you
@@ -133,7 +172,7 @@ def refresh_function_index(cwd):
             return
 
         subprocess.run(
-            [sys.executable, "build_function_index.py"],
+            [python or suite_python(cwd), "build_function_index.py"],
             cwd=cwd, capture_output=True, text=True, timeout=60,
         )
     except Exception:
