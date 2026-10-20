@@ -13174,10 +13174,13 @@ def test_init_db_failure_survives(monkeypatch, tmp_path):
     import subprocess
     import sys as _sys
     # (1) real import with an unopenable database path: exits 0 and records the error
-    env = dict(os.environ, JOBS_DB_PATH=str(tmp_path), PYTEST_CURRENT_TEST="x")
+    # The child inherits the parent's module search path so it resolves the same
+    # packages (user site-packages included) whichever interpreter runs the suite.
+    env = dict(os.environ, JOBS_DB_PATH=str(tmp_path), PYTEST_CURRENT_TEST="x",
+               PYTHONPATH=os.pathsep.join(p for p in _sys.path if p))
     repo = os.path.dirname(os.path.abspath(m.__file__))
     t0 = time.time()
-    r = subprocess.run([_sys.executable, "-I", "-c", "import sys; sys.path.insert(0, %r); import main; print(main._DB_INIT_ERROR['error'])" % repo],
+    r = subprocess.run([_sys.executable, "-c", "import sys; sys.path.insert(0, %r); import main; print(main._DB_INIT_ERROR['error'])" % repo],
                        cwd=repo, env=env, capture_output=True, text=True, timeout=120)
     print("subprocess wall time: %.2fs" % (time.time() - t0))
     assert r.returncode == 0, r.stderr[-2000:]
