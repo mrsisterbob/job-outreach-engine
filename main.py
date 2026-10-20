@@ -15119,10 +15119,28 @@ def _is_oneshot_invocation():
     """
     return "--once" in sys.argv[1:]
 
-# Background daemons belong to the long-lived Flask server only. Two exclusions, both at import
-# time: pytest (must never poll Gmail or write to the live CRM) and --once (a one-shot batch run -
-# these threads would keep the process alive past the pipeline and could write to the CRM mid-run).
-if not os.environ.get("PYTEST_CURRENT_TEST") and not _is_oneshot_invocation():
+# Background daemons belong to the long-lived Flask server only. Three exclusions, all read at import
+# time: JOB_ENGINE_NO_DAEMONS (the explicit opt-out both test files set before `import main`; pytest
+# sets PYTEST_CURRENT_TEST only while a test RUNS, not at collection where the test modules import
+# main, so that variable alone never kept the daemons off), PYTEST_CURRENT_TEST (kept as a second
+# net), and --once (a one-shot batch run - these threads would keep the process alive past the
+# pipeline and could write to the CRM mid-run).
+def _daemons_opted_out():
+    """True when JOB_ENGINE_NO_DAEMONS is set to an affirmative value (1/true/yes/on).
+
+    Parsed like EMAIL_POLL_ENABLED: only an explicit yes disables. "0", "false", "no", "off", ""
+    and unset all leave the daemons on, so a stray JOB_ENGINE_NO_DAEMONS=0 in the Render dashboard
+    cannot silently turn off every production daemon.
+    """
+    return os.environ.get("JOB_ENGINE_NO_DAEMONS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+if _daemons_opted_out():
+    logging.info("[DAEMONS] JOB_ENGINE_NO_DAEMONS is set: background daemons NOT started in this process.")
+
+if (not _daemons_opted_out()
+        and not os.environ.get("PYTEST_CURRENT_TEST")
+        and not _is_oneshot_invocation()):
     try:
         alert_if_db_unhealthy_at_boot()
     except Exception:
