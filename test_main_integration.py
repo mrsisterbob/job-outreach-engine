@@ -13988,3 +13988,34 @@ def test_swipe_move_readback_a_malformed_cached_job_does_not_abort_the_warm_swip
     assert "add_company_cooldown" in side and "upsert_company_identity" in side, side
     assert len(_outbox_payloads()) == 3
     assert len(armed) == 1, "the check is still armed (company from the mapping), just without a role"
+
+
+def test_off_direction_title_gate_both_filters(monkeypatch):
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000, "valid_cities": ["farmington", "detroit"],
+        "title_exclusions": [], "company_exclusions": [],
+        "hard_ban_keywords": [], "seniority_exclusions": [],
+    }.get(key, default if default is not None else []))
+    strict = {
+        "employer_name": "Northwind Co", "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL and reporting.",
+        "job_city": "Farmington Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1",
+    }
+    remote = _remote_job()
+    assert m.passes_strict_filter(strict) is True
+    assert m._passes_remote_filter(remote) is True
+    for title in ("Onsite IT Administrator: Cloud, Salesforce & Security",
+                  "Data Center Operations Specialist", "Help-Desk Technician"):
+        trace = m.FunnelTrace()
+        assert m.passes_strict_filter({**strict, "job_title": title}, trace=trace) is False, title
+        assert trace.reasons.get("off_direction_title") == 1, (title, trace.reasons)
+        assert m._passes_remote_filter({**remote, "job_title": title}) is False, title
+    for title in ("Business Systems Analyst", "Data Analyst", "Salesforce Administrator",
+                  "IT Business Analyst", "Data Engineer", "IT Operations Analyst",
+                  "Business Systems Administrator", "Data Center Finance Analyst"):
+        assert m.passes_strict_filter({**strict, "job_title": title}) is True, title
+        assert m._passes_remote_filter({**remote, "job_title": title}) is True, title
