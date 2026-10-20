@@ -564,6 +564,20 @@ grep -i "contact" FUNCTION_INDEX.md
 | 2902 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
 | 2948 | `is_banned_employer` | True when the employer name matches a BANNED_EMPLOYER_PATTERNS whole-word regex. |
 
+## `queue_baseline.py` — 9 defs, 224 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 47 | `_git` | stdout bytes of a git command, or None when it failed (any failure means "cannot prove"). |
+| 58 | `tree_id` | Hash of HEAD's tracked tree (paths, modes, blob ids) minus FUNCTION_INDEX.md, or None. |
+| 79 | `_python_identity` | (version, interpreter path): the suites also depend on which Python and venv ran them. |
+| 84 | `default_marker_path` | The marker lives in the git dir: git never lists it, so it cannot dirty the folder. |
+| 97 | `_folder_state` | (ok, reason): the working tree is clean and the branch is main. |
+| 110 | `record_green` | Record that `main`'s tree passed both suites. True only when a marker was written. |
+| 143 | `_remove` | _(no docstring)_ |
+| 150 | `baseline_needed` | (needed, reason). False only when EVERY skip condition holds; any doubt is True. |
+| 188 | `main` | _(no docstring)_ |
+
 ## `render_gate.py` — 1 defs, 21 lines
 
 | Line | Name | Summary |
@@ -717,4 +731,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**603 definitions across 19 files + Code.gs.**
+**612 definitions across 20 files + Code.gs.**
