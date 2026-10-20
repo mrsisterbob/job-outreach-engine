@@ -3668,6 +3668,128 @@ def test_warm_swipe_atomic_enqueue_auth_hold_alerts_once(monkeypatch):
         rows = conn.execute("SELECT retry_count, status FROM crm_outbox ORDER BY id").fetchall()
     assert rows == [(0, "PENDING"), (0, "PENDING")]
 
+# --- TASK-92: swipe move read-back ------------------------------------------------------------
+
+def _readback_env(monkeypatch, tab_rows=None, ok=True, raises=False):
+    """verify_swipe_move with a recorded Telegram, a stubbed tab read and a REAL outbox."""
+    sent, reads = [], []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
+
+    def _fetch(code, qty=2):
+        reads.append((code, qty))
+        if raises:
+            raise RuntimeError("sheet exploded")
+        return (tab_rows or []), ok
+    monkeypatch.setattr(m, "fetch_networking_cards_checked", _fetch)
+    return sent, reads
+
+
+def test_swipe_move_readback_silent_when_the_row_is_in_the_destination_tab(monkeypatch):
+    sent, reads = _readback_env(monkeypatch, tab_rows=[{"sheet_uuid": "other"}, {"sheet_uuid": "uuid-hn"}])
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash", "Procurement Operations Specialist") == "landed"
+    assert sent == []
+    assert reads == [("TW", None)], "the destination tab is read once, in full"
+
+
+def test_swipe_move_readback_reports_a_row_missing_from_the_destination(monkeypatch):
+    sent, _ = _readback_env(monkeypatch, tab_rows=[{"sheet_uuid": "someone-else"}])
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash", "Procurement Operations Specialist") == "missing"
+    assert len(sent) == 1, sent
+    assert "Harvey Nash" in sent[0] and "NOT in Tetiana Warm" in sent[0] and "move the row by hand" in sent[0]
+
+
+def test_swipe_move_readback_pending_outbox_row_is_reported_without_reading_the_tab(monkeypatch):
+    sent, reads = _readback_env(monkeypatch)
+    m.enqueue_crm_payloads([{"action": "update_status", "sheet_uuid": "uuid-hn", "new_tab": "Tetiana Warm"},
+                            {"action": "set_status", "sheet_uuid": "uuid-hn", "status": "Applied"}])
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE crm_outbox SET retry_count = 4 WHERE id = (SELECT MIN(id) FROM crm_outbox)")
+        conn.commit()
+    # A different row's queued write must not be mistaken for this move.
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "uuid-other", "new_tab": "Tetiana Cold"})
+
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash", "Buyer", recheck_seconds=0) == "outbox_stuck"
+    assert reads == [], "a move still in the outbox needs no tab read"
+    assert len(sent) == 1, "the recheck must not repeat the message"
+    assert "Harvey Nash" in sent[0] and "still not written" in sent[0] and "Tetiana Warm" in sent[0]
+    assert "1 queued, retry 4/10" in sent[0], sent[0]
+
+
+def test_swipe_move_readback_outbox_that_drains_during_the_recheck_falls_through_to_the_tab(monkeypatch):
+    sent, reads = _readback_env(monkeypatch, tab_rows=[{"sheet_uuid": "uuid-hn"}])
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "uuid-hn", "new_tab": "Tetiana Warm"})
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE crm_outbox SET retry_count = 2")
+        conn.commit()
+
+    def _drain(seconds):
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM crm_outbox")
+            conn.commit()
+    monkeypatch.setattr(m.time, "sleep", _drain)
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash", recheck_seconds=300) == "landed"
+    assert len(sent) == 2 and "still not written" in sent[0], sent
+    assert "Harvey Nash" in sent[1] and "landed after all" in sent[1], sent
+    assert reads == [("TW", None)]
+
+
+def test_swipe_move_readback_failed_read_says_it_could_not_verify(monkeypatch):
+    sent, reads = _readback_env(monkeypatch, ok=False)
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash", "Buyer",
+                               read_retry_seconds=0) == "read_failed"
+    assert len(reads) == 2, "a failed read is retried exactly once before alerting"
+    assert sent == ["⚠️ Couldn't verify the move for Harvey Nash - Buyer (CRM read failed)."], sent
+
+
+def test_swipe_move_readback_a_raising_read_never_escapes(monkeypatch):
+    sent, _ = _readback_env(monkeypatch, raises=True)
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash", read_retry_seconds=0) == "error"
+    assert len(sent) == 1 and "Couldn't verify" in sent[0]
+    # A Telegram failure on top of it must not escape either.
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("tg down")))
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash", read_retry_seconds=0) == "error"
+
+
+def test_swipe_move_readback_swipe_arms_a_120s_daemon_timer_after_the_enqueue(monkeypatch):
+    """Drives the real /warm branch; the timer class is captured, so nothing actually fires."""
+    sent, side = _warm_swipe_env(monkeypatch)
+    armed = []
+
+    class _FakeTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.interval, self.function, self.args, self.daemon = interval, function, tuple(args or ()), False
+            self.kwargs = dict(kwargs or {})
+            armed.append(self)
+
+        def start(self):
+            self.started = True
+    monkeypatch.setattr(m.threading, "Timer", _FakeTimer)
+    monkeypatch.setattr(m, "_daemons_opted_out", lambda: False)
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid",
+                        lambda u: {"employer_name": "Harvey Nash", "job_title": "Procurement Operations Specialist"})
+
+    _dispatch("/warm")
+
+    assert len(armed) == 1 and armed[0].started and armed[0].daemon
+    assert armed[0].interval == 120
+    assert armed[0].function is m.verify_swipe_move
+    assert armed[0].args == ("uuid-hn", "Tetiana Warm", "Harvey Nash", "Procurement Operations Specialist")
+    assert armed[0].kwargs["after_outbox_id"] == 0, "the high-water mark is taken BEFORE the enqueue"
+    assert armed[0].kwargs["token"] == m._SWIPE_VERIFY_LATEST["uuid-hn"]
+    assert len(_outbox_payloads()) == 3, "the timer is armed only after the writes are queued"
+
+
+def test_swipe_move_readback_is_not_armed_when_the_enqueue_fails_or_daemons_are_off(monkeypatch):
+    sent, side = _warm_swipe_env(monkeypatch)
+    armed = []
+    monkeypatch.setattr(m.threading, "Timer", lambda *a, **k: armed.append(a) or (_ for _ in ()).throw(AssertionError))
+    _dispatch("/warm")  # daemons are opted out in the test process
+    assert armed == []
+    monkeypatch.setattr(m, "_daemons_opted_out", lambda: False)
+    monkeypatch.setattr(m, "enqueue_crm_payloads", lambda payloads: False)
+    _dispatch("/warm")
+    assert armed == []
+
 
 @pytest.mark.parametrize("command,short_id,expected_status", [
     ("/replied", "abc123", "Replied"),
@@ -13763,3 +13885,106 @@ def test_pipeline_utils_sets_the_daemon_opt_out_before_importing_main():
     import_at = src.find("import main as m")
     assert set_at != -1, "test_pipeline_utils.py no longer sets JOB_ENGINE_NO_DAEMONS"
     assert import_at != -1 and set_at < import_at, "the opt-out must be set BEFORE `import main`"
+
+
+def test_swipe_move_readback_old_failed_row_does_not_alarm_a_healthy_move(monkeypatch):
+    """An abandoned FAILED update_status from last week is not evidence about today's swipe: only
+    rows queued after the swipe's high-water mark count, and the tab read decides."""
+    sent, reads = _readback_env(monkeypatch, tab_rows=[{"sheet_uuid": "uuid-hn"}])
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO crm_outbox (payload_json, status, retry_count) VALUES (?, 'FAILED', 10)",
+                     (json.dumps({"action": "update_status", "sheet_uuid": "uuid-hn", "new_tab": "Tetiana Cold"}),))
+        conn.commit()
+    mark = m.current_crm_outbox_max_id()
+    assert mark >= 1
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash", after_outbox_id=mark) == "landed"
+    assert sent == [] and reads == [("TW", None)]
+
+
+def test_swipe_move_readback_a_later_swipe_on_the_same_row_silences_the_earlier_check(monkeypatch):
+    sent, reads = _readback_env(monkeypatch, tab_rows=[])  # the row is in NEITHER tab list read here
+    monkeypatch.setattr(m, "_daemons_opted_out", lambda: False)
+    armed = []
+
+    class _FakeTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.function, self.args, self.kwargs, self.daemon = function, tuple(args or ()), dict(kwargs or {}), False
+            armed.append(self)
+
+        def start(self):
+            pass
+    monkeypatch.setattr(m.threading, "Timer", _FakeTimer)
+    m._SWIPE_VERIFY_LATEST.pop("uuid-hn", None)
+    m.schedule_swipe_verify("uuid-hn", "Tetiana Warm", "Harvey Nash")
+    m.schedule_swipe_verify("uuid-hn", "Tetiana Cold", "Harvey Nash")  # /cold 30s after /warm
+
+    first, second = armed
+    assert first.function(*first.args, **first.kwargs) == "superseded"
+    assert sent == [] and reads == [], "the superseded check must not read the sheet or message"
+    assert second.function(*second.args, **second.kwargs) == "missing"  # the newest one still checks
+    assert len(sent) == 1 and "NOT in Tetiana Cold" in sent[0]
+    assert "uuid-hn" not in m._SWIPE_VERIFY_LATEST, "a finished check must not leak its token"
+
+
+def test_swipe_move_readback_backlog_row_at_retry_zero_is_not_alerted_until_the_second_look(monkeypatch):
+    sent, reads = _readback_env(monkeypatch, tab_rows=[{"sheet_uuid": "uuid-hn"}])
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "uuid-hn", "new_tab": "Tetiana Warm"})
+
+    def _worker_catches_up(seconds):
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM crm_outbox")
+            conn.commit()
+    monkeypatch.setattr(m.time, "sleep", _worker_catches_up)
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash") == "landed"
+    assert sent == [], "a healthy backlog must not page Kevin"
+
+    # Still PENDING at retry 0 at the second look: now it is a real stall.
+    sent.clear()
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "uuid-hn", "new_tab": "Tetiana Warm"})
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash") == "outbox_stuck"
+    assert len(sent) == 1 and "still not written" in sent[0]
+
+
+def test_swipe_move_readback_transient_read_failure_is_retried_once_before_alerting(monkeypatch):
+    sent, _ = _readback_env(monkeypatch)
+    results = iter([([], False), ([{"sheet_uuid": "uuid-hn"}], True)])
+    calls = []
+    monkeypatch.setattr(m, "fetch_networking_cards_checked", lambda code, qty=2: calls.append(code) or next(results))
+    naps = []
+    monkeypatch.setattr(m.time, "sleep", lambda s: naps.append(s))
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash") == "landed"
+    assert calls == ["TW", "TW"] and naps == [m.SWIPE_VERIFY_READ_RETRY_SECONDS]
+    assert sent == []
+
+
+def test_swipe_move_readback_a_sqlite_error_is_reported_as_an_outbox_problem_not_a_crm_read(monkeypatch):
+    sent, reads = _readback_env(monkeypatch)
+
+    def _locked():
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(m, "get_db_conn", _locked)
+    assert m.verify_swipe_move("uuid-hn", "Tetiana Warm", "Harvey Nash") == "outbox_unreadable"
+    assert len(sent) == 1 and "outbox" in sent[0] and "CRM read failed" not in sent[0], sent
+    assert reads == []
+
+
+def test_swipe_move_readback_a_malformed_cached_job_does_not_abort_the_warm_swipe(monkeypatch):
+    """job_json that is not a dict must cost the read-back, never the metrics/cooldown/identity
+    bookkeeping that follows the confirmation."""
+    sent, side = _warm_swipe_env(monkeypatch)
+    monkeypatch.setattr(m, "_daemons_opted_out", lambda: False)
+    armed = []
+
+    class _FakeTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            armed.append(self)
+
+        def start(self):
+            pass
+    monkeypatch.setattr(m.threading, "Timer", _FakeTimer)
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: ["not", "a", "dict"])
+    _dispatch("/warm")
+    assert "add_company_cooldown" in side and "upsert_company_identity" in side, side
+    assert len(_outbox_payloads()) == 3
+    assert len(armed) == 1, "the check is still armed (company from the mapping), just without a role"

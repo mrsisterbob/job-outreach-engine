@@ -9152,6 +9152,226 @@ def fetch_networking_cards_checked(target_code="CW", qty=2):
     return [], False
 
 
+# --- Swipe move read-back (TASK-92) -------------------------------------------------------------
+# The bot says "Moved to Warm" the moment the writes are QUEUED, and nothing afterwards looked at
+# the sheet. On 2026-10-19 Harvey Nash got that reply at 18:17 and was still in Tetiana Cold at
+# 18:25, found only by opening the sheet. A move that is lost, held behind a rejected secret,
+# retried to exhaustion or dropped as permanent is now reported by name.
+SWIPE_VERIFY_DELAY_SECONDS = 120
+SWIPE_VERIFY_RECHECK_SECONDS = 300
+SWIPE_VERIFY_READ_RETRY_SECONDS = 5
+CRM_OUTBOX_MAX_RETRIES = 10
+_SWIPE_VERIFY_LOCK = threading.Lock()  # a burst of swipes reads one tab at a time; none is dropped
+# sheet_uuid -> token of the NEWEST swipe on that row. A check whose token is no longer the latest
+# does nothing: /warm then /cold 30s apart must not report the first move as lost.
+_SWIPE_VERIFY_LATEST = {}
+_SWIPE_VERIFY_TOKEN_LOCK = threading.Lock()
+_SWIPE_VERIFY_SEQ = [0]
+# Tab name -> get_followups code (Code.gs get_followups). "Died" is read-only there and "Killed" is
+# not readable at all, so a swipe landing in a tab absent from this map is logged, not verified.
+CRM_TAB_NAME_TO_CODE = {
+    "Tetiana Warm": "TW", "Tetiana Cold": "TC", "Clavicular": "CL",
+    "Carmen Warm": "CW", "Carmen Cold": "CC", "Carmen Hot": "CH",
+}
+
+
+def current_crm_outbox_max_id():
+    """Highest crm_outbox id right now (0 when empty), or None if the table cannot be read. Captured
+    BEFORE a swipe enqueues so verify_swipe_move can tell this swipe's rows from older leftovers."""
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT MAX(id) FROM crm_outbox").fetchone()
+        return int(row[0] or 0)
+    except Exception as e:
+        logging.error(f"[SWIPE VERIFY] could not read the outbox high-water mark: {e}")
+        return None
+
+
+def _swipe_move_outbox_rows(sheet_uuid, after_id=None):
+    """[(id, status, retry_count)] for this row's UNWRITTEN move. A delivered payload is deleted from
+    crm_outbox, so a surviving update_status row is a move that is not in the sheet yet. `after_id`
+    restricts it to rows queued by THIS swipe (an old FAILED row from a past abandoned move is not
+    evidence about this one). The LIKE only narrows the scan; the JSON is parsed to confirm the
+    sheet_uuid field. Raises on a SQLite error - the caller reports that as an outbox problem."""
+    found = []
+    with get_db_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, payload_json, status, retry_count FROM crm_outbox WHERE payload_json LIKE ? ORDER BY id",
+            (f"%{sheet_uuid}%",)
+        ).fetchall()
+    for row_id, payload_json, status, retry_count in rows:
+        if after_id is not None and row_id <= after_id:
+            continue
+        try:
+            payload = json.loads(payload_json)
+        except Exception:
+            continue
+        if (isinstance(payload, dict) and payload.get("sheet_uuid") == sheet_uuid
+                and payload.get("action") == "update_status"):
+            found.append((row_id, status, retry_count or 0))
+    return found
+
+
+def _swipe_verify_is_current(sheet_uuid, token):
+    if token is None:
+        return True
+    with _SWIPE_VERIFY_TOKEN_LOCK:
+        return _SWIPE_VERIFY_LATEST.get(sheet_uuid) == token
+
+
+def _swipe_verify_read_tab(code, retry_seconds):
+    """(rows, ok) for one tab, retrying the read ONCE after a few seconds: an Apps Script lock
+    timeout, a timeout or an HTTP error is usually gone a moment later. A raising read counts as a
+    failed one. Serialized behind _SWIPE_VERIFY_LOCK."""
+    last_error = None
+    for attempt in (1, 2):
+        try:
+            with _SWIPE_VERIFY_LOCK:
+                rows, ok = fetch_networking_cards_checked(code, None)
+            if ok:
+                return rows, True
+        except Exception as e:
+            last_error = e
+            logging.error(f"[SWIPE VERIFY] tab read {code} raised: {type(e).__name__}: {e}")
+        if attempt == 1:
+            time.sleep(retry_seconds)
+    if last_error is not None:
+        raise last_error
+    return [], False
+
+
+def verify_swipe_move(sheet_uuid, expected_tab, company, role="", recheck_seconds=None,
+                      after_outbox_id=None, token=None, read_retry_seconds=None):
+    """Two minutes after a /warm or /cold swipe, confirm the row really sits in `expected_tab`.
+
+    Silent when it does. Messages Kevin, naming the company, when the move is stuck in the outbox,
+    is absent from the destination tab, or could not be checked. Never raises: it runs on a timer
+    thread. A restart inside the 120s window loses the check; that is accepted.
+
+    Every lost move is reported - there is deliberately no per-company debounce. Guards against
+    false alarms: a check superseded by a later swipe on the same row does nothing (`token`); only
+    outbox rows from THIS swipe count (`after_outbox_id`); a healthy row merely waiting its turn in
+    a backlog (PENDING, retry 0) is not alerted until a second look 300s later; a failed tab read is
+    retried once; and an alert followed by a landing gets a short "landed" follow-up.
+    """
+    label = str(company or "this row").strip() or "this row"
+    if role:
+        label = f"{label} - {role}"
+    label = html.escape(label)
+    tab = html.escape(str(expected_tab))
+    wait = SWIPE_VERIFY_RECHECK_SECONDS if recheck_seconds is None else recheck_seconds
+    read_wait = SWIPE_VERIFY_READ_RETRY_SECONDS if read_retry_seconds is None else read_retry_seconds
+    alerted = False
+
+    def _say(text):
+        try:
+            send_telegram_message(TELEGRAM_CHAT_ID, text)
+        except Exception as e:
+            logging.error(f"[SWIPE VERIFY] could not send message for {sheet_uuid}: {e}")
+
+    def _stuck_text(rows):
+        return (f"⚠️ {label}: the move to {tab} is still not written "
+                f"({len(rows)} queued, retry {max(r[2] for r in rows)}/{CRM_OUTBOX_MAX_RETRIES}). "
+                "Check /health and /crazy.")
+
+    def _superseded():
+        if _swipe_verify_is_current(sheet_uuid, token):
+            return False
+        logging.info(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: superseded by a later swipe, skipped")
+        return True
+
+    try:
+        if _superseded():
+            return "superseded"
+        try:
+            stuck = _swipe_move_outbox_rows(sheet_uuid, after_outbox_id)
+        except Exception as e:
+            logging.error(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: outbox unreadable: {e}")
+            _say(f"⚠️ Couldn't read the outbox to check the move for {label} (database error). "
+                 "Check the row by hand.")
+            return "outbox_unreadable"
+        if stuck:
+            # A row at retry 0 that is still PENDING is usually a backlog (a burst of swipes) and
+            # not a fault: say nothing until the second look. Any retry or terminal status is real.
+            real_fault = any(r[2] > 0 or r[1] != "PENDING" for r in stuck)
+            logging.warning(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: move still in outbox "
+                            f"({[(r[1], r[2]) for r in stuck]}) real_fault={real_fault}")
+            if real_fault:
+                _say(_stuck_text(stuck))
+                alerted = True
+            time.sleep(wait)
+            if _superseded():
+                return "superseded"
+            try:
+                stuck = _swipe_move_outbox_rows(sheet_uuid, after_outbox_id)
+            except Exception as e:
+                logging.error(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: outbox unreadable on recheck: {e}")
+                _say(f"⚠️ Couldn't read the outbox to check the move for {label} (database error). "
+                     "Check the row by hand.")
+                return "outbox_unreadable"
+            if stuck:
+                logging.error(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: STILL in outbox after "
+                              f"recheck ({[(r[1], r[2]) for r in stuck]}); giving up")
+                if not alerted:
+                    _say(_stuck_text(stuck))
+                return "outbox_stuck"
+            logging.info(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: outbox drained; checking the tab")
+
+        code = CRM_TAB_NAME_TO_CODE.get(expected_tab)
+        if not code:
+            logging.info(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: tab is not readable, skipped")
+            return "unreadable_tab"
+        rows, ok = _swipe_verify_read_tab(code, read_wait)
+        if _superseded():
+            return "superseded"
+        if not ok:
+            logging.error(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: CRM read failed (after retry)")
+            _say(f"⚠️ Couldn't verify the move for {label} (CRM read failed).")
+            return "read_failed"
+        if any(str(r.get("sheet_uuid") or "") == sheet_uuid for r in (rows or []) if isinstance(r, dict)):
+            logging.info(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: landed")
+            if alerted:
+                _say(f"✅ {label}: the move to {tab} landed after all.")
+            return "landed"
+        logging.error(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: NOT in the tab ({len(rows or [])} rows read)")
+        _say(f"⚠️ {label} is NOT in {tab} two minutes after your swipe. "
+             "The move did not land; move the row by hand.")
+        return "missing"
+    except Exception as e:
+        logging.error(f"[SWIPE VERIFY] {sheet_uuid} -> {expected_tab}: check crashed: {type(e).__name__}: {e}")
+        if not _swipe_verify_is_current(sheet_uuid, token):
+            return "superseded"
+        _say(f"⚠️ Couldn't verify the move for {label} (CRM read failed).")
+        return "error"
+    finally:
+        if token is not None:
+            with _SWIPE_VERIFY_TOKEN_LOCK:
+                if _SWIPE_VERIFY_LATEST.get(sheet_uuid) == token:
+                    _SWIPE_VERIFY_LATEST.pop(sheet_uuid, None)
+
+
+def schedule_swipe_verify(sheet_uuid, expected_tab, company, role="", after_outbox_id=None):
+    """Arm verify_swipe_move on a daemon timer and record this swipe as the row's latest. Off under
+    JOB_ENGINE_NO_DAEMONS so a test that swipes does not leave a 120s timer firing into a later
+    test. Never raises into the swipe."""
+    if _daemons_opted_out():
+        return None
+    try:
+        with _SWIPE_VERIFY_TOKEN_LOCK:
+            _SWIPE_VERIFY_SEQ[0] += 1
+            token = _SWIPE_VERIFY_SEQ[0]
+            _SWIPE_VERIFY_LATEST[sheet_uuid] = token
+        timer = threading.Timer(SWIPE_VERIFY_DELAY_SECONDS, verify_swipe_move,
+                                args=(sheet_uuid, expected_tab, company, role),
+                                kwargs={"after_outbox_id": after_outbox_id, "token": token})
+        timer.daemon = True
+        timer.start()
+        return timer
+    except Exception as e:
+        logging.error(f"[SWIPE VERIFY] could not arm the check for {sheet_uuid}: {e}")
+        return None
+
+
 # One alert per outage for a rejected CRM read. Every caller of fetch_networking_cards would
 # otherwise fire its own, and the sweep alone calls it three times per pass. A successful read in
 # fetch_networking_cards clears this, so the next outage alerts again.
@@ -14665,6 +14885,7 @@ def process_webhook_payload_async(data):
             # 2026-10-19 a /warm said "Moved" while the row stayed in Tetiana Cold: the old code
             # confirmed first and ignored a False from the enqueue. The enqueue is a local SQLite
             # insert (milliseconds), so confirming after it keeps the instant feel.
+            outbox_mark = current_crm_outbox_max_id()  # this swipe's rows are the ones above it
             if not enqueue_crm_payloads(payloads):
                 failed_company = mapping.get("contact_company") or "this row"
                 logging.error(f"{text} swipe NOT queued: {sheet_uuid} -> {new_tab} ({failed_company})")
@@ -14688,6 +14909,19 @@ def process_webhook_payload_async(data):
                         _APPLIED_CRM_CACHE["data"].add(normalized_company)
                     add_company_cooldown(company)
                     upsert_company_identity(company, crm_status="Tetiana Warm", applied=True)
+            # Armed LAST: the ladder bookkeeping above must never be skipped by the read-back, and
+            # a malformed cached job (non-dict job_json) must cost the check, not the swipe.
+            try:
+                cached_job = get_job_by_sheet_uuid(sheet_uuid)
+                if not isinstance(cached_job, dict):
+                    cached_job = {}
+                schedule_swipe_verify(
+                    sheet_uuid, new_tab,
+                    mapping.get("contact_company") or cached_job.get("employer_name"),
+                    cached_job.get("job_title") or "",
+                    after_outbox_id=outbox_mark)
+            except Exception as e:
+                logging.error(f"[SWIPE VERIFY] could not arm the check for {sheet_uuid}: {e}")
             return
 
         if text == "/x":
