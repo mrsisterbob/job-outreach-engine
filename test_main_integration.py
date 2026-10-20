@@ -65,6 +65,12 @@ def _inline_background_builds(monkeypatch):
     monkeypatch.setattr(m, "_spawn_background", lambda fn: fn())
 
 
+@pytest.fixture(autouse=True)
+def _no_db_retry_sleep(monkeypatch):
+    """db_write_with_retry backs off 0.2s then 0.8s; no test should wait for that."""
+    monkeypatch.setattr(m, "_db_retry_sleep", lambda seconds: None)
+
+
 def teardown_module(module):
     for suffix in ("", "-wal", "-shm"):
         try:
@@ -13490,3 +13496,183 @@ def test_pipeline_refuses_on_db_error(monkeypatch, sourcing_filters):
     assert m.enqueue_crm_payload({"action": "update_status"}) is False
     assert len(alerts) == 1 and "update_status" in alerts[0] and "disk I/O error" in alerts[0]
     monkeypatch.setattr(m, "get_db_conn", real_conn)
+
+
+# ---- SQLite "disk I/O error": name the error, show the process, retry the writes Kevin can see ----
+
+def _io_error(name="SQLITE_IOERR_SHMSIZE", code=4874):
+    e = sqlite3.OperationalError("disk I/O error")
+    e.sqlite_errorname = name
+    e.sqlite_errorcode = code
+    return e
+
+
+def _flaky_get_db_conn(monkeypatch, fail_times, exc):
+    """get_db_conn that raises exc on its first fail_times entries, then behaves. Returns the call log."""
+    real = m.get_db_conn
+    calls = []
+
+    @contextlib.contextmanager
+    def flaky():
+        calls.append(1)
+        if len(calls) <= fail_times:
+            raise exc
+        with real() as conn:
+            yield conn
+    monkeypatch.setattr(m, "get_db_conn", flaky)
+    return calls
+
+
+def test_db_io_error_diagnostics_and_retry(monkeypatch, caplog):
+    import logging as _logging
+    slept = []
+    monkeypatch.setattr(m, "_db_retry_sleep", lambda s: slept.append(s))
+    real_conn = m.get_db_conn
+
+    def _count(sql, args=()):
+        with real_conn() as conn:
+            return conn.execute(sql, args).fetchone()[0]
+
+    # (1) two I/O errors then success: True, exactly one row, two [DB RETRY] lines, backoff 0.2 then 0.8
+    calls = _flaky_get_db_conn(monkeypatch, 2, _io_error())
+    with caplog.at_level(_logging.INFO):
+        assert m.save_message_mapping(5256, "uuid-koch", "Carmen Cold", "", "Koch", "bizops@kochindustriesinc.com") is True
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+    assert len(calls) == 3 and slept == [0.2, 0.8]
+    assert _count("SELECT COUNT(*) FROM sheet_row_map WHERE sheet_uuid = 'uuid-koch'") == 1
+    retry_lines = [r.getMessage() for r in caplog.records if "[DB RETRY]" in r.getMessage()]
+    assert len([ln for ln in retry_lines if "failed" in ln]) == 2
+    assert any("succeeded on attempt 3" in ln for ln in retry_lines)
+    assert all("message_mapping" in ln for ln in retry_lines)
+    assert "SQLITE_IOERR_SHMSIZE / 4874" in retry_lines[0]
+
+    # (2) always failing: False after exactly 3 attempts; the error line names the SQLite error and the process
+    caplog.clear()
+    calls = _flaky_get_db_conn(monkeypatch, 99, _io_error())
+    with caplog.at_level(_logging.INFO):
+        assert m.save_message_mapping(5257, "uuid-fail", "Carmen Cold", "", "Koch", "") is False
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+    assert len(calls) == 3
+    err = [r.getMessage() for r in caplog.records if r.levelno >= _logging.ERROR][-1]
+    assert err.startswith("DB Message Mapping Save Error (5257)")
+    assert "SQLITE_IOERR_SHMSIZE" in err and "open files" in err and "threads" in err
+    assert _count("SELECT COUNT(*) FROM sheet_row_map WHERE sheet_uuid = 'uuid-fail'") == 0
+
+    # the other three helpers retry too
+    _flaky_get_db_conn(monkeypatch, 1, _io_error())
+    assert m.save_gmail_draft_record("a@b.com", "subj", "draft-1") is True
+    _flaky_get_db_conn(monkeypatch, 1, _io_error())
+    assert m.log_metric_event("message_sent", "uuid-x") is True
+    _flaky_get_db_conn(monkeypatch, 1, _io_error())
+    assert m.log_daily_activity("drafts_staged") is True
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+    assert _count("SELECT COUNT(*) FROM gmail_drafts WHERE draft_id = 'draft-1'") == 1
+    assert _count("SELECT COUNT(*) FROM pipeline_metrics WHERE sheet_uuid = 'uuid-x'") == 1
+    assert _count("SELECT drafts_staged FROM daily_activity WHERE date = ?", (datetime.now().strftime("%Y-%m-%d"),)) >= 1
+
+    # (3) an IntegrityError is raised at once, never retried; "locked" is retried
+    calls = []
+
+    def _integrity():
+        calls.append(1)
+        raise sqlite3.IntegrityError("UNIQUE constraint failed")
+    with pytest.raises(sqlite3.IntegrityError):
+        m.db_write_with_retry(_integrity, "t")
+    assert len(calls) == 1
+    calls.clear()
+
+    def _other_operational():
+        calls.append(1)
+        raise sqlite3.OperationalError("no such table: nope")
+    with pytest.raises(sqlite3.OperationalError):
+        m.db_write_with_retry(_other_operational, "t")
+    assert len(calls) == 1
+    calls.clear()
+
+    def _locked_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return "done"
+    assert m.db_write_with_retry(_locked_once, "t") == "done" and len(calls) == 2
+
+    # (4) enqueue: an insert that fails halfway once leaves no partial set, then exactly one set
+    class _HalfwayFail:
+        def __init__(self, conn, state):
+            self._conn, self._state = conn, state
+
+        def execute(self, sql, *a):
+            if sql.startswith("INSERT INTO crm_outbox"):
+                self._state["inserts"] += 1
+                if self._state["inserts"] == 2:
+                    raise _io_error()
+            return self._conn.execute(sql, *a)
+
+        def commit(self):
+            return self._conn.commit()
+
+        def rollback(self):
+            return self._conn.rollback()
+
+    state = {"inserts": 0}
+
+    @contextlib.contextmanager
+    def _halfway():
+        with real_conn() as conn:
+            yield _HalfwayFail(conn, state)
+    monkeypatch.setattr(m, "get_db_conn", _halfway)
+    payloads = [{"action": "move", "sheet_uuid": "u1"}, {"action": "update_status", "sheet_uuid": "u1"}]
+    assert m.enqueue_crm_payloads(payloads) is True
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+    with real_conn() as conn:
+        rows = [json.loads(r[0]) for r in conn.execute("SELECT payload_json FROM crm_outbox ORDER BY id")]
+    assert rows == payloads, "the failed first attempt rolled back; the retry left exactly one set"
+
+    # an un-encodable payload is not retried and leaves zero rows
+    with real_conn() as conn:
+        conn.execute("DELETE FROM crm_outbox")
+        conn.commit()
+    calls = _flaky_get_db_conn(monkeypatch, 0, None)
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: True)
+    m._LOCAL_ALERT_SENT.pop("crm_outbox_enqueue_failed", None)
+    assert m.enqueue_crm_payloads([{"action": "ok"}, {"action": "bad", "x": object()}]) is False
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+    assert len(calls) == 1
+    assert _count("SELECT COUNT(*) FROM crm_outbox") == 0
+    m._LOCAL_ALERT_SENT.pop("crm_outbox_enqueue_failed", None)
+
+    # (5) get_filter on a failing database: the alert names the error and the snapshot, once an hour
+    alerts = []
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg) or True)
+    m._LOCAL_ALERT_SENT.pop("db_error", None)
+    _flaky_get_db_conn(monkeypatch, 99, _io_error())
+    snapshots = []
+    real_line = m.process_snapshot_line
+    monkeypatch.setattr(m, "process_snapshot_line", lambda: snapshots.append(1) or real_line())
+    assert m.get_filter("target_queries", ["dflt"]) == ["dflt"]
+    assert m.get_filter("target_queries", ["dflt"]) == ["dflt"]
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+    assert len(snapshots) == 1, "a failing get_filter takes the snapshot only when the alert goes out"
+    assert len(alerts) == 1
+    assert "SQLITE_IOERR_SHMSIZE" in alerts[0] and "open files" in alerts[0] and "threads" in alerts[0]
+    assert "target_queries" in alerts[0]
+    m._LOCAL_ALERT_SENT.pop("db_error", None)
+
+    # the boot alert carries them too
+    alerts.clear()
+    monkeypatch.setattr(m, "db_health_probe", lambda: {
+        "ok": False, "error": "disk I/O error", "error_detail": m.sqlite_error_detail(_io_error()),
+        "db_path": "/x/db", "disk_free_mb": 5.0})
+    m.alert_if_db_unhealthy_at_boot()
+    assert len(alerts) == 1 and "SQLITE_IOERR_SHMSIZE" in alerts[0] and "open files" in alerts[0]
+
+    # (6) process_snapshot never raises, with or without /proc
+    keys = {"open_fds", "threads", "uptime_s", "db_bytes", "wal_bytes", "shm_bytes"}
+
+    monkeypatch.setattr(m, "_PROC_FD_DIR", os.path.join(_TMP_DB_PATH + "-no-such-dir", "fd"))
+    snap = m.process_snapshot()
+    assert keys <= set(snap) and snap["open_fds"] is None and snap["threads"] >= 1
+    assert "open files unknown" in m.process_snapshot_line()
+    # a hand-built exception has no sqlite attributes
+    assert m.sqlite_error_detail(sqlite3.OperationalError("x")) == "OperationalError: x [unknown / unknown]"
+    assert "SQLITE_IOERR_SHMSIZE / 4874" in m.sqlite_error_detail(_io_error())
