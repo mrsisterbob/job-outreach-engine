@@ -539,7 +539,9 @@ def _reconcile_summary_figures(track_key: str, tone_key: str, selected: list, ev
 
 # d (business intelligence), h (technical systems), b (engineering): skills row under SUMMARY.
 SKILLS_ROW_TRACKS = ("d", "h", "b")
-# Track d prints two labeled lines instead of the one row; the cap is its longest base line.
+# Track d prints two labeled lines instead of the one row. The cap is the measured no-wrap width
+# (TASK-86: a 109-char BI line compiles on one line, 118 wraps; Data wraps at 120), not a base
+# line's length, so both base lines (93 and 91 chars) leave room for posting-named skills.
 D_SKILLS_LINE_CHARS = 109
 D_HEDGED_SKILLS = ("Google Ads", "Meta Ads", "Snowflake", "Marketing Metrics")
 

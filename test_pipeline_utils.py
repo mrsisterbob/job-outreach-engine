@@ -3876,12 +3876,13 @@ def test_d_skills_two_labeled_lines():
     import track_registry as tr_
 
     hedged = ("Snowflake", "Google Ads", "Meta Ads", "Marketing Metrics")
-    posting = "We use Git, Flask, Google Ads, Meta Ads, Snowflake and Marketing Metrics."
+    posting = "We use XLOOKUP, Git, Flask, Google Ads, Meta Ads, Snowflake and Marketing Metrics."
     pool = re_.load_resume_bullets_bank()[tr_.pool_key_for("d")]
     lens = [-(-len(re_.bullet_text(e)) // 105) for e in pool]
     combos = [list(c) for k in (3, 4) for c in itertools.combinations(range(len(pool)), k)]
     longest = sorted(combos, key=lambda r: -sum(lens[i] for i in r))[:12]
-    routings = [[0, 1, 2], [0, 1, 2, 3], [1, 4, 8, 10], [0, 1, 8, 13]] + longest
+    # [1, 4, 8] and [3, 7, 13, 14] overflowed before TASK-88's same-claim dedupe (TASK-77 Log).
+    routings = [[0, 1, 2], [0, 1, 2, 3], [1, 4, 8, 10], [0, 1, 8, 13], [1, 4, 8], [3, 7, 13, 14]] + longest
     for tone in ("conservative", "tech"):
         for jt in ("", posting):
             mk = re_.render_typst_markup("Acme", "d", tone_mode=tone, job_text=jt)
@@ -3895,6 +3896,8 @@ def test_d_skills_two_labeled_lines():
         mk = re_.render_typst_markup("Acme", "d", tone_mode=tone, job_text=posting)
         data_line = mk.split("*Data:*")[1].split(chr(10))[0]
         assert "Git" in data_line and "Flask" in data_line, tone
+        bi_line = mk.split("*BI & Reporting:*")[1].split(chr(10))[0]
+        assert "XLOOKUP" in bi_line, tone
         for idx in routings:
             pdf = re_.compile_resume_pdf("Acme", "d", idx, tone, job_text=posting)
             reader = pypdf.PdfReader(io.BytesIO(pdf))
@@ -3902,3 +3905,7 @@ def test_d_skills_two_labeled_lines():
             lines = reader.pages[0].extract_text().splitlines()
             assert sum(1 for l in lines if l.startswith("BI & Reporting:")) == 1, (tone, idx)
             assert sum(1 for l in lines if l.startswith("Data: SQL")) == 1, (tone, idx)
+            # Neither line wraps: BI is followed directly by Data, Data by the next section.
+            i_bi = next(k for k, l in enumerate(lines) if l.startswith("BI & Reporting:"))
+            assert lines[i_bi + 1].startswith("Data: SQL"), (tone, idx, lines[i_bi + 1])
+            assert lines[i_bi + 2].startswith("PROFESSIONAL EXPERIENCE"), (tone, idx, lines[i_bi + 2])

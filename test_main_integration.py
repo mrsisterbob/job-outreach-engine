@@ -10475,8 +10475,11 @@ def test_footer_surfaces_banked_skills_in_two_lines():
     out = resume_engine.render_typst_markup("Acme", "d", job_text=posting)
     # Track d prints two labeled skills lines under the summary, no footer.
     block = out.split("*BI & Reporting:*")[1].split("#v(6.5pt)")[0]
-    for skill in ("Looker Studio", "Tableau"):
+    for skill in ("Looker Studio", "Tableau", "XLOOKUP"):
         assert skill in block
+    # XLOOKUP is not a base item: the posting surfaced it, onto the BI line.
+    assert "XLOOKUP" not in base
+    assert "XLOOKUP" in out.split("*BI & Reporting:*")[1].split(chr(10))[0]
     assert len([l for l in block.strip().splitlines() if not l.startswith("#v")]) == 2
     assert resume_engine.render_typst_markup("Acme", "d", job_text="") == base
 
