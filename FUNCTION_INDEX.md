@@ -10,15 +10,17 @@ grep -i email FUNCTION_INDEX.md
 grep -i "contact" FUNCTION_INDEX.md
 ```
 
-## `.claude/hooks/verify_suites.py` — 5 defs, 172 lines
+## `.claude/hooks/verify_suites.py` — 7 defs, 211 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
 | 34 | `main` | _(no docstring)_ |
-| 81 | `tree_under_test` | The root of the git tree this session is actually working in. |
-| 109 | `refresh_function_index` | Rewrite FUNCTION_INDEX.md when a turn changed what is in it. |
-| 143 | `failure_summary` | The part of pytest's output that names what broke. |
-| 167 | `block` | _(no docstring)_ |
+| 82 | `venv_python_launches` | True when `candidate` starts and can import pytest. |
+| 98 | `suite_python` | The interpreter the suites should run under. |
+| 120 | `tree_under_test` | The root of the git tree this session is actually working in. |
+| 148 | `refresh_function_index` | Rewrite FUNCTION_INDEX.md when a turn changed what is in it. |
+| 182 | `failure_summary` | The part of pytest's output that names what broke. |
+| 206 | `block` | _(no docstring)_ |
 
 ## `build_function_index.py` — 6 defs, 196 lines
 
@@ -702,4 +704,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**588 definitions across 19 files + Code.gs.**
+**590 definitions across 19 files + Code.gs.**
