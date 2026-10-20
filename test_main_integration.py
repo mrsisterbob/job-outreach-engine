@@ -3503,7 +3503,7 @@ def test_warm_on_a_job_row_starts_the_followup_ladder(monkeypatch):
                  "add_company_cooldown", "upsert_company_identity"):
         monkeypatch.setattr(m, name, lambda *a, **k: None)
     enqueued = []
-    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    monkeypatch.setattr(m, "enqueue_crm_payloads", lambda ps: enqueued.extend(ps) or True)
 
     _dispatch("/warm")
 
@@ -3528,7 +3528,7 @@ def test_warm_on_a_carmen_contact_does_not_write_applied(monkeypatch):
                  "add_company_cooldown", "upsert_company_identity", "auto_expand_ats_slug"):
         monkeypatch.setattr(m, name, lambda *a, **k: None)
     enqueued = []
-    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    monkeypatch.setattr(m, "enqueue_crm_payloads", lambda ps: enqueued.extend(ps) or True)
 
     _dispatch("/warm")
 
@@ -3545,11 +3545,119 @@ def test_cold_never_starts_the_followup_ladder(monkeypatch):
                  "add_company_cooldown", "upsert_company_identity"):
         monkeypatch.setattr(m, name, lambda *a, **k: None)
     enqueued = []
-    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    monkeypatch.setattr(m, "enqueue_crm_payloads", lambda ps: enqueued.extend(ps) or True)
 
     _dispatch("/cold")
 
     assert [p["action"] for p in enqueued] == ["update_status"]
+
+
+def _outbox_payloads():
+    with m.get_db_conn() as conn:
+        return [json.loads(r[0]) for r in
+                conn.execute("SELECT payload_json FROM crm_outbox ORDER BY id").fetchall()]
+
+
+def _warm_swipe_env(monkeypatch):
+    """A /warm reply to a Tetiana Cold job card. Records every Telegram text together with the
+    outbox contents at the moment it was sent, and every side effect that must wait for the queue."""
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "uuid-hn", "sheet_tab": "Tetiana Cold", "contact_company": "Harvey Nash"})
+    sent, side = [], []
+    monkeypatch.setattr(m, "send_telegram_message",
+                        lambda chat_id, text, *a, **k: sent.append((text, len(_outbox_payloads()))))
+    for name in ("log_metric_event", "log_daily_activity", "add_company_cooldown",
+                 "upsert_company_identity", "auto_expand_ats_slug"):
+        monkeypatch.setattr(m, name, lambda *a, _n=name, **k: side.append(_n))
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: True)
+    m._APPLIED_CRM_CACHE["data"].discard("harvey nash")
+    return sent, side
+
+
+def test_warm_swipe_atomic_enqueue_confirms_only_after_all_three_rows_are_queued(monkeypatch):
+    """2026-10-19: /warm on Harvey Nash said "Moved to Warm" while the row stayed in Tetiana Cold.
+    Drives the real swipe into the real SQLite outbox: the three writes land in order, and the
+    confirmation goes out only when all three already exist."""
+    sent, side = _warm_swipe_env(monkeypatch)
+
+    _dispatch("/warm")
+
+    rows = _outbox_payloads()
+    assert [p["action"] for p in rows] == ["update_status", "set_status", "update_snooze"], rows
+    assert rows[0]["new_tab"] == "Tetiana Warm"
+    assert rows[1]["status"] == "Applied"
+    assert rows[2]["next_followup"] == (date.today() + timedelta(days=m.FOLLOWUP_1_DAYS)).strftime("%Y-%m-%d")
+    assert len(sent) == 1 and sent[0][0].startswith("🔥 Moved to Warm"), sent
+    assert sent[0][1] == 3, "the confirmation went out before the writes were queued"
+    assert "add_company_cooldown" in side and "upsert_company_identity" in side
+    assert "harvey nash" in m._APPLIED_CRM_CACHE["data"]
+
+
+def test_warm_swipe_atomic_enqueue_failure_says_so_and_changes_nothing(monkeypatch):
+    sent, side = _warm_swipe_env(monkeypatch)
+    real_conn = m.get_db_conn
+
+    def _locked():
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(m, "get_db_conn", _locked)
+    m._APPLIED_CRM_CACHE["data"].discard("harvey nash")
+
+    # SQLite is unreachable for the whole swipe, so record the text alone.
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    _dispatch("/warm")
+    monkeypatch.setattr(m, "get_db_conn", real_conn)
+
+    assert _outbox_payloads() == []
+    assert sent == ["⚠️ Couldn't queue the move to Tetiana Warm for Harvey Nash. Nothing changed; swipe again."], sent
+    assert side == [], f"side effects ran on a failed queue: {side}"
+    assert "harvey nash" not in m._APPLIED_CRM_CACHE["data"]
+
+
+def test_warm_swipe_atomic_enqueue_is_all_or_nothing(monkeypatch):
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: True)
+    ok = m.enqueue_crm_payloads([
+        {"action": "update_status", "sheet_uuid": "u1", "new_tab": "Tetiana Warm"},
+        {"action": "set_status", "sheet_uuid": "u1", "status": object()},  # not JSON-encodable
+        {"action": "update_snooze", "sheet_uuid": "u1", "next_followup": "2026-10-27"},
+    ])
+    assert ok is False
+    assert _outbox_payloads() == [], "a failed batch left part of the move queued"
+
+    assert m.enqueue_crm_payloads([{"action": "a"}, {"action": "b"}]) is True
+    assert [p["action"] for p in _outbox_payloads()] == ["a", "b"]
+    # The single-payload entry point still works, through the same transaction path.
+    assert m.enqueue_crm_payload({"action": "c"}) is True
+    assert [p["action"] for p in _outbox_payloads()] == ["a", "b", "c"]
+
+
+def test_warm_swipe_atomic_enqueue_auth_hold_alerts_once(monkeypatch):
+    """A rejected secret holds every queued write. That hold must be announced once, not sit silent
+    behind a "Moved" the bot already sent, and it must not spend any retries."""
+    m._CRM_AUTH_BACKOFF["until"] = 0.0
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'crm_outbox_auth_hold'")
+        conn.commit()
+    alerts = _capture_alerts(monkeypatch)
+    m.enqueue_crm_payloads([{"action": "update_status", "sheet_uuid": "u-hn", "new_tab": "Tetiana Warm"},
+                            {"action": "set_status", "sheet_uuid": "u-hn", "status": "Applied"}])
+
+    def _rejected(*a, **k):
+        raise m.CRMAuthRejected("Unauthorized")
+    monkeypatch.setattr(m, "log_to_sheets_crm", _rejected)
+    try:
+        for _ in range(2):
+            m._CRM_AUTH_BACKOFF["until"] = 0.0
+            m.process_crm_outbox_batch(inter_job_sleep=0)
+        assert m._CRM_AUTH_BACKOFF["until"] > time.time(), "the backoff stopped being set"
+    finally:
+        m._CRM_AUTH_BACKOFF["until"] = 0.0
+
+    hold = [a for a in alerts if "secret rejected" in a]
+    assert len(hold) == 1, alerts
+    assert "2 queued" in hold[0]
+    with m.get_db_conn() as conn:
+        rows = conn.execute("SELECT retry_count, status FROM crm_outbox ORDER BY id").fetchall()
+    assert rows == [(0, "PENDING"), (0, "PENDING")]
 
 
 @pytest.mark.parametrize("command,short_id,expected_status", [
@@ -12068,7 +12176,7 @@ def _outbox_rows():
 def _auth_reset():
     m._CRM_AUTH_BACKOFF["until"] = 0.0
     with m.get_db_conn() as conn:
-        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'crm_write_unauthorized'")
+        conn.execute("DELETE FROM system_alerts WHERE alert_key IN ('crm_write_unauthorized', 'crm_outbox_auth_hold')")
         conn.commit()
     yield
     m._CRM_AUTH_BACKOFF["until"] = 0.0
