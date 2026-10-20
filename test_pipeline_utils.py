@@ -21,8 +21,9 @@ import pipeline_utils as pu
 _tmp_db_fd, _TMP_DB_PATH = tempfile.mkstemp(suffix=".db")
 os.close(_tmp_db_fd)
 os.environ.setdefault("JOBS_DB_PATH", _TMP_DB_PATH)
+os.environ["JOB_ENGINE_NO_DAEMONS"] = "1"
 
-import main as m  # noqa: E402  (must import after JOBS_DB_PATH is set)
+import main as m  # noqa: E402  (must import after JOBS_DB_PATH and JOB_ENGINE_NO_DAEMONS are set)
 
 
 # ---- Google dork builders ----

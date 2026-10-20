@@ -2,9 +2,11 @@
 reply-mapping, batch follow-ups, Gmail draft MIME attachment).
 
 Isolation strategy: JOBS_DB_PATH is set to a temp file BEFORE importing main, so main's own
-init_db() builds its schema there instead of touching the real jobs_cache.db, and PYTEST_CURRENT_TEST
-(auto-set by pytest) makes main skip starting its background daemons (Gmail poller, CRM outbox
-worker, morning digest, backup scheduler) so nothing races against these tests' assertions.
+init_db() builds its schema there instead of touching the real jobs_cache.db, and JOB_ENGINE_NO_DAEMONS
+(set below, also before the import) makes main skip starting its background daemons (Gmail poller,
+CRM outbox worker, morning digest, backup scheduler, weekly build log, sequencer, link checker) so
+nothing races against these tests' assertions. PYTEST_CURRENT_TEST cannot do this job: pytest sets it
+only while a test runs, and this module imports main at collection, when it is still unset.
 """
 import base64
 import contextlib
@@ -28,8 +30,9 @@ import pytest
 _tmp_db_fd, _TMP_DB_PATH = tempfile.mkstemp(suffix=".db")
 os.close(_tmp_db_fd)
 os.environ["JOBS_DB_PATH"] = _TMP_DB_PATH
+os.environ["JOB_ENGINE_NO_DAEMONS"] = "1"
 
-import main as m  # noqa: E402  (must import after JOBS_DB_PATH is set)
+import main as m  # noqa: E402  (must import after JOBS_DB_PATH and JOB_ENGINE_NO_DAEMONS are set)
 import resume_engine  # noqa: E402
 import track_registry  # noqa: E402
 import pipeline_utils  # noqa: E402
@@ -13676,3 +13679,87 @@ def test_db_io_error_diagnostics_and_retry(monkeypatch, caplog):
     # a hand-built exception has no sqlite attributes
     assert m.sqlite_error_detail(sqlite3.OperationalError("x")) == "OperationalError: x [unknown / unknown]"
     assert "SQLITE_IOERR_SHMSIZE / 4874" in m.sqlite_error_detail(_io_error())
+
+
+# ---- TASK-110: importing main under pytest must not start the background daemons ----
+
+# Each name is a thread (or APScheduler job host) that main.py's daemon block starts:
+#   start_crm_outbox_worker  -> Thread(target=crm_outbox_worker_loop)
+#   start_morning_digest     -> Thread(target=morning_digest_loop)
+#   start_gmail_poller / start_backup_scheduler / start_weekly_build_log /
+#   start_followup_sequencer / start_job_link_checker -> jobs on EMAIL_POLL_SCHEDULER, whose
+#                              start() creates the single "APScheduler" thread
+_DAEMON_THREAD_MARKERS = ("crm_outbox_worker_loop", "morning_digest_loop", "APScheduler")
+
+# The production-probe child gets ONLY these variables (plus the ones the test names), so a live
+# CRM_SHARED_SECRET / TELEGRAM_* / Gmail / API key in the developer's shell can never reach a
+# process that really starts the daemons.
+_CHILD_ENV_ALLOWLIST = ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+                        "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
+                        "VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME", "PYTHONUSERBASE",
+                        "PYTHONIOENCODING", "PYTHONUTF8", "LANG", "LC_ALL")
+
+
+def test_no_daemons_under_pytest():
+    # (1) this process: main was imported at collection with the opt-out set, so nothing runs
+    assert os.environ.get("JOB_ENGINE_NO_DAEMONS")
+    live = [t.name for t in threading.enumerate()
+            if any(marker in t.name for marker in _DAEMON_THREAD_MARKERS)]
+    assert live == [], "daemon threads alive under pytest: %r" % live
+    assert not m.EMAIL_POLL_SCHEDULER.running
+
+    # (2) production still starts them: a child with NEITHER opt-out (and without pytest) imports main
+    import subprocess
+    import sys as _sys
+    tmp_db = _TMP_DB_PATH + ".daemon-probe"
+    env = {k: v for k, v in os.environ.items() if k.upper() in _CHILD_ENV_ALLOWLIST}
+    env.update(JOBS_DB_PATH=tmp_db, CRM_WEBHOOK_URL="", TELEGRAM_BOT_TOKEN="",
+               PYTHONPATH=os.pathsep.join(p for p in _sys.path if p))
+    assert "CRM_SHARED_SECRET" not in env and "JOB_ENGINE_NO_DAEMONS" not in env
+    repo = os.path.dirname(os.path.abspath(m.__file__))
+    code = ("import sys, threading; sys.path.insert(0, %r); import main; "
+            "assert 'pytest' not in sys.modules; "
+            "print('THREADS=' + '|'.join(t.name for t in threading.enumerate()))" % repo)
+    try:
+        r = subprocess.run([_sys.executable, "-c", code], cwd=repo, env=env,
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as e:
+        def _txt(b):
+            return b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+        pytest.fail("daemon-probe child timed out after 60s\nstdout: %s\nstderr: %s"
+                    % (_txt(e.stdout)[-1500:], _txt(e.stderr)[-1500:]))
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(tmp_db + suffix)
+            except OSError:
+                pass
+    assert r.returncode == 0, r.stderr[-2000:]
+    names = [ln for ln in r.stdout.splitlines() if ln.startswith("THREADS=")]
+    assert names, r.stdout[-1000:] + r.stderr[-1000:]
+    for marker in _DAEMON_THREAD_MARKERS:
+        assert marker in names[-1], "%s missing from a normal start: %s" % (marker, names[-1])
+
+
+@pytest.mark.parametrize("value,opted_out", [
+    (None, False), ("", False), ("0", False), ("false", False), ("False", False), ("no", False),
+    ("off", False), ("1", True), ("true", True), ("TRUE", True), (" yes ", True), ("on", True),
+])
+def test_no_daemons_opt_out_only_on_an_affirmative_value(monkeypatch, value, opted_out):
+    # A stray JOB_ENGINE_NO_DAEMONS=0 in the Render dashboard must not silently disable production.
+    if value is None:
+        monkeypatch.delenv("JOB_ENGINE_NO_DAEMONS", raising=False)
+    else:
+        monkeypatch.setenv("JOB_ENGINE_NO_DAEMONS", value)
+    assert m._daemons_opted_out() is opted_out
+
+
+def test_pipeline_utils_sets_the_daemon_opt_out_before_importing_main():
+    # Run alone, test_pipeline_utils.py is the only importer of main; deleting its opt-out line
+    # would start every daemon in that run. Check the source order (setting precedes the import).
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_pipeline_utils.py"),
+               encoding="utf-8").read()
+    set_at = src.find('os.environ["JOB_ENGINE_NO_DAEMONS"]')
+    import_at = src.find("import main as m")
+    assert set_at != -1, "test_pipeline_utils.py no longer sets JOB_ENGINE_NO_DAEMONS"
+    assert import_at != -1 and set_at < import_at, "the opt-out must be set BEFORE `import main`"
