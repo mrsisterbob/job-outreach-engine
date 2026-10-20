@@ -10,17 +10,23 @@ grep -i email FUNCTION_INDEX.md
 grep -i "contact" FUNCTION_INDEX.md
 ```
 
-## `.claude/hooks/verify_suites.py` — 7 defs, 211 lines
+## `.claude/hooks/verify_suites.py` — 13 defs, 386 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 34 | `main` | _(no docstring)_ |
-| 82 | `venv_python_launches` | True when `candidate` starts and can import pytest. |
-| 98 | `suite_python` | The interpreter the suites should run under. |
-| 120 | `tree_under_test` | The root of the git tree this session is actually working in. |
-| 148 | `refresh_function_index` | Rewrite FUNCTION_INDEX.md when a turn changed what is in it. |
-| 182 | `failure_summary` | The part of pytest's output that names what broke. |
-| 206 | `block` | _(no docstring)_ |
+| 47 | `main` | _(no docstring)_ |
+| 111 | `_git_out` | stdout of a git command, or None when it failed (any failure means "cannot prove"). |
+| 123 | `tree_fingerprint` | A hash of everything the suites could read in `tree`, or None when it cannot be taken. |
+| 175 | `_proof_path` | _(no docstring)_ |
+| 185 | `proof_matches` | True only when a readable, well-formed, unexpired proof for exactly this fingerprint exists. |
+| 209 | `write_proof` | Record that the tree with this fingerprint passed. Never raises, never blocks. |
+| 233 | `clear_proof` | Drop any proof: a red, hung or unrunnable suite must never leave one behind. |
+| 257 | `venv_python_launches` | True when `candidate` starts and can import pytest. |
+| 273 | `suite_python` | The interpreter the suites should run under. |
+| 295 | `tree_under_test` | The root of the git tree this session is actually working in. |
+| 323 | `refresh_function_index` | Rewrite FUNCTION_INDEX.md when a turn changed what is in it. |
+| 357 | `failure_summary` | The part of pytest's output that names what broke. |
+| 381 | `block` | _(no docstring)_ |
 
 ## `build_function_index.py` — 6 defs, 196 lines
 
@@ -711,4 +717,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**597 definitions across 19 files + Code.gs.**
+**603 definitions across 19 files + Code.gs.**
