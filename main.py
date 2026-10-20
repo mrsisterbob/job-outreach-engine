@@ -588,12 +588,14 @@ def update_template_entry(file_path, list_key, idx, new_text):
     if idx < 0 or idx >= len(pool):
         return False, f"❌ Index {idx} out of range for <code>{html.escape(str(list_key))}</code> (valid: 0-{len(pool) - 1})."
 
-    # A resume bullet may be a {"text", "source_job"} dict, and /edit only ever supplies prose.
-    # Overwriting the whole entry would silently drop the tag and send the bullet back under
-    # Signal Advisors, which is the exact misattribution source tags exist to prevent - one phone
-    # edit would undo it. Anything else in the bank stays a plain string, as it always was.
+    # A resume bullet may be a dict carrying metadata ("source_job", "same_claim_as", "replaces",
+    # or any future key), and /edit only ever supplies prose. Overwriting the whole entry would
+    # silently drop every key but the text: losing "source_job" sends the bullet back under
+    # Signal Advisors, losing "same_claim_as" re-opens the duplicate-claim guard's bypass - one
+    # phone edit would undo either. So any dict keeps all its keys and only "text" is replaced.
+    # Anything else in the bank stays a plain string, as it always was.
     existing = pool[idx]
-    if isinstance(existing, dict) and "source_job" in existing:
+    if isinstance(existing, dict):
         pool[idx] = dict(existing, text=new_text)
     else:
         pool[idx] = new_text

@@ -10800,6 +10800,66 @@ def test_bare_string_and_tagged_entry_both_survive_a_phone_edit():
         assert "Reworded the tagged bullet from a phone." in blocks["ABC Technologies"]
 
 
+def test_phone_edit_keeps_bullet_metadata_on_every_dict_entry(monkeypatch, tmp_path):
+    """edit_keeps_bullet_metadata: drives the real /edit webhook path against a tmp copy of the
+    bank and reads the file back. update_template_entry used to keep the dict form only when the
+    entry had "source_job", so /edit TD7, TE13 or TF12 rewrote the bullet as a bare string and
+    dropped "same_claim_as" - the duplicate-claim guard then no longer saw the pair."""
+    import shutil
+    path = str(tmp_path / "resume_bullets_bank.json")
+    shutil.copy(resume_engine.RESUME_BULLETS_BANK_PATH, path)
+
+    real_resolve = m.resolve_edit_target
+
+    def resolve_into_tmp(edit_id):
+        target = real_resolve(edit_id)
+        assert target is not None, edit_id
+        return (path, target[1], target[2])
+
+    monkeypatch.setattr(m, "resolve_edit_target", resolve_into_tmp)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+
+    def phone_edit(edit_id, prose):
+        m.process_webhook_payload_async(
+            {"message": {"chat": {"id": 1}, "text": f"/edit {edit_id} {prose}"}})
+        assert sent and "Template Updated" in sent[-1], sent[-1:]
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    cases = [
+        ("TD7", "track_d_business_intelligence", 7, {"same_claim_as": 3}),
+        ("TE13", "track_e_bizops", 13, {"same_claim_as": 4}),
+        ("TF12", "track_f_operations_logistics", 12, {"same_claim_as": 5}),
+        ("TD8", "track_d_business_intelligence", 8,
+         {"source_job": 3, "same_claim_as": 1, "replaces": 0}),
+    ]
+    for edit_id, pool, idx, meta in cases:
+        prose = f"Reworded {edit_id} from a phone."
+        bank = phone_edit(edit_id, prose)
+        entry = bank[pool][idx]
+        assert isinstance(entry, dict), f"/edit {edit_id} flattened the entry to a string"
+        assert entry["text"] == prose
+        assert {k: v for k, v in entry.items() if k != "text"} == meta, edit_id
+
+    # A plain-string entry stays a plain string.
+    assert isinstance(bank["track_d_business_intelligence"][0], str)
+    bank = phone_edit("TD0", "Reworded the plain bullet from a phone.")
+    assert bank["track_d_business_intelligence"][0] == "Reworded the plain bullet from a phone."
+
+    # The edited copy still passes the same_claim_as bank lint (test_pipeline_utils.py).
+    for pool, items in bank.items():
+        if not isinstance(items, list):
+            continue
+        for i, item in enumerate(items):
+            if not isinstance(item, dict) or "same_claim_as" not in item:
+                continue
+            t = item["same_claim_as"]
+            assert isinstance(t, int) and not isinstance(t, bool), (pool, i)
+            assert 0 <= t < len(items) and t != i, (pool, i, t)
+            assert not (isinstance(items[t], dict) and "same_claim_as" in items[t]), (pool, i, t)
+
+
 def test_a_later_job_keeps_its_other_statics_when_a_routed_bullet_lands_on_it():
     """The rule differs by job, and this is the half that is easy to get wrong.
 
