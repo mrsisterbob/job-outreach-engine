@@ -167,7 +167,8 @@ Kevin has - so do not decide to build inline instead. That brings the bloat back
 **This session keeps:** the session-name guard, Claim steps 1-5, spawning the build agent,
 re-checking its result, `/code-review`, the commit, every queue `mv`, the merge (Finish) and the
 planner message. **The build agent gets:** reading the task, implementing it within `scope`,
-running verify and both suites, and up to 3 attempts. It does **not** commit, run
+running verify and the test files its diff touches (the full suites are the re-check's job,
+below), and up to 3 attempts. It does **not** commit, run
 `/code-review`, move queue files, merge, or message anyone.
 
 **Spawn it** with the `Agent` tool: `subagent_type: "general-purpose"`. Never `"fork"` (a fork
@@ -207,18 +208,24 @@ persist). Never write anything in the main folder EXCEPT appending to the task f
    append why to the task's `## Log` and reply "TASK-n: blocked - scope: <why>".
 3. Before adding any function, run `grep -i <noun> FUNCTION_INDEX.md`. A duplicate never fails a
    test. Follow CLAUDE.md: new subsystems go in new modules, not main.py.
-4. Run the task's `verify` command through the quiet wrapper in step 0, then the full suite
-   through the same wrapper, with <python> -m pytest test_main_integration.py
-   test_pipeline_utils.py -q -p no:cacheprovider as its <command>. Judge each by the printed
-   `exit=` line, not the tool status (the wrapper makes the tool call itself exit 0).
-   Both must be green; a task is not done because its own verify passed while something else broke.
+4. Run the task's `verify` command through the quiet wrapper in step 0, then run ONLY the test
+   files your change touches, through the same wrapper, with <python> -m pytest <those files>
+   -q -p no:cacheprovider as its <command>. Find them with `git status --short`: every
+   test_*.py file you changed or added, plus the test file for every module you changed
+   (pipeline_utils.py -> test_pipeline_utils.py; main.py or Code.gs -> test_main_integration.py;
+   any other module X.py -> test_X.py if it exists). A change with no code and no test file in it
+   (a docs or command-file edit) has none to run; say so in the Log. Do NOT run the full suites:
+   the worker re-runs them on this same code as the gate, and you running them first is a
+   duplicate. Judge each run by the printed `exit=` line, not the tool status (the wrapper makes
+   the tool call itself exit 0). Both must be green; a task is not done because its own verify
+   passed while the tests next to your change broke.
 5. On failure fix and retry, up to 3 attempts TOTAL. Append every attempt to the task's `## Log`:
    what you tried and the real failure output, not a summary.
 6. Never run git reset, git checkout --, git stash, or anything that discards changes. Do NOT
    commit, run /code-review, move queue files, merge, or message anyone. Leave the change
    uncommitted in the worktree.
 7. Your final reply is ONE line and nothing else:
-   TASK-n: built|blocked - verify exit <code>, suites "<pytest last line>", files: <list>
+   TASK-n: built|blocked - verify exit <code>, suites "<pytest last line of your touched-files run, or none>", files: <list>
    Everything else belongs in the task's Log.
 ```
 
