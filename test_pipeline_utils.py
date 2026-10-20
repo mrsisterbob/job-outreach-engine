@@ -3910,3 +3910,37 @@ def test_d_skills_two_labeled_lines():
             i_bi = next(k for k, l in enumerate(lines) if l.startswith("BI & Reporting:"))
             assert lines[i_bi + 1].startswith("Data: SQL"), (tone, idx, lines[i_bi + 1])
             assert lines[i_bi + 2].startswith("PROFESSIONAL EXPERIENCE"), (tone, idx, lines[i_bi + 2])
+
+
+def test_off_direction_title_gate_pure_cases():
+    from pipeline_utils import is_off_direction_title
+    rejected = (
+        "Onsite IT Administrator: Cloud, Salesforce & Security", "IT Support Specialist",
+        "IT-Support Specialist", "Network Administrator", "Systems Administrator", "System Admin",
+        "Sysadmin", "Sys-Admin", "Help Desk Technician", "Help-Desk Analyst", "Service Desk Analyst",
+        "Support Desk Agent", "Desktop Support Technician", "Tech-Support Specialist", "Cloud Engineer",
+        "Cybersecurity Analyst", "Cyber Security Analyst", "Information Security Analyst",
+        "Data Center Operations Specialist", "Data-Center Technician", "Datacenter Administrator",
+        "Data Center Technician", "24/7 Data Center Engineer", "Data Center Operations Analyst",
+        "Windows Administrator", "Linux Administrator", "Security Operations Center Analyst", "NOC Analyst",
+    )
+    allowed = (
+        "Salesforce Administrator", "Salesforce Systems Administrator", "Business Systems Administrator",
+        "CRM Systems Administrator", "HRIS Administrator", "NetSuite Administrator",
+        "ERP Systems Administrator", "Systems Administrator (Salesforce)", "Systems Analyst",
+        "IT Business Analyst", "IT Operations Analyst", "IT Operations Reporting Analyst",
+        "Business Analyst - IT Operations", "IT Operations Business Analyst",
+        "Business Systems Analyst", "Data Analyst", "Business Data Analyst", "Data Operations Analyst",
+        "Data Engineer", "Data Infrastructure Engineer", "Analytics Infrastructure Engineer",
+        "Business Systems Engineer", "Systems Engineer, Sales", "Salesforce Data Cloud Engineer",
+        "Cybersecurity Governance Analyst", "Information Security Compliance Analyst",
+        "Cybersecurity Marketing Analyst", "Information Security Program Analyst", "Cyber Security GRC Analyst",
+        "Data Center Finance Analyst", "Data Center Procurement Analyst", "Data Center Real Estate Analyst",
+        "Data Center Strategy Analyst", "Data Centers Business Analyst", "Operations Analyst",
+        "Business Analyst", "Reporting Analyst", "Administrative Assistant", "Revenue Operations Analyst",
+        "Revenue Operations Systems Administrator", "Supply Chain Analyst", "BI Analyst", "", None,
+    )
+    for title in rejected:
+        assert is_off_direction_title(title), title
+    for title in allowed:
+        assert not is_off_direction_title(title), title

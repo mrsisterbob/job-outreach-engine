@@ -2951,3 +2951,66 @@ def is_banned_employer(company):
     if not name:
         return False
     return any(re.search(p, name) for p in BANNED_EMPLOYER_PATTERNS)
+
+
+# Titles for work that is not the direction Kevin is headed: IT administration, infrastructure,
+# help desk, security operations, and data center hardware. Lives in code, not in the
+# System_Config sheet, so a deploy is all it takes to reach production (same reason as
+# BANNED_EMPLOYER_PATTERNS). Case-insensitive, word-bounded, and a hyphen counts as a space.
+# Business-systems work stays: "Salesforce Administrator", "Business Systems Administrator",
+# "Systems Analyst", "IT Business Analyst", "IT Operations Analyst", "Data Analyst",
+# "Data Engineer", "Data Infrastructure Engineer" and "Cybersecurity Compliance Analyst" pass.
+OFF_DIRECTION_TITLE_PATTERNS = (
+    r"\bit[\s-]+(?:administrator|admin|support|technician|specialist)\b",
+    r"\b(?:network|server|desktop|database|windows|linux|unix|azure|aws|vmware)[\s-]+(?:administrator|admin|technician)\b",
+    r"\bsys[\s-]?admin\b",
+    r"\bhelp[\s-]?desk\b",
+    r"\b(?:service|support)[\s-]desk\b",
+    r"\b(?:desktop|technical|tech)[\s-]+support\b",
+    r"\bnoc[\s-]+(?:analyst|technician|engineer)\b",
+    r"\bsecurity[\s-]+operations\b",
+    r"\bsoc[\s-]+analyst\b",
+)
+
+# Patterns that only fire when no exemption matches: (pattern, exemption). A system(s) admin or
+# a cloud engineer with a CRM / ERP / HRIS / business-system word is business-systems work; a
+# cybersecurity or information security title about governance, compliance or risk is not
+# security operations; a data center title about finance, procurement or real estate is not the
+# floor. "Data Center Operations Analyst" is still rejected: "operations" is a floor noun.
+_BIZ_SYSTEM_WORDS = (
+    r"\b(?:salesforce|sfdc|crm|hris|hr\s?is|netsuite|erp|business|hubspot|workday|marketing|revenue|"
+    r"sales|dynamics|oracle|sap|applications?|saas|zendesk|servicenow|data\s+cloud)\b"
+)
+_SECURITY_GOVERNANCE_WORDS = (
+    r"\b(?:governance|compliance|grc|risk|audit|policy|policies|program|marketing|awareness|privacy|"
+    r"business|training|communications?)\b"
+)
+_DATA_CENTER_BUSINESS_WORDS = (
+    r"\b(?:finance|financial|procurement|real\s+estate|strategy|strategic|sales|marketing|legal|"
+    r"accounting|leasing|contracts?|sourcing|business|pricing|investment|market|research)\b"
+)
+OFF_DIRECTION_QUALIFIED_PATTERNS = (
+    (r"\bsystems?[\s-]+(?:administrator|admin)\b", _BIZ_SYSTEM_WORDS),
+    (r"(?<!data[\s-])\bcloud[\s-]+(?:administrator|admin|engineer|technician)\b", _BIZ_SYSTEM_WORDS),
+    (r"\bcyber[\s-]?security\b", _SECURITY_GOVERNANCE_WORDS),
+    (r"\binformation[\s-]+security\b", _SECURITY_GOVERNANCE_WORDS),
+    # Phrase plus a hardware / operations noun anywhere in the title.
+    (r"(?=.*\bdata[\s-]?cent(?:er|re)s?\b)(?=.*\b(?:technician|tech|specialist|administrator|admin|engineer|"
+     r"operations?|ops|facilities|facility|infrastructure|hardware|mechanical|electrical|critical|manager|"
+     r"technologist)\b)", _DATA_CENTER_BUSINESS_WORDS),
+)
+_OFF_DIRECTION_TITLE_RES = tuple(re.compile(p, re.IGNORECASE) for p in OFF_DIRECTION_TITLE_PATTERNS)
+_OFF_DIRECTION_QUALIFIED_RES = tuple(
+    (re.compile(p, re.IGNORECASE), re.compile(x, re.IGNORECASE))
+    for p, x in OFF_DIRECTION_QUALIFIED_PATTERNS
+)
+
+
+def is_off_direction_title(title):
+    """True when the job title names IT admin, infrastructure, help desk, security ops or data center work."""
+    text = str(title or "")
+    if not text.strip():
+        return False
+    if any(rx.search(text) for rx in _OFF_DIRECTION_TITLE_RES):
+        return True
+    return any(rx.search(text) and not exempt.search(text) for rx, exempt in _OFF_DIRECTION_QUALIFIED_RES)
