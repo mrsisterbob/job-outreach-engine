@@ -164,7 +164,7 @@ def build_jsearch_request_config():
         return {"X-RapidAPI-Key": rapidapi_key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}, "https://jsearch.p.rapidapi.com/search"
     logging.error("[CONFIG ERROR] No JSearch API key found in environment variables.")
     return {}, JSEARCH_URL
-_DB_INIT_ERROR = {"error": None}  # set by init_db_or_record() when SQLite cannot be opened at boot
+_DB_INIT_ERROR = {"error": None, "detail": None}  # set by init_db_or_record() when SQLite cannot be opened at boot
 DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs_cache.db")  # override lets tests isolate their own SQLite file
 EVIDENCE_BANK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence_bank.json")
 
@@ -886,6 +886,104 @@ def read_only_db():
     finally:
         _db_read_only.active = previous
 
+
+def sqlite_error_detail(e):
+    """"<ExceptionClass>: <message> [<sqlite_errorname> / <sqlite_errorcode>]". Never raises.
+
+    Python 3.11+ sets sqlite_errorname/sqlite_errorcode on a sqlite3.Error once SQLite raised it
+    (SQLITE_IOERR_SHMSIZE, _WRITE, _FSYNC and _SHORT_READ all print as "disk I/O error" but point
+    at different causes). An exception built by hand has neither, hence getattr and "unknown".
+    """
+    try:
+        name = getattr(e, "sqlite_errorname", None) or "unknown"
+        code = getattr(e, "sqlite_errorcode", None)
+        code = "unknown" if code is None else code
+        return f"{type(e).__name__}: {e} [{name} / {code}]"
+    except Exception:
+        return "unknown error [unknown / unknown]"
+
+
+def db_file_sizes():
+    """Bytes of the database, its -wal and its -shm (None where a file is missing). Never raises."""
+    sizes = {}
+    for key, suffix in (("db_bytes", ""), ("wal_bytes", "-wal"), ("shm_bytes", "-shm")):
+        try:
+            sizes[key] = os.path.getsize(os.path.abspath(DB_PATH) + suffix)
+        except Exception:
+            sizes[key] = None
+    return sizes
+
+
+_PROC_FD_DIR = "/proc/self/fd"  # a module constant so a test can point it at a missing path
+
+
+def process_snapshot():
+    """What the process looked like when SQLite failed. Never raises.
+
+    open_fds is None where /proc does not exist (Windows, macOS).
+    """
+    snap = {"open_fds": None, "threads": None, "uptime_s": None,
+            "db_bytes": None, "wal_bytes": None, "shm_bytes": None}
+    try:
+        snap["open_fds"] = len(os.listdir(_PROC_FD_DIR))
+    except Exception:
+        pass
+    try:
+        snap["threads"] = threading.active_count()
+    except Exception:
+        pass
+    try:
+        snap["uptime_s"] = int(time.time() - APP_START_TIME)
+    except Exception:
+        pass
+    try:
+        snap.update(db_file_sizes())
+    except Exception:
+        pass
+    return snap
+
+
+def process_snapshot_line():
+    """process_snapshot() as one short log/alert line. Never raises."""
+    try:
+        snap = process_snapshot()
+
+        def _v(k):
+            return "unknown" if snap.get(k) is None else snap[k]
+        return (f"open files {_v('open_fds')}, threads {_v('threads')}, up {_v('uptime_s')}s, "
+                f"db/wal/shm bytes {_v('db_bytes')}/{_v('wal_bytes')}/{_v('shm_bytes')}")
+    except Exception:
+        return "open files unknown, threads unknown"
+
+
+def _db_retry_sleep(seconds):
+    time.sleep(seconds)
+
+
+def db_write_with_retry(fn, label, attempts=3, delays=(0.2, 0.8)):
+    """Call fn(); retry a short burst of "disk I/O error" / "database is locked" a few times.
+
+    fn must open its own connection and run ONE `BEGIN IMMEDIATE ... commit`, so a failed attempt
+    rolled back and a retried one cannot double-insert. Any other exception (IntegrityError, a
+    JSON TypeError) is raised at once; after the last attempt the OperationalError is re-raised.
+    Writes only: reads and probes must report the first failure, not hide it.
+    """
+    attempts = max(1, int(attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            result = fn()
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if attempt >= attempts or not ("disk i/o error" in msg or "database is locked" in msg):
+                raise
+            logging.warning(f"[DB RETRY] {label} attempt {attempt}/{attempts} failed: {sqlite_error_detail(e)}")
+            if delays:
+                _db_retry_sleep(delays[min(attempt - 1, len(delays) - 1)])
+            continue
+        if attempt > 1:
+            logging.warning(f"[DB RETRY] {label} succeeded on attempt {attempt}")
+        return result
+
 # Seed values for a brand-new search_filters table. Module-level (not inlined in init_db) so
 # restore_core_sourcing_filters() can put target_queries back if a restart ever leaves it blank.
 DEFAULT_SEARCH_FILTERS = {
@@ -1106,6 +1204,8 @@ def init_db_or_record():
     except Exception as e:
         logging.exception("init_db failed at boot; starting degraded")
         _DB_INIT_ERROR["error"] = str(e) or type(e).__name__
+        # Only worth a second line when SQLite named the error; otherwise it just repeats the message.
+        _DB_INIT_ERROR["detail"] = sqlite_error_detail(e) if getattr(e, "sqlite_errorname", None) else None
         return False
 
 
@@ -1565,16 +1665,21 @@ def get_filter(key, default_val=None):
             if row:
                 return json.loads(row[0])
     except Exception as e:
-        logging.error(f"Filter Read Error ({key}): {e}")
+        # Cheap on purpose: get_filter fails on every call while the database is down. The process
+        # snapshot (a /proc listing and file stats) is taken only when the alert cooldown lets one out.
+        logging.error(f"Filter Read Error ({key}): {e} | {sqlite_error_detail(e)}")
         # Still return default_val (callers rely on it), but a failed read must not look like an
         # empty configuration: record it and raise a debounced alert. Never raises from here.
         try:
             _DB_LAST_ERROR["at"] = time.time()
             _DB_LAST_ERROR["error"] = str(e) or type(e).__name__
             if local_alert_cooldown("db_error", 1):
+                snapshot = process_snapshot_line()
+                logging.error(f"Filter Read Error process snapshot: {snapshot}")
                 send_health_alert(
-                    f"\U0001F534 Database read failed for filter '{key}': {_DB_LAST_ERROR['error']}. "
-                    "The default was used instead. Check /health."
+                    f"\U0001F534 Database read failed for filter '{key}': {sqlite_error_detail(e)}. "
+                    "The default was used instead. Check /health.\n"
+                    f"{snapshot}"
                 )
         except Exception:
             pass
@@ -1844,7 +1949,7 @@ def log_metric_event(event_type, sheet_uuid=None, source=None):
     `source` (jsearch/greenhouse/lever/ashby/manual_ingest) is optional, used for per-source
     discovery/screening counts in /outcomes and the Tuesday hub.
     """
-    try:
+    def _write():
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
@@ -1852,9 +1957,11 @@ def log_metric_event(event_type, sheet_uuid=None, source=None):
                 (event_type, sheet_uuid, source)
             )
             conn.commit()
+    try:
+        db_write_with_retry(_write, f"metric:{event_type}")
         return True
     except Exception as e:
-        logging.error(f"DB Metric Log Error ({event_type}): {e}")
+        logging.error(f"DB Metric Log Error ({event_type}): {e} | {sqlite_error_detail(e)} | {process_snapshot_line()}")
         return False
 
 def get_metric_count(event_type):
@@ -2454,7 +2561,7 @@ def log_daily_activity(activity_type):
         logging.error(f"Invalid daily_activity type: {activity_type}")
         return False
     today_str = datetime.now().strftime("%Y-%m-%d")
-    try:
+    def _write():
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
@@ -2463,9 +2570,11 @@ def log_daily_activity(activity_type):
                 (today_str,)
             )
             conn.commit()
+    try:
+        db_write_with_retry(_write, f"daily_activity:{activity_type}")
         return True
     except Exception as e:
-        logging.error(f"DB Daily Activity Error ({activity_type}): {e}")
+        logging.error(f"DB Daily Activity Error ({activity_type}): {e} | {sqlite_error_detail(e)} | {process_snapshot_line()}")
         return False
 
 def get_daily_activity(date_str):
@@ -2633,7 +2742,7 @@ def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_
     if not telegram_message_id or not sheet_uuid:
         return False
     clean_email = str(contact_email or "").split(" [")[0].strip().lower()
-    try:
+    def _write():
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
@@ -2642,9 +2751,11 @@ def save_message_mapping(telegram_message_id, sheet_uuid, sheet_tab="", contact_
                 VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM sheet_row_map WHERE sheet_uuid = ?), CURRENT_TIMESTAMP))
             """, (sheet_uuid, sheet_tab, contact_name, contact_company, telegram_message_id, clean_email, sheet_uuid))
             conn.commit()
+    try:
+        db_write_with_retry(_write, "message_mapping")
         return True
     except Exception as e:
-        logging.error(f"DB Message Mapping Save Error ({telegram_message_id}): {e}")
+        logging.error(f"DB Message Mapping Save Error ({telegram_message_id}): {e} | {sqlite_error_detail(e)} | {process_snapshot_line()}")
         return False
 
 def record_captured_contact(sheet_uuid, sheet_tab, contact_name="", contact_company="", contact_email=""):
@@ -5479,7 +5590,7 @@ def process_single_candidate(job, force=False):
 # ==============================================================================
 def save_gmail_draft_record(to_email, subject, draft_id):
     """Persist a created Gmail draft's identity atomically for 24h dedup checks."""
-    try:
+    def _write():
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
@@ -5487,9 +5598,11 @@ def save_gmail_draft_record(to_email, subject, draft_id):
                 (to_email, subject, draft_id)
             )
             conn.commit()
+    try:
+        db_write_with_retry(_write, "gmail_draft")
         return True
     except Exception as e:
-        logging.error(f"DB Gmail Draft Save Error ({to_email}): {e}")
+        logging.error(f"DB Gmail Draft Save Error ({to_email}): {e} | {sqlite_error_detail(e)} | {process_snapshot_line()}")
         return False
 
 def check_existing_gmail_draft(to_email, subject):
@@ -8810,7 +8923,7 @@ def enqueue_crm_payloads(payloads):
     follow-up date) must not leave half of them queued when one insert fails.
     """
     payloads = list(payloads)
-    try:
+    def _write():
         with get_db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -8823,16 +8936,19 @@ def enqueue_crm_payloads(payloads):
             except Exception:
                 conn.rollback()
                 raise
+    try:
+        db_write_with_retry(_write, "crm_outbox_enqueue")
         return True
     except Exception as e:
-        logging.error(f"CRM Outbox Enqueue Error: {e}")
+        logging.error(f"CRM Outbox Enqueue Error: {e} | {sqlite_error_detail(e)} | {process_snapshot_line()}")
         try:
             if local_alert_cooldown("crm_outbox_enqueue_failed", 1):
                 actions = [p.get("action") for p in payloads if isinstance(p, dict) and p.get("action")]
                 action = ", ".join(actions) if actions else None
                 send_health_alert(
-                    f"\U0001F534 A Sheets write was NOT queued (action: {action or 'unknown'}): {e}. "
-                    "It is lost unless redone by hand. Check /health."
+                    f"\U0001F534 A Sheets write was NOT queued (action: {action or 'unknown'}): {sqlite_error_detail(e)}. "
+                    "It is lost unless redone by hand. Check /health.\n"
+                    f"{process_snapshot_line()}"
                 )
         except Exception:
             pass
@@ -14916,7 +15032,7 @@ def db_health_probe():
     succeed through get_db_conn().
     """
     start = time.time()
-    ok, error, journal_mode = False, None, None
+    ok, error, journal_mode, error_detail = False, None, None, None
     try:
         with get_db_conn() as conn:
             cur = conn.cursor()
@@ -14927,6 +15043,7 @@ def db_health_probe():
         ok = True
     except Exception as e:
         error = str(e) or type(e).__name__
+        error_detail = sqlite_error_detail(e)
     elapsed_ms = round((time.time() - start) * 1000, 2)
 
     def _guard(fn, default=None):
@@ -14934,9 +15051,6 @@ def db_health_probe():
             return fn()
         except Exception:
             return default
-
-    def _size(path):
-        return _guard(lambda: os.path.getsize(path))
 
     db_path = _guard(lambda: os.path.abspath(DB_PATH), str(DB_PATH))
     db_dir = _guard(lambda: os.path.dirname(db_path) or ".", ".")
@@ -14953,6 +15067,7 @@ def db_health_probe():
         "ok": ok,
         "journal_mode": journal_mode,
         "error": error,
+        "error_detail": error_detail,
         "init_error": _DB_INIT_ERROR["error"],
         "elapsed_ms": elapsed_ms,
         "db_path": db_path,
@@ -14960,9 +15075,7 @@ def db_health_probe():
         "db_dir_writable": _guard(lambda: os.access(db_dir, os.W_OK), False),
         "disk_free_mb": round(usage.free / 1048576, 1) if usage else None,
         "disk_total_mb": round(usage.total / 1048576, 1) if usage else None,
-        "db_bytes": _size(db_path),
-        "wal_bytes": _size(db_path + "-wal"),
-        "shm_bytes": _size(db_path + "-shm"),
+        **db_file_sizes(),
         "backup_dir": BACKUP_DIR,
         "backup_bytes": _guard(_backup_total),
     }
@@ -14987,6 +15100,11 @@ def alert_if_db_unhealthy_at_boot():
             lines.append(f"Error: {init_error}")
         lines.append(f"DB path: {probe['db_path']}")
         lines.append(f"Free disk: {free if free is not None else 'unknown'} MB")
+        if probe.get("error_detail"):
+            lines.append(f"SQLite: {probe['error_detail']}")
+        elif _DB_INIT_ERROR.get("detail") and init_error:
+            lines.append(f"SQLite (init): {_DB_INIT_ERROR['detail']}")
+        lines.append(process_snapshot_line())
         send_health_alert("\n".join(lines))
     return probe
 
