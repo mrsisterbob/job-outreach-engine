@@ -321,6 +321,20 @@ On success - verify, both suites and the review all green:
    ```bash
    git status --porcelain
    git symbolic-ref --short HEAD
+   .venv/Scripts/python queue_baseline.py check; echo "baseline-check=$?"
+   ```
+
+   The first two lines are the dirty-folder and branch checks, and they run on every task,
+   unchanged. `queue_baseline.py check` asks whether the baseline below can be skipped: it
+   exits 0 and prints `baseline skipped: main == proven-green tree (<short id>), proof recorded
+   <UTC time>` only when
+   `main`'s tracked tree (not counting `FUNCTION_INDEX.md`) is the tree the previous task's
+   green post-merge run (step 6) recorded, the folder is clean, the branch is `main`, and the
+   proof is recent. Any other result - exit 1, no output, an error, anything you cannot read
+   - means **run the baseline**; when in doubt, run it. On a skip, append that whole line
+   (it names the proof it skipped on) to the Log and go to step 4. Otherwise run the baseline:
+
+   ```bash
    out=$(mktemp)
    .venv/Scripts/python -m pytest test_main_integration.py test_pipeline_utils.py -q \
      -p no:cacheprovider >"$out" 2>&1; rc=$?
@@ -359,6 +373,10 @@ On success - verify, both suites and the review all green:
      to abort. Treat it as a held merge (step 3, first bullet) and stop the loop.
 6. **Re-run both suites on `main`, from the main folder** (same command as the baseline,
    quiet output included, per "Keep context small").
+   **Before the run, capture the tree id** (the tracked-tree digest of the merged `main`):
+   `.venv/Scripts/python queue_baseline.py tree` prints it; note it as `<T>`. The run's
+   `exit=` value is `<rc>`; both go into the record step after 6a. Capture only once, for
+   the FIRST post-merge run - not again after a revert.
    This is also the first run of the montelattice-site test, which skips inside a worktree.
    **If anything is red, first run `git status --porcelain` again.** If it prints anything,
    someone edited the main folder during the run, and the red cannot be pinned on your
@@ -408,6 +426,22 @@ On success - verify, both suites and the review all green:
    if it refuses over the index alone, keep the worktree and say so - then move the task to
    `done/` and `rmdir .queue/merge.lock`) before you stop. Otherwise the lock is
    left held and a merged task sits in `active/`.
+
+   **Record the proof** - the last thing before step 7, only when step 6a finished without a
+   stop (index committed, or nothing to commit) and `git status --porcelain` is empty:
+
+   ```bash
+   .venv/Scripts/python queue_baseline.py record --exit <rc> --tree <T>
+   ```
+
+   `<rc>` is the exit code of the FIRST post-merge suite run of step 6 and `<T>` the tree id
+   captured before that run. Never pass the rc of a re-run after a `git revert`: a reverted
+   merge records nothing. The command enforces this itself and prints "not recorded"
+   (exit 1, nothing written) unless `<rc>` is 0, the tree is still `<T>` (nothing landed
+   between the run and now), the folder is clean and the branch is `main`. It stores the
+   tree content (not the commit id, and not `FUNCTION_INDEX.md`) under the git directory,
+   where `git status` never sees it, so the next task's step 3 can skip the baseline if
+   `main` has not changed since. "Not recorded" is not an error - the next baseline just runs.
 7. **Green on `main`:** only now remove the worktree and branch, mark the task done, and
    release the lock. Task scopes never include `FUNCTION_INDEX.md`, but a regenerated copy can
    still be left uncommitted in the worktree, so check it first:
