@@ -9,7 +9,7 @@ Hard rules, each with a test in test_referral_asks.py:
   - Every draft passes pipeline_utils.negative_language_hits() before it can be stored. A role whose
     title or link trips the gate on its own is left OUT; a draft with a hit is never returned.
   - The "why Kevin fits" sentence is a bullet taken VERBATIM from the resume bullet bank for the
-    track the TITLE implies (track_registry.override_track_for_title). No title rule, no sentence:
+    track the TITLE implies (track_registry.track_for_title). No title rule, no sentence:
     blank beats false. An employer is named only when the bullet's own metadata names one.
   - A requisition id is shown only when the board gave a non-empty value with no spaces (a Greenhouse
     board can return the placeholder "See Opening ID").
@@ -18,10 +18,6 @@ import re
 
 import pipeline_utils as pu
 import track_registry
-
-# override_track_for_title() hands a track back unchanged unless the current one is finance-framed,
-# and no title rule ever selects "a". So starting from "a", a different answer means a rule fired.
-_PROBE_TRACK = "a"
 
 # Verb-first bullets only: a first word is lower-cased for the endorsement when it is a plain
 # capitalised past-tense verb. Anything else (an acronym, "SQL", "iPhone", a noun such as
@@ -81,8 +77,7 @@ def merge_roles(existing, new, taken_hashes=()):
 def derive_track(title, company="") -> str:
     """The track letter the TITLE alone implies, or "" when no title rule fires (or the employer is
     itself a financial-services business, which the registry refuses to override)."""
-    letter = track_registry.override_track_for_title(_PROBE_TRACK, title, employer=company)
-    return "" if letter == _PROBE_TRACK else letter
+    return track_registry.track_for_title(title, employer=company) or ""
 
 
 def _bullet_text(entry) -> str:
