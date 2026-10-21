@@ -1216,6 +1216,35 @@ def init_db_or_record():
         return False
 
 
+def _ensure_one_pending_referral_ask_per_contact(conn):
+    """Make "one pending referral ask per contact" a database fact, never a boot failure.
+
+    store_referral_asks holds the invariant by code order; the partial unique index is the backstop
+    for any write path that bypasses it. A database that already holds two pending rows for one
+    contact would make CREATE UNIQUE INDEX fail, so those are collapsed first: the NEWEST pending
+    row stays, each older one is set to 'dismissed' (not deleted, so its roles stay "taken" and
+    are never asked about again) and the ids are logged. Any failure here is logged, not raised.
+    """
+    try:
+        dupes = conn.execute(
+            "SELECT sheet_uuid, MAX(id) FROM referral_asks WHERE status = 'pending' "
+            "GROUP BY sheet_uuid HAVING COUNT(*) > 1").fetchall()
+        for sheet_uuid, newest_id in dupes:
+            older = [r[0] for r in conn.execute(
+                "SELECT id FROM referral_asks WHERE sheet_uuid = ? AND status = 'pending' AND id < ?",
+                (sheet_uuid, newest_id)).fetchall()]
+            conn.execute(
+                "UPDATE referral_asks SET status = 'dismissed', updated_at = ? "
+                "WHERE sheet_uuid = ? AND status = 'pending' AND id < ?",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), sheet_uuid, newest_id))
+            logging.warning(f"[DB] referral_asks: {len(older) + 1} pending asks for one contact; kept "
+                            f"#{newest_id}, dismissed older {older}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_asks_one_pending "
+                     "ON referral_asks(sheet_uuid) WHERE status = 'pending'")
+    except Exception as e:
+        logging.error(f"[DB] referral_asks one-pending-per-contact index not created: {e}")
+
+
 def init_db():
     """Initializes local SQLite tables with WAL mode enabled for multithreaded concurrency."""
     with get_db_conn() as conn:
@@ -1427,6 +1456,7 @@ def init_db():
             sent_at TIMESTAMP
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_asks_contact ON referral_asks(sheet_uuid, status)")
+        _ensure_one_pending_referral_ask_per_contact(conn)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS owed_dismissals (
             sheet_uuid TEXT PRIMARY KEY,
@@ -13123,6 +13153,29 @@ def _referral_ask_entries(track):
     return resume_engine.filter_ats_bullet_entries(track)
 
 
+def _referral_run_state(sheet_uuids):
+    """(taken job_hashes, {sheet_uuid: (id, roles_json)}) read once for a whole /w run.
+
+    `taken` is every job_hash in ANY ask whatever its status; the dict holds the newest PENDING ask
+    of each contact named in this run, from ONE query over those contacts.
+    """
+    taken, pending = set(), {}
+    with get_db_conn() as conn:
+        for (blob,) in conn.execute("SELECT roles_json FROM referral_asks").fetchall():
+            try:
+                taken.update(r.get("job_hash") for r in json.loads(blob or "[]"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        uuids = sorted(set(sheet_uuids))
+        for start in range(0, len(uuids), 500):
+            chunk = uuids[start:start + 500]
+            for row_id, uuid_, blob in conn.execute(
+                    "SELECT id, sheet_uuid, roles_json FROM referral_asks WHERE status = 'pending' "
+                    f"AND sheet_uuid IN ({','.join('?' * len(chunk))}) ORDER BY id", chunk).fetchall():
+                pending[uuid_] = (row_id, blob)  # ORDER BY id: the newest wins
+    return taken, pending
+
+
 def store_referral_asks(pending):
     """Render and store the referral asks for the roles /w just surfaced. NEVER sends, never drafts.
 
@@ -13130,18 +13183,39 @@ def store_referral_asks(pending):
     "roles": [referral_asks.build_role(...)]}. Per contact, in one write transaction:
       - a role (job_hash) already in ANY ask, whatever its status, is never added again;
       - an existing PENDING ask for the contact takes the new roles and is re-rendered in place,
-        otherwise a new row is created (one message per contact, never a second pending row);
+        otherwise a new row is created (one message per contact, never a second pending row; the
+        partial unique index idx_referral_asks_one_pending is the backstop, and an insert that
+        collides with it falls back to updating the pending row it collided with);
       - a draft is stored only when it passes the wording gate; a role the gate rejects is counted.
+    The taken roles and the pending asks are read ONCE per run, not once per contact.
     A contact with no sheet_uuid is skipped and counted. One contact failing never stops the rest.
     Returns {"stored", "left_out", "no_uuid", "failed"}.
+
+    A role that was NOT stored as an ask (left out by the wording gate, no sheet_uuid, or a failed
+    store) is NOT counted again on a later /w: the card and the Clavicular row already went out and
+    the role is a live Clavicular row in the CRM (is_role_tracked), so the next /w skips it. Nothing records that an ask is owed; the
+    counts in the closing message are the only trace, and a store failure is a database problem
+    that the TASK-93/95 alerts report.
     """
     result = {"stored": 0, "left_out": 0, "no_uuid": 0, "failed": 0}
+    entries = []
     for company_key, entry in (pending or {}).items():
         contact = entry.get("contact") or {}
         sheet_uuid = str(contact.get("sheet_uuid") or "").strip()
         if not sheet_uuid:
             result["no_uuid"] += 1
             continue
+        entries.append((company_key, entry, contact, sheet_uuid))
+    if not entries:
+        return result
+    try:
+        taken, pending_rows = _referral_run_state([e[3] for e in entries])
+    except Exception as e:
+        result["failed"] += len(entries)
+        logging.error(f"Referral ask state read failed: {e}")
+        return result
+
+    for company_key, entry, contact, sheet_uuid in entries:
         company = entry.get("company") or ""
         new_roles = entry.get("roles") or []
 
@@ -13149,54 +13223,66 @@ def store_referral_asks(pending):
             evidence = resume_engine.load_evidence_bank()
             with get_db_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                taken = set()
-                for (blob,) in conn.execute("SELECT roles_json FROM referral_asks").fetchall():
+                row = pending_rows.get(sheet_uuid)
+                for attempt in (0, 1):
+                    if attempt:
+                        # The unique index (or a status change) showed the run's snapshot was stale.
+                        row = conn.execute(
+                            "SELECT id, roles_json FROM referral_asks WHERE sheet_uuid = ? "
+                            "AND status = 'pending' ORDER BY id DESC LIMIT 1", (sheet_uuid,)).fetchone()
+                    existing = json.loads(row[1]) if row else []
+                    merged, added = referral_asks.merge_roles(existing, new_roles, taken_hashes=taken)
+                    if not added:
+                        conn.commit()
+                        return 0, 0, None
+                    composed = referral_asks.compose_ask(
+                        first_name_for_greeting(contact.get("name")), company, merged,
+                        (evidence.get("identity") or {}).get("name") or "Kevin",
+                        _referral_ask_entries, evidence.get("experience") or [])
+                    added_hashes = {r["job_hash"] for r in added}
+                    left_out = len([r for r in composed["left_out"] if r["job_hash"] in added_hashes])
+                    if not composed["body"]:
+                        conn.commit()
+                        return 0, left_out, None
+                    if row and composed["kept"] == existing:
+                        # Every newly added role was dropped by the gate: the stored draft is unchanged,
+                        # so it is neither rewritten nor counted as stored. The drops are still reported.
+                        conn.commit()
+                        return 0, left_out, None
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    roles_json = json.dumps(composed["kept"])
+                    if row:
+                        cur = conn.execute(
+                            "UPDATE referral_asks SET roles_json = ?, body = ?, contact_name = ?, company = ?, "
+                            "updated_at = ? WHERE id = ? AND status = 'pending' AND roles_json = ?",
+                            (roles_json, composed["body"], contact.get("name") or "", company, now,
+                             row[0], row[1]))
+                        if cur.rowcount:
+                            conn.commit()
+                            return 1, left_out, (row[0], roles_json)
+                        continue  # sent, or its roles changed since the snapshot: look again
                     try:
-                        taken.update(r.get("job_hash") for r in json.loads(blob or "[]"))
-                    except (TypeError, ValueError):
-                        continue
-                row = conn.execute(
-                    "SELECT id, roles_json FROM referral_asks WHERE sheet_uuid = ? AND status = 'pending' "
-                    "ORDER BY id DESC LIMIT 1", (sheet_uuid,)).fetchone()
-                existing = json.loads(row[1]) if row else []
-                merged, added = referral_asks.merge_roles(existing, new_roles, taken_hashes=taken)
-                if not added:
+                        cur = conn.execute(
+                            "INSERT INTO referral_asks (sheet_uuid, contact_name, company, company_key, status, "
+                            "roles_json, body, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                            (sheet_uuid, contact.get("name") or "", company, company_key, roles_json,
+                             composed["body"], now, now))
+                    except sqlite3.IntegrityError:
+                        continue  # a pending ask for this contact exists: merge into it
                     conn.commit()
-                    return 0, 0
-                composed = referral_asks.compose_ask(
-                    first_name_for_greeting(contact.get("name")), company, merged,
-                    (evidence.get("identity") or {}).get("name") or "Kevin",
-                    _referral_ask_entries, evidence.get("experience") or [])
-                added_hashes = {r["job_hash"] for r in added}
-                left_out = len([r for r in composed["left_out"] if r["job_hash"] in added_hashes])
-                if not composed["body"]:
-                    conn.commit()
-                    return 0, left_out
-                if row and composed["kept"] == existing:
-                    # Every newly added role was dropped by the gate: the stored draft is unchanged,
-                    # so it is neither rewritten nor counted as stored. The drops are still reported.
-                    conn.commit()
-                    return 0, left_out
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                roles_json = json.dumps(composed["kept"])
-                if row:
-                    conn.execute(
-                        "UPDATE referral_asks SET roles_json = ?, body = ?, contact_name = ?, company = ?, "
-                        "updated_at = ? WHERE id = ?",
-                        (roles_json, composed["body"], contact.get("name") or "", company, now, row[0]))
-                else:
-                    conn.execute(
-                        "INSERT INTO referral_asks (sheet_uuid, contact_name, company, company_key, status, "
-                        "roles_json, body, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
-                        (sheet_uuid, contact.get("name") or "", company, company_key, roles_json,
-                         composed["body"], now, now))
-                conn.commit()
-                return 1, left_out
+                    return 1, left_out, (cur.lastrowid, roles_json)
+                raise RuntimeError("pending referral ask kept changing under the write")
 
         try:
-            wrote, left_out = db_write_with_retry(_write, "referral_asks")
+            wrote, left_out, stored = db_write_with_retry(_write, "referral_asks")
             result["stored"] += wrote
             result["left_out"] += left_out
+            if stored:
+                pending_rows[sheet_uuid] = stored
+                try:
+                    taken.update(r.get("job_hash") for r in json.loads(stored[1]))
+                except (TypeError, ValueError):
+                    pass
         except Exception as e:
             result["failed"] += 1
             logging.error(f"Referral ask store failed for {company}: {e}")
@@ -13630,7 +13716,9 @@ def run_warm_radar_scan(chat_id=None):
                              other_contacts=max(0, int(contact.get("count") or 1) - 1))
         try:
             # Collected only; the asks are rendered and stored AFTER the card loop so nothing
-            # here can ever stop a card.
+            # here can ever stop a card. A role that ends up with no stored ask (gate, no CRM id,
+            # store failure) is NOT picked up by a later /w: its Clavicular row below makes
+            # is_role_tracked skip it next time, and no table records that an ask is owed.
             ask_company_raw = contact.get("raw_company") or company
             pending_entry = referral_pending.setdefault(
                 normalize_company_for_match(ask_company_raw),

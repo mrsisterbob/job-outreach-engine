@@ -330,6 +330,28 @@ def employer_is_financial_services(employer) -> bool:
     return bool(_FINANCE_EMPLOYER_RE.search(str(employer or "")))
 
 
+def _title_rule_track(job_title):
+    """The track letter the first title rule that fires selects, else None. The ONE reader of
+    _TITLE_TRACK_RULES: override_track_for_title and track_for_title both go through it."""
+    title = str(job_title or "")
+    for pattern, target in _TITLE_TRACK_RULES:
+        if pattern.search(title):
+            return target
+    return None
+
+
+def track_for_title(job_title, employer=None, tone_mode=None):
+    """The track letter a job TITLE implies, or None when no title rule fires.
+
+    Same rules and the same two employer guards as override_track_for_title, without a current
+    track to compare against: None means "no title rule applies" (including a financial-services
+    employer or tone_mode "conservative", where the registry refuses to override), never a default.
+    """
+    if tone_mode == "conservative" or employer_is_financial_services(employer):
+        return None
+    return _title_rule_track(job_title)
+
+
 def override_track_for_title(track, job_title, employer=None, tone_mode=None) -> str:
     """`track`, or the track a high-confidence non-finance job TITLE demands instead.
 
@@ -340,13 +362,7 @@ def override_track_for_title(track, job_title, employer=None, tone_mode=None) ->
     letter = normalize_track(track)
     if letter not in _FINANCE_FRAMED_TRACKS:
         return letter
-    if tone_mode == "conservative" or employer_is_financial_services(employer):
-        return letter
-    title = str(job_title or "")
-    for pattern, target in _TITLE_TRACK_RULES:
-        if pattern.search(title):
-            return target
-    return letter
+    return track_for_title(job_title, employer=employer, tone_mode=tone_mode) or letter
 
 
 def normalize_track(value) -> str:

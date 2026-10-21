@@ -225,3 +225,55 @@ def test_referral_ask_drafts_stored_title_is_kept_as_the_board_wrote_it():
     assert role["title"] == "Sales, Marketing, and Operations Analyst"
     role = ra.build_role("Analyst: Supply Chain; Logistics", "https://x.example/2", "", "h2")
     assert role["title"] == "Analyst: Supply Chain; Logistics"
+
+
+# ---- TASK-126: the track comes from a public registry function, not from a probe ----
+
+def test_referral_asks_review_followups_track_for_title_is_none_when_no_rule_fires():
+    import track_registry as tr
+    assert tr.track_for_title("Operations Analyst") is None
+    assert tr.track_for_title("") is None and tr.track_for_title(None) is None
+    assert tr.track_for_title("Supply Chain Analyst") == "g"
+    assert tr.track_for_title("Logistics Coordinator") == "f"
+    assert tr.track_for_title("Automation Analyst") == "h"
+    assert tr.track_for_title("Data Analyst") == "d"
+
+
+def test_referral_asks_review_followups_track_for_title_keeps_the_employer_guards():
+    import track_registry as tr
+    assert tr.track_for_title("Supply Chain Analyst", employer="First Capital Bank") is None
+    assert tr.track_for_title("Supply Chain Analyst", tone_mode="conservative") is None
+    assert tr.track_for_title("Supply Chain Analyst", employer="Acme Robotics") == "g"
+
+
+def test_referral_asks_review_followups_override_track_for_title_is_unchanged():
+    import track_registry as tr
+    cases = [("e", "Supply Chain Analyst", "g"), ("a", "Logistics Coordinator", "f"),
+             ("c", "Automation Analyst", "h"), ("b", "Data Analyst", "d"),
+             ("e", "Operations Analyst", "e"), ("f", "Supply Chain Analyst", "f"),
+             ("h", "Data Analyst", "h"), ("zzz", "Operations Analyst", tr.normalize_track("zzz"))]
+    for track, title, want in cases:
+        assert tr.override_track_for_title(track, title, employer="Acme Robotics") == want, (track, title)
+    assert tr.override_track_for_title("e", "Supply Chain Analyst", employer="First Capital Bank") == "e"
+    assert tr.override_track_for_title("e", "Supply Chain Analyst", tone_mode="conservative") == "e"
+
+
+def test_referral_asks_review_followups_derive_track_does_not_probe_the_override(monkeypatch):
+    import track_registry as tr
+
+    def boom(*a, **kw):
+        raise AssertionError("derive_track must not call override_track_for_title")
+
+    monkeypatch.setattr(tr, "override_track_for_title", boom)
+    assert ra.derive_track("Supply Chain Analyst", "Acme Robotics") == "g"
+    assert ra.derive_track("Operations Analyst", "Acme Robotics") == ""
+    assert ra.derive_track("Supply Chain Analyst", "First Capital Bank") == ""
+
+
+def test_referral_asks_review_followups_no_rule_means_no_fit_sentence_and_no_endorsement():
+    assert ra.pick_fit("Operations Analyst", "Acme Robotics", _entries, _experience()) is None
+    body = _compose([_role("Operations Analyst", 1)])["body"]
+    assert "example" not in body and "paste into the referral form" not in body
+    assert "Would you be willing to refer me for it?" in body
+    fit = ra.pick_fit("Supply Chain Analyst", "Acme Robotics", _entries, _experience())
+    assert fit is not None and fit["sentence"] in _compose([_role("Supply Chain Analyst", 1)])["body"]

@@ -15707,3 +15707,167 @@ def test_refer_command_pages_pending_asks_a_cut_never_lands_inside_an_html_entit
         assert not re.search(r"&(?!(?:amp|lt|gt|quot|#x27);)", code), code[:80]
         assert "<" not in code
     assert html.unescape("".join(codes)).replace("\n", "") == body
+
+
+# ---- TASK-126: one pending referral ask per contact is a database fact, not code order ----
+
+def _seed_pending_ask(sheet_uuid, hash_, status="pending", created="2026-10-01 09:00:00"):
+    roles = [{"title": "Supply Chain Analyst", "link": f"https://boards.greenhouse.io/acme/jobs/{hash_}",
+              "req": "", "job_hash": hash_}]
+    with m.get_db_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO referral_asks (sheet_uuid, contact_name, company, company_key, status, roles_json, "
+            "body, created_at, updated_at) VALUES (?, 'Dana Reyes', 'Acme Robotics', 'acmerobotics', ?, ?, "
+            "'old body', ?, ?)", (sheet_uuid, status, json.dumps(roles), created, created))
+        return cur.lastrowid
+
+
+def _pending_index_exists():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                            "AND name = 'idx_referral_asks_one_pending'").fetchone() is not None
+
+
+def test_referral_asks_review_followups_index_rejects_a_second_pending_row_but_not_a_sent_one():
+    assert _pending_index_exists()
+    _seed_pending_ask("u-dana", "h1")
+    _seed_pending_ask("u-dana", "h2", status="sent")      # history is allowed
+    _seed_pending_ask("u-other", "h3")                    # another contact is allowed
+    with pytest.raises(sqlite3.IntegrityError):
+        _seed_pending_ask("u-dana", "h4")
+    assert [(r["sheet_uuid"], r["status"]) for r in _asks()] == [
+        ("u-dana", "pending"), ("u-dana", "sent"), ("u-other", "pending")]
+
+
+def test_referral_asks_review_followups_boot_collapses_seeded_duplicates_and_still_builds_the_index():
+    with m.get_db_conn() as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_referral_asks_one_pending")
+    old = _seed_pending_ask("u-dana", "h1", created="2026-10-01 09:00:00")
+    newest = _seed_pending_ask("u-dana", "h2", created="2026-10-02 09:00:00")
+    mid = _seed_pending_ask("u-dana", "h3", created="2026-10-03 09:00:00")
+    other = _seed_pending_ask("u-other", "h4")
+    sent = _seed_pending_ask("u-dana", "h5", status="sent")
+    assert not _pending_index_exists()
+
+    m.init_db()  # the boot path: must not raise on the duplicates
+
+    assert _pending_index_exists()
+    status = {r["id"]: r["status"] for r in _asks()}
+    assert status == {old: "dismissed", newest: "dismissed", mid: "pending", other: "pending", sent: "sent"}
+    m.init_db()  # and a second boot is a no-op
+    assert {r["id"]: r["status"] for r in _asks()} == status
+
+
+def test_referral_asks_review_followups_boot_survives_an_index_that_cannot_be_built(monkeypatch):
+    class _Conn:
+        def execute(self, sql, *a):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    m._ensure_one_pending_referral_ask_per_contact(_Conn())  # logs, never raises
+
+
+def _ask_pending_entry(first_hash_title, uuid="u-dana", name="Dana Reyes", key="acmerobotics"):
+    return {"contact": {"sheet_uuid": uuid, "name": name}, "company": "Acme Robotics",
+            "roles": [m.referral_asks.build_role(t, f"https://boards.greenhouse.io/acme/jobs/{h}", "", h)
+                      for h, t in first_hash_title]}
+
+
+def test_referral_asks_review_followups_store_reads_the_pending_asks_once_per_run(monkeypatch):
+    calls = []
+    real = m._referral_run_state
+    monkeypatch.setattr(m, "_referral_run_state", lambda uuids: calls.append(list(uuids)) or real(uuids))
+    summary = m.store_referral_asks({
+        "acme": _ask_pending_entry([("a1", "Supply Chain Analyst")], uuid="u-dana"),
+        "globex": _ask_pending_entry([("g1", "Logistics Coordinator")], uuid="u-sam", name="Sam Lee"),
+    })
+    assert summary["stored"] == 2 and summary["failed"] == 0
+    assert len(calls) == 1 and sorted(calls[0]) == ["u-dana", "u-sam"]
+    assert sorted(r["sheet_uuid"] for r in _asks()) == ["u-dana", "u-sam"]
+
+
+def test_referral_asks_review_followups_store_falls_back_to_the_pending_row_the_index_protects(monkeypatch):
+    """The run's snapshot says 'no pending ask' while one exists (a write that bypassed the store):
+    the insert collides with the unique index and the store merges into that row instead of failing."""
+    existing = _seed_pending_ask("u-dana", "h1")
+    real = m._referral_run_state
+    monkeypatch.setattr(m, "_referral_run_state", lambda uuids: (real(uuids)[0] - {"h1"}, {}))
+    summary = m.store_referral_asks({"acme": _ask_pending_entry([("h9", "Logistics Coordinator")])})
+    rows = _asks()
+    assert summary == {"stored": 1, "left_out": 0, "no_uuid": 0, "failed": 0}
+    assert len(rows) == 1 and rows[0]["id"] == existing and rows[0]["status"] == "pending"
+    assert {r["job_hash"] for r in json.loads(rows[0]["roles_json"])} == {"h1", "h9"}
+    assert rows[0]["body"] != "old body"
+
+
+def test_referral_asks_review_followups_store_does_not_touch_an_ask_sent_since_the_snapshot(monkeypatch):
+    stale = _seed_pending_ask("u-dana", "h1")
+    real = m._referral_run_state
+
+    def snapshot(uuids):
+        state = real(uuids)
+        with m.get_db_conn() as conn:  # Kevin marks it sent after the snapshot, before the write
+            conn.execute("UPDATE referral_asks SET status = 'sent', sent_at = '2026-10-21 09:00:00'")
+        return state
+
+    monkeypatch.setattr(m, "_referral_run_state", snapshot)
+    summary = m.store_referral_asks({"acme": _ask_pending_entry([("h9", "Logistics Coordinator")])})
+    rows = _asks()
+    assert summary["stored"] == 1 and summary["failed"] == 0
+    assert [(r["id"], r["status"], r["body"]) for r in rows if r["id"] == stale] == [(stale, "sent", "old body")]
+    assert [r["status"] for r in rows if r["id"] != stale] == ["pending"]
+
+
+def test_referral_asks_review_followups_store_failure_is_counted_and_a_later_w_does_not_resurface_the_role(
+        monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", "")])
+    real = m._referral_run_state
+
+    def boom(uuids):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(m, "_referral_run_state", boom)
+    text = h.run()
+    assert h.cards == ["Supply Chain Analyst"] and _asks() == []
+    assert "ask drafts failed" in text, text
+    # The store works again and the role's Clavicular row is now in the CRM (what the first run
+    # enqueued; the harness stubs is_role_tracked to False, so flip it here), so the same postings are skipped as tracked: no card and no ask.
+    monkeypatch.setattr(m, "_referral_run_state", real)
+    monkeypatch.setattr(m, "is_role_tracked", lambda company, title: True)
+    again = h.run()
+    assert h.cards == ["Supply Chain Analyst"], h.cards
+    assert _asks() == [] and "ask draft" not in again, again
+
+
+def test_referral_asks_review_followups_role_added_to_the_pending_ask_after_the_snapshot_survives(monkeypatch):
+    pending_id = _seed_pending_ask("u-dana", "h1")
+    real = m._referral_run_state
+
+    def snapshot(uuids):
+        state = real(uuids)
+        # A concurrent /w adds h2 to the same pending ask after this run's snapshot was taken.
+        roles = [{"title": "Procurement Analyst", "link": "https://boards.greenhouse.io/acme/jobs/h2",
+                  "req": "", "job_hash": "h2"}]
+        with m.get_db_conn() as conn:
+            blob = json.loads(conn.execute("SELECT roles_json FROM referral_asks WHERE id = ?",
+                                           (pending_id,)).fetchone()[0])
+            conn.execute("UPDATE referral_asks SET roles_json = ? WHERE id = ?", (json.dumps(blob + roles), pending_id))
+        return state
+
+    monkeypatch.setattr(m, "_referral_run_state", snapshot)
+    summary = m.store_referral_asks({"acme": _ask_pending_entry([("h9", "Logistics Coordinator")])})
+    rows = _asks()
+    assert summary["stored"] == 1 and summary["failed"] == 0
+    assert len(rows) == 1 and rows[0]["id"] == pending_id and rows[0]["status"] == "pending"
+    assert {r["job_hash"] for r in json.loads(rows[0]["roles_json"])} == {"h1", "h2", "h9"}
+
+
+def test_referral_asks_review_followups_ask_names_the_company_as_the_contact_knows_it(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", "")], contacts=[
+        {"company": "Acme Robotics Inc", "name": "", "email": "dana@acme.example",
+         "raw_priority": 5, "sheet_uuid": "u-dana"}])
+    h.run()
+    rows = _asks()
+    assert len(rows) == 1
+    # Legal suffix cleaned off the contact's own company text; the job's employer reads the same.
+    assert rows[0]["company"] == "Acme Robotics" and "Acme Robotics Inc" not in rows[0]["body"]
+    assert rows[0]["body"].startswith("Hi") and "Acme Robotics" in rows[0]["body"]
