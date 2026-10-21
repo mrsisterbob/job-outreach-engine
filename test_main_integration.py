@@ -6462,6 +6462,9 @@ def finance_boot(monkeypatch):
     Restores the shared rows afterwards."""
     keys = ("target_queries", m.APPLIED_ADDITIONS_KEY)
     saved = {k: _raw_filter(k) for k in keys}
+    # Only the finance addition: later additions (the supplier watchlist) would add their own
+    # System_Config posts and applied ids to the exact-equality assertions below.
+    monkeypatch.setattr(m, "FILTER_ADDITIONS", {"finance-queries-2026-10": m.FILTER_ADDITIONS["finance-queries-2026-10"]})
     old = [q for q in m.DEFAULT_SEARCH_FILTERS["target_queries"] if q not in m.FINANCE_QUERY_PHRASES]
     assert old and len(old) + len(m.FINANCE_QUERY_PHRASES) == len(m.DEFAULT_SEARCH_FILTERS["target_queries"])
     env = {"sheet": list(old), "posts": [], "up": True, "old": old}
@@ -6653,6 +6656,255 @@ def test_finance_queries_reach_the_live_list_each_reads_as_a_title_the_gate_acce
         title = phrase.rsplit(" ", 2)[0]
         assert m.title_rejection_reason(title) is None, phrase
     assert all(q in m.DEFAULT_SEARCH_FILTERS["target_queries"] for q in m.FINANCE_QUERY_PHRASES)
+
+
+# ==============================================================================
+# TASK-121: Michigan auto-supplier Workday boards seeded into the live watchlist
+# ==============================================================================
+
+SUPPLIER_ADDITION_ID = "auto-supplier-watchlist-2026-10"
+# The boards below are exactly the ones whose CXS /jobs endpoint answered a real POST with a posting
+# total on 2026-10-21 (the TASK-121 log carries the table: BorgWarner 346, Adient 188, Magna 1402,
+# Valeo 1028, thyssenkrupp Materials NA 195). Spelled out here, not imported, so an address added to
+# the code without a fetch behind it fails this file.
+VERIFIED_SUPPLIER_WORKDAY_BOARDS = [
+    "borgwarner/wd5/BorgWarner_Careers",
+    "adient/wd3/External",
+    "magna/wd3/Magna",
+    "valeo/wd3/valeo_jobs",
+    "thyssenkruppmaterialsna/wd12/1",
+]
+SUPPLIER_OLD_SLUGS = ["blockchain", "garage", "arbor", "capital", "ventures", "atomicobject",
+                      "junipersquare", "alixpartners"]
+SUPPLIER_OLD_BOARD = "flagstar/wd1/Flagstar_Careers"
+
+
+def _write_filter_rows(rows):
+    """rows: {key: value or None}. None deletes the row."""
+    with m.get_db_conn() as conn:
+        for key, val in rows.items():
+            if val is None:
+                conn.execute("DELETE FROM search_filters WHERE key = ?", (key,))
+            else:
+                conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)",
+                             (key, json.dumps(val)))
+        conn.commit()
+
+
+@pytest.fixture
+def supplier_boot(monkeypatch):
+    """The real init_db() against the temp database with the Sheet stubbed and FILTER_ADDITIONS cut
+    down to the supplier addition. env["sheet"] is the System_Config filters dict, env["posts"] every
+    payload sent. Restores every row it touches."""
+    keys = ("workday_boards", "ats_company_slugs", "target_queries", "query_bank_pointer",
+            "ats_watchlist_enabled", m.APPLIED_ADDITIONS_KEY)
+    saved = {k: _raw_filter(k) for k in keys}
+    monkeypatch.setattr(m, "FILTER_ADDITIONS", {SUPPLIER_ADDITION_ID: m.FILTER_ADDITIONS[SUPPLIER_ADDITION_ID]})
+    queries = saved["target_queries"] or list(m.DEFAULT_SEARCH_FILTERS["target_queries"])
+    env = {"posts": [], "queries": queries,
+           "sheet": {"target_queries": list(queries), "ats_company_slugs": list(SUPPLIER_OLD_SLUGS),
+                     "workday_boards": [SUPPLIER_OLD_BOARD]}}
+
+    def fake_get(params, timeout=10):
+        resp = _FakeResp({"filters": env["sheet"]})
+        resp.status_code = 200
+        return resp
+
+    def fake_post(payload, timeout=10):
+        env["posts"].append(payload)
+        if payload.get("action") == "update_system_config":
+            env["sheet"][payload["key"]] = payload["value"]
+        return _SheetResp()
+
+    monkeypatch.setattr(m, "crm_get", fake_get)
+    monkeypatch.setattr(m, "crm_post", fake_post)
+    env["seed"] = lambda **rows: _write_filter_rows(
+        {"target_queries": queries, "ats_company_slugs": list(SUPPLIER_OLD_SLUGS),
+         "workday_boards": [SUPPLIER_OLD_BOARD], m.APPLIED_ADDITIONS_KEY: None, **rows})
+    env["seed"]()
+    yield env
+    _write_filter_rows(saved)
+
+
+def test_auto_supplier_watchlist_seeded_write_path_keeps_old_entries_and_dual_writes(supplier_boot):
+    """Boot with a populated watchlist: the verified boards land AFTER the old entry, the old
+    ats_company_slugs are untouched, and the one System_Config payload carries the same list SQLite
+    ends with (what the next boot's hydration reads back)."""
+    m.init_db()
+    expected = [SUPPLIER_OLD_BOARD] + VERIFIED_SUPPLIER_WORKDAY_BOARDS
+    assert m.get_filter("workday_boards") == expected
+    assert m.get_filter("ats_company_slugs") == SUPPLIER_OLD_SLUGS
+    sent = [p for p in supplier_boot["posts"] if p.get("action") == "update_system_config"]
+    assert [(p["key"], p["value"]) for p in sent] == [("workday_boards", expected)]
+    assert supplier_boot["sheet"]["workday_boards"] == expected
+    assert _raw_filter(m.APPLIED_ADDITIONS_KEY) == [SUPPLIER_ADDITION_ID]
+
+
+def test_auto_supplier_watchlist_seeded_from_an_empty_or_absent_list(supplier_boot):
+    """workday_boards ships as [] and the live System_Config has no such row, so empty and absent are
+    the real starting states. (The TASK-120 refusal to rebuild an empty list still holds for
+    target_queries; see test_finance_queries_reach_the_live_list_never_rebuild_a_missing_or_empty_list.)"""
+    for local, sheet_has_row, sheet_value in ((None, False, None), ([], False, None), ([], True, []), ([], True, "")):
+        supplier_boot["seed"](workday_boards=local)
+        supplier_boot["posts"].clear()
+        supplier_boot["sheet"].pop("workday_boards", None)
+        if sheet_has_row:
+            supplier_boot["sheet"]["workday_boards"] = sheet_value
+        m.init_db()
+        assert m.get_filter("workday_boards") == VERIFIED_SUPPLIER_WORKDAY_BOARDS, (local, sheet_value)
+        sent = [p for p in supplier_boot["posts"] if p.get("action") == "update_system_config"]
+        assert [(p["key"], p["value"]) for p in sent] == [("workday_boards", VERIFIED_SUPPLIER_WORKDAY_BOARDS)]
+
+
+def test_auto_supplier_watchlist_seeded_stage_1c_reads_the_boards_from_the_filter_store(supplier_boot, monkeypatch):
+    """A real run_job_pipeline pass with ats_watchlist_enabled on, after the seed: fetch_ats_jobs
+    resolves the Workday triples from the filter store (old entry plus the seeded ones), fetch_workday_jobs
+    is called once per board, and only the Michigan posting from each board reaches Stage 2."""
+    m.init_db()
+    _write_filter_rows({"ats_watchlist_enabled": True})
+    stored = _raw_filter("workday_boards")
+    assert stored == [SUPPLIER_OLD_BOARD] + VERIFIED_SUPPLIER_WORKDAY_BOARDS
+
+    workday_calls, slug_calls, evaluated = [], [], []
+
+    def fake_workday(board):
+        workday_calls.append(board)
+        n = len(workday_calls)
+        return [
+            {"job_id": f"wd_{n}_a", "employer_name": f"Zzsupplier {n} Group", "job_title": "Cost Analyst",
+             "job_description": "Reconcile invoices.", "job_apply_link": f"https://x/{n}/a",
+             "job_city": "Auburn Hills, Michigan", "job_state": "", "job_is_remote": False},
+            {"job_id": f"wd_{n}_b", "employer_name": f"Zzsupplier {n} Group", "job_title": "Pricing Analyst",
+             "job_description": "Reconcile invoices.", "job_apply_link": f"https://x/{n}/b",
+             "job_city": "Greenville, South Carolina", "job_state": "", "job_is_remote": False},
+        ]
+
+    monkeypatch.setattr(m, "pipeline_refusal_message", lambda: None)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda *a, **k: set())
+    monkeypatch.setattr(m, "get_warm_crm_contacts", lambda *a, **k: {})
+    monkeypatch.setattr(m, "get_tracked_job_keys", lambda *a, **k: set())
+    monkeypatch.setattr(m, "resolve_warm_company_ats_slugs", lambda *a, **k: [])
+    monkeypatch.setattr(m, "build_jsearch_request_config", lambda: ({}, "https://x"))
+    monkeypatch.setattr(m, "fetch_single_query_jobs", lambda task: [])
+    monkeypatch.setattr(m, "fetch_workday_jobs", fake_workday)
+    for name in ("fetch_greenhouse_jobs", "fetch_lever_jobs", "fetch_ashby_jobs"):
+        monkeypatch.setattr(m, name, lambda slug, _n=name: slug_calls.append((_n, slug)) or [])
+    monkeypatch.setattr(m, "process_single_candidate", lambda job, force=False: evaluated.append(job) or None)
+    monkeypatch.setattr(m, "dispatch_tier1_matches", lambda matches: 0)
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    monkeypatch.setattr(m, "send_status_update", lambda *a, **k: None)
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: None)
+
+    assert m.run_job_pipeline(None, top_n=1) == 0
+    assert sorted(workday_calls) == sorted(stored)
+    assert {s for _, s in slug_calls} == set(SUPPLIER_OLD_SLUGS)
+    assert len(evaluated) == len(stored)
+    assert all(j["job_city"] == "Auburn Hills, Michigan" for j in evaluated)
+
+
+def test_auto_supplier_watchlist_seeded_runs_once_and_a_deletion_sticks(supplier_boot):
+    m.init_db()
+    supplier_boot["posts"].clear()
+    m.init_db()
+    assert supplier_boot["posts"] == []
+    assert m.get_filter("workday_boards") == [SUPPLIER_OLD_BOARD] + VERIFIED_SUPPLIER_WORKDAY_BOARDS
+
+    gone = "valeo/wd3/valeo_jobs"
+    kept = [b for b in m.get_filter("workday_boards") if b != gone]
+    _write_filter_rows({"workday_boards": kept})
+    supplier_boot["sheet"]["workday_boards"] = list(kept)
+    supplier_boot["posts"].clear()
+    m.init_db()
+    assert m.get_filter("workday_boards") == kept and gone not in kept
+    assert supplier_boot["posts"] == []
+    assert _raw_filter(m.APPLIED_ADDITIONS_KEY) == [SUPPLIER_ADDITION_ID]
+
+
+class _WorkdayFake:
+    """Stands in for requests.post/get against one Workday board; every search returns its own 20
+    distinct postings so the detail cap, not the supply, decides what is fetched."""
+    def __init__(self, shared=None):
+        self.search_texts, self.detail_paths, self.shared = [], [], shared or []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        assert url.endswith("/jobs")
+        text = json["searchText"]
+        self.search_texts.append(text)
+        tag = re.sub(r"\W+", "_", text)
+        postings = [{"externalPath": f"/job/{tag}/{i}", "title": f"{text} {i}", "locationsText": "Troy, Michigan",
+                     "bulletFields": [f"R-{tag}-{i}"]} for i in range(json["limit"])]
+        postings[:0] = [{"externalPath": p, "title": f"shared {p}", "locationsText": "Troy, Michigan",
+                         "bulletFields": [p]} for p in self.shared]
+        return type("R", (), {"status_code": 200, "json": staticmethod(lambda: {"jobPostings": postings})})()
+
+    def get(self, url, headers=None, timeout=None):
+        self.detail_paths.append(url.split("/job/", 1)[1])
+        info = {"jobDescription": "<p>Reconcile invoices.</p>", "externalUrl": "https://x", "location": "Troy, Michigan"}
+        return type("R", (), {"status_code": 200, "json": staticmethod(lambda: {"jobPostingInfo": info})})()
+
+
+def test_auto_supplier_watchlist_seeded_workday_sends_one_search_per_old_and_new_term(monkeypatch):
+    fake = _WorkdayFake()
+    monkeypatch.setattr(m.requests, "post", fake.post)
+    monkeypatch.setattr(m.requests, "get", fake.get)
+    jobs = m.fetch_workday_jobs("magna/wd3/Magna")
+    old_terms = ["operations analyst", "business operations", "financial analyst", "operations specialist"]
+    new_terms = ["controller", "cost analyst", "pricing analyst", "fp&a", "commercial finance"]
+    assert list(m.WORKDAY_SEARCH_TERMS) == old_terms, "the original four keep their text and their order"
+    assert list(m.WORKDAY_FINANCE_SEARCH_TERMS) == new_terms
+    # one POST per term, the old four first and unchanged, the finance five after with the location hint
+    assert fake.search_texts == old_terms + [f"{t} Michigan" for t in new_terms]
+    assert len(fake.search_texts) == 9
+    # The old terms cannot be crowded out: the first 12 detail fetches are exactly the 12 the old
+    # code would have fetched (the first term's first 12), then the finance terms get their own 12.
+    assert len(fake.detail_paths) == 24 == len(jobs)
+    first_old_term = re.sub(r"\W+", "_", old_terms[0])
+    assert fake.detail_paths[:12] == [f"{first_old_term}/{i}" for i in range(12)]
+    assert all(p.startswith("controller_Michigan/") for p in fake.detail_paths[12:])
+
+
+def test_auto_supplier_watchlist_seeded_workday_never_fetches_a_posting_twice(monkeypatch):
+    fake = _WorkdayFake(shared=["/job/shared/1", "/job/shared/2"])
+    monkeypatch.setattr(m.requests, "post", fake.post)
+    monkeypatch.setattr(m.requests, "get", fake.get)
+    m.fetch_workday_jobs("magna/wd3/Magna")
+    assert len(fake.detail_paths) == len(set(fake.detail_paths))
+
+
+def test_auto_supplier_watchlist_seeded_matches_the_verified_log_table():
+    """No unverified address ships: the code constant is exactly the list in the TASK-121 log, every
+    entry is a tenant/wdN/site triple, and nothing is seeded into ats_company_slugs (none of the 16
+    candidates answered on Greenhouse, Lever or Ashby)."""
+    assert m.AUTO_SUPPLIER_WORKDAY_BOARDS == VERIFIED_SUPPLIER_WORKDAY_BOARDS
+    assert len({b.lower() for b in m.AUTO_SUPPLIER_WORKDAY_BOARDS}) == len(m.AUTO_SUPPLIER_WORKDAY_BOARDS)
+    for board in m.AUTO_SUPPLIER_WORKDAY_BOARDS:
+        tenant, wd, site = board.split("/")
+        assert tenant and site and re.fullmatch(r"wd\d+", wd), board
+    assert m.FILTER_ADDITIONS[SUPPLIER_ADDITION_ID] == {"workday_boards": VERIFIED_SUPPLIER_WORKDAY_BOARDS}
+    assert set(m.EMPTY_OK_FILTER_KEYS) == {"workday_boards", "ats_company_slugs"}
+    assert "target_queries" not in m.EMPTY_OK_FILTER_KEYS
+
+
+def test_auto_supplier_watchlist_seeded_gate_passes_michigan_and_rejects_other_states(supplier_boot, monkeypatch):
+    """fetch_ats_jobs on a kept board with the Workday call stubbed: the Michigan posting clears
+    passes_strict_filter, the South Carolina one is rejected at the city gate (Workday sets no state,
+    so it is city_allowlist rather than out_of_state)."""
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda *a, **k: set())
+    monkeypatch.setattr(m, "fetch_workday_jobs", lambda board: [
+        {"job_id": "wd_1", "employer_name": "Zzsupplier Gate Group", "job_title": "Cost Analyst",
+         "job_description": "Reconcile invoices.", "job_apply_link": "https://x/1",
+         "job_city": "Auburn Hills, Michigan", "job_state": "", "job_is_remote": False},
+        {"job_id": "wd_2", "employer_name": "Zzsupplier Gate Group", "job_title": "Pricing Analyst",
+         "job_description": "Reconcile invoices.", "job_apply_link": "https://x/2",
+         "job_city": "Greenville, South Carolina", "job_state": "", "job_is_remote": False},
+    ])
+    _write_filter_rows({"workday_boards": ["magna/wd3/Magna"]})
+    jobs = m.fetch_ats_jobs([], include_workday=True)
+    assert len(jobs) == 2
+    trace = m.FunnelTrace()
+    verdicts = {j["job_city"]: m.passes_strict_filter(j, trace=trace) for j in jobs}
+    assert verdicts == {"Auburn Hills, Michigan": True, "Greenville, South Carolina": False}
+    assert trace.reasons == {"city_allowlist": 1}
 
 
 def test_t_warns_when_target_queries_is_empty(monkeypatch, sourcing_filters):
