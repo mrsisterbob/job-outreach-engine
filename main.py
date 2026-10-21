@@ -1375,6 +1375,12 @@ def init_db():
         identity_columns = {row[1] for row in conn.execute("PRAGMA table_info(company_identities)")}
         if "board_checked_at" not in identity_columns:
             conn.execute("ALTER TABLE company_identities ADD COLUMN board_checked_at TEXT")
+        # board_attempted_at (ISO timestamp): the last time a /w lookup FINISHED for this company,
+        # a clean miss and an error alike. It only rotates the lookup batch (least-recently-
+        # attempted first) so companies that keep erroring cannot hold the front of the queue;
+        # the 14-day miss window above still reads board_checked_at alone.
+        if "board_attempted_at" not in identity_columns:
+            conn.execute("ALTER TABLE company_identities ADD COLUMN board_attempted_at TEXT")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS system_alerts (
             alert_key TEXT PRIMARY KEY,
@@ -3671,8 +3677,11 @@ def get_warm_crm_contacts():
     people Kevin has there) and `contacts` (every one of them, same keys, best first).
 
     A row with no company is NOT keyed under a guessed one (the old last-word-of-the-name fallback
-    turned "Dean cousin" into company "cousin"). Those rows, and a LinkedIn URL typed into the name
-    column, are kept apart: see get_warm_contacts_without_company().
+    turned "Dean cousin" into company "cousin"). Those rows are "unplaced" and kept apart: see
+    get_warm_contacts_without_company(). So is a company cell that normalizes to nothing ("Group",
+    "Co."). Unplaced means NO usable company, and nothing else: a row with a company is always
+    keyed by it, even when its name column holds a LinkedIn URL (that contact's name becomes the
+    placeholder "Contact", so no URL is ever used as a greeting).
     Cached in-process for a few minutes so parallel candidate evaluation doesn't hammer the CRM webhook.
     """
     now = time.time()
@@ -3692,17 +3701,23 @@ def get_warm_crm_contacts():
         for row in data.get("followups", []):
             company = str(row.get("company") or "").strip()
             raw_name = str(row.get("name") or "").strip()
+            # A LinkedIn URL typed into the name column is never a name. With a company the row
+            # keeps that company and the URL becomes the nameless-row placeholder, so it cannot
+            # reach a greeting (first_name_for_greeting); the URL is copied nowhere else.
+            contact_name = row.get("name") or "Contact"
+            company_key = normalize_company_for_match(company)
+            if company_key and raw_name.lower().startswith("http"):
+                contact_name = "Contact"
             contact = {
-                "name": row.get("name") or "Contact",
+                "name": contact_name,
                 "raw_company": company,
                 "email": str(row.get("email") or "").strip(),
                 "note": row.get("note") or "Active relationship",
                 "priority_score": normalize_priority_value(row.get("raw_priority", row.get("priority"))),
                 "sheet_uuid": row.get("sheet_uuid", "")
             }
-            company_key = normalize_company_for_match(company)
             # "Group", "Holdings Inc", "Co." normalize to "" - not a company, so never a shared key
-            if not company_key or raw_name.lower().startswith("http"):
+            if not company_key:
                 unplaced.append(contact)
                 continue
             by_company.setdefault(company_key, []).append(contact)
@@ -3715,7 +3730,7 @@ def get_warm_crm_contacts():
             best["contacts"] = [dict(c) for c in ranked]
             contacts[key] = best
         if unplaced:
-            logging.info(f"get_warm_crm_contacts: {len(unplaced)} Carmen Warm rows have no company (or a URL as the name) and are not keyed to any company")
+            logging.info(f"get_warm_crm_contacts: {len(unplaced)} Carmen Warm rows have no usable company and are not keyed to any company")
         _WARM_CRM_CACHE["data"] = contacts
         _WARM_CRM_CACHE["unplaced"] = unplaced
         _WARM_CRM_CACHE["fetched_at"] = now
@@ -3726,8 +3741,9 @@ def get_warm_crm_contacts():
 
 def get_warm_contacts_without_company():
     """Carmen Warm rows get_warm_crm_contacts() could not place at a company: a blank Company cell,
-    or a LinkedIn URL in the name column. Same contact-dict shape as the company map. Refreshes
-    through get_warm_crm_contacts() (cached), so it costs nothing extra inside the TTL."""
+    or one that normalizes to nothing ("Group", "Co."). A LinkedIn URL in the name column does NOT
+    make a row unplaced when its company is filled. Same contact-dict shape as the company map.
+    Refreshes through get_warm_crm_contacts() (cached), so it costs nothing extra inside the TTL."""
     get_warm_crm_contacts()
     return list(_WARM_CRM_CACHE.get("unplaced", []))
 
@@ -12310,6 +12326,11 @@ def fetch_ats_jobs(company_slugs, include_workday=False):
                 logging.error(f"Workday Fetch Future Error: {e}")
     return all_jobs
 
+# Serializes the read-modify-write of the ats_company_slugs filter in auto_expand_ats_slug, so
+# overlapping /w lookup batches and /t threads cannot overwrite each other's new slug.
+_ATS_SLUG_FILTER_LOCK = threading.Lock()
+
+
 def auto_expand_ats_slug(company_name, errors=None):
     """Silent Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its
     name; if any board actually resolves, appends the slug to the ats_company_slugs filter so future
@@ -12322,7 +12343,8 @@ def auto_expand_ats_slug(company_name, errors=None):
     and that column holds personal contacts. See pipeline_utils.is_probable_company_name().
 
     Returns the slug when a board resolved, else None. `errors`, when a list is passed, collects
-    every board check that FAILED (exception, 429, 5xx) as opposed to cleanly returning no board,
+    every board check that FAILED (exception, 401, 403, 429, 5xx) as opposed to cleanly returning
+    no board (404 and the like),
     so a caller can tell "no public board" from "could not tell" (see lookup_warm_company_board).
     """
     if not is_probable_company_name(company_name):
@@ -12342,11 +12364,16 @@ def auto_expand_ats_slug(company_name, errors=None):
     for board_name, url in board_checks:
         try:
             res = requests.get(url, timeout=8)
-            if errors is not None and (res.status_code == 429 or res.status_code >= 500):
+            if errors is not None and (res.status_code in (401, 403, 429) or res.status_code >= 500):
                 errors.append(f"{board_name} HTTP {res.status_code}")
             if res.status_code == 200 and res.json():
-                existing_slugs.append(slug_guess)
-                set_filter("ats_company_slugs", existing_slugs)
+                # Re-read INSIDE the lock: the list read before the probes may be stale by now.
+                # The lock is never held across the HTTP calls above.
+                with _ATS_SLUG_FILTER_LOCK:
+                    current_slugs = list(safe_list(get_filter("ats_company_slugs", [])))
+                    if slug_guess not in current_slugs:
+                        current_slugs.append(slug_guess)
+                        set_filter("ats_company_slugs", current_slugs)
                 upsert_company_identity(company_name, ats_slug=slug_guess)
                 logging.info(f"[ATS EXPANSION] '{company_name}' resolved to '{slug_guess}' on {board_name} - added to ats_company_slugs")
                 return slug_guess
@@ -13103,29 +13130,53 @@ def lookup_warm_company_board(company_name):
     here without an HTTP probe. A genuine miss (every board answered, none had postings) is stamped
     with today's date so /w skips it for WARM_RADAR_MISS_RETRY_DAYS; a lookup that merely errored
     is NOT stamped, so a network blip is retried on the next run instead of read as "no board".
+
+    Separately, EVERY finished attempt (hit, clean miss or error) stamps board_attempted_at, which
+    run_warm_radar_scan uses only to put the least-recently-attempted companies first in the next
+    batch. Without it, 20 companies that keep erroring would sit at the front of every /w and
+    starve the ones behind them.
     """
     if not is_probable_company_name(company_name):
         return None
-    slug_guess = ats_slug_guess(company_name)
-    if slug_guess in safe_list(get_filter("ats_company_slugs", [])):
-        upsert_company_identity(company_name, ats_slug=slug_guess)
-        return slug_guess
-    errors = []
-    slug = auto_expand_ats_slug(company_name, errors=errors)
-    if slug:
-        return slug
-    if not errors and upsert_company_identity(company_name):
-        try:
-            with get_db_conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+    clean_miss = False
+    try:
+        slug_guess = ats_slug_guess(company_name)
+        if slug_guess in safe_list(get_filter("ats_company_slugs", [])):
+            upsert_company_identity(company_name, ats_slug=slug_guess)
+            return slug_guess
+        errors = []
+        slug = auto_expand_ats_slug(company_name, errors=errors)
+        if slug:
+            return slug
+        clean_miss = not errors
+        return None
+    finally:
+        _stamp_board_lookup(company_name, clean_miss)
+
+
+def _stamp_board_lookup(company_name, clean_miss):
+    """Record that a /w board lookup for company_name just finished: board_attempted_at always
+    (full timestamp, so runs on the same day still order), board_checked_at (a date, the 14-day
+    miss window) only for a clean miss. Never raises."""
+    try:
+        if not upsert_company_identity(company_name):
+            return
+        now = datetime.now()
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if clean_miss:
                 conn.execute(
-                    "UPDATE company_identities SET board_checked_at = ? WHERE normalized_name = ?",
-                    (datetime.now().strftime("%Y-%m-%d"), normalize_company_for_match(company_name))
+                    "UPDATE company_identities SET board_attempted_at = ?, board_checked_at = ? WHERE normalized_name = ?",
+                    (now.isoformat(), now.strftime("%Y-%m-%d"), normalize_company_for_match(company_name))
                 )
-                conn.commit()
-        except Exception as e:
-            logging.error(f"Warm Radar Board-Miss Stamp Error ({company_name}): {e}")
-    return None
+            else:
+                conn.execute(
+                    "UPDATE company_identities SET board_attempted_at = ? WHERE normalized_name = ?",
+                    (now.isoformat(), normalize_company_for_match(company_name))
+                )
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Warm Radar Board Lookup Stamp Error ({company_name}): {e}")
 
 
 def _warm_radar_lookup_batch(companies):
@@ -13565,6 +13616,18 @@ def handle_refer_command(chat_id, text):
         send_telegram_message(chat_id, _REFER_USAGE)
 
 
+def _warm_radar_unplaced_line():
+    """'N warm contacts have no company' (singular for 1), or "" when every contact has one."""
+    try:
+        count = len(get_warm_contacts_without_company())
+    except Exception as e:
+        logging.error(f"Warm Radar Unplaced Count Error: {e}")
+        return ""
+    if not count:
+        return ""
+    return f"{count} warm contact{' has' if count == 1 else 's have'} no company"
+
+
 def run_warm_radar_scan(chat_id=None):
     """/w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen
     Warm CRM contact already exists. Resolves each warm company's ATS slug straight from the
@@ -13583,7 +13646,11 @@ def run_warm_radar_scan(chat_id=None):
     warm_contacts = get_warm_crm_contacts()
     if not warm_contacts:
         if chat_id:
-            send_telegram_message(chat_id, "⚠️ <b>Warm Radar:</b> no Carmen Warm contacts found.")
+            lines = ["⚠️ <b>Warm Radar:</b> no Carmen Warm contacts found."]
+            unplaced_line = _warm_radar_unplaced_line()
+            if unplaced_line:
+                lines.append(unplaced_line)
+            send_telegram_message(chat_id, "\n".join(lines))
         return 0
 
     # Cache-only slug resolution: every warm company that already has a verified ats_slug row.
@@ -13592,18 +13659,21 @@ def run_warm_radar_scan(chat_id=None):
     try:
         with get_db_conn() as conn:
             identity_rows = conn.execute(
-                "SELECT normalized_name, ats_slug, board_checked_at FROM company_identities"
+                "SELECT normalized_name, ats_slug, board_checked_at, board_attempted_at FROM company_identities"
             ).fetchall()
     except Exception as e:
         logging.error(f"Warm Radar Identity Lookup Error: {e}")
         identity_rows = []
     slug_to_contact = {}
     checked_on = {}
+    attempted_at = {}
     scanned_keys = set()
-    for normalized_name, slug, board_checked_at in identity_rows:
+    for normalized_name, slug, board_checked_at, board_attempted_at in identity_rows:
         contact = warm_contacts.get(normalized_name)
         if not contact:
             continue
+        if board_attempted_at:
+            attempted_at[normalized_name] = board_attempted_at
         if slug:
             slug_to_contact.setdefault(slug, contact)
             # Every warm entry with a slug counts as scanned, including a second one that shares
@@ -13614,7 +13684,7 @@ def run_warm_radar_scan(chat_id=None):
 
     retry_cutoff = (datetime.now() - timedelta(days=WARM_RADAR_MISS_RETRY_DAYS)).strftime("%Y-%m-%d")
     checked_no_board = []   # looked up recently, nothing public found
-    unchecked = []          # never looked up, or the last miss is older than the retry window
+    unchecked_keys = []     # never looked up, or the last miss is older than the retry window
     not_company = 0
     for key, contact in warm_contacts.items():
         if key in scanned_keys:
@@ -13625,148 +13695,164 @@ def run_warm_radar_scan(chat_id=None):
         elif checked_on.get(key, "") > retry_cutoff:
             checked_no_board.append(display)
         else:
-            unchecked.append(display)
+            unchecked_keys.append(key)
+    # Least-recently-attempted first, never-attempted ("") first of all; sorted() is stable, so
+    # ties keep warm-contact order. A lookup that errored is "unchecked" again next run, and
+    # without this rotation the same first batch would be retried forever.
+    unchecked_keys.sort(key=lambda k: attempted_at.get(k, ""))
+    unchecked = [warm_contacts[k].get("raw_company") or k for k in unchecked_keys]
     lookup_now = unchecked[:WARM_RADAR_LOOKUP_BATCH]
-    queued = len(unchecked) - len(lookup_now)
+    # Everything after the batch is chosen sits in try/finally: the lookups start exactly once on
+    # every path out (a raise in the scan loop, the early "no cached board" return, the normal
+    # end). They run AFTER the closing message on a normal exit, because the lookups are slow
+    # and what they find shows up on the next /w.
+    try:
+        queued = len(unchecked) - len(lookup_now)
+        unplaced_line = _warm_radar_unplaced_line()
 
-    def _skipped_report():
-        lines = []
-        budget = WARM_RADAR_NAME_CAP
-        if unchecked:
-            names, used = _warm_radar_name_list(lookup_now, budget)
-            budget -= used
-            lines.append(f"Not looked at yet, checking {len(lookup_now)} for a job board now"
-                         f"{': ' + names if names else ''}")
-            if queued:
-                lines.append(f"{queued} more queued for the next run")
-        if checked_no_board:
-            names, used = _warm_radar_name_list(checked_no_board, budget)
-            budget -= used
-            lines.append(f"Checked, no public job board found ({len(checked_no_board)}): {names}"
-                         if names else f"Checked, no public job board found: {len(checked_no_board)}")
-        if not_company:
-            lines.append(f"{not_company} warm entries are not company names")
-        return lines
+        def _skipped_report():
+            lines = []
+            budget = WARM_RADAR_NAME_CAP
+            if unchecked:
+                names, used = _warm_radar_name_list(lookup_now, budget)
+                budget -= used
+                lines.append(f"Not looked at yet, checking {len(lookup_now)} for a job board now"
+                             f"{': ' + names if names else ''}")
+                if queued:
+                    lines.append(f"{queued} more queued for the next run")
+            if checked_no_board:
+                names, used = _warm_radar_name_list(checked_no_board, budget)
+                budget -= used
+                lines.append(f"Checked, no public job board found ({len(checked_no_board)}): {names}"
+                             if names else f"Checked, no public job board found: {len(checked_no_board)}")
+            if not_company:
+                lines.append(f"{not_company} warm entries are not company names")
+            if unplaced_line:
+                lines.append(unplaced_line)
+            return lines
 
-    if not slug_to_contact:
+        if not slug_to_contact:
+            if chat_id:
+                lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm entries has a cached job board yet."]
+                lines += _skipped_report()
+                send_telegram_message(chat_id, "\n".join(lines))
+            return 0
+
         if chat_id:
-            lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm entries has a cached job board yet."]
+            send_status_update(chat_id, f"Warm Radar: scanning {len(slug_to_contact)} warm companies with a cached ATS board (no AI scoring)...")
+
+        slugs = list(slug_to_contact)
+        seen_hashes = set()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
+        clavicular_rows = []
+        match_count = 0
+        filtered_hashes = set()
+        title_filtered = 0
+        referral_pending = {}   # company key -> best contact + the roles that produced cards this run
+
+        for job in fetch_ats_jobs(slugs):
+            company = job.get("employer_name") or ""
+            title = job.get("job_title") or ""
+            if is_banned_employer(company):
+                continue
+            job_hash = generate_dedup_hash(company, title)
+            # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
+            # when the role is already tracked in a job tab - never merely because /t once saw it.
+            if job_hash in seen_hashes or is_role_tracked(company, title):
+                continue
+
+            # Tie the posting back to its warm contact by the slug baked into its job_id
+            # (gh_/lever_/ashby_<slug>_...), falling back to a normalized-name match on the ATS
+            # employer label. Postings we can't attribute to a warm contact aren't /w's to surface.
+            job_id = str(job.get("job_id") or "")
+            contact = next(
+                (c for s, c in slug_to_contact.items() if job_id.startswith((f"gh_{s}_", f"lever_{s}_", f"ashby_{s}_"))),
+                None
+            ) or warm_contacts.get(normalize_company_for_match(company))
+            if not contact:
+                continue
+
+            # The title gate /t uses (one shared function), and only that: a warm contact is a reason
+            # to look at a role in any city, salary band or cooldown state, so those gates stay off
+            # on purpose. A filtered role is counted, never stamped into seen_jobs (same reason
+            # _add_candidate does not): the rule can change and the role should be seen again.
+            if title_rejection_reason(title):
+                if job_hash not in filtered_hashes:
+                    filtered_hashes.add(job_hash)
+                    title_filtered += 1
+                continue
+
+            seen_hashes.add(job_hash)
+            save_seen_job_db(job_hash)
+            match_count += 1
+
+            raw_id = job.get("job_id") or f"{company}_{title}"
+            short_id = generate_short_key(raw_id, fallback=time.time())
+            target_email = resolve_target_email(company, title, job.get("employer_website"))
+            job["target_email"] = target_email
+            sheet_uuid = save_job_to_cache(short_id, job)
+
+            contact_name = contact.get("name", "Contact")
+            send_warm_radar_card(job, contact_name, contact.get("note", "Active relationship"), sheet_uuid,
+                                 other_contacts=max(0, int(contact.get("count") or 1) - 1))
+            try:
+                # Collected only; the asks are rendered and stored AFTER the card loop so nothing
+                # here can ever stop a card. A role that ends up with no stored ask (gate, no CRM id,
+                # store failure) is NOT picked up by a later /w: its Clavicular row below makes
+                # is_role_tracked skip it next time, and no table records that an ask is owed.
+                ask_company_raw = contact.get("raw_company") or company
+                pending_entry = referral_pending.setdefault(
+                    normalize_company_for_match(ask_company_raw),
+                    {"contact": contact, "company": clean_company_for_copy(ask_company_raw), "roles": []})
+                pending_entry["roles"].append(referral_asks.build_role(
+                    title, job.get("job_apply_link", ""), job.get("job_requisition_id", ""), job_hash))
+            except Exception as e:
+                logging.error(f"Warm Radar referral collect error: {e}")
+
+            clavicular_rows.append({
+                "sheet_uuid": sheet_uuid,
+                "row_data": [
+                    # Same rule as the standard rows below: a GUESS never reaches the sheet. The card
+                    # keeps target_email so it has something to draft to; the cell stays blank until
+                    # /e types a real address or the sent-mail back-fill promotes one.
+                    today_str, company, title,
+                    "" if is_guessed_contact_email(target_email) else target_email, "",
+                    "Matched", followup_date, job.get("job_apply_link", ""),
+                    f"Warm Radar Match (no AI score): {contact_name}"
+                ]
+            })
+            time.sleep(1.1)  # same inter-card Telegram pacing run_job_pipeline uses
+
+        if clavicular_rows:
+            enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows))
+
+        referral_summary = {}
+        try:
+            referral_summary = store_referral_asks(referral_pending)
+        except Exception as e:
+            logging.error(f"Warm Radar referral asks failed: {e}")
+            referral_summary = {"failed": 1}
+
+        logging.info(f"Warm Radar Complete: {match_count} new matches across {len(slugs)} warm companies; {title_filtered} filtered by title.")
+        if chat_id:
+            done = f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies scanned"
+            done += (f"; {title_filtered} role{'' if title_filtered == 1 else 's'} filtered out by title."
+                     if title_filtered else ".")
+            lines = [done]
+            referral_line = _referral_summary_line(referral_summary)
+            if referral_line:
+                lines.append(referral_line)
             lines += _skipped_report()
             send_telegram_message(chat_id, "\n".join(lines))
-        _spawn_background(lambda: _warm_radar_lookup_batch(lookup_now))
-        return 0
-
-    if chat_id:
-        send_status_update(chat_id, f"Warm Radar: scanning {len(slug_to_contact)} warm companies with a cached ATS board (no AI scoring)...")
-
-    slugs = list(slug_to_contact)
-    seen_hashes = set()
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
-    clavicular_rows = []
-    match_count = 0
-    filtered_hashes = set()
-    title_filtered = 0
-    referral_pending = {}   # company key -> best contact + the roles that produced cards this run
-
-    for job in fetch_ats_jobs(slugs):
-        company = job.get("employer_name") or ""
-        title = job.get("job_title") or ""
-        if is_banned_employer(company):
-            continue
-        job_hash = generate_dedup_hash(company, title)
-        # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
-        # when the role is already tracked in a job tab - never merely because /t once saw it.
-        if job_hash in seen_hashes or is_role_tracked(company, title):
-            continue
-
-        # Tie the posting back to its warm contact by the slug baked into its job_id
-        # (gh_/lever_/ashby_<slug>_...), falling back to a normalized-name match on the ATS
-        # employer label. Postings we can't attribute to a warm contact aren't /w's to surface.
-        job_id = str(job.get("job_id") or "")
-        contact = next(
-            (c for s, c in slug_to_contact.items() if job_id.startswith((f"gh_{s}_", f"lever_{s}_", f"ashby_{s}_"))),
-            None
-        ) or warm_contacts.get(normalize_company_for_match(company))
-        if not contact:
-            continue
-
-        # The title gate /t uses (one shared function), and only that: a warm contact is a reason
-        # to look at a role in any city, salary band or cooldown state, so those gates stay off
-        # on purpose. A filtered role is counted, never stamped into seen_jobs (same reason
-        # _add_candidate does not): the rule can change and the role should be seen again.
-        if title_rejection_reason(title):
-            if job_hash not in filtered_hashes:
-                filtered_hashes.add(job_hash)
-                title_filtered += 1
-            continue
-
-        seen_hashes.add(job_hash)
-        save_seen_job_db(job_hash)
-        match_count += 1
-
-        raw_id = job.get("job_id") or f"{company}_{title}"
-        short_id = generate_short_key(raw_id, fallback=time.time())
-        target_email = resolve_target_email(company, title, job.get("employer_website"))
-        job["target_email"] = target_email
-        sheet_uuid = save_job_to_cache(short_id, job)
-
-        contact_name = contact.get("name", "Contact")
-        send_warm_radar_card(job, contact_name, contact.get("note", "Active relationship"), sheet_uuid,
-                             other_contacts=max(0, int(contact.get("count") or 1) - 1))
-        try:
-            # Collected only; the asks are rendered and stored AFTER the card loop so nothing
-            # here can ever stop a card. A role that ends up with no stored ask (gate, no CRM id,
-            # store failure) is NOT picked up by a later /w: its Clavicular row below makes
-            # is_role_tracked skip it next time, and no table records that an ask is owed.
-            ask_company_raw = contact.get("raw_company") or company
-            pending_entry = referral_pending.setdefault(
-                normalize_company_for_match(ask_company_raw),
-                {"contact": contact, "company": clean_company_for_copy(ask_company_raw), "roles": []})
-            pending_entry["roles"].append(referral_asks.build_role(
-                title, job.get("job_apply_link", ""), job.get("job_requisition_id", ""), job_hash))
-        except Exception as e:
-            logging.error(f"Warm Radar referral collect error: {e}")
-
-        clavicular_rows.append({
-            "sheet_uuid": sheet_uuid,
-            "row_data": [
-                # Same rule as the standard rows below: a GUESS never reaches the sheet. The card
-                # keeps target_email so it has something to draft to; the cell stays blank until
-                # /e types a real address or the sent-mail back-fill promotes one.
-                today_str, company, title,
-                "" if is_guessed_contact_email(target_email) else target_email, "",
-                "Matched", followup_date, job.get("job_apply_link", ""),
-                f"Warm Radar Match (no AI score): {contact_name}"
-            ]
-        })
-        time.sleep(1.1)  # same inter-card Telegram pacing run_job_pipeline uses
-
-    if clavicular_rows:
-        enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows))
-
-    referral_summary = {}
-    try:
-        referral_summary = store_referral_asks(referral_pending)
-    except Exception as e:
-        logging.error(f"Warm Radar referral asks failed: {e}")
-        referral_summary = {"failed": 1}
-
-    logging.info(f"Warm Radar Complete: {match_count} new matches across {len(slugs)} warm companies; {title_filtered} filtered by title.")
-    if chat_id:
-        done = f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies scanned"
-        done += (f"; {title_filtered} role{'' if title_filtered == 1 else 's'} filtered out by title."
-                 if title_filtered else ".")
-        lines = [done]
-        referral_line = _referral_summary_line(referral_summary)
-        if referral_line:
-            lines.append(referral_line)
-        lines += _skipped_report()
-        send_telegram_message(chat_id, "\n".join(lines))
-    # AFTER the message: the lookups are slow, and what they find shows up on the next /w.
-    if lookup_now:
-        _spawn_background(lambda: _warm_radar_lookup_batch(lookup_now))
-    return match_count
+        return match_count
+    finally:
+        if lookup_now:
+            # Must never replace the scan's own exception, or turn a good scan into an error.
+            try:
+                _spawn_background(lambda: _warm_radar_lookup_batch(lookup_now))
+            except Exception:
+                logging.exception("Warm Radar: could not start the board lookups")
 
 # ==============================================================================
 # 9. ASYNC WORKLOAD PROCESSOR & WEBHOOK CONTROLLER
