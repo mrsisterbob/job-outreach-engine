@@ -6444,6 +6444,217 @@ def test_restore_leaves_a_populated_list_alone(monkeypatch, sourcing_filters):
     assert _raw_filter("target_queries") == ["Custom Q"]
 
 
+# ---- TASK-120: finance search phrases reach the LIVE target_queries list ----
+
+class _SheetResp:
+    def __init__(self, body=None, status_code=200):
+        self._body = body if body is not None else {"status": "success"}
+        self.status_code = status_code
+
+    def json(self):
+        return self._body
+
+
+@pytest.fixture
+def finance_boot(monkeypatch):
+    """The real init_db() against a temp database with the Sheet stubbed: env["sheet"] is the
+    System_Config list hydration reads back, env["posts"] every payload sent to the Sheet.
+    Restores the shared rows afterwards."""
+    keys = ("target_queries", m.APPLIED_ADDITIONS_KEY)
+    saved = {k: _raw_filter(k) for k in keys}
+    old = [q for q in m.DEFAULT_SEARCH_FILTERS["target_queries"] if q not in m.FINANCE_QUERY_PHRASES]
+    assert old and len(old) + len(m.FINANCE_QUERY_PHRASES) == len(m.DEFAULT_SEARCH_FILTERS["target_queries"])
+    env = {"sheet": list(old), "posts": [], "up": True, "old": old}
+
+    def fake_get(params, timeout=10):
+        if not env["up"]:
+            return None
+        resp = _FakeResp({"filters": {"target_queries": env["sheet"]}})
+        resp.status_code = 200
+        return resp
+
+    def fake_post(payload, timeout=10):
+        if not env["up"]:
+            return None
+        env["posts"].append(payload)
+        if payload.get("action") == "update_system_config" and payload["key"] == "target_queries":
+            env["sheet"] = list(payload["value"])  # the Sheet keeps what it is sent
+        return _SheetResp()
+
+    monkeypatch.setattr(m, "crm_get", fake_get)
+    monkeypatch.setattr(m, "crm_post", fake_post)
+
+    def seed(live, applied=None):
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM search_filters WHERE key = ?", (m.APPLIED_ADDITIONS_KEY,))
+            if applied is not None:
+                conn.execute("INSERT INTO search_filters (key, value_json) VALUES (?, ?)",
+                             (m.APPLIED_ADDITIONS_KEY, json.dumps(applied)))
+            if live is None:
+                conn.execute("DELETE FROM search_filters WHERE key = 'target_queries'")
+            else:
+                conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES ('target_queries', ?)",
+                             (json.dumps(live),))
+            conn.commit()
+
+    env["seed"] = seed
+    seed(old)
+    yield env
+    with m.get_db_conn() as conn:
+        for key, val in saved.items():
+            if val is None:
+                conn.execute("DELETE FROM search_filters WHERE key = ?", (key,))
+            else:
+                conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(val)))
+        conn.commit()
+
+
+def test_finance_queries_reach_the_live_list_and_the_sheet(finance_boot):
+    """Boot with the old 110 live and in the Sheet: the 13 new phrases land after them, once each,
+    and the payload sent to System_Config (what the next boot's hydration reads) is the merged list."""
+    old = finance_boot["old"]
+    m.init_db()
+    live = _raw_filter("target_queries")
+    assert live == old + m.FINANCE_QUERY_PHRASES
+    assert len(live) == len(set(live)) == len(old) + len(m.FINANCE_QUERY_PHRASES)
+    sent = [p for p in finance_boot["posts"] if p.get("key") == "target_queries"]
+    assert len(sent) == 1 and sent[0]["action"] == "update_system_config"
+    assert sent[0]["value"] == live
+    assert _raw_filter(m.APPLIED_ADDITIONS_KEY) == ["finance-queries-2026-10"]
+
+
+def test_finance_queries_reach_the_live_list_once_and_stay_through_hydration(finance_boot):
+    """A second boot reads the merged list back from the Sheet and adds nothing, writes nothing."""
+    m.init_db()
+    finance_boot["posts"].clear()
+    m.init_db()
+    assert _raw_filter("target_queries") == finance_boot["old"] + m.FINANCE_QUERY_PHRASES
+    assert finance_boot["posts"] == []
+
+
+def test_finance_queries_reach_the_live_list_not_re_added_when_the_sheet_serves_the_old_list(finance_boot):
+    """Applied once means applied: if the Sheet later serves the old 110 again (a manual edit), the
+    id is remembered and the phrases are NOT put back. Re-adding after a failed dual-write is the
+    Sheets-down case below, where the id was never recorded."""
+    old = finance_boot["old"]
+    m.init_db()
+    finance_boot["sheet"] = list(old)
+    finance_boot["posts"].clear()
+    m.init_db()
+    assert _raw_filter("target_queries") == old
+    assert finance_boot["posts"] == []
+
+
+def test_finance_queries_reach_the_live_list_after_a_sheets_outage(finance_boot):
+    """Sheets down at boot: boot completes, nothing is recorded as applied, nothing is half-written
+    locally; the next boot with Sheets up applies it."""
+    old = finance_boot["old"]
+    finance_boot["up"] = False
+    m.init_db()
+    assert _raw_filter("target_queries") == old
+    assert _raw_filter(m.APPLIED_ADDITIONS_KEY) is None
+    finance_boot["up"] = True
+    m.init_db()
+    assert _raw_filter("target_queries") == old + m.FINANCE_QUERY_PHRASES
+    assert _raw_filter(m.APPLIED_ADDITIONS_KEY) == ["finance-queries-2026-10"]
+
+
+def test_finance_queries_reach_the_live_list_keeps_a_phrase_added_by_hand_in_the_sheet(finance_boot, monkeypatch):
+    """Hydration failed this boot (local row stale) but the Sheet answers when the helper asks: the
+    merged list is built from the SHEET, so Kevin's hand-added phrase survives the write."""
+    old = finance_boot["old"]
+    extra = "Hand Added Role Detroit MI"
+    finance_boot["sheet"] = old + [extra]
+    real_get = m.crm_get
+    calls = {"n": 0}
+
+    def get_fails_once(params, timeout=10):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real_get(params, timeout)  # hydration's read fails
+
+    monkeypatch.setattr(m, "crm_get", get_fails_once)
+    m.init_db()
+    expected = old + [extra] + m.FINANCE_QUERY_PHRASES
+    sent = [p for p in finance_boot["posts"] if p.get("key") == "target_queries"]
+    assert len(sent) == 1 and sent[0]["value"] == expected
+    assert finance_boot["sheet"] == expected
+    assert _raw_filter("target_queries") == expected
+    assert _raw_filter(m.APPLIED_ADDITIONS_KEY) == ["finance-queries-2026-10"]
+
+
+def test_finance_queries_reach_the_live_list_nothing_applied_when_system_config_cannot_be_read(finance_boot, monkeypatch):
+    """load_system_config fails (no reply, then HTTP 500, then a reply with no filters): no write to
+    the Sheet, local list untouched, id unrecorded."""
+    old = finance_boot["old"]
+    for bad in (None, _SheetResp({}, status_code=500), _SheetResp({"status": "success"})):
+        monkeypatch.setattr(m, "crm_get", lambda params, timeout=10, bad=bad: bad)
+        finance_boot["posts"].clear()
+        m.init_db()
+        assert finance_boot["posts"] == []
+        assert _raw_filter("target_queries") == old
+        assert _raw_filter(m.APPLIED_ADDITIONS_KEY) is None
+
+
+def test_finance_queries_reach_the_live_list_keeps_an_id_recorded_meanwhile(finance_boot, monkeypatch):
+    """The applied ids are re-read inside the final transaction: an id another writer stored while
+    the Sheet write was in flight is kept."""
+    real_post = m.crm_post
+
+    def post_then_other_writer(payload, timeout=10):
+        res = real_post(payload, timeout)
+        with m.get_db_conn() as conn:
+            conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)",
+                         (m.APPLIED_ADDITIONS_KEY, json.dumps(["other-id"])))
+            conn.commit()
+        return res
+
+    monkeypatch.setattr(m, "crm_post", post_then_other_writer)
+    m.init_db()
+    assert _raw_filter(m.APPLIED_ADDITIONS_KEY) == ["other-id", "finance-queries-2026-10"]
+
+
+def test_finance_queries_reach_the_live_list_a_refused_write_is_retried(finance_boot, monkeypatch):
+    """The Sheet answers but refuses the write (HTTP 500): not recorded, retried next boot."""
+    old = finance_boot["old"]
+    monkeypatch.setattr(m, "crm_post", lambda payload, timeout=10: _SheetResp({"status": "error"}, status_code=500))
+    m.init_db()
+    assert _raw_filter("target_queries") == old
+    assert _raw_filter(m.APPLIED_ADDITIONS_KEY) is None
+
+
+def test_finance_queries_reach_the_live_list_a_phrase_kevin_deleted_stays_gone(finance_boot):
+    gone = "Pricing Analyst Troy MI"
+    m.init_db()
+    kept = [q for q in _raw_filter("target_queries") if q != gone]
+    finance_boot["seed"](kept, applied=["finance-queries-2026-10"])
+    finance_boot["sheet"] = list(kept)
+    finance_boot["posts"].clear()
+    m.init_db()
+    assert _raw_filter("target_queries") == kept
+    assert gone not in _raw_filter("target_queries")
+    assert finance_boot["posts"] == []
+
+
+def test_finance_queries_reach_the_live_list_never_rebuild_a_missing_or_empty_list(finance_boot):
+    """An empty or absent live list is restore_core_sourcing_filters' job: the helper adds nothing,
+    writes nothing and does not record the id."""
+    for bad in (None, []):
+        finance_boot["seed"](bad)
+        finance_boot["posts"].clear()
+        assert m.apply_filter_additions("finance-queries-2026-10", {"target_queries": m.FINANCE_QUERY_PHRASES}) == 0
+        assert _raw_filter("target_queries") in (None, [])
+        assert _raw_filter(m.APPLIED_ADDITIONS_KEY) is None
+        assert finance_boot["posts"] == []
+
+
+def test_finance_queries_reach_the_live_list_each_reads_as_a_title_the_gate_accepts():
+    assert len(m.FINANCE_QUERY_PHRASES) <= 13
+    for phrase in m.FINANCE_QUERY_PHRASES:
+        title = phrase.rsplit(" ", 2)[0]
+        assert m.title_rejection_reason(title) is None, phrase
+    assert all(q in m.DEFAULT_SEARCH_FILTERS["target_queries"] for q in m.FINANCE_QUERY_PHRASES)
+
+
 def test_t_warns_when_target_queries_is_empty(monkeypatch, sourcing_filters):
     sent = []
     monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
