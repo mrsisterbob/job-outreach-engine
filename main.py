@@ -4998,6 +4998,33 @@ def generate_cover_letter(company, job_title, track="a", letter_index=0, job_loc
 # ==============================================================================
 # 6. STAGE 1 STRICT FILTER & SINGLE CANDIDATE EVALUATION
 # ==============================================================================
+def title_seniority_rejection(title):
+    """"seniority" when the title carries a seniority_exclusions word, else None. Split out of
+    title_rejection_reason only because the two job filters check seniority AFTER their
+    company and description gates, and that order decides which reason the funnel records."""
+    title = str(title or "").lower()
+    if any(sen in title for sen in get_filter("seniority_exclusions", [])):
+        return "seniority"
+    return None
+
+
+def title_rejection_reason(title, include_seniority=True):
+    """The ONE title rejection, shared by passes_strict_filter (/t), _passes_remote_filter and /w.
+    Returns the funnel reason string ("title_exclusion", "off_direction_title", "industrial_title",
+    "seniority") or None when the title is acceptable. Title only: no company, city, salary or
+    description. include_seniority=False leaves the seniority check to the caller."""
+    title = str(title or "").lower()
+    if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
+        return "title_exclusion"
+    if is_off_direction_title(title):
+        return "off_direction_title"
+    if is_industrial_title(title):
+        return "industrial_title"
+    if include_seniority:
+        return title_seniority_rejection(title)
+    return None
+
+
 def _passes_remote_filter(job):
     """passes_strict_filter minus the geography gates, for genuinely remote postings.
 
@@ -5027,11 +5054,9 @@ def _passes_remote_filter(job):
     if max_sal > 0 and max_sal < safe_int(get_filter("min_salary"), 50000):
         return False
 
-    if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
+    if title_rejection_reason(title, include_seniority=False):
         return False
-    if is_off_direction_title(title):
-        return False
-    if (is_industrial_title(title) or len(industrial_term_hits(description)) >= 3
+    if (len(industrial_term_hits(description)) >= 3
             or required_degree_is_technical_trade(description)):
         return False
     if is_banned_employer(company):
@@ -5040,7 +5065,7 @@ def _passes_remote_filter(job):
         return False
     if any(trigger in description for trigger in get_filter("hard_ban_keywords", [])):
         return False
-    if any(sen in title for sen in get_filter("seniority_exclusions", [])):
+    if title_seniority_rejection(title):
         return False
 
     # Remote feeds skew heavily engineering, so require at least one core skill rather than
@@ -5336,12 +5361,9 @@ def passes_strict_filter(job, trace=None):
     if any(k in description for k in ["3+ years", "3-5 years", "4+ years"]) and (0 < max_sal < exp_floor):
         return reject("experience_salary")
 
-    if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
-        return reject("title_exclusion")
-    if is_off_direction_title(title):
-        return reject("off_direction_title")
-    if is_industrial_title(title):
-        return reject("industrial_title")
+    title_reason = title_rejection_reason(title, include_seniority=False)
+    if title_reason:
+        return reject(title_reason)
     if len(industrial_term_hits(description)) >= 3:
         return reject("industrial_description")
     if required_degree_is_technical_trade(description):
@@ -5352,8 +5374,9 @@ def passes_strict_filter(job, trace=None):
         return reject("company_exclusion")
     if any(trigger in description for trigger in get_filter("hard_ban_keywords", [])):
         return reject("hard_ban_keyword")
-    if any(sen in title for sen in get_filter("seniority_exclusions", [])):
-        return reject("seniority")
+    seniority_reason = title_seniority_rejection(title)
+    if seniority_reason:
+        return reject(seniority_reason)
 
     # Gate wealth/finance roles: require at least one systems, automation, or tooling anchor
     if any(term in title or term in description for term in ["wealth", "financial", "advisor", "branch", "banking"]):
@@ -12959,6 +12982,13 @@ def run_warm_radar_scan(chat_id=None):
     deliberately not called), pulls its Greenhouse/Lever/Ashby postings, and reports any new role
     against the contact it maps to. Shares the /t dedup ledger (seen_jobs) so it never re-alerts a
     role /t already surfaced, and only stamps the ones it newly surfaces itself. No Gemini scoring.
+
+    Filtering: /w applies ONLY the shared title gate (title_rejection_reason, seniority on - the
+    same rejection /t uses) plus is_banned_employer and is_role_tracked. It deliberately does NOT
+    apply the city, state, salary, cooldown or already-applied gates: a warm contact at a company
+    is a reason to look at a role anywhere that company hires. Roles the title gate drops are
+    counted in the closing message and are NOT stamped into seen_jobs (same as _add_candidate),
+    so they can resurface if the rule changes.
     """
     warm_contacts = get_warm_crm_contacts()
     if not warm_contacts:
@@ -13045,6 +13075,8 @@ def run_warm_radar_scan(chat_id=None):
     followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
     clavicular_rows = []
     match_count = 0
+    filtered_hashes = set()
+    title_filtered = 0
 
     for job in fetch_ats_jobs(slugs):
         company = job.get("employer_name") or ""
@@ -13066,6 +13098,16 @@ def run_warm_radar_scan(chat_id=None):
             None
         ) or warm_contacts.get(normalize_company_for_match(company))
         if not contact:
+            continue
+
+        # The title gate /t uses (one shared function), and only that: a warm contact is a reason
+        # to look at a role in any city, salary band or cooldown state, so those gates stay off
+        # on purpose. A filtered role is counted, never stamped into seen_jobs (same reason
+        # _add_candidate does not): the rule can change and the role should be seen again.
+        if title_rejection_reason(title):
+            if job_hash not in filtered_hashes:
+                filtered_hashes.add(job_hash)
+                title_filtered += 1
             continue
 
         seen_hashes.add(job_hash)
@@ -13098,9 +13140,12 @@ def run_warm_radar_scan(chat_id=None):
     if clavicular_rows:
         enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows))
 
-    logging.info(f"Warm Radar Complete: {match_count} new matches across {len(slugs)} warm companies.")
+    logging.info(f"Warm Radar Complete: {match_count} new matches across {len(slugs)} warm companies; {title_filtered} filtered by title.")
     if chat_id:
-        lines = [f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies scanned."]
+        done = f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies scanned"
+        done += (f"; {title_filtered} role{'' if title_filtered == 1 else 's'} filtered out by title."
+                 if title_filtered else ".")
+        lines = [done]
         lines += _skipped_report()
         send_telegram_message(chat_id, "\n".join(lines))
     # AFTER the message: the lookups are slow, and what they find shows up on the next /w.

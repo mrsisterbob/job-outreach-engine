@@ -14319,3 +14319,113 @@ def test_warm_radar_reports_skipped_companies_shared_slug_counts_both_as_scanned
     assert h.fetched == [["acmerobotics"]]
     assert "Not looked at yet" not in text
     assert "Acme-Robotics" not in text and h.http == []
+
+
+# ---- /w applies the same title rejection /t uses, from one shared function ----
+
+def _warm_title_jobs(titles, slug="acmerobotics"):
+    return [{"employer_name": "Acme Robotics", "job_title": t, "job_id": f"gh_{slug}_{i}",
+             "job_apply_link": f"https://boards.greenhouse.io/{slug}/jobs/{i}",
+             "job_description": "Reconciliation workflows with SQL and reporting."}
+            for i, t in enumerate(titles)]
+
+
+def _warm_title_harness(monkeypatch, titles):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    h.filters.update({k: m.DEFAULT_SEARCH_FILTERS[k] for k in ("title_exclusions", "seniority_exclusions")})
+    h.cards, h.payloads = [], []
+    monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: _warm_title_jobs(titles))
+    monkeypatch.setattr(m, "send_warm_radar_card", lambda job, *a, **kw: h.cards.append(job["job_title"]))
+    monkeypatch.setattr(m, "is_role_tracked", lambda company, title: False)
+    monkeypatch.setattr(m, "resolve_target_email", lambda *a, **kw: "")
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: h.payloads.append(payload) or True)
+    return h
+
+
+def test_warm_radar_applies_the_title_gate(monkeypatch):
+    excl = m.DEFAULT_SEARCH_FILTERS["title_exclusions"][0]
+    senior = m.DEFAULT_SEARCH_FILTERS["seniority_exclusions"][0]
+    titles = ["Operations Analyst", "Help Desk Technician", "Data Center Technician",
+              f"{excl.title()} Associate", f"{senior.title()} Operations Analyst",
+              "Automation Systems Analyst - ASRS & AMR Optimization"]
+    h = _warm_title_harness(monkeypatch, titles)
+    text = h.run()
+    assert h.cards == ["Operations Analyst"], h.cards
+    rows = [r for p in h.payloads for r in p.get("rows", [])]
+    assert len(rows) == 1 and rows[0]["row_data"][2] == "Operations Analyst", rows
+    assert "1 new matches" in text and "5 roles filtered out by title" in text, text
+    # Filtered roles are not stamped into seen_jobs: only the surfaced role is.
+    for t in titles[1:]:
+        assert not m.is_job_seen_db(m.generate_dedup_hash("Acme Robotics", t)), t
+
+
+def test_warm_radar_without_filtered_roles_keeps_the_closing_line(monkeypatch):
+    h = _warm_title_harness(monkeypatch, ["Operations Analyst"])
+    text = h.run()
+    assert h.cards == ["Operations Analyst"]
+    assert "filtered out by title" not in text and "1 warm companies scanned." in text, text
+
+
+def test_warm_radar_applies_the_title_gate_from_one_shared_function(monkeypatch):
+    # Baseline: every title passes /t's gate and /w's before the shared function is swapped.
+    desc = "Reconciliation workflows with SQL and reporting."
+    strict = {
+        "employer_name": "Northwind Co", "job_title": "Operations Analyst", "job_description": desc,
+        "job_city": "Farmington Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1",
+    }
+    h = _warm_title_harness(monkeypatch, ["Operations Analyst", "Business Systems Analyst"])
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    h.filters.update({"min_salary": 50000, "valid_cities": ["farmington", "detroit"],
+                      "company_exclusions": [], "hard_ban_keywords": []})
+    assert m.passes_strict_filter(strict) is True
+    assert m._passes_remote_filter(_remote_job()) is True
+    assert len(h.cards) == 0
+    h.run()
+    assert h.cards == ["Operations Analyst", "Business Systems Analyst"]
+    # Swap the shared function: neither gate keeps a list of its own.
+    monkeypatch.setattr(m, "title_rejection_reason", lambda title, include_seniority=True: "x")
+    trace = m.FunnelTrace()
+    assert m.passes_strict_filter(strict, trace=trace) is False
+    assert trace.reasons.get("x") == 1, trace.reasons
+    assert m._passes_remote_filter(_remote_job()) is False
+    h.cards.clear()
+    text = h.run()
+    assert h.cards == [] and "2 roles filtered out by title" in text, (h.cards, text)
+
+
+def test_warm_radar_closing_message_singular_filtered_role(monkeypatch):
+    h = _warm_title_harness(monkeypatch, ["Operations Analyst", "Help Desk Technician"])
+    text = h.run()
+    assert "1 role filtered out by title" in text and "1 roles" not in text, text
+
+
+def test_warm_radar_applies_the_title_gate_seniority_only_title_rejected_everywhere(monkeypatch):
+    # A title only the seniority check rejects: guards the include_seniority=False + late
+    # title_seniority_rejection split at the real entry points, with no patching of the shared function.
+    senior = "Senior Operations Analyst"
+    assert m.title_rejection_reason(senior, include_seniority=False) is None
+    h = _warm_title_harness(monkeypatch, [senior, "Operations Analyst"])
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    h.filters.update({"min_salary": 50000, "valid_cities": ["farmington", "detroit"],
+                      "company_exclusions": [], "hard_ban_keywords": []})
+    strict = {
+        "employer_name": "Northwind Co", "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL and reporting.",
+        "job_city": "Farmington Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1",
+    }
+    remote = _remote_job()
+    assert m.passes_strict_filter(strict) is True and m._passes_remote_filter(remote) is True
+    trace = m.FunnelTrace()
+    assert m.passes_strict_filter({**strict, "job_title": senior}, trace=trace) is False
+    assert trace.reasons.get("seniority") == 1, trace.reasons
+    assert m._passes_remote_filter({**remote, "job_title": senior}) is False
+    text = h.run()
+    assert h.cards == ["Operations Analyst"], h.cards
+    assert "1 role filtered out by title" in text, text
