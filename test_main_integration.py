@@ -14152,3 +14152,170 @@ def test_industrial_role_gate_business_posting_with_two_industrial_words_passes(
     assert m.passes_strict_filter({**strict, "job_description": heavy}, trace=trace) is False
     assert trace.reasons.get("industrial_description") == 1, trace.reasons
     assert m._passes_remote_filter({**_remote_job(), "job_description": heavy}) is False
+
+
+# ---- /w names the warm companies it cannot scan, and looks up their boards ----
+
+class _WarmRadarHarness:
+    """Drives the real m.run_warm_radar_scan. Stubs only the edges: the CRM webhook, the board
+    HTTP calls, the ATS fetch and Telegram. `live_boards` is the set of slugs whose Greenhouse URL
+    answers 200 with postings; every other board URL answers 404."""
+
+    def __init__(self, monkeypatch, companies, live_boards=(), tracked_slugs=()):
+        self.messages, self.fetched, self.http = [], [], []
+        self.live_boards = set(live_boards)
+        self.filters = {"ats_company_slugs": list(tracked_slugs)}
+
+        rows = [{"company": c, "name": f"Person {i}", "email": f"p{i}@example.com",
+                 "note": "Active relationship", "raw_priority": 5, "sheet_uuid": f"u{i}"}
+                for i, c in enumerate(companies)]
+
+        class _Resp:
+            def __init__(self, status, body):
+                self.status_code, self._body = status, body
+            def json(self):
+                return self._body
+
+        def fake_crm_post(payload, **kw):
+            assert payload.get("action") == "get_followups" and payload.get("tab") == "CW", payload
+            return _Resp(200, {"status": "success", "followups": rows})
+
+        def fake_get(url, timeout=None, **kw):
+            self.http.append(url)
+            for slug in self.live_boards:
+                if url == f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs":
+                    return _Resp(200, {"jobs": [{"id": 1}]})
+            return _Resp(404, {})
+
+        m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
+        monkeypatch.setattr(m, "crm_post", fake_crm_post)
+        monkeypatch.setattr(m.requests, "get", fake_get)
+        monkeypatch.setattr(m, "get_filter", lambda key, default=None: self.filters.get(key, default))
+        monkeypatch.setattr(m, "set_filter", lambda key, val: self.filters.__setitem__(key, val))
+        monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: self.fetched.append(list(slugs)) or [])
+        monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+        monkeypatch.setattr(m, "send_status_update", lambda chat_id, text: None)
+        monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: self.messages.append(text))
+        monkeypatch.setattr(m.time, "sleep", lambda s: None)
+
+    def run(self):
+        """One /w. The board lookups run inline here (the autouse _spawn_background seam), so a
+        second run() sees whatever the first one's lookups wrote."""
+        m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
+        count_before = len(self.messages)
+        m.run_warm_radar_scan(chat_id=1)
+        return "\n".join(self.messages[count_before:])
+
+
+def _identity(name):
+    with m.get_db_conn() as conn:
+        return conn.execute(
+            "SELECT ats_slug, board_checked_at FROM company_identities WHERE normalized_name = ?",
+            (m.normalize_company_for_match(name),)
+        ).fetchone()
+
+
+def test_warm_radar_reports_skipped_companies_names_and_counts(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    text = h.run()
+    assert h.fetched == [["acmerobotics"]]
+    assert "1 warm companies scanned" in text
+    assert "Globex Systems" in text and "Acme Robotics" not in text
+
+
+def test_warm_radar_reports_skipped_companies_lookup_makes_next_run_scan_it(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"], live_boards=["acmerobotics"])
+    first = h.run()
+    # First run: nothing scanned yet, the company is named, and the lookup found the board.
+    assert h.fetched == []
+    assert "Acme Robotics" in first and "checking 1" in first
+    assert _identity("Acme Robotics")[0] == "acmerobotics"
+    second = h.run()
+    assert h.fetched == [["acmerobotics"]]
+    assert "Not looked at yet" not in second and "1 warm companies scanned" in second
+
+
+def test_warm_radar_reports_skipped_companies_already_tracked_slug_still_gets_identity(monkeypatch):
+    """auto_expand_ats_slug returns before upserting when the slug is already in ats_company_slugs;
+    /w reads only company_identities, so the lookup has to write the row itself, with no probe."""
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"], tracked_slugs=["acmerobotics"])
+    assert _identity("Acme Robotics") is None
+    h.run()
+    assert _identity("Acme Robotics")[0] == "acmerobotics"
+    assert h.http == []
+    h.run()
+    assert h.fetched == [["acmerobotics"]]
+    assert h.http == []
+
+
+def test_warm_radar_reports_skipped_companies_never_probes_non_company_names(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["cousin", "https://www.linkedin.com/in/someone", "Acme Robotics"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    text = h.run()
+    assert "2 warm entries are not company names" in text
+    assert h.http == []
+    assert "cousin" not in text and "linkedin" not in text
+
+
+def test_warm_radar_reports_skipped_companies_remembers_a_miss(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Nopeboard Labs"])
+    first = h.run()
+    assert len(h.http) == 3  # greenhouse, lever, ashby: one probe
+    assert _identity("Nopeboard Labs")[1] is not None
+    assert "Nopeboard Labs" in first and "Not looked at yet" in first
+    second = h.run()
+    assert len(h.http) == 3  # not probed again
+    assert "Checked, no public job board found" in second and "Nopeboard Labs" in second
+    assert "Not looked at yet" not in second
+    # Past the retry window the miss expires and the company is looked up again.
+    old = (m.datetime.now() - m.timedelta(days=m.WARM_RADAR_MISS_RETRY_DAYS + 1)).strftime("%Y-%m-%d")
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE company_identities SET board_checked_at = ?", (old,))
+        conn.commit()
+    h.run()
+    assert len(h.http) == 6
+
+
+def test_warm_radar_reports_skipped_companies_a_failed_probe_is_not_a_miss(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Flaky Corp Labs"])
+
+    def boom(url, timeout=None, **kw):
+        h.http.append(url)
+        raise ConnectionError("network down")
+
+    monkeypatch.setattr(m.requests, "get", boom)
+    h.run()
+    row = _identity("Flaky Corp Labs")
+    assert row is None or row[1] is None
+    h.run()
+    assert len(h.http) == 6  # retried, because an error is not "no public board"
+
+
+def test_warm_radar_reports_skipped_companies_with_zero_scanned_and_batch_cap(monkeypatch):
+    names = [f"Company{chr(65 + i // 26)}{chr(65 + i % 26)} Works" for i in range(25)]
+    h = _WarmRadarHarness(monkeypatch, names)
+    text = h.run()
+    assert h.fetched == []
+    assert "none of your 25 warm entries" in text
+    assert "checking 20" in text and "5 more queued for the next run" in text
+    assert text.count("Works") <= m.WARM_RADAR_NAME_CAP
+    assert len(h.http) == 20 * 3  # one batch of probes, the remaining 5 wait
+
+
+def test_warm_radar_reports_skipped_companies_escapes_html_in_names(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Foo <Bar> Labs", "Acme Robotics"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    text = h.run()
+    assert "Foo &lt;Bar&gt; Labs" in text
+    assert "<Bar>" not in text
+
+
+def test_warm_radar_reports_skipped_companies_shared_slug_counts_both_as_scanned(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "Acme-Robotics"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    m.upsert_company_identity("Acme-Robotics", ats_slug="acmerobotics")
+    text = h.run()
+    assert h.fetched == [["acmerobotics"]]
+    assert "Not looked at yet" not in text
+    assert "Acme-Robotics" not in text and h.http == []
