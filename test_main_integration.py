@@ -14837,3 +14837,438 @@ def test_referral_ask_drafts_stored_role_without_a_link_is_left_out_on_the_write
     assert [r["title"] for r in json.loads(rows[0]["roles_json"])] == ["Logistics Coordinator"]
     assert "- Supply Chain Analyst" not in rows[0]["body"]
     assert "1 ask draft stored, 1 role left out by the wording check" in text, text
+
+
+# ---- /refer: page the pending referral asks, and hand a sent one to the Carmen Cold ladder ----
+
+def _seed_refer_ask(idx, status="pending", body=None, name=None, company=None, uuid=None, roles=2):
+    """One referral_asks row, created in `idx` order (oldest first). Returns its id."""
+    body = body if body is not None else (
+        f"Hi Dana{idx},\n\nI saw {roles} roles at Acme & Co <fit>: see https://jobs.acme.test/{idx}?a=1&b=2\n\n"
+        f"Thanks,\nKevin")
+    created = f"2026-10-01 09:{idx % 60:02d}:00"
+    with m.get_db_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO referral_asks (sheet_uuid, contact_name, company, company_key, status, roles_json, body, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (uuid if uuid is not None else f"refer-uuid-{idx}", name or f"Contact{idx}", company or f"Company{idx}", f"company{idx}",
+             status, json.dumps([{"title": f"Role{n}", "link": "", "req": "", "job_hash": f"h{idx}-{n}"}
+                                 for n in range(roles)]), body, created, created))
+        conn.commit()
+        return cur.lastrowid
+
+
+def _stored_body(ask_id):
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT body FROM referral_asks WHERE id = ?", (ask_id,)).fetchone()[0]
+
+
+def _refer_ids(message):
+    return [int(i) for i in re.findall(r"<b>#(\d+)</b>", message)]
+
+
+def _ask_row(ask_id):
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT status, sent_at FROM referral_asks WHERE id = ?", (ask_id,)).fetchone()
+
+
+def test_refer_command_pages_pending_asks_five_per_page_with_the_stored_text(capture_sent):
+    ids = [_seed_refer_ask(i) for i in range(12)]
+    _seed_refer_ask(40, status="sent", name="SentPerson")
+    _seed_refer_ask(41, status="dismissed", name="DismissedPerson")
+
+    _dispatch("/refer")
+    assert len(capture_sent) == 1
+    page1 = capture_sent[0]
+    assert _refer_ids(page1) == ids[:5]
+    assert "Page 1 of 3 · /refer 2" in page1
+    assert "Attach your resume by hand before you send." in page1
+    assert "Contact0" in page1 and "Company0" in page1 and "2 roles" in page1
+
+    capture_sent.clear()
+    _dispatch("/refer 2")
+    assert _refer_ids(capture_sent[0]) == ids[5:10]
+    assert "Page 2 of 3 · /refer 3" in capture_sent[0]
+
+    capture_sent.clear()
+    _dispatch("/refer 3")
+    page3 = capture_sent[0]
+    assert _refer_ids(page3) == ids[10:]
+    assert "Page 3 of 3" in page3 and "/refer 4" not in page3
+
+    # The stored draft is shown byte-for-byte: read each one back from SQLite and unescape the page.
+    for page, expected in ((page1, ids[:5]), (page3, ids[10:])):
+        codes = [html.unescape(c) for c in re.findall(r"<code>(.*?)</code>", page, re.DOTALL)]
+        assert codes == [_stored_body(i) for i in expected]
+    assert "&amp;b=2" in page1 and "&lt;fit&gt;" in page1  # escaped for HTML mode; ':' and links intact
+
+    for page in (page1, page3):
+        assert "SentPerson" not in page and "DismissedPerson" not in page
+    for bad in ("/refer 4", "/refer 0"):
+        capture_sent.clear()
+        _dispatch(bad)
+        assert capture_sent == [f"No page {bad.split()[1]}; there are 3."]
+    capture_sent.clear()
+    _dispatch("/refer nonsense")
+    assert capture_sent[0].startswith("Use /refer")
+
+
+def test_refer_command_pages_pending_asks_empty_table_is_one_plain_line(capture_sent):
+    _seed_refer_ask(1, status="sent")
+    _dispatch("/refer")
+    _dispatch("/refer 2")
+    assert len(capture_sent) == 2
+    for msg in capture_sent:
+        assert "No pending referral asks" in msg and "/w" in msg and "<code>" not in msg
+
+
+def test_refer_command_pages_pending_asks_a_long_page_is_split_never_cut(capture_sent):
+    long_bodies = [f"Hi Dana{i},\n\n" + "\n".join(
+        f"Line {n} of ask {i}: a fairly long sentence about fit." for n in range(18)) for i in range(5)]
+    ids = [_seed_refer_ask(i, body=b) for i, b in enumerate(long_bodies)]
+    _dispatch("/refer")
+
+    assert len(capture_sent) > 1
+    assert all(len(msg) <= m.TELEGRAM_CHUNK_CHARS for msg in capture_sent)
+    assert all(msg.count("<code>") == msg.count("</code>") for msg in capture_sent)
+    assert [i for msg in capture_sent for i in _refer_ids(msg)] == ids
+    codes = [html.unescape(c) for msg in capture_sent for c in re.findall(r"<code>(.*?)</code>", msg, re.DOTALL)]
+    assert codes == long_bodies
+    assert "Page 1 of 1" in capture_sent[-1]
+
+
+def test_refer_command_pages_pending_asks_a_draft_longer_than_a_message_is_split_on_lines(capture_sent):
+    body = "\n".join(f"Line {n}: " + "word " * 12 for n in range(150))
+    assert len(body) > m.TELEGRAM_CHUNK_CHARS
+    _seed_refer_ask(1, body=body)
+    _dispatch("/refer")
+
+    assert len(capture_sent) > 1
+    assert all(len(msg) <= m.TELEGRAM_CHUNK_CHARS for msg in capture_sent)
+    parts = [html.unescape(c) for msg in capture_sent for c in re.findall(r"<code>(.*?)</code>", msg, re.DOTALL)]
+    assert "\n".join(parts) == body
+
+
+class _ReferSheet:
+    """In-memory Carmen Warm/Cold/Hot tabs. The outbox rows /refer queues are applied to it in order,
+    the way the drain and Code.gs would, so the moved row can be walked through the real sequencer."""
+    _TAB_CODES = {"Carmen Warm": "CW", "Carmen Cold": "CC", "Carmen Hot": "CH"}
+
+    def __init__(self, monkeypatch, warm=(), cold=(), hot=(), read_ok=True):
+        self.tabs = {"CW": [dict(r) for r in warm], "CC": [dict(r) for r in cold], "CH": [dict(r) for r in hot]}
+        monkeypatch.setattr(m, "fetch_networking_cards_checked",
+                            lambda code, qty=2: ([dict(r) for r in self.tabs.get(code, [])], read_ok))
+
+    def row(self, sheet_uuid):
+        return next((r for rows in self.tabs.values() for r in rows if r["sheet_uuid"] == sheet_uuid), None)
+
+    def apply_outbox(self):
+        with m.get_db_conn() as conn:
+            payloads = [json.loads(p) for (p,) in conn.execute("SELECT payload_json FROM crm_outbox ORDER BY id ASC")]
+        for p in payloads:
+            row = self.row(p["sheet_uuid"])
+            if p["action"] == "update_status":
+                for rows in self.tabs.values():
+                    if row in rows:
+                        rows.remove(row)
+                self.tabs[self._TAB_CODES[p["new_tab"]]].append(row)
+            elif p["action"] == "update_snooze":
+                row["next_followup"] = p["next_followup"]
+            elif p["action"] == "append_note":
+                row["note"] = f"{row.get('note') or ''}\n{p['note']}".strip()
+        return payloads
+
+
+def _warm_contact(uuid="refer-uuid-1", email="dana@acme.test", last_contact=None, next_followup="1970-01-01"):
+    return {"sheet_uuid": uuid, "name": "Dana Reed", "company": "Acme", "title": "", "email": email,
+            "status": "Cold Lead", "date_added": last_contact or (date.today() - timedelta(days=365)).isoformat(),
+            "next_followup": next_followup, "raw_priority": "Medium", "note": "[2025-10-01] met at a mixer"}
+
+
+def _outbox_count():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM crm_outbox").fetchone()[0]
+
+
+@pytest.mark.parametrize("old_followup", ["1970-01-01", "2025-11-03", (date.today() + timedelta(days=10)).isoformat()])
+def test_refer_command_pages_pending_asks_sent_queues_the_cold_move_then_the_ladder_starts(
+        monkeypatch, capture_sent, old_followup):
+    """A Warm row a year stale (with an old, blank or hand-set future follow-up date) is marked sent:
+    the real sequencer must read the moved row as the START of the ladder, never as exhausted."""
+    today = date.today()
+    sheet = _ReferSheet(monkeypatch, warm=[_warm_contact(next_followup=old_followup)])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    other_id = _seed_refer_ask(2, uuid="refer-uuid-2")
+
+    _dispatch(f"/refer sent {ask_id}")
+
+    first_nudge = (today + timedelta(days=m.CARMEN_LADDER_DAYS_COLD[0])).isoformat()
+    payloads = sheet.apply_outbox()
+    assert [(p["action"], p["sheet_uuid"]) for p in payloads] == [
+        ("update_status", "refer-uuid-1"), ("append_note", "refer-uuid-1"), ("update_snooze", "refer-uuid-1")]
+    assert payloads[0]["new_tab"] == "Carmen Cold"
+    assert payloads[1]["note"].startswith(f"[{today.isoformat()}] {m.LADDER_RESTART_NOTE_MARKER}")
+    assert payloads[2]["next_followup"] == first_nudge
+    status, sent_at = _ask_row(ask_id)
+    assert status == "sent" and sent_at
+    assert _ask_row(other_id)[0] == "pending"
+    assert "marked sent" in capture_sent[0] and "Carmen Cold" in capture_sent[0] and first_nudge in capture_sent[0]
+    assert "LinkedIn" not in capture_sent[0]
+    with m.get_db_conn() as conn:  # the hand-off never adds a second pending row for the contact
+        assert conn.execute("SELECT COUNT(*) FROM referral_asks WHERE sheet_uuid = 'refer-uuid-1'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM referral_asks WHERE sheet_uuid = 'refer-uuid-1' "
+                            "AND status = 'pending'").fetchone()[0] == 0
+
+    moved = sheet.row("refer-uuid-1")
+    assert moved in sheet.tabs["CC"] and moved["date_added"] == (today - timedelta(days=365)).isoformat()
+    ladder = _FakeCarmenSheet(monkeypatch, sheet.tabs["CC"])
+    results = _run_days(ladder, today, 6)
+    assert all(r["killed"] == [] and r["revived"] == [] for r in results.values())
+    assert ladder.moves == []
+    assert results[0]["followups_ready"] == []
+    assert [e["attempt"] for e in results[m.CARMEN_LADDER_DAYS_COLD[0]]["followups_ready"]] == [1]
+
+
+def test_refer_command_pages_pending_asks_sent_note_alone_plans_the_start_of_the_ladder():
+    """What the restart note buys on its own: with the date column still a year old, the planner
+    answers "schedule" (start), not "exhausted"; the snooze only reinforces it."""
+    today = date.today()
+    old = (today - timedelta(days=365)).isoformat()
+    note = f"[{today.isoformat()}] {m.LADDER_RESTART_NOTE_MARKER} - referral ask #1 sent by hand."
+    plan = m.plan_carmen_ladder(old, "1970-01-01", today, note=note)
+    assert plan.action == "schedule" and not plan.revived
+
+
+def test_refer_command_pages_pending_asks_failed_enqueue_leaves_the_ask_pending(monkeypatch, capture_sent):
+    sheet = _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    monkeypatch.setattr(m, "enqueue_crm_payloads", lambda payloads: False)
+
+    _dispatch(f"/refer sent {ask_id}")
+
+    assert _ask_row(ask_id) == ("pending", None)
+    assert _outbox_count() == 0
+    assert "Nothing changed" in capture_sent[0] and "stays pending" in capture_sent[0]
+    assert "marked sent" not in capture_sent[0]
+    assert sheet.row("refer-uuid-1") in sheet.tabs["CW"]
+
+
+def test_refer_command_pages_pending_asks_a_real_insert_failure_rolls_the_queue_back(monkeypatch, capture_sent):
+    """Through the real atomic enqueue: the second insert fails, so no half-queued hand-off remains."""
+    _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    real = m.get_db_conn
+
+    class _Boom:
+        def __init__(self, conn):
+            self._conn, self._n = conn, 0
+
+        def execute(self, sql, *a):
+            if "INSERT INTO crm_outbox" in sql:
+                self._n += 1
+                if self._n == 2:
+                    raise RuntimeError("disk full")
+            return self._conn.execute(sql, *a)
+
+        def commit(self):
+            return self._conn.commit()
+
+        def rollback(self):
+            return self._conn.rollback()
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def flaky():
+        with real() as conn:
+            yield _Boom(conn)
+
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: None)
+    # Patch only the enqueue's connection: the ask lookup and the status write use the real one.
+    calls = {"n": 0}
+    original_enqueue = m.enqueue_crm_payloads
+
+    def enqueue_with_flaky_conn(payloads):
+        calls["n"] += 1
+        with monkeypatch.context() as patch:
+            patch.setattr(m, "get_db_conn", flaky)
+            return original_enqueue(payloads)
+
+    monkeypatch.setattr(m, "enqueue_crm_payloads", enqueue_with_flaky_conn)
+    _dispatch(f"/refer sent {ask_id}")
+
+    assert calls["n"] == 1
+    assert _ask_row(ask_id) == ("pending", None)
+    assert _outbox_count() == 0
+    assert "Nothing changed" in capture_sent[0]
+
+
+def test_refer_command_pages_pending_asks_sent_refuses_repeat_unknown_and_non_pending(monkeypatch, capture_sent):
+    sheet = _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    dismissed_id = _seed_refer_ask(2, status="dismissed", uuid="refer-uuid-1")
+
+    _dispatch(f"/refer sent {ask_id}")
+    queued = _outbox_count()
+    assert queued == 3
+    capture_sent.clear()
+
+    _dispatch(f"/refer sent {ask_id}")
+    _dispatch("/refer sent 9999")
+    _dispatch(f"/refer sent {dismissed_id}")
+    _dispatch("/refer sent")
+
+    assert "already marked sent" in capture_sent[0]
+    assert "No ask #9999" in capture_sent[1]
+    assert "dismissed, not pending" in capture_sent[2]
+    assert capture_sent[3].startswith("Use /refer")
+    assert _outbox_count() == queued
+    assert _ask_row(dismissed_id)[0] == "dismissed"
+    assert sheet.row("refer-uuid-1") is not None
+
+
+def test_refer_command_pages_pending_asks_sent_changes_nothing_when_the_contact_cannot_be_found(
+        monkeypatch, capture_sent):
+    _ReferSheet(monkeypatch, warm=[])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    _dispatch(f"/refer sent {ask_id}")
+    assert "Could not find this contact" in capture_sent[0] and _ask_row(ask_id)[0] == "pending"
+
+    capture_sent.clear()
+    monkeypatch.setattr(m, "fetch_networking_cards_checked", lambda code, qty=2: ([], False))
+    _dispatch(f"/refer sent {ask_id}")
+    assert "CRM read failed" in capture_sent[0] and _ask_row(ask_id)[0] == "pending"
+    assert _outbox_count() == 0
+
+
+def test_refer_command_pages_pending_asks_sent_tells_kevin_when_the_contact_has_no_email(monkeypatch, capture_sent):
+    sheet = _ReferSheet(monkeypatch, warm=[_warm_contact(email="")])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    _dispatch(f"/refer sent {ask_id}")
+
+    assert _ask_row(ask_id)[0] == "sent"
+    assert "No usable email" in capture_sent[0] and "LinkedIn" in capture_sent[0]
+    sheet.apply_outbox()
+    ladder = _FakeCarmenSheet(monkeypatch, sheet.tabs["CC"])
+    results = _run_days(ladder, date.today(), 6)  # the row still walks the ladder; only the email is missing
+    entry = results[m.CARMEN_LADDER_DAYS_COLD[0]]["followups_ready"][0]
+    assert entry["attempt"] == 1 and entry["email"] == "" and ladder.moves == []
+
+
+def test_refer_command_pages_pending_asks_sent_for_cold_and_hot_contacts_never_demotes_them(
+        monkeypatch, capture_sent):
+    sheet = _ReferSheet(monkeypatch, cold=[_warm_contact("refer-cold")], hot=[_warm_contact("refer-hot")])
+    cold_id = _seed_refer_ask(1, uuid="refer-cold")
+    hot_id = _seed_refer_ask(2, uuid="refer-hot")
+
+    _dispatch(f"/refer sent {cold_id}")
+    assert [p["action"] for p in sheet.apply_outbox()] == ["append_note", "update_snooze"]
+    assert "already in Carmen Cold" in capture_sent[0]
+
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM crm_outbox")
+        conn.commit()
+    _dispatch(f"/refer sent {hot_id}")
+    assert _outbox_count() == 0
+    assert "Carmen Hot and stays there" in capture_sent[1]
+    assert _ask_row(hot_id)[0] == "sent" and sheet.row("refer-hot") in sheet.tabs["CH"]
+
+
+def test_refer_command_pages_pending_asks_is_in_help_and_not_swallowed_by_refs(capture_sent):
+    _dispatch("/help")
+    assert "/refer - Pending referral asks" in "".join(capture_sent)
+    capture_sent.clear()
+    _dispatch("/refs")
+    assert "Pending referral" not in "".join(capture_sent)
+
+
+def test_refer_command_pages_pending_asks_sent_refuses_an_ask_with_a_blank_contact_id(monkeypatch, capture_sent):
+    """A blank stored sheet_uuid must not match the first CRM row with a blank Column J."""
+    blank_row = _warm_contact(uuid="")
+    sheet = _ReferSheet(monkeypatch, warm=[blank_row])
+    ask_id = _seed_refer_ask(1, uuid="")
+
+    _dispatch(f"/refer sent {ask_id}")
+
+    assert _ask_row(ask_id) == ("pending", None)
+    assert _outbox_count() == 0
+    assert "no contact id" in capture_sent[0] and "stays pending" in capture_sent[0]
+    assert "marked sent" not in capture_sent[0]
+    assert sheet.row("") in sheet.tabs["CW"]
+
+
+def test_refer_command_pages_pending_asks_odd_arguments_get_a_usage_reply_not_an_exception(capture_sent):
+    ask_id = _seed_refer_ask(1)
+    for text in ("/refer ²", "/refer sent ²", "/refer 99999999999999999999",
+                 "/refer sent 99999999999999999999", "/refer sent 2147483648", "/refer ٣", "/refer sent 1 2"):
+        capture_sent.clear()
+        _dispatch(text)
+        assert len(capture_sent) == 1 and capture_sent[0].startswith("Use /refer"), (text, capture_sent)
+    assert _ask_row(ask_id) == ("pending", None)
+    capture_sent.clear()
+    _dispatch("/refer sent 2147483647")  # the largest accepted id is a normal "no such ask"
+    assert "No ask #2147483647" in capture_sent[0]
+    capture_sent.clear()
+    _dispatch("/refer 2147483647")
+    assert capture_sent == ["No page 2147483647; there is 1."]
+
+
+def _referral_reads_fail(monkeypatch):
+    """get_db_conn whose statements touching referral_asks raise 'database is locked'."""
+    import sqlite3
+    from contextlib import contextmanager
+    real = m.get_db_conn
+
+    class _Locked:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a):
+            if "referral_asks" in sql:
+                raise sqlite3.OperationalError("database is locked")
+            return self._conn.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    @contextmanager
+    def locked():
+        with real() as conn:
+            yield _Locked(conn)
+
+    monkeypatch.setattr(m, "get_db_conn", locked)
+    return real
+
+
+def test_refer_command_pages_pending_asks_an_unreadable_db_gets_a_reply_not_silence(monkeypatch, capture_sent):
+    _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    real = _referral_reads_fail(monkeypatch)
+
+    _dispatch("/refer")
+    _dispatch("/refer 2")
+    _dispatch(f"/refer sent {ask_id}")
+
+    monkeypatch.setattr(m, "get_db_conn", real)
+    assert len(capture_sent) == 3
+    assert all("Could not read the ask list, check /health" in msg for msg in capture_sent)
+    assert _ask_row(ask_id) == ("pending", None)
+    assert _outbox_count() == 0
+
+
+def test_refer_command_pages_pending_asks_a_cut_never_lands_inside_an_html_entity(capture_sent):
+    """An unbroken >4k string full of & and < : each cut is made on the raw text, so every piece
+    still carries only whole entities and Telegram accepts the message."""
+    body = "&<" * 3000
+    assert len(body) > 4000
+    _seed_refer_ask(1, body=body)
+    _dispatch("/refer")
+
+    assert len(capture_sent) > 1
+    assert all(len(msg) <= m.TELEGRAM_CHUNK_CHARS for msg in capture_sent)
+    codes = [c for msg in capture_sent for c in re.findall(r"<code>(.*?)</code>", msg, re.DOTALL)]
+    assert len(codes) > 1
+    for code in codes:
+        assert not re.search(r"&(?!(?:amp|lt|gt|quot|#x27);)", code), code[:80]
+        assert "<" not in code
+    assert html.unescape("".join(codes)).replace("\n", "") == body

@@ -13131,6 +13131,266 @@ def _referral_summary_line(summary):
     return ", ".join(parts)
 
 
+# /refer pages the pending asks 5 at a time. The reason is message size, not lag: a full ask draft is
+# a few hundred characters and Telegram's cap is TELEGRAM_CHUNK_CHARS (3900), so five fit with room
+# to spare. The read itself is one COUNT and one LIMIT/OFFSET query on SQLite.
+REFER_PAGE_SIZE = 5
+REFER_RESUME_REMINDER = "Attach your resume by hand before you send."
+_REFER_READ_FAILED = "Could not read the ask list, check /health. Nothing changed."
+_REFER_MAX_ARG = 2 ** 31 - 1
+_REFER_USAGE = "Use /refer, /refer 2 for another page, or /refer sent &lt;id&gt;."
+_REFER_NO_ASKS = "No pending referral asks. /w creates them when a warm contact's company posts a new role."
+
+
+def referral_asks_page(page, size=REFER_PAGE_SIZE):
+    """(total pending, rows) for one page of pending asks, OLDEST first (the longest-waiting ask
+    leads), ties broken by id. Row = (id, contact_name, company, roles_json, body)."""
+    with get_db_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM referral_asks WHERE status = 'pending'").fetchone()[0]
+        rows = conn.execute(
+            "SELECT id, contact_name, company, roles_json, body FROM referral_asks "
+            "WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?",
+            (size, (page - 1) * size)).fetchall()
+    return total, rows
+
+
+def _split_escaped_for_code(body, max_len):
+    """`body` cut into HTML-escaped pieces of at most max_len characters (escaped length), on line
+    breaks first and word boundaries second, so no sentence is cut mid-word. Every character is kept.
+    The RAW text is cut and each piece escaped afterwards, so a cut can never land inside an entity
+    such as &amp; (Telegram rejects a message with a broken one)."""
+    def esc_len(text):
+        return len(html.escape(text))
+
+    pieces = []
+    for line in str(body or "").split("\n"):
+        if esc_len(line) <= max_len:
+            pieces.append(line)
+            continue
+        run = ""
+        for word in line.split(" "):
+            while esc_len(word) > max_len:  # one unbroken string longer than a message: slice, never drop
+                if run:
+                    pieces.append(run)
+                    run = ""
+                cut, used = 0, 0
+                for ch in word:
+                    width = esc_len(ch)
+                    if used + width > max_len:
+                        break
+                    used += width
+                    cut += 1
+                pieces.append(word[:cut])
+                word = word[cut:]
+            if run and esc_len(run) + 1 + esc_len(word) > max_len:
+                pieces.append(run)
+                run = word
+            else:
+                run = f"{run} {word}" if run else word
+        if run:
+            pieces.append(run)
+    parts, current = [], ""
+    for piece in pieces:
+        if current and esc_len(current) + 1 + esc_len(piece) > max_len:
+            parts.append(current)
+            current = piece
+        else:
+            current = f"{current}\n{piece}" if current else piece
+    if current:
+        parts.append(current)
+    return [html.escape(part) for part in parts]
+
+
+def _refer_item_blocks(row, limit=TELEGRAM_CHUNK_CHARS):
+    """The message block(s) for one ask: header line plus the draft in a <code> block (copy-ready).
+    One block when it fits. A draft longer than a whole message is split into several <code> blocks
+    on line/word boundaries. NOT format_email_block: sanitize_text strips ':' and ';', which would
+    break every link in the stored draft."""
+    ask_id, name, company, roles_json, body = row
+    try:
+        n_roles = len(json.loads(roles_json or "[]"))
+    except (TypeError, ValueError):
+        n_roles = 0
+    head = (f"<b>#{ask_id}</b> · {html.escape(str(name or 'Unknown contact'))} · "
+            f"{html.escape(str(company or 'Unknown company'))} · {n_roles} role{'' if n_roles == 1 else 's'}")
+    whole = f"{head}\n<code>{html.escape(str(body or ''))}</code>"
+    if len(whole) <= limit:
+        return [whole]
+    return [head] + [f"<code>{part}</code>" for part in _split_escaped_for_code(body, limit - len("<code></code>"))]
+
+
+def _pack_telegram_blocks(blocks, limit=TELEGRAM_CHUNK_CHARS):
+    """Greedy-pack whole blocks into messages of at most `limit` characters. A block is never cut
+    (a cut <code> block is invalid HTML to Telegram); a block over the limit goes out alone."""
+    messages, current = [], ""
+    for block in blocks:
+        if current and len(current) + 2 + len(block) > limit:
+            messages.append(current)
+            current = block
+        else:
+            current = f"{current}\n\n{block}" if current else block
+    if current:
+        messages.append(current)
+    return messages
+
+
+def send_refer_page(chat_id, page):
+    """/refer [N]: one page of pending asks with copy-ready text, plus a footer naming the next page."""
+    try:
+        total, _ = referral_asks_page(1, 1)
+    except Exception as e:
+        logging.error(f"/refer could not read the ask list: {e}")
+        send_telegram_message(chat_id, _REFER_READ_FAILED)
+        return
+    if total == 0:
+        send_telegram_message(chat_id, _REFER_NO_ASKS)
+        return
+    pages = -(-total // REFER_PAGE_SIZE)
+    if not 1 <= page <= pages:
+        send_telegram_message(chat_id, f"No page {page}; there {'is' if pages == 1 else 'are'} {pages}.")
+        return
+    try:
+        _, rows = referral_asks_page(page)
+    except Exception as e:
+        logging.error(f"/refer could not read page {page}: {e}")
+        send_telegram_message(chat_id, _REFER_READ_FAILED)
+        return
+    blocks = []
+    for row in rows:
+        blocks.extend(_refer_item_blocks(row))
+    footer = f"Page {page} of {pages}" + (f" · /refer {page + 1}" if page < pages else "")
+    blocks.append(f"<i>{footer}\n{REFER_RESUME_REMINDER}\nSent one? /refer sent &lt;id&gt;</i>")
+    for message in _pack_telegram_blocks(blocks):
+        send_telegram_message(chat_id, message)
+
+
+def _locate_carmen_contact(sheet_uuid):
+    """(tab name, CRM record, all_reads_ok) for the contact, searching Carmen Warm, Cold, Hot in
+    that order. (None, None, ok) when absent; ok is False when a tab read failed, so an absent
+    contact is not mistaken for a CRM outage-free miss."""
+    if not str(sheet_uuid or "").strip():
+        return None, None, True
+    all_ok = True
+    for code, tab_name in (("CW", "Carmen Warm"), ("CC", "Carmen Cold"), ("CH", "Carmen Hot")):
+        rows, ok = fetch_networking_cards_checked(code, None)
+        all_ok = all_ok and ok
+        for rec in rows or []:
+            if str(rec.get("sheet_uuid") or "") == sheet_uuid:
+                return tab_name, rec, all_ok
+    return None, None, all_ok
+
+
+def mark_referral_ask_sent(ask_id):
+    """/refer sent <id>: the reply text. Queues the CRM hand-off to the Carmen Cold ladder FIRST
+    (one atomic enqueue), and only once it is durably queued sets the ask 'sent'. If the queue
+    fails, nothing changed and the ask stays pending.
+
+    The hand-off mirrors what the sequencer itself writes when it revives a stale Carmen Cold row
+    (a "Ladder restarted" note dated today, then Next Followup = today + the first rung) so the
+    moved row can never read as an exhausted ladder: plan_carmen_ladder() anchors on the LATEST of
+    Last Contact Date and that note. Existing actions only: update_status, append_note, update_snooze.
+    A contact already in Carmen Cold keeps its tab (note + date only); one in Carmen Hot is left
+    where it is (Hot is Kevin's hand-run bench, outside the ladder). Only a pending row is ever
+    updated, so this write can never create a second pending ask for a contact."""
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT id, sheet_uuid, contact_name, company, status FROM referral_asks "
+                               "WHERE id = ?", (ask_id,)).fetchone()
+    except Exception as e:
+        logging.error(f"/refer sent #{ask_id} could not read the ask: {e}")
+        return _REFER_READ_FAILED
+    if not row:
+        return f"No ask #{ask_id}. /refer lists the pending ones."
+    _, sheet_uuid, name, company, status = row
+    sheet_uuid = str(sheet_uuid or "").strip()
+    if status == "sent":
+        return f"Ask #{ask_id} is already marked sent. Nothing changed."
+    if status != "pending":
+        return f"Ask #{ask_id} is {html.escape(str(status))}, not pending. Nothing changed."
+
+    if not sheet_uuid:
+        # A blank id would match the first CRM row with a blank Column J and queue writes against "".
+        return f"Ask #{ask_id} has no contact id, so there is no CRM row to hand off. Nothing changed; it stays pending."
+    tab, rec, reads_ok = _locate_carmen_contact(sheet_uuid)
+    if rec is None:
+        why = ("The CRM read failed" if not reads_ok
+               else "Could not find this contact in Carmen Warm, Cold or Hot")
+        return f"{why}. Nothing changed; ask #{ask_id} stays pending."
+
+    today = datetime.now().date()
+    first_nudge = (today + timedelta(days=CARMEN_LADDER_DAYS_COLD[0])).strftime("%Y-%m-%d")
+    payloads = []
+    if tab == "Carmen Warm":
+        payloads.append(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Carmen Cold"))
+    if tab in ("Carmen Warm", "Carmen Cold"):
+        cadence = "/".join(str(d) for d in CARMEN_LADDER_DAYS_COLD)
+        payloads.append(build_crm_payload(
+            "append_note", sheet_uuid=sheet_uuid,
+            note=f"[{today.strftime('%Y-%m-%d')}] {LADDER_RESTART_NOTE_MARKER} - referral ask #{ask_id} sent by "
+                 f"hand, {cadence} ladder starts from today. First nudge {first_nudge}."))
+        payloads.append(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=first_nudge))
+    if payloads and not enqueue_crm_payloads(payloads):
+        return f"Nothing changed: the CRM writes could not be queued. Ask #{ask_id} stays pending."
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        def _write():
+            with get_db_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "UPDATE referral_asks SET status = 'sent', sent_at = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'pending'", (now, now, ask_id))
+                conn.commit()
+                return cur.rowcount
+        changed = db_write_with_retry(_write, "referral_ask_sent")
+    except Exception as e:
+        logging.error(f"Referral ask #{ask_id} sent-write failed after the CRM hand-off was queued: {e}")
+        changed = 0
+    if changed != 1:
+        return (f"The CRM hand-off for ask #{ask_id} was queued but the ask could not be marked sent. "
+                "Check /health before running this again.")
+
+    who = html.escape(str(name or "the contact"))
+    if tab == "Carmen Warm":
+        lines = [f"✅ <b>Ask #{ask_id} marked sent.</b> {who} moves to Carmen Cold; the nudge ladder "
+                 f"starts today (first nudge {first_nudge})."]
+    elif tab == "Carmen Cold":
+        lines = [f"✅ <b>Ask #{ask_id} marked sent.</b> {who} is already in Carmen Cold; the nudge ladder "
+                 f"restarts today (first nudge {first_nudge})."]
+    else:
+        lines = [f"✅ <b>Ask #{ask_id} marked sent.</b> {who} is in Carmen Hot and stays there; "
+                 "no ladder was started."]
+    if tab != "Carmen Hot" and not _sequencer_draft_recipient(rec):
+        lines.append("<i>No usable email on file, so the nudges cannot be drafted or sent from here. "
+                     "Follow up on LinkedIn yourself.</i>")
+    return "\n".join(lines)
+
+
+def _refer_int(token):
+    """An ASCII-digit token as an int no larger than 2**31-1, else None. isdecimal() alone accepts
+    superscripts and other Unicode digits that int() rejects; the length cap keeps int() and the
+    SQLite binding away from absurd values."""
+    token = str(token)
+    if token.isascii() and token.isdecimal() and len(token) <= 10 and int(token) <= _REFER_MAX_ARG:
+        return int(token)
+    return None
+
+
+def handle_refer_command(chat_id, text):
+    """/refer, /refer N, /refer sent <id>. Text-only: the bot has no inline keyboards."""
+    arg = text[len("/refer"):].strip()
+    if not arg:
+        send_refer_page(chat_id, 1)
+        return
+    parts = arg.split()
+    if len(parts) == 1 and _refer_int(parts[0]) is not None:
+        send_refer_page(chat_id, _refer_int(parts[0]))
+    elif len(parts) == 2 and parts[0].lower() == "sent" and _refer_int(parts[1]) is not None:
+        send_telegram_message(chat_id, mark_referral_ask_sent(_refer_int(parts[1])))
+    else:
+        send_telegram_message(chat_id, _REFER_USAGE)
+
+
 def run_warm_radar_scan(chat_id=None):
     """/w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen
     Warm CRM contact already exists. Resolves each warm company's ATS slug straight from the
@@ -14356,6 +14616,10 @@ def process_webhook_payload_async(data):
             # AFTER the reply, on this same thread: look up every greeting now, so each page link
             # renders from the name cache instead of doing 20 people's Gmail reads on tap.
             _prewarm_followup_names(owed["items"])
+            return
+
+        if text == "/refer" or text.startswith("/refer "):
+            handle_refer_command(chat_id, text)
             return
 
         if text == "/outcomes":
@@ -15601,7 +15865,8 @@ def process_webhook_payload_async(data):
                 "/snoozeall [days] - Move every overdue follow-up by 7 days (or the specified number)\n"
                 "/overdue - Full overdue list (the morning digest shows only the 10 most overdue)\n"
                 "/owed - Every follow-up still owed (last 14 days), count + links\n"
-                "/owedx - Dismiss every open follow-up (CRM untouched; /owedx undo restores)\n\n"
+                "/owedx - Dismiss every open follow-up (CRM untouched; /owedx undo restores)\n"
+                "/refer - Pending referral asks from /w, 5 per page (/refer 2, /refer sent &lt;id&gt;)\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
