@@ -25,6 +25,7 @@ import requests
 from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 import resume_engine
+import referral_asks
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from track_registry import (
     TRACK_PROMPT_LINE, TRACK_TRIGGER_GUIDANCE, normalize_track, pool_key_for,
@@ -1402,6 +1403,25 @@ def init_db():
         # /owed, the morning card, /followups, /overdue and auto-send while followup_dismissed()
         # holds. Writes NOTHING to the CRM - no tab move, no status - and lapses on its own when
         # the contact replies.
+        # /w referral asks: ONE row per warm contact, holding the ready-to-send text for every new
+        # role found at their company. Nothing here is ever sent by the engine; Kevin reads the
+        # draft, edits it and sends it by hand. status: 'pending' | 'sent' | 'dismissed'. A role
+        # (job_hash inside roles_json) lives in at most one ask, whatever that ask's status.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS referral_asks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sheet_uuid TEXT NOT NULL,
+            contact_name TEXT,
+            company TEXT,
+            company_key TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            roles_json TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP,
+            sent_at TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_asks_contact ON referral_asks(sheet_uuid, status)")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS owed_dismissals (
             sheet_uuid TEXT PRIMARY KEY,
@@ -11699,7 +11719,11 @@ def fetch_greenhouse_jobs(slug):
                 "job_city": location,
                 "job_state": "",
                 "job_is_remote": "remote" in location.lower(),
-                "job_posted_at_datetime_utc": p.get("updated_at", "")
+                "job_posted_at_datetime_utc": p.get("updated_at", ""),
+                # The board's own requisition id. Can be a placeholder ("See Opening ID") or empty;
+                # referral_asks.valid_requisition_id decides whether it is shown. Lever and Ashby
+                # return only the UUID already in the link, so they carry no such key.
+                "job_requisition_id": str(p.get("requisition_id") or "").strip()
             })
         return jobs
     except Exception as e:
@@ -13006,6 +13030,107 @@ def _warm_radar_name_list(names, budget):
     return text, len(shown)
 
 
+def _referral_ask_entries(track):
+    """Confirmed bullet entries for a track: the same pool and selection resume_engine renders from."""
+    return resume_engine.filter_ats_bullet_entries(track)
+
+
+def store_referral_asks(pending):
+    """Render and store the referral asks for the roles /w just surfaced. NEVER sends, never drafts.
+
+    `pending` maps a company key to {"contact": best warm contact, "company": display name,
+    "roles": [referral_asks.build_role(...)]}. Per contact, in one write transaction:
+      - a role (job_hash) already in ANY ask, whatever its status, is never added again;
+      - an existing PENDING ask for the contact takes the new roles and is re-rendered in place,
+        otherwise a new row is created (one message per contact, never a second pending row);
+      - a draft is stored only when it passes the wording gate; a role the gate rejects is counted.
+    A contact with no sheet_uuid is skipped and counted. One contact failing never stops the rest.
+    Returns {"stored", "left_out", "no_uuid", "failed"}.
+    """
+    result = {"stored": 0, "left_out": 0, "no_uuid": 0, "failed": 0}
+    for company_key, entry in (pending or {}).items():
+        contact = entry.get("contact") or {}
+        sheet_uuid = str(contact.get("sheet_uuid") or "").strip()
+        if not sheet_uuid:
+            result["no_uuid"] += 1
+            continue
+        company = entry.get("company") or ""
+        new_roles = entry.get("roles") or []
+
+        def _write():
+            evidence = resume_engine.load_evidence_bank()
+            with get_db_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                taken = set()
+                for (blob,) in conn.execute("SELECT roles_json FROM referral_asks").fetchall():
+                    try:
+                        taken.update(r.get("job_hash") for r in json.loads(blob or "[]"))
+                    except (TypeError, ValueError):
+                        continue
+                row = conn.execute(
+                    "SELECT id, roles_json FROM referral_asks WHERE sheet_uuid = ? AND status = 'pending' "
+                    "ORDER BY id DESC LIMIT 1", (sheet_uuid,)).fetchone()
+                existing = json.loads(row[1]) if row else []
+                merged, added = referral_asks.merge_roles(existing, new_roles, taken_hashes=taken)
+                if not added:
+                    conn.commit()
+                    return 0, 0
+                composed = referral_asks.compose_ask(
+                    first_name_for_greeting(contact.get("name")), company, merged,
+                    (evidence.get("identity") or {}).get("name") or "Kevin",
+                    _referral_ask_entries, evidence.get("experience") or [])
+                added_hashes = {r["job_hash"] for r in added}
+                left_out = len([r for r in composed["left_out"] if r["job_hash"] in added_hashes])
+                if not composed["body"]:
+                    conn.commit()
+                    return 0, left_out
+                if row and composed["kept"] == existing:
+                    # Every newly added role was dropped by the gate: the stored draft is unchanged,
+                    # so it is neither rewritten nor counted as stored. The drops are still reported.
+                    conn.commit()
+                    return 0, left_out
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                roles_json = json.dumps(composed["kept"])
+                if row:
+                    conn.execute(
+                        "UPDATE referral_asks SET roles_json = ?, body = ?, contact_name = ?, company = ?, "
+                        "updated_at = ? WHERE id = ?",
+                        (roles_json, composed["body"], contact.get("name") or "", company, now, row[0]))
+                else:
+                    conn.execute(
+                        "INSERT INTO referral_asks (sheet_uuid, contact_name, company, company_key, status, "
+                        "roles_json, body, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                        (sheet_uuid, contact.get("name") or "", company, company_key, roles_json,
+                         composed["body"], now, now))
+                conn.commit()
+                return 1, left_out
+
+        try:
+            wrote, left_out = db_write_with_retry(_write, "referral_asks")
+            result["stored"] += wrote
+            result["left_out"] += left_out
+        except Exception as e:
+            result["failed"] += 1
+            logging.error(f"Referral ask store failed for {company}: {e}")
+    return result
+
+
+def _referral_summary_line(summary):
+    """The closing-message clause for the asks stored on this /w run, or "" when there is nothing to say."""
+    parts = []
+    stored, left_out = summary.get("stored", 0), summary.get("left_out", 0)
+    if stored:
+        parts.append(f"{stored} ask draft{'' if stored == 1 else 's'} stored")
+    if left_out:
+        parts.append(f"{left_out} role{'' if left_out == 1 else 's'} left out by the wording check")
+    if summary.get("no_uuid"):
+        n = summary["no_uuid"]
+        parts.append(f"{n} contact{'' if n == 1 else 's'} skipped, no CRM id")
+    if summary.get("failed"):
+        parts.append("ask drafts failed, see the logs")
+    return ", ".join(parts)
+
+
 def run_warm_radar_scan(chat_id=None):
     """/w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen
     Warm CRM contact already exists. Resolves each warm company's ATS slug straight from the
@@ -13108,6 +13233,7 @@ def run_warm_radar_scan(chat_id=None):
     match_count = 0
     filtered_hashes = set()
     title_filtered = 0
+    referral_pending = {}   # company key -> best contact + the roles that produced cards this run
 
     for job in fetch_ats_jobs(slugs):
         company = job.get("employer_name") or ""
@@ -13154,6 +13280,17 @@ def run_warm_radar_scan(chat_id=None):
         contact_name = contact.get("name", "Contact")
         send_warm_radar_card(job, contact_name, contact.get("note", "Active relationship"), sheet_uuid,
                              other_contacts=max(0, int(contact.get("count") or 1) - 1))
+        try:
+            # Collected only; the asks are rendered and stored AFTER the card loop so nothing
+            # here can ever stop a card.
+            ask_company_raw = contact.get("raw_company") or company
+            pending_entry = referral_pending.setdefault(
+                normalize_company_for_match(ask_company_raw),
+                {"contact": contact, "company": clean_company_for_copy(ask_company_raw), "roles": []})
+            pending_entry["roles"].append(referral_asks.build_role(
+                title, job.get("job_apply_link", ""), job.get("job_requisition_id", ""), job_hash))
+        except Exception as e:
+            logging.error(f"Warm Radar referral collect error: {e}")
 
         clavicular_rows.append({
             "sheet_uuid": sheet_uuid,
@@ -13172,12 +13309,22 @@ def run_warm_radar_scan(chat_id=None):
     if clavicular_rows:
         enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows))
 
+    referral_summary = {}
+    try:
+        referral_summary = store_referral_asks(referral_pending)
+    except Exception as e:
+        logging.error(f"Warm Radar referral asks failed: {e}")
+        referral_summary = {"failed": 1}
+
     logging.info(f"Warm Radar Complete: {match_count} new matches across {len(slugs)} warm companies; {title_filtered} filtered by title.")
     if chat_id:
         done = f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies scanned"
         done += (f"; {title_filtered} role{'' if title_filtered == 1 else 's'} filtered out by title."
                  if title_filtered else ".")
         lines = [done]
+        referral_line = _referral_summary_line(referral_summary)
+        if referral_line:
+            lines.append(referral_line)
         lines += _skipped_report()
         send_telegram_message(chat_id, "\n".join(lines))
     # AFTER the message: the lookups are slow, and what they find shows up on the next /w.
