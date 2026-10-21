@@ -14019,3 +14019,83 @@ def test_off_direction_title_gate_both_filters(monkeypatch):
                   "Business Systems Administrator", "Data Center Finance Analyst"):
         assert m.passes_strict_filter({**strict, "job_title": title}) is True, title
         assert m._passes_remote_filter({**remote, "job_title": title}) is True, title
+
+
+_INDUSTRIAL_DESC = (
+    "Support automated material handling across our ASRS and AMR/AGV fleet. Troubleshoot Cognex "
+    "vision systems and conveyor controls, and manage preventive maintenance in the CMMS.\n"
+    "Bachelor's degree in Mechatronics, Industrial Technology, Automation, Robotics, Mechanical or Electrical. "
+    "Salesforce and Excel reporting a plus."
+)
+
+
+def test_industrial_role_gate_both_filters(monkeypatch):
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000, "valid_cities": ["farmington", "detroit", "auburn hills"],
+        "title_exclusions": [], "company_exclusions": [],
+        "hard_ban_keywords": [], "seniority_exclusions": [],
+        "core_skills": ["salesforce", "excel", "sql"],
+    }.get(key, default if default is not None else []))
+    strict = {
+        "employer_name": "Northwind Co", "job_title": "Operations Analyst",
+        "job_description": "Reconciliation workflows with SQL and reporting.",
+        "job_city": "Auburn Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1",
+    }
+    remote = _remote_job()
+    assert m.passes_strict_filter(strict) is True
+    assert m._passes_remote_filter(remote) is True
+
+    def strict_reason(**over):
+        trace = m.FunnelTrace()
+        assert m.passes_strict_filter({**strict, **over}, trace=trace) is False, over
+        return trace.reasons
+
+    title = "Automation Systems Analyst - ASRS & AMR Optimization"
+    assert strict_reason(job_title=title, job_description=_INDUSTRIAL_DESC).get("industrial_title") == 1
+    assert m._passes_remote_filter({**remote, "job_title": title, "job_description": _INDUSTRIAL_DESC}) is False
+    # Same description under a plain title: vocabulary gate.
+    assert strict_reason(job_description=_INDUSTRIAL_DESC).get("industrial_description") == 1
+    assert m._passes_remote_filter({**remote, "job_description": _INDUSTRIAL_DESC}) is False
+    # One industrial term is not enough, but a required trade degree is.
+    degree_only = "Excel reporting. Bachelor's degree in Mechanical or Electrical Engineering."
+    assert strict_reason(job_description=degree_only).get("trade_degree_required") == 1
+    assert m._passes_remote_filter({**remote, "job_description": degree_only}) is False
+    # Wanted titles and plain business descriptions still pass.
+    biz = "Own preventive maintenance of reports in Excel and SQL. Bachelor's degree in business or a related field."
+    for t in ("Operations Analyst", "Workflow Automation Analyst", "Business Process Automation Analyst",
+              "Supply Chain Analyst", "Data Analyst", "Finance Analyst"):
+        assert m.passes_strict_filter({**strict, "job_title": t, "job_description": biz}) is True, t
+        assert m._passes_remote_filter({**remote, "job_title": t, "job_description": biz}) is True, t
+
+
+def test_industrial_role_gate_business_posting_with_two_industrial_words_passes(monkeypatch):
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000, "valid_cities": ["farmington", "detroit"],
+        "title_exclusions": [], "company_exclusions": [],
+        "hard_ban_keywords": [], "seniority_exclusions": [],
+        "core_skills": ["salesforce", "excel", "sql"],
+    }.get(key, default if default is not None else []))
+    desc = ("Report on conveyor downtime and material handling KPIs for our distribution network "
+            "using SQL and Excel. Bachelor's degree in business or supply chain.")
+    strict = {
+        "employer_name": "Northwind Co", "job_title": "Supply Chain Analyst", "job_description": desc,
+        "job_city": "Farmington Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1",
+    }
+    for title in ("Supply Chain Analyst", "Operations Analyst", "Robotic Process Automation Analyst",
+                  "Workflow Automation Engineer"):
+        assert m.passes_strict_filter({**strict, "job_title": title}) is True, title
+        assert m._passes_remote_filter({**_remote_job(), "job_title": title, "job_description": desc}) is True, title
+    # A truly industrial description (3+ distinct terms) is still rejected under the same title.
+    heavy = desc + " Maintain the ASRS and AGV fleet in the CMMS."
+    trace = m.FunnelTrace()
+    assert m.passes_strict_filter({**strict, "job_description": heavy}, trace=trace) is False
+    assert trace.reasons.get("industrial_description") == 1, trace.reasons
+    assert m._passes_remote_filter({**_remote_job(), "job_description": heavy}) is False

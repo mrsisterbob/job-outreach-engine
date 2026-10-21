@@ -38,6 +38,7 @@ from role_funnel import compute_role_funnel
 from build_log import compose_build_log
 from pipeline_utils import (
     is_banned_employer, is_off_direction_title,
+    is_industrial_title, industrial_term_hits, required_degree_is_technical_trade,
     ladder_progress, format_ladder_progress, carmen_terminal_gap,
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
     build_alumni_dork, normalize_priority_value, calculate_followup_interval,
@@ -5024,6 +5025,9 @@ def _passes_remote_filter(job):
         return False
     if is_off_direction_title(title):
         return False
+    if (is_industrial_title(title) or len(industrial_term_hits(description)) >= 3
+            or required_degree_is_technical_trade(description)):
+        return False
     if is_banned_employer(company):
         return False
     if any(comp in company for comp in get_filter("company_exclusions", [])):
@@ -5177,6 +5181,9 @@ FUNNEL_REJECTION_LABELS = {
     "experience_salary": "Experience demand vs. salary",
     "title_exclusion": "Excluded title",
     "off_direction_title": "Off-direction title (IT admin / help desk / data center)",
+    "industrial_title": "Industrial / robotics / maintenance title",
+    "industrial_description": "Industrial vocabulary in description (3+ terms)",
+    "trade_degree_required": "Technical-trade degree required",
     "company_exclusion": "Excluded company",
     "hard_ban_keyword": "Hard-ban keyword in description",
     "seniority": "Too senior",
@@ -5327,6 +5334,12 @@ def passes_strict_filter(job, trace=None):
         return reject("title_exclusion")
     if is_off_direction_title(title):
         return reject("off_direction_title")
+    if is_industrial_title(title):
+        return reject("industrial_title")
+    if len(industrial_term_hits(description)) >= 3:
+        return reject("industrial_description")
+    if required_degree_is_technical_trade(description):
+        return reject("trade_degree_required")
     if is_banned_employer(company):
         return reject("banned_employer")
     if any(comp in company for comp in get_filter("company_exclusions", [])):
