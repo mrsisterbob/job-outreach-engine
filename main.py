@@ -10417,7 +10417,9 @@ def run_followup_sequencer(today=None, dry_run=False):
     result = {"run_date": run_date, "followups_ready": [], "ready_to_promote": [], "revived": [],
               "applications_quiet": [], "going_cold": [], "buried": [], "killed": [],
               "top_matched": [], "live_conversations": [], "counts": {},
-              "auto_bury_ghosted": ghost_burial_on}
+              "auto_bury_ghosted": ghost_burial_on,
+              # Job rows past the bury day, in BOTH modes (one selection for /ghost's count).
+              "ghost_past_cutoff": []}
     buries_written = 0
     buries_suppressed = 0
     kills_written = 0
@@ -10667,6 +10669,7 @@ def run_followup_sequencer(today=None, dry_run=False):
                     "status": rec.get("status") or "", "days": days_since,
                 })
                 continue
+            result["ghost_past_cutoff"].append({"sheet_uuid": sheet_uuid, "days": days_since})
             if not ghost_burial_on:
                 # Switch OFF: the application stays where it is. Report it as going cold (status
                 # and days kept) so it does not vanish from view, and write NOTHING - no note, no
@@ -10675,6 +10678,7 @@ def run_followup_sequencer(today=None, dry_run=False):
                 result["going_cold"].append({
                     "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
                     "status": rec.get("status") or "", "days": days_since,
+                    "ghosted_applied": True,   # the card ranks live conversations ahead of these
                 })
                 continue
             result["buried"].append({
@@ -10964,6 +10968,11 @@ def render_followup_needs_card(result, on_demand=False):
             # Ghost burial off: this list also carries every Applied row past the bury day, which
             # can be dozens. Status-neutral header, oldest 10 only (the list is sorted oldest first).
             lines.append(f"\n▶ <b>Going cold ({len(cold)})</b> <i>— no reply or movement, oldest first</i>")
+            # Live conversations (stale_nudge: Replied/Screening/Interviewing) rank AHEAD of the
+            # Applied rows burial would have taken, each group oldest first. Otherwise ten
+            # always-older dead Applied rows would hide every live one. sorted() is stable.
+            cold = sorted(cold, key=lambda e: (bool(e.get("ghosted_applied")),
+                                               -(e["days"] if isinstance(e.get("days"), int) else -1)))
             cold_shown = cold[:GOING_COLD_CARD_LIMIT]
         for e in cold_shown:
             company = html.escape(str(e.get("company") or "—"))
@@ -15289,47 +15298,57 @@ def process_webhook_payload_async(data):
         # /ghost [on|off] - the switch behind the sequencer's automatic "ghosted" burial of job
         # applications. Calls set_filter directly, like /ats: update_filter_param answers "Unknown
         # filter parameter" for a key that has no stored row yet, which is production's state.
-        ghost_match = re.match(r"^/ghost(?:\s+(on|off))?\s*$", text, re.IGNORECASE)
+        ghost_match = re.match(r"^/ghost(?=\s|$)", text, re.IGNORECASE)
         if ghost_match:
-            action = (ghost_match.group(1) or "").lower()
-            if action == "on":
-                set_filter("auto_bury_ghosted_applications", True)
-                send_telegram_message(
-                    chat_id,
-                    f"✅ <b>Ghost burial ON</b> - each morning, an Applied row with no movement for "
-                    f"{FOLLOWUP_BURY_DAYS}+ days is noted [reason: ghosted] and moved to Died "
-                    f"(max {MAX_AUTO_BURIES_PER_RUN}/run). Died is terminal: /t will not re-source that role.\n"
-                    "/ghost off to stop."
-                )
-            elif action == "off":
-                set_filter("auto_bury_ghosted_applications", False)
-                send_telegram_message(
-                    chat_id,
-                    "🚫 <b>Ghost burial OFF</b> - applications stay in place however quiet they get. "
-                    "The day-10 follow-up reminder still runs; the Matched \"never actioned\" expiry is unaffected."
-                )
+            arg = text[len("/ghost"):].strip().lower()
+            if arg in ("on", "off"):
+                want = arg == "on"
+                if not set_filter("auto_bury_ghosted_applications", want):
+                    # set_filter returns False on a DB write error. Never claim a change that did not
+                    # happen: a failed "off" leaves burial ON for the 07:30 pass.
+                    current = "ON" if ghost_burial_enabled() else "OFF"
+                    send_telegram_message(
+                        chat_id,
+                        f"⚠️ <b>Ghost burial was NOT changed</b> - the setting could not be saved. "
+                        f"It is still <b>{current}</b>. Try /ghost {arg} again."
+                    )
+                elif want:
+                    send_telegram_message(
+                        chat_id,
+                        f"✅ <b>Ghost burial ON</b> - each morning, an Applied row with no movement for "
+                        f"{FOLLOWUP_BURY_DAYS}+ days is noted [reason: ghosted] and moved to Died "
+                        f"(max {MAX_AUTO_BURIES_PER_RUN}/run). Died is terminal: /t will not re-source that role.\n"
+                        "/ghost off to stop."
+                    )
+                else:
+                    send_telegram_message(
+                        chat_id,
+                        "🚫 <b>Ghost burial OFF</b> - applications stay in place however quiet they get. "
+                        "The day-10 follow-up reminder still runs; the Matched \"never actioned\" expiry is unaffected."
+                    )
             else:
                 state = "ON" if ghost_burial_enabled() else "OFF"
+                # Anything but "", "on" or "off" gets the status plus usage, not silence.
+                unknown = (f"\n❓ Did not understand <code>{html.escape(arg[:40])}</code> - nothing was changed."
+                           if arg else "")
                 try:
-                    # Read-only: a dry_run pass writes nothing. OFF: the Applied rows past the cutoff
-                    # are the ones left in going cold. ON: they are in "buried" (which also holds
-                    # expired Matched rows, so that count is labelled as everything queued).
+                    # Read-only: a dry_run pass writes nothing. One selection for both states: the job
+                    # rows past the bury day (result["ghost_past_cutoff"]); expired Matched rows are a
+                    # separate rule and reported separately.
                     plan = run_followup_sequencer(dry_run=True)
-                    if state == "ON":
-                        past_line = (f"\n{len(plan.get('buried', []))} row(s) would be moved to Died on the next "
-                                     "pass (includes expired Matched rows; read-only dry run).")
-                    else:
-                        past = [e for e in plan.get("going_cold", [])
-                                if (e.get("status") or "") == "Applied"
-                                and isinstance(e.get("days"), int) and e["days"] >= FOLLOWUP_BURY_DAYS]
-                        past_line = (f"\n{len(past)} Applied row(s) are currently past day {FOLLOWUP_BURY_DAYS} "
-                                     "(read-only dry run).")
+                    past_n = len(plan.get("ghost_past_cutoff", []))
+                    matched_n = len(plan.get("buried", [])) - (past_n if state == "ON" else 0)
+                    past_line = (f"\n{past_n} Applied row(s) are currently past day {FOLLOWUP_BURY_DAYS}"
+                                 " (read-only dry run).")
+                    if matched_n:
+                        past_line += (f"\n{matched_n} never-actioned Matched row(s) also expire to Died on their own"
+                                      " rule, whatever this switch says.")
                 except Exception as e:
                     logging.error(f"/ghost dry run failed: {e}")
                     past_line = "\nCould not count rows past the cutoff right now."
                 send_telegram_message(
                     chat_id,
-                    f"👻 <b>Ghost burial: {state}</b>\n"
+                    f"👻 <b>Ghost burial: {state}</b>{unknown}\n"
                     f"When ON, Applied rows with no movement for {FOLLOWUP_BURY_DAYS}+ days are moved to Died overnight."
                     f"{past_line}\n\n/ghost on · /ghost off"
                 )

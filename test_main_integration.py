@@ -1231,6 +1231,96 @@ def test_ghost_command_bare_reports_state_and_rows_past_the_cutoff(monkeypatch):
     assert m.get_filter("auto_bury_ghosted_applications") is False
 
 
+# ---- Ghost burial switch, review fixes ----
+
+def test_ghost_burial_switch_off_card_keeps_live_conversations_ahead_of_dead_applications(monkeypatch):
+    """40 Applied ghosts are all older than the 3 live conversations. Oldest-first alone would fill
+    the card's 10 lines with ghosts and hide every live row."""
+    _set_ghost_burial(monkeypatch, False)
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    live = [{"sheet_uuid": f"live-{i}", "company": f"Live{i}", "title": "Ops", "name": "",
+             "status": "Interviewing", "date_added": (_SEQ_TODAY - timedelta(days=10 + i)).isoformat(),
+             "next_followup": "1970-01-01", "raw_priority": "80"} for i in range(3)]
+    ghosts = [_ghosted_app(f"dead-{i}", days=25 + (i % 36), company=f"Dead{i}") for i in range(40)]
+    _serve_rows(monkeypatch, {"TW": live, "TC": ghosts})
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert len(result["going_cold"]) == 43 and result["buried"] == []
+    card = m.render_followup_needs_card(result)
+
+    assert "Going cold (43)" in card
+    live_at = [card.index(f"Live{i}</b>") for i in range(3)]          # all three are on the card
+    shown_ghosts = [line for line in card.splitlines() if line.startswith("• <b>Dead")]
+    assert len(shown_ghosts) == m.GOING_COLD_CARD_LIMIT - 3
+    assert max(live_at) < card.index(shown_ghosts[0])                 # live rows come first
+    assert live_at == sorted(live_at, reverse=True)                   # oldest live row first (Live2)
+    assert "…and 33 more" in card
+    # Ghost lines are oldest first too.
+    days = [int(line.split("· ")[-2].split("d")[0]) for line in shown_ghosts]
+    assert days == sorted(days, reverse=True)
+
+
+def test_ghost_command_does_not_claim_success_when_the_write_fails(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    _set_ghost_burial(monkeypatch, True)
+    monkeypatch.setattr(m, "set_filter", lambda key, val: False)
+
+    _dispatch("/ghost off")
+    assert "NOT changed" in sent[-1] and "still <b>ON</b>" in sent[-1]
+    assert "Ghost burial OFF" not in sent[-1]
+    assert m.ghost_burial_enabled() is True          # burial really is still on
+
+    monkeypatch.undo()
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    _set_ghost_burial(monkeypatch, False)
+    monkeypatch.setattr(m, "set_filter", lambda key, val: False)
+    _dispatch("/ghost on")
+    assert "NOT changed" in sent[-1] and "still <b>OFF</b>" in sent[-1]
+    assert "Ghost burial ON" not in sent[-1]
+    assert m.ghost_burial_enabled() is False
+
+
+def test_ghost_command_answers_unrecognised_arguments_with_usage_and_state(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    _set_ghost_burial(monkeypatch, True)
+    _serve_rows(monkeypatch, {})
+
+    for typed in ("/ghost status", "/ghost ON please", "/ghost 0"):
+        before = len(sent)
+        _dispatch(typed)
+        assert len(sent) == before + 1, typed
+        assert "Ghost burial: ON" in sent[-1] and "/ghost on · /ghost off" in sent[-1]
+        assert "nothing was changed" in sent[-1]
+        assert m.get_filter("auto_bury_ghosted_applications") is True   # never flipped
+
+    _dispatch("/ghost OFF")                          # case-insensitive form still works
+    assert m.ghost_burial_enabled() is False
+
+
+def test_ghost_command_bare_counts_the_same_quantity_in_both_states(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    today = date.today()
+    expired = (today - timedelta(days=m.MATCHED_EXPIRY_DAYS + 3)).isoformat()
+    _serve_rows(monkeypatch, {
+        "TC": [_ghosted_app("g-1", days=40, today=today), _ghosted_app("g-2", days=30, today=today)],
+        "CL": [{"sheet_uuid": "mx-9", "company": "Mx", "title": "Analyst", "name": "", "status": "Matched",
+                "date_added": expired, "next_followup": "1970-01-01", "raw_priority": "60"}]})
+
+    for state in (False, True):
+        _set_ghost_burial(monkeypatch, state)
+        _dispatch("/ghost")
+        text = sent[-1]
+        assert f"Ghost burial: {'ON' if state else 'OFF'}" in text
+        assert "2 Applied row(s) are currently past day" in text
+        assert "1 never-actioned Matched row(s)" in text
+    assert _logged_uuids() == set()                  # read-only in both states
+
+
 # ---- Follow-up drafts: none at 7:30, created on demand from /followups ----
 # Only PEOPLE rows (Carmen Cold) get draft text; JOBS rows are watch-only (applications_quiet).
 
