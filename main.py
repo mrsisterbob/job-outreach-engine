@@ -1382,6 +1382,11 @@ def init_db():
         # the 14-day miss window above still reads board_checked_at alone.
         if "board_attempted_at" not in identity_columns:
             conn.execute("ALTER TABLE company_identities ADD COLUMN board_attempted_at TEXT")
+        # board_scanned_at (ISO timestamp): the last time a /w run FETCHED this company's board
+        # (ats_slug) without a fetch error. /w scans a bounded number of boards per run, least
+        # recently scanned first (never scanned first of all), so every board is reached in turn.
+        if "board_scanned_at" not in identity_columns:
+            conn.execute("ALTER TABLE company_identities ADD COLUMN board_scanned_at TEXT")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS system_alerts (
             alert_key TEXT PRIMARY KEY,
@@ -4699,15 +4704,19 @@ def expand_ecosystem_filter(target_entity: str) -> str:
             logging.info(f"Added {len(added_keywords)} keywords to tier1_ecosystem: {added_keywords}")
 
         # Merge live slugs into ats_company_slugs
-        current_slugs = get_filter("ats_company_slugs") or []
-        for slug in live_slugs:
-            slug_lower = str(slug).lower().strip()
-            if slug_lower and not any(str(existing).lower() == slug_lower for existing in current_slugs):
-                current_slugs.append(slug)
-                added_slugs.append(slug)
+        # Read-modify-write under _ATS_SLUG_FILTER_LOCK (re-read inside it), so a /w lookup or an
+        # /ats add landing at the same moment cannot overwrite this merge or be overwritten by it.
+        with _ATS_SLUG_FILTER_LOCK:
+            current_slugs = list(get_filter("ats_company_slugs") or [])
+            for slug in live_slugs:
+                slug_lower = str(slug).lower().strip()
+                if slug_lower and not any(str(existing).lower() == slug_lower for existing in current_slugs):
+                    current_slugs.append(slug)
+                    added_slugs.append(slug)
 
+            if added_slugs:
+                set_filter("ats_company_slugs", current_slugs)
         if added_slugs:
-            set_filter("ats_company_slugs", current_slugs)
             logging.info(f"Added {len(added_slugs)} live ATS slugs: {added_slugs}")
 
     except Exception as e:
@@ -13222,6 +13231,17 @@ WARM_RADAR_MISS_RETRY_DAYS = 14   # a company with no public board is not probed
 WARM_RADAR_ROLES_PER_COMPANY = referral_asks.REFERRAL_ASK_MAX_ROLES   # roles listed for one company in one /w message; one ask holds the same number
 WARM_RADAR_MESSAGES_PER_RUN = 15   # company messages sent per /w run (~17s at the 1.1s pacing)
 WARM_RADAR_NAME_CAP = 15          # company names listed in one closing message
+# Boards fetched per /w run, and boards per fetch_ats_jobs call. fetch_greenhouse_jobs asks for
+# content=true; its own comment puts a 22-slug fan-out at ~124MB peak on a 512MB instance whose idle
+# baseline is ~95MB. A chunk of 10 is under half of that, and each chunk's raw posting list is
+# dropped before the next is fetched, so the peak is one chunk no matter how many boards a run takes.
+WARM_RADAR_SCAN_BATCH = 20
+WARM_RADAR_SCAN_CHUNK = 10
+# Companies whose board lookup (_warm_radar_lookup_batch) is queued or running in this process.
+# board_attempted_at is written only when a lookup FINISHES, so without this a second /w started
+# while the first one's lookups are still running would choose the same companies again.
+_WARM_LOOKUPS_IN_FLIGHT = set()
+_WARM_LOOKUPS_LOCK = threading.Lock()
 
 
 def lookup_warm_company_board(company_name):
@@ -13284,12 +13304,37 @@ def _stamp_board_lookup(company_name, clean_miss):
 
 
 def _warm_radar_lookup_batch(companies):
-    """Run lookup_warm_company_board over `companies`, one failure never stopping the rest."""
+    """Run lookup_warm_company_board over `companies`, one failure never stopping the rest. Each
+    company leaves _WARM_LOOKUPS_IN_FLIGHT when its own lookup ends, however it ends."""
     for company in companies:
         try:
             lookup_warm_company_board(company)
         except Exception as e:
             logging.error(f"Warm Radar Board Lookup Error ({company}): {e}")
+        finally:
+            with _WARM_LOOKUPS_LOCK:
+                _WARM_LOOKUPS_IN_FLIGHT.discard(company)
+
+
+def _stamp_boards_scanned(slugs, errored=False):
+    """Stamp the company_identities rows whose ats_slug is in `slugs`: board_scanned_at for a board
+    /w fetched cleanly, board_attempted_at (the lookup rotation stamp) for one whose fetch errored,
+    so an erroring board sorts behind boards never tried instead of holding the front. Never raises."""
+    slugs = sorted(set(slugs))
+    if not slugs:
+        return
+    column = "board_attempted_at" if errored else "board_scanned_at"
+    now = datetime.now().isoformat()
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for start in range(0, len(slugs), 500):
+                part = slugs[start:start + 500]
+                conn.execute(f"UPDATE company_identities SET {column} = ? "
+                             f"WHERE ats_slug IN ({','.join('?' * len(part))})", [now] + part)
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Warm Radar Board Scan Stamp Error: {e}")
 
 
 def _warm_radar_name_list(names, budget):
@@ -13788,7 +13833,7 @@ def run_warm_radar_scan(chat_id=None):
     try:
         with get_db_conn() as conn:
             identity_rows = conn.execute(
-                "SELECT normalized_name, ats_slug, board_checked_at, board_attempted_at FROM company_identities"
+                "SELECT normalized_name, ats_slug, board_checked_at, board_attempted_at, board_scanned_at FROM company_identities"
             ).fetchall()
     except Exception as e:
         logging.error(f"Warm Radar Identity Lookup Error: {e}")
@@ -13797,7 +13842,10 @@ def run_warm_radar_scan(chat_id=None):
     checked_on = {}
     attempted_at = {}
     scanned_keys = set()
-    for normalized_name, slug, board_checked_at, board_attempted_at in identity_rows:
+    slug_scanned = {}     # slug -> oldest board_scanned_at among its warm entries ("" = never)
+    slug_attempted = {}   # slug -> newest board_attempted_at among its warm entries
+    name_to_slug = {}     # warm normalized company name -> its cached slug (for roles matched by name)
+    for normalized_name, slug, board_checked_at, board_attempted_at, board_scanned_at in identity_rows:
         contact = warm_contacts.get(normalized_name)
         if not contact:
             continue
@@ -13805,6 +13853,9 @@ def run_warm_radar_scan(chat_id=None):
             attempted_at[normalized_name] = board_attempted_at
         if slug:
             slug_to_contact.setdefault(slug, contact)
+            name_to_slug[normalized_name] = slug
+            slug_scanned[slug] = min(slug_scanned.get(slug, board_scanned_at or ""), board_scanned_at or "")
+            slug_attempted[slug] = max(slug_attempted.get(slug, ""), board_attempted_at or "")
             # Every warm entry with a slug counts as scanned, including a second one that shares
             # a slug with the first ("Acme Robotics" / "Acme-Robotics"); slug_to_contact keeps one.
             scanned_keys.add(normalized_name)
@@ -13829,8 +13880,14 @@ def run_warm_radar_scan(chat_id=None):
     # ties keep warm-contact order. A lookup that errored is "unchecked" again next run, and
     # without this rotation the same first batch would be retried forever.
     unchecked_keys.sort(key=lambda k: attempted_at.get(k, ""))
-    unchecked = [warm_contacts[k].get("raw_company") or k for k in unchecked_keys]
-    lookup_now = unchecked[:WARM_RADAR_LOOKUP_BATCH]
+    unchecked_all = [warm_contacts[k].get("raw_company") or k for k in unchecked_keys]
+    # A company whose lookup from an earlier /w is still running is not chosen again. Choosing and
+    # marking happen under one lock so two overlapping /w runs cannot take the same company.
+    with _WARM_LOOKUPS_LOCK:
+        unchecked = [c for c in unchecked_all if c not in _WARM_LOOKUPS_IN_FLIGHT]
+        lookup_now = unchecked[:WARM_RADAR_LOOKUP_BATCH]
+        _WARM_LOOKUPS_IN_FLIGHT.update(lookup_now)
+    in_flight_skipped = len(unchecked_all) - len(unchecked)
     # Everything after the batch is chosen sits in try/finally: the lookups start exactly once on
     # every path out (a raise in the scan loop, the early "no cached board" return, the normal
     # end). They run AFTER the closing message on a normal exit, because the lookups are slow
@@ -13849,6 +13906,8 @@ def run_warm_radar_scan(chat_id=None):
                              f"{': ' + names if names else ''}")
                 if queued:
                     lines.append(f"{queued} more queued for the next run")
+            if in_flight_skipped:
+                lines.append(f"{in_flight_skipped} more still being checked from the last run")
             if checked_no_board:
                 names, used = _warm_radar_name_list(checked_no_board, budget)
                 budget -= used
@@ -13867,10 +13926,15 @@ def run_warm_radar_scan(chat_id=None):
                 send_telegram_message(chat_id, "\n".join(lines))
             return 0
 
+        # The boards this run fetches: the ones whose most recent touch is oldest, never-touched
+        # first of all. A touch is a clean scan (board_scanned_at) OR a failed attempt
+        # (board_attempted_at), so a board that keeps erroring moves to the back each time it is
+        # tried instead of holding the front on its old scan stamp. sorted() is stable.
+        all_slugs = sorted(slug_to_contact, key=lambda s: max(slug_scanned.get(s, ""), slug_attempted.get(s, "")))
+        slugs = all_slugs[:WARM_RADAR_SCAN_BATCH]
         if chat_id:
-            send_status_update(chat_id, f"Warm Radar: scanning {len(slug_to_contact)} warm companies with a cached ATS board (no AI scoring)...")
+            send_status_update(chat_id, f"Warm Radar: scanning {len(slugs)} of {len(all_slugs)} warm companies with a cached ATS board (no AI scoring)...")
 
-        slugs = list(slug_to_contact)
         seen_hashes = set()
         today_str = datetime.now().strftime("%Y-%m-%d")
         followup_date = (datetime.now() + timedelta(days=calculate_followup_interval(5))).strftime("%Y-%m-%d")
@@ -13888,60 +13952,87 @@ def run_warm_radar_scan(chat_id=None):
         # PASS 1 - collect. Every gate that decides whether a role is a /w candidate runs here, and
         # nothing is stamped, cached, sent or written yet: whether a surviving role is LISTED depends
         # on the per-company and per-run caps, and only a listed role may leave a trace.
-        for job in fetch_ats_jobs(slugs):
-            company = job.get("employer_name") or ""
-            title = job.get("job_title") or ""
-            if is_banned_employer(company):
-                continue
-            job_hash = generate_dedup_hash(company, title)
-            # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
-            # when the role is already tracked in a job tab - never merely because /t once saw it.
-            if job_hash in seen_hashes or is_role_tracked(company, title):
-                continue
-
-            # Tie the posting back to its warm contact by the slug baked into its job_id
-            # (gh_/lever_/ashby_<slug>_...), falling back to a normalized-name match on the ATS
-            # employer label. Postings we can't attribute to a warm contact aren't /w's to surface.
-            job_id = str(job.get("job_id") or "")
-            contact = next(
-                (c for s, c in slug_to_contact.items() if job_id.startswith((f"gh_{s}_", f"lever_{s}_", f"ashby_{s}_"))),
-                None
-            ) or warm_contacts.get(normalize_company_for_match(company))
-            if not contact:
-                continue
-
-            # The title gate /t uses (one shared function). A filtered role is counted, never stamped
-            # into seen_jobs (same reason _add_candidate does not): the rule can change and the role
-            # should be seen again.
-            if title_rejection_reason(title):
-                if job_hash not in filtered_hashes:
-                    filtered_hashes.add(job_hash)
-                    title_filtered += 1
-                continue
-
-            # The region/language gate (role_region): the one location rule /w has. It drops only
-            # clearly foreign or non-English roles; an unreadable location is KEPT and counted.
-            # Counted and never stamped, exactly like the title gate.
-            verdict, _why = role_region.role_region_gate(job)
-            if verdict in (role_region.FOREIGN, role_region.NON_ENGLISH):
-                if job_hash not in region_hashes:
-                    region_hashes.add(job_hash)
-                    region_filtered += 1
-                continue
-
-            seen_hashes.add(job_hash)
+        scanned_slugs = []      # boards fetched without a fetch error this run
+        errored_slugs = []      # boards in a chunk whose fetch raised
+        keep_jobs = WARM_RADAR_ROLES_PER_COMPANY
+        for chunk_start in range(0, len(slugs), WARM_RADAR_SCAN_CHUNK):
+            chunk = slugs[chunk_start:chunk_start + WARM_RADAR_SCAN_CHUNK]
             try:
-                track_hit = bool(track_for_title(title, employer=company))
-            except Exception:
-                track_hit = False
-            group_key = normalize_company_for_match(contact.get("raw_company") or company)
-            group = groups.setdefault(group_key, {"contact": contact, "company": company, "roles": []})
-            group["roles"].append({
-                "job": job, "job_hash": job_hash, "company": company, "title": title,
-                "verdict": verdict,
-                "rank": role_region.role_rank_key(track_hit, verdict, board_index),
-            })
-            board_index += 1
+                chunk_jobs = fetch_ats_jobs(chunk)
+            except Exception as e:
+                logging.error(f"Warm Radar Board Fetch Error ({len(chunk)} boards, first {chunk[0]}): {e}")
+                errored_slugs.extend(chunk)
+                continue
+            for job in chunk_jobs:
+                company = job.get("employer_name") or ""
+                title = job.get("job_title") or ""
+                if is_banned_employer(company):
+                    continue
+                job_hash = generate_dedup_hash(company, title)
+                # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
+                # when the role is already tracked in a job tab - never merely because /t once saw it.
+                if job_hash in seen_hashes or is_role_tracked(company, title):
+                    continue
+
+                # Tie the posting back to its warm contact by the slug baked into its job_id
+                # (gh_/lever_/ashby_<slug>_...), falling back to a normalized-name match on the ATS
+                # employer label. Postings we can't attribute to a warm contact aren't /w's to surface.
+                job_id = str(job.get("job_id") or "")
+                role_slug = next(
+                    (s for s in slug_to_contact if job_id.startswith((f"gh_{s}_", f"lever_{s}_", f"ashby_{s}_"))),
+                    None)
+                contact = slug_to_contact[role_slug] if role_slug else None
+                contact = contact or warm_contacts.get(normalize_company_for_match(company))
+                if not contact:
+                    continue
+
+                # The title gate /t uses (one shared function). A filtered role is counted, never stamped
+                # into seen_jobs (same reason _add_candidate does not): the rule can change and the role
+                # should be seen again.
+                if title_rejection_reason(title):
+                    if job_hash not in filtered_hashes:
+                        filtered_hashes.add(job_hash)
+                        title_filtered += 1
+                    continue
+
+                # The region/language gate (role_region): the one location rule /w has. It drops only
+                # clearly foreign or non-English roles; an unreadable location is KEPT and counted.
+                # Counted and never stamped, exactly like the title gate.
+                verdict, _why = role_region.role_region_gate(job)
+                if verdict in (role_region.FOREIGN, role_region.NON_ENGLISH):
+                    if job_hash not in region_hashes:
+                        region_hashes.add(job_hash)
+                        region_filtered += 1
+                    continue
+
+                seen_hashes.add(job_hash)
+                try:
+                    track_hit = bool(track_for_title(title, employer=company))
+                except Exception:
+                    track_hit = False
+                group_key = normalize_company_for_match(contact.get("raw_company") or company)
+                # A role matched by company NAME has no slug in its job id; map it back through the
+                # identity rows so a held or unsent role still keeps its board from being stamped.
+                role_slug = role_slug or name_to_slug.get(group_key) or name_to_slug.get(normalize_company_for_match(company))
+                group = groups.setdefault(group_key, {"contact": contact, "company": company, "roles": []})
+                group["roles"].append({
+                    "job": job, "job_hash": job_hash, "company": company, "title": title,
+                    "verdict": verdict, "slug": role_slug,
+                    "rank": role_region.role_rank_key(track_hit, verdict, board_index),
+                })
+                board_index += 1
+            # Drop the chunk's raw posting list BEFORE the next fetch: only the per-role records in
+            # `groups` survive. A role keeps its job dict (description and all) only while it is in
+            # its company's top WARM_RADAR_ROLES_PER_COMPANY; past that it can never be listed this
+            # run, so just its title (for the contact pick), hash and slug are kept.
+            chunk_jobs = None
+            job = None
+            for group in groups.values():
+                if len(group["roles"]) > keep_jobs:
+                    group["roles"].sort(key=lambda r: r["rank"])
+                    for dropped in group["roles"][keep_jobs:]:
+                        dropped["job"] = None
+            scanned_slugs.extend(chunk)
 
         # PASS 2 - rank, cap and send. Roles inside a company: track-rule titles, then a positively
         # read US location, then the board's order. Companies: contact priority, role count, name.
@@ -13959,12 +14050,14 @@ def run_warm_radar_scan(chat_id=None):
         held_roles = 0
         held_companies = 0
         failed_companies = 0
+        blocked_slugs = set()   # boards with roles held back or unsent: not stamped, so they come back first
         for group in ordered:
             roles = sorted(group["roles"], key=lambda r: r["rank"])
             total_roles = len(roles)
             if messages_sent >= WARM_RADAR_MESSAGES_PER_RUN:
                 held_roles += total_roles
                 held_companies += 1
+                blocked_slugs.update(r["slug"] for r in roles if r["slug"])
                 continue
             messages_sent += 1
             listed = roles[:WARM_RADAR_ROLES_PER_COMPANY]
@@ -14024,11 +14117,13 @@ def run_warm_radar_scan(chat_id=None):
                 failed_companies += 1
                 logging.error(f"Warm Radar: Telegram did not accept the message for {group['company']}; "
                               f"{len(listed)} role(s) left unstamped for the next /w")
+                blocked_slugs.update(r["slug"] for r in roles if r["slug"])
                 continue
 
             if total_roles > len(listed):
                 held_roles += total_roles - len(listed)
                 held_companies += 1
+                blocked_slugs.update(r["slug"] for r in roles if r["slug"])
             for entry in listed:
                 job, job_hash = entry["job"], entry["job_hash"]
                 company, title = entry["company"], entry["title"]
@@ -14075,15 +14170,27 @@ def run_warm_radar_scan(chat_id=None):
             logging.error(f"Warm Radar referral asks failed: {e}")
             referral_summary = {"failed": 1}
 
+        # Rotation stamps, written only now that the run's sends are settled. A board whose roles
+        # were held back (message cap, per-company cap) or whose message failed is NOT stamped, so
+        # it stays at the front and the next /w offers those roles again; a board that errored is
+        # stamped only in the attempt column, which orders it behind boards never tried.
+        _stamp_boards_scanned([s for s in scanned_slugs if s not in blocked_slugs])
+        _stamp_boards_scanned(errored_slugs, errored=True)
+
         logging.info(f"Warm Radar Complete: {match_count} roles listed in {messages_sent} messages across "
-                     f"{len(slugs)} warm companies; {title_filtered} filtered by title, {region_filtered} by "
+                     f"{len(scanned_slugs)} warm companies; {title_filtered} filtered by title, {region_filtered} by "
                      f"region/language, {location_unknown} listed with unknown location; held back "
                      f"{held_roles} roles at {held_companies} companies; {failed_companies} companies failed to send.")
         if chat_id:
-            done = f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies scanned"
+            done = f"🏁 Warm scan complete. {match_count} new matches across {len(scanned_slugs)} warm companies scanned"
             done += (f"; {title_filtered} role{'' if title_filtered == 1 else 's'} filtered out by title."
                      if title_filtered else ".")
             lines = [done]
+            if len(scanned_slugs) < len(all_slugs):
+                lines.append(f"Scanned {len(scanned_slugs)} of {len(all_slugs)} boards this run; run /w again to continue.")
+            if errored_slugs:
+                lines.append(f"{len(errored_slugs)} board{'' if len(errored_slugs) == 1 else 's'} could not be fetched; "
+                             "they are retried on a later run.")
             if region_filtered:
                 lines.append(f"{region_filtered} role{'' if region_filtered == 1 else 's'} outside the US/English filtered")
             if location_unknown:
@@ -14109,6 +14216,8 @@ def run_warm_radar_scan(chat_id=None):
                 _spawn_background(lambda: _warm_radar_lookup_batch(lookup_now))
             except Exception:
                 logging.exception("Warm Radar: could not start the board lookups")
+                with _WARM_LOOKUPS_LOCK:   # they will never run, so they are not in flight
+                    _WARM_LOOKUPS_IN_FLIGHT.difference_update(lookup_now)
 
 # ==============================================================================
 # 9. ASYNC WORKLOAD PROCESSOR & WEBHOOK CONTROLLER
@@ -15799,19 +15908,28 @@ def process_webhook_payload_async(data):
                 # Only persist a slug whose board actually resolves, so a typo never becomes a
                 # permanent no-op costing three HTTP calls on every future run.
                 added = []
+                resolved = []
+                tried = set()   # a slug typed twice is probed and saved once
                 for slug in re.split(r"[\s,]+", arg):
-                    if not slug or slug in slugs:
+                    if not slug or slug in slugs or slug in tried:
                         continue
+                    tried.add(slug)
                     found = len(fetch_greenhouse_jobs(slug)) + len(fetch_lever_jobs(slug)) + len(fetch_ashby_jobs(slug))
                     if found:
-                        slugs.append(slug)
+                        resolved.append(slug)
                         added.append(f"{slug} ({found})")
-                set_filter("ats_company_slugs", slugs)
+                # The probes above are HTTP and run outside the lock; the list update is inside it
+                # and re-reads, so a slug another thread added meanwhile is not lost.
+                with _ATS_SLUG_FILTER_LOCK:
+                    current = list(safe_list(get_filter("ats_company_slugs", [])))
+                    current += [s for s in resolved if s not in current]
+                    set_filter("ats_company_slugs", current)
                 send_telegram_message(chat_id, f"➕ Added: {html.escape(', '.join(added))}" if added else "⚠️ No board resolved for that slug.")
             elif action == "remove" and arg:
-                removed = [s for s in re.split(r"[\s,]+", arg) if s in slugs]
-                slugs = [s for s in slugs if s not in removed]
-                set_filter("ats_company_slugs", slugs)
+                with _ATS_SLUG_FILTER_LOCK:
+                    current = list(safe_list(get_filter("ats_company_slugs", [])))
+                    removed = [s for s in re.split(r"[\s,]+", arg) if s in current]
+                    set_filter("ats_company_slugs", [s for s in current if s not in removed])
                 send_telegram_message(chat_id, f"➖ Removed: {html.escape(', '.join(removed))}" if removed else "⚠️ Not on the list.")
             else:
                 state = "ON" if get_filter("ats_watchlist_enabled") else "OFF"
