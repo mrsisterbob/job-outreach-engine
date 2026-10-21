@@ -11,6 +11,7 @@ only while a test runs, and this module imports main at collection, when it is s
 import base64
 import contextlib
 import difflib
+import glob
 import html
 import io
 import json
@@ -9337,12 +9338,64 @@ def _reject_env(monkeypatch, reason="Insurance sales role, not operations",
         monkeypatch.setattr(m, name, fn)
 
 
+# Posted 288 hours (12 days) before the module loads. score_rules.py gives a freshness bonus up
+# to 240 hours and starts the stale penalty at 336, so 288 sits mid-way in the zero-point band and
+# a fixture this old neither earns nor loses age points. A literal date here went dead (720 h)
+# on 2026-10-21 and capped the score at 64; the clock must move the fixture, not the reverse.
+_REJECTED_JOB_POSTED_AGE_HOURS = 288
 _REJECTED_JOB = {
     "job_id": "ingest_x", "employer_name": "AAA-The Auto Club Group",
     "job_title": "Life Insurance Specialist - Michigan",
     "job_description": "Sell life insurance.", "job_apply_link": "https://x",
-    "job_posted_at_datetime_utc": "2026-09-21T15:11:49Z",
+    "job_posted_at_datetime_utc": (
+        datetime.now(timezone.utc) - timedelta(hours=_REJECTED_JOB_POSTED_AGE_HOURS)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
+
+
+# Keys that carry a posting date, followed by a quoted literal that starts with a four-digit year.
+# The pattern spells the year as \d{4}, so this source line cannot match itself.
+_POSTING_DATE_LITERAL_RE = re.compile(
+    r"""(job_posted_at_datetime_utc|date_posted|posted_at)["']?\s*[:=]\s*["']\d{4}"""
+)
+
+
+def _posting_date_literal_hits(text, label):
+    return [f"{label}:{n}: {line.strip()}"
+            for n, line in enumerate(text.splitlines(), 1)
+            if _POSTING_DATE_LITERAL_RE.search(line)]
+
+
+def test_no_fixture_hardcodes_a_posting_date():
+    """A fixed posting date ages into the dead band and the test fails on a calendar day, not a code change."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    hits = []
+    for path in sorted(glob.glob(os.path.join(here, "test_*.py"))):
+        with open(path, encoding="utf-8") as fh:
+            hits += _posting_date_literal_hits(fh.read(), os.path.basename(path))
+    assert not hits, "hard-coded posting date(s); compute from datetime.now() instead:\n" + "\n".join(hits)
+
+
+def test_rejected_job_posting_age_earns_no_age_points():
+    """Pins the comment on _REJECTED_JOB: its age sits in the zero-point band of the age ladder."""
+    import score_rules
+    hours = pipeline_utils.parse_posted_hours(_REJECTED_JOB["job_posted_at_datetime_utc"])
+    assert score_rules.posted_age_adjustment(hours) == 0, hours
+
+
+def test_posting_date_guard_catches_a_literal_date():
+    """Prove the guard can fail: synthetic text, not an edited file."""
+    year = "20" + "26"
+    for bad in ('x = {"job_posted_at_datetime_utc": "' + year + '-09-21T15:11:49Z"}',
+                "dict(job, posted_at='" + year + "-01-01')",
+                '{"date_posted": "' + year + '-01-01"}'):
+        assert _posting_date_literal_hits(bad, "synthetic"), bad
+    good = ('{"job_posted_at_datetime_utc": (datetime.now(timezone.utc)).strftime("%Y")}',
+            'dict(job, job_posted_at_datetime_utc=posted)', '"job_posted_at_datetime_utc": ""')
+    for ok in good:
+        assert not _posting_date_literal_hits(ok, "synthetic"), ok
+    assert _posting_date_literal_hits(
+        'a\n  "posted_at": "' + year + '-02-02"', "f")[0].startswith("f:2:")
 
 
 def test_ai_rejection_still_blocks_an_unforced_candidate(monkeypatch):
