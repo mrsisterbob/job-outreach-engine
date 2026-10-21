@@ -1013,9 +1013,29 @@ FINANCE_QUERY_PHRASES = [
 # One-time additions to LIVE list filters: {addition_id: {filter_key: [values]}}. An id is recorded
 # in the applied_filter_additions row once its values are in the Sheet and the local row, so a
 # phrase Kevin later removes with /q is not put back on the next boot.
+# Michigan auto suppliers whose public Workday board answered a real fetch with postings (TASK-121,
+# 2026-10-21). Each entry is a "tenant/wdN/site" triple and each was confirmed by POSTing the CXS
+# /jobs endpoint and reading back a total; none of the 16 candidates had a Greenhouse, Lever or
+# Ashby board, so ats_company_slugs gets nothing from this addition. A company that is not here
+# either uses an ATS fetch_workday_jobs cannot read (SuccessFactors, UltiPro, a custom site) or
+# showed no public board; the per-company evidence is in the TASK-121 log. Do not add an address
+# that has not been fetched: test_auto_supplier_watchlist_seeded pins this list to that log.
+AUTO_SUPPLIER_WORKDAY_BOARDS = [
+    "borgwarner/wd5/BorgWarner_Careers",
+    "adient/wd3/External",
+    "magna/wd3/Magna",
+    "valeo/wd3/valeo_jobs",
+    "thyssenkruppmaterialsna/wd12/1",
+]
+
 FILTER_ADDITIONS = {
     "finance-queries-2026-10": {"target_queries": FINANCE_QUERY_PHRASES},
+    "auto-supplier-watchlist-2026-10": {"workday_boards": AUTO_SUPPLIER_WORKDAY_BOARDS},
 }
+# Watchlist lists ship EMPTY ([] in DEFAULT_SEARCH_FILTERS), so an empty or missing live list is the
+# normal starting state for them, not damage. target_queries is different: empty there is a wiped
+# core list that restore_core_sourcing_filters owns, and an addition must never rebuild it.
+EMPTY_OK_FILTER_KEYS = frozenset({"workday_boards", "ats_company_slugs"})
 APPLIED_ADDITIONS_KEY = "applied_filter_additions"
 
 # Seed values for a brand-new search_filters table. Module-level (not inlined in init_db) so
@@ -1735,7 +1755,8 @@ def apply_filter_additions(addition_id, additions):
     which is set_filter's dual-write; set_filter itself is not defined yet when init_db runs at
     import. The id is recorded only when every key is settled, so a Sheets outage leaves it
     unrecorded and the next boot retries; a value Kevin removes afterwards stays removed. A missing
-    or empty live list is restore_core_sourcing_filters' job and is never rebuilt from these values.
+    or empty live target_queries is restore_core_sourcing_filters' job and is never rebuilt from these
+    values; the watchlist keys in EMPTY_OK_FILTER_KEYS ship empty, so for them empty is a valid start.
     Never raises.
     """
     added = 0
@@ -1751,7 +1772,11 @@ def apply_filter_additions(addition_id, additions):
             for key in additions:
                 row = conn.execute("SELECT value_json FROM search_filters WHERE key = ?", (key,)).fetchone()
                 current = json.loads(row[0]) if row and row[0] else None
-                if not (isinstance(current, list) and current):
+                if key in EMPTY_OK_FILTER_KEYS and (current is None or (isinstance(current, str) and not current.strip())):
+                    # Never set locally (the shipped default is []), or hydration copied a blank
+                    # System_Config cell over the empty list as "".
+                    current = []
+                if not isinstance(current, list) or (not current and key not in EMPTY_OK_FILTER_KEYS):
                     logging.warning(f"[FILTER ADD] {addition_id}: '{key}' is missing or empty; left to restore")
                     return 0
                 local[key] = current
@@ -1771,7 +1796,9 @@ def apply_filter_additions(addition_id, additions):
             base = local[key]  # the Sheet has no row for this key: the local list is all there is
             if key in remote:
                 base = remote[key]
-                if not (isinstance(base, list) and base):
+                if key in EMPTY_OK_FILTER_KEYS and (base is None or (isinstance(base, str) and not base.strip())):
+                    base = []  # a blank System_Config cell on a list that ships empty
+                if not isinstance(base, list) or (not base and key not in EMPTY_OK_FILTER_KEYS):
                     logging.warning(f"[FILTER ADD] {addition_id}: Sheet '{key}' is empty or not a list; will retry next boot")
                     return 0
             have = {str(v).strip().lower() for v in base}
@@ -12137,6 +12164,15 @@ WORKDAY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 WORKDAY_SEARCH_TERMS = ("operations analyst", "business operations", "financial analyst", "operations specialist")
 WORKDAY_MAX_PER_TERM = 20
 WORKDAY_DETAIL_FETCH_CAP = 12
+# Finance titles (TASK-121), matching FINANCE_QUERY_PHRASES. Searched AFTER the four terms above and
+# fetched under their OWN cap, because on a big board the first four already fill all
+# WORKDAY_DETAIL_FETCH_CAP slots (measured 2026-10-21: Magna 73 distinct postings, BorgWarner 51),
+# so a term appended to one shared 12-slot pool would add requests and no results. Workday's text
+# search is global, so each finance term carries WORKDAY_LOCATION_HINT; without it the top 20 of a
+# global supplier are mostly other countries and the Michigan gate throws them away.
+WORKDAY_FINANCE_SEARCH_TERMS = ("controller", "cost analyst", "pricing analyst", "fp&a", "commercial finance")
+WORKDAY_LOCATION_HINT = "Michigan"
+WORKDAY_FINANCE_DETAIL_FETCH_CAP = 12
 
 
 def fetch_workday_jobs(board):
@@ -12167,11 +12203,14 @@ def fetch_workday_jobs(board):
     headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": WORKDAY_USER_AGENT}
 
     seen_paths = {}
-    for term in WORKDAY_SEARCH_TERMS:
+    finance_paths = {}
+    searches = [(term, term, seen_paths) for term in WORKDAY_SEARCH_TERMS]
+    searches += [(term, f"{term} {WORKDAY_LOCATION_HINT}", finance_paths) for term in WORKDAY_FINANCE_SEARCH_TERMS]
+    for term, search_text, bucket in searches:
         try:
             res = requests.post(
                 f"{base}/jobs",
-                json={"appliedFacets": {}, "limit": WORKDAY_MAX_PER_TERM, "offset": 0, "searchText": term},
+                json={"appliedFacets": {}, "limit": WORKDAY_MAX_PER_TERM, "offset": 0, "searchText": search_text},
                 headers=headers,
                 timeout=15,
             )
@@ -12183,14 +12222,21 @@ def fetch_workday_jobs(board):
                 continue
             for posting in res.json().get("jobPostings", []):
                 path = posting.get("externalPath")
-                if path and path not in seen_paths:
-                    seen_paths[path] = posting
+                if path and path not in bucket:
+                    bucket[path] = posting
         except Exception as e:
             logging.error(f"Workday list exception ({board}, term='{term}'): {e}")
 
+    # The original terms keep their first WORKDAY_DETAIL_FETCH_CAP postings exactly as before; the
+    # finance postings they did not already select follow under their own cap.
+    selected = list(seen_paths.items())[:WORKDAY_DETAIL_FETCH_CAP]
+    chosen = {path for path, _ in selected}
+    selected += [(p, v) for p, v in finance_paths.items() if p not in chosen][:WORKDAY_FINANCE_DETAIL_FETCH_CAP]
+    matched = len(set(seen_paths) | set(finance_paths))
+
     jobs = []
     employer = tenant.replace("-", " ").replace("_", " ").title()
-    for path, posting in list(seen_paths.items())[:WORKDAY_DETAIL_FETCH_CAP]:
+    for path, posting in selected:
         location = posting.get("locationsText", "") or ""
         description = ""
         apply_link = f"https://{tenant}.{wd_host}.myworkdayjobs.com/{site}{path}"
@@ -12218,7 +12264,7 @@ def fetch_workday_jobs(board):
             "job_is_remote": "remote" in str(location).lower(),
             "job_posted_at_datetime_utc": posted_iso,
         })
-    logging.info(f"Workday {board}: {len(seen_paths)} matched search terms, {len(jobs)} enriched")
+    logging.info(f"Workday {board}: {matched} matched search terms, {len(jobs)} enriched")
     return jobs
 
 
