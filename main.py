@@ -987,6 +987,37 @@ def db_write_with_retry(fn, label, attempts=3, delays=(0.2, 0.8)):
             logging.warning(f"[DB RETRY] {label} succeeded on attempt {attempt}")
         return result
 
+# Controller / cost / pricing / commercial-finance / FP&A titles for Metro Detroit (TASK-120). Kept
+# as its own constant because it reaches production two ways: appended to the default list below
+# (a fresh install matches), and applied ONCE to the live row by apply_filter_additions(), since a
+# code default alone never reaches an existing database (init_db seeds only an empty table and
+# hydrate_filters_from_sheets overwrites the row with the Sheet's list). Nine titles against
+# Detroit, the four most auto-supplier-shaped repeated against Troy (suppliers cluster in Auburn
+# Hills, Troy and Southfield, all inside radius_miles).
+FINANCE_QUERY_PHRASES = [
+    "Cost Analyst Detroit MI",
+    "Pricing Analyst Detroit MI",
+    "Commercial Finance Analyst Detroit MI",
+    "FP&A Analyst Detroit MI",
+    "Financial Planning Analyst Detroit MI",
+    "Assistant Controller Detroit MI",
+    "Cost Accountant Detroit MI",
+    "Business Controller Detroit MI",
+    "Financial Reporting Analyst Detroit MI",
+    "Cost Analyst Troy MI",
+    "Pricing Analyst Troy MI",
+    "Commercial Finance Analyst Troy MI",
+    "FP&A Analyst Troy MI",
+]
+
+# One-time additions to LIVE list filters: {addition_id: {filter_key: [values]}}. An id is recorded
+# in the applied_filter_additions row once its values are in the Sheet and the local row, so a
+# phrase Kevin later removes with /q is not put back on the next boot.
+FILTER_ADDITIONS = {
+    "finance-queries-2026-10": {"target_queries": FINANCE_QUERY_PHRASES},
+}
+APPLIED_ADDITIONS_KEY = "applied_filter_additions"
+
 # Seed values for a brand-new search_filters table. Module-level (not inlined in init_db) so
 # restore_core_sourcing_filters() can put target_queries back if a restart ever leaves it blank.
 DEFAULT_SEARCH_FILTERS = {
@@ -1195,7 +1226,7 @@ DEFAULT_SEARCH_FILTERS = {
         "Business Systems Analyst Troy MI",
         "Business Process Analyst Troy MI",
         "Operations Specialist Troy MI"
-    ],
+    ] + FINANCE_QUERY_PHRASES,
     "query_bank_pointer": 0
 }
 
@@ -1626,6 +1657,9 @@ def init_db():
 
     hydrate_filters_from_sheets()
     restore_core_sourcing_filters()
+    # After hydration, which would otherwise overwrite the row with the Sheet's older list.
+    for addition_id, additions in FILTER_ADDITIONS.items():
+        apply_filter_additions(addition_id, additions)
 
 def hydrate_filters_from_sheets():
     """On startup, pull load_system_config from Sheets so local filters reflect any manual spreadsheet edits.
@@ -1690,6 +1724,91 @@ def restore_core_sourcing_filters():
     except Exception as e:
         logging.error(f"System_Config dual-write failed (target_queries restore): {e}")
     return True
+
+def apply_filter_additions(addition_id, additions):
+    """Append values to LIVE list filters exactly once per addition_id. Returns how many were added.
+
+    additions is {filter_key: [values]}. Runs at the end of init_db, AFTER hydrate_filters_from_sheets
+    (a phrase merged into SQLite earlier is overwritten by the Sheet's list on that same boot). The
+    merged list is the SHEET's current list plus the missing values (an unreadable Sheet applies
+    nothing); it goes to the Sheet's System_Config first and into SQLite only if that write succeeded,
+    which is set_filter's dual-write; set_filter itself is not defined yet when init_db runs at
+    import. The id is recorded only when every key is settled, so a Sheets outage leaves it
+    unrecorded and the next boot retries; a value Kevin removes afterwards stays removed. A missing
+    or empty live list is restore_core_sourcing_filters' job and is never rebuilt from these values.
+    Never raises.
+    """
+    added = 0
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT value_json FROM search_filters WHERE key = ?", (APPLIED_ADDITIONS_KEY,)).fetchone()
+            applied = json.loads(row[0]) if row and row[0] else []
+            if not isinstance(applied, list):
+                applied = []
+            if addition_id in applied:
+                return 0
+            local = {}
+            for key in additions:
+                row = conn.execute("SELECT value_json FROM search_filters WHERE key = ?", (key,)).fetchone()
+                current = json.loads(row[0]) if row and row[0] else None
+                if not (isinstance(current, list) and current):
+                    logging.warning(f"[FILTER ADD] {addition_id}: '{key}' is missing or empty; left to restore")
+                    return 0
+                local[key] = current
+        # The merge base is the SHEET's current list, read the way hydrate_filters_from_sheets reads it.
+        # The local row can be stale (hydration failed this boot) and writing it back would erase
+        # Kevin's hand edits in System_Config. No usable read = apply nothing, retry next boot.
+        res = crm_get({"action": "load_system_config"})
+        if not res or getattr(res, "status_code", None) != 200:
+            logging.warning(f"[FILTER ADD] {addition_id}: System_Config unreadable; will retry next boot")
+            return 0
+        remote = res.json().get("filters")
+        if not isinstance(remote, dict):
+            logging.warning(f"[FILTER ADD] {addition_id}: System_Config reply had no filters; will retry next boot")
+            return 0
+        merged_by_key = {}
+        for key, values in additions.items():
+            base = local[key]  # the Sheet has no row for this key: the local list is all there is
+            if key in remote:
+                base = remote[key]
+                if not (isinstance(base, list) and base):
+                    logging.warning(f"[FILTER ADD] {addition_id}: Sheet '{key}' is empty or not a list; will retry next boot")
+                    return 0
+            have = {str(v).strip().lower() for v in base}
+            missing = [v for v in values if str(v).strip().lower() not in have]
+            if missing:
+                merged_by_key[key] = base + missing
+                added += len(missing)
+        for key, merged in merged_by_key.items():
+            res = crm_post({"action": "update_system_config", "key": key, "value": merged}, timeout=5)
+            ok = res is not None and getattr(res, "status_code", None) == 200
+            if ok:
+                try:
+                    ok = res.json().get("status") != "error"
+                except Exception:
+                    pass
+            if not ok:
+                logging.warning(f"[FILTER ADD] {addition_id}: System_Config write for '{key}' failed; will retry next boot")
+                return 0
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for key, merged in merged_by_key.items():
+                conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)", (key, json.dumps(merged)))
+            # Re-read the applied ids inside the transaction: a concurrent writer's id must not be lost.
+            row = conn.execute("SELECT value_json FROM search_filters WHERE key = ?", (APPLIED_ADDITIONS_KEY,)).fetchone()
+            applied_now = json.loads(row[0]) if row and row[0] else []
+            if not isinstance(applied_now, list):
+                applied_now = []
+            if addition_id not in applied_now:
+                applied_now.append(addition_id)
+            conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)",
+                         (APPLIED_ADDITIONS_KEY, json.dumps(applied_now)))
+            conn.commit()
+        logging.info(f"[FILTER ADD] {addition_id} applied")
+    except Exception as e:
+        logging.error(f"[FILTER ADD] {addition_id} not applied: {e}")
+        return 0
+    return added
 
 init_db_or_record()
 
