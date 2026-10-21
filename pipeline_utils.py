@@ -3014,3 +3014,112 @@ def is_off_direction_title(title):
     if any(rx.search(text) for rx in _OFF_DIRECTION_TITLE_RES):
         return True
     return any(rx.search(text) and not exempt.search(text) for rx, exempt in _OFF_DIRECTION_QUALIFIED_RES)
+
+
+# Industrial, robotics and maintenance-automation work. The word "Analyst" in a title does not
+# make a warehouse-automation or plant-maintenance posting a systems role, and Kevin's Automation
+# skill would otherwise score it high. Lives in code, not in System_Config (same reason as
+# OFF_DIRECTION_TITLE_PATTERNS). A bare "automation" is NOT a pattern: "Workflow Automation
+# Analyst" and "Business Process Automation Analyst" are wanted.
+# Whole-title tokens: these are industrial wherever they sit in the title ("Automation Systems
+# Analyst - ASRS & AMR Optimization"). "Robotic Process Automation" / RPA is software process
+# automation and is wanted, so robotics is not matched when "process" follows.
+INDUSTRIAL_TITLE_PATTERNS = (
+    r"\basrs\b",
+    r"\bamrs?\b",
+    r"\bagvs?\b",
+    r"\brobotics?\b(?![\s-]+process)",
+    r"\bmechatronics?\b",
+    r"\bmillwright\b",
+)
+# Role phrases: matched against the HEAD segment only (before " - ", ",", "(", "|", ":"), so a
+# suffix or parenthetical ("Operations Analyst - Manufacturing Engineer Support",
+# "Business Analyst (Automation Engineer track)") cannot reject the title. "Automation
+# Engineer/Technician" counts only bare (optionally with a level word) or with a plant qualifier:
+# Workflow / Test / Marketing / Business Process / Software Automation Engineer are wanted.
+INDUSTRIAL_HEAD_PATTERNS = (
+    r"\bmaintenance[\s-]+(?:technician|engineer|planner|supervisor|mechanic)\b",
+    r"\b(?:industrial|manufacturing|plant|factory|controls?|plc|mechanical|electrical)[\s-]+(?:engineer|technician)\b",
+    r"\b(?:industrial|manufacturing|plant|factory|controls?|plc)[\s-]+automation[\s-]+(?:engineer|technician)\b",
+    r"^\s*(?:(?:senior|sr\.?|lead|principal|junior|jr\.?|staff|associate)[\s-]+)?automation[\s-]+(?:engineer|technician)\b",
+    r"\bplc[\s-]+(?:programmer|technician|engineer)\b",
+)
+_INDUSTRIAL_TITLE_RES = tuple(re.compile(p, re.IGNORECASE) for p in INDUSTRIAL_TITLE_PATTERNS)
+_INDUSTRIAL_HEAD_RES = tuple(re.compile(p, re.IGNORECASE) for p in INDUSTRIAL_HEAD_PATTERNS)
+_TITLE_HEAD_SPLIT_RE = re.compile(r"\s+[-\u2013\u2014]\s+|[,(|:]")
+
+# (label, pattern). No bare "plc": it is also the UK company suffix ("Barclays PLC").
+INDUSTRIAL_DESCRIPTION_TERMS = (
+    ("asrs", r"\basrs\b"),
+    ("automated storage", r"\bautomated[\s-]+storage\b"),
+    ("amr", r"\bamrs?\b"),
+    ("agv", r"\bagvs?\b"),
+    ("autonomous mobile robot", r"\bautonomous[\s-]+mobile[\s-]+robots?\b"),
+    ("cmms", r"\bcmms\b"),
+    ("cognex", r"\bcognex\b"),
+    ("mechatronics", r"\bmechatronics\b"),
+    ("robotics", r"\brobotics\b"),
+    ("programmable logic controller", r"\bprogrammable[\s-]+logic[\s-]+controllers?\b"),
+    ("scada", r"\bscada\b"),
+    ("conveyor", r"\bconveyors?\b"),
+    ("material handling", r"\bmaterials?[\s-]+handling\b"),
+    ("preventive maintenance", r"\bpreventive[\s-]+maintenance\b"),
+)
+_INDUSTRIAL_TERM_RES = tuple((label, re.compile(p, re.IGNORECASE)) for label, p in INDUSTRIAL_DESCRIPTION_TERMS)
+
+_DEGREE_WORD_RE = re.compile(r"\b(?:bachelor|bachelors|degree|bs)\b", re.IGNORECASE)
+_TRADE_FIELD_RE = re.compile(
+    r"\b(?:mechatronics|robotics|mechanical|electrical|industrial\s+technology"
+    r"|(?:mechanical|electrical|controls?|industrial|manufacturing)\s+engineering)\b",
+    re.IGNORECASE,
+)
+_BUSINESS_FIELD_RE = re.compile(
+    r"\b(?:business|finance|economics|accounting|analytics|statistics|data|information|computer|"
+    r"management|supply\s+chain|operations|related\s+field)\b",
+    re.IGNORECASE,
+)
+_DEGREE_OPTIONAL_RE = re.compile(
+    r"\b(?:preferred|preferably|ideally|desired|a\s+plus|equivalent|or\s+similar)\b", re.IGNORECASE
+)
+
+
+def is_industrial_title(title):
+    """True when the title names industrial, robotics or plant-maintenance work (not process automation)."""
+    text = str(title or "")
+    if not text.strip():
+        return False
+    if any(rx.search(text) for rx in _INDUSTRIAL_TITLE_RES):
+        return True
+    head = _TITLE_HEAD_SPLIT_RE.split(text, maxsplit=1)[0]
+    return any(rx.search(head) for rx in _INDUSTRIAL_HEAD_RES)
+
+
+def industrial_term_hits(description):
+    """Distinct industrial / material-handling vocabulary found in a job description."""
+    text = str(description or "")
+    if not text.strip():
+        return []
+    return [label for label, rx in _INDUSTRIAL_TERM_RES if rx.search(text)]
+
+
+def required_degree_is_technical_trade(description):
+    """True when a degree clause names only technical-trade fields (mechatronics, mechanical, electrical...).
+
+    A clause that also lists a business or analytics field, or that says preferred / a plus /
+    equivalent experience, is not a hard trade-degree requirement.
+    """
+    text = str(description or "")
+    if not text.strip():
+        return False
+    text = re.sub(r"\bb\.\s?s\.?", "bs", text, flags=re.IGNORECASE)
+    # "e.g. " / "i.e. " must not end a clause.
+    text = re.sub(r"\b([ei])\.([ge])\.", r"\1\2", text, flags=re.IGNORECASE)
+    for clause in re.split(r"[\n;\u2022]+|(?<=[A-Za-z0-9)])\.\s+", text):
+        if not _DEGREE_WORD_RE.search(clause):
+            continue
+        if not _TRADE_FIELD_RE.search(clause):
+            continue
+        if _BUSINESS_FIELD_RE.search(clause) or _DEGREE_OPTIONAL_RE.search(clause):
+            continue
+        return True
+    return False

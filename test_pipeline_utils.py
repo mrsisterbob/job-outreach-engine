@@ -3944,3 +3944,73 @@ def test_off_direction_title_gate_pure_cases():
         assert is_off_direction_title(title), title
     for title in allowed:
         assert not is_off_direction_title(title), title
+
+
+_CBRE_DESC = (
+    "Support automated material handling across our ASRS and AMR/AGV fleet. Troubleshoot Cognex "
+    "vision systems and conveyor controls, and manage preventive maintenance in the CMMS.\n"
+    "Bachelor's degree in Mechatronics, Industrial Technology, Automation, Robotics, Mechanical or Electrical."
+)
+
+
+def test_industrial_role_gate_titles():
+    from pipeline_utils import is_industrial_title
+    for title in ("Automation Systems Analyst - ASRS & AMR Optimization", "Robotics Technician",
+                  "Maintenance Technician", "Controls Engineer", "Millwright", "AGV Operations Lead",
+                  "PLC Programmer", "Industrial Engineer", "Mechatronics Specialist"):
+        assert is_industrial_title(title), title
+    for title in ("Workflow Automation Analyst", "Business Process Automation Analyst",
+                  "Operations Analyst", "Systems Analyst", "Supply Chain Analyst", "Data Analyst",
+                  "Business Analyst", "Salesforce Administrator", "Revenue Operations Analyst",
+                  "Finance Analyst", "Reporting Analyst", "", None):
+        assert not is_industrial_title(title), title
+
+
+def test_industrial_role_gate_description_terms():
+    from pipeline_utils import industrial_term_hits
+    hits = industrial_term_hits(_CBRE_DESC)
+    for term in ("asrs", "amr", "cmms", "cognex"):
+        assert term in hits, (term, hits)
+    assert len(hits) == len(set(hits))
+    assert industrial_term_hits("Own preventive maintenance budgeting and vendor reporting in Excel.") == ["preventive maintenance"]
+    assert industrial_term_hits("Reporting to the CFO of Barclays PLC in London.") == []
+    assert industrial_term_hits("") == [] and industrial_term_hits(None) == []
+
+
+def test_industrial_role_gate_trade_degree():
+    from pipeline_utils import required_degree_is_technical_trade as f
+    assert f("Bachelor's degree in Mechatronics, Industrial Technology, Automation, Robotics, Mechanical or Electrical")
+    assert f("Requirements: B.S. in Mechanical Engineering. Five years of experience.")
+    assert not f("Bachelor's degree in business, finance, engineering or a related field")
+    assert not f("Bachelor's degree in Electrical Engineering preferred, or equivalent experience")
+    assert not f("Bachelor's degree in Mechanical Engineering, Data Analytics or Statistics")
+    assert not f("Experience with electrical systems. Bachelor's degree in any field.")
+    assert not f("Strong Excel skills and mechanical aptitude.")
+    assert not f("") and not f(None)
+
+
+def test_industrial_role_gate_keeps_process_automation_and_suffix_titles():
+    from pipeline_utils import is_industrial_title
+    for title in ("Robotic Process Automation Analyst", "RPA Developer - Robotic Process Automation",
+                  "Robotics Process Analyst", "Workflow Automation Engineer", "Test Automation Engineer",
+                  "Marketing Automation Engineer", "Business Process Automation Engineer",
+                  "Software Automation Engineer", "Operations Analyst - Manufacturing Engineer Support",
+                  "Business Analyst (Automation Engineer track)", "Business Analyst, Maintenance Technician Team",
+                  "Operations Analyst | Plant Engineer Liaison"):
+        assert not is_industrial_title(title), title
+    for title in ("Automation Engineer", "Senior Automation Technician", "Industrial Automation Engineer",
+                  "Plant Automation Engineer", "PLC Automation Technician", "Manufacturing Engineer - Plant 4",
+                  "Maintenance Technician (Nights)", "Operations Analyst - ASRS", "Robotics Engineer"):
+        assert is_industrial_title(title), title
+
+
+def test_industrial_role_gate_optional_degree_language_and_abbreviations():
+    from pipeline_utils import required_degree_is_technical_trade as f
+    assert not f("Bachelor's degree (preferably in Electrical Engineering)")
+    assert not f("Bachelor's degree, ideally in Mechanical Engineering.")
+    assert not f("Bachelor's degree in Mechatronics or similar field desired.")
+    assert not f("Degree in Electrical Engineering or similar")
+    # e.g. / i.e. do not end the clause, so the business field in the same sentence is seen.
+    assert not f("Bachelor's degree (e.g. Business, or Electrical Engineering) required.")
+    assert not f("Bachelor's degree, i.e. Finance or Mechanical Engineering.")
+    assert f("Bachelor's degree in Electrical Engineering required.")
