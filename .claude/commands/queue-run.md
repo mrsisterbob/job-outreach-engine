@@ -238,9 +238,18 @@ Waiting inside the worktree would make the Stop hook test the agent's half-made 
 and tempt this session into "fixing" it alongside the agent.
 
 **Do not trust the line - re-check it.** The Stop hook fires on `Stop`, not `SubagentStop`, so
-nothing deterministic checks the agent's work: the re-check is the gate. When the agent says
-`built`, run the task's `verify` and both suites yourself, in a subshell so this shell never
-leaves the main folder, with quiet output:
+nothing deterministic checks the agent's work: the re-check is the gate. The full suites take
+about 110 seconds, so they run ONCE per task before the merge, not after every `built` (measured
+2026-10-21: three full runs per task, two of them before the merge, about 4 minutes of a
+19-minute task).
+
+1. When the agent says `built`, run only the task's `verify` yourself, in a subshell, through the
+   step 0 quiet wrapper. Red is one more failed attempt: send it back as described below.
+2. Then decide on the review (next section). The full-suite gate below runs once, **after** the
+   review's fixes are back and the agent says `built` again, or **right away** if the review was
+   skipped. A review that sent nothing back still ends with the gate, never without it.
+
+The full-suite gate, in a subshell so this shell never leaves the main folder, with quiet output:
 
 ```bash
 out=$(mktemp)
@@ -273,6 +282,21 @@ it is why a block is committed to its branch as `WIP <TASK-id>: blocked`.
 
 ## Review before calling it done
 
+**Size gate first (added 2026-10-21).** A small diff does not earn a review: it cost about 5
+minutes (the review, then the build agent applying its fixes). Count the non-test lines changed:
+
+```bash
+git -C .worktrees/<TASK-id> add -N <scope files>
+git -C .worktrees/<TASK-id> diff --numstat HEAD -- . ':(exclude)test_*.py' ':(exclude)FUNCTION_INDEX.md' \
+  | awk '{n+=$1+$2} END{print "non-test lines:", n+0}'
+```
+
+Skip the review when that count is **80 or fewer** AND the task's `scope` does not list `Code.gs`.
+Run the full-suite gate right away (re-check step 2) and write `review skipped: <N> non-test
+lines` in the Log. Over 80, or any doubt, run it. The 80 is a starting figure, not a measured
+one: of the last 14 merges only four were at or under it (22, 46, 64, 75 lines; the median was
+about 200), so most tasks still get a review. Kevin tunes the number.
+
 Green tests are not a review. Run `/code-review` on the diff.
 
 It runs in a fresh subagent that sees only the diff and never saw the reasoning that
@@ -289,7 +313,7 @@ happen. If a finding is real, fix it and re-run the suite.
 Run it against the worktree's diff. That is the one place this session enters the worktree: `cd`
 there for the review only, `cd` back to the main folder right after, and never end a turn
 while inside it (the Stop hook would test the worktree's state). Fixes for real findings go back to the same build agent with `SendMessage`, listing
-them, rather than being made in this session; then re-check as above. If `SendMessage` cannot
+them, rather than being made in this session; then re-check as above (verify, then the full-suite gate). If `SendMessage` cannot
 reach the agent (it errors, or the agent is gone), spawn a fresh build agent with the same
 prompt plus the findings - the task's Log carries the history.
 
@@ -298,7 +322,7 @@ you deliberately skipped and why.
 
 ## Finish
 
-On success - verify, both suites and the review all green:
+On success - verify, both suites and the review (or its logged skip) all green:
 
 1. Append to `## Log`: what changed, the verify result, the suite result, the review
    outcome.
