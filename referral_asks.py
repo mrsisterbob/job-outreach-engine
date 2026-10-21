@@ -15,6 +15,7 @@ Hard rules, each with a test in test_referral_asks.py:
     board can return the placeholder "See Opening ID").
 """
 import re
+from datetime import date
 
 import pipeline_utils as pu
 import track_registry
@@ -58,19 +59,54 @@ def build_role(title, link, requisition_id, job_hash) -> dict:
     }
 
 
-def merge_roles(existing, new, taken_hashes=()):
-    """(merged, added): `existing` plus every role in `new` whose job_hash is not already in the ask,
-    not in `taken_hashes` (roles in ANY ask, whatever its status) and not repeated inside `new`."""
+# The most roles ONE ask holds. main.WARM_RADAR_ROLES_PER_COMPANY is set from this, so the number a
+# /w message lists for a company and the number one pending ask can hold are the same by construction.
+REFERRAL_ASK_MAX_ROLES = 5
+# A role title is cut to this many characters on the ask LINE only (roles_json keeps the full title).
+ROLE_TITLE_MAX_CHARS = 120
+# A finished ask must stay under one Telegram message (main.TELEGRAM_CHUNK_CHARS is 3900); /refer adds
+# a header around it, so the draft itself stops a little short of that.
+REFERRAL_ASK_MAX_CHARS = 3500
+
+
+def role_usable(role) -> bool:
+    """True when a role can stand on an ask line: it has a link (every draft carries the job link) and
+    neither its title nor its finished line has negative wording. compose_ask leaves out any other role."""
+    if not str(role.get("link") or "").strip():
+        return False
+    return not (pu.negative_language_hits(role.get("title")) or pu.negative_language_hits(_role_line(role)))
+
+
+def merge_roles_counted(existing, new, taken_hashes=(), max_roles=REFERRAL_ASK_MAX_ROLES):
+    """(merged, added, full): `existing` plus every role in `new` whose job_hash is not already in the
+    ask, not in `taken_hashes` (roles in ANY ask, whatever its status) and not repeated inside `new`,
+    until the ask holds `max_roles` USABLE roles. The cap is applied after the link and wording checks
+    (role_usable): a role compose_ask will leave out takes no slot, so it never crowds out a good role
+    behind it. Such a role is still returned in `merged`/`added` so compose_ask drops and reports it.
+    `full` counts the usable, otherwise-new roles that did not fit; they are not added anywhere here,
+    and an ask already past the cap (older data) just takes no more."""
     merged = [dict(r) for r in (existing or [])]
     seen = {r.get("job_hash") for r in merged} | set(taken_hashes or ())
-    added = []
+    held = sum(1 for r in merged if role_usable(r))
+    added, full = [], 0
     for role in new or []:
         h = role.get("job_hash")
         if not h or h in seen:
             continue
         seen.add(h)
+        if role_usable(role):
+            if max_roles is not None and held >= max_roles:
+                full += 1
+                continue
+            held += 1
         merged.append(dict(role))
         added.append(dict(role))
+    return merged, added, full
+
+
+def merge_roles(existing, new, taken_hashes=(), max_roles=REFERRAL_ASK_MAX_ROLES):
+    """(merged, added): merge_roles_counted without the count of roles that did not fit."""
+    merged, added, _full = merge_roles_counted(existing, new, taken_hashes, max_roles)
     return merged, added
 
 
@@ -152,8 +188,16 @@ def pick_fit(title, company, entries_for_track, experience, sender_name="Kevin M
     return None
 
 
+def _ask_title(title) -> str:
+    """The title as shown on an ask line: cut to ROLE_TITLE_MAX_CHARS, with "..." marking the cut."""
+    text = str(title or "")
+    if len(text) <= ROLE_TITLE_MAX_CHARS:
+        return text
+    return text[:ROLE_TITLE_MAX_CHARS - 3].rstrip() + "..."
+
+
 def _role_line(role) -> str:
-    line = f"- {role['title']}: {role['link']}"
+    line = f"- {_ask_title(role['title'])}: {role['link']}"
     if role.get("req"):
         line += f" (Req ID {role['req']})"
     return line
@@ -191,33 +235,132 @@ def render_ask(first_name, company, roles, sender_name, fit=None) -> str:
 def compose_ask(first_name, company, roles, sender_name, entries_for_track, experience):
     """Render one contact's ask through the wording gate.
 
-    Returns {"body": str or None, "kept": [roles], "left_out": [roles], "fit_title": str}.
-    A role is left out when it has no link (every draft must carry the job link) or when its own
-    line (title, link, requisition id) or its title alone has a hit. `body` is None when no role remains or the finished text still has a hit (the fit lines
+    Returns {"body": str or None, "kept": [roles], "left_out": [roles], "too_long": [roles],
+    "fit_title": str}. A role is left out when it has no link (every draft must carry the job link) or
+    when its own line (title, link, requisition id) or its title alone has a hit. A role dropped only
+    because the finished text would pass REFERRAL_ASK_MAX_CHARS is in `too_long`, never in `left_out`.
+    `body` is None when no role remains or the finished text still has a hit (the fit lines
     are dropped first, so a bad bullet costs the sentence rather than the draft). Never a draft
-    with a hit.
+    with a hit. The fit sentence always names a role that is still in `kept`.
     """
-    kept, left_out = [], []
+    kept, left_out, too_long = [], [], []
     for role in roles or []:
-        if not str(role.get("link") or "").strip():
-            left_out.append(role)
-        elif pu.negative_language_hits(role.get("title")) or pu.negative_language_hits(_role_line(role)):
-            left_out.append(role)
-        else:
-            kept.append(role)
+        (kept if role_usable(role) else left_out).append(role)
     if not kept:
-        return {"body": None, "kept": [], "left_out": left_out, "fit_title": ""}
+        return {"body": None, "kept": [], "left_out": left_out, "too_long": [], "fit_title": ""}
 
-    fit, fit_title = None, ""
-    for role in kept:
-        candidate = pick_fit(role["title"], company, entries_for_track, experience, sender_name)
-        if candidate:
-            fit, fit_title = candidate, role["title"]
-            break
+    def _fit_for(remaining):
+        for role in remaining:
+            candidate = pick_fit(role["title"], company, entries_for_track, experience, sender_name)
+            if candidate:
+                return candidate, role["title"]
+        return None, ""
 
-    for attempt in (fit, None):
-        body = render_ask(first_name, company, kept, sender_name, attempt)
-        if not pu.negative_language_hits(body):
-            return {"body": body, "kept": kept, "left_out": left_out,
+    fit, fit_title = _fit_for(kept)
+
+    # One ask is one Telegram message: while the finished text is too long (only very long links get
+    # it there once the title is cut and the role count is capped) the NEWEST role is left out.
+    while True:
+        for attempt in (fit, None):
+            body = render_ask(first_name, company, kept, sender_name, attempt)
+            if not pu.negative_language_hits(body):
+                break
+        else:
+            return {"body": None, "kept": [], "left_out": left_out + kept + too_long, "too_long": [],
+                    "fit_title": ""}
+        if len(body) <= REFERRAL_ASK_MAX_CHARS or len(kept) <= 1:
+            return {"body": body, "kept": kept, "left_out": left_out, "too_long": too_long,
                     "fit_title": fit_title if attempt else ""}
-    return {"body": None, "kept": [], "left_out": left_out + kept, "fit_title": ""}
+        too_long.append(kept.pop())
+        fit, fit_title = _fit_for(kept)   # the sentence may have been about the role just cut
+
+
+# ---- which warm contact a company's roles go to ----------------------------------------------------
+
+_IMPORT_SUFFIX = "(LinkedIn import)"
+_DATE_PREFIX_RE = re.compile(r"^\s*\[\d{4}-\d{2}-\d{2}\]\s*")
+_CONNECTED_RE = re.compile(r"Connected (\d{4})-(\d{2})-(\d{2})")
+
+
+def contact_title_and_date(note, company=""):
+    """(title, connected) read from a LinkedIn-import note, "" for what is not there.
+
+    The note reads `<Title> at <Company>. Connected <YYYY-MM-DD> (LinkedIn import)`, optionally behind a
+    `[YYYY-MM-DD] ` prefix and optionally followed by free text; a row with no title reads `Works at <Company>`. A title may itself contain
+    " at " ("Analyst at Large Bank at Acme"), so the company is cut from the END: by name when
+    `company` is given and the sentence ends with it, otherwise at the last " at ". Any other note
+    ("Hiring manager", "Active relationship") has no title: nothing is guessed from free text.
+    `connected` is the ISO date after "Connected", or "" when absent or not a real date.
+    """
+    text = _DATE_PREFIX_RE.sub("", str(note or "")).strip()
+    # The date is read from "Connected YYYY-MM-DD" wherever it sits in the note (text typed after the
+    # import line must not hide it); the title needs the "(LinkedIn import)" marker and is the text before it.
+    connected = ""
+    match = _CONNECTED_RE.search(text)
+    if match:
+        try:
+            connected = date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+        except ValueError:
+            connected = ""
+    marker = text.find(_IMPORT_SUFFIX)
+    if marker < 0:
+        return "", connected
+    text = text[:marker]
+    head = _CONNECTED_RE.search(text)
+    if head:
+        text = text[:head.start()]
+    sentence = text.strip().rstrip(".").strip()
+    company = str(company or "").strip()
+    if company and sentence.lower() == f"works at {company}".lower():
+        return "", connected
+    if company and sentence.lower().endswith(f" at {company}".lower()):
+        return sentence[:-len(f" at {company}")].strip(), connected
+    if " at " not in sentence:
+        return "", connected
+    if sentence.startswith("Works at ") and sentence.count(" at ") == 1:
+        return "", connected
+    return sentence.rsplit(" at ", 1)[0].strip(), connected
+
+
+def is_placeholder_name(name) -> bool:
+    """True for the nameless-row placeholder get_warm_crm_contacts stores ("Contact") or an empty name."""
+    return str(name or "").strip().lower() in ("", "contact")
+
+
+def contact_sort_key(contact):
+    """Sort key for the contacts at ONE company, best first: a real name before the placeholder, then
+    higher priority, then a row with an email, then the more recent connection (a note with no date
+    last). sorted() is stable, so full ties keep sheet order."""
+    _title, connected = contact_title_and_date(contact.get("note"), contact.get("raw_company", ""))
+    ordinal = date.fromisoformat(connected).toordinal() if connected else 0
+    try:
+        priority = float(contact.get("priority_score") or 0)
+    except (TypeError, ValueError):
+        priority = 0.0
+    return (1 if is_placeholder_name(contact.get("name")) else 0, -priority,
+            0 if str(contact.get("email") or "").strip() else 1, -ordinal)
+
+
+def pick_contact(contacts, role_titles, company=""):
+    """The one contact a company's roles go to, or None when `contacts` is empty.
+
+    Only a contact with a sheet_uuid is eligible while any has one (an ask is keyed by it). Among
+    them a real name beats the placeholder, then a higher priority always wins; only contacts tied at
+    that top priority are compared by role fit: the one whose imported title implies the same track
+    as the company's top role (the first of `role_titles`). With no match, or no title rule firing
+    on either side, the best by contact_sort_key (email, then recency, then sheet order) is taken.
+    """
+    people = [c for c in (contacts or []) if c]
+    if not people:
+        return None
+    with_uuid = [c for c in people if str(c.get("sheet_uuid") or "").strip()]
+    ranked = sorted(with_uuid or people, key=contact_sort_key)
+    top = ranked[0]
+    tied = [c for c in ranked if contact_sort_key(c)[:2] == contact_sort_key(top)[:2]]
+    role_track = derive_track(role_titles[0], company) if role_titles else ""
+    if role_track:
+        for c in tied:
+            title, _date = contact_title_and_date(c.get("note"), c.get("raw_company", ""))
+            if title and derive_track(title, company) == role_track:
+                return c
+    return top
