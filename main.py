@@ -3672,8 +3672,9 @@ def get_applied_crm_companies():
 
 def get_warm_crm_contacts():
     """Fetch every Carmen Warm CRM contact keyed by normalize_company_for_match(company). Each value
-    is the BEST contact at that company (highest priority_score, ties to the one with an email, then
-    to the earlier sheet row) with the keys callers read: name, raw_company, email, note,
+    is the BEST contact at that company (a real name before the "Contact" placeholder, then highest
+    priority_score, ties to the one with an email, then the most recent "Connected <date>" in the
+    note, then the earlier sheet row) with the keys callers read: name, raw_company, email, note,
     priority_score, sheet_uuid. Two more keys carry the rest of the company: `count` (how many Warm
     people Kevin has there) and `contacts` (every one of them, same keys, best first).
 
@@ -3724,8 +3725,10 @@ def get_warm_crm_contacts():
             by_company.setdefault(company_key, []).append(contact)
         contacts = {}
         for key, people in by_company.items():
-            # sorted() is stable, so equal priority and email keeps sheet order (earlier row first)
-            ranked = sorted(people, key=lambda c: (-c["priority_score"], 0 if c["email"] else 1))
+            # A real name before the "Contact" placeholder (whatever the priority), then priority, then
+            # an email, then the more recent "Connected <date>" in the note. sorted() is stable, so a
+            # full tie keeps sheet order (earlier row first).
+            ranked = sorted(people, key=referral_asks.contact_sort_key)
             best = dict(ranked[0])
             best["count"] = len(ranked)
             best["contacts"] = [dict(c) for c in ranked]
@@ -13216,7 +13219,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
 
 WARM_RADAR_LOOKUP_BATCH = 20      # board lookups started per /w run (each is up to 3 HTTP calls of 8s)
 WARM_RADAR_MISS_RETRY_DAYS = 14   # a company with no public board is not probed again for this long
-WARM_RADAR_ROLES_PER_COMPANY = 5   # roles listed for one company in one /w message
+WARM_RADAR_ROLES_PER_COMPANY = referral_asks.REFERRAL_ASK_MAX_ROLES   # roles listed for one company in one /w message; one ask holds the same number
 WARM_RADAR_MESSAGES_PER_RUN = 15   # company messages sent per /w run (~17s at the 1.1s pacing)
 WARM_RADAR_NAME_CAP = 15          # company names listed in one closing message
 
@@ -13341,7 +13344,14 @@ def store_referral_asks(pending):
       - a draft is stored only when it passes the wording gate; a role the gate rejects is counted.
     The taken roles and the pending asks are read ONCE per run, not once per contact.
     A contact with no sheet_uuid is skipped and counted. One contact failing never stops the rest.
-    Returns {"stored", "left_out", "no_uuid", "failed"}.
+    One ask holds at most referral_asks.REFERRAL_ASK_MAX_ROLES usable roles (the cap is applied after the
+    link and wording checks, so a role that will be left out takes no slot): a usable new role that does
+    not fit is not added and is counted in "ask_full". That role was already listed on the /w card or
+    summary and stamped in seen_jobs with its Clavicular row, so a later /w does NOT offer it again and
+    it never gets an ask; the count in the closing message is the only trace. A role dropped only
+    because the finished text would pass referral_asks.REFERRAL_ASK_MAX_CHARS is counted in "too_long",
+    separately from "left_out" (the wording check).
+    Returns {"stored", "left_out", "no_uuid", "failed", "ask_full", "too_long"}.
 
     A role that was NOT stored as an ask (left out by the wording gate, no sheet_uuid, or a failed
     store) is NOT counted again on a later /w: the card and the Clavicular row already went out and
@@ -13349,7 +13359,7 @@ def store_referral_asks(pending):
     counts in the closing message are the only trace, and a store failure is a database problem
     that the TASK-93/95 alerts report.
     """
-    result = {"stored": 0, "left_out": 0, "no_uuid": 0, "failed": 0}
+    result = {"stored": 0, "left_out": 0, "no_uuid": 0, "failed": 0, "ask_full": 0, "too_long": 0}
     entries = []
     for company_key, entry in (pending or {}).items():
         contact = entry.get("contact") or {}
@@ -13383,24 +13393,26 @@ def store_referral_asks(pending):
                             "SELECT id, roles_json FROM referral_asks WHERE sheet_uuid = ? "
                             "AND status = 'pending' ORDER BY id DESC LIMIT 1", (sheet_uuid,)).fetchone()
                     existing = json.loads(row[1]) if row else []
-                    merged, added = referral_asks.merge_roles(existing, new_roles, taken_hashes=taken)
+                    merged, added, full = referral_asks.merge_roles_counted(existing, new_roles,
+                                                                            taken_hashes=taken)
                     if not added:
                         conn.commit()
-                        return 0, 0, None
+                        return 0, 0, None, full, 0
                     composed = referral_asks.compose_ask(
                         first_name_for_greeting(contact.get("name")), company, merged,
                         (evidence.get("identity") or {}).get("name") or "Kevin",
                         _referral_ask_entries, evidence.get("experience") or [])
                     added_hashes = {r["job_hash"] for r in added}
                     left_out = len([r for r in composed["left_out"] if r["job_hash"] in added_hashes])
+                    too_long = len([r for r in composed["too_long"] if r["job_hash"] in added_hashes])
                     if not composed["body"]:
                         conn.commit()
-                        return 0, left_out, None
+                        return 0, left_out, None, full, too_long
                     if row and composed["kept"] == existing:
                         # Every newly added role was dropped by the gate: the stored draft is unchanged,
                         # so it is neither rewritten nor counted as stored. The drops are still reported.
                         conn.commit()
-                        return 0, left_out, None
+                        return 0, left_out, None, full, too_long
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     roles_json = json.dumps(composed["kept"])
                     if row:
@@ -13411,7 +13423,7 @@ def store_referral_asks(pending):
                              row[0], row[1]))
                         if cur.rowcount:
                             conn.commit()
-                            return 1, left_out, (row[0], roles_json)
+                            return 1, left_out, (row[0], roles_json), full, too_long
                         continue  # sent, or its roles changed since the snapshot: look again
                     try:
                         cur = conn.execute(
@@ -13422,13 +13434,15 @@ def store_referral_asks(pending):
                     except sqlite3.IntegrityError:
                         continue  # a pending ask for this contact exists: merge into it
                     conn.commit()
-                    return 1, left_out, (cur.lastrowid, roles_json)
+                    return 1, left_out, (cur.lastrowid, roles_json), full, too_long
                 raise RuntimeError("pending referral ask kept changing under the write")
 
         try:
-            wrote, left_out, stored = db_write_with_retry(_write, "referral_asks")
+            wrote, left_out, stored, full, too_long = db_write_with_retry(_write, "referral_asks")
             result["stored"] += wrote
             result["left_out"] += left_out
+            result["ask_full"] += full
+            result["too_long"] += too_long
             if stored:
                 pending_rows[sheet_uuid] = stored
                 try:
@@ -13449,6 +13463,13 @@ def _referral_summary_line(summary):
         parts.append(f"{stored} ask draft{'' if stored == 1 else 's'} stored")
     if left_out:
         parts.append(f"{left_out} role{'' if left_out == 1 else 's'} left out by the wording check")
+    if summary.get("too_long"):
+        n = summary["too_long"]
+        parts.append(f"{n} role{'' if n == 1 else 's'} too long for one ask")
+    if summary.get("ask_full"):
+        n = summary["ask_full"]
+        parts.append(f"{n} role{'' if n == 1 else 's'} not added to an ask, the contact's ask is full "
+                     f"({referral_asks.REFERRAL_ASK_MAX_ROLES} roles; send or dismiss it in /refer)")
     if summary.get("no_uuid"):
         n = summary["no_uuid"]
         parts.append(f"{n} contact{'' if n == 1 else 's'} skipped, no CRM id")
@@ -13947,7 +13968,18 @@ def run_warm_radar_scan(chat_id=None):
                 continue
             messages_sent += 1
             listed = roles[:WARM_RADAR_ROLES_PER_COMPANY]
-            contact = group["contact"]
+            # ONE contact per company for everything below: the card or summary, the Clavicular row
+            # note and the referral ask all name this person. The company-level best is the default;
+            # among contacts tied at the top priority the one whose imported title fits the top role
+            # wins (referral_asks.pick_contact).
+            best_contact = group["contact"]
+            contact = best_contact
+            picked = referral_asks.pick_contact(best_contact.get("contacts") or [best_contact],
+                                                [r["title"] for r in roles], group["company"])
+            if picked:
+                contact = dict(picked)
+                contact["count"] = best_contact.get("count") or 1
+                contact["contacts"] = best_contact.get("contacts") or [best_contact]
             contact_name = contact.get("name", "Contact")
             contact_note = contact.get("note", "Active relationship")
             other_contacts = max(0, int(contact.get("count") or 1) - 1)

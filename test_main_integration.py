@@ -15799,7 +15799,7 @@ def test_referral_asks_review_followups_store_falls_back_to_the_pending_row_the_
     monkeypatch.setattr(m, "_referral_run_state", lambda uuids: (real(uuids)[0] - {"h1"}, {}))
     summary = m.store_referral_asks({"acme": _ask_pending_entry([("h9", "Logistics Coordinator")])})
     rows = _asks()
-    assert summary == {"stored": 1, "left_out": 0, "no_uuid": 0, "failed": 0}
+    assert summary == {"stored": 1, "left_out": 0, "no_uuid": 0, "failed": 0, "ask_full": 0, "too_long": 0}
     assert len(rows) == 1 and rows[0]["id"] == existing and rows[0]["status"] == "pending"
     assert {r["job_hash"] for r in json.loads(rows[0]["roles_json"])} == {"h1", "h9"}
     assert rows[0]["body"] != "old body"
@@ -16050,15 +16050,16 @@ def test_warm_radar_review_followups_a_failing_spawn_changes_nothing(monkeypatch
 
 # ---- TASK-127: /w sends one message per company, with caps and a region/language gate ----
 
-def _summary_harness(monkeypatch, boards, priorities=None):
+def _summary_harness(monkeypatch, boards, priorities=None, rows=None):
     """Drives the real m.run_warm_radar_scan. `boards` maps company -> [(title, location)] in board
     order. Stubs only the edges: the CRM webhook, the ATS fetch, Telegram (card and summary posts are
     captured in h.posts as (message_id, text)) and the Clavicular enqueue, whose rows also feed
     is_role_tracked so a second run sees what the first one wrote."""
     h = _WarmRadarHarness(monkeypatch, list(boards))
-    rows = [{"company": c, "name": f"Person {i}", "email": f"p{i}@example.com", "note": "Active relationship",
-             "raw_priority": (priorities or {}).get(c, 5), "sheet_uuid": f"u{i}"}
-            for i, c in enumerate(boards)]
+    if rows is None:
+        rows = [{"company": c, "name": f"Person {i}", "email": f"p{i}@example.com", "note": "Active relationship",
+                 "raw_priority": (priorities or {}).get(c, 5), "sheet_uuid": f"u{i}"}
+                for i, c in enumerate(boards)]
     monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _AskResp({"status": "success", "followups": rows}))
     h.filters.update({k: m.DEFAULT_SEARCH_FILTERS[k] for k in ("title_exclusions", "seniority_exclusions")})
     h.payloads, h.posts, h.tracked, h.jobs = [], [], set(), []
@@ -16370,3 +16371,144 @@ def test_warm_radar_company_summaries_unknown_location_count_covers_listed_roles
     text = h.run()
     assert "5 roles kept with no readable location" in text, text
     assert "8 roles kept" not in text and "Held back 3 roles" in text
+
+
+# ---- TASK-128: one contact per company for the card, the Clavicular row and the ask; the ask size cap ----
+
+def _imp_note(title, joined, company="Acme Robotics"):
+    return f"{title} at {company}. Connected {joined} (LinkedIn import)"
+
+
+def _pick_rows():
+    """Five Carmen Warm people at one company, ALL with a blank priority (the shape of the LinkedIn import)."""
+    def row(name, note, uuid_, priority=""):
+        return {"company": "Acme Robotics", "name": name, "email": "", "note": note,
+                "raw_priority": priority, "sheet_uuid": uuid_}
+    return [
+        row("Ann Finance", _imp_note("Financial Analyst", "2025-12-01"), "u-ann"),          # newest, no track rule
+        row("Bob Supply", _imp_note("Supply Chain Analyst", "2019-01-01"), "u-bob"),        # fits a "g" role
+        row("Cy Data", _imp_note("Data Analyst", "2022-03-01"), "u-cy"),                    # fits a "d" role
+        row("Dee Procure", _imp_note("Procurement Analyst", "2023-06-01"), "u-dee"),        # fits a "g" role, newer than Bob
+        # a LinkedIn URL in the name column: stored as the placeholder "Contact", but with priority 9
+        row("https://www.linkedin.com/in/ghost", _imp_note("Supply Chain Analyst", "2026-01-01"), "u-ghost", 9),
+    ]
+
+
+def test_warm_contact_pick_and_ask_cap_card_clavicular_row_and_ask_name_the_same_fitting_contact(monkeypatch):
+    boards = {"Acme Robotics": [("Procurement Analyst", "Chicago"), ("Data Analyst", "Chicago")]}
+    h = _summary_harness(monkeypatch, boards, rows=_pick_rows())
+    text = h.run()
+    # the company-level default is a REAL name at the top priority: the newest connection, not the ghost
+    best = m.get_warm_crm_contacts()[m.normalize_company_for_match("Acme Robotics")]
+    assert best["name"] == "Ann Finance" and best["count"] == 5
+    assert [c["name"] for c in best["contacts"]] == ["Ann Finance", "Dee Procure", "Cy Data", "Bob Supply", "Contact"]
+    # /w picks by role fit among the top-priority people: the top role is Procurement Analyst, so Dee
+    # (newest of the two "g" titles), not the default Ann
+    assert len(h.posts) == 1
+    summary = h.posts[0][1]
+    assert "Dee Procure" in summary and "Ann Finance" not in summary, summary
+    notes = {r["row_data"][8] for r in h.rows()}
+    assert notes == {"Warm Radar Match (no AI score): Dee Procure"}, notes
+    asks = _asks()
+    assert len(asks) == 1 and asks[0]["sheet_uuid"] == "u-dee" and asks[0]["contact_name"] == "Dee Procure"
+    assert asks[0]["body"].startswith("Hi Dee,\n")
+    assert [r["title"] for r in json.loads(asks[0]["roles_json"])] == ["Procurement Analyst", "Data Analyst"]
+    assert "1 ask draft stored" in text and "ask is full" not in text, text
+
+
+def test_warm_contact_pick_and_ask_cap_a_different_top_role_picks_a_different_contact(monkeypatch):
+    boards = {"Acme Robotics": [("Data Analyst", "Chicago"), ("Procurement Analyst", "Chicago")]}
+    h = _summary_harness(monkeypatch, boards, rows=_pick_rows())
+    h.run()
+    assert "Cy Data" in h.posts[0][1]
+    assert {r["row_data"][8] for r in h.rows()} == {"Warm Radar Match (no AI score): Cy Data"}
+    assert [a["sheet_uuid"] for a in _asks()] == ["u-cy"]
+
+
+def test_warm_contact_pick_and_ask_cap_only_the_placeholder_contact_is_still_used(monkeypatch):
+    rows = [r for r in _pick_rows() if r["sheet_uuid"] == "u-ghost"]
+    boards = {"Acme Robotics": [("Procurement Analyst", "Chicago")]}
+    h = _summary_harness(monkeypatch, boards, rows=rows)
+    h.run()
+    assert len(h.posts) == 1 and len(h.rows()) == 1
+    assert [a["sheet_uuid"] for a in _asks()] == ["u-ghost"]
+    assert _asks()[0]["body"].startswith("Hi,\n")      # never "Hi Contact,"
+
+
+def test_warm_contact_pick_and_ask_cap_two_runs_stop_the_ask_at_five_and_report_ask_full(monkeypatch):
+    long_link = "https://boards.greenhouse.io/acmerobotics/jobs/{i}?gh_src=" + "x" * 120
+    roles = [(f"Operations Analyst {chr(65 + i)} " + "Strategic Sourcing and Planning " * 3, "Chicago",
+              long_link.format(i=i)) for i in range(12)]
+    h = _summary_harness(monkeypatch, {"Acme Robotics": roles})
+    assert m.WARM_RADAR_ROLES_PER_COMPANY == m.referral_asks.REFERRAL_ASK_MAX_ROLES == 5
+    text1 = h.run()
+    first = {r["row_data"][2] for r in h.rows()}
+    asks = _asks()
+    assert len(first) == 5 and len(asks) == 1 and len(json.loads(asks[0]["roles_json"])) == 5
+    assert "1 ask draft stored" in text1 and "ask is full" not in text1, text1
+
+    text2 = h.run()
+    second = {r["row_data"][2] for r in h.rows()} - first
+    assert len(second) == 5 and not (first & second)
+    asks = _asks()
+    stored_titles = [r["title"] for r in json.loads(asks[0]["roles_json"])]
+    # still ONE pending ask, still the first five roles: the second five did not fit
+    assert len(asks) == 1 and asks[0]["status"] == "pending" and set(stored_titles) == {t.strip() for t in first}, stored_titles
+    assert "5 roles not added to an ask, the contact's ask is full" in text2, text2
+    assert "ask draft stored" not in text2
+    # the maximum ask is under one Telegram message even with ~110 character titles and long links
+    assert len(asks[0]["body"]) < m.TELEGRAM_CHUNK_CHARS, len(asks[0]["body"])
+    assert asks[0]["body"].count("\n- ") == 5 and asks[0]["body"].startswith("Hi Person,\n")
+
+    # the third run offers the two roles still left (held back by the per-company cap, never stamped)
+    text3 = h.run()
+    third = {r["row_data"][2] for r in h.rows()} - first - second
+    assert len(third) == 2 and "and 2 more not listed" not in h.posts[2][1]
+    assert "2 roles not added to an ask, the contact's ask is full" in text3, text3
+    assert len(json.loads(_asks()[0]["roles_json"])) == 5 and len(_asks()) == 1
+
+
+def test_warm_contact_pick_and_ask_cap_a_sent_ask_makes_room_for_the_next_roles(monkeypatch):
+    h = _summary_harness(monkeypatch, {"Acme Robotics": _roles_text(8)})
+    h.run()
+    ask = _asks()[0]
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE referral_asks SET status = 'sent' WHERE id = ?", (ask["id"],))
+    text = h.run()
+    asks = _asks()
+    assert [a["status"] for a in asks] == ["sent", "pending"], asks
+    new_titles = [r["title"] for r in json.loads(asks[1]["roles_json"])]
+    assert len(new_titles) == 3 and not (set(new_titles) & {r["title"] for r in json.loads(asks[0]["roles_json"])})
+    assert "ask is full" not in text, text
+
+
+def test_warm_contact_pick_and_ask_cap_roles_the_wording_gate_drops_take_no_slot(monkeypatch):
+    good = [("Procurement Analyst", "Chicago"), ("Supply Chain Analyst", "Chicago"), ("Buyer Analyst", "Chicago")]
+    boards = {"Acme Robotics": list(good)}
+    h = _summary_harness(monkeypatch, boards)
+    h.run()
+    assert len(json.loads(_asks()[0]["roles_json"])) == 3
+    # run two: two roles the wording gate rejects, then three good ones (3 held + 2 flagged = 5 would have
+    # filled the ask before the good ones were looked at)
+    boards["Acme Robotics"] = good + [("Operations Analyst No Experience Needed", "Chicago"),
+                                      ("Operations Analyst Cannot Fail", "Chicago"),
+                                      ("Operations Analyst Alpha", "Chicago"),
+                                      ("Operations Analyst Beta", "Chicago")]
+    text = h.run()
+    asks = _asks()
+    titles = [r["title"] for r in json.loads(asks[0]["roles_json"])]
+    assert len(asks) == 1 and len(titles) == 5, titles
+    assert "Operations Analyst Alpha" in titles and "Operations Analyst Beta" in titles, titles
+    assert "2 roles left out by the wording check" in text and "ask is full" not in text, text
+
+
+def test_warm_contact_pick_and_ask_cap_a_size_trim_is_reported_apart_from_the_wording_check(monkeypatch):
+    long_link = "https://boards.greenhouse.io/acmerobotics/jobs/9?gh_src=" + "x" * 3600
+    boards = {"Acme Robotics": [("Procurement Analyst", "Chicago"),
+                                ("Supply Chain Analyst", "Chicago", long_link)]}
+    h = _summary_harness(monkeypatch, boards)
+    text = h.run()
+    asks = _asks()
+    assert len(asks) == 1 and [r["title"] for r in json.loads(asks[0]["roles_json"])] == ["Procurement Analyst"]
+    assert len(asks[0]["body"]) < m.TELEGRAM_CHUNK_CHARS
+    assert "1 role too long for one ask" in text and "wording check" not in text and "ask is full" not in text, text
