@@ -1058,6 +1058,11 @@ DEFAULT_SEARCH_FILTERS = {
     ],
     "required_keywords": [],
     "ats_company_slugs": [],
+    # Runtime switch for the sequencer's automatic "ghosted" burial of job-application rows
+    # (Applied, past FOLLOWUP_BURY_DAYS -> note + move to Died). OFF: those rows stay where they
+    # are. Read with get_filter(..., False), so a database seeded before this key existed is OFF
+    # too. Flipped with /ghost on|off.
+    "auto_bury_ghosted_applications": False,
     # Workday tenants as "tenant/wdN/site" triples - see fetch_workday_jobs(). Unlike
     # ats_company_slugs these cannot be auto-discovered from a company name, so they are
     # curated by hand and seeded with the Metro Detroit financial employers Workday hosts.
@@ -9625,6 +9630,11 @@ SEQUENCER_SCAN_TABS = (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "C
 # a PEOPLE row is surfaced on the card as "going cold" for a human call, never written.
 SEQUENCER_PEOPLE_SCHEMA_TABS = frozenset({"Carmen Cold"})
 
+# Morning card, ghost burial OFF: the going-cold list also holds every Applied row past the bury day
+# (dozens), so the card shows the oldest this many and a count of the rest. The full list is
+# result["going_cold"] and counts["going_cold"].
+GOING_COLD_CARD_LIMIT = 10
+
 # Where a Carmen Cold contact goes after three nudges and a grace week with no reply. Kevin's call:
 # Killed, the existing PEOPLE archive - it is reversible (the row still exists) and skipped by
 # quick_add's duplicate check, so the person can be re-added later. Set to "Carmen Warm" to return
@@ -10343,6 +10353,14 @@ def _stage_sequencer_draft(record, draft_text):
         return None, False, str(message or "Gmail did not create the draft")
     return (draft_id or None), bool(ok), str(message or "")
 
+def ghost_burial_enabled():
+    """True when the sequencer may auto-bury Applied rows past FOLLOWUP_BURY_DAYS to Died.
+
+    Filter `auto_bury_ghosted_applications`, default False: an absent row (every database seeded
+    before the key existed, which includes production) reads as OFF. Set with /ghost on|off.
+    Only the job-application branch of run_followup_sequencer consults it."""
+    return get_filter("auto_bury_ghosted_applications", False) is True
+
 def run_followup_sequencer(today=None, dry_run=False):
     """Scan Tetiana Cold/Warm + Clavicular via get_followups, run followup_action() on every row,
     and return a structured plan: followups_ready / applications_quiet / going_cold / buried /
@@ -10362,6 +10380,12 @@ def run_followup_sequencer(today=None, dry_run=False):
     the scanned tabs entirely.
 
     Buries are capped at MAX_AUTO_BURIES_PER_RUN per pass (see counts["buries_suppressed"]).
+
+    Ghost burial of JOB rows is behind a switch (ghost_burial_enabled(), default OFF). While off,
+    a job row past FOLLOWUP_BURY_DAYS is written nothing (no note, no Died move, no
+    record_died_role, no sequencer marker) and is listed in going_cold instead; applications_quiet
+    entries carry an empty buries_on. result["auto_bury_ghosted"] records which mode the pass ran
+    in, for the card. The Matched never-actioned expiry is a separate rule and is unaffected.
 
     Carmen Cold runs its own 4/11/21 ladder (plan_carmen_ladder). A stale row is revived - a dated
     restart note plus a fresh first nudge, listed in `revived`. When the ladder is exhausted, a
@@ -10389,9 +10413,13 @@ def run_followup_sequencer(today=None, dry_run=False):
                 seen_uuids.add(uuid_val)
             records.append({**rec, "sheet_tab": tab_name})
 
+    ghost_burial_on = ghost_burial_enabled()
     result = {"run_date": run_date, "followups_ready": [], "ready_to_promote": [], "revived": [],
               "applications_quiet": [], "going_cold": [], "buried": [], "killed": [],
-              "top_matched": [], "live_conversations": [], "counts": {}}
+              "top_matched": [], "live_conversations": [], "counts": {},
+              "auto_bury_ghosted": ghost_burial_on,
+              # Job rows past the bury day, in BOTH modes (one selection for /ghost's count).
+              "ghost_past_cutoff": []}
     buries_written = 0
     buries_suppressed = 0
     kills_written = 0
@@ -10604,7 +10632,9 @@ def run_followup_sequencer(today=None, dry_run=False):
                     "next_followup": rec.get("next_followup") or "",
                     "new_next_followup": new_nf,
                     "days_silent": days_since,
-                    "buries_on": (anchor + timedelta(days=FOLLOWUP_BURY_DAYS)).strftime("%Y-%m-%d") if anchor else None,
+                    # Empty while ghost burial is off: nothing will happen on that date, so none is shown.
+                    "buries_on": ((anchor + timedelta(days=FOLLOWUP_BURY_DAYS)).strftime("%Y-%m-%d")
+                                  if anchor and ghost_burial_on else None),
                 })
                 if dry_run or already or not sheet_uuid:
                     continue
@@ -10637,6 +10667,18 @@ def run_followup_sequencer(today=None, dry_run=False):
                 result["going_cold"].append({
                     "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
                     "status": rec.get("status") or "", "days": days_since,
+                })
+                continue
+            result["ghost_past_cutoff"].append({"sheet_uuid": sheet_uuid, "days": days_since})
+            if not ghost_burial_on:
+                # Switch OFF: the application stays where it is. Report it as going cold (status
+                # and days kept) so it does not vanish from view, and write NOTHING - no note, no
+                # Died move, no record_died_role, no sequencer marker (a "bury_ghosted" marker
+                # would claim an action that did not happen).
+                result["going_cold"].append({
+                    "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
+                    "status": rec.get("status") or "", "days": days_since,
+                    "ghosted_applied": True,   # the card ranks live conversations ahead of these
                 })
                 continue
             result["buried"].append({
@@ -10798,6 +10840,8 @@ def render_followup_needs_card(result, on_demand=False):
         tail = "queue is clear" if on_demand else "nothing needs you today"
         return f"✅ <b>{tail.capitalize()} · {today_str}</b>"
 
+    # A result without the key is a hand-built or older one: render it as the burying version.
+    ghost_burial_on = result.get("auto_bury_ghosted", True)
     header = "Queue Preview" if on_demand else "Needs You Today"
     note = " <i>(read-only, no writes)</i>" if on_demand else ""
     lines = [f"🗂️ <b>{header} · {today_str}</b>{note}"]
@@ -10902,10 +10946,13 @@ def render_followup_needs_card(result, on_demand=False):
             role = html.escape(str(e.get("role") or "—"))
             days = e.get("days_silent")
             days_str = f"{days}d silent" if isinstance(days, int) else "? silent"
+            # No " · buries <date>" while ghost burial is off (buries_on is empty): nothing will happen.
+            buries_part = (f" · buries {html.escape(_followup_date_label(e.get('buries_on')))}"
+                           if e.get("buries_on") else "")
             line = (
                 f"{_silence_dot(days)} <b>{company}</b> — {role}"
                 f" · applied {html.escape(_followup_date_label(e.get('date_added')))} · {days_str}"
-                f" · buries {html.escape(_followup_date_label(e.get('buries_on')))}"
+                f"{buries_part}"
             )
             if e.get("short_id"):
                 stage_url = html.escape(f"{BASE_URL}/stage/{e['short_id']}", quote=True)
@@ -10914,18 +10961,34 @@ def render_followup_needs_card(result, on_demand=False):
 
     cold = result.get("going_cold", [])
     if cold:
-        lines.append(f"\n▶ <b>Going cold ({len(cold)})</b> <i>— Replied/Screening/Interviewing, oldest first</i>")
-        for e in cold:
+        if ghost_burial_on:
+            lines.append(f"\n▶ <b>Going cold ({len(cold)})</b> <i>— Replied/Screening/Interviewing, oldest first</i>")
+            cold_shown = cold
+        else:
+            # Ghost burial off: this list also carries every Applied row past the bury day, which
+            # can be dozens. Status-neutral header, oldest 10 only (the list is sorted oldest first).
+            lines.append(f"\n▶ <b>Going cold ({len(cold)})</b> <i>— no reply or movement, oldest first</i>")
+            # Live conversations (stale_nudge: Replied/Screening/Interviewing) rank AHEAD of the
+            # Applied rows burial would have taken, each group oldest first. Otherwise ten
+            # always-older dead Applied rows would hide every live one. sorted() is stable.
+            cold = sorted(cold, key=lambda e: (bool(e.get("ghosted_applied")),
+                                               -(e["days"] if isinstance(e.get("days"), int) else -1)))
+            cold_shown = cold[:GOING_COLD_CARD_LIMIT]
+        for e in cold_shown:
             company = html.escape(str(e.get("company") or "—"))
             role = html.escape(str(e.get("role") or "—"))
             status = html.escape(str(e.get("status") or ""))
             days = e.get("days")
             days_str = f"{days}d untouched" if isinstance(days, int) else "stale"
             lines.append(f"• <b>{company}</b> — {role} · {status} · {days_str} · <code>{html.escape(_seq_id_tag(e))}</code>")
+        if len(cold_shown) < len(cold):
+            lines.append(f"<i>…and {len(cold) - len(cold_shown)} more</i>")
 
     buried = result.get("buried", [])
     if buried:
-        lines.append(f"\n▶ <b>Buried overnight ({len(buried)})</b> <i>— auto-moved to Died as ghosted</i>")
+        # With ghost burial off, "buried" can only hold expired Matched rows, which carry their own note.
+        buried_why = "auto-moved to Died as ghosted" if ghost_burial_on else "auto-moved to Died"
+        lines.append(f"\n▶ <b>Buried overnight ({len(buried)})</b> <i>— {buried_why}</i>")
         for e in buried:
             company = html.escape(str(e.get("company") or "—"))
             role = html.escape(str(e.get("role") or "—"))
@@ -10972,6 +11035,9 @@ def render_followup_needs_card(result, on_demand=False):
         f"{counts.get('going_cold', 0)} going cold · {counts.get('buried', 0)} buried · "
         f"{counts.get('top_matched', 0)} top matches"
     )
+    if not ghost_burial_on and not counts.get("buried", 0):
+        # Nothing was buried and nothing will be: do not print "0 buried" on a card that says burial is off.
+        summary = summary.replace(f" · {counts.get('buried', 0)} buried", "", 1)
     if counts.get("buries_suppressed", 0):
         summary += f" · {counts['buries_suppressed']} buries capped"
     for key, label in (("ready_to_promote", "to promote"), ("revived", "revived"), ("killed", "killed")):
@@ -15229,6 +15295,65 @@ def process_webhook_payload_async(data):
                 )
             return
 
+        # /ghost [on|off] - the switch behind the sequencer's automatic "ghosted" burial of job
+        # applications. Calls set_filter directly, like /ats: update_filter_param answers "Unknown
+        # filter parameter" for a key that has no stored row yet, which is production's state.
+        ghost_match = re.match(r"^/ghost(?=\s|$)", text, re.IGNORECASE)
+        if ghost_match:
+            arg = text[len("/ghost"):].strip().lower()
+            if arg in ("on", "off"):
+                want = arg == "on"
+                if not set_filter("auto_bury_ghosted_applications", want):
+                    # set_filter returns False on a DB write error. Never claim a change that did not
+                    # happen: a failed "off" leaves burial ON for the 07:30 pass.
+                    current = "ON" if ghost_burial_enabled() else "OFF"
+                    send_telegram_message(
+                        chat_id,
+                        f"⚠️ <b>Ghost burial was NOT changed</b> - the setting could not be saved. "
+                        f"It is still <b>{current}</b>. Try /ghost {arg} again."
+                    )
+                elif want:
+                    send_telegram_message(
+                        chat_id,
+                        f"✅ <b>Ghost burial ON</b> - each morning, an Applied row with no movement for "
+                        f"{FOLLOWUP_BURY_DAYS}+ days is noted [reason: ghosted] and moved to Died "
+                        f"(max {MAX_AUTO_BURIES_PER_RUN}/run). Died is terminal: /t will not re-source that role.\n"
+                        "/ghost off to stop."
+                    )
+                else:
+                    send_telegram_message(
+                        chat_id,
+                        "🚫 <b>Ghost burial OFF</b> - applications stay in place however quiet they get. "
+                        "The day-10 follow-up reminder still runs; the Matched \"never actioned\" expiry is unaffected."
+                    )
+            else:
+                state = "ON" if ghost_burial_enabled() else "OFF"
+                # Anything but "", "on" or "off" gets the status plus usage, not silence.
+                unknown = (f"\n❓ Did not understand <code>{html.escape(arg[:40])}</code> - nothing was changed."
+                           if arg else "")
+                try:
+                    # Read-only: a dry_run pass writes nothing. One selection for both states: the job
+                    # rows past the bury day (result["ghost_past_cutoff"]); expired Matched rows are a
+                    # separate rule and reported separately.
+                    plan = run_followup_sequencer(dry_run=True)
+                    past_n = len(plan.get("ghost_past_cutoff", []))
+                    matched_n = len(plan.get("buried", [])) - (past_n if state == "ON" else 0)
+                    past_line = (f"\n{past_n} Applied row(s) are currently past day {FOLLOWUP_BURY_DAYS}"
+                                 " (read-only dry run).")
+                    if matched_n:
+                        past_line += (f"\n{matched_n} never-actioned Matched row(s) also expire to Died on their own"
+                                      " rule, whatever this switch says.")
+                except Exception as e:
+                    logging.error(f"/ghost dry run failed: {e}")
+                    past_line = "\nCould not count rows past the cutoff right now."
+                send_telegram_message(
+                    chat_id,
+                    f"👻 <b>Ghost burial: {state}</b>{unknown}\n"
+                    f"When ON, Applied rows with no movement for {FOLLOWUP_BURY_DAYS}+ days are moved to Died overnight."
+                    f"{past_line}\n\n/ghost on · /ghost off"
+                )
+            return
+
         ats_match = re.match(r"^/ats(?:\s+(on|off|list|add|remove)\s*(.*))?$", text, re.IGNORECASE)
         if ats_match:
             action = (ats_match.group(1) or "list").lower()
@@ -15876,6 +16001,7 @@ def process_webhook_payload_async(data):
                 "/refs - Your references, tap-to-copy for application forms (/refs add, /refs remove)\n"
                 "/gear - Search breadth 1-5 (one dial for all sources)\n"
                 "/ats - Company board watchlist (on/off/add/remove)\n"
+                "/ghost - Automatic ghosted burial of old applications (on/off)\n"
                 "/remote - Keyless remote feeds (on/off)\n"
                 "/poll - Run the email poll cycle now (scheduled: daily)\n"
                 "/inbox - Open conversations that still need a reply\n"
@@ -16330,6 +16456,8 @@ def followup_queue_view():
 
     if quiet:
         rows_html = []
+        # Data-driven, so an older saved snapshot (which has dates) still renders its column.
+        show_buries = any(e.get("buries_on") for e in quiet)
         for e in quiet:
             days = e.get("days_silent")
             stage = ""
@@ -16342,16 +16470,18 @@ def followup_queue_view():
                 f"<td>{html.escape(str(e.get('role') or '—'))}</td>"
                 f"<td>{html.escape(_followup_date_label(e.get('date_added')))}</td>"
                 f"<td>{_silence_dot(days)} {html.escape(str(days) if isinstance(days, int) else '?')}d</td>"
-                f"<td>{html.escape(_followup_date_label(e.get('buries_on')))}</td>"
-                f"<td>{stage}</td>"
+                + (f"<td>{html.escape(_followup_date_label(e.get('buries_on')))}</td>" if show_buries else "")
+                + f"<td>{stage}</td>"
                 "</tr>"
             )
         parts.append(
             f"<h3 style='margin-top: 32px;'>👀 Applications Going Quiet ({len(quiet)})</h3>"
-            "<p class='meta'>Watch only - no drafts. Each is auto-buried to Died on its buries-on date "
-            "unless its status moves.</p>"
-            "<table><tr><th>Company</th><th>Role</th><th>Applied</th><th>Silent</th>"
-            "<th>Buries on</th><th></th></tr>"
+            + ("<p class='meta'>Watch only - no drafts. Each is auto-buried to Died on its buries-on date "
+               "unless its status moves.</p>" if show_buries else
+               "<p class='meta'>Watch only - no drafts. Automatic burial is off, so these applications "
+               "stay in place until you move them.</p>")
+            + "<table><tr><th>Company</th><th>Role</th><th>Applied</th><th>Silent</th>"
+            + ("<th>Buries on</th>" if show_buries else "") + "<th></th></tr>"
             + "".join(rows_html) + "</table>"
         )
     return _followups_page(title, "".join(parts)), 200

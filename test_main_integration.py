@@ -54,6 +54,9 @@ def clean_tables():
                       "died_roles", "owed_dismissals", "referral_asks",
                       "command_usage"):
             conn.execute(f"DELETE FROM {table}")
+        # search_filters is shared config, so only the ghost-burial switch is reset: every test
+        # starts with it unset (= OFF, the production state) and opts in through _set_ghost_burial.
+        conn.execute("DELETE FROM search_filters WHERE key = 'auto_bury_ghosted_applications'")
         conn.commit()
     # Module-global name cache: a Sent lookup in one test must not answer for the next.
     m._SENT_NAME_CACHE.clear()
@@ -790,7 +793,19 @@ _SEQ_RECORDS = {
 }
 
 
-def _mock_sequencer_crm(monkeypatch):
+def _set_ghost_burial(monkeypatch, on):
+    """Set the ghost-burial switch through the real set_filter store. crm_post is stubbed (set_filter
+    dual-writes to System_Config) and the payloads it saw are returned for assertions."""
+    posts = []
+    monkeypatch.setattr(m, "crm_post", lambda payload, timeout=10: posts.append(payload))
+    assert m.set_filter("auto_bury_ghosted_applications", bool(on))
+    return posts
+
+
+def _mock_sequencer_crm(monkeypatch, ghost_burial=True):
+    # Most sequencer tests here exercise the burial path, so it is ON unless a test says otherwise.
+    if ghost_burial is not None:
+        _set_ghost_burial(monkeypatch, ghost_burial)
     monkeypatch.setattr(m, "fetch_networking_cards",
                         lambda code, qty=None: [dict(r) for r in _SEQ_RECORDS.get(code, [])])
     enqueued = []
@@ -878,9 +893,11 @@ def test_sequencer_dry_run_performs_zero_writes(monkeypatch):
 
 # ---- Bury safety cap (MAX_AUTO_BURIES_PER_RUN) ----
 
-def _mock_bury_backlog(monkeypatch, count):
+def _mock_bury_backlog(monkeypatch, count, ghost_burial=True):
     """Stand up `count` Applied rows all well past FOLLOWUP_BURY_DAYS - the stale-CRM shape where
     the whole backlog turns bury-eligible on one pass."""
+    if ghost_burial is not None:
+        _set_ghost_burial(monkeypatch, ghost_burial)
     rows = [{"sheet_uuid": f"bury-{i}", "company": f"Co{i}", "title": "Ops", "name": "",
              "status": "Applied", "date_added": "2026-04-01", "next_followup": "1970-01-01",
              "raw_priority": "50"} for i in range(count)]
@@ -957,6 +974,351 @@ def test_needs_card_flags_withheld_buries_in_the_buried_section_and_summary(monk
     assert "5 of these were withheld by the safety cap" in card
     assert "re-run" in card.lower()
     assert "5 buries capped" in card
+
+
+# ---- Ghost burial switch (auto_bury_ghosted_applications, default OFF) ----
+# While off, the sequencer writes nothing for a job row past FOLLOWUP_BURY_DAYS. Every test below
+# drives the real run_followup_sequencer against stubbed CRM rows, with the switch set through the
+# real get_filter/set_filter store.
+
+def _ghosted_app(uuid, days=None, company="Ghosty", status="Applied", today=_SEQ_TODAY):
+    """An Applied job row `days` old (default: well past the bury day), carrying the Next Followup
+    the day-10 snooze leaves behind: anchor + FOLLOWUP_BURY_DAYS."""
+    days = m.FOLLOWUP_BURY_DAYS + 4 if days is None else days
+    added = today - timedelta(days=days)
+    return {"sheet_uuid": uuid, "company": company, "title": "Ops Analyst", "name": "",
+            "status": status, "date_added": added.isoformat(),
+            "next_followup": (added + timedelta(days=m.FOLLOWUP_BURY_DAYS)).isoformat(),
+            "raw_priority": "50"}
+
+
+def _serve_rows(monkeypatch, by_code):
+    monkeypatch.setattr(m, "fetch_networking_cards",
+                        lambda code, qty=None: [dict(r) for r in by_code.get(code, [])])
+
+
+def _spy_died(monkeypatch):
+    died = []
+    monkeypatch.setattr(m, "record_died_role", lambda company, role: died.append((company, role)))
+    return died
+
+
+def test_ghost_burial_switch_off_keeps_applications(monkeypatch):
+    """OFF: a day-25 Applied row gets no note, no Died move, no died-role record and no sequencer
+    marker; it is reported under going_cold instead of vanishing."""
+    _set_ghost_burial(monkeypatch, False)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    died = _spy_died(monkeypatch)
+    _serve_rows(monkeypatch, {"TC": [_ghosted_app("gb-1", days=25)]})
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert enqueued == []                      # no append_note, no update_status, nothing
+    assert died == []                          # record_died_role never called
+    assert result["buried"] == []
+    assert [r["sheet_uuid"] for r in result["going_cold"]] == ["gb-1"]
+    assert result["going_cold"][0]["status"] == "Applied"
+    assert result["going_cold"][0]["days"] == 25
+    assert result["counts"]["going_cold"] == 1 and result["counts"]["buried"] == 0
+    assert result["auto_bury_ghosted"] is False
+    assert _logged_uuids() == set()            # no "bury_ghosted" marker claiming an action
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM crm_outbox").fetchone()[0] == 0
+
+
+def test_ghost_burial_switch_unset_reads_as_off(monkeypatch):
+    """Production state: the search_filters row does not exist, so get_filter yields the default."""
+    assert m.get_filter("auto_bury_ghosted_applications") is None
+    assert m.ghost_burial_enabled() is False
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    _serve_rows(monkeypatch, {"TC": [_ghosted_app("gb-unset")]})
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert enqueued == [] and result["buried"] == []
+    assert m.DEFAULT_SEARCH_FILTERS["auto_bury_ghosted_applications"] is False
+
+
+def test_ghost_burial_switch_off_leaves_carmen_contacts_exactly_as_before(monkeypatch):
+    """A Carmen Cold contact walks its own ladder; the switch must not change one byte of that."""
+    rows = {"CC": [_due_person(1), _ghosted_app("cc-old", days=61, company="Nliven")]}
+    runs = {}
+    for state in (True, False):
+        _set_ghost_burial(monkeypatch, state)
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM followup_sequencer_log")
+            conn.commit()
+        enqueued = []
+        monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload, q=enqueued: q.append(payload) or True)
+        monkeypatch.setattr(m, "_stage_sequencer_draft", lambda *a, **k: ("d", True, ""))
+        _serve_rows(monkeypatch, rows)
+        result = m.run_followup_sequencer(today=_SEQ_TODAY)
+        result.pop("auto_bury_ghosted")
+        runs[state] = (result, enqueued)
+    assert runs[False] == runs[True]
+    assert runs[False][1], "the Carmen rows should still have been processed"
+    assert not any(p.get("new_tab") == "Died" for p in runs[False][1])
+
+
+def test_ghost_burial_switch_on_buries_exactly_as_before(monkeypatch):
+    _set_ghost_burial(monkeypatch, True)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    died = _spy_died(monkeypatch)
+    _serve_rows(monkeypatch, {"TC": [_ghosted_app("gb-on", days=25, company="Beta")]})
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert [r["sheet_uuid"] for r in result["buried"]] == ["gb-on"]
+    assert [p["action"] for p in enqueued] == ["append_note", "update_status"]
+    assert enqueued[0]["note"] == "[reason: ghosted]"
+    assert enqueued[1]["new_tab"] == "Died"
+    assert died == [("Beta", "Ops Analyst")]
+    assert result["going_cold"] == []
+    assert _logged_uuids() == {"gb-on"}
+    assert result["auto_bury_ghosted"] is True
+
+
+def test_ghost_burial_switch_off_still_sends_the_day_10_followup_snooze(monkeypatch):
+    """The quiet-application snooze is untouched: it still pushes Next Followup to the day-21 date,
+    but the entry no longer promises a bury date."""
+    _set_ghost_burial(monkeypatch, False)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    _serve_rows(monkeypatch, {"TW": [_due_application(0)]})
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    expected = (date.fromisoformat(_SEQ_BUMP_DATE) + timedelta(days=m.FOLLOWUP_BURY_DAYS)).isoformat()
+    assert [(p["action"], p["next_followup"]) for p in enqueued] == [("update_snooze", expected)]
+    quiet = result["applications_quiet"][0]
+    assert quiet["new_next_followup"] == expected
+    assert not quiet["buries_on"]
+    assert _logged_uuids() == {"app-0"}
+
+
+def test_ghost_burial_switch_off_second_day_run_reads_the_row_back_still_open(monkeypatch):
+    """WRITE PATH. Two consecutive passes through the real outbox: nothing is ever queued, the CRM
+    (stub) still serves the row, and the next day's pass sees it still open and not buried."""
+    _set_ghost_burial(monkeypatch, False)
+    _spy_died(monkeypatch)
+    _serve_rows(monkeypatch, {"TC": [_ghosted_app("gb-2", days=25)]})   # real enqueue_crm_payload
+
+    first = m.run_followup_sequencer(today=_SEQ_TODAY)
+    second = m.run_followup_sequencer(today=_SEQ_TODAY + timedelta(days=1))
+
+    for result, days in ((first, 25), (second, 26)):
+        assert result["buried"] == []
+        assert [(r["sheet_uuid"], r["days"]) for r in result["going_cold"]] == [("gb-2", days)]
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM crm_outbox").fetchone()[0] == 0
+    assert _logged_uuids() == set()
+
+
+def test_ghost_burial_switch_off_has_no_cap_and_queues_nothing_for_fifteen_rows(monkeypatch):
+    enqueued = _mock_bury_backlog(monkeypatch, 15, ghost_burial=False)
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert enqueued == []
+    assert result["counts"]["buries_suppressed"] == 0
+    assert result["buried"] == [] and len(result["going_cold"]) == 15
+    # The card lists the oldest GOING_COLD_CARD_LIMIT and counts the rest.
+    card = m.render_followup_needs_card(result)
+    assert "Going cold (15)" in card
+    assert card.count("• <b>Co") == m.GOING_COLD_CARD_LIMIT
+    assert "…and 5 more" in card
+
+
+def test_ghost_burial_switch_off_still_expires_a_matched_row(monkeypatch):
+    """The Matched never-actioned expiry is a different rule (a role Kevin never applied to)."""
+    _set_ghost_burial(monkeypatch, False)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    died = _spy_died(monkeypatch)
+    old = (_SEQ_TODAY - timedelta(days=m.MATCHED_EXPIRY_DAYS + 3)).isoformat()
+    _serve_rows(monkeypatch, {"CL": [{"sheet_uuid": "mx-1", "company": "Mx", "title": "Analyst", "name": "",
+                                      "status": "Matched", "date_added": old, "next_followup": "1970-01-01",
+                                      "raw_priority": "60"}]})
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+
+    assert [r["sheet_uuid"] for r in result["buried"]] == ["mx-1"]
+    assert [p["action"] for p in enqueued] == ["append_note", "update_status"]
+    assert "never actioned" in enqueued[0]["note"] and enqueued[1]["new_tab"] == "Died"
+    assert died == [("Mx", "Analyst")]
+    card = m.render_followup_needs_card(result)
+    assert "auto-moved to Died</i>" in card and "as ghosted" not in card
+
+
+def test_ghost_burial_switch_card_text_matches_the_mode(monkeypatch):
+    rows = {"TC": [_ghosted_app("gb-c", days=25, company="Oldco")], "TW": [_due_application(0)]}
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    _spy_died(monkeypatch)
+
+    _set_ghost_burial(monkeypatch, False)
+    _serve_rows(monkeypatch, rows)
+    off_card = m.render_followup_needs_card(m.run_followup_sequencer(today=_SEQ_TODAY))
+    assert "buries" not in off_card.lower() and "Buried overnight" not in off_card
+    assert "buried" not in off_card.lower()
+    assert "Going cold (1)" in off_card and "Oldco" in off_card and "no reply or movement" in off_card
+    assert "Applications going quiet (1)" in off_card
+
+    _set_ghost_burial(monkeypatch, True)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM followup_sequencer_log")
+        conn.commit()
+    _serve_rows(monkeypatch, rows)
+    on_card = m.render_followup_needs_card(m.run_followup_sequencer(today=_SEQ_TODAY))
+    boundary = (date.fromisoformat(_SEQ_BUMP_DATE) + timedelta(days=m.FOLLOWUP_BURY_DAYS)).isoformat()
+    assert f"buries {m._followup_date_label(boundary)}" in on_card
+    assert "Buried overnight (1)" in on_card and "auto-moved to Died as ghosted" in on_card
+
+
+def test_ghost_burial_switch_followups_page_stops_promising_a_bury_while_off(monkeypatch):
+    today = date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    row = {"sheet_uuid": "pg-1", "company": "Pagey", "title": "Ops Analyst", "name": "",
+           "status": "Applied", "date_added": (today - timedelta(days=m.FOLLOWUP_1_DAYS)).isoformat(),
+           "next_followup": "1970-01-01", "raw_priority": "70"}
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    pages = {}
+    for key in ("off", "on"):
+        _set_ghost_burial(monkeypatch, key == "on")
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM followup_sequencer_log")
+            conn.commit()
+        _serve_rows(monkeypatch, {"TW": [row]})
+        assert m.save_followup_queue_snapshot(today_str, m.run_followup_sequencer(today=today))
+        status, pages[key] = _get_followups_page()
+        assert status == 200 and "Pagey" in pages[key]
+    assert "auto-buried" not in pages["off"] and "Buries on" not in pages["off"]
+    assert "stay in place" in pages["off"]
+    assert "auto-buried" in pages["on"] and "Buries on" in pages["on"]
+
+
+def test_ghost_command_flips_the_stored_switch_and_dual_writes(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    posts = _set_ghost_burial(monkeypatch, False)
+    posts.clear()
+
+    _dispatch("/ghost on")
+    assert m.get_filter("auto_bury_ghosted_applications") is True and m.ghost_burial_enabled()
+    assert {"action": "update_system_config", "key": "auto_bury_ghosted_applications", "value": True} in posts
+    assert "Ghost burial ON" in sent[-1]
+
+    _dispatch("/ghost off")
+    assert m.get_filter("auto_bury_ghosted_applications") is False and not m.ghost_burial_enabled()
+    assert posts[-1] == {"action": "update_system_config", "key": "auto_bury_ghosted_applications", "value": False}
+    assert "Ghost burial OFF" in sent[-1]
+
+
+def test_ghost_command_bare_reports_state_and_rows_past_the_cutoff(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    _set_ghost_burial(monkeypatch, False)
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    _serve_rows(monkeypatch, {"TC": [_ghosted_app("gb-r1", days=40, today=date.today()),
+                                     _ghosted_app("gb-r2", days=30, today=date.today())]})
+
+    _dispatch("/ghost")
+
+    assert "Ghost burial: OFF" in sent[-1]
+    assert "2 Applied row(s) are currently past day" in sent[-1]
+    assert enqueued == []                      # the bare form is read-only
+    assert _logged_uuids() == set()
+    assert m.get_filter("auto_bury_ghosted_applications") is False
+
+
+# ---- Ghost burial switch, review fixes ----
+
+def test_ghost_burial_switch_off_card_keeps_live_conversations_ahead_of_dead_applications(monkeypatch):
+    """40 Applied ghosts are all older than the 3 live conversations. Oldest-first alone would fill
+    the card's 10 lines with ghosts and hide every live row."""
+    _set_ghost_burial(monkeypatch, False)
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    live = [{"sheet_uuid": f"live-{i}", "company": f"Live{i}", "title": "Ops", "name": "",
+             "status": "Interviewing", "date_added": (_SEQ_TODAY - timedelta(days=10 + i)).isoformat(),
+             "next_followup": "1970-01-01", "raw_priority": "80"} for i in range(3)]
+    ghosts = [_ghosted_app(f"dead-{i}", days=25 + (i % 36), company=f"Dead{i}") for i in range(40)]
+    _serve_rows(monkeypatch, {"TW": live, "TC": ghosts})
+
+    result = m.run_followup_sequencer(today=_SEQ_TODAY)
+    assert len(result["going_cold"]) == 43 and result["buried"] == []
+    card = m.render_followup_needs_card(result)
+
+    assert "Going cold (43)" in card
+    live_at = [card.index(f"Live{i}</b>") for i in range(3)]          # all three are on the card
+    shown_ghosts = [line for line in card.splitlines() if line.startswith("• <b>Dead")]
+    assert len(shown_ghosts) == m.GOING_COLD_CARD_LIMIT - 3
+    assert max(live_at) < card.index(shown_ghosts[0])                 # live rows come first
+    assert live_at == sorted(live_at, reverse=True)                   # oldest live row first (Live2)
+    assert "…and 33 more" in card
+    # Ghost lines are oldest first too.
+    days = [int(line.split("· ")[-2].split("d")[0]) for line in shown_ghosts]
+    assert days == sorted(days, reverse=True)
+
+
+def test_ghost_command_does_not_claim_success_when_the_write_fails(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    _set_ghost_burial(monkeypatch, True)
+    monkeypatch.setattr(m, "set_filter", lambda key, val: False)
+
+    _dispatch("/ghost off")
+    assert "NOT changed" in sent[-1] and "still <b>ON</b>" in sent[-1]
+    assert "Ghost burial OFF" not in sent[-1]
+    assert m.ghost_burial_enabled() is True          # burial really is still on
+
+    monkeypatch.undo()
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    _set_ghost_burial(monkeypatch, False)
+    monkeypatch.setattr(m, "set_filter", lambda key, val: False)
+    _dispatch("/ghost on")
+    assert "NOT changed" in sent[-1] and "still <b>OFF</b>" in sent[-1]
+    assert "Ghost burial ON" not in sent[-1]
+    assert m.ghost_burial_enabled() is False
+
+
+def test_ghost_command_answers_unrecognised_arguments_with_usage_and_state(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    _set_ghost_burial(monkeypatch, True)
+    _serve_rows(monkeypatch, {})
+
+    for typed in ("/ghost status", "/ghost ON please", "/ghost 0"):
+        before = len(sent)
+        _dispatch(typed)
+        assert len(sent) == before + 1, typed
+        assert "Ghost burial: ON" in sent[-1] and "/ghost on · /ghost off" in sent[-1]
+        assert "nothing was changed" in sent[-1]
+        assert m.get_filter("auto_bury_ghosted_applications") is True   # never flipped
+
+    _dispatch("/ghost OFF")                          # case-insensitive form still works
+    assert m.ghost_burial_enabled() is False
+
+
+def test_ghost_command_bare_counts_the_same_quantity_in_both_states(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    today = date.today()
+    expired = (today - timedelta(days=m.MATCHED_EXPIRY_DAYS + 3)).isoformat()
+    _serve_rows(monkeypatch, {
+        "TC": [_ghosted_app("g-1", days=40, today=today), _ghosted_app("g-2", days=30, today=today)],
+        "CL": [{"sheet_uuid": "mx-9", "company": "Mx", "title": "Analyst", "name": "", "status": "Matched",
+                "date_added": expired, "next_followup": "1970-01-01", "raw_priority": "60"}]})
+
+    for state in (False, True):
+        _set_ghost_burial(monkeypatch, state)
+        _dispatch("/ghost")
+        text = sent[-1]
+        assert f"Ghost burial: {'ON' if state else 'OFF'}" in text
+        assert "2 Applied row(s) are currently past day" in text
+        assert "1 never-actioned Matched row(s)" in text
+    assert _logged_uuids() == set()                  # read-only in both states
 
 
 # ---- Follow-up drafts: none at 7:30, created on demand from /followups ----
@@ -1065,6 +1427,7 @@ def test_sequencer_dry_run_creates_no_gmail_drafts(monkeypatch):
 def test_sequencer_jobs_rows_are_watched_not_drafted(monkeypatch):
     """A Tetiana Warm application never gets bump text, but its clock still advances (snooze +
     log) so the bury is reached."""
+    _set_ghost_burial(monkeypatch, True)  # buries_on is only filled while ghost burial is on
     _mock_followup_rows(monkeypatch, jobs_rows=[_due_application(0)])
     bumped = []
     monkeypatch.setattr(m, "build_followup_bump_draft", lambda *a, **k: bumped.append(a) or "text")
