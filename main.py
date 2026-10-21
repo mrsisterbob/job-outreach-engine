@@ -3019,7 +3019,7 @@ def _job_data_available(job, mapping):
 # ==============================================================================
 # 3. DYNAMIC PRIORITY DECAY & ANTI-FLUFF EMAIL ENGINE
 # ==============================================================================
-_WARM_CRM_CACHE = {"data": {}, "fetched_at": 0.0}
+_WARM_CRM_CACHE = {"data": {}, "unplaced": [], "fetched_at": 0.0}
 _WARM_CRM_CACHE_TTL_SECONDS = 300
 _APPLIED_CRM_CACHE = {"data": set(), "fetched_at": 0.0}
 _APPLIED_CRM_CACHE_TTL_SECONDS = 300
@@ -3609,8 +3609,15 @@ def get_applied_crm_companies():
     return _APPLIED_CRM_CACHE["data"]
 
 def get_warm_crm_contacts():
-    """Fetch every Carmen Warm CRM contact keyed by lowercased company name, each tagged with a
-    normalized 1-10 priority_score for the Dynamic Contact Quality Multiplier.
+    """Fetch every Carmen Warm CRM contact keyed by normalize_company_for_match(company). Each value
+    is the BEST contact at that company (highest priority_score, ties to the one with an email, then
+    to the earlier sheet row) with the keys callers read: name, raw_company, email, note,
+    priority_score, sheet_uuid. Two more keys carry the rest of the company: `count` (how many Warm
+    people Kevin has there) and `contacts` (every one of them, same keys, best first).
+
+    A row with no company is NOT keyed under a guessed one (the old last-word-of-the-name fallback
+    turned "Dean cousin" into company "cousin"). Those rows, and a LinkedIn URL typed into the name
+    column, are kept apart: see get_warm_contacts_without_company().
     Cached in-process for a few minutes so parallel candidate evaluation doesn't hammer the CRM webhook.
     """
     now = time.time()
@@ -3625,30 +3632,49 @@ def get_warm_crm_contacts():
         data = res.json()
         if data.get("status") != "success":
             return _WARM_CRM_CACHE["data"]
-        contacts = {}
+        by_company = {}
+        unplaced = []
         for row in data.get("followups", []):
             company = str(row.get("company") or "").strip()
             raw_name = str(row.get("name") or "").strip()
-            # Fallback: infer company from the trailing token of the contact name when Column C is blank
-            if not company and raw_name and not raw_name.lower().startswith("http"):
-                name_parts = raw_name.split()
-                if len(name_parts) >= 2:
-                    company = name_parts[-1]
-            if not company:
-                continue
-            contacts[normalize_company_for_match(company)] = {
+            contact = {
                 "name": row.get("name") or "Contact",
                 "raw_company": company,
-                "email": row.get("email", ""),
+                "email": str(row.get("email") or "").strip(),
                 "note": row.get("note") or "Active relationship",
                 "priority_score": normalize_priority_value(row.get("raw_priority", row.get("priority"))),
                 "sheet_uuid": row.get("sheet_uuid", "")
             }
+            company_key = normalize_company_for_match(company)
+            # "Group", "Holdings Inc", "Co." normalize to "" - not a company, so never a shared key
+            if not company_key or raw_name.lower().startswith("http"):
+                unplaced.append(contact)
+                continue
+            by_company.setdefault(company_key, []).append(contact)
+        contacts = {}
+        for key, people in by_company.items():
+            # sorted() is stable, so equal priority and email keeps sheet order (earlier row first)
+            ranked = sorted(people, key=lambda c: (-c["priority_score"], 0 if c["email"] else 1))
+            best = dict(ranked[0])
+            best["count"] = len(ranked)
+            best["contacts"] = [dict(c) for c in ranked]
+            contacts[key] = best
+        if unplaced:
+            logging.info(f"get_warm_crm_contacts: {len(unplaced)} Carmen Warm rows have no company (or a URL as the name) and are not keyed to any company")
         _WARM_CRM_CACHE["data"] = contacts
+        _WARM_CRM_CACHE["unplaced"] = unplaced
         _WARM_CRM_CACHE["fetched_at"] = now
     except Exception as e:
         logging.error(f"get_warm_crm_contacts Error: {e}")
     return _WARM_CRM_CACHE["data"]
+
+
+def get_warm_contacts_without_company():
+    """Carmen Warm rows get_warm_crm_contacts() could not place at a company: a blank Company cell,
+    or a LinkedIn URL in the name column. Same contact-dict shape as the company map. Refreshes
+    through get_warm_crm_contacts() (cached), so it costs nothing extra inside the TTL."""
+    get_warm_crm_contacts()
+    return list(_WARM_CRM_CACHE.get("unplaced", []))
 
 
 def backfill_job_contacts_from_carmen_cold(dry_run=True):
@@ -11516,7 +11542,7 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
         logging.error(f"Failed to post card to Telegram: {e}")
     return None
 
-def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid):
+def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid, other_contacts=0):
     """Lean /w warm-radar card: no AI fit score, no fit reason, no tailored outreach copy - just
     the role, the warm contact it maps to, and Apply. Swipe-replies (/apply, /dead, /x, /n, /f) resolve
     against the Clavicular tab via the embedded 🆔 marker, exactly like a Clavicular pipeline card.
@@ -11527,10 +11553,15 @@ def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid):
     company = html.escape(company_raw)
     title = html.escape(str(job.get("job_title") or "N/A"))
     apply_link = html.escape(str(job.get("job_apply_link") or "#"), quote=True)
+    try:
+        others = max(0, int(other_contacts or 0))
+    except (TypeError, ValueError):
+        others = 0
+    others_text = f" +{others} others" if others > 1 else (" +1 other" if others == 1 else "")
     card_text = (
         f"🤝 <b>{title}</b>\n"
         f"🏢 <b>{company}</b>\n"
-        f"👤 <b>Warm contact:</b> {html.escape(str(contact_name or 'Contact'))}\n"
+        f"👤 <b>Warm contact:</b> {html.escape(str(contact_name or 'Contact'))}{others_text}\n"
         f"📝 <i>{html.escape(str(contact_note or 'Active relationship'))}</i>\n\n"
         f"🔗 <a href='{apply_link}'>Apply</a>\n"
         f"🆔 <code>{html.escape(str(sheet_uuid or ''))}</code> · <code>Clavicular</code>\n\n"
@@ -13121,7 +13152,8 @@ def run_warm_radar_scan(chat_id=None):
         sheet_uuid = save_job_to_cache(short_id, job)
 
         contact_name = contact.get("name", "Contact")
-        send_warm_radar_card(job, contact_name, contact.get("note", "Active relationship"), sheet_uuid)
+        send_warm_radar_card(job, contact_name, contact.get("note", "Active relationship"), sheet_uuid,
+                             other_contacts=max(0, int(contact.get("count") or 1) - 1))
 
         clavicular_rows.append({
             "sheet_uuid": sheet_uuid,

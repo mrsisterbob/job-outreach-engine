@@ -11255,6 +11255,170 @@ def test_a_warm_radar_card_keeps_the_real_contact_name(monkeypatch):
     assert row["contact_company"] == "Signal Advisors"
 
 
+# ---- TASK-115: Carmen Warm keeps every person at a company and never guesses a company ----
+
+_REAL_GET_WARM_CRM_CONTACTS = m.get_warm_crm_contacts
+
+
+def _stub_warm_tab(monkeypatch, rows):
+    """Stubs only the CRM edge (get_followups for tab CW) and resets the in-process cache, so the
+    real get_warm_crm_contacts() runs end to end."""
+    class _Resp:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"status": "success", "followups": rows}
+
+    def fake_crm_post(payload, **kw):
+        assert payload.get("action") == "get_followups" and payload.get("tab") == "CW", payload
+        return _Resp()
+
+    monkeypatch.setattr(m, "crm_post", fake_crm_post)
+    monkeypatch.setattr(m, "get_warm_crm_contacts", _REAL_GET_WARM_CRM_CONTACTS)
+    # A fresh dict swapped in through monkeypatch: the original cache object is put back untouched
+    # on teardown, so no TTL-fresh test data is left for a later test to read.
+    monkeypatch.setattr(m, "_WARM_CRM_CACHE", {"data": {}, "unplaced": [], "fetched_at": 0.0})
+
+
+def _warm_row(name, company, priority, email="", uuid_="", note="Active relationship"):
+    return {"name": name, "company": company, "email": email, "note": note,
+            "raw_priority": priority, "sheet_uuid": uuid_}
+
+
+_SPARK_ROWS = [
+    _warm_row("Ann One", "Spark", 2, uuid_="u-a"),
+    _warm_row("Bea Nine", "Spark", 9, email="bea@spark.com", uuid_="u-b", note="Hiring manager"),
+    _warm_row("Cy Four", "Spark", 4, uuid_="u-c"),
+    _warm_row("Di Six", "Spark", 6, uuid_="u-d"),
+]
+
+
+def test_warm_contacts_keep_every_person_at_a_company(monkeypatch):
+    _stub_warm_tab(monkeypatch, _SPARK_ROWS)
+    out = m.get_warm_crm_contacts()
+    key = m.normalize_company_for_match("Spark")
+    assert list(out) == [key]
+    best = out[key]
+    assert best["count"] == 4 and len(best["contacts"]) == 4
+    # the top-level dict is the priority-9 contact, and callers still read the same keys
+    assert (best["name"], best["priority_score"], best["email"], best["sheet_uuid"], best["note"]) == \
+        ("Bea Nine", 9, "bea@spark.com", "u-b", "Hiring manager")
+    assert best["raw_company"] == "Spark"
+    assert [c["name"] for c in best["contacts"]] == ["Bea Nine", "Di Six", "Cy Four", "Ann One"]
+    assert {"name", "raw_company", "email", "note", "priority_score", "sheet_uuid"} <= set(best["contacts"][3])
+
+
+def test_warm_contacts_keep_every_person_ties_go_to_email_then_sheet_order(monkeypatch):
+    _stub_warm_tab(monkeypatch, [
+        _warm_row("First", "Acme", 5, uuid_="u1"),
+        _warm_row("Second", "Acme", 5, email="s@acme.com", uuid_="u2"),
+        _warm_row("Third", "Acme", 5, email="t@acme.com", uuid_="u3"),
+    ])
+    best = m.get_warm_crm_contacts()[m.normalize_company_for_match("Acme")]
+    assert [c["name"] for c in best["contacts"]] == ["Second", "Third", "First"]
+    assert best["name"] == "Second"
+
+
+def test_warm_contacts_keep_every_person_never_guesses_a_company(monkeypatch):
+    _stub_warm_tab(monkeypatch, [
+        _warm_row("Dean cousin", "", 5, uuid_="u-dean"),
+        _warm_row("https://www.linkedin.com/in/someone", "", 5, uuid_="u-url"),
+        _warm_row("https://www.linkedin.com/in/other", "Zeta Corp", 5, uuid_="u-url2"),
+        _warm_row("Eve Real", "Zeta Corp", 7, email="eve@zeta.com", uuid_="u-eve", note="Friend"),
+    ])
+    out = m.get_warm_crm_contacts()
+    assert m.normalize_company_for_match("cousin") not in out
+    assert list(out) == [m.normalize_company_for_match("Zeta Corp")]
+    unplaced = m.get_warm_contacts_without_company()
+    assert [c["name"] for c in unplaced] == ["Dean cousin", "https://www.linkedin.com/in/someone",
+                                            "https://www.linkedin.com/in/other"]
+    assert next(c for c in unplaced if c["name"] == "Dean cousin")["sheet_uuid"] == "u-dean"
+    # a row that has a company is unchanged from today: name, note, email, sheet_uuid
+    eve = out[m.normalize_company_for_match("Zeta Corp")]
+    assert (eve["name"], eve["note"], eve["email"], eve["sheet_uuid"]) == \
+        ("Eve Real", "Friend", "eve@zeta.com", "u-eve")
+
+
+def test_warm_contacts_keep_every_person_empty_normalized_key_is_unplaced(monkeypatch):
+    """"Group", "Holdings Inc" and "Co." all normalize to "": they are not companies, and must not
+    collapse under key "" and merge unrelated people."""
+    _stub_warm_tab(monkeypatch, [
+        _warm_row("Gus One", "Group", 5, uuid_="u1"),
+        _warm_row("Hal Two", "Holdings Inc", 8, uuid_="u2"),
+        _warm_row("Ira Three", "Co.", 3, uuid_="u3"),
+        _warm_row("Jo Real", "Spark", 4, uuid_="u4"),
+    ])
+    out = m.get_warm_crm_contacts()
+    assert list(out) == [m.normalize_company_for_match("Spark")]
+    assert "" not in out and out[m.normalize_company_for_match("Spark")]["count"] == 1
+    assert [c["name"] for c in m.get_warm_contacts_without_company()] == ["Gus One", "Hal Two", "Ira Three"]
+
+
+def test_warm_contacts_keep_every_person_blank_email_does_not_win_the_tie(monkeypatch):
+    _stub_warm_tab(monkeypatch, [
+        _warm_row("Early", "Acme", 5, email=" ", uuid_="u1"),
+        _warm_row("Late", "Acme", 5, email="late@acme.com", uuid_="u2"),
+        _warm_row("Nullmail", "Acme", 5, email=None, uuid_="u3"),
+    ])
+    best = m.get_warm_crm_contacts()[m.normalize_company_for_match("Acme")]
+    assert best["name"] == "Late"
+    assert [c["name"] for c in best["contacts"]] == ["Late", "Early", "Nullmail"]
+    # stored value is the stripped string, never None or whitespace
+    assert {c["name"]: c["email"] for c in best["contacts"]} ==         {"Late": "late@acme.com", "Early": "", "Nullmail": ""}
+
+
+def test_warm_contacts_keep_every_person_stub_leaves_no_cache_behind(monkeypatch):
+    before = m._WARM_CRM_CACHE
+    with pytest.MonkeyPatch.context() as mp:
+        _stub_warm_tab(mp, _SPARK_ROWS)
+        assert m.get_warm_crm_contacts()
+        assert m._WARM_CRM_CACHE is not before
+    assert m._WARM_CRM_CACHE is before
+
+
+def test_warm_contacts_keep_every_person_scoring_reads_the_best_contact(run_candidate, monkeypatch):
+    """Through process_single_candidate with the real get_warm_crm_contacts: the priority-2 row is
+    the LAST sheet row, and it used to win."""
+    rows = [_warm_row("Bea Nine", "Acme Co", 9, uuid_="u-b"),
+            _warm_row("Ann One", "Acme Co", 2, uuid_="u-a")]
+    _stub_warm_tab(monkeypatch, rows)
+    # non-ATS job: priority_score * 3 = 27 from the priority-9 contact (the last row would give 6)
+    plain = run_candidate(gemini_base=40, layer1_bonus=0)
+    assert plain["score_boost"] == 27 and plain["score"] == 67
+    # ATS job at raw score >= 70: Clavicular names the priority-9 contact
+    m._WARM_CRM_CACHE.update(data={}, unplaced=[], fetched_at=0.0)
+    ats = run_candidate(gemini_base=70, layer1_bonus=0, job_id="gh_1")
+    assert ats["is_clavicular"] is True
+    assert ats["contact_name"] == "Bea Nine"
+
+
+def test_warm_contacts_keep_every_person_card_counts_the_others(monkeypatch):
+    monkeypatch.setattr(m, "TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "c")
+    monkeypatch.setattr(m, "log_metric_event", lambda *a, **k: None)
+    sent = []
+
+    class _Res:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"result": {"message_id": 918299}}
+
+    monkeypatch.setattr(m.requests, "post", lambda url, json=None, **k: sent.append(json["text"]) or _Res())
+    job = {"employer_name": "Spark", "job_title": "Ops Analyst", "job_apply_link": "https://x/y"}
+    m.send_warm_radar_card(job, "Dana Reyes", "Active relationship", "uuid-w1", other_contacts=3)
+    m.send_warm_radar_card(job, "Dana Reyes", "Active relationship", "uuid-w1")
+    m.send_warm_radar_card(job, "Dana Reyes", "Active relationship", "uuid-w1", other_contacts=0)
+    many, default, zero = sent
+    assert "👤 <b>Warm contact:</b> Dana Reyes +3 others\n" in many
+    # count == 1 is exactly today's card
+    assert "👤 <b>Warm contact:</b> Dana Reyes\n" in default and "others" not in default
+    assert zero == default
+    assert many.replace(" +3 others", "") == default
+    # the new copy is clean under the negative-language gate
+    assert pipeline_utils.negative_language_hits("Warm contact: Dana Reyes +3 others") == []
+
+
 def test_crm_contact_is_a_person_screens_the_employer_but_keeps_real_names():
     """The reader-side guard. sheet_row_map is durable SQLite, so every card sent before the writer
     was fixed still carries a company in contact_name - fixing only the writer would leave every
