@@ -51,7 +51,7 @@ def clean_tables():
                       "seen_content_hashes", "jd_term_yield", "job_link_status",
                       # died_roles is permanent by design, so a row left behind by one test would
                       # silently suppress a role in every later one.
-                      "died_roles", "owed_dismissals",
+                      "died_roles", "owed_dismissals", "referral_asks",
                       "command_usage"):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
@@ -14593,3 +14593,247 @@ def test_warm_radar_applies_the_title_gate_seniority_only_title_rejected_everywh
     text = h.run()
     assert h.cards == ["Operations Analyst"], h.cards
     assert "1 role filtered out by title" in text, text
+
+
+# ---- /w stores a referral ask per warm contact (TASK-117) ----
+
+class _AskResp:
+    def __init__(self, body, status=200):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return self._body
+
+
+def _ask_jobs(specs):
+    """specs: [(title, requisition_id)] -> Greenhouse-shaped jobs for Acme Robotics."""
+    return [{"employer_name": "Acme Robotics", "job_title": t, "job_id": f"gh_acmerobotics_{i}_{len(t)}",
+             "job_apply_link": f"https://boards.greenhouse.io/acmerobotics/jobs/{len(t)}{i}",
+             "job_requisition_id": req, "job_description": "Reconciliation workflows with SQL and reporting."}
+            for i, (t, req) in enumerate(specs)]
+
+
+def _ask_harness(monkeypatch, specs, contacts=None):
+    h = _warm_title_harness(monkeypatch, [])
+    h.specs = list(specs)
+    h.contacts = contacts or [
+        {"company": "Acme Robotics", "name": "Dana Reyes", "email": "dana@acme.example",
+         "raw_priority": 5, "sheet_uuid": "u-dana"},
+        {"company": "Acme Robotics", "name": "Sam Lee", "email": "sam@acme.example",
+         "raw_priority": 3, "sheet_uuid": "u-sam"},
+    ]
+    h.gmail, h.pdfs = [], []
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _AskResp({"status": "success", "followups": h.contacts}))
+    monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: _ask_jobs(h.specs))
+    monkeypatch.setattr(m, "create_gmail_draft", lambda *a, **kw: h.gmail.append((a, kw)))
+    for name in ("compile_resume_pdf", "compile_resume_pdf_resilient", "compile_cover_letter_pdf"):
+        monkeypatch.setattr(m, name, lambda *a, _n=name, **kw: h.pdfs.append(_n), raising=False)
+        monkeypatch.setattr(m.resume_engine, name, lambda *a, _n=name, **kw: h.pdfs.append(_n), raising=False)
+    return h
+
+
+_ASK_COLUMNS = ("id", "sheet_uuid", "contact_name", "company", "status", "roles_json", "body",
+                "created_at", "updated_at", "sent_at")
+
+
+def _asks():
+    with m.get_db_conn() as conn:
+        rows = conn.execute(f"SELECT {', '.join(_ASK_COLUMNS)} FROM referral_asks ORDER BY id").fetchall()
+    return [dict(zip(_ASK_COLUMNS, r)) for r in rows]
+
+
+def _expected_ask_text(first, company, roles):
+    evidence = m.resume_engine.load_evidence_bank()
+    return m.referral_asks.compose_ask(first, company, roles, evidence["identity"]["name"],
+                                       m._referral_ask_entries, evidence["experience"])["body"]
+
+
+def _assert_nothing_sent(h):
+    assert h.gmail == [], "a Gmail draft was created"
+    assert h.pdfs == [], f"a PDF was compiled: {h.pdfs}"
+    for msg in h.messages:
+        assert "refer me" not in msg and "referral form" not in msg, msg
+
+
+def test_referral_ask_drafts_stored_write_path_one_draft_for_the_best_contact(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", "R-77"), ("Logistics Coordinator", "See Opening ID")])
+    text = h.run()
+    rows = _asks()
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["sheet_uuid"] == "u-dana" and row["contact_name"] == "Dana Reyes"
+    assert row["status"] == "pending" and row["sent_at"] is None and row["company"] == "Acme Robotics"
+    roles = json.loads(row["roles_json"])
+    assert [r["title"] for r in roles] == ["Supply Chain Analyst", "Logistics Coordinator"]
+    assert [r["req"] for r in roles] == ["R-77", ""]
+    assert all(r["link"].startswith("https://boards.greenhouse.io/acmerobotics/jobs/") and r["job_hash"] for r in roles)
+    # The row read BACK is the text the renderer produces for those inputs.
+    assert row["body"] == _expected_ask_text("Dana", "Acme Robotics", roles)
+    assert row["body"].startswith("Hi Dana,\n") and "2 openings that match" in row["body"]
+    assert "(Req ID R-77)" in row["body"] and "See Opening ID" not in row["body"]
+    assert pipeline_utils.negative_language_hits(row["body"]) == []
+    assert "1 ask draft stored" in text and "left out" not in text, text
+    assert h.cards == ["Supply Chain Analyst", "Logistics Coordinator"]
+    _assert_nothing_sent(h)
+
+
+def test_referral_ask_drafts_stored_second_run_updates_the_same_row(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", ""), ("Logistics Coordinator", "")])
+    h.run()
+    first = _asks()[0]
+    # Same roles again: nothing to add, nothing re-stored, nothing claimed in the closing message.
+    again = h.run()
+    assert len(_asks()) == 1 and _asks()[0]["body"] == first["body"]
+    assert "ask draft" not in again, again
+    # A third role: the SAME row is re-rendered with all three.
+    h.specs.append(("Procurement Analyst", "R-9"))
+    text = h.run()
+    rows = _asks()
+    assert len(rows) == 1 and rows[0]["id"] == first["id"], rows
+    roles = json.loads(rows[0]["roles_json"])
+    assert [r["title"] for r in roles] == ["Supply Chain Analyst", "Logistics Coordinator", "Procurement Analyst"]
+    assert rows[0]["body"] == _expected_ask_text("Dana", "Acme Robotics", roles)
+    assert "3 openings that match" in rows[0]["body"] and "refer me for any of them?" in rows[0]["body"]
+    assert rows[0]["created_at"] == first["created_at"]
+    assert "1 ask draft stored" in text
+    _assert_nothing_sent(h)
+
+
+def test_referral_ask_drafts_stored_second_contact_is_not_asked_about_a_role_already_asked(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", ""), ("Logistics Coordinator", "")])
+    h.run()
+    assert [r["sheet_uuid"] for r in _asks()] == ["u-dana"]
+    # Sam is now the higher priority contact, but both roles were already put to Dana.
+    h.contacts[0]["raw_priority"], h.contacts[1]["raw_priority"] = 2, 9
+    text = h.run()
+    assert [r["sheet_uuid"] for r in _asks()] == ["u-dana"]
+    assert "ask draft" not in text, text
+    # A brand-new role goes to Sam, alone: the two Dana was asked about are not repeated.
+    h.specs.append(("Procurement Analyst", ""))
+    h.run()
+    rows = _asks()
+    assert [r["sheet_uuid"] for r in rows] == ["u-dana", "u-sam"]
+    sam_roles = json.loads(rows[1]["roles_json"])
+    assert [r["title"] for r in sam_roles] == ["Procurement Analyst"]
+    assert rows[1]["body"].startswith("Hi Sam,\n") and "an opening that matches" in rows[1]["body"]
+    assert len(json.loads(rows[0]["roles_json"])) == 2
+    _assert_nothing_sent(h)
+
+
+def test_referral_ask_drafts_stored_a_sent_ask_is_never_reopened_or_repeated(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", "")])
+    h.run()
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE referral_asks SET status = 'sent', sent_at = '2026-10-21 09:00:00'")
+        conn.commit()
+    sent_body = _asks()[0]["body"]
+    h.specs.append(("Logistics Coordinator", ""))
+    h.run()
+    rows = _asks()
+    assert len(rows) == 2 and rows[0]["status"] == "sent" and rows[0]["body"] == sent_body
+    assert rows[1]["status"] == "pending"
+    assert [r["title"] for r in json.loads(rows[1]["roles_json"])] == ["Logistics Coordinator"]
+
+
+def test_referral_ask_drafts_stored_flagged_role_is_left_out_and_counted(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", ""), ("No-Fault Claims Analyst", "")])
+    text = h.run()
+    rows = _asks()
+    assert len(rows) == 1
+    roles = json.loads(rows[0]["roles_json"])
+    assert [r["title"] for r in roles] == ["Supply Chain Analyst"]
+    assert "No-Fault" not in rows[0]["body"]
+    assert "1 ask draft stored, 1 role left out by the wording check" in text, text
+
+
+def test_referral_ask_drafts_stored_every_role_flagged_stores_nothing(monkeypatch):
+    h = _ask_harness(monkeypatch, [("No-Fault Claims Analyst", "")])
+    text = h.run()
+    assert _asks() == []
+    assert "1 role left out by the wording check" in text and "ask draft" not in text, text
+
+
+def test_referral_ask_drafts_stored_contact_without_a_crm_id_is_skipped_and_counted(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", "")], contacts=[
+        {"company": "Acme Robotics", "name": "Dana Reyes", "raw_priority": 5, "sheet_uuid": ""}])
+    text = h.run()
+    assert _asks() == []
+    assert "1 contact skipped, no CRM id" in text, text
+    assert h.cards == ["Supply Chain Analyst"]
+
+
+def test_referral_ask_drafts_stored_a_failure_here_never_stops_the_cards(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", ""), ("Logistics Coordinator", "")])
+
+    def boom(pending):
+        raise RuntimeError("table locked")
+
+    monkeypatch.setattr(m, "store_referral_asks", boom)
+    text = h.run()
+    assert h.cards == ["Supply Chain Analyst", "Logistics Coordinator"]
+    assert "2 new matches" in text and "ask drafts failed" in text, text
+    rows = [r for p in h.payloads for r in p.get("rows", [])]
+    assert len(rows) == 2
+
+
+def test_referral_ask_drafts_stored_greenhouse_keeps_the_requisition_id_other_boards_carry_none(monkeypatch):
+    bodies = {
+        "boards-api.greenhouse.io": {"jobs": [
+            {"id": 1, "title": "Ops Analyst", "absolute_url": "https://gh.example/1", "requisition_id": "R-5",
+             "internal_job_id": 99, "location": {"name": "Remote"}, "content": ""},
+            {"id": 2, "title": "Ops Lead", "absolute_url": "https://gh.example/2", "location": {"name": "Remote"}}]},
+        "api.lever.co": [{"id": "uuid-1", "text": "Ops Analyst", "hostedUrl": "https://lever.example/1", "categories": {}}],
+        "api.ashbyhq.com": {"jobs": [{"id": "uuid-2", "title": "Ops Analyst", "jobUrl": "https://ashby.example/2"}]},
+    }
+
+    def fake_get(url, timeout=None, **kw):
+        for host, body in bodies.items():
+            if host in url:
+                return _AskResp(body)
+        return _AskResp({}, 404)
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    gh = m.fetch_greenhouse_jobs("acme")
+    assert [j["job_requisition_id"] for j in gh] == ["R-5", ""]
+    assert all("job_requisition_id" not in j for j in m.fetch_lever_jobs("acme") + m.fetch_ashby_jobs("acme"))
+
+
+def test_referral_ask_drafts_stored_real_title_punctuation_survives_the_write_path(monkeypatch):
+    titles = [("Billing, Reporting, and Operations Analyst", ""), ("Analyst: Supply Chain; Logistics", "")]
+    h = _ask_harness(monkeypatch, titles)
+    h.run()
+    rows = _asks()
+    assert len(rows) == 1
+    roles = json.loads(rows[0]["roles_json"])
+    assert [r["title"] for r in roles] == [t for t, _ in titles]
+    for role in roles:
+        assert role["job_hash"] == m.generate_dedup_hash("Acme Robotics", role["title"])
+        assert f"- {role['title']}: {role['link']}" in rows[0]["body"]
+
+
+def test_referral_ask_drafts_stored_pending_ask_untouched_when_new_roles_are_all_dropped(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", "")])
+    h.run()
+    before = _asks()[0]
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE referral_asks SET updated_at = '2026-01-01 00:00:00'")
+        conn.commit()
+    h.specs.append(("No-Fault Claims Analyst", ""))
+    text = h.run()
+    rows = _asks()
+    assert len(rows) == 1 and rows[0]["body"] == before["body"]
+    assert rows[0]["updated_at"] == "2026-01-01 00:00:00"
+    assert "ask draft" not in text and "1 role left out by the wording check" in text, text
+
+
+def test_referral_ask_drafts_stored_role_without_a_link_is_left_out_on_the_write_path(monkeypatch):
+    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", ""), ("Logistics Coordinator", "")])
+    jobs = _ask_jobs(h.specs)
+    jobs[0]["job_apply_link"] = ""
+    monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: jobs)
+    text = h.run()
+    rows = _asks()
+    assert len(rows) == 1
+    assert [r["title"] for r in json.loads(rows[0]["roles_json"])] == ["Logistics Coordinator"]
+    assert "- Supply Chain Analyst" not in rows[0]["body"]
+    assert "1 ask draft stored, 1 role left out by the wording check" in text, text
