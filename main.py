@@ -39,7 +39,7 @@ from open_followups import collect_open_followups
 from role_funnel import compute_role_funnel
 from build_log import compose_build_log
 from pipeline_utils import (
-    is_banned_employer, is_off_direction_title,
+    sales_title_is_selling_role, is_banned_employer, is_off_direction_title,
     is_industrial_title, industrial_term_hits, required_degree_is_technical_trade,
     ladder_progress, format_ladder_progress, carmen_terminal_gap,
     build_apollo_url, build_linkedin_url, build_linkedin_company_posts_url, build_hiring_manager_dork, build_recruiter_dork,
@@ -5124,7 +5124,11 @@ def title_rejection_reason(title, include_seniority=True):
     "seniority") or None when the title is acceptable. Title only: no company, city, salary or
     description. include_seniority=False leaves the seniority check to the caller."""
     title = str(title or "").lower()
-    if any(re.search(rf"\b{re.escape(term)}\b", title) for term in get_filter("title_exclusions", [])):
+    hits = [term for term in get_filter("title_exclusions", []) if re.search(rf"\b{re.escape(term)}\b", title)]
+    # "sales" alone is a selling role only when no finance/operations function word rescues it
+    # ("Sales Controller"). The rule lives here, not in the stored list, because the stored
+    # search_filters row keeps "sales" whatever DEFAULT_SEARCH_FILTERS says. Any other hit still rejects.
+    if hits and not (set(hits) == {"sales"} and not sales_title_is_selling_role(title)):
         return "title_exclusion"
     if is_off_direction_title(title):
         return "off_direction_title"

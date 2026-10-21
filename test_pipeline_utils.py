@@ -4014,3 +4014,47 @@ def test_industrial_role_gate_optional_degree_language_and_abbreviations():
     assert not f("Bachelor's degree (e.g. Business, or Electrical Engineering) required.")
     assert not f("Bachelor's degree, i.e. Finance or Mechanical Engineering.")
     assert f("Bachelor's degree in Electrical Engineering required.")
+
+
+# ---- TASK-119: "sales" in a title rejects selling roles only ----
+
+def test_sales_title_rejects_selling_roles_only_pure_cases():
+    from pipeline_utils import sales_title_is_selling_role
+    function_roles = (
+        "Sales Controller", "Sales Analyst", "Sales Operations Analyst", "Sales Finance Analyst",
+        "Sales Support Specialist", "Sales Accounting Analyst",
+        "Sales Tax Accountant", "Sales Planning Analyst", "Sales Budget Reporting Lead",
+    )
+    selling_roles = (
+        "Sales Representative", "Account Executive", "Sales Associate", "Financial Sales Representative",
+        "Sales Engineer", "Inside Sales Analyst", "Outside Sales Analyst", "Sales Development Analyst",
+        "Sales Agent", "Sales Rep", "Territory Sales Analyst", "Sales Account Analyst",
+        # No function word at all: the sales question alone answers "selling". Seniority is not its job.
+        "Sales Manager", "Sales", "",
+        "Sales Representatives", "Account Executives", "Insurance Sales Broker", "Inside Sales Analysts",
+        "Financial Sales Specialist", "Financial Sales Professional", "Sales Reps", "Sales Closer",
+    )
+    for title in function_roles:
+        assert sales_title_is_selling_role(title) is False, title
+    for title in selling_roles:
+        assert sales_title_is_selling_role(title) is True, title
+    assert sales_title_is_selling_role(None) is True
+    assert sales_title_is_selling_role('   ') is True   # blank: conservative, reject
+
+
+def test_sales_title_rejects_selling_roles_only_leaves_other_exclusions_alone(monkeypatch):
+    # Drives the real gate with the stored list as production has it (it still holds "sales").
+    import main as mm
+    filters = {"title_exclusions": ["sales", "agent", "branch"], "seniority_exclusions": ["manager"]}
+    monkeypatch.setattr(mm, "get_filter", lambda key, default=None: filters.get(key, default))
+    assert mm.title_rejection_reason("Salesforce Administrator") is None   # no word-boundary match
+    assert mm.title_rejection_reason("Sales Controller") is None
+    assert mm.title_rejection_reason("Sales Agent") == "title_exclusion"   # "agent" still rejects it
+    assert mm.title_rejection_reason("Sales Operations Agent") == "title_exclusion"
+    assert mm.title_rejection_reason("Branch Sales Controller") == "title_exclusion"
+    assert mm.title_rejection_reason("Sales Representative") == "title_exclusion"
+    # "Sales Manager": the sales question says selling, so it is rejected there; and a "Sales
+    # Operations Manager" gets past the sales rule and is stopped by the seniority gate instead.
+    assert mm.title_rejection_reason("Sales Manager") == "title_exclusion"
+    assert mm.title_rejection_reason("Sales Operations Manager") == "seniority"
+    assert mm.title_rejection_reason("Sales Operations Manager", include_seniority=False) is None
