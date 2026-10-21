@@ -4528,6 +4528,78 @@ def test_future_dated_records_are_still_excluded_and_most_overdue_sorts_first(mo
     assert [r["company"] for r in m.get_overdue_followups()] == ["Older", "Newer"]
 
 
+def _sequencer_dated_rows():
+    """Real dates off the clock (get_overdue_followups reads it). Each row is 25 days old; the
+    date the sequencer wrote is date_added + FOLLOWUP_BURY_DAYS, computed the same way it does."""
+    today = datetime.now().date()
+    added = today - timedelta(days=25)
+    bury_day = added + timedelta(days=m.FOLLOWUP_BURY_DAYS)
+
+    def row(company, status, next_followup):
+        return {**_overdue_record(company, next_followup.isoformat()), "status": status,
+                "date_added": added.isoformat()}
+    return today, added, bury_day, row
+
+
+def test_overdue_scan_skips_sequencer_dated_applications(monkeypatch):
+    today, added, bury_day, row = _sequencer_dated_rows()
+    hand_set = bury_day + timedelta(days=1)
+    assert bury_day < today and hand_set < today
+    _mock_followup_tabs(
+        monkeypatch,
+        tc=[row("SeqApplied", "Applied", bury_day),      # (1) the sequencer's own date -> skipped
+            row("HandApplied", "Applied", hand_set),     # (2) a date Kevin set -> still counts
+            row("MatchedRow", "Matched", bury_day),      # (3) not Applied -> unchanged
+            row("FutureApplied", "Applied", today + timedelta(days=3))],  # (5) not overdue anyway
+    )
+    overdue = m.get_overdue_followups()
+    assert sorted(r["company"] for r in overdue) == ["HandApplied", "MatchedRow"]
+
+
+def test_overdue_scan_skips_sequencer_dated_applications_only_on_the_jobs_tab(monkeypatch):
+    today, added, bury_day, row = _sequencer_dated_rows()
+    by_code = {"CC": [row("CarmenApplied", "Applied", bury_day)],  # (4) Carmen Cold untouched
+               "TC": [row("JobApplied", "Applied", bury_day)]}
+    monkeypatch.setattr(m, "fetch_networking_cards", lambda target_code="CW", qty=2: by_code.get(target_code, []))
+    overdue = m.get_overdue_followups()
+    assert [(r["company"], r["sheet_tab"]) for r in overdue] == [("CarmenApplied", "Carmen Cold")]
+
+
+def test_overdue_scan_skips_sequencer_dated_applications_end_to_end(monkeypatch, capture_sent):
+    """The sequencer's real snooze (run_followup_sequencer) writes the date; the overdue scan,
+    /sendall and the digest must then all leave that row alone while a hand-set one is kept."""
+    today, added, bury_day, row = _sequencer_dated_rows()
+    _mock_followup_tabs(monkeypatch, tc=[row("SeqApplied", "Applied", bury_day),
+                                         row("HandApplied", "Applied", bury_day + timedelta(days=1))])
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    drafts = []
+    monkeypatch.setattr(m, "create_gmail_draft",
+                        lambda **kwargs: drafts.append(kwargs["to_email"]) or (True, "Success", "d1"))
+
+    result, _ = m.process_overdue_batch("sendall", snooze_days=7)   # (6)
+    assert drafts == ["HandApplied@example.com"]
+    assert result["total"] == 1
+
+    m.send_overdue_digest(1, m.get_overdue_followups(), limit=None)  # (7)
+    body = "\n".join(capture_sent)
+    assert "HandApplied" in body and "SeqApplied" not in body
+    assert "(1," in body
+
+
+def test_sequencer_snooze_date_is_what_the_overdue_scan_skips(monkeypatch):
+    """Write path: the date the sequencer really enqueues for an Applied job row is the date the
+    overdue scan excludes, so the two cannot drift apart."""
+    app = _due_application(0)
+    enqueued, _ = _mock_followup_rows(monkeypatch, jobs_rows=[app], jobs_code="TC")
+    m.run_followup_sequencer(today=_SEQ_TODAY)
+    snoozes = [p for p in enqueued if p["action"] == "update_snooze" and p["sheet_uuid"] == "app-0"]
+    assert snoozes, "the sequencer should snooze the due application"
+    written = {**app, "next_followup": snoozes[0]["next_followup"]}
+    assert m._is_sequencer_dated_application(written) is True
+    assert m._is_sequencer_dated_application({**written, "status": "Matched"}) is False
+    assert m._is_sequencer_dated_application({**written, "next_followup": "2020-01-01"}) is False
+
+
 def test_digest_renders_the_blank_date_sentinel_as_no_date_set(capture_sent):
     """Second line of defence. get_overdue_followups() drops these, but nothing should ever
     put a literal 'due 1970-01-01' in front of Kevin again."""

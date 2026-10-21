@@ -9503,6 +9503,19 @@ def _alert_crm_read_rejection(message):
         f"\n\nCRM said: {message}{hint}"
     )
 
+def _is_sequencer_dated_application(record):
+    """True for an Applied row whose Next Followup is exactly the date the sequencer's day-10
+    snooze writes (date_added + FOLLOWUP_BURY_DAYS). Any other date is one Kevin set by hand.
+    The caller restricts this to the JOBS tab; Date Added only (no Next Followup fallback), since
+    a blank Date Added leaves nothing to compare against."""
+    if status_rank(record.get("status")) != status_rank("Applied"):
+        return False
+    anchor = followup_anchor(record.get("date_added"), "")
+    if not anchor:
+        return False
+    written = (anchor + timedelta(days=FOLLOWUP_BURY_DAYS)).strftime("%Y-%m-%d")
+    return str(record.get("next_followup") or "")[:10] == written
+
 def get_overdue_followups():
     """Return every overdue Carmen Cold, Carmen Warm and Tetiana Cold record sorted by
     next_followup ASC.
@@ -9521,6 +9534,13 @@ def get_overdue_followups():
 
     This is also what /sendall and /snoozeall iterate (process_overdue_batch), so the filter
     additionally stops those from drafting bump emails to rows that were never scheduled.
+
+    SEQUENCER-DATED APPLICATIONS ARE NOT OVERDUE. The day-10 snooze of an Applied job row writes
+    Next Followup = date_added + FOLLOWUP_BURY_DAYS (run_followup_sequencer). That date is the
+    sequencer's own, not a reminder Kevin set, and once it passes (with ghost burial off nothing
+    moves the row) the row would be reported overdue every day and /sendall would draft a bump
+    to it. So an Applied Tetiana Cold row whose Next Followup is exactly that date is skipped; a
+    date Kevin set himself differs from it and still counts.
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
     overdue = []
@@ -9532,6 +9552,8 @@ def get_overdue_followups():
             if is_followup_unscheduled(next_followup):
                 continue
             if _is_dismissed(record, dismissals):
+                continue
+            if tab_name == "Tetiana Cold" and _is_sequencer_dated_application(record):
                 continue
             if next_followup <= today_str:
                 overdue.append({**record, "sheet_tab": tab_name})
