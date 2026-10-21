@@ -1334,6 +1334,12 @@ def init_db():
             applied_at TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        # board_checked_at (YYYY-MM-DD): the last day /w probed Greenhouse/Lever/Ashby for this
+        # company and found nothing, so a miss is remembered instead of re-probed (3 HTTP calls of
+        # up to 8s) on every run. An ALTER for the same reason as posted_hours above.
+        identity_columns = {row[1] for row in conn.execute("PRAGMA table_info(company_identities)")}
+        if "board_checked_at" not in identity_columns:
+            conn.execute("ALTER TABLE company_identities ADD COLUMN board_checked_at TEXT")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS system_alerts (
             alert_key TEXT PRIMARY KEY,
@@ -12108,7 +12114,7 @@ def fetch_ats_jobs(company_slugs, include_workday=False):
                 logging.error(f"Workday Fetch Future Error: {e}")
     return all_jobs
 
-def auto_expand_ats_slug(company_name):
+def auto_expand_ats_slug(company_name, errors=None):
     """Silent Auto-ATS Expansion: best-effort guess of a company's Greenhouse/Lever/Ashby board slug from its
     name; if any board actually resolves, appends the slug to the ats_company_slugs filter so future
     /t runs source directly from it. Meant to run on a background daemon thread - silent on no match.
@@ -12118,16 +12124,20 @@ def auto_expand_ats_slug(company_name):
     Names that are obviously people or notes rather than companies are skipped before any HTTP
     request: resolve_warm_company_ats_slugs() feeds this every unique Carmen Warm "company",
     and that column holds personal contacts. See pipeline_utils.is_probable_company_name().
+
+    Returns the slug when a board resolved, else None. `errors`, when a list is passed, collects
+    every board check that FAILED (exception, 429, 5xx) as opposed to cleanly returning no board,
+    so a caller can tell "no public board" from "could not tell" (see lookup_warm_company_board).
     """
     if not is_probable_company_name(company_name):
         # DEBUG, not INFO: on a warm network of personal contacts this is the common case, and
         # at INFO it would just replace the probe spam it exists to prevent.
         logging.debug(f"[ATS EXPANSION] Skipped '{company_name}' - not a probable company name, no board probe")
-        return
+        return None
     slug_guess = ats_slug_guess(company_name)
     existing_slugs = safe_list(get_filter("ats_company_slugs", []))
     if slug_guess in existing_slugs:
-        return  # already tracked
+        return None  # already tracked
     board_checks = (
         ("greenhouse", f"https://boards-api.greenhouse.io/v1/boards/{slug_guess}/jobs"),
         ("lever", f"https://api.lever.co/v0/postings/{slug_guess}?mode=json"),
@@ -12136,17 +12146,22 @@ def auto_expand_ats_slug(company_name):
     for board_name, url in board_checks:
         try:
             res = requests.get(url, timeout=8)
+            if errors is not None and (res.status_code == 429 or res.status_code >= 500):
+                errors.append(f"{board_name} HTTP {res.status_code}")
             if res.status_code == 200 and res.json():
                 existing_slugs.append(slug_guess)
                 set_filter("ats_company_slugs", existing_slugs)
                 upsert_company_identity(company_name, ats_slug=slug_guess)
                 logging.info(f"[ATS EXPANSION] '{company_name}' resolved to '{slug_guess}' on {board_name} - added to ats_company_slugs")
-                return
+                return slug_guess
         except Exception as e:
+            if errors is not None:
+                errors.append(f"{board_name} {type(e).__name__}")
             logging.error(f"[ATS EXPANSION] {board_name} check failed for '{slug_guess}': {e}")
     # DEBUG: a miss is the normal outcome of a speculative slug guess, so this at INFO was
     # one log line per company per pipeline run for no signal. The match above stays at INFO.
     logging.debug(f"[ATS EXPANSION] No ATS board match found for '{company_name}' (guessed slug '{slug_guess}')")
+    return None
 
 def resolve_warm_company_ats_slugs():
     """Resolves an ATS board slug for every unique Carmen Warm CRM company: prefers the
@@ -12877,6 +12892,66 @@ def run_job_pipeline(chat_id=None, top_n=2):
     
     return len(tier1_matches) + len(tier2_matches)
 
+WARM_RADAR_LOOKUP_BATCH = 20      # board lookups started per /w run (each is up to 3 HTTP calls of 8s)
+WARM_RADAR_MISS_RETRY_DAYS = 14   # a company with no public board is not probed again for this long
+WARM_RADAR_NAME_CAP = 15          # company names listed in one closing message
+
+
+def lookup_warm_company_board(company_name):
+    """Find a warm company's job board and leave a company_identities row behind, which is the
+    only thing /w reads. Returns the slug, or None.
+
+    auto_expand_ats_slug() alone is not enough: it returns early ("already tracked") when the
+    guessed slug is already in the ats_company_slugs filter, BEFORE it upserts the identity, so a
+    company that /t had already tracked would stay invisible to /w forever. That case is handled
+    here without an HTTP probe. A genuine miss (every board answered, none had postings) is stamped
+    with today's date so /w skips it for WARM_RADAR_MISS_RETRY_DAYS; a lookup that merely errored
+    is NOT stamped, so a network blip is retried on the next run instead of read as "no board".
+    """
+    if not is_probable_company_name(company_name):
+        return None
+    slug_guess = ats_slug_guess(company_name)
+    if slug_guess in safe_list(get_filter("ats_company_slugs", [])):
+        upsert_company_identity(company_name, ats_slug=slug_guess)
+        return slug_guess
+    errors = []
+    slug = auto_expand_ats_slug(company_name, errors=errors)
+    if slug:
+        return slug
+    if not errors and upsert_company_identity(company_name):
+        try:
+            with get_db_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE company_identities SET board_checked_at = ? WHERE normalized_name = ?",
+                    (datetime.now().strftime("%Y-%m-%d"), normalize_company_for_match(company_name))
+                )
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Warm Radar Board-Miss Stamp Error ({company_name}): {e}")
+    return None
+
+
+def _warm_radar_lookup_batch(companies):
+    """Run lookup_warm_company_board over `companies`, one failure never stopping the rest."""
+    for company in companies:
+        try:
+            lookup_warm_company_board(company)
+        except Exception as e:
+            logging.error(f"Warm Radar Board Lookup Error ({company}): {e}")
+
+
+def _warm_radar_name_list(names, budget):
+    """'A, B, C and 4 more' using at most `budget` names. Returns (text, names_used)."""
+    shown = names[:max(budget, 0)]
+    # Company text comes straight from the CRM and send_telegram_message sends parse_mode=HTML: a
+    # raw "<" in a name makes Telegram answer 400 and the whole message is dropped.
+    text = ", ".join(html.escape(n) for n in shown)
+    if len(names) > len(shown):
+        text += f" and {len(names) - len(shown)} more"
+    return text, len(shown)
+
+
 def run_warm_radar_scan(chat_id=None):
     """/w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen
     Warm CRM contact already exists. Resolves each warm company's ATS slug straight from the
@@ -12892,25 +12967,73 @@ def run_warm_radar_scan(chat_id=None):
         return 0
 
     # Cache-only slug resolution: every warm company that already has a verified ats_slug row.
-    # A warm company with no cached slug is skipped silently - it gets picked up whenever /t or
-    # /eco add next populates company_identities for it.
+    # A warm company without one is no longer silent: it is named in the closing message and,
+    # when it looks like a company, queued for a board lookup that runs after that message.
     try:
         with get_db_conn() as conn:
             identity_rows = conn.execute(
-                "SELECT normalized_name, ats_slug FROM company_identities WHERE ats_slug IS NOT NULL AND ats_slug != ''"
+                "SELECT normalized_name, ats_slug, board_checked_at FROM company_identities"
             ).fetchall()
     except Exception as e:
         logging.error(f"Warm Radar Identity Lookup Error: {e}")
         identity_rows = []
     slug_to_contact = {}
-    for normalized_name, slug in identity_rows:
+    checked_on = {}
+    scanned_keys = set()
+    for normalized_name, slug, board_checked_at in identity_rows:
         contact = warm_contacts.get(normalized_name)
-        if contact:
+        if not contact:
+            continue
+        if slug:
             slug_to_contact.setdefault(slug, contact)
+            # Every warm entry with a slug counts as scanned, including a second one that shares
+            # a slug with the first ("Acme Robotics" / "Acme-Robotics"); slug_to_contact keeps one.
+            scanned_keys.add(normalized_name)
+        elif board_checked_at:
+            checked_on[normalized_name] = board_checked_at
+
+    retry_cutoff = (datetime.now() - timedelta(days=WARM_RADAR_MISS_RETRY_DAYS)).strftime("%Y-%m-%d")
+    checked_no_board = []   # looked up recently, nothing public found
+    unchecked = []          # never looked up, or the last miss is older than the retry window
+    not_company = 0
+    for key, contact in warm_contacts.items():
+        if key in scanned_keys:
+            continue
+        display = contact.get("raw_company") or key
+        if not is_probable_company_name(display):
+            not_company += 1  # counted, never probed
+        elif checked_on.get(key, "") > retry_cutoff:
+            checked_no_board.append(display)
+        else:
+            unchecked.append(display)
+    lookup_now = unchecked[:WARM_RADAR_LOOKUP_BATCH]
+    queued = len(unchecked) - len(lookup_now)
+
+    def _skipped_report():
+        lines = []
+        budget = WARM_RADAR_NAME_CAP
+        if unchecked:
+            names, used = _warm_radar_name_list(lookup_now, budget)
+            budget -= used
+            lines.append(f"Not looked at yet, checking {len(lookup_now)} for a job board now"
+                         f"{': ' + names if names else ''}")
+            if queued:
+                lines.append(f"{queued} more queued for the next run")
+        if checked_no_board:
+            names, used = _warm_radar_name_list(checked_no_board, budget)
+            budget -= used
+            lines.append(f"Checked, no public job board found ({len(checked_no_board)}): {names}"
+                         if names else f"Checked, no public job board found: {len(checked_no_board)}")
+        if not_company:
+            lines.append(f"{not_company} warm entries are not company names")
+        return lines
 
     if not slug_to_contact:
         if chat_id:
-            send_telegram_message(chat_id, "🔭 <b>Warm Radar:</b> no warm companies have a cached ATS board yet - run /t or /eco add first.")
+            lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm entries has a cached job board yet."]
+            lines += _skipped_report()
+            send_telegram_message(chat_id, "\n".join(lines))
+        _spawn_background(lambda: _warm_radar_lookup_batch(lookup_now))
         return 0
 
     if chat_id:
@@ -12977,7 +13100,12 @@ def run_warm_radar_scan(chat_id=None):
 
     logging.info(f"Warm Radar Complete: {match_count} new matches across {len(slugs)} warm companies.")
     if chat_id:
-        send_telegram_message(chat_id, f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies checked.")
+        lines = [f"🏁 Warm scan complete. {match_count} new matches across {len(slugs)} warm companies scanned."]
+        lines += _skipped_report()
+        send_telegram_message(chat_id, "\n".join(lines))
+    # AFTER the message: the lookups are slow, and what they find shows up on the next /w.
+    if lookup_now:
+        _spawn_background(lambda: _warm_radar_lookup_batch(lookup_now))
     return match_count
 
 # ==============================================================================
