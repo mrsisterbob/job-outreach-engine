@@ -3006,6 +3006,44 @@ _OFF_DIRECTION_QUALIFIED_RES = tuple(
 )
 
 
+# A title that says "sales" is a selling role unless it also names a finance or operations function.
+# A SELLING word wins over a function word ("Inside Sales Analyst", "Financial Sales Representative"),
+# so the function list only ever rescues titles that name no selling shape at all. Every word also
+# matches its plural ("representatives", "reps"); "account" stays word-bounded so "Accounting" and
+# "Accountant" are function words, not selling ones. "sales tax" is a tax function, not selling.
+SALES_TITLE_FUNCTION_WORDS = (
+    "controller", "finance", "financial", "accounting", "accountant", "analyst", "operations", "reporting",
+    "support", "tax", "planning", "budget", "forecasting",
+)
+SALES_TITLE_SELLING_WORDS = (
+    "representative", "rep", "associate", "executive", "consultant", "advisor", "adviser", "engineer",
+    "development", "inside sales", "outside sales", "financial sales", "account", "territory", "agent",
+    "business development", "professional", "officer", "broker", "closer",
+)
+
+
+def _word_alternation(words):
+    """One case-insensitive regex matching any of `words` (or its plural) as whole words."""
+    return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")s?\b", re.IGNORECASE)
+
+
+_SALES_FUNCTION_RE = _word_alternation(SALES_TITLE_FUNCTION_WORDS)
+_SALES_SELLING_RE = _word_alternation(SALES_TITLE_SELLING_WORDS)
+
+
+def sales_title_is_selling_role(title):
+    """True when a title with the word "sales" in it names a selling role, False when it names a
+    finance or operations function ("Sales Controller", "Sales Operations Analyst"). Answers the
+    sales question only: seniority and every other exclusion are the caller's gates. An empty,
+    blank or None title returns True (conservative: reject)."""
+    text = str(title or "")
+    if not text.strip():
+        return True
+    if _SALES_SELLING_RE.search(text):
+        return True
+    return not _SALES_FUNCTION_RE.search(text)
+
+
 def is_off_direction_title(title):
     """True when the job title names IT admin, infrastructure, help desk, security ops or data center work."""
     text = str(title or "")

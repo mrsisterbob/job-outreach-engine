@@ -16844,3 +16844,51 @@ def test_warm_radar_scans_boards_in_batches_ats_add_with_a_repeated_slug_probes_
     monkeypatch.setattr(m, "fetch_ashby_jobs", lambda slug: [])
     m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/ats add acme, beta acme"}})
     assert filters["ats_company_slugs"] == ["acme", "beta"] and probes == ["acme", "beta"]
+
+
+# ---- TASK-119: "sales" in a title rejects selling roles only ----
+
+def _sales_title_filters(monkeypatch):
+    """The stored list exactly as production has it: it still contains the bare word "sales"."""
+    assert "sales" in m.DEFAULT_SEARCH_FILTERS["title_exclusions"]
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000, "valid_cities": ["farmington", "detroit", "auburn hills"],
+        "title_exclusions": list(m.DEFAULT_SEARCH_FILTERS["title_exclusions"]),
+        "company_exclusions": [], "hard_ban_keywords": [],
+        "seniority_exclusions": list(m.DEFAULT_SEARCH_FILTERS["seniority_exclusions"]),
+    }.get(key, default if default is not None else []))
+
+
+def test_sales_title_rejects_selling_roles_only_through_the_strict_and_remote_gates(monkeypatch):
+    _sales_title_filters(monkeypatch)
+    autoliv = {
+        "employer_name": "Autoliv", "job_title": "Sales Controller",
+        "job_description": "Commercial and financial reporting, month-end closing and pricing analysis. "
+                           "Bachelor's in Finance or Accounting. Reporting in Excel and SQL.",
+        "job_city": "Auburn Hills", "job_state": "MI",
+        "job_salary": "$80,000", "job_min_salary": 80000, "job_max_salary": 95000,
+        "job_apply_link": "https://boards.greenhouse.io/autoliv/jobs/1",
+    }
+    for title in ("Sales Controller", "Sales Analyst", "Sales Operations Analyst"):
+        trace = m.FunnelTrace()
+        assert m.passes_strict_filter({**autoliv, "job_title": title}, trace=trace) is True, (title, trace.reasons)
+        assert m._passes_remote_filter(_remote_job(job_title=title)) is True, title
+    for title in ("Sales Representative", "Account Executive", "Sales Agent", "Inside Sales Analyst"):
+        trace = m.FunnelTrace()
+        assert m.passes_strict_filter({**autoliv, "job_title": title}, trace=trace) is False, title
+        assert trace.reasons.get("title_exclusion") == 1, (title, trace.reasons)
+        assert m._passes_remote_filter(_remote_job(job_title=title)) is False, title
+    # The shared function the three gates call, with the same stored list.
+    assert m.title_rejection_reason("Sales Controller") is None
+    assert m.title_rejection_reason("Sales Representative") == "title_exclusion"
+
+
+def test_sales_title_rejects_selling_roles_only_through_the_warm_radar_gate(monkeypatch):
+    titles = ["Sales Controller", "Sales Representative", "Account Executive"]
+    h = _warm_title_harness(monkeypatch, titles)
+    assert "sales" in h.filters["title_exclusions"]
+    text = h.run()
+    assert h.cards == ["Sales Controller"], h.cards
+    assert "2 roles filtered out by title" in text, text
