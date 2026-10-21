@@ -11764,9 +11764,9 @@ def test_warm_contacts_keep_every_person_never_guesses_a_company(monkeypatch):
     out = m.get_warm_crm_contacts()
     assert m.normalize_company_for_match("cousin") not in out
     assert list(out) == [m.normalize_company_for_match("Zeta Corp")]
+    # Unplaced means no company: the URL-named row WITH a company (u-url2) is keyed, not unplaced.
     unplaced = m.get_warm_contacts_without_company()
-    assert [c["name"] for c in unplaced] == ["Dean cousin", "https://www.linkedin.com/in/someone",
-                                            "https://www.linkedin.com/in/other"]
+    assert [c["name"] for c in unplaced] == ["Dean cousin", "https://www.linkedin.com/in/someone"]
     assert next(c for c in unplaced if c["name"] == "Dean cousin")["sheet_uuid"] == "u-dean"
     # a row that has a company is unchanged from today: name, note, email, sheet_uuid
     eve = out[m.normalize_company_for_match("Zeta Corp")]
@@ -15871,3 +15871,172 @@ def test_referral_asks_review_followups_ask_names_the_company_as_the_contact_kno
     # Legal suffix cleaned off the contact's own company text; the job's employer reads the same.
     assert rows[0]["company"] == "Acme Robotics" and "Acme Robotics Inc" not in rows[0]["body"]
     assert rows[0]["body"].startswith("Hi") and "Acme Robotics" in rows[0]["body"]
+
+
+# ---- TASK-122: review follow-ups on the warm radar ----
+
+def _slug_in(url, slug):
+    return f"/{slug}/" in url or f"/{slug}?" in url or url.endswith(f"/{slug}")
+
+
+def test_warm_radar_review_followups_erroring_companies_do_not_starve_the_rest(monkeypatch):
+    """Item 1: 25 warm companies, the first 20 always error. Errors are not miss-stamped, so they
+    are 'unchecked' every run; the batch must rotate to the ones never attempted."""
+    names = [f"Company{chr(65 + i // 26)}{chr(65 + i % 26)} Works" for i in range(25)]
+    h = _WarmRadarHarness(monkeypatch, names)
+    failing = {m.ats_slug_guess(n) for n in names[:20]}
+
+    def flaky(url, timeout=None, **kw):
+        h.http.append(url)
+        if any(_slug_in(url, s) for s in failing):
+            return types.SimpleNamespace(status_code=503, json=lambda: {})
+        return types.SimpleNamespace(status_code=404, json=lambda: {})
+
+    monkeypatch.setattr(m.requests, "get", flaky)
+    for _ in range(3):
+        h.run()
+    with m.get_db_conn() as conn:
+        rows = dict(conn.execute("SELECT normalized_name, board_attempted_at FROM company_identities").fetchall())
+    for n in names:
+        assert rows.get(m.normalize_company_for_match(n)), f"{n} was never attempted"
+    # the errored ones still carry no miss stamp, so their 14-day window is untouched
+    assert _identity(names[0])[1] is None
+    # the five that were behind the failing front were reached
+    last_five_slugs = [m.ats_slug_guess(n) for n in names[20:]]
+    assert all(any(_slug_in(u, s) for u in h.http) for s in last_five_slugs)
+
+
+def test_warm_radar_review_followups_overlapping_slug_adds_both_survive(monkeypatch):
+    """Item 2: both threads read ats_company_slugs before either writes (the barrier sits inside
+    the probe, which is outside the lock). The write re-reads under the lock, so both slugs land."""
+    filters = {"ats_company_slugs": []}
+    barrier = threading.Barrier(2, timeout=10)
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: list(filters.get(key, default)))
+    monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
+    monkeypatch.setattr(m, "upsert_company_identity", lambda *a, **kw: True)
+
+    def fake_get(url, timeout=None, **kw):
+        barrier.wait()
+        return types.SimpleNamespace(status_code=200, json=lambda: {"jobs": [{"id": 1}]})
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    out = {}
+    threads = [threading.Thread(target=lambda n=n: out.__setitem__(n, m.auto_expand_ats_slug(n)))
+               for n in ("Alpha Robotics", "Beta Robotics")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+    assert out == {"Alpha Robotics": "alpharobotics", "Beta Robotics": "betarobotics"}
+    assert sorted(filters["ats_company_slugs"]) == ["alpharobotics", "betarobotics"]
+
+
+def test_warm_radar_review_followups_401_and_403_are_errors_not_a_miss(monkeypatch):
+    """Item 3: only 404-style answers mean 'no public board'. 401/403 are 'could not tell'."""
+    _WarmRadarHarness(monkeypatch, [])
+    for status, name in ((401, "Guarded Labs"), (403, "Forbidden Labs")):
+        monkeypatch.setattr(m.requests, "get",
+                            lambda url, timeout=None, s=status, **kw: types.SimpleNamespace(status_code=s, json=lambda: {}))
+        errors = []
+        assert m.auto_expand_ats_slug(name, errors=errors) is None
+        assert errors == [f"greenhouse HTTP {status}", f"lever HTTP {status}", f"ashby HTTP {status}"]
+        assert m.lookup_warm_company_board(name) is None
+        row = _identity(name)
+        assert row is not None and row[1] is None  # attempted (row exists), never miss-stamped
+    # 404 stays a clean miss
+    monkeypatch.setattr(m.requests, "get", lambda url, timeout=None, **kw: types.SimpleNamespace(status_code=404, json=lambda: {}))
+    assert m.lookup_warm_company_board("Missing Labs") is None
+    assert _identity("Missing Labs")[1] is not None
+
+
+def test_warm_radar_review_followups_lookups_start_once_even_if_the_scan_raises(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    spawned = []
+    monkeypatch.setattr(m, "_spawn_background", lambda fn: (spawned.append(fn), fn()))
+
+    def boom(slugs, **kw):
+        raise RuntimeError("ats fetch exploded")
+
+    monkeypatch.setattr(m, "fetch_ats_jobs", boom)
+    m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
+    with pytest.raises(RuntimeError):
+        m.run_warm_radar_scan(chat_id=1)
+    assert len(spawned) == 1
+    assert len(h.http) == 3  # Globex Systems was still looked up (greenhouse, lever, ashby)
+    # and a normal run starts them exactly once too
+    spawned.clear()
+    monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: [])
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE company_identities SET board_checked_at = NULL")
+        conn.commit()
+    h.run()
+    assert len(spawned) == 1
+
+
+def test_warm_radar_review_followups_url_name_with_a_company_keeps_the_company(monkeypatch):
+    _stub_warm_tab(monkeypatch, [
+        _warm_row("https://www.linkedin.com/in/someone", "Zeta Corp", 5, uuid_="u-url"),
+        _warm_row("https://www.linkedin.com/in/nobody", "", 5, uuid_="u-blank"),
+    ])
+    out = m.get_warm_crm_contacts()
+    zeta = out[m.normalize_company_for_match("Zeta Corp")]
+    assert zeta["name"] == "Contact" and zeta["sheet_uuid"] == "u-url" and zeta["count"] == 1
+    assert m.first_name_for_greeting(zeta["name"]) == ""
+    assert "http" not in " ".join(str(v) for v in zeta.values())
+    # a blank company stays unplaced, URL name or not
+    assert [c["sheet_uuid"] for c in m.get_warm_contacts_without_company()] == ["u-blank"]
+    # a real name at the same company still outranks the placeholder on priority
+    _stub_warm_tab(monkeypatch, [
+        _warm_row("https://www.linkedin.com/in/someone", "Zeta Corp", 5, uuid_="u-url"),
+        _warm_row("Eve Real", "Zeta Corp", 7, uuid_="u-eve"),
+    ])
+    best = m.get_warm_crm_contacts()[m.normalize_company_for_match("Zeta Corp")]
+    assert best["name"] == "Eve Real" and best["count"] == 2
+    assert [c["name"] for c in best["contacts"]] == ["Eve Real", "Contact"]
+
+
+def test_warm_radar_review_followups_w_says_how_many_warm_contacts_have_no_company(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "", ""])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    text = h.run()
+    assert "2 warm contacts have no company" in text
+    # the "no warm board yet" message carries it too, singular when there is one
+    h2 = _WarmRadarHarness(monkeypatch, ["Globex Systems", ""])
+    text2 = h2.run()
+    assert "none of your 1 warm entries" in text2 and "1 warm contact has no company" in text2
+    # and nothing is said when every contact has a company
+    h3 = _WarmRadarHarness(monkeypatch, ["Acme Robotics"])
+    assert "no company" not in h3.run()
+
+
+def test_warm_radar_review_followups_w_with_only_unplaced_rows_still_names_the_count(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["", "", ""])
+    text = h.run()
+    assert "no Carmen Warm contacts found" in text
+    assert "3 warm contacts have no company" in text
+
+
+def test_warm_radar_review_followups_a_failing_spawn_changes_nothing(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+
+    def bad_spawn(fn):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(m, "_spawn_background", bad_spawn)
+    # a good scan stays a good scan
+    monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: [])
+    m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
+    assert m.run_warm_radar_scan(chat_id=1) == 0
+    assert any("Warm scan complete" in msg for msg in h.messages)
+
+    # and the scan's own exception is the one that surfaces
+    def boom(slugs, **kw):
+        raise ValueError("scan exploded")
+
+    monkeypatch.setattr(m, "fetch_ats_jobs", boom)
+    m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
+    with pytest.raises(ValueError, match="scan exploded"):
+        m.run_warm_radar_scan(chat_id=1)
