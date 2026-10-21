@@ -15962,10 +15962,12 @@ def test_warm_radar_review_followups_lookups_start_once_even_if_the_scan_raises(
     spawned = []
     monkeypatch.setattr(m, "_spawn_background", lambda fn: (spawned.append(fn), fn()))
 
-    def boom(slugs, **kw):
-        raise RuntimeError("ats fetch exploded")
+    def boom(company):
+        raise RuntimeError("scan exploded")
 
-    monkeypatch.setattr(m, "fetch_ats_jobs", boom)
+    # A fetch error is now contained per chunk, so the scan is made to explode in the posting loop.
+    monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: [{"employer_name": "Acme Robotics", "job_title": "Analyst"}])
+    monkeypatch.setattr(m, "is_banned_employer", boom)
     m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
     with pytest.raises(RuntimeError):
         m.run_warm_radar_scan(chat_id=1)
@@ -15973,6 +15975,7 @@ def test_warm_radar_review_followups_lookups_start_once_even_if_the_scan_raises(
     assert len(h.http) == 3  # Globex Systems was still looked up (greenhouse, lever, ashby)
     # and a normal run starts them exactly once too
     spawned.clear()
+    monkeypatch.setattr(m, "is_banned_employer", lambda company: False)
     monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: [])
     with m.get_db_conn() as conn:
         conn.execute("UPDATE company_identities SET board_checked_at = NULL")
@@ -16039,10 +16042,11 @@ def test_warm_radar_review_followups_a_failing_spawn_changes_nothing(monkeypatch
     assert any("Warm scan complete" in msg for msg in h.messages)
 
     # and the scan's own exception is the one that surfaces
-    def boom(slugs, **kw):
+    def boom(company):
         raise ValueError("scan exploded")
 
-    monkeypatch.setattr(m, "fetch_ats_jobs", boom)
+    monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: [{"employer_name": "Acme Robotics", "job_title": "Analyst"}])
+    monkeypatch.setattr(m, "is_banned_employer", boom)
     m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
     with pytest.raises(ValueError, match="scan exploded"):
         m.run_warm_radar_scan(chat_id=1)
@@ -16512,3 +16516,331 @@ def test_warm_contact_pick_and_ask_cap_a_size_trim_is_reported_apart_from_the_wo
     assert len(asks) == 1 and [r["title"] for r in json.loads(asks[0]["roles_json"])] == ["Procurement Analyst"]
     assert len(asks[0]["body"]) < m.TELEGRAM_CHUNK_CHARS
     assert "1 role too long for one ask" in text and "wording check" not in text and "ask is full" not in text, text
+
+
+# ---- TASK-129: /w scans a bounded number of boards per run, in chunks, least recently scanned first ----
+
+def _batch_names(n):
+    return [f"Company{chr(65 + i // 26)}{chr(65 + i % 26)} Works" for i in range(n)]
+
+
+def _batch_harness(monkeypatch, n):
+    """n warm companies, each with a cached board. fetch_ats_jobs is stubbed to record every call's
+    slug list (h.fetched); h.fetch_hook, when set, decides what a call returns or raises."""
+    names = _batch_names(n)
+    h = _WarmRadarHarness(monkeypatch, names)
+    h.slug_of = {c: re.sub(r"[^a-z]", "", c.lower()) for c in names}
+    for c in names:
+        m.upsert_company_identity(c, ats_slug=h.slug_of[c])
+    h.fetch_hook = None
+
+    def fetch(slugs, **kw):
+        h.fetched.append(list(slugs))
+        return h.fetch_hook(list(slugs)) if h.fetch_hook else []
+
+    monkeypatch.setattr(m, "fetch_ats_jobs", fetch)
+    return h
+
+
+def _scanned_at():
+    with m.get_db_conn() as conn:
+        return dict(conn.execute("SELECT ats_slug, board_scanned_at FROM company_identities").fetchall())
+
+
+def _attempted_at():
+    with m.get_db_conn() as conn:
+        return dict(conn.execute("SELECT ats_slug, board_attempted_at FROM company_identities").fetchall())
+
+
+def test_warm_radar_scans_boards_in_batches_a_run_fetches_20_in_chunks_and_rotates(monkeypatch):
+    h = _batch_harness(monkeypatch, 45)
+    assert (m.WARM_RADAR_SCAN_BATCH, m.WARM_RADAR_SCAN_CHUNK) == (20, 10)
+
+    first = h.run()
+    assert [len(c) for c in h.fetched] == [10, 10]
+    run1 = {s for c in h.fetched for s in c}
+    assert len(run1) == 20
+    stamped = {s for s, at in _scanned_at().items() if at}
+    assert stamped == run1                      # boards with NO postings are stamped too
+    assert "Scanned 20 of 45 boards this run; run /w again to continue." in first, first
+
+    h.fetched.clear()
+    second = h.run()
+    run2 = {s for c in h.fetched for s in c}
+    assert len(run2) == 20 and not (run2 & run1)   # the 25 never scanned come first
+    assert "Scanned 20 of 45" in second
+
+    h.fetched.clear()
+    third = h.run()
+    run3 = {s for c in h.fetched for s in c}
+    assert [len(c) for c in h.fetched] == [10, 10]
+    everything = set(h.slug_of.values())
+    assert (everything - run1 - run2) <= run3       # the 5 still never scanned
+    assert len(run3 & run1) == 15 and not (run3 & run2)   # then the oldest stamps, not the newest
+    assert "Scanned 20 of 45" in third
+    assert all(at for at in _scanned_at().values())
+
+
+def test_warm_radar_scans_boards_in_batches_small_set_says_nothing_about_progress(monkeypatch):
+    h = _batch_harness(monkeypatch, 7)
+    text = h.run()
+    assert h.fetched == [list(h.slug_of.values())] and "of 7 boards" not in text
+    assert "7 warm companies scanned" in text
+
+
+def test_warm_radar_scans_boards_in_batches_a_failing_chunk_is_logged_and_the_rest_still_run(monkeypatch):
+    h = _batch_harness(monkeypatch, 45)
+    calls = []
+
+    def hook(slugs):
+        calls.append(slugs)
+        if len(calls) == 1:
+            raise RuntimeError("greenhouse fell over")
+        return []
+
+    h.fetch_hook = hook
+    text = h.run()
+    assert len(h.fetched) == 2                      # the second chunk still ran
+    bad, good = set(h.fetched[0]), set(h.fetched[1])
+    scanned = {s for s, at in _scanned_at().items() if at}
+    assert scanned == good                          # the errored chunk is not stamped as scanned
+    assert {s for s, at in _attempted_at().items() if at} >= bad   # but its attempt is recorded
+    assert "Scanned 10 of 45 boards this run" in text and "10 boards could not be fetched" in text, text
+
+    # the errored boards sort behind boards never tried, so they cannot hold the front
+    h.fetched.clear()
+    h.fetch_hook = None
+    h.run()
+    assert not ({s for c in h.fetched for s in c} & bad)
+
+
+def test_warm_radar_scans_boards_in_batches_a_chunks_postings_are_dropped_before_the_next_fetch(monkeypatch):
+    import gc
+    import weakref
+
+    class _Postings(list):      # a plain list cannot be weakly referenced
+        pass
+
+    h = _batch_harness(monkeypatch, 45)
+    monkeypatch.setattr(m, "is_role_tracked", lambda company, title: False)
+    prev = []
+    alive_when_next_chunk_requested = []
+
+    def hook(slugs):
+        gc.collect()
+        if prev:
+            alive_when_next_chunk_requested.append(prev[-1]() is not None)
+        big = _Postings({"employer_name": "Nobody Inc", "job_title": f"Analyst {i}", "job_id": f"x_{s}_{i}",
+                         "job_description": "x" * 1000} for s in slugs for i in range(50))
+        prev.append(weakref.ref(big))
+        return big
+
+    h.fetch_hook = hook
+    h.run()
+    assert len(prev) == 2 and alive_when_next_chunk_requested == [False]
+    gc.collect()
+    assert prev[-1]() is None
+
+
+def test_warm_radar_scans_boards_in_batches_one_company_with_many_roles_still_lists_the_top_ones(monkeypatch):
+    """Roles past a company's cap keep a title and hash, not the posting; the message still lists
+    the top roles and counts the rest."""
+    titles = [f"Operations Analyst {chr(65 + i)}" for i in range(12)]
+    h = _summary_harness(monkeypatch, {"Acme Robotics": [(t, "Chicago") for t in titles]})
+    h.run()
+    assert len(h.posts) == 1
+    assert len(h.rows()) == m.WARM_RADAR_ROLES_PER_COMPANY
+    assert "12" in h.posts[0][1]
+
+
+def test_warm_radar_scans_boards_in_batches_a_held_back_company_keeps_its_place_in_the_queue(monkeypatch):
+    """Companies held back by the message cap are not stamped scanned, so the next run's
+    batch puts them in front again instead of at the back of the whole rotation."""
+    names = [f"Co{chr(97 + i)} Labs" for i in range(18)]
+    h = _summary_harness(monkeypatch, {n: [("Operations Analyst", "Detroit")] for n in names})
+    h.run()
+    assert len(h.posts) == m.WARM_RADAR_MESSAGES_PER_RUN
+    stamped = {s for s, at in _scanned_at().items() if at}
+    sent = {re.sub(r"[^a-z]", "", r["row_data"][1].lower()) for r in h.rows()}
+    assert stamped == sent and len(stamped) == 15       # the 3 held-back boards were not stamped
+
+
+def test_warm_radar_scans_boards_in_batches_a_second_run_does_not_reselect_lookups_in_flight(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    started, release, calls, threads = threading.Event(), threading.Event(), [], []
+
+    def blocked_lookup(company):
+        calls.append(company)
+        started.set()
+        release.wait(timeout=10)
+
+    monkeypatch.setattr(m, "lookup_warm_company_board", blocked_lookup)
+
+    def spawn(fn):
+        t = threading.Thread(target=fn, daemon=True)
+        threads.append(t)
+        t.start()
+
+    monkeypatch.setattr(m, "_spawn_background", spawn)
+    h.run()
+    assert started.wait(timeout=10)
+    assert m._WARM_LOOKUPS_IN_FLIGHT == {"Acme Robotics", "Globex Systems"}
+    second = h.run()                                # the first batch is still blocked
+    assert calls == ["Acme Robotics"]               # the second run started no lookup at all
+    assert "Not looked at yet" not in second and "2 more still being checked" in second, second
+    release.set()
+    for t in threads:
+        t.join(timeout=10)
+    assert calls == ["Acme Robotics", "Globex Systems"]
+    assert not m._WARM_LOOKUPS_IN_FLIGHT            # each company left the set when its own lookup ended
+    h.run()                                         # no longer in flight, so it is chosen again
+    for t in threads:
+        t.join(timeout=10)
+    assert calls[2:] == ["Acme Robotics", "Globex Systems"]
+
+
+def test_warm_radar_scans_boards_in_batches_an_in_flight_company_leaves_the_set_when_its_lookup_raises(monkeypatch):
+    _WarmRadarHarness(monkeypatch, ["Acme Robotics"])
+    m._WARM_LOOKUPS_IN_FLIGHT.add("Acme Robotics")
+
+    def boom(company):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(m, "lookup_warm_company_board", boom)
+    m._warm_radar_lookup_batch(["Acme Robotics"])
+    assert not m._WARM_LOOKUPS_IN_FLIGHT
+
+
+def test_warm_radar_scans_boards_in_batches_slug_list_writes_through_two_paths_both_survive(monkeypatch):
+    """/ats add and the /t live-slug merge (expand_ecosystem_filter) each read-modify-write
+    ats_company_slugs. Each thread parks (up to 0.5s) right after its read of the list: without
+    _ATS_SLUG_FILTER_LOCK both read the same list and the second write drops the first thread's
+    slug; with it the second thread's read happens after the first thread's write."""
+    filters = {"ats_company_slugs": [], "tier1_ecosystem": []}
+    barrier = threading.Barrier(2)
+    local = threading.local()
+
+    def fake_get_filter(key, default=None):
+        value = list(filters.get(key) if filters.get(key) is not None else (default or []))
+        if key == "ats_company_slugs":
+            local.reads = getattr(local, "reads", 0) + 1
+            if local.reads == local.park_on_read:
+                try:
+                    barrier.wait(timeout=0.5)
+                except threading.BrokenBarrierError:
+                    pass
+        return value
+
+    sent = []
+    monkeypatch.setattr(m, "get_filter", fake_get_filter)
+    monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
+    monkeypatch.setattr(m, "fetch_greenhouse_jobs", lambda slug: [{"id": 1}])
+    monkeypatch.setattr(m, "fetch_lever_jobs", lambda slug: [])
+    monkeypatch.setattr(m, "fetch_ashby_jobs", lambda slug: [])
+    monkeypatch.setattr(m, "discover_ecosystem_network",
+                        lambda entity: {"canonical_name": entity, "ecosystem_keywords": [], "probable_ats_slugs": ["betaboard"]})
+    monkeypatch.setattr(m, "verify_live_slugs", lambda candidates: list(candidates))
+
+    def add_path():
+        local.park_on_read = 2      # read 1 is the handler's top-of-command read; read 2 is the update's
+        m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/ats add alphaboard"}})
+
+    def merge_path():
+        local.park_on_read = 1
+        m.expand_ecosystem_filter("Beta")
+
+    threads = [threading.Thread(target=add_path), threading.Thread(target=merge_path)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+    assert sorted(filters["ats_company_slugs"]) == ["alphaboard", "betaboard"]
+
+
+def test_warm_radar_scans_boards_in_batches_ats_remove_edits_the_current_list(monkeypatch):
+    filters = {"ats_company_slugs": ["alpha", "beta", "gamma"]}
+    sent = []
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: list(filters.get(key, default or [])))
+    monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/ats remove beta nothere"}})
+    assert filters["ats_company_slugs"] == ["alpha", "gamma"]
+    assert any("Removed: beta" in t for t in sent)
+
+
+# ---- TASK-129 review follow-ups ----
+
+def test_warm_radar_scans_boards_in_batches_failing_scanned_boards_move_behind_healthy_ones(monkeypatch):
+    h = _batch_harness(monkeypatch, 25)
+    slugs = list(h.slug_of.values())
+    failing, healthy = set(slugs[:20]), set(slugs[20:])
+    with m.get_db_conn() as conn:
+        for sl in slugs:
+            conn.execute("UPDATE company_identities SET board_scanned_at = ? WHERE ats_slug = ?",
+                         ("2020-01-01T00:00:00" if sl in failing else "2026-10-01T00:00:00", sl))
+        conn.commit()
+
+    def hook(chunk):
+        if set(chunk) <= failing:
+            raise RuntimeError("board is down")
+        return []
+
+    h.fetch_hook = hook
+    h.run()                                         # the 20 oldest are the failing ones, all tried once
+    assert {s for c in h.fetched for s in c} == failing
+    h.fetched.clear()
+    h.run()                                         # now they sort behind the healthy five
+    reached = [s for c in h.fetched for s in c]
+    assert healthy <= set(reached[:5]) and len(reached) == 20
+
+
+def test_warm_radar_scans_boards_in_batches_slug_matched_and_name_matched_held_boards_stay_unstamped(monkeypatch):
+    for name_matched in (False, True):
+        names = [f"Co{chr(97 + i // 26)}{chr(97 + i % 26)} Labs" for i in range(30)]
+        h = _summary_harness(monkeypatch, {n: [("Operations Analyst", "Detroit")] for n in names})
+        slug_of = {n: re.sub(r"[^a-z]", "", n.lower()) for n in names}
+        requested = []
+
+        def fetch(slugs, **kw):
+            requested.append(list(slugs))
+            return [{"employer_name": n, "job_title": "Operations Analyst",
+                     "job_id": (f"other_{i}" if name_matched else f"gh_{slug_of[n]}_0"),
+                     "job_apply_link": f"https://boards.greenhouse.io/{slug_of[n]}/jobs/{i}",
+                     "job_city": "Detroit", "job_state": "", "job_is_remote": False,
+                     "job_requisition_id": "", "job_description": "Reconciliation workflows with SQL."}
+                    for i, n in enumerate(names) if slug_of[n] in slugs]
+
+        monkeypatch.setattr(m, "fetch_ats_jobs", fetch)
+        h.run()
+        first = {s for c in requested for s in c}
+        assert [len(c) for c in requested] == [10, 10] and len(first) == 20
+        sent = {slug_of[r["row_data"][1]] for r in h.rows()}
+        assert len(h.posts) == m.WARM_RADAR_MESSAGES_PER_RUN and sent <= first
+        held = first - sent
+        assert len(held) == 5
+        stamped = {s for s, at in _scanned_at().items() if at}
+        assert stamped == sent, (name_matched, stamped ^ sent)    # held boards were NOT stamped
+
+        requested.clear()
+        h.run()                                     # the held five come first, with the ten never reached
+        assert held <= {s for c in requested for s in c}
+        assert {slug_of[r["row_data"][1]] for r in h.rows()} >= held | sent
+        # fresh state for the second pass of the loop
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM company_identities")
+            conn.commit()
+
+
+def test_warm_radar_scans_boards_in_batches_ats_add_with_a_repeated_slug_probes_and_saves_it_once(monkeypatch):
+    filters = {"ats_company_slugs": []}
+    probes, sent = [], []
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: list(filters.get(key, default or [])))
+    monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
+    monkeypatch.setattr(m, "fetch_greenhouse_jobs", lambda slug: probes.append(slug) or [{"id": 1}])
+    monkeypatch.setattr(m, "fetch_lever_jobs", lambda slug: [])
+    monkeypatch.setattr(m, "fetch_ashby_jobs", lambda slug: [])
+    m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/ats add acme, beta acme"}})
+    assert filters["ats_company_slugs"] == ["acme", "beta"] and probes == ["acme", "beta"]
