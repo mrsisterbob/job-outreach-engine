@@ -18079,3 +18079,71 @@ def test_refer_review_followups_dismiss_never_prints_pending_not_pending(monkeyp
 
     assert "pending, not pending" not in reply and "changed while dismissing" in reply and "try again" in reply
     assert _ask_row(ask_id)[0] == "pending"
+
+
+# ==============================================================================
+# TASK-89: years REQUIRED is a hard gate in both filter gates
+# ==============================================================================
+
+_YEARS_GATE_REJECT = [
+    "4-5 years of experience as a Business Analyst or similar role.",
+    "Minimum of 4 years in a similar role",
+    "5+ years of experience in operations",
+]
+_YEARS_GATE_ACCEPT = [
+    "3+ years of experience",
+    "2-3 years of experience",
+    "0-2 years of experience",
+    "5+ years of experience preferred",
+    "4 years of experience or equivalent education",
+    "We have served Michigan families for 40 years. Entry level role.",
+]
+
+
+def test_years_gate_rejects_unit_cases_on_years_required_reject():
+    from score_rules import years_required_reject, YEARS_REQUIRED_REJECT_AT
+    assert YEARS_REQUIRED_REJECT_AT == 4
+    assert years_required_reject("4-5 years of experience as a business analyst.") == 4
+    assert years_required_reject("Great team. Minimum of 4 years in a similar role") == 4
+    assert years_required_reject("5+ years of experience in operations") == 5
+    # The largest requirement wins, and a soft sentence beside it is ignored.
+    assert years_required_reject("Needs 4 years of experience. 8 years of experience is a plus.") == 4
+    assert years_required_reject("") is None and years_required_reject(None) is None
+    for text in _YEARS_GATE_ACCEPT:
+        assert years_required_reject(text) is None, text
+    assert years_required_reject("Ideally 6 years of experience. Needs 2 years of experience.") is None
+
+
+def test_years_gate_rejects_through_both_real_filter_gates(monkeypatch, caplog):
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: False)
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: set())
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: {
+        "min_salary": 50000, "valid_cities": ["farmington", "detroit"], "title_exclusions": [],
+        "company_exclusions": [], "hard_ban_keywords": [], "seniority_exclusions": [],
+    }.get(key, default if default is not None else []))
+    skill = " Daily reconciliation in Salesforce and Excel."   # keeps the remote core-skill gate satisfied
+    strict = {
+        "employer_name": "Northwind Co", "job_title": "Operations Analyst",
+        "job_city": "Farmington Hills", "job_state": "MI",
+        "job_salary": "$70,000", "job_min_salary": 70000, "job_max_salary": 90000,
+        "job_apply_link": "https://boards.greenhouse.io/acme/jobs/1",
+    }
+    # Control: the same jobs with a harmless description pass, so only years can be rejecting below.
+    assert m.passes_strict_filter({**strict, "job_description": "Reconciliation in SQL."}) is True
+    assert m._passes_remote_filter(_remote_job(job_description="Reconciliation in Salesforce and Excel.")) is True
+
+    for text in _YEARS_GATE_REJECT:
+        trace = m.FunnelTrace()
+        assert m.passes_strict_filter({**strict, "job_description": text + " SQL."}, trace=trace) is False, text
+        assert trace.reasons.get("years_required") == 1, (text, trace.reasons)
+        assert m._passes_remote_filter(_remote_job(job_description=text + skill)) is False, text
+    for text in _YEARS_GATE_ACCEPT:
+        assert m.passes_strict_filter({**strict, "job_description": text + " SQL."}) is True, text
+        assert m._passes_remote_filter(_remote_job(job_description=text + skill)) is True, text
+
+    # An unreadable (signup-wall) description is never rejected on years; the short-text line fires.
+    teaser = "Sign up to see the full description"
+    teaser = (teaser + " " * 120)[:120]
+    caplog.set_level("DEBUG")
+    assert m.passes_strict_filter({**strict, "job_description": teaser + " SQL"}) is True
+    assert any("[YEARS] description too short to read years (" in r.getMessage() for r in caplog.records)

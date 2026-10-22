@@ -112,3 +112,25 @@ def years_of_experience_demanded(description):
             if best is None or years > best:
                 best = years
     return best
+
+
+# ---- Years REQUIRED: the hard gate (TASK-89) ----
+# A posting that demands this many years of experience (largest lower bound) is rejected before it
+# is scored. 3 stays a score penalty only (the -4 branch above), so "3+ years" and "2-3 years" pass.
+YEARS_REQUIRED_REJECT_AT = 4
+# A sentence carrying one of these is a wish or a degree-or-experience alternative, not a requirement.
+_YEARS_SOFT_RE = re.compile(r"preferred|a plus|nice to have|bonus|ideally|or equivalent")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|[\r\n]+")
+
+
+def years_required_reject(description):
+    """Largest years-of-experience demand in the REQUIRED sentences of a (lowercase) posting when it
+    is >= YEARS_REQUIRED_REJECT_AT, else None (also None when no years text can be read)."""
+    best = None
+    for sentence in _SENTENCE_SPLIT_RE.split(str(description or "").lower()):
+        if not sentence or _YEARS_SOFT_RE.search(sentence):
+            continue
+        years = years_of_experience_demanded(sentence)
+        if years is not None and (best is None or years > best):
+            best = years
+    return best if best is not None and best >= YEARS_REQUIRED_REJECT_AT else None

@@ -157,7 +157,7 @@ WILDCARD_BONUS = max(0, int(os.environ.get("WILDCARD_BONUS", "2")))
 BONUS_STACK_CAP = 30
 from score_rules import (posted_age_adjustment, is_dead_posting, AGE_DEAD_CEILING, SENIORITY_TITLE_RE,
                          seniority_ceiling, title_level, ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS,
-                         years_of_experience_demanded)
+                         years_of_experience_demanded, years_required_reject)
 
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
@@ -5295,6 +5295,19 @@ def title_rejection_reason(title, include_seniority=True):
     return None
 
 
+YEARS_GATE_MIN_READABLE_CHARS = 300
+
+
+def years_required_gate(description):
+    """Years the posting REQUIRES when that is >= YEARS_REQUIRED_REJECT_AT (reject it), else None.
+    A description under 300 chars is usually an aggregator teaser behind a signup wall: there is no
+    years text to read, so it is never rejected on this gate - just logged at debug."""
+    text = str(description or "")
+    if len(text) < YEARS_GATE_MIN_READABLE_CHARS:
+        logging.debug(f"[YEARS] description too short to read years ({len(text)} chars)")
+    return years_required_reject(text)
+
+
 def _passes_remote_filter(job):
     """passes_strict_filter minus the geography gates, for genuinely remote postings.
 
@@ -5334,6 +5347,8 @@ def _passes_remote_filter(job):
     if any(comp in company for comp in get_filter("company_exclusions", [])):
         return False
     if any(trigger in description for trigger in get_filter("hard_ban_keywords", [])):
+        return False
+    if years_required_gate(description) is not None:
         return False
     if title_seniority_rejection(title):
         return False
@@ -5644,6 +5659,8 @@ def passes_strict_filter(job, trace=None):
         return reject("company_exclusion")
     if any(trigger in description for trigger in get_filter("hard_ban_keywords", [])):
         return reject("hard_ban_keyword")
+    if years_required_gate(description) is not None:
+        return reject("years_required")
     seniority_reason = title_seniority_rejection(title)
     if seniority_reason:
         return reject(seniority_reason)
