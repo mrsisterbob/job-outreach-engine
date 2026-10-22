@@ -513,7 +513,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 26 | `_norm_email` | _(no docstring)_ |
 | 30 | `collect_open_followups` | snapshots: {run_date "YYYY-MM-DD": result dict as saved by save_followup_queue_snapshot} |
 
-## `pipeline_utils.py` — 120 defs, 3,248 lines
+## `pipeline_utils.py` — 120 defs, 3,249 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -630,13 +630,13 @@ grep -i "contact" FUNCTION_INDEX.md
 | 2947 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
 | 2982 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
 | 2987 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
-| 3033 | `is_banned_employer` | True when the employer name matches a BANNED_EMPLOYER_PATTERNS whole-word regex. |
-| 3110 | `_word_alternation` | One case-insensitive regex matching any of `words` (or its plural) as whole words. |
-| 3119 | `sales_title_is_selling_role` | True when a title with the word "sales" in it names a selling role, False when it names a |
-| 3132 | `is_off_direction_title` | True when the job title names IT admin, infrastructure, help desk, security ops or data center work. |
-| 3209 | `is_industrial_title` | True when the title names industrial, robotics or plant-maintenance work (not process automation). |
-| 3220 | `industrial_term_hits` | Distinct industrial / material-handling vocabulary found in a job description. |
-| 3228 | `required_degree_is_technical_trade` | True when a degree clause names only technical-trade fields (mechatronics, mechanical, electrical...). |
+| 3034 | `is_banned_employer` | True when the employer name matches a BANNED_EMPLOYER_PATTERNS whole-word regex. |
+| 3111 | `_word_alternation` | One case-insensitive regex matching any of `words` (or its plural) as whole words. |
+| 3120 | `sales_title_is_selling_role` | True when a title with the word "sales" in it names a selling role, False when it names a |
+| 3133 | `is_off_direction_title` | True when the job title names IT admin, infrastructure, help desk, security ops or data center work. |
+| 3210 | `is_industrial_title` | True when the title names industrial, robotics or plant-maintenance work (not process automation). |
+| 3221 | `industrial_term_hits` | Distinct industrial / material-handling vocabulary found in a job description. |
+| 3229 | `required_degree_is_technical_trade` | True when a degree clause names only technical-trade fields (mechatronics, mechanical, electrical...). |
 
 ## `queue_baseline.py` — 9 defs, 224 lines
 
