@@ -4058,3 +4058,16 @@ def test_sales_title_rejects_selling_roles_only_leaves_other_exclusions_alone(mo
     assert mm.title_rejection_reason("Sales Manager") == "title_exclusion"
     assert mm.title_rejection_reason("Sales Operations Manager") == "seniority"
     assert mm.title_rejection_reason("Sales Operations Manager", include_seniority=False) is None
+
+
+def test_ghost_switch_review_followups_application_snooze_date_contract():
+    from datetime import date, datetime, timedelta
+    bury = timedelta(days=pu.FOLLOWUP_BURY_DAYS)
+    assert pu.application_snooze_date("2026-06-01") == date(2026, 6, 1) + bury
+    assert pu.application_snooze_date("2026-06-01", next_followup="1970-01-01") == pu.application_snooze_date("2026-06-01")
+    # Date Added is the anchor; Next Followup is only the fallback for a blank one.
+    assert pu.application_snooze_date("", next_followup="2026-06-10") == date(2026, 6, 10) + bury
+    # No anchor at all: None, unless the caller supplies the base day.
+    assert pu.application_snooze_date("", next_followup="") is None and pu.application_snooze_date("garbage") is None
+    assert pu.application_snooze_date("", date(2026, 6, 2)) == date(2026, 6, 2) + bury
+    assert pu.application_snooze_date("", datetime(2026, 6, 2, 9, 30)) == date(2026, 6, 2) + bury

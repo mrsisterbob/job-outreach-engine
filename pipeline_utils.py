@@ -382,6 +382,24 @@ def followup_anchor(date_added, next_followup):
     return _parse_sequencer_date(date_added) or _parse_sequencer_date(next_followup)
 
 
+def application_snooze_date(date_added, today=None, *, next_followup=""):
+    """The one definition of the date the sequencer's day-10 snooze writes for an Applied job
+    row: followup_anchor(...) + FOLLOWUP_BURY_DAYS, as a datetime.date.
+
+    Three places depend on it agreeing with itself: the snooze the sequencer writes (new_nf),
+    the "buries on" date it reports, and the overdue scan that must recognise that date as the
+    sequencer's own rather than a reminder Kevin set. Change it here and all three move together.
+
+    `next_followup` is only the anchor's fallback for a blank Date Added (the sequencer passes
+    it; the overdue scan passes nothing, so a row with no Date Added has nothing to compare).
+    `today` is the base when there is no anchor at all; without it that case returns None.
+    """
+    base = followup_anchor(date_added, next_followup) or today
+    if isinstance(base, datetime):
+        base = base.date()
+    return base + timedelta(days=FOLLOWUP_BURY_DAYS) if base else None
+
+
 def followup_action(status, date_added, next_followup, today):
     """Pure: the one thing that should happen to a JOBS row today. Side-effect free.
 
