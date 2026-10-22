@@ -12,6 +12,7 @@ import pytest
 
 import linkedin_import as li
 
+TODAY = "2026-10-21"
 HEADER = "First Name,Last Name,URL,Email Address,Company,Position,Connected On"
 
 
@@ -96,7 +97,7 @@ def test_linkedin_connections_import_plan_company_reasons():
         _row(first="F", company="Initech"),
         _row(first="", last="", company="Initech"),
     ]
-    plan = li.plan_import(rows, [], normalize_company)
+    plan = li.plan_import(rows, [], normalize_company, TODAY)
     reasons = {s["name"]: s["reason"] for s in plan.skipped}
     assert reasons["A Reyes"] == li.NO_COMPANY
     assert reasons["B Reyes"] == li.NOT_A_COMPANY
@@ -126,7 +127,7 @@ def test_linkedin_connections_import_plan_dedupes_in_file_and_against_sheet():
         # one row matching all three keys at once is counted once, under the URL key
         _row(first="Ana", last="Cruz", company="Umbrella Works", url="https://www.linkedin.com/in/ana-cruz", email="ana@example.com"),
     ]
-    plan = li.plan_import(rows, existing, normalize_company)
+    plan = li.plan_import(rows, existing, normalize_company, TODAY)
     got = [s["reason"] for s in plan.skipped]
     assert got == [
         li.ALREADY_IN_SHEET_NAME_COMPANY, li.ALREADY_IN_SHEET_EMAIL, li.ALREADY_IN_SHEET_URL,
@@ -139,7 +140,7 @@ def test_linkedin_connections_import_plan_dedupes_in_file_and_against_sheet():
         [_row(first="Ana", last="Cruz", company="Umbrella Works", url="https://www.linkedin.com/in/ana-cruz", email="ana@example.com")],
         [{"name": "Ana Cruz", "company": "Umbrella Works Inc", "email": "ana@example.com",
           "source_link": "https://www.linkedin.com/in/ana-cruz", "sheet_uuid": "u9"}],
-        normalize_company)
+        normalize_company, TODAY)
     assert [s["reason"] for s in triple.skipped] == [li.ALREADY_IN_SHEET_URL]
     assert triple.summary["skipped"] == 1 and sum(triple.summary["by_reason"].values()) == 1
 
@@ -149,7 +150,7 @@ def test_linkedin_connections_import_plan_rows_with_email_are_listed_for_check_a
         _row(first="Ana", last="Cruz", company="Umbrella Works", email="Ana@Example.com"),
         _row(first="Bo", last="Diaz", company="Hooli"),
     ]
-    plan = li.plan_import(rows, [], normalize_company)
+    plan = li.plan_import(rows, [], normalize_company, TODAY)
     assert [a["name"] for a in plan.add] == ["Ana Cruz", "Bo Diaz"]
     assert plan.emails_to_check == [{
         "email": "ana@example.com", "name": "Ana Cruz", "company": "Umbrella Works",
@@ -178,7 +179,7 @@ def test_linkedin_connections_import_plan_summary_counts_add_up_for_mixed_file()
     ]) + "\n"
     rows = li.parse_connections_csv(text)
     assert len(rows) == 12
-    plan = li.plan_import(rows, existing, normalize_company)
+    plan = li.plan_import(rows, existing, normalize_company, TODAY)
     s = plan.summary
     assert s["total"] == 12 == len(plan.add) + len(plan.skipped)
     assert s["added"] == len(plan.add) == 6
@@ -196,18 +197,18 @@ def test_linkedin_connections_import_plan_warm_row_puts_title_in_note_not_priori
     plan = li.plan_import(
         [_row(url="https://www.linkedin.com/in/Dana-Reyes-123/?trk=x", position="Operations Manager",
               company="Acme Logistics", connected="15 Mar 2023")],
-        [], normalize_company)
+        [], normalize_company, TODAY)
     row = plan.add[0]
     assert row["priority"] == ""
-    assert row["note"] == "Operations Manager at Acme Logistics. Connected 2023-03-15 (LinkedIn import)"
+    assert row["note"] == "[2026-10-21] Operations Manager at Acme Logistics. Connected 2023-03-15 (LinkedIn import)"
     assert "Operations Manager" not in str(row["priority"])
     assert row["source"] == "https://www.linkedin.com/in/dana-reyes-123"
     assert row["name"] == "Dana Reyes" and row["company"] == "Acme Logistics"
     assert row["status"] == "Warm Lead"
-    assert "last_contact" not in row and "next_followup" not in row
+    assert "next_followup" not in row
     # No title, no date: the note still reads cleanly.
-    bare = li.plan_import([_row(position="", connected="")], [], normalize_company).add[0]
-    assert bare["note"] == "Works at Acme Logistics (LinkedIn import)"
+    bare = li.plan_import([_row(position="", connected="")], [], normalize_company, TODAY).add[0]
+    assert bare["note"] == "[2026-10-21] Works at Acme Logistics (LinkedIn import)"
 
 
 def test_linkedin_connections_import_plan_module_is_pure():
@@ -234,11 +235,11 @@ def test_linkedin_connections_import_plan_real_names_with_employer_looking_prefi
     names = ["Independent Bank Group", "Student Transportation of America", "Self Regional Healthcare",
              "Stealth BioTherapeutics", "Confidential Cures"]
     rows = [_row(first=f"P{i}", company=c) for i, c in enumerate(names)]
-    plan = li.plan_import(rows, [], normalize_company)
+    plan = li.plan_import(rows, [], normalize_company, TODAY)
     assert [a["company"] for a in plan.add] == names and plan.skipped == []
     rejected = [_row(first=f"Q{i}", company=c) for i, c in
                 enumerate(["Freelance Designer", "Self-Employed Consultant", "Independent Consultant", "Student", "Stealth"])]
-    plan = li.plan_import(rejected, [], normalize_company)
+    plan = li.plan_import(rejected, [], normalize_company, TODAY)
     assert [s["reason"] for s in plan.skipped] == [li.NOT_A_COMPANY] * 5
 
 
@@ -247,7 +248,7 @@ def test_linkedin_connections_import_plan_unparseable_url_cell_does_not_abort_th
     existing = [{"name": "Pat Lane", "company": "Acme Logistics", "email": "", "source_link": "https://[abc", "sheet_uuid": "u1"}]
     rows = [_row(first="Bo", last="Diaz", company="Hooli", url="https://[abc"),
             _row(first="Pat", last="Lane", company="Acme Logistics")]
-    plan = li.plan_import(rows, existing, normalize_company)
+    plan = li.plan_import(rows, existing, normalize_company, TODAY)
     assert [a["name"] for a in plan.add] == ["Bo Diaz"]
     assert plan.add[0]["source"] == ""
     assert [s["reason"] for s in plan.skipped] == [li.ALREADY_IN_SHEET_NAME_COMPANY]
@@ -261,11 +262,11 @@ def test_linkedin_connections_import_plan_messy_sheet_rows_still_dedupe():
     rows = [_row(first="Pat", last="Lane", company="Acme Logistics", url="https://www.linkedin.com/in/Pat-Lane/"),
             _row(first="Kim", last="Voss", company="Acme Logistics"),
             _row(first="Zed", last="Quinn", company="Acme Logistics")]
-    plan = li.plan_import(rows, existing, normalize_company)
+    plan = li.plan_import(rows, existing, normalize_company, TODAY)
     assert [s["reason"] for s in plan.skipped] == [li.ALREADY_IN_SHEET_URL, li.ALREADY_IN_SHEET_NAME_ONLY]
     assert [a["name"] for a in plan.add] == ["Zed Quinn"]
     # a URL-in-name row is not also treated as a person called "https://..."
-    only_url = li.plan_import([_row(first="Zed", last="Quinn")], existing[:1], normalize_company)
+    only_url = li.plan_import([_row(first="Zed", last="Quinn")], existing[:1], normalize_company, TODAY)
     assert len(only_url.add) == 1
 
 
@@ -279,16 +280,42 @@ def test_linkedin_connections_import_plan_unmapped_company_header_fails_loudly()
 def test_linkedin_connections_import_plan_empty_body_reports_zero_rows_in():
     rows = li.parse_connections_csv(HEADER + "\n")
     assert rows == []
-    plan = li.plan_import(rows, [], normalize_company)
+    plan = li.plan_import(rows, [], normalize_company, TODAY)
     assert plan.summary["rows_in"] == 0 and plan.summary["total"] == 0
-    mixed = li.plan_import([_row(), _row(first="Bo", company="")], [], normalize_company)
+    mixed = li.plan_import([_row(), _row(first="Bo", company="")], [], normalize_company, TODAY)
     assert mixed.summary["rows_in"] == 2 == mixed.summary["total"]
 
 
 def test_linkedin_connections_import_plan_punctuation_in_company_does_not_break_name_match():
     existing = [{"name": "Pat Lane", "company": "Acme, Inc.", "email": "", "source_link": "", "sheet_uuid": "u1"}]
-    plan = li.plan_import([_row(first="Pat", last="Lane", company="Acme")], existing, normalize_company)
+    plan = li.plan_import([_row(first="Pat", last="Lane", company="Acme")], existing, normalize_company, TODAY)
     assert [s["reason"] for s in plan.skipped] == [li.ALREADY_IN_SHEET_NAME_COMPANY]
     existing = [{"name": "Pat Lane", "company": "Acme", "email": "", "source_link": "", "sheet_uuid": "u1"}]
-    plan = li.plan_import([_row(first="Pat", last="Lane", company="Acme, Inc.")], existing, normalize_company)
+    plan = li.plan_import([_row(first="Pat", last="Lane", company="Acme, Inc.")], existing, normalize_company, TODAY)
     assert [s["reason"] for s in plan.skipped] == [li.ALREADY_IN_SHEET_NAME_COMPANY]
+
+
+def test_linkedin_import_review_followups():
+    # (1) the Warm row carries the three contact dates, a dated note and no next_followup.
+    clean = li.clean_connection(_row(connected="15 Mar 2023"))
+    item = li.to_warm_row(clean, "2026-10-21")
+    assert item["first_contact"] == item["date_added"] == item["last_contact"] == "2026-10-21"
+    assert item["note"].startswith("[2026-10-21] ")
+    assert "next_followup" not in item
+    # (2) dates: time parts dropped, slash dates read only when unambiguous, the rest empty.
+    for text in ("15 Mar 2023", "2023-03-15", "2023-03-15 10:22:00", "2023-03-15T10:22:00Z",
+                 "15 Mar 2023 10:22", "03/15/2023", "15/03/2023"):
+        assert li._iso_date(text) == "2023-03-15", text
+    assert li._iso_date("03/04/2023") == ""
+    assert li._iso_date("not a date") == ""
+    assert li._iso_date("") == ""
+    # (3) the plan counts rows whose date text it could not read, and still adds them.
+    rows = [_row(first="Ana", last="Cruz", connected="03/04/2023"),
+            _row(first="Bo", last="Lane", connected="not a date"),
+            _row(first="Cy", last="Park", connected="15 Mar 2023"),
+            _row(first="Di", last="Wu", connected="")]
+    plan = li.plan_import(rows, [], normalize_company, TODAY)
+    assert plan.summary["dates_unparsed"] == 2
+    assert plan.summary["total"] == len(plan.add) + len(plan.skipped) == 4
+    assert len(plan.add) == 4
+    assert all("Connected" not in a["note"] for a in plan.add if a["name"] in ("Ana Cruz", "Bo Lane"))
