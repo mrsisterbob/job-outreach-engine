@@ -18,9 +18,12 @@ step must call it for each listed email BEFORE writing and drop the hits.
 
 Landing tab is Carmen Warm (PEOPLE schema). The job title goes in `note`, never in `priority`:
 column E of a PEOPLE row is "Context / Priority" and get_warm_crm_contacts parses it as a priority.
-`last_contact` and `next_followup` are deliberately NOT set: the follow-up sequencer derives its
-rung from the date gap, so the write step must stamp today and the first ladder rung, not the
-(possibly years-old) Connected On date.
+`first_contact`, `date_added` and `last_contact` are stamped with the `today` the caller passes in
+(never the possibly years-old Connected On date), and the note starts `[today] ` exactly as the
+/warm quick-add writes it. `next_followup` is deliberately NOT set: these rows land in the reserve
+bench, and an undated row moved to Carmen Cold starts the ladder at +4 days.
+A Connected On value that cannot be read as a date becomes "" and is counted in
+`summary["dates_unparsed"]`; an all-numeric slash date is read only when one number is above 12.
 """
 import csv
 import io
@@ -168,16 +171,46 @@ def canonical_linkedin_url(url):
     return f"https://www.linkedin.com/in/{slug}" if slug else ""
 
 
-def _iso_date(value):
+# A trailing time of day ("10:22", "10:22:00", "10:22:00Z", "10:22:00+01:00") after a space or "T".
+_TIME_TAIL = re.compile(
+    r"^(?P<date>.*?\S)(?:\s+|T)\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+    r"(?:\s*[AaPp][Mm])?\s*(?:Z|[+-]\d{2}:?\d{2})?$")
+_SLASH_DATE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})$")
+
+
+def _parse_date(value):
+    """(iso, status): status is "empty", "ok" or "unparsed". Never guesses an ambiguous date."""
     text = _collapse(value)
     if not text:
-        return ""
+        return "", "empty"
+    tail = _TIME_TAIL.match(text)
+    if tail:
+        text = tail.group("date")
+    slash = _SLASH_DATE.match(text)
+    if slash:
+        first, second, year = int(slash.group(1)), int(slash.group(2)), slash.group(3)
+        if first == second or (second > 12 >= first):
+            month, day = first, second
+        elif first > 12 >= second:
+            month, day = second, first
+        else:  # both 12 or below and different (ambiguous), or both above 12 (impossible)
+            return "", "unparsed"
+        fmt = "%m/%d/%Y" if len(year) == 4 else "%m/%d/%y"
+        try:
+            return datetime.strptime(f"{month}/{day}/{year}", fmt).strftime("%Y-%m-%d"), "ok"
+        except ValueError:
+            return "", "unparsed"
     for fmt in _DATE_FORMATS:
         try:
-            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d"), "ok"
         except ValueError:
             continue
-    return ""
+    return "", "unparsed"
+
+
+def _iso_date(value):
+    """YYYY-MM-DD, or "" when the value is empty or cannot be read as a date."""
+    return _parse_date(value)[0]
 
 
 def clean_connection(raw):
@@ -189,13 +222,15 @@ def clean_connection(raw):
     email = _collapse(raw.get("email")).lower()
     if "@" not in email or " " in email:
         email = ""
+    connected_on, date_status = _parse_date(raw.get("connected_on"))
     return {
         "name": name,
         "company": _collapse(raw.get("company")),
         "title": _collapse(raw.get("position") or raw.get("title")),
         "url": canonical_linkedin_url(raw.get("url")),
         "email": email,
-        "connected_on": _iso_date(raw.get("connected_on")),
+        "connected_on": connected_on,
+        "date_unparsed": date_status == "unparsed",
     }
 
 
@@ -206,13 +241,15 @@ def _is_non_employer(company):
     return any(flat.startswith(p + " ") for p in NON_EMPLOYER_PREFIXES)
 
 
-def to_warm_row(clean):
-    """Cleaned connection -> Carmen Warm named-object fields (Code.gs FIELD_ALIASES PEOPLE)."""
+def to_warm_row(clean, today):
+    """Cleaned connection -> Carmen Warm named-object fields (Code.gs FIELD_ALIASES PEOPLE).
+    `today` is an ISO date string passed in (this module never reads the clock); it stamps the
+    three contact dates and prefixes the note. `next_followup` is left unset on purpose."""
     title, company, joined = clean.get("title", ""), clean.get("company", ""), clean.get("connected_on", "")
     parts = [f"{title} at {company}" if title else f"Works at {company}"]
     if joined:
         parts.append(f"Connected {joined}")
-    note = ". ".join(parts) + " (LinkedIn import)"
+    note = f"[{today}] " + ". ".join(parts) + " (LinkedIn import)"
     return {
         "name": clean.get("name", ""),
         "company": company,
@@ -220,6 +257,9 @@ def to_warm_row(clean):
         "priority": "",
         "status": WARM_STATUS,
         "source": clean.get("url", ""),
+        "first_contact": today,
+        "date_added": today,
+        "last_contact": today,
         "note": note,
     }
 
@@ -243,10 +283,11 @@ def _name_company_key(name, company, normalize_company):
     return (n, c) if n and c else None
 
 
-def plan_import(rows, existing, normalize_company):
+def plan_import(rows, existing, normalize_company, today):
     """Clean, de-duplicate and map `rows`. `existing` is a list of PEOPLE-row dicts (name,
     company, email, source_link, sheet_uuid). `normalize_company` is injected (the real call
-    passes main.normalize_company_for_match). Nothing is written."""
+    passes main.normalize_company_for_match). `today` is an ISO date string stamped on every added
+    row. Nothing is written."""
     sheet_urls, sheet_emails, sheet_names, sheet_name_only = set(), set(), set(), set()
     for rec in existing or []:
         # A messy sheet row can hold the profile URL in the NAME column.
@@ -268,6 +309,7 @@ def plan_import(rows, existing, normalize_company):
 
     file_urls, file_emails, file_names = set(), set(), set()
     plan = ImportPlan()
+    dates_unparsed = 0
 
     def skip(clean, reason):
         plan.skipped.append({
@@ -277,6 +319,8 @@ def plan_import(rows, existing, normalize_company):
 
     for raw in rows or []:
         clean = clean_connection(raw)
+        if clean["date_unparsed"]:
+            dates_unparsed += 1
         if not clean["name"]:
             skip(clean, NO_NAME)
             continue
@@ -314,7 +358,7 @@ def plan_import(rows, existing, normalize_company):
             file_emails.add(email)
         if nc_key:
             file_names.add(nc_key)
-        item = to_warm_row(clean)
+        item = to_warm_row(clean, today)
         if email:
             item["needs_email_check"] = True
             plan.emails_to_check.append({
@@ -333,5 +377,6 @@ def plan_import(rows, existing, normalize_company):
         "skipped": len(plan.skipped),
         "by_reason": by_reason,
         "emails_to_check": len(plan.emails_to_check),
+        "dates_unparsed": dates_unparsed,
     }
     return plan
