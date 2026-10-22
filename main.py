@@ -11,7 +11,6 @@ import re
 import shutil
 import contextlib
 import hashlib
-import inspect
 import sqlite3
 import sys
 import threading
@@ -16632,9 +16631,7 @@ def process_webhook_payload_async(data):
                     probe_failures = []   # the fetchers append the slug here when their request FAILED
                     found = 0
                     for fetcher in (fetch_greenhouse_jobs, fetch_lever_jobs, fetch_ashby_jobs):
-                        # Stand-in fetchers that predate failures= are still called with the slug only.
-                        takes_failures = "failures" in inspect.signature(fetcher).parameters
-                        found += len(fetcher(slug, failures=probe_failures) if takes_failures else fetcher(slug))
+                        found += len(fetcher(slug, failures=probe_failures))
                     if found:
                         resolved.append(slug)
                         added.append(f"{slug} ({found})")

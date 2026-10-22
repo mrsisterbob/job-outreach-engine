@@ -17584,9 +17584,9 @@ def test_warm_radar_scans_boards_in_batches_slug_list_writes_through_two_paths_b
     monkeypatch.setattr(m, "get_filter", fake_get_filter)
     monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
     monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
-    monkeypatch.setattr(m, "fetch_greenhouse_jobs", lambda slug: [{"id": 1}])
-    monkeypatch.setattr(m, "fetch_lever_jobs", lambda slug: [])
-    monkeypatch.setattr(m, "fetch_ashby_jobs", lambda slug: [])
+    monkeypatch.setattr(m, "fetch_greenhouse_jobs", lambda slug, failures=None: [{"id": 1}])
+    monkeypatch.setattr(m, "fetch_lever_jobs", lambda slug, failures=None: [])
+    monkeypatch.setattr(m, "fetch_ashby_jobs", lambda slug, failures=None: [])
     monkeypatch.setattr(m, "discover_ecosystem_network",
                         lambda entity: {"canonical_name": entity, "ecosystem_keywords": [], "probable_ats_slugs": ["betaboard"]})
     monkeypatch.setattr(m, "verify_live_slugs", lambda candidates: list(candidates))
@@ -17688,9 +17688,9 @@ def test_warm_radar_scans_boards_in_batches_ats_add_with_a_repeated_slug_probes_
     monkeypatch.setattr(m, "get_filter", lambda key, default=None: list(filters.get(key, default or [])))
     monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
     monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
-    monkeypatch.setattr(m, "fetch_greenhouse_jobs", lambda slug: probes.append(slug) or [{"id": 1}])
-    monkeypatch.setattr(m, "fetch_lever_jobs", lambda slug: [])
-    monkeypatch.setattr(m, "fetch_ashby_jobs", lambda slug: [])
+    monkeypatch.setattr(m, "fetch_greenhouse_jobs", lambda slug, failures=None: probes.append(slug) or [{"id": 1}])
+    monkeypatch.setattr(m, "fetch_lever_jobs", lambda slug, failures=None: [])
+    monkeypatch.setattr(m, "fetch_ashby_jobs", lambda slug, failures=None: [])
     m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": "/ats add acme, beta acme"}})
     assert filters["ats_company_slugs"] == ["acme", "beta"] and probes == ["acme", "beta"]
 
