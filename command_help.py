@@ -109,6 +109,23 @@ HELP = {
         "/f 7\n-> next follow-up moves out a week",
     ),
 
+    "/refer": (
+        "Lists the referral asks /w has written for warm contacts, with the text ready to copy, 5 per "
+        "page and oldest first. 'sent' hands the contact to the Carmen Cold nudge ladder; 'dismiss' "
+        "drops an ask that can never be sent (the contact moved to Killed or was deleted) and writes "
+        "nothing to the CRM.",
+        "/refer\n-> page 1 of the pending asks\n/refer 2\n-> page 2\n"
+        "/refer sent 14\n-> ask 14 marked sent, contact moves to Carmen Cold\n"
+        "/refer dismiss 14\n-> ask 14 leaves the list",
+    ),
+    "/ghost": (
+        "The switch behind the nightly 'ghosted' burial of Applied rows with no movement. ON moves "
+        "them to Died; OFF leaves every application where it is. With no argument it shows the "
+        "state and the rows past the cutoff, oldest first, one page at a time.",
+        "/ghost\n-> state plus page 1 of the rows past the cutoff\n/ghost 2\n-> page 2\n"
+        "/ghost on\n/ghost off",
+    ),
+
     # ---- The template bank editor, which is the confusing one ----
     "/edit": (
         "Edits one banked template in place by its slot code. The code is a letter for the bank "

@@ -13836,7 +13836,8 @@ REFER_PAGE_SIZE = 5
 REFER_RESUME_REMINDER = "Attach your resume by hand before you send."
 _REFER_READ_FAILED = "Could not read the ask list, check /health. Nothing changed."
 _REFER_MAX_ARG = 2 ** 31 - 1
-_REFER_USAGE = "Use /refer, /refer 2 for another page, or /refer sent &lt;id&gt;."
+_REFER_USAGE = ("Use /refer, /refer 2 for another page, /refer sent &lt;id&gt;, "
+                "or /refer dismiss &lt;id&gt;.")
 _REFER_NO_ASKS = "No pending referral asks. /w creates them when a warm contact's company posts a new role."
 
 
@@ -13957,7 +13958,8 @@ def send_refer_page(chat_id, page):
     for row in rows:
         blocks.extend(_refer_item_blocks(row))
     footer = f"Page {page} of {pages}" + (f" · /refer {page + 1}" if page < pages else "")
-    blocks.append(f"<i>{footer}\n{REFER_RESUME_REMINDER}\nSent one? /refer sent &lt;id&gt;</i>")
+    blocks.append(f"<i>{footer}\n{REFER_RESUME_REMINDER}\nSent one? /refer sent &lt;id&gt; · "
+                  f"Can't send one? /refer dismiss &lt;id&gt;</i>")
     for message in _pack_telegram_blocks(blocks):
         send_telegram_message(chat_id, message)
 
@@ -13979,9 +13981,18 @@ def _locate_carmen_contact(sheet_uuid):
 
 
 def mark_referral_ask_sent(ask_id):
-    """/refer sent <id>: the reply text. Queues the CRM hand-off to the Carmen Cold ladder FIRST
-    (one atomic enqueue), and only once it is durably queued sets the ask 'sent'. If the queue
-    fails, nothing changed and the ask stays pending.
+    """/refer sent <id>: the reply text. CLAIM FIRST: one conditional UPDATE sets the ask 'sent'
+    (WHERE status = 'pending') and its rowcount decides which of two overlapping calls proceeds; the
+    loser queues nothing and reports the ask's real current status. Only the claimant then queues
+    the CRM hand-off to the Carmen Cold ladder (one atomic enqueue), and Kevin is told "sent" only
+    once that is durably queued. If the enqueue fails or raises, the claim is RELEASED (status back
+    to 'pending', sent_at cleared) so the ask is not lost, and the reply says so; if the release
+    itself fails the reply says that instead and points at /health. The claim commits on its own
+    connection before the enqueue, so no SQLite write lock is held across it.
+
+    Residual risk: a process crash between the claim commit and the enqueue leaves the ask 'sent'
+    with no CRM writes queued (the same record-only state a Hot contact has by design). Kevin was
+    not told "sent" in that case, because the reply is only built after the enqueue.
 
     The hand-off mirrors what the sequencer itself writes when it revives a stale Carmen Cold row
     (a "Ladder restarted" note dated today, then Next Followup = today + the first rung) so the
@@ -14008,12 +14019,19 @@ def mark_referral_ask_sent(ask_id):
 
     if not sheet_uuid:
         # A blank id would match the first CRM row with a blank Column J and queue writes against "".
-        return f"Ask #{ask_id} has no contact id, so there is no CRM row to hand off. Nothing changed; it stays pending."
+        return (f"Ask #{ask_id} has no contact id, so there is no CRM row to hand off. Nothing changed; it "
+                f"stays pending. If it can never be sent, /refer dismiss {ask_id} clears it.")
+    # Hand-rolled scan of three tabs: the server-side find_contact_by_email in Code.gs searches every
+    # tab but by EMAIL, and a referral ask stores only the sheet_uuid, so it cannot be reused here;
+    # Killed is not readable through get_followups at all. A contact in Killed (or deleted) therefore
+    # lands in the branch below, which names the way out instead of leaving the ask stuck in silence.
     tab, rec, reads_ok = _locate_carmen_contact(sheet_uuid)
     if rec is None:
-        why = ("The CRM read failed" if not reads_ok
-               else "Could not find this contact in Carmen Warm, Cold or Hot")
-        return f"{why}. Nothing changed; ask #{ask_id} stays pending."
+        if not reads_ok:
+            return f"The CRM read failed. Nothing changed; ask #{ask_id} stays pending."
+        return (f"Could not find this contact in Carmen Warm, Cold or Hot (it may have been moved to Killed "
+                f"or deleted). Nothing changed; ask #{ask_id} stays pending. If it can never be sent, "
+                f"/refer dismiss {ask_id} clears it.")
 
     today = datetime.now().date()
     first_nudge = (today + timedelta(days=CARMEN_LADDER_DAYS_COLD[0])).strftime("%Y-%m-%d")
@@ -14027,26 +14045,61 @@ def mark_referral_ask_sent(ask_id):
             note=f"[{today.strftime('%Y-%m-%d')}] {LADDER_RESTART_NOTE_MARKER} - referral ask #{ask_id} sent by "
                  f"hand, {cadence} ladder starts from today. First nudge {first_nudge}."))
         payloads.append(build_crm_payload("update_snooze", sheet_uuid=sheet_uuid, next_followup=first_nudge))
-    if payloads and not enqueue_crm_payloads(payloads):
-        return f"Nothing changed: the CRM writes could not be queued. Ask #{ask_id} stays pending."
-
+    # CLAIM FIRST. Telegram redelivers an update when the first response is slow, so two
+    # `/refer sent N` can run at once; both pass the pending check above. One conditional UPDATE
+    # decides who proceeds, and only the claimant queues the CRM payloads. The claim commits before
+    # the enqueue, so no SQLite write lock is held across it.
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        def _write():
+        def _claim():
             with get_db_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 cur = conn.execute(
                     "UPDATE referral_asks SET status = 'sent', sent_at = ?, updated_at = ? "
                     "WHERE id = ? AND status = 'pending'", (now, now, ask_id))
+                seen = None
+                if cur.rowcount != 1:  # same transaction as the UPDATE: what the loser actually lost to
+                    seen = conn.execute("SELECT status FROM referral_asks WHERE id = ?", (ask_id,)).fetchone()
                 conn.commit()
-                return cur.rowcount
-        changed = db_write_with_retry(_write, "referral_ask_sent")
+                return cur.rowcount, (str(seen[0]) if seen else None)
+        claimed, seen_status = db_write_with_retry(_claim, "referral_ask_sent")
     except Exception as e:
-        logging.error(f"Referral ask #{ask_id} sent-write failed after the CRM hand-off was queued: {e}")
-        changed = 0
-    if changed != 1:
-        return (f"The CRM hand-off for ask #{ask_id} was queued but the ask could not be marked sent. "
-                "Check /health before running this again.")
+        logging.error(f"Referral ask #{ask_id} claim failed: {e}")
+        return f"Nothing changed: could not save the ask as sent. Ask #{ask_id} stays pending."
+    if claimed != 1:
+        if seen_status is None:
+            return f"No ask #{ask_id}. /refer lists the pending ones."
+        if seen_status == "sent":
+            return f"Ask #{ask_id} is already marked sent. Nothing changed."
+        if seen_status == "pending":
+            return f"Ask #{ask_id} changed while saving it as sent. Nothing changed; try again."
+        return f"Ask #{ask_id} is {html.escape(seen_status)}, not pending. Nothing changed."
+
+    # Kevin is told "sent" only once the writes are durably queued; if they are not, give the ask back.
+    try:
+        queued = (not payloads) or bool(enqueue_crm_payloads(payloads))
+    except Exception as e:
+        logging.error(f"Referral ask #{ask_id} CRM enqueue raised: {e}")
+        queued = False
+    if not queued:
+        try:
+            def _release():
+                with get_db_conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur = conn.execute(
+                        "UPDATE referral_asks SET status = 'pending', sent_at = NULL, updated_at = ? "
+                        "WHERE id = ? AND status = 'sent'", (now, ask_id))
+                    conn.commit()
+                    return cur.rowcount
+            released = db_write_with_retry(_release, "referral_ask_release")
+        except Exception as e:
+            logging.error(f"Referral ask #{ask_id} could not be released after a failed enqueue: {e}")
+            released = 0
+        if released == 1:
+            return (f"Nothing changed: the CRM writes could not be queued, so the claim was released. "
+                    f"Ask #{ask_id} stays pending.")
+        return (f"The CRM writes for ask #{ask_id} could not be queued and the ask could not be put back to "
+                "pending. Check /health, then run /refer to see where it stands.")
 
     who = html.escape(str(name or "the contact"))
     if tab == "Carmen Warm":
@@ -14064,6 +14117,39 @@ def mark_referral_ask_sent(ask_id):
     return "\n".join(lines)
 
 
+def dismiss_referral_ask(ask_id):
+    """/refer dismiss <id>: the reply text. Sets a PENDING ask to 'dismissed' (a value the table already
+    allows) so an ask that can never be sent leaves every page and the footer total. Writes nothing to
+    the CRM. One conditional UPDATE, so a dismiss racing a `sent` cannot undo it."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        def _write():
+            with get_db_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "UPDATE referral_asks SET status = 'dismissed', updated_at = ? "
+                    "WHERE id = ? AND status = 'pending'", (now, ask_id))
+                seen = None
+                if cur.rowcount != 1:  # read in the SAME transaction as the UPDATE, so it cannot disagree
+                    seen = conn.execute("SELECT status FROM referral_asks WHERE id = ?", (ask_id,)).fetchone()
+                conn.commit()
+                return cur.rowcount, seen
+        changed, row = db_write_with_retry(_write, "referral_ask_dismiss")
+        if changed == 1:
+            return f"Ask #{ask_id} dismissed. It is off the /refer list; nothing was changed in the CRM."
+    except Exception as e:
+        logging.error(f"/refer dismiss #{ask_id} failed: {e}")
+        return _REFER_READ_FAILED
+    if not row:
+        return f"No ask #{ask_id}. /refer lists the pending ones."
+    status = str(row[0])
+    if status == "sent":
+        return f"Ask #{ask_id} is already marked sent, not pending. Nothing changed."
+    if status == "pending":
+        return f"Ask #{ask_id} changed while dismissing it. Nothing changed; try again."
+    return f"Ask #{ask_id} is {html.escape(status)}, not pending. Nothing changed."
+
+
 def _refer_int(token):
     """An ASCII-digit token as an int no larger than 2**31-1, else None. isdecimal() alone accepts
     superscripts and other Unicode digits that int() rejects; the length cap keeps int() and the
@@ -14075,7 +14161,7 @@ def _refer_int(token):
 
 
 def handle_refer_command(chat_id, text):
-    """/refer, /refer N, /refer sent <id>. Text-only: the bot has no inline keyboards."""
+    """/refer, /refer N, /refer sent <id>, /refer dismiss <id>. Text-only: the bot has no inline keyboards."""
     arg = text[len("/refer"):].strip()
     if not arg:
         send_refer_page(chat_id, 1)
@@ -14085,6 +14171,8 @@ def handle_refer_command(chat_id, text):
         send_refer_page(chat_id, _refer_int(parts[0]))
     elif len(parts) == 2 and parts[0].lower() == "sent" and _refer_int(parts[1]) is not None:
         send_telegram_message(chat_id, mark_referral_ask_sent(_refer_int(parts[1])))
+    elif len(parts) == 2 and parts[0].lower() == "dismiss" and _refer_int(parts[1]) is not None:
+        send_telegram_message(chat_id, dismiss_referral_ask(_refer_int(parts[1])))
     else:
         send_telegram_message(chat_id, _REFER_USAGE)
 

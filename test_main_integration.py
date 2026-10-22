@@ -17714,3 +17714,226 @@ def test_ghost_switch_review_followups_escaped_page_fits_the_telegram_limit(monk
     pages = m.render_ghost_page([{"company": "&" * 300, "role": "<" * 300, "days": 30, "short_id": "ab12"}] * 10,
                                 1, False, limit=1000)
     assert len(pages) > 1 and all(len(p) <= 1000 for p in pages)
+
+
+# ---- /refer review follow-ups: dismiss, claim-first sent, help entries (TASK-131) ----
+
+def test_refer_review_followups_dismiss_removes_the_ask_from_every_page_and_the_footer_total(capture_sent):
+    ids = [_seed_refer_ask(i) for i in range(6)]
+    _dispatch("/refer")
+    assert "Page 1 of 2" in capture_sent[-1] and "dismiss" in capture_sent[-1]
+    capture_sent.clear()
+
+    _dispatch(f"/refer dismiss {ids[0]}")
+    assert f"Ask #{ids[0]} dismissed" in capture_sent[0]
+    assert _ask_row(ids[0])[0] == "dismissed"
+    assert _outbox_count() == 0                      # nothing reaches the CRM
+    capture_sent.clear()
+
+    _dispatch("/refer")                              # 5 left: one page, the sixth ask moved up
+    page = "\n".join(capture_sent)
+    assert _refer_ids(page) == ids[1:]
+    assert "Page 1 of 1" in page and "/refer 2" not in page
+    capture_sent.clear()
+    _dispatch("/refer 2")
+    assert "No page 2" in capture_sent[0]
+    total, rows = m.referral_asks_page(1, 50)
+    assert total == 5 and ids[0] not in [r[0] for r in rows]
+
+
+def test_refer_review_followups_dismiss_of_a_missing_sent_or_dismissed_id_replies_without_writing(capture_sent):
+    sent_id = _seed_refer_ask(1, status="sent")
+    gone_id = _seed_refer_ask(2, status="dismissed")
+    _dispatch("/refer dismiss 9999")
+    _dispatch(f"/refer dismiss {sent_id}")
+    _dispatch(f"/refer dismiss {gone_id}")
+    _dispatch("/refer dismiss")
+    _dispatch("/refer dismiss abc")
+
+    assert "No ask #9999" in capture_sent[0]
+    assert "already marked sent" in capture_sent[1] and "Nothing changed" in capture_sent[1]
+    assert "dismissed, not pending" in capture_sent[2]
+    assert capture_sent[3].startswith("Use /refer") and capture_sent[4].startswith("Use /refer")
+    assert _ask_row(sent_id)[0] == "sent" and _ask_row(gone_id)[0] == "dismissed"
+    assert _outbox_count() == 0
+
+
+def test_refer_review_followups_a_contact_that_cannot_be_found_gets_the_stuck_reply_and_can_be_dismissed(
+        monkeypatch, capture_sent):
+    _ReferSheet(monkeypatch, warm=[])               # moved to Killed or deleted: no tab the scan reads has it
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    live_id = _seed_refer_ask(2, uuid="refer-uuid-2")
+
+    _dispatch(f"/refer sent {ask_id}")
+    assert "Could not find this contact" in capture_sent[0] and f"/refer dismiss {ask_id}" in capture_sent[0]
+    assert _ask_row(ask_id) == ("pending", None) and _outbox_count() == 0
+
+    _dispatch(f"/refer dismiss {ask_id}")
+    assert _ask_row(ask_id)[0] == "dismissed" and _outbox_count() == 0
+    capture_sent.clear()
+    _dispatch("/refer")
+    assert _refer_ids("\n".join(capture_sent)) == [live_id]
+    assert "Page 1 of 1" in capture_sent[-1]
+
+
+def test_refer_review_followups_sent_twice_in_a_row_queues_one_set_of_payloads(monkeypatch, capture_sent):
+    _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+
+    first = m.mark_referral_ask_sent(ask_id)
+    second = m.mark_referral_ask_sent(ask_id)
+
+    assert "marked sent" in first and "already marked sent" in second
+    assert _outbox_count() == 3
+    with m.get_db_conn() as conn:
+        actions = [json.loads(p)["action"] for (p,) in conn.execute("SELECT payload_json FROM crm_outbox ORDER BY id")]
+    assert actions == ["update_status", "append_note", "update_snooze"]
+    assert _ask_row(ask_id)[0] == "sent"
+
+
+def test_refer_review_followups_two_overlapping_sent_calls_queue_exactly_one_set_of_payloads(monkeypatch):
+    """Both threads read the ask as pending and reach the contact lookup together (barrier), the way a
+    redelivered Telegram update would; only the claimant may queue the CRM writes."""
+    _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    real_locate = m._locate_carmen_contact
+    barrier = threading.Barrier(2, timeout=10)
+
+    def locate_together(sheet_uuid):
+        barrier.wait()
+        return real_locate(sheet_uuid)
+
+    monkeypatch.setattr(m, "_locate_carmen_contact", locate_together)
+    replies, errors = [], []
+
+    def run():
+        try:
+            replies.append(m.mark_referral_ask_sent(ask_id))
+        except Exception as e:  # pragma: no cover - surfaced by the assert below
+            errors.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert errors == [] and len(replies) == 2
+    assert sum("marked sent" in r and "already" not in r for r in replies) == 1
+    assert sum("already marked sent" in r for r in replies) == 1
+    assert _outbox_count() == 3                      # one set, not two
+    with m.get_db_conn() as conn:
+        payloads = [json.loads(p) for (p,) in conn.execute("SELECT payload_json FROM crm_outbox ORDER BY id")]
+    assert [p["action"] for p in payloads] == ["update_status", "append_note", "update_snooze"]
+    assert _ask_row(ask_id)[0] == "sent"
+
+
+@pytest.mark.parametrize("failure", ["returns_false", "raises"])
+def test_refer_review_followups_an_enqueue_failure_releases_the_claim(monkeypatch, capture_sent, failure):
+    _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    seen = {}
+    real_enqueue = m.enqueue_crm_payloads
+
+    def failing_enqueue(payloads):
+        seen["status_during"] = _ask_row(ask_id)[0]   # the claim is held while the writes are queued
+        if failure == "raises":
+            raise RuntimeError("disk full")
+        return False
+
+    monkeypatch.setattr(m, "enqueue_crm_payloads", failing_enqueue)
+    _dispatch(f"/refer sent {ask_id}")
+
+    assert seen["status_during"] == "sent"
+    assert _ask_row(ask_id) == ("pending", None)     # released: the ask is not lost
+    assert _outbox_count() == 0
+    assert "Nothing changed" in capture_sent[0] and "claim was released" in capture_sent[0]
+    assert "stays pending" in capture_sent[0] and "marked sent" not in capture_sent[0]
+
+    monkeypatch.setattr(m, "enqueue_crm_payloads", real_enqueue)   # a later retry queues the full set once
+    capture_sent.clear()
+    _dispatch(f"/refer sent {ask_id}")
+    assert "marked sent" in capture_sent[0] and _ask_row(ask_id)[0] == "sent" and _outbox_count() == 3
+
+
+def test_refer_review_followups_help_has_refer_and_ghost_entries():
+    import command_help as ch
+    refer = ch.lookup_command_help("/refer/")
+    assert refer and "No per-command help" not in refer
+    for needle in ("/refer sent", "/refer dismiss", "5 per page"):
+        assert needle in refer
+    ghost = ch.lookup_command_help("/ghost/")
+    assert ghost and "No per-command help" not in ghost
+    assert "/ghost on" in ghost and "/ghost off" in ghost and "/ghost 2" in ghost
+    assert ch.lookup_command_help("/refer sent 3") is None      # a real invocation falls through
+    assert ch.lookup_command_help("/ghost") is None
+
+
+def test_refer_review_followups_the_losing_claim_reports_the_real_status_never_sent_for_a_dismissed_ask(
+        monkeypatch):
+    """The ask is dismissed between the pending check and the claim: the loser must say dismissed."""
+    _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    real_locate = m._locate_carmen_contact
+
+    def locate_then_dismiss(sheet_uuid):
+        found = real_locate(sheet_uuid)
+        with m.get_db_conn() as conn:
+            conn.execute("UPDATE referral_asks SET status = 'dismissed' WHERE id = ?", (ask_id,))
+            conn.commit()
+        return found
+
+    monkeypatch.setattr(m, "_locate_carmen_contact", locate_then_dismiss)
+    reply = m.mark_referral_ask_sent(ask_id)
+
+    assert "dismissed, not pending" in reply and "marked sent" not in reply and "Nothing changed" in reply
+    assert _ask_row(ask_id)[0] == "dismissed" and _outbox_count() == 0
+
+
+def test_refer_review_followups_the_losing_claim_on_a_deleted_ask_says_no_ask(monkeypatch):
+    _ReferSheet(monkeypatch, warm=[_warm_contact()])
+    ask_id = _seed_refer_ask(1, uuid="refer-uuid-1")
+    real_locate = m._locate_carmen_contact
+
+    def locate_then_delete(sheet_uuid):
+        found = real_locate(sheet_uuid)
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM referral_asks WHERE id = ?", (ask_id,))
+            conn.commit()
+        return found
+
+    monkeypatch.setattr(m, "_locate_carmen_contact", locate_then_delete)
+    assert f"No ask #{ask_id}" in m.mark_referral_ask_sent(ask_id)
+    assert _outbox_count() == 0
+
+
+def test_refer_review_followups_dismiss_never_prints_pending_not_pending(monkeypatch):
+    """If the UPDATE misses but the same-transaction read shows pending, say it changed, not 'pending, not pending'."""
+    ask_id = _seed_refer_ask(1)
+
+    class _MissingUpdate:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a):
+            if sql.lstrip().startswith("UPDATE referral_asks SET status = 'dismissed'"):
+                return self._conn.execute("UPDATE referral_asks SET status = status WHERE 0")  # rowcount 0
+            return self._conn.execute(sql, *a)
+
+        def commit(self):
+            return self._conn.commit()
+
+    real = m.get_db_conn
+    from contextlib import contextmanager
+
+    @contextmanager
+    def wrapped():
+        with real() as conn:
+            yield _MissingUpdate(conn)
+
+    monkeypatch.setattr(m, "get_db_conn", wrapped)
+    reply = m.dismiss_referral_ask(ask_id)
+    monkeypatch.setattr(m, "get_db_conn", real)
+
+    assert "pending, not pending" not in reply and "changed while dismissing" in reply and "try again" in reply
+    assert _ask_row(ask_id)[0] == "pending"
