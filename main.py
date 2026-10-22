@@ -5038,9 +5038,8 @@ def evaluate_job_with_gemini(job):
         # Fail closed like every other failure path below: a missing key means nothing was screened,
         # and passing at a fabricated 75 would clear the >= 65 gate and ship every job unscreened.
         # Debounced because this runs inside a 20-worker pool - send_health_alert has no cooldown
-        # of its own, so without should_send_alert one keyless run would fire 20 Telegram messages.
-        if should_send_alert("gemini_key_missing"):
-            send_health_alert("GEMINI_API_KEY is unset - every candidate is failing closed as 'Evaluation Pending'. Expect a zero-result run until the key is restored.")
+        # of its own, so without send_debounced_alert one keyless run would fire 20 Telegram messages.
+        send_debounced_alert("gemini_key_missing", "GEMINI_API_KEY is unset - every candidate is failing closed as 'Evaluation Pending'. Expect a zero-result run until the key is restored.")
         return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0, 0, 0
 
     try:
@@ -5997,7 +5996,11 @@ def check_recent_gmail_draft_to(to_email):
         return None
 
 def should_send_alert(alert_key: str, cooldown_hours: int = 6) -> bool:
-    """Returns True if the alert has not been triggered within cooldown_hours (debounces repetitive alerts)."""
+    """Returns True if the alert has not been triggered within cooldown_hours (debounces repetitive alerts).
+
+    WARNING: this stamps the cooldown BEFORE the caller sends, so a failed send silences the alert
+    for the whole cooldown. New callers should use send_debounced_alert (stamps after the send).
+    """
     try:
         with get_db_conn() as conn:
             cursor = conn.cursor()
@@ -6017,6 +6020,60 @@ def should_send_alert(alert_key: str, cooldown_hours: int = 6) -> bool:
         logging.error(f"Alert Debounce Error: {e}")
         return True
 
+_ALERT_IN_FLIGHT = set()
+_ALERT_IN_FLIGHT_LOCK = threading.Lock()
+
+def send_debounced_alert(alert_key: str, message: str, cooldown_hours: int = 6, sender=None) -> bool:
+    """Send a debounced alert and stamp its cooldown only AFTER the send was accepted.
+
+    should_send_alert writes the system_alerts row before the caller sends, so one failed Telegram
+    send (unset token, network error, 429/5xx) silenced the alert for its whole cooldown - and the
+    alerts that exist to say "something is broken" are the ones that must not be eaten by a hiccup.
+    Here the row is only read first; a falsy send leaves no row and the next occurrence retries.
+
+    A database error while checking fails OPEN (send, return the send result), like
+    should_send_alert. `sender` defaults to send_health_alert(message); pass another callable
+    (taking the message, returning truthy on success) for alerts that go out another way.
+    A send that landed returns True even if the row could not be written.
+
+    Check-send-stamp is not atomic, so a worker pool (evaluate_job_with_gemini runs 20 wide) would
+    all read "no row" and each send. An in-process in-flight set closes that: while one call for a
+    key is between its check and its stamp, any other call for the same key returns False at once
+    (never blocks). The mark is cleared in a finally, so a failed send still retries next time.
+    """
+    with _ALERT_IN_FLIGHT_LOCK:
+        if alert_key in _ALERT_IN_FLIGHT:
+            return False
+        _ALERT_IN_FLIGHT.add(alert_key)
+    try:
+        try:
+            with get_db_conn() as conn:
+                row = conn.execute(
+                    "SELECT last_sent FROM system_alerts WHERE alert_key = ? AND last_sent >= datetime('now', ?)",
+                    (alert_key, f"-{cooldown_hours} hours")
+                ).fetchone()
+            if row:
+                return False
+        except Exception as e:
+            logging.error(f"Alert Debounce Error: {e}")
+            return bool(sender(message) if sender else send_health_alert(message))
+        sent = bool(sender(message) if sender else send_health_alert(message))
+        if not sent:
+            return False
+        try:
+            with get_db_conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO system_alerts (alert_key, last_sent) VALUES (?, CURRENT_TIMESTAMP)",
+                    (alert_key,)
+                )
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Alert stamp failed for {alert_key}: {e}")
+        return True
+    finally:
+        with _ALERT_IN_FLIGHT_LOCK:
+            _ALERT_IN_FLIGHT.discard(alert_key)
+
 def get_gmail_access_token():
     """Refresh a Gmail OAuth access token. Alerts Telegram (debounced) and returns None on any failure."""
     token_url = "https://oauth2.googleapis.com/token"
@@ -6033,20 +6090,22 @@ def get_gmail_access_token():
         # Any OAuth failure (invalid_grant, revoked, etc.) needs an explicit re-auth alert
         if "error" in token_json:
             error_code = token_json.get("error", "unknown_error")
-            if should_send_alert(f"oauth_{error_code}", cooldown_hours=6):
-                oauth_link = (
-                    "https://accounts.google.com/o/oauth2/v2/auth?"
-                    f"client_id={GMAIL_CLIENT_ID}&redirect_uri=http://localhost&"
-                    "scope=https://www.googleapis.com/auth/gmail.compose&response_type=code&"
-                    "access_type=offline&prompt=consent"
+            oauth_link = (
+                "https://accounts.google.com/o/oauth2/v2/auth?"
+                f"client_id={GMAIL_CLIENT_ID}&redirect_uri=http://localhost&"
+                "scope=https://www.googleapis.com/auth/gmail.compose&response_type=code&"
+                "access_type=offline&prompt=consent"
+            )
+            alert_msg = (
+                f"⚠️ <b>Gmail OAuth Failure ({html.escape(error_code)})</b>\n"
+                f"Please re-authorize production access:\n"
+                f"<a href='{html.escape(oauth_link, quote=True)}'>Authorize Gmail</a>"
+            )
+            if TELEGRAM_CHAT_ID:
+                send_debounced_alert(
+                    f"oauth_{error_code}", alert_msg, cooldown_hours=6,
+                    sender=lambda text: send_telegram_message(TELEGRAM_CHAT_ID, text),
                 )
-                alert_msg = (
-                    f"⚠️ <b>Gmail OAuth Failure ({html.escape(error_code)})</b>\n"
-                    f"Please re-authorize production access:\n"
-                    f"<a href='{html.escape(oauth_link, quote=True)}'>Authorize Gmail</a>"
-                )
-                if TELEGRAM_CHAT_ID:
-                    send_telegram_message(TELEGRAM_CHAT_ID, alert_msg)
             return None
         return token_json.get("access_token")
     except Exception as e:
@@ -7314,22 +7373,25 @@ def report_poller_failure(stage, detail):
     the failure mode is finding out from a missed interview days later.
 
     Rate-limited per stage so a persistent outage costs one message every six hours rather than one
-    per cycle. Uses the DB-backed should_send_alert() rather than a module-level dict: Render
+    per cycle. Uses the DB-backed send_debounced_alert() rather than a module-level dict: Render
     restarts the container on every deploy, and an in-memory cooldown would reset with it and
     re-alert on each boot. Never raises: a broken alerter must not also break the poll.
     """
     try:
         if not TELEGRAM_CHAT_ID:
             return
-        if not should_send_alert(f"poller_failure:{stage}", POLLER_FAILURE_ALERT_COOLDOWN_HOURS):
-            return
-        send_telegram_message(TELEGRAM_CHAT_ID, (
-            "🛑 <b>Email poller failure</b>\n\n"
-            f"<b>Stage:</b> {html.escape(str(stage))}\n"
-            f"<b>Detail:</b> {html.escape(str(detail))}\n\n"
-            "<i>Inbound alerts may be stopped. Check Gmail credentials on Render, "
-            "then run /poll to retry.</i>"
-        ))
+        send_debounced_alert(
+            f"poller_failure:{stage}",
+            (
+                "🛑 <b>Email poller failure</b>\n\n"
+                f"<b>Stage:</b> {html.escape(str(stage))}\n"
+                f"<b>Detail:</b> {html.escape(str(detail))}\n\n"
+                "<i>Inbound alerts may be stopped. Check Gmail credentials on Render, "
+                "then run /poll to retry.</i>"
+            ),
+            POLLER_FAILURE_ALERT_COOLDOWN_HOURS,
+            sender=lambda text: send_telegram_message(TELEGRAM_CHAT_ID, text),
+        )
     except Exception as e:
         logging.error(f"Poller failure alert could not be sent: {e}")
 
@@ -9021,6 +9083,16 @@ class PermanentCRMRejection(Exception):
         super().__init__(f"CRM '{action}' permanently rejected: {message}")
 
 
+CRM_UNAUTHORIZED_ALERT_TEXT = (
+    "CRM webhook is rejecting every write as Unauthorized - rows are NOT "
+    "reaching the sheet yet. They are HELD in the outbox and will land on "
+    "their own once this is fixed. Set the CRM_SHARED_SECRET Script "
+    "Property in the Apps Script project to match Render's "
+    "CRM_SHARED_SECRET, then redeploy the web app (Deploy > Manage "
+    "deployments > New version). /crazy shows what is waiting."
+)
+
+
 class CRMAuthRejected(Exception):
     """Apps Script answered "Unauthorized": the shared secret does not match, so EVERY write is
     refused until a human fixes the Render env var or the Script Property.
@@ -9231,19 +9303,12 @@ def log_to_sheets_crm(payload, max_retries=3, raise_on_permanent=False, alert_on
                     logging.error(f"CRM '{action}' rejected by Apps Script: {message}")
                     last_failure = message or "rejected with no message"
                     if "unauthorized" in message.lower():
-                        # Hourly at most: the outbox now holds these writes and re-tries them every
-                        # pass until the secret is fixed, so an unthrottled alert would fire every 5s.
-                        if should_send_alert("crm_write_unauthorized", cooldown_hours=1):
-                            send_health_alert(
-                                "CRM webhook is rejecting every write as Unauthorized - rows are NOT "
-                                "reaching the sheet yet. They are HELD in the outbox and will land on "
-                                "their own once this is fixed. Set the CRM_SHARED_SECRET Script "
-                                "Property in the Apps Script project to match Render's "
-                                "CRM_SHARED_SECRET, then redeploy the web app (Deploy > Manage "
-                                "deployments > New version). /crazy shows what is waiting."
-                            )
+                        # The outbox pass (raise_on_unauthorized) raises and alerts ITSELF, with the
+                        # held count, under the same key: one alert per outage, not two.
                         if raise_on_unauthorized:
                             raise CRMAuthRejected(message)
+                        # Hourly at most, and stamped only once Telegram accepted it.
+                        send_debounced_alert("crm_write_unauthorized", CRM_UNAUTHORIZED_ALERT_TEXT, cooldown_hours=1)
                         return False
                     # A deterministic rejection will answer identically forever, so retrying it
                     # only burns the backoff and - via the outbox, which re-dispatches every 5s
@@ -9384,18 +9449,28 @@ def process_crm_outbox_batch(inter_job_sleep=1.0):
             )
             _CRM_AUTH_BACKOFF["until"] = time.time() + _CRM_AUTH_BACKOFF_SECONDS
             # A held outbox is otherwise silent: the bot already said "Moved" and the writes sit
-            # PENDING until the secret is fixed. Alert once per outage (6h debounce in SQLite).
+            # PENDING until the secret is fixed. This is the ONE alert for the outage (log_to_sheets_crm
+            # does not alert when it raises CRMAuthRejected): 1h debounce in SQLite, stamped only
+            # after Telegram accepted it.
             try:
-                if should_send_alert("crm_outbox_auth_hold", cooldown_hours=6):
+                try:
                     with get_db_conn() as conn:
                         held = conn.execute(
                             "SELECT COUNT(*) FROM crm_outbox WHERE status = 'PENDING'"
                         ).fetchone()[0]
-                    send_health_alert(
-                        f"\U0001F510 CRM secret rejected: {held} queued Sheets write(s) are on hold "
-                        "(moves, statuses, follow-up dates). They will land in order once the "
-                        "Apps Script secret is fixed. Check /health."
-                    )
+                except Exception:
+                    held = None  # never guess: this pass only fetched 5 rows, and the debounce pins the text
+                held_text = f"{held} queued" if held is not None else "some queued"
+                send_debounced_alert(
+                    "crm_write_unauthorized",
+                    f"\U0001F510 CRM webhook is rejecting every write as Unauthorized - {held_text} "
+                    "Sheets write(s) are on hold (moves, statuses, follow-up dates). They will land "
+                    "in order on their own once this is fixed. Set the CRM_SHARED_SECRET Script "
+                    "Property in the Apps Script project to match Render's CRM_SHARED_SECRET, then "
+                    "redeploy the web app (Deploy > Manage deployments > New version). "
+                    "/crazy shows what is waiting.",
+                    cooldown_hours=1,
+                )
             except Exception as e:
                 logging.error(f"CRM auth-hold alert failed: {e}")
             return
