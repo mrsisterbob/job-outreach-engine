@@ -2354,6 +2354,46 @@ def split_link_check_budget(row_counts, limit):
     return alloc
 
 
+# A dead phrase on a 200 page counts only in the first DEAD_PHRASE_HEAD_CHARS characters of the
+# visible text, or anywhere on a page shorter than DEAD_PHRASE_STUB_CHARS (a retirement notice is
+# a stub). Planner's defaults, 2026-10-19; not measured against a corpus.
+DEAD_PHRASE_HEAD_CHARS = 1500
+DEAD_PHRASE_STUB_CHARS = 4000
+
+# Hours between two 'dead' verdicts before the second counts as a separate sweep. The sweep is
+# nightly, so 12h means two different nights and never a double fire of one.
+DEAD_CONFIRM_HOURS = 12
+
+# Each alternative takes a closed block, or an UNTERMINATED one through the end of the text:
+# fetch_job_link_state cuts pages at 400,000 chars, so a big inline script can lose its closing
+# tag, and its strings must not survive into the phrase scan. The lazy body stops at the block's
+# own closing tag when there is one, so text after a normal block is still read.
+_INVISIBLE_BLOCKS = re.compile(
+    r"<!--.*?(?:-->|\Z)|<(script|style|noscript)\b[^>]*>.*?(?:</\1\s*>|\Z)",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _visible_page_text(page_text):
+    """Lowercased, whitespace-collapsed text a visitor would read: no scripts, styles, comments."""
+    text = _INVISIBLE_BLOCKS.sub(" ", str(page_text or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).lower().strip()
+
+
+def dead_verdict_confirmed(previous_verdict, hours_since_first_dead):
+    """True when this sweep's 'dead' is a SECOND sighting from an earlier sweep.
+
+    `previous_verdict` is the ledger's verdict BEFORE this sweep overwrote it; the hours are since
+    its first_dead_at (None when unknown). A first dead verdict is recorded, never acted on.
+    """
+    if str(previous_verdict or "") != "dead" or hours_since_first_dead is None:
+        return False
+    try:
+        return float(hours_since_first_dead) >= DEAD_CONFIRM_HOURS
+    except (TypeError, ValueError):
+        return False
+
+
 def classify_job_link(url, status_code, final_url, page_text, fetch_error=None):
     """Classify one job link as 'dead', 'alive' or 'unknown'.
 
@@ -2379,10 +2419,13 @@ def classify_job_link(url, status_code, final_url, page_text, fetch_error=None):
     if code in (404, 410):
         return ("dead", f"HTTP {code}")
 
-    text = re.sub(r"<[^>]+>", " ", str(page_text or ""))
-    text = re.sub(r"\s+", " ", text).lower()
+    text = _visible_page_text(page_text)
+    # A live posting is long and its "no longer available" (a benefits line, a footer) is buried in
+    # the description; a retired posting is a stub that says so up top. So on a long page only the
+    # head counts, and a short page counts whole.
+    scanned = text if len(text) < DEAD_PHRASE_STUB_CHARS else text[:DEAD_PHRASE_HEAD_CHARS]
     for phrase in DEAD_JOB_PHRASES:
-        if phrase in text:
+        if phrase in scanned:
             return ("dead", f'page says "{phrase}"')
 
     if code >= 500:

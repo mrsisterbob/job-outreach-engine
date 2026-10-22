@@ -10681,13 +10681,29 @@ def _job_row(uuid_v, status, link, company="Acme", role="Ops Analyst"):
             "company": company, "job_title": role}
 
 
+def _age_first_dead(hours):
+    """Make every recorded first death `hours` old, as if the earlier sweep ran that long ago.
+    first_dead_at is SQLite UTC, so the rewrite uses SQLite's clock rather than sleeping."""
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE job_link_status SET first_dead_at = datetime('now', ?) "
+                     "WHERE first_dead_at IS NOT NULL", (f"-{int(hours)} hours",))
+        conn.commit()
+
+
+def _two_sweeps(**kw):
+    """First sweep sees the row dead; the next night's sweep (13h later) is the one that counts."""
+    m.check_job_links(sleep_between=0, **kw)
+    _age_first_dead(13)
+    return m.check_job_links(sleep_between=0, **kw)
+
+
 def test_sweep_retires_a_matched_row_with_a_dead_link(monkeypatch):
     queued = _linkcheck_env(
         monkeypatch,
         [_job_row("u-matched", "Matched", "https://co.com/j/1")],
         {"https://co.com/j/1": (404, "https://co.com/j/1", "", None)},
     )
-    result = m.check_job_links(sleep_between=0)
+    result = _two_sweeps()
 
     assert len(result["dead"]) == 1
     assert len(result["retired"]) == 1
@@ -10695,6 +10711,95 @@ def test_sweep_retires_a_matched_row_with_a_dead_link(monkeypatch):
     assert "append_note" in actions and "update_status" in actions
     move = [p for p in queued if p.get("action") == "update_status"][0]
     assert move["new_tab"] == "Died"
+
+
+def test_dead_link_verified_needs_two_sweeps(monkeypatch):
+    """THE BUG: the first dead verdict retired the row. Now a first sighting is recorded and listed
+    as unconfirmed; only a second sweep (>= 12h later) moves it to Died and records the role."""
+    url = "https://co.com/j/two"
+    fetches = {url: (404, url, "", None)}
+    queued = _linkcheck_env(monkeypatch, [_job_row("u-two-sweeps", "Matched", url)], fetches)
+    died = []
+    monkeypatch.setattr(m, "record_died_role", lambda c, r: died.append((c, r)))
+
+    first = m.check_job_links(sleep_between=0)
+    assert first["retired"] == []
+    assert len(first["dead"]) == 1 and first["dead"][0]["confirmed"] is False
+    assert queued == [] and died == []
+
+    # 5h later is the same night's retry, not a second sweep.
+    _age_first_dead(5)
+    early = m.check_job_links(sleep_between=0)
+    assert early["retired"] == [] and early["dead"][0]["confirmed"] is False and queued == []
+
+    _age_first_dead(13)
+    second = m.check_job_links(sleep_between=0)
+    assert len(second["retired"]) == 1 and second["dead"][0]["confirmed"] is True
+    move = [p for p in queued if p.get("action") == "update_status"]
+    assert len(move) == 1 and move[0]["new_tab"] == "Died"
+    assert died == [("Acme", "Ops Analyst")]
+
+    # The ledger is what the NEXT read sees: the row is flagged retired.
+    assert [r[6] for r in m.get_dead_job_links()] == [1]
+
+
+def test_dead_link_verified_alive_between_two_dead_resets_the_clock(monkeypatch):
+    url = "https://co.com/j/flap"
+    fetches = {url: (404, url, "", None)}
+    queued = _linkcheck_env(monkeypatch, [_job_row("u-flap", "Matched", url)], fetches)
+
+    m.check_job_links(sleep_between=0)
+    _age_first_dead(13)
+    fetches[url] = (200, url, "<p>Apply now. Responsibilities include reconciliation.</p>", None)
+    assert m.check_job_links(sleep_between=0)["dead"] == []
+
+    fetches[url] = (404, url, "", None)
+    again = m.check_job_links(sleep_between=0)
+    assert again["retired"] == [] and again["dead"][0]["confirmed"] is False
+    assert queued == [], "the alive night reset the confirmation, so nothing may be written"
+
+
+def test_dead_link_verified_links_report_lists_a_row_retired_tonight(monkeypatch):
+    """THE BUG: /links windowed on first_dead_at, which is ~24h old when the SECOND sweep retires
+    the row, so a row moved to Died tonight read as 'Nothing died in the last 24h'."""
+    url = "https://co.com/j/window"
+    _linkcheck_env(monkeypatch, [_job_row("u-window", "Matched", url, company="Windowco")],
+                   {url: (404, url, "", None)})
+    m.check_job_links(sleep_between=0)
+    _age_first_dead(25)
+    result = m.check_job_links(sleep_between=0)
+    assert len(result["retired"]) == 1
+
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    _dispatch("/links")
+    assert "Nothing died in the last 24h" not in sent[-1]
+    assert "Auto-retired to Died (1)" in sent[-1]
+
+
+def test_dead_link_verified_a_row_retired_long_ago_stays_out_of_the_window(monkeypatch):
+    _seed_dead_link_aged("u-long-gone", "Oldco", "Analyst", "Matched", 9, retired=1)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    _dispatch("/links")
+    assert "Nothing died in the last 24h" in sent[-1]
+
+
+def test_dead_link_verified_unconfirmed_matched_row_stays_out_of_the_digest(monkeypatch):
+    """A first sighting is not 'applied' and must not be flagged notified, or tomorrow's
+    retirement would never be reported."""
+    url = "https://co.com/j/digest"
+    _linkcheck_env(monkeypatch, [_job_row("u-digest", "Matched", url)], {url: (404, url, "", None)})
+    m.check_job_links(sleep_between=0)
+
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    _dispatch("/links")
+    assert "Seen dead once" in sent[-1] and "You applied" not in sent[-1]
+
+    _age_first_dead(13)
+    m.check_job_links(sleep_between=0)
+    assert [r[0] for r in m.get_dead_job_links(include_notified=False)] == ["u-digest"]
 
 
 def test_sweep_never_retires_an_applied_row(monkeypatch):
@@ -10740,7 +10845,7 @@ def test_sweep_caps_auto_retirement(monkeypatch):
     fetches = {f"https://co.com/j/{i}": (404, f"https://co.com/j/{i}", "", None) for i in range(over)}
     _linkcheck_env(monkeypatch, rows, fetches)
 
-    result = m.check_job_links(sleep_between=0)
+    result = _two_sweeps()
 
     assert len(result["dead"]) == over
     assert len(result["retired"]) == m.MAX_AUTO_RETIRE_PER_RUN
@@ -10941,9 +11046,9 @@ def _seed_dead_link_aged(sheet_uuid, company, role, status, days_ago, retired=0)
         conn.execute(
             "INSERT OR REPLACE INTO job_link_status "
             "(sheet_uuid, company, role, job_link, status, verdict, reason, retired, notified, "
-            " first_dead_at) "
-            "VALUES (?, ?, ?, ?, ?, 'dead', 'page says no longer available', ?, 0, ?)",
-            (sheet_uuid, company, role, "https://example.com/job", status, retired, when))
+            " first_dead_at, checked_at) "
+            "VALUES (?, ?, ?, ?, ?, 'dead', 'page says no longer available', ?, 0, ?, ?)",
+            (sheet_uuid, company, role, "https://example.com/job", status, retired, when, when))
         conn.commit()
 
 
@@ -11079,6 +11184,10 @@ def test_dry_run_then_commit_actually_retires(monkeypatch):
 
     m.check_job_links(auto_retire=False, sleep_between=0)
     assert queued == []
+
+    _age_first_dead(13)
+    dry = m.check_job_links(auto_retire=False, sleep_between=0)
+    assert dry["dead"][0]["confirmed"] is True and dry["retired"] == [] and queued == []
 
     result = m.check_job_links(auto_retire=True, sleep_between=0)
     assert len(result["retired"]) == 1
@@ -12925,9 +13034,9 @@ def test_sweep_still_fetches_linkedin_because_it_404s_honestly(monkeypatch):
         monkeypatch, rows,
         {"https://www.linkedin.com/jobs/view/1": (404, "https://www.linkedin.com/jobs/view/1", "", None)})
 
-    result = m.check_job_links(sleep_between=0)
+    result = _two_sweeps()
 
-    assert fetched == ["https://www.linkedin.com/jobs/view/1"]
+    assert fetched == ["https://www.linkedin.com/jobs/view/1"] * 2
     assert len(result["retired"]) == 1
 
 
@@ -12953,7 +13062,7 @@ def test_standup_names_each_auto_retired_row_and_why(monkeypatch):
                             company="Slate", role="Automotive Logistics Ops Specialist")]}
     _linkcheck_env_by_tab(monkeypatch, rows,
                           {"https://www.jobleads.com/us/job/x": (404, "https://www.jobleads.com/us/job/x", "", None)})
-    m.check_job_links(sleep_between=0)
+    _two_sweeps()
 
     sent = []
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
