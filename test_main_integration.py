@@ -17406,3 +17406,141 @@ def test_sales_title_rejects_selling_roles_only_through_the_warm_radar_gate(monk
     text = h.run()
     assert h.cards == ["Sales Controller"], h.cards
     assert "2 roles filtered out by title" in text, text
+
+
+# ---- TASK-132: a board whose fetch FAILED is reported, so /w does not stamp it as scanned ----
+
+class _AtsResp:
+    def __init__(self, status, body=None, bad_json=False):
+        self.status_code, self._body, self._bad_json = status, body, bad_json
+
+    def json(self):
+        if self._bad_json:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return self._body
+
+
+def _ats_get(behaviors):
+    """requests.get stub. behaviors: {(slug, platform): _AtsResp | Exception}; anything absent is 404."""
+    def fake_get(url, timeout=None, **kw):
+        if "greenhouse" in url:
+            platform, slug = "greenhouse", url.split("/boards/")[1].split("/")[0]
+        elif "lever" in url:
+            platform, slug = "lever", url.split("?")[0].rsplit("/", 1)[-1]
+        else:
+            platform, slug = "ashby", url.split("?")[0].rsplit("/", 1)[-1]
+        outcome = behaviors.get((slug, platform), _AtsResp(404, {}))
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+    return fake_get
+
+
+def test_ats_fetch_failures_are_reported(monkeypatch):
+    gh_post = {"id": 7, "title": "Analyst", "absolute_url": "https://x/7", "location": {"name": "Detroit"}}
+    behaviors = {
+        ("clean404", "greenhouse"): _AtsResp(404, {}),
+        ("rate", "greenhouse"): _AtsResp(429, {}),
+        ("down", "lever"): _AtsResp(503, {}),
+        ("slow", "ashby"): m.requests.exceptions.Timeout("read timed out"),
+        ("garbled", "greenhouse"): _AtsResp(200, bad_json=True),
+        ("partial", "greenhouse"): _AtsResp(200, {"jobs": [gh_post]}),
+        ("partial", "lever"): _AtsResp(500, {}),
+        ("healthy", "greenhouse"): _AtsResp(200, {"jobs": [gh_post]}),
+    }
+    monkeypatch.setattr(m.requests, "get", _ats_get(behaviors))
+
+    # (1) 404/404/404 is a clean "no board": returned [] and NOT reported
+    failed = []
+    assert m.fetch_ats_jobs(["clean404"], failed_slugs=failed) == []
+    assert failed == []
+
+    # (2) each failure shape is reported while the return stays []
+    for slug in ("rate", "down", "slow", "garbled"):
+        failed = []
+        assert m.fetch_ats_jobs([slug], failed_slugs=failed) == [], slug
+        assert failed == [slug], (slug, failed)
+
+    # a failure on one platform with postings from another: still reported, postings still returned
+    failed = []
+    jobs = m.fetch_ats_jobs(["partial"], failed_slugs=failed)
+    assert failed == ["partial"] and [j["job_id"] for j in jobs] == ["gh_partial_7"]
+
+    # unique, in input order, healthy and clean-404 boards left out
+    failed = []
+    m.fetch_ats_jobs(["garbled", "healthy", "rate", "clean404", "rate", "down"], failed_slugs=failed)
+    assert failed == ["garbled", "rate", "down"], failed
+
+    # the single fetchers report into `failures` directly and take no list by default
+    failures = []
+    assert m.fetch_greenhouse_jobs("rate", failures=failures) == [] and failures == ["rate"]
+    failures = []
+    assert m.fetch_lever_jobs("clean404", failures=failures) == [] and failures == []
+
+    # a future that RAISES (a fetcher blowing up outside its own try) is reported too
+    real_greenhouse = m.fetch_greenhouse_jobs
+
+    def boom(slug, failures=None):
+        raise RuntimeError("worker died")
+    monkeypatch.setattr(m, "fetch_greenhouse_jobs", boom)
+    failed = []
+    m.fetch_ats_jobs(["healthy"], failed_slugs=failed)
+    assert failed == ["healthy"]
+    monkeypatch.setattr(m, "fetch_greenhouse_jobs", real_greenhouse)
+
+    # (3) parameter omitted: same return values as before, old one-argument fetcher calls
+    assert [j["job_id"] for j in m.fetch_ats_jobs(["healthy"])] == ["gh_healthy_7"]
+    assert m.fetch_ats_jobs(["rate"]) == [] and m.fetch_ats_jobs(["clean404"]) == []
+    assert m.fetch_ats_jobs([]) == []
+    seen_calls = []
+    for name in ("fetch_greenhouse_jobs", "fetch_lever_jobs", "fetch_ashby_jobs"):
+        monkeypatch.setattr(m, name, lambda slug, _n=name: seen_calls.append((_n, slug)) or [])
+    assert m.fetch_ats_jobs(["solo"]) == [] and len(seen_calls) == 3
+
+
+def test_ats_fetch_failures_are_reported_and_warm_radar_leaves_the_failed_board_unstamped(monkeypatch):
+    h = _batch_harness(monkeypatch, 25)
+    seen, failed_once = [], []
+
+    def fetch(slugs, include_workday=False, failed_slugs=None):
+        seen.append(list(slugs))
+        if failed_slugs is not None:
+            if not failed_once:
+                failed_once.append(slugs[3])   # one board of the first chunk fails ...
+            if failed_once[0] in slugs:        # ... and keeps failing every time it is fetched
+                failed_slugs.append(failed_once[0])
+        return []
+
+    monkeypatch.setattr(m, "fetch_ats_jobs", fetch)
+    text = h.run()
+    first_run = [s for c in seen for s in c]
+    failed = failed_once[0]
+    assert len(first_run) == 20 and failed in first_run
+
+    scanned = {s for s, at in _scanned_at().items() if at}
+    assert scanned == set(first_run) - {failed}          # the rest of both chunks are stamped
+    assert _scanned_at()[failed] in (None, "")           # the failed board is not
+    assert _attempted_at()[failed]                       # but its attempt is recorded
+    assert "1 board could not be fetched" in text, text
+
+    # run 2: the 5 never-tried boards come first, then the oldest stamps. The failed board carries
+    # the newest stamp (its attempt, written after the scan stamps), so it is NOT fetched yet.
+    seen.clear()
+    h.run()
+    second_run = [s for c in seen for s in c]
+    never = set(h.slug_of.values()) - set(first_run)
+    assert len(never) == 5 and set(second_run[:5]) == never
+    assert failed not in second_run
+    assert _scanned_at()[failed] in (None, "")
+
+    # run 3: the 4 boards left from run 1 are older than the failed board's attempt, so it is
+    # fetched now - behind every board that was never tried or is staler - and, still reported
+    # failed by the stub, it stays unscanned.
+    seen.clear()
+    h.run()
+    third_run = [s for c in seen for s in c]
+    assert failed in third_run
+    assert set(third_run[:4]) == set(first_run) - set(second_run) - {failed}
+    assert third_run[4] == failed
+    assert _scanned_at()[failed] in (None, "")
+    assert _attempted_at()[failed]
