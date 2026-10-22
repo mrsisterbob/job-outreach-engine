@@ -55,8 +55,34 @@ ENTRY_TITLE_BONUS = 10          # junior / associate / entry-level / coordinator
 PLAIN_FAMILY_TITLE_BONUS = 6    # bare analyst / operations / administrator / assistant (was 4)
 
 
+# A trailing level numeral reads as seniority: "Analyst II" is a step up from "Analyst I". Roman forms
+# are uppercase only ("Analyst Iv" and the word "ii" in prose do not match). The numeral must follow
+# a letter word and end the title or sit right before a separator, so "Tier 2 Support Analyst",
+# "Level 3 Reporting Lead" and "Analyst (2025 Cohort)" are not read as levels.
+LEVEL2_CEILING = 74             # level II / 2: still in the Tier-2 digest band, never carded
+LEVEL3_PLUS_CEILING = 64        # level III and above: one under the digest floor (65), out of sight
+_LEVEL_VALUES = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5}
+_TITLE_LEVEL_RE = re.compile(r'(?<=[A-Za-z])\s+(III|II|IV|V|I|[1-5])\s*(?:$|[-–—,(|:])')
+
+
+def title_level(title):
+    """Level read off a trailing numeral (I/1 -> 1, II/2 -> 2, ... V/5 -> 5), None when absent."""
+    found = _TITLE_LEVEL_RE.search(str(title or "").strip())
+    if not found:
+        return None
+    tok = found.group(1)
+    return _LEVEL_VALUES[tok] if tok in _LEVEL_VALUES else int(tok)
+
+
 def seniority_ceiling(title):
-    """SENIOR_CEILING when the title matches SENIORITY_TITLE_RE, else None."""
+    """Lowest ceiling that applies to the title, or None: SENIOR_CEILING for a seniority word,
+    LEVEL2_CEILING for level 2, LEVEL3_PLUS_CEILING for level 3 or higher."""
+    caps = []
     if title and SENIORITY_TITLE_RE.search(title.lower()):
-        return SENIOR_CEILING
-    return None
+        caps.append(SENIOR_CEILING)
+    level = title_level(title)
+    if level is not None and level >= 3:
+        caps.append(LEVEL3_PLUS_CEILING)
+    elif level == 2:
+        caps.append(LEVEL2_CEILING)
+    return min(caps) if caps else None

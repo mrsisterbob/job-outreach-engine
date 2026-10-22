@@ -36,7 +36,8 @@ os.environ["JOB_ENGINE_NO_DAEMONS"] = "1"
 
 import main as m  # noqa: E402  (must import after JOBS_DB_PATH and JOB_ENGINE_NO_DAEMONS are set)
 from score_rules import (  # noqa: E402
-    ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS, SENIOR_CEILING, TIER1_FLOOR, seniority_ceiling)
+    ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS, SENIOR_CEILING, TIER1_FLOOR, seniority_ceiling,
+    title_level, LEVEL2_CEILING, LEVEL3_PLUS_CEILING)
 import resume_engine  # noqa: E402
 import track_registry  # noqa: E402
 import pipeline_utils  # noqa: E402
@@ -7971,6 +7972,65 @@ def test_score_seniority_ceiling_caps_senior_titles_and_weights_entry_titles(run
                          **dict(maxed, job_title="Senior Operations Manager", job_posted_at_datetime_utc=dead))
     assert both["score"] <= min(SENIOR_CEILING, m.AGE_DEAD_CEILING)
     assert seniority_ceiling("Operations Analyst") is None
+
+
+def test_score_title_level_ceiling_reads_a_trailing_numeral_as_seniority(run_candidate):
+    """Level I / 1 is left alone, level II loses the entry and plain-family bonuses and cannot reach
+    Tier 1, level III+ falls out of the Tier-2 digest as well. Kevin's example: Panasonic
+    "Financial Analyst II" asked for too much experience and scored the same +20 as "Junior"."""
+    cases = {
+        "Financial Analyst II": 2, "Financial Analyst III - Treasury": 3, "Financial Analyst IV": 4,
+        "Financial Analyst 2": 2, "Financial Analyst I": 1, "Analyst 1": 1, "Financial Analyst": None,
+        "Tier 2 Support Analyst": None, "Analyst (2025 Cohort)": None, "Analyst Iv": None,
+        "Level 3 Reporting Lead": None, "Financial Analyst V, Treasury": 5, "Analyst 6": None,
+    }
+    for title, level in cases.items():
+        assert title_level(title) == level, title
+    assert title_level(None) is None and title_level("") is None
+
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    maxed = {
+        "job_city": "troy", "job_posted_at_datetime_utc": fresh,
+        "job_description": "Fintech payments platform. Salesforce, Python and SQL reporting.",
+        "job_min_salary": 100000, "job_max_salary": 120000,
+    }
+
+    def run(title):
+        job = dict(maxed, job_title=title)
+        _, l1 = m.calculate_hybrid_score_modifier(dict(job), 75)
+        return run_candidate(gemini_base=75, layer1_bonus=l1, **job), l1
+
+    plain, plain_l1 = run("Financial Analyst")
+    one, one_l1 = run("Financial Analyst I")
+    two, two_l1 = run("Financial Analyst II")
+    two_digit, two_digit_l1 = run("Financial Analyst 2")
+    four, _ = run("Financial Analyst IV")
+    three_digit, _ = run("Financial Analyst 3")
+
+    assert plain["score"] >= TIER1_FLOOR
+    # Level I is left alone: it keeps the entry bonus the "analyst i" pattern always gave it.
+    assert one["score"] == plain["score"]
+    assert one_l1 - plain_l1 == ENTRY_TITLE_BONUS - PLAIN_FAMILY_TITLE_BONUS
+    assert two["score"] <= LEVEL2_CEILING < TIER1_FLOOR
+    assert two_digit["score"] <= LEVEL2_CEILING
+    assert plain_l1 - two_l1 == PLAIN_FAMILY_TITLE_BONUS                  # lost exactly the title bonus
+    assert plain_l1 - two_digit_l1 == PLAIN_FAMILY_TITLE_BONUS
+    assert one_l1 - two_l1 == ENTRY_TITLE_BONUS                           # II vs I: the entry bonus
+    assert four["score"] <= LEVEL3_PLUS_CEILING and three_digit["score"] <= LEVEL3_PLUS_CEILING
+    for res in (two, four):                                               # what the CRM/cache reads back
+        assert res["job"]["fit_score"] == res["score"]
+        assert res["score_boost"] >= 0
+
+    # "Junior ... II" no longer keeps the entry bonus, so it scores below plain "Junior ..." too.
+    junior, junior_l1 = run("Junior Financial Analyst")
+    junior_two, junior_two_l1 = run("Junior Financial Analyst II")
+    assert junior_l1 - junior_two_l1 == ENTRY_TITLE_BONUS
+    assert junior_two["score"] <= LEVEL2_CEILING
+
+    # Lowest ceiling wins: a senior word on a level-IV title still lands at the level III+ cap.
+    assert seniority_ceiling("Senior Financial Analyst IV") == LEVEL3_PLUS_CEILING
+    assert seniority_ceiling("Senior Financial Analyst II") == min(SENIOR_CEILING, LEVEL2_CEILING)
+    assert seniority_ceiling("Financial Analyst I") is None
 
 
 # ---- /dead decoy marking + /decoys report ----

@@ -156,7 +156,7 @@ WILDCARD_BONUS = max(0, int(os.environ.get("WILDCARD_BONUS", "2")))
 # tunable knob - raise toward 35 to loosen, drop toward 25 to force more spread.
 BONUS_STACK_CAP = 30
 from score_rules import (posted_age_adjustment, is_dead_posting, AGE_DEAD_CEILING, SENIORITY_TITLE_RE,
-                         seniority_ceiling, ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS)
+                         seniority_ceiling, title_level, ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS)
 
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
@@ -4609,6 +4609,11 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     # 80-point Tier-1 card gate. -30 so a maxed keyword+salary stack cannot buy it back.
     elif re.search(r'\b(developer|engineer|engineering|architect|programmer|swe|sdet|devops)\b', title):
         bonus -= 30
+    # Level II or higher ("Financial Analyst II") is a step up from the entry role, not an entry
+    # marker: it earns neither the entry nor the plain-family bonus. No penalty of its own; the
+    # ceiling in seniority_ceiling() keeps it out of Tier 1. Level I / 1 falls through unchanged.
+    elif (title_level(job.get("job_title")) or 0) >= 2:
+        pass
     elif re.search(r'\b(junior|jr\.?|associate|entry[ -]?level|analyst i|i{1,2}\b|coordinator|specialist)\b', title):
         bonus += ENTRY_TITLE_BONUS
     # Plain job-family titles, no seniority marker either way. "Operations Analyst", "EHR Clinical
