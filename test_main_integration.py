@@ -17544,3 +17544,173 @@ def test_ats_fetch_failures_are_reported_and_warm_radar_leaves_the_failed_board_
     assert third_run[4] == failed
     assert _scanned_at()[failed] in (None, "")
     assert _attempted_at()[failed]
+
+
+# ---- TASK-130: ghost switch review follow-ups ----
+
+def _ghost_rows_past_cutoff(n):
+    """n Applied rows past the bury day on Tetiana Cold, real-clock dates (the /ghost dry run reads
+    the clock), distinct ages so the oldest-first order is checkable: Co00 is the youngest."""
+    today = date.today()
+    return [_ghosted_app(f"gp-{i:02d}", days=m.FOLLOWUP_BURY_DAYS + 9 + i, company=f"Co{i:02d}", today=today)
+            for i in range(n)]
+
+
+def _ghost_page_companies(text):
+    return re.findall(r"• <b>(Co\d\d)</b>", text)
+
+
+def test_ghost_switch_review_followups_pages_through_every_row_with_burial_off(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    monkeypatch.setattr(m, "get_short_id_by_sheet_uuid", lambda su: f"sid{su[-2:]}")
+    _set_ghost_burial(monkeypatch, False)
+    _serve_rows(monkeypatch, {"TC": _ghost_rows_past_cutoff(25)})
+
+    _dispatch("/ghost")
+    page1 = sent[-1]
+    assert "Ghost burial: OFF" in page1 and "25 Applied row(s) are currently past day" in page1
+    assert _ghost_page_companies(page1) == [f"Co{i:02d}" for i in range(24, 14, -1)]   # oldest first, 10
+    assert "Page 1 of 3 · /ghost 2" in page1 and "they stay in place" in page1
+    assert "/stage/sid24" in page1 and "Full Card" in page1       # a row can be opened from the page
+
+    _dispatch("/ghost 2")
+    page2 = sent[-1]
+    assert _ghost_page_companies(page2) == [f"Co{i:02d}" for i in range(14, 4, -1)]
+    assert "Page 2 of 3 · /ghost 3" in page2 and "Ghost burial:" not in page2
+
+    _dispatch("/ghost 3")
+    page3 = sent[-1]
+    assert _ghost_page_companies(page3) == [f"Co{i:02d}" for i in range(4, -1, -1)]
+    assert "Page 3 of 3" in page3 and "/ghost 4" not in page3
+
+    _dispatch("/ghost 4")
+    assert sent[-1] == "No page 4; there are 3."
+
+    seen = _ghost_page_companies(page1) + _ghost_page_companies(page2) + _ghost_page_companies(page3)
+    assert sorted(seen) == [f"Co{i:02d}" for i in range(25)]       # every row appears exactly once
+    assert all(len(text) <= m.TELEGRAM_CHUNK_CHARS for text in sent)
+    assert enqueued == [] and _logged_uuids() == set()              # paging is read-only
+    assert m.get_filter("auto_bury_ghosted_applications") is False
+
+
+def test_ghost_switch_review_followups_page_text_survives_long_names_and_zero_rows(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    _set_ghost_burial(monkeypatch, False)
+    rows = _ghost_rows_past_cutoff(10)
+    for r in rows:
+        r["company"] = "C" * 400 + r["company"]
+        r["title"] = "<b>" + "R" * 400
+    _serve_rows(monkeypatch, {"TC": rows})
+    _dispatch("/ghost")
+    assert sent and all(len(t) <= m.TELEGRAM_CHUNK_CHARS for t in sent)
+
+    _serve_rows(monkeypatch, {})
+    _dispatch("/ghost 2")
+    assert sent[-1] == f"No Applied rows are past day {m.FOLLOWUP_BURY_DAYS}."
+    _dispatch("/ghost")
+    assert "Ghost burial: OFF" in sent[-1] and "Page 1" not in sent[-1]
+
+
+def test_ghost_switch_review_followups_burial_on_still_reports_state_and_labels_the_pages(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    _set_ghost_burial(monkeypatch, True)
+    _serve_rows(monkeypatch, {"TC": _ghost_rows_past_cutoff(12)})
+
+    _dispatch("/ghost")
+    assert "Ghost burial: ON" in sent[-1] and "12 Applied row(s) are currently past day" in sent[-1]
+    assert "/ghost on · /ghost off" in sent[-1]
+    # ON: the same rows are what the next morning pass takes, and the page says so.
+    assert "the next morning pass moves them to Died" in sent[-1] and "they stay in place" not in sent[-1]
+    assert len(_ghost_page_companies(sent[-1])) == 10
+    _dispatch("/ghost 2")
+    assert _ghost_page_companies(sent[-1]) == ["Co01", "Co00"] and "Page 2 of 2" in sent[-1]
+    assert enqueued == [] and _logged_uuids() == set()
+    assert m.ghost_burial_enabled() is True
+
+
+def test_ghost_switch_review_followups_legend_says_the_true_meaning_in_both_modes():
+    on, off = m.silence_dot_legend(True), m.silence_dot_legend(False)
+    for text in (on, off):
+        # Only dots a listed application can show (day 10 and later): no green or yellow.
+        assert all(dot in text for dot in ("🟠", "🔴")) and not any(dot in text for dot in ("🟢", "🟡"))
+    assert "burial is ON" in on and "moves to Died overnight" in on
+    assert "burial is OFF" in off and "no application is closed out automatically" in off and "Died" not in off
+    # The dot itself never changed meaning: red is past day 14 in both modes.
+    assert [m._silence_dot(d) for d in (4, 5, 9, 10, 14, 15, None)] == ["🟢", "🟡", "🟡", "🟠", "🟠", "🔴", "⚪"]
+
+    quiet = {"company": "Acme", "role": "Ops", "days_silent": 15, "date_added": "2026-06-01",
+             "buries_on": None, "short_id": None}
+    base = {"counts": {"applications_quiet": 1}, "applications_quiet": [quiet]}
+    off_card = m.render_followup_needs_card({**base, "auto_bury_ghosted": False})
+    on_card = m.render_followup_needs_card({**base, "auto_bury_ghosted": True})
+    assert off in off_card and "moves to Died" not in off_card
+    assert on in on_card
+
+
+def test_ghost_switch_review_followups_snooze_date_has_one_definition(monkeypatch):
+    """The date the sequencer writes, the date it reports as 'buries on', and the date the overdue
+    scan treats as the sequencer's own all come from application_snooze_date. Drive each real path
+    on one row and assert they agree; a drift in any one of them breaks equality here."""
+    added = date.today() - timedelta(days=40)
+    run_day = added + timedelta(days=m.FOLLOWUP_1_DAYS)
+    row = {"sheet_uuid": "snz-1", "company": "Snooz", "title": "Ops Analyst", "name": "",
+           "status": "Applied", "date_added": added.isoformat(), "next_followup": "1970-01-01",
+           "raw_priority": "50"}
+    expected = m.application_snooze_date(row["date_added"]).strftime("%Y-%m-%d")
+    assert expected == (added + timedelta(days=m.FOLLOWUP_BURY_DAYS)).isoformat()
+
+    enqueued = []
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: enqueued.append(payload) or True)
+    _set_ghost_burial(monkeypatch, True)       # buries_on is only filled while burial is ON
+    _serve_rows(monkeypatch, {"TC": [row]})
+
+    result = m.run_followup_sequencer(today=run_day)
+    entry = result["applications_quiet"][0]
+    written = [p for p in enqueued if p.get("action") == "update_snooze"]
+    assert len(written) == 1
+    from_write, from_entry, from_buries_on = written[0]["next_followup"], entry["new_next_followup"], entry["buries_on"]
+    assert from_write == from_entry == from_buries_on == expected          # sequencer: write, report, buries_on
+
+    # The overdue scan, fed the row exactly as the CRM would now hold it.
+    sequencer_row = {**row, "next_followup": from_write, "email": "snooz@example.com"}
+    _mock_followup_tabs(monkeypatch, tc=[sequencer_row])
+    assert m._is_sequencer_dated_application(sequencer_row) is True
+    assert m.get_overdue_followups() == []
+    hand_set = {**sequencer_row, "next_followup": (added + timedelta(days=m.FOLLOWUP_BURY_DAYS + 1)).isoformat()}
+    _mock_followup_tabs(monkeypatch, tc=[hand_set])
+    assert [r["company"] for r in m.get_overdue_followups()] == ["Snooz"]   # not vacuous: a hand-set date counts
+
+
+def test_ghost_switch_review_followups_escaped_page_fits_the_telegram_limit(monkeypatch):
+    """Escaping grows '&' and '<' (&amp; / &lt;), so cutting before escaping can overflow the
+    message and cut an entity in half. Ten rows of max-length '&'/'<' names must still be sent in
+    messages under the limit, with no dangling partial entity."""
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text))
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
+    _set_ghost_burial(monkeypatch, False)
+    rows = _ghost_rows_past_cutoff(10)
+    for i, r in enumerate(rows):
+        r["company"] = "&" * 200 if i % 2 else "<" * 200
+        r["title"] = "<&" * 200
+    _serve_rows(monkeypatch, {"TC": rows})
+    _dispatch("/ghost")
+    assert sent and all(len(t) <= m.TELEGRAM_CHUNK_CHARS for t in sent)
+    body = "\n".join(sent)
+    assert body.count("• <b>") == 10
+    stripped = body
+    for entity in ("&amp;", "&lt;", "&gt;", "&#x27;", "&quot;"):
+        stripped = stripped.replace(entity, "")
+    assert "&" not in stripped                      # no entity was cut in half
+    # Direct: the page renderer returns a list of messages, each within the limit, even at a tiny cap.
+    pages = m.render_ghost_page([{"company": "&" * 300, "role": "<" * 300, "days": 30, "short_id": "ab12"}] * 10,
+                                1, False, limit=1000)
+    assert len(pages) > 1 and all(len(p) <= 1000 for p in pages)

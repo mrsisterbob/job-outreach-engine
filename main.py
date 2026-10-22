@@ -48,7 +48,7 @@ from pipeline_utils import (
     generate_dedup_hash, normalize_dedup_key, generate_short_key, parse_posted_hours, get_age_badge,
     extract_salary, extract_work_style, compute_description_simhash, resolve_email_waterfall,
     derive_job_source, job_link_host, is_unverified_email, status_rank, STATUS_VOCAB,
-    followup_action, followup_anchor, is_followup_unscheduled,
+    followup_action, followup_anchor, application_snooze_date, is_followup_unscheduled,
     lint_outreach_template, advise_outreach_template,
     is_probable_company_name, ats_slug_guess, build_sent_contact,
     is_guessed_contact_email, resolve_sent_email_backfill,
@@ -9719,16 +9719,16 @@ def _alert_crm_read_rejection(message):
 
 def _is_sequencer_dated_application(record):
     """True for an Applied row whose Next Followup is exactly the date the sequencer's day-10
-    snooze writes (date_added + FOLLOWUP_BURY_DAYS). Any other date is one Kevin set by hand.
+    snooze writes (application_snooze_date: date_added + FOLLOWUP_BURY_DAYS). Any other date is
+    one Kevin set by hand.
     The caller restricts this to the JOBS tab; Date Added only (no Next Followup fallback), since
     a blank Date Added leaves nothing to compare against."""
     if status_rank(record.get("status")) != status_rank("Applied"):
         return False
-    anchor = followup_anchor(record.get("date_added"), "")
-    if not anchor:
+    written = application_snooze_date(record.get("date_added"))
+    if not written:
         return False
-    written = (anchor + timedelta(days=FOLLOWUP_BURY_DAYS)).strftime("%Y-%m-%d")
-    return str(record.get("next_followup") or "")[:10] == written
+    return str(record.get("next_followup") or "")[:10] == written.strftime("%Y-%m-%d")
 
 def get_overdue_followups():
     """Return every overdue Carmen Cold, Carmen Warm and Tetiana Cold record sorted by
@@ -9822,8 +9822,9 @@ def process_overdue_batch(mode, snooze_days=7):
 # ==============================================================================
 # NIGHTLY FOLLOW-UP SEQUENCER
 # Reads every live JOBS row via the existing get_followups path, runs the pure
-# pipeline_utils.followup_action() policy on each, buries ghosted rows (the only
-# automatic write), and queues everything else for the morning "needs you today"
+# pipeline_utils.followup_action() policy on each, buries ghosted rows ONLY while the
+# /ghost switch is ON (default OFF; the Matched never-actioned expiry is separate), and
+# queues everything else for the morning "needs you today"
 # card. No schema change - state is derived from Status / Date Added / Next
 # Followup Date only.
 # ==============================================================================
@@ -9835,7 +9836,7 @@ SEQUENCER_SCAN_TABS = (("TC", "Tetiana Cold"), ("TW", "Tetiana Warm"), ("CL", "C
 # the hottest leads and must sit in the same follow-up cadence as the JOBS tabs. But these rows
 # are people, not job applications: followup_action() can still flag one "bury_ghosted" off a
 # stale "Applied" Status carried over by the tab move, and auto-moving a live networking contact
-# into the Died JOBS tab on a 16-day clock is wrong (and crosses schemas). So a would-be bury on
+# into the Died JOBS tab on a 21-day clock is wrong (and crosses schemas). So a would-be bury on
 # a PEOPLE row is surfaced on the card as "going cold" for a human call, never written.
 SEQUENCER_PEOPLE_SCHEMA_TABS = frozenset({"Carmen Cold"})
 
@@ -10577,10 +10578,11 @@ def run_followup_sequencer(today=None, dry_run=False):
 
     Due follow-ups split by tab: PEOPLE rows (Carmen Cold) land in followups_ready with bump text
     and a Gmail draft; JOBS rows land in applications_quiet as status only - no text, no draft -
-    but are still snoozed and logged so the +4/+9/+16 clock (and the +16 bury) keeps advancing.
+    but are still snoozed and logged so the day-10 bump and the day-21 snooze date keep advancing.
 
     Unless dry_run: queues a +window snooze via update_snooze for each drafted follow-up, buries
-    each ghosted row (append_note '[reason: ghosted]' + update_status -> Died), and records each
+    each ghosted row (append_note '[reason: ghosted]' + update_status -> Died) ONLY while ghost
+    burial is ON (see ghost_burial_enabled; default OFF), and records each
     actioned row in followup_sequencer_log. dry_run=True (the /queue path) performs ZERO writes.
 
     Idempotent: (a) same-day - followup_sequencer_log skips a row already actioned today;
@@ -10638,7 +10640,7 @@ def run_followup_sequencer(today=None, dry_run=False):
     dismissals = load_owed_dismissals()
 
     for rec in records:
-        # Carmen Cold runs the 4/11/21 people ladder instead of the JOBS +4/+9/+16 windows: these
+        # Carmen Cold runs the 4/11/21 people ladder instead of the JOBS day-10 bump / day-21 bury windows: these
         # are networking contacts, so the cadence is tighter and the sequence ends quietly rather
         # than burying. Rung is read from the row's own dates, so a contact dragged in by hand
         # joins the ladder on this pass with nothing to configure.
@@ -10825,15 +10827,15 @@ def run_followup_sequencer(today=None, dry_run=False):
 
         if action in ("send_followup_1", "send_followup_2"):
             attempt = 1 if action == "send_followup_1" else 2
-            base = anchor or today
-            # Bump #1 is the only bump, so its snooze goes straight to the bury boundary. Pushing
-            # to FOLLOWUP_2_DAYS would park the row on a retired rung that never fires.
-            push_days = FOLLOWUP_BURY_DAYS
-            new_nf = (base + timedelta(days=push_days)).strftime("%Y-%m-%d")
+            # Bump #1 is the only bump, so its snooze goes straight to the day-21 boundary. Pushing
+            # to FOLLOWUP_2_DAYS would park the row on a retired rung that never fires. The date
+            # comes from application_snooze_date, the one definition the overdue scan also uses.
+            new_nf = application_snooze_date(rec.get("date_added"), today,
+                                             next_followup=rec.get("next_followup")).strftime("%Y-%m-%d")
             if rec.get("sheet_tab") not in SEQUENCER_PEOPLE_SCHEMA_TABS:
                 # A job application is watched, not messaged: its Contact Email is often Kevin's own
                 # address or a contact already tracked in Carmen Cold, so no bump text and no Gmail
-                # draft. The snooze still advances, or the +16 bury would never be reached.
+                # draft. The snooze still advances, or the row would sit on its day-10 date forever.
                 result["applications_quiet"].append({
                     "company": company, "role": role, "short_id": short_id, "sheet_uuid": sheet_uuid,
                     "sheet_tab": rec.get("sheet_tab"), "attempt": attempt,
@@ -10842,8 +10844,8 @@ def run_followup_sequencer(today=None, dry_run=False):
                     "new_next_followup": new_nf,
                     "days_silent": days_since,
                     # Empty while ghost burial is off: nothing will happen on that date, so none is shown.
-                    "buries_on": ((anchor + timedelta(days=FOLLOWUP_BURY_DAYS)).strftime("%Y-%m-%d")
-                                  if anchor and ghost_burial_on else None),
+                    "buries_on": (application_snooze_date(rec.get("date_added"), next_followup=rec.get("next_followup"))
+                                  .strftime("%Y-%m-%d") if anchor and ghost_burial_on else None),
                 })
                 if dry_run or already or not sheet_uuid:
                     continue
@@ -10878,7 +10880,10 @@ def run_followup_sequencer(today=None, dry_run=False):
                     "status": rec.get("status") or "", "days": days_since,
                 })
                 continue
-            result["ghost_past_cutoff"].append({"sheet_uuid": sheet_uuid, "days": days_since})
+            result["ghost_past_cutoff"].append({
+                "company": company, "role": role, "short_id": short_id,
+                "sheet_uuid": sheet_uuid, "days": days_since,
+            })
             if not ghost_burial_on:
                 # Switch OFF: the application stays where it is. Report it as going cold (status
                 # and days kept) so it does not vanish from view, and write NOTHING - no note, no
@@ -11025,18 +11030,99 @@ def _next_step_label(entry):
         return f"{CARMEN_GHOST_TAB.lower()} {nxt} if silent"
     return f"next {nxt}"
 
+# (max days silent, dot) bands for an application's silence; anything past the last is red. A row
+# only reaches the card and /followups at day FOLLOWUP_1_DAYS (10) or later, so there the dot is
+# orange or red; the two lower bands cover any other caller.
+_SILENCE_BANDS = ((4, "🟢"), (9, "🟡"), (14, "🟠"))
+_SILENCE_RED = "🔴"
+
+def silence_dot_legend(ghost_burial_on):
+    """One italic line saying what the silence dots mean, true for the current /ghost mode."""
+    # Only bands a listed application can land in: applications_quiet starts at FOLLOWUP_1_DAYS.
+    parts = []
+    low = 0
+    for top, dot in _SILENCE_BANDS:
+        if top >= FOLLOWUP_1_DAYS:
+            parts.append(f"{dot} {max(low + 1, FOLLOWUP_1_DAYS)}-{top}d silent")
+        low = top
+    parts.append(f"{_SILENCE_RED} over {low}d silent")
+    tail = (f"burial is ON: a row past day {FOLLOWUP_BURY_DAYS} moves to Died overnight"
+            if ghost_burial_on else
+            "burial is OFF: no application is closed out automatically, red just means long silent")
+    return "<i>" + " · ".join(parts) + f" ({tail})</i>"
+
 def _silence_dot(days):
     """Severity dot for an application's silence, on the job card's fit-dot idiom. The bands
-    track the 4/9/16 JOBS ladder: red means the +16 bury is at most a day away."""
+    follow the application's age (_SILENCE_BANDS). Red means silent past day 14, in both modes.
+    With ghost burial ON a red row is within a week of the day-21 bury; OFF nothing is coming and
+    it just means long silent. silence_dot_legend() says which, to the reader."""
     if not isinstance(days, int):
         return "⚪"
-    if days <= 4:
-        return "🟢"
-    if days <= 9:
-        return "🟡"
-    if days <= 14:
-        return "🟠"
-    return "🔴"
+    for top, dot in _SILENCE_BANDS:
+        if days <= top:
+            return dot
+    return _SILENCE_RED
+
+# /ghost lists the Applied rows past the bury day this many per page (oldest first). With burial
+# OFF the morning card shows only the oldest GOING_COLD_CARD_LIMIT of them; this is where the rest
+# can be seen. Text-argument paging, like /refer: the bot has no inline keyboards.
+GHOST_PAGE_SIZE = 10
+
+def _ghost_page_arg(arg):
+    """A /ghost argument that is a page number (a positive ASCII integer) as an int, else None.
+    "0" is not a page, so it stays an unrecognised argument."""
+    arg = str(arg)
+    if arg.isascii() and arg.isdecimal() and len(arg) <= 9 and int(arg) >= 1:
+        return int(arg)
+    return None
+
+def _html_cut(raw, limit):
+    """html.escape(raw) cut to at most `limit` characters AFTER escaping (escaped text is up to 6x
+    longer than the raw), never ending inside an entity, with an ellipsis when cut."""
+    esc = html.escape(str(raw))
+    if len(esc) <= limit:
+        return esc
+    esc = re.sub(r"&[#\w]*$", "", esc[:max(1, limit - 1)])
+    return esc + "…"
+
+def render_ghost_page(rows, page, ghost_burial_on, limit=TELEGRAM_CHUNK_CHARS):
+    """One /ghost page of Applied rows past the bury day (result["ghost_past_cutoff"]), oldest
+    first, GHOST_PAGE_SIZE per page. Pure - no I/O. Returns a LIST of messages, each at most
+    `limit` characters: normally one; fields are cut after escaping and whole lines are packed, so
+    a page of '&' and '<' still fits. A plain out-of-range or no-rows reply is a one-item list."""
+    ordered = sorted(rows or [], key=lambda e: -(e["days"] if isinstance(e.get("days"), int) else -1))
+    if not ordered:
+        return [f"No Applied rows are past day {FOLLOWUP_BURY_DAYS}."]
+    pages = -(-len(ordered) // GHOST_PAGE_SIZE)
+    if not 1 <= page <= pages:
+        return [f"No page {page}; there {'is' if pages == 1 else 'are'} {pages}."]
+    if ghost_burial_on:
+        fate = (f"the next morning pass moves them to Died (max {MAX_AUTO_BURIES_PER_RUN} per run, "
+                "oldest first)")
+    else:
+        fate = "they stay in place until you move them"
+    start = (page - 1) * GHOST_PAGE_SIZE
+    lines = [f"👻 <b>Applied rows past day {FOLLOWUP_BURY_DAYS} ({len(ordered)})</b> <i>— {fate}</i>"]
+    for e in ordered[start:start + GHOST_PAGE_SIZE]:
+        company = _html_cut(e.get("company") or "—", 50)
+        role = _html_cut(e.get("role") or "—", 70)
+        days = e.get("days")
+        days_str = f"{days}d" if isinstance(days, int) else "? days"
+        line = f"• <b>{company}</b> — {role} · applied {days_str} ago · <code>{html.escape(_seq_id_tag(e))}</code>"
+        if e.get("short_id"):
+            stage_url = html.escape(f"{BASE_URL}/stage/{e['short_id']}", quote=True)
+            line += f" · 📋 <a href='{stage_url}'>Full Card</a>"
+        lines.append(line)
+    lines.append(f"<i>Page {page} of {pages}" + (f" · /ghost {page + 1}" if page < pages else "") + "</i>")
+    messages, current = [], ""
+    for line in lines:
+        if current and len(current) + 1 + len(line) > limit:
+            messages.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    messages.append(current)
+    return messages
 
 def render_followup_needs_card(result, on_demand=False):
     """Render the single 'needs you today' Telegram message from a run_followup_sequencer() result.
@@ -11150,6 +11236,7 @@ def render_followup_needs_card(result, on_demand=False):
     quiet = result.get("applications_quiet", [])
     if quiet:
         lines.append(f"\n▶ <b>Applications going quiet ({len(quiet)})</b> <i>— watch only, no drafts</i>")
+        lines.append(silence_dot_legend(ghost_burial_on))
         for e in quiet:
             company = html.escape(str(e.get("company") or "—"))
             role = html.escape(str(e.get("role") or "—"))
@@ -11191,7 +11278,8 @@ def render_followup_needs_card(result, on_demand=False):
             days_str = f"{days}d untouched" if isinstance(days, int) else "stale"
             lines.append(f"• <b>{company}</b> — {role} · {status} · {days_str} · <code>{html.escape(_seq_id_tag(e))}</code>")
         if len(cold_shown) < len(cold):
-            lines.append(f"<i>…and {len(cold) - len(cold_shown)} more</i>")
+            lines.append(f"<i>…and {len(cold) - len(cold_shown)} more"
+                         + ("" if ghost_burial_on else " · see /ghost") + "</i>")
 
     buried = result.get("buried", [])
     if buried:
@@ -11621,7 +11709,7 @@ def scheduled_job_link_check():
 
 def scheduled_followup_sequencer_job():
     """APScheduler target: nightly follow-up sequencer pass (07:30 local, before the digest).
-    Applies the automatic bury, queues follow-up drafts, saves the result for GET /followups,
+    Applies the automatic bury (only while /ghost is ON), queues follow-up snoozes, saves the result for GET /followups,
     and posts the single 'needs you today' card. This is the only morning message at this hour -
     the standup digest posts at 08:30.
     """
@@ -11643,7 +11731,9 @@ def scheduled_followup_sequencer_job():
 
 def start_followup_sequencer():
     """Register the nightly sequencer on the shared background scheduler (07:30 local, one hour
-    ahead of the 08:30 morning digest). Bury-to-Died is its only automatic write.
+    ahead of the 08:30 morning digest). Its only automatic writes are the day-10 snooze, the
+    Carmen ladder moves, the Matched never-actioned expiry, and (only while /ghost is ON,
+    default OFF) the ghosted Applied burial.
 
     "Local" means America/Detroit, pinned on EMAIL_POLL_SCHEDULER. Render runs UTC, so before
     the pin this fired at 07:00 UTC (03:00 Detroit).
@@ -16092,15 +16182,18 @@ def process_webhook_payload_async(data):
                     )
             else:
                 state = "ON" if ghost_burial_enabled() else "OFF"
-                # Anything but "", "on" or "off" gets the status plus usage, not silence.
+                page = _ghost_page_arg(arg)
+                # Anything but "", "on", "off" or a page number gets the status plus usage, not silence.
                 unknown = (f"\n❓ Did not understand <code>{html.escape(arg[:40])}</code> - nothing was changed."
-                           if arg else "")
+                           if arg and page is None else "")
+                past_rows = None
                 try:
                     # Read-only: a dry_run pass writes nothing. One selection for both states: the job
                     # rows past the bury day (result["ghost_past_cutoff"]); expired Matched rows are a
                     # separate rule and reported separately.
                     plan = run_followup_sequencer(dry_run=True)
-                    past_n = len(plan.get("ghost_past_cutoff", []))
+                    past_rows = plan.get("ghost_past_cutoff", [])
+                    past_n = len(past_rows)
                     matched_n = len(plan.get("buried", [])) - (past_n if state == "ON" else 0)
                     past_line = (f"\n{past_n} Applied row(s) are currently past day {FOLLOWUP_BURY_DAYS}"
                                  " (read-only dry run).")
@@ -16110,12 +16203,21 @@ def process_webhook_payload_async(data):
                 except Exception as e:
                     logging.error(f"/ghost dry run failed: {e}")
                     past_line = "\nCould not count rows past the cutoff right now."
-                send_telegram_message(
-                    chat_id,
-                    f"👻 <b>Ghost burial: {state}</b>{unknown}\n"
-                    f"When ON, Applied rows with no movement for {FOLLOWUP_BURY_DAYS}+ days are moved to Died overnight."
-                    f"{past_line}\n\n/ghost on · /ghost off"
-                )
+                if page is not None:
+                    # /ghost N: the page only, no status block.
+                    blocks = (["Could not read the rows past the cutoff right now. Nothing changed."]
+                              if past_rows is None else render_ghost_page(past_rows, page, state == "ON"))
+                else:
+                    blocks = [
+                        f"👻 <b>Ghost burial: {state}</b>{unknown}\n"
+                        f"When ON, Applied rows with no movement for {FOLLOWUP_BURY_DAYS}+ days are moved to Died overnight."
+                        f"{past_line}\n\n/ghost on · /ghost off"
+                    ]
+                    if not arg and past_rows:
+                        # Bare /ghost: the status, then page 1 of the rows themselves (/ghost 2 ...).
+                        blocks.extend(render_ghost_page(past_rows, 1, state == "ON"))
+                for message in _pack_telegram_blocks(blocks):
+                    send_telegram_message(chat_id, message)
             return
 
         ats_match = re.match(r"^/ats(?:\s+(on|off|list|add|remove)\s*(.*))?$", text, re.IGNORECASE)
@@ -16774,7 +16876,7 @@ def process_webhook_payload_async(data):
                 "/refs - Your references, tap-to-copy for application forms (/refs add, /refs remove)\n"
                 "/gear - Search breadth 1-5 (one dial for all sources)\n"
                 "/ats - Company board watchlist (on/off/add/remove)\n"
-                "/ghost - Automatic ghosted burial of old applications (on/off)\n"
+                "/ghost - Applied rows past day 21, 10 per page (/ghost 2), and the automatic burial switch (on/off)\n"
                 "/remote - Keyless remote feeds (on/off)\n"
                 "/poll - Run the email poll cycle now (scheduled: daily)\n"
                 "/inbox - Open conversations that still need a reply\n"
@@ -17229,8 +17331,9 @@ def followup_queue_view():
 
     if quiet:
         rows_html = []
-        # Data-driven, so an older saved snapshot (which has dates) still renders its column.
-        show_buries = any(e.get("buries_on") for e in quiet)
+        # The mode the 7:30 run was in, not whether a row happens to carry a date: a snapshot from
+        # an OFF run must not say burial is ON. A snapshot without the key renders as ON.
+        show_buries = bool(result.get("auto_bury_ghosted", True))
         for e in quiet:
             days = e.get("days_silent")
             stage = ""
@@ -17253,6 +17356,7 @@ def followup_queue_view():
                "unless its status moves.</p>" if show_buries else
                "<p class='meta'>Watch only - no drafts. Automatic burial is off, so these applications "
                "stay in place until you move them.</p>")
+            + f"<p class='meta'>{silence_dot_legend(show_buries)}</p>"
             + "<table><tr><th>Company</th><th>Role</th><th>Applied</th><th>Silent</th>"
             + ("<th>Buries on</th>" if show_buries else "") + "<th></th></tr>"
             + "".join(rows_html) + "</table>"
