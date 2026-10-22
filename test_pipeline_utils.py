@@ -2136,6 +2136,60 @@ def test_classify_redirect_to_careers_root_is_dead():
     assert verdict == "dead"
 
 
+def test_dead_link_verified_ignores_script_text():
+    """MEASURED 2026-10-19: an i18n string inside <script> condemned a live 200 page."""
+    url = "https://co.com/careers/job/5"
+    page = ('<script>window.i18n={"closed":"This job is no longer available"}</script>'
+            "<body><h1>Operations Analyst</h1><p>Apply now.</p>")
+    assert pu.classify_job_link(url, 200, url, page)[0] == "alive"
+    for block in ("<style>.x:after{content:'no longer available'}</style>",
+                  "<noscript>This job is no longer available</noscript>",
+                  "<!-- this job is no longer available -->"):
+        assert pu.classify_job_link(url, 200, url, block + "<p>Apply now.</p>")[0] == "alive", block
+
+
+def test_dead_link_verified_unterminated_block_is_stripped():
+    """fetch_job_link_state cuts pages at 400,000 chars, so a script can lose its closing tag."""
+    url = "https://co.com/careers/job/5"
+    for tag in ("script", "style", "noscript"):
+        cut = (f"<h1>Operations Analyst</h1><p>Apply now.</p><{tag}>var i18n="
+               '{"closed":"This job is no longer available"')
+        assert pu.classify_job_link(url, 200, url, cut)[0] == "alive", tag
+    assert pu.classify_job_link(url, 200, url, "<p>Apply</p><!-- no longer available")[0] == "alive"
+    # A closed block still ends at its own closing tag, so text after it is still read.
+    closed = "<script>var a=1</script><h1>This job is no longer available</h1>"
+    assert pu.classify_job_link(url, 200, url, closed)[0] == "dead"
+
+
+def test_dead_link_verified_long_page_phrase_buried():
+    url = "https://co.com/careers/job/5"
+    filler = "Reconcile accounts and report variances. " * 200      # ~8,000 chars
+    buried = "<p>" + filler[:5000] + " benefits no longer available to new hires. " + filler[:1000] + "</p>"
+    assert len(buried) > 6000
+    assert pu.classify_job_link(url, 200, url, buried)[0] == "alive"
+
+    stub = "<h1>This job is no longer available.</h1>" + "<p>See other roles.</p>" * 8
+    assert len(stub) < 400 and pu.classify_job_link(url, 200, url, stub)[0] == "dead"
+
+    head = "<h1>This job is no longer available</h1><p>" + filler + "</p>"
+    verdict, reason = pu.classify_job_link(url, 200, url, head)
+    assert verdict == "dead" and "no longer available" in reason
+
+
+def test_dead_link_verified_404_still_dead():
+    assert pu.classify_job_link("https://co.com/j", 404, None, "<script>x</script>")[0] == "dead"
+    assert pu.classify_job_link("https://www.linkedin.com/jobs/view/1", 410, None, "")[0] == "dead"
+
+
+def test_dead_link_verified_confirmation_needs_a_prior_dead_and_12_hours():
+    assert pu.dead_verdict_confirmed("dead", 13) is True
+    assert pu.dead_verdict_confirmed("dead", 12) is True
+    assert pu.dead_verdict_confirmed("dead", 5) is False
+    assert pu.dead_verdict_confirmed("dead", None) is False
+    assert pu.dead_verdict_confirmed("alive", 99) is False
+    assert pu.dead_verdict_confirmed(None, 99) is False
+
+
 def test_classify_live_posting_is_alive():
     verdict, _ = pu.classify_job_link(
         "https://co.com/careers/job/5", 200, "https://co.com/careers/job/5",

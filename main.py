@@ -63,7 +63,7 @@ from pipeline_utils import (
     INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, LINKEDIN_TOUCH_NOTE_MARKER,
     MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
-    classify_job_link, may_auto_retire, is_opaque_job_host, is_opaque_link_reason, split_link_check_budget,
+    classify_job_link, dead_verdict_confirmed, may_auto_retire, is_opaque_job_host, is_opaque_link_reason, split_link_check_budget,
     parse_job_command, parse_job_command_urls, parse_job_page_html, build_ingest_job_dict,
     is_expired_job_redirect, title_company_from_linkedin_slug, extract_jd_terms,
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
@@ -8924,7 +8924,10 @@ def send_daily_standup(chat_id):
     )
     # Job links that died since the last digest. Reported once each (notified flag), so a posting
     # that stays dead does not repeat every morning.
-    fresh_dead = get_dead_job_links(include_notified=False, limit=10)
+    # A Matched row seen dead once is still awaiting its second sweep: it is neither "applied" nor
+    # retired, and flagging it notified now would hide its retirement tomorrow. Leave it out.
+    fresh_dead = [r for r in get_dead_job_links(include_notified=False, limit=100)
+                  if r[6] or not may_auto_retire(r[4])][:10]
     if fresh_dead:
         # Applied rows lead: a posting coming down on a job Kevin is waiting to hear about is the
         # only half of this list he can act on. Retired rows follow, one line each with the reason:
@@ -11538,7 +11541,9 @@ def fetch_job_link_state(url):
 def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=LINK_CHECK_SLEEP):
     """Sweep live JOBS rows, classify each Job Link, record the verdict and retire the safe ones.
 
-    Only a 'dead' verdict on a row whose Status permits it (see may_auto_retire) is moved to Died.
+    Only a 'dead' verdict on a row whose Status permits it (see may_auto_retire) is moved to Died,
+    and only when a previous sweep at least DEAD_CONFIRM_HOURS earlier saw it dead as well: a first
+    dead verdict is recorded and listed with "confirmed": False, never retired.
     An APPLIED row with a dead posting is recorded and surfaced instead: the posting coming down
     means the employer stopped sourcing, not that Kevin was rejected, and burying it would lose a
     live thread.
@@ -11580,6 +11585,22 @@ def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=L
                 else:
                     unknown += 1
 
+            # The PREVIOUS verdict, read before the upsert below overwrites it. A dead verdict is
+            # acted on only when an earlier sweep (>= DEAD_CONFIRM_HOURS ago) saw it dead too; a
+            # live page that merely says "no longer available" must survive one bad night. Any
+            # alive/unknown verdict NULLs first_dead_at in the upsert, which resets this.
+            confirmed = False
+            if verdict == "dead":
+                try:
+                    with get_db_conn() as conn:
+                        prev = conn.execute(
+                            "SELECT verdict, (julianday('now') - julianday(first_dead_at)) * 24 "
+                            "FROM job_link_status WHERE sheet_uuid = ?", (sheet_uuid,)).fetchone()
+                    if prev:
+                        confirmed = dead_verdict_confirmed(prev[0], prev[1])
+                except Exception as e:
+                    logging.error(f"[LINKCHECK] previous verdict read error ({sheet_uuid}): {e}")
+
             try:
                 with get_db_conn() as conn:
                     conn.execute("BEGIN IMMEDIATE")
@@ -11608,9 +11629,11 @@ def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=L
 
             if verdict == "dead":
                 item = {"sheet_uuid": sheet_uuid, "company": company, "role": role,
-                        "status": row_status, "tab": tab_name, "reason": reason, "link": link}
+                        "status": row_status, "tab": tab_name, "reason": reason, "link": link,
+                        "confirmed": confirmed}
                 dead.append(item)
-                if auto_retire and may_auto_retire(row_status) and len(retired) < MAX_AUTO_RETIRE_PER_RUN:
+                if (auto_retire and confirmed and may_auto_retire(row_status)
+                        and len(retired) < MAX_AUTO_RETIRE_PER_RUN):
                     # Same two-step the sequencer's bury uses: note the reason on the row while it
                     # is still in its source tab, then move it.
                     enqueue_crm_payload(build_crm_payload(
@@ -11689,8 +11712,14 @@ def get_dead_job_links(include_notified=True, limit=40, since_hours=None):
             if not include_notified:
                 sql += " AND notified = 0"
             if since_hours is not None:
-                sql += (" AND first_dead_at IS NOT NULL"
-                        " AND first_dead_at >= datetime('now', ?)")
+                # A row retires on its SECOND sweep, so its first_dead_at is already ~24h old that
+                # night and would fall out of the window it was retired in. A retired row leaves
+                # the sweep (it is in Died), so its checked_at IS the retirement time. Rows still
+                # dead and not retired stay keyed on first_dead_at, or a posting that stays dead
+                # would be re-checked nightly and replay forever.
+                sql += (" AND ((first_dead_at IS NOT NULL AND first_dead_at >= datetime('now', ?))"
+                        " OR (retired = 1 AND checked_at >= datetime('now', ?)))")
+                params.append(f"-{int(since_hours)} hours")
                 params.append(f"-{int(since_hours)} hours")
             sql += " ORDER BY first_dead_at DESC LIMIT ?"
             params.append(limit)
@@ -15068,7 +15097,8 @@ def process_webhook_payload_async(data):
                      "🔗 <b>Dry run</b> - checking job links, writing nothing...")
                 )
                 result = check_job_links(auto_retire=commit)
-                would = [d for d in result["dead"] if may_auto_retire(d.get("status"))]
+                would = [d for d in result["dead"]
+                         if may_auto_retire(d.get("status")) and d.get("confirmed")]
                 if result["checked"] == 0:
                     # Zero checked is almost never "no jobs" - it means the CRM read came back
                     # empty, which a rejected webhook does silently. Say so instead of
@@ -15125,9 +15155,17 @@ def process_webhook_payload_async(data):
             # chase the recruiter, and burying it in a list of corpses is what made the whole
             # digest read as noise.
             retired_rows = [r for r in rows if r[6]]
-            applied_rows = [r for r in rows if not r[6]]
+            # A Matched row seen dead once is not "applied" and not yet verified: the second sweep
+            # decides it (see check_job_links), so it is counted here rather than offered to /linksx.
+            pending_rows = [r for r in rows if not r[6] and may_auto_retire(r[4])]
+            applied_rows = [r for r in rows if not r[6] and not may_auto_retire(r[4])]
             lines = ["🔗 <b>Dead Job Links</b>"
                      + ("" if show_all else " <i>(last 24h)</i>") + "\n"]
+            if pending_rows:
+                lines.append(f"▶ <b>Seen dead once, checking again tomorrow ({len(pending_rows)})</b>")
+                for _u, company, role, *_rest in pending_rows[:10]:
+                    lines.append(f"🕓 <b>{html.escape(str(company or '?'))}</b> - {html.escape(str(role or '?'))}")
+                lines.append("")
 
             if applied_rows:
                 lines.append(f"▶ <b>You applied - posting came down ({len(applied_rows)})</b>")
@@ -15187,7 +15225,8 @@ def process_webhook_payload_async(data):
             # saw in the report. The limit stays high so "archive all N" archives all N - the
             # default limit=40 would archive the first 40 of an offer of 57 and report 40.
             rows = [r for r in get_dead_job_links(
-                limit=100000, since_hours=DEAD_LINK_REPORT_WINDOW_HOURS) if not r[6]]
+                limit=100000, since_hours=DEAD_LINK_REPORT_WINDOW_HOURS)
+                if not r[6] and not may_auto_retire(r[4])]
             if not rows:
                 send_telegram_message(
                     chat_id,
