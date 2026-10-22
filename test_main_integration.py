@@ -64,6 +64,8 @@ def clean_tables():
         conn.commit()
     # Module-global name cache: a Sent lookup in one test must not answer for the next.
     m._SENT_NAME_CACHE.clear()
+    # /e, /eh and /letter cache their live posting check per sheet_uuid for 10 minutes.
+    m._POSTING_CHECK_CACHE.clear()
     m._OPEN_FOLLOWUPS_CACHE.update(owed=None, at=None)
     m._OPEN_FOLLOWUPS_BUILD.update(running=False, error=None)
     yield
@@ -18256,3 +18258,195 @@ def test_years_gate_rejects_through_both_real_filter_gates(monkeypatch, caplog):
     caplog.set_level("DEBUG")
     assert m.passes_strict_filter({**strict, "job_description": teaser + " SQL"}) is True
     assert any("[YEARS] description too short to read years (" in r.getMessage() for r in caplog.records)
+
+
+# --- posting_check_at_send: /e, /eh and /letter warn (after the output) when the posting looks closed ---
+
+def _posting_check_env(monkeypatch, command, link, fetch):
+    """Drive the real dispatcher for one command with every outbound stubbed. `fetch` replaces
+    fetch_job_link_state. Returns (events, fetch_calls, payloads): events is the ordered list of
+    ('msg', text) / ('draft',) so a test can assert the warning lands AFTER the draft or letter."""
+    events, fetch_calls, payloads = [], [], []
+    job = {"employer_name": "Atwell", "job_title": "Operations Analyst", "track": "e",
+           "employer_website": "https://atwell.com"}
+    if link is not None:
+        job["job_apply_link"] = link
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, cid, label: {
+        "sheet_uuid": "uuid-pc", "sheet_tab": "Tetiana Cold", "contact_name": "",
+        "contact_company": "Atwell"})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: dict(job))
+    monkeypatch.setattr(m, "rebuild_job_from_card", lambda j, txt: (j, False))
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text, **k: events.append(("msg", text)))
+    monkeypatch.setattr(m, "send_cover_letter_pdf_async", lambda *a, **k: None)
+    monkeypatch.setattr(m, "stage_outreach_draft", lambda *a, **k: events.append(("draft",)))
+    monkeypatch.setattr(m, "resolve_target_email", lambda *a, **k: "operations@atwell.com")
+    monkeypatch.setattr(m, "resolve_email_waterfall", lambda *a, **k: "dana@atwell.com")
+    monkeypatch.setattr(m, "log_email_enrichment_attempt", lambda *a, **k: None)
+    monkeypatch.setattr(m, "update_job_target_email", lambda u, e: None)
+    monkeypatch.setattr(m, "log_addressed_contact_to_carmen_cold", lambda *a, **k: None)
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p))
+
+    def recorded_fetch(url, timeout=None):
+        fetch_calls.append((url, timeout))
+        return fetch(url, timeout)
+
+    monkeypatch.setattr(m, "fetch_job_link_state", recorded_fetch)
+    _dispatch(command, reply_to_message={"message_id": 42, "text": "card"})
+    return events, fetch_calls, payloads
+
+
+def _fetch_404(url, timeout):
+    return (404, url, "", None)
+
+
+def _fetch_200(url, timeout):
+    return (200, url, "Operations Analyst. " + "Responsibilities include reconciling accounts. " * 20, None)
+
+
+_PC_LINK = "https://boards.greenhouse.io/atwell/jobs/123"
+
+
+def _pc_warnings(events):
+    return [e[1] for e in events if e[0] == "msg" and ("looks closed" in e[1] or "Could not verify" in e[1])]
+
+
+@pytest.mark.parametrize("command", ["/e", "/eh", "/letter"])
+def test_posting_check_at_send_dead_link_warns_after_the_output(monkeypatch, command):
+    events, fetch_calls, _ = _posting_check_env(monkeypatch, command, _PC_LINK, _fetch_404)
+    first = events[0]
+    if command == "/letter":
+        assert first[0] == "msg" and "Cover Letter" in first[1]
+    else:
+        assert first == ("draft",)
+    assert "looks closed" in events[-1][1] and "HTTP 404" in events[-1][1]
+    assert _PC_LINK in events[-1][1]
+    assert len(_pc_warnings(events)) == 1
+    assert len(fetch_calls) == 1
+
+
+@pytest.mark.parametrize("command", ["/e", "/eh", "/letter"])
+def test_posting_check_at_send_opaque_host_says_it_could_not_verify(monkeypatch, command):
+    link = "https://www.linkedin.com/jobs/view/3912345678"
+    events, _, _ = _posting_check_env(monkeypatch, command, link, lambda u, t: (200, u, "x", None))
+    warning = events[-1][1]
+    assert "Could not verify" in warning and "linkedin.com" in warning
+
+
+@pytest.mark.parametrize("command", ["/e", "/eh", "/letter"])
+def test_posting_check_at_send_live_posting_adds_no_message(monkeypatch, command):
+    events, fetch_calls, _ = _posting_check_env(monkeypatch, command, _PC_LINK, _fetch_200)
+    assert _pc_warnings(events) == []
+    assert len(fetch_calls) == 1
+
+
+@pytest.mark.parametrize("command", ["/e", "/eh", "/letter"])
+def test_posting_check_at_send_a_raising_fetch_never_breaks_the_command(monkeypatch, command):
+    def boom(url, timeout):
+        raise RuntimeError("socket exploded")
+
+    events, _, _ = _posting_check_env(monkeypatch, command, _PC_LINK, boom)
+    assert events, "the command itself must still have produced its output"
+    assert _pc_warnings(events) == []
+
+
+@pytest.mark.parametrize("command", ["/e", "/eh", "/letter"])
+def test_posting_check_at_send_transient_failure_stays_silent(monkeypatch, command):
+    events, _, _ = _posting_check_env(monkeypatch, command, _PC_LINK,
+                                      lambda u, t: (None, None, "", TimeoutError("slow")))
+    assert events and _pc_warnings(events) == []
+
+
+@pytest.mark.parametrize("command", ["/e", "/eh", "/letter"])
+def test_posting_check_at_send_no_link_means_no_fetch_and_no_warning(monkeypatch, command):
+    events, fetch_calls, _ = _posting_check_env(monkeypatch, command, None, _fetch_404)
+    assert fetch_calls == []
+    assert _pc_warnings(events) == []
+
+
+def test_posting_check_at_send_a_non_http_link_is_ignored(monkeypatch):
+    _, fetch_calls, _ = _posting_check_env(monkeypatch, "/letter", "see careers page", _fetch_404)
+    assert fetch_calls == []
+
+
+def test_posting_check_at_send_uses_the_short_timeout(monkeypatch):
+    _, fetch_calls, _ = _posting_check_env(monkeypatch, "/letter", _PC_LINK, _fetch_404)
+    assert fetch_calls == [(_PC_LINK, m.POSTING_CHECK_TIMEOUT)]
+    assert m.POSTING_CHECK_TIMEOUT < m.LINK_CHECK_TIMEOUT
+
+
+def test_posting_check_at_send_fetch_default_timeout_is_the_sweeps(monkeypatch):
+    seen = {}
+
+    class _Res:
+        status_code, url, text = 200, "https://x.test/j", "ok"
+
+    monkeypatch.setattr(m.requests, "get", lambda url, **kw: seen.update(kw) or _Res())
+    m.fetch_job_link_state("https://x.test/j")
+    assert seen["timeout"] == m.LINK_CHECK_TIMEOUT
+    m.fetch_job_link_state("https://x.test/j", timeout=5)
+    assert seen["timeout"] == 5
+
+
+@pytest.mark.parametrize("command", ["/e", "/eh", "/letter"])
+def test_posting_check_at_send_writes_nothing(monkeypatch, command):
+    events, _, payloads = _posting_check_env(monkeypatch, command, _PC_LINK, _fetch_404)
+    assert len(_pc_warnings(events)) == 1  # the warning did fire, and still wrote nothing
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM job_link_status").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM died_roles").fetchone()[0] == 0
+    assert not [p for p in payloads if p.get("action") in ("update_status", "retire", "mark_died")]
+
+
+def test_posting_check_at_send_e_then_letter_fetches_once(monkeypatch):
+    events, fetch_calls, _ = _posting_check_env(monkeypatch, "/e", _PC_LINK, _fetch_404)
+    _dispatch("/letter", reply_to_message={"message_id": 42, "text": "card"})
+    assert len(fetch_calls) == 1
+    # ... yet the second command still warns, from the cached verdict.
+    assert len(_pc_warnings(events)) == 2
+
+
+def test_posting_check_at_send_falls_back_to_the_sweep_ledger_link(monkeypatch):
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO job_link_status (sheet_uuid, job_link, verdict, reason) "
+                     "VALUES ('uuid-pc', ?, 'alive', 'HTTP 200')", (_PC_LINK,))
+        conn.commit()
+    _, fetch_calls, _ = _posting_check_env(monkeypatch, "/letter", None, _fetch_404)
+    assert [c[0] for c in fetch_calls] == [_PC_LINK]
+
+
+def test_posting_check_at_send_a_transient_unknown_is_not_cached(monkeypatch):
+    """/e times out (silent), then the host recovers: /letter must fetch again and warn."""
+    events, fetch_calls, _ = _posting_check_env(
+        monkeypatch, "/e", _PC_LINK, lambda u, t: (None, None, "", TimeoutError("slow")))
+    assert _pc_warnings(events) == [] and len(fetch_calls) == 1
+    assert "uuid-pc" not in m._POSTING_CHECK_CACHE
+
+    monkeypatch.setattr(m, "fetch_job_link_state",
+                        lambda url, timeout=None: fetch_calls.append((url, timeout)) or (404, url, "", None))
+    _dispatch("/letter", reply_to_message={"message_id": 42, "text": "card"})
+    assert len(fetch_calls) == 2
+    assert len(_pc_warnings(events)) == 1 and "looks closed" in events[-1][1]
+
+
+def test_posting_check_at_send_an_opaque_host_unknown_is_still_cached(monkeypatch):
+    link = "https://www.linkedin.com/jobs/view/3912345678"
+    _, fetch_calls, _ = _posting_check_env(monkeypatch, "/e", link, lambda u, t: (200, u, "x", None))
+    _dispatch("/letter", reply_to_message={"message_id": 42, "text": "card"})
+    assert len(fetch_calls) == 1
+
+
+def test_posting_check_at_send_a_stale_cache_entry_is_removed_on_lookup(monkeypatch):
+    stale = (time.monotonic() - m.POSTING_CHECK_CACHE_SECONDS - 1, "dead", "HTTP 404", _PC_LINK)
+    m._POSTING_CHECK_CACHE["uuid-pc"] = stale
+    m._POSTING_CHECK_CACHE["uuid-other-stale"] = stale
+    _, fetch_calls, _ = _posting_check_env(monkeypatch, "/letter", _PC_LINK, _fetch_200)
+    assert len(fetch_calls) == 1  # the stale verdict was not trusted
+    assert m._POSTING_CHECK_CACHE["uuid-pc"][1] == "alive"  # replaced by the fresh one
+    assert "uuid-other-stale" not in m._POSTING_CHECK_CACHE  # opportunistically pruned on write
+
+
+def test_posting_check_at_send_a_stale_entry_is_dropped_even_when_the_refetch_is_transient(monkeypatch):
+    m._POSTING_CHECK_CACHE["uuid-pc"] = (
+        time.monotonic() - m.POSTING_CHECK_CACHE_SECONDS - 1, "dead", "HTTP 404", _PC_LINK)
+    _posting_check_env(monkeypatch, "/letter", _PC_LINK, lambda u, t: (None, None, "", TimeoutError("slow")))
+    assert "uuid-pc" not in m._POSTING_CHECK_CACHE
