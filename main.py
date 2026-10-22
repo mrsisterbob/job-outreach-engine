@@ -12081,7 +12081,17 @@ def fetch_single_query_jobs(query_args):
         all_jobs = all_jobs[:1]
     return all_jobs
 
-def fetch_greenhouse_jobs(slug):
+def ats_status_is_failure(status_code):
+    """True when an ATS board response means "could not tell" rather than "no such board".
+
+    401, 403, 429 and 5xx are failures; 404 and the other 4xx are a clean "no board here" (a slug
+    lives on one platform, so two of the three fetchers always 404 for it). One definition, shared
+    by auto_expand_ats_slug() and the three board fetchers so the two never classify differently.
+    """
+    return status_code in (401, 403, 429) or status_code >= 500
+
+
+def fetch_greenhouse_jobs(slug, failures=None):
     """Pull unauthenticated postings from a Greenhouse job board for a company slug.
 
     `content=true` is REQUIRED: without it Greenhouse omits the `content` field entirely, so
@@ -12091,6 +12101,10 @@ def fetch_greenhouse_jobs(slug):
     payload (0.7MB -> 9MB on a large board, ~124MB peak across a full 22-slug fan-out), which
     only became affordable once the get_db_conn() connection leak was fixed and the idle
     baseline dropped from ~477MB to ~95MB.
+
+    `failures`, when a list is passed, receives `slug` if the fetch FAILED (exception, a status
+    ats_status_is_failure() flags, or a 200 whose JSON cannot be read). The return value is `[]`
+    either way; a 404 is a clean "no board" and is not a failure.
     """
     try:
         # 30s, not the 10s the other boards use: content=true returns ~12x the bytes (a large
@@ -12098,6 +12112,8 @@ def fetch_greenhouse_jobs(slug):
         # whole boards - every ATS board timing out at once is what a 0-candidate /t run looks like.
         res = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true", timeout=30)
         if res.status_code != 200:
+            if failures is not None and ats_status_is_failure(res.status_code):
+                failures.append(slug)
             return []
         postings = res.json().get("jobs", [])
         jobs = []
@@ -12123,13 +12139,19 @@ def fetch_greenhouse_jobs(slug):
         return jobs
     except Exception as e:
         logging.error(f"Greenhouse Fetch Exception ({slug}): {e}")
+        if failures is not None:
+            failures.append(slug)
         return []
 
-def fetch_lever_jobs(slug):
-    """Pull unauthenticated postings from a Lever job board for a company slug."""
+def fetch_lever_jobs(slug, failures=None):
+    """Pull unauthenticated postings from a Lever job board for a company slug.
+
+    `failures`: same contract as fetch_greenhouse_jobs()."""
     try:
         res = requests.get(f"https://api.lever.co/v0/postings/{slug}", params={"mode": "json"}, timeout=10)
         if res.status_code != 200:
+            if failures is not None and ats_status_is_failure(res.status_code):
+                failures.append(slug)
             return []
         postings = res.json()
         jobs = []
@@ -12156,6 +12178,8 @@ def fetch_lever_jobs(slug):
         return jobs
     except Exception as e:
         logging.error(f"Lever Fetch Exception ({slug}): {e}")
+        if failures is not None:
+            failures.append(slug)
         return []
 
 # Workday's CXS endpoints 403 a default python-requests UA; a browser UA is required to read the
@@ -12268,11 +12292,15 @@ def fetch_workday_jobs(board):
     return jobs
 
 
-def fetch_ashby_jobs(slug):
-    """Pull unauthenticated postings from an Ashby job board for a company slug."""
+def fetch_ashby_jobs(slug, failures=None):
+    """Pull unauthenticated postings from an Ashby job board for a company slug.
+
+    `failures`: same contract as fetch_greenhouse_jobs()."""
     try:
         res = requests.get(f"https://api.ashbyhq.com/posting-api/job-board/{slug}", timeout=10)
         if res.status_code != 200:
+            if failures is not None and ats_status_is_failure(res.status_code):
+                failures.append(slug)
             return []
         postings = res.json().get("jobs", [])
         jobs = []
@@ -12294,6 +12322,8 @@ def fetch_ashby_jobs(slug):
         return jobs
     except Exception as e:
         logging.error(f"Ashby Fetch Exception ({slug}): {e}")
+        if failures is not None:
+            failures.append(slug)
         return []
 
 # ==============================================================================
@@ -12563,7 +12593,7 @@ def fetch_remote_feed_jobs(limit=100):
     return all_jobs
 
 
-def fetch_ats_jobs(company_slugs, include_workday=False):
+def fetch_ats_jobs(company_slugs, include_workday=False, failed_slugs=None):
     """Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in
     parallel; with include_workday=True, also every board in the `workday_boards` filter.
 
@@ -12574,6 +12604,13 @@ def fetch_ats_jobs(company_slugs, include_workday=False):
     watchlist material - NOT Stage 1b, which is deliberately scoped to Kevin's Carmen Warm network
     only. Defaulting to False keeps the warm stage warm: sourcing national boards there would
     contaminate the one stage whose whole purpose is that every posting traces to a real contact.
+
+    `failed_slugs`, when a list is passed, receives every slug whose fetch FAILED on any of the
+    three platforms (timeout, 429, 5xx, unreadable JSON) or whose future raised or timed out at the
+    45 s wait - unique, in input order. The fetchers return [] on failure, so without this a board
+    that errored is indistinguishable from one with no postings. A slug that failed on one platform
+    but returned postings on another is still listed here; its postings are still returned.
+    Workday boards are not reported.
     """
     workday_boards = (
         [str(b).strip() for b in safe_list(get_filter("workday_boards", [])) if str(b).strip()]
@@ -12583,27 +12620,37 @@ def fetch_ats_jobs(company_slugs, include_workday=False):
         return []
     all_jobs = []
     worker_count = min(len(company_slugs) * 3 + len(workday_boards), 18) or 1
+    # Shared by the worker threads; list.append is atomic. Only passed to the fetchers when the
+    # caller asked, so callers (and test stubs) that omit failed_slugs see the old one-arg calls.
+    fetch_failures = [] if failed_slugs is not None else None
+    fetch_kwargs = {"failures": fetch_failures} if failed_slugs is not None else {}
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = []
+        future_slugs = []
         for slug in company_slugs:
-            futures.append(executor.submit(fetch_greenhouse_jobs, slug))
-            futures.append(executor.submit(fetch_lever_jobs, slug))
-            futures.append(executor.submit(fetch_ashby_jobs, slug))
+            for fetcher in (fetch_greenhouse_jobs, fetch_lever_jobs, fetch_ashby_jobs):
+                futures.append(executor.submit(fetcher, slug, **fetch_kwargs))
+                future_slugs.append(slug)
         # Workday is two-stage (list + a detail fetch per posting), so it needs a longer timeout
         # than the single-request boards - collected separately rather than raising the shared one.
         workday_futures = [executor.submit(fetch_workday_jobs, board) for board in workday_boards]
-        for future in futures:
+        for future, future_slug in zip(futures, future_slugs):
             try:
                 # Must exceed the slowest single-board request (Greenhouse at 30s) or a board that
                 # is merely slow gets counted as a failure while its thread keeps running.
                 all_jobs.extend(future.result(timeout=45))
             except Exception as e:
                 logging.error(f"ATS Fetch Future Error: {e}")
+                if fetch_failures is not None:
+                    fetch_failures.append(future_slug)
         for future in workday_futures:
             try:
                 all_jobs.extend(future.result(timeout=90))
             except Exception as e:
                 logging.error(f"Workday Fetch Future Error: {e}")
+    if failed_slugs is not None:
+        failed = set(fetch_failures)
+        failed_slugs.extend(s for s in dict.fromkeys(company_slugs) if s in failed)
     return all_jobs
 
 # Serializes the read-modify-write of the ats_company_slugs filter in auto_expand_ats_slug, so
@@ -12644,7 +12691,7 @@ def auto_expand_ats_slug(company_name, errors=None):
     for board_name, url in board_checks:
         try:
             res = requests.get(url, timeout=8)
-            if errors is not None and (res.status_code in (401, 403, 429) or res.status_code >= 500):
+            if errors is not None and ats_status_is_failure(res.status_code):
                 errors.append(f"{board_name} HTTP {res.status_code}")
             if res.status_code == 200 and res.json():
                 # Re-read INSIDE the lock: the list read before the probes may be stale by now.
@@ -14122,12 +14169,13 @@ def run_warm_radar_scan(chat_id=None):
         # nothing is stamped, cached, sent or written yet: whether a surviving role is LISTED depends
         # on the per-company and per-run caps, and only a listed role may leave a trace.
         scanned_slugs = []      # boards fetched without a fetch error this run
-        errored_slugs = []      # boards in a chunk whose fetch raised
+        errored_slugs = []      # boards whose fetch raised or reported a failed platform
         keep_jobs = WARM_RADAR_ROLES_PER_COMPANY
         for chunk_start in range(0, len(slugs), WARM_RADAR_SCAN_CHUNK):
             chunk = slugs[chunk_start:chunk_start + WARM_RADAR_SCAN_CHUNK]
+            chunk_failed = []
             try:
-                chunk_jobs = fetch_ats_jobs(chunk)
+                chunk_jobs = fetch_ats_jobs(chunk, failed_slugs=chunk_failed)
             except Exception as e:
                 logging.error(f"Warm Radar Board Fetch Error ({len(chunk)} boards, first {chunk[0]}): {e}")
                 errored_slugs.extend(chunk)
@@ -14201,7 +14249,15 @@ def run_warm_radar_scan(chat_id=None):
                     group["roles"].sort(key=lambda r: r["rank"])
                     for dropped in group["roles"][keep_jobs:]:
                         dropped["job"] = None
-            scanned_slugs.extend(chunk)
+            # A board whose fetch failed (the fetchers swallow errors and return []) is not "scanned":
+            # it takes the same errored stamp a raising chunk gets. Its postings from a platform that
+            # DID answer were still processed above - one failed platform does not discard real
+            # roles - but the board stays due, so the failed platform is retried next /w.
+            if chunk_failed:
+                logging.warning(f"Warm Radar: {len(chunk_failed)} of {len(chunk)} boards failed to fetch: {chunk_failed}")
+            failed_set = set(chunk_failed)
+            errored_slugs.extend(s for s in chunk if s in failed_set)
+            scanned_slugs.extend(s for s in chunk if s not in failed_set)
 
         # PASS 2 - rank, cap and send. Roles inside a company: track-rule titles, then a positively
         # read US location, then the board's order. Companies: contact priority, role count, name.
