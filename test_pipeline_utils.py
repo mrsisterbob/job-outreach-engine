@@ -4165,3 +4165,13 @@ def test_posting_check_at_send_escapes_html_in_reason_and_url():
 def test_posting_check_at_send_classifies_through_the_real_classifier():
     verdict, reason = pu.classify_job_link("https://acme.com/jobs/1", 404, "https://acme.com/jobs/1", "")
     assert "looks closed" in pu.posting_check_warning(verdict, reason, "https://acme.com/jobs/1")
+
+
+def test_ups_ban_edge_names():
+    banned = ["UPS", "U.P.S.", "United  Parcel Service", "United Parcel Service Inc",
+              "UPS Supply Chain Solutions", "The UPS Store", "UPS-Freight"]
+    allowed = ["Start-Ups Hub", "Pop-Ups Co", "Groups Inc", "Startups Hub", "Cups Coffee", "Setups LLC"]
+    for name in banned:
+        assert pu.is_banned_employer(name) is True, name
+    for name in allowed:
+        assert pu.is_banned_employer(name) is False, name

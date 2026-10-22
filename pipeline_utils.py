@@ -3025,8 +3025,9 @@ def retag_card_routing(text, entities, track, bullet_indices, outreach_template_
 # Employers Kevin has banned outright. Lives in code, not in the System_Config sheet, so a deploy
 # is all it takes to reach production. Whole-word regexes: "ups" must not hit Groups or Startups.
 BANNED_EMPLOYER_PATTERNS = (
-    r"\bups\b",
-    r"\bunited parcel service\b",
+    r"(?<![\w-])ups(?!\w)",  # not Start-Ups / Pop-Ups / Groups; UPS-Freight still matches
+    r"(?<![\w.])u\.p\.s\.?(?!\w)",
+    r"\bunited\s+parcel\s+service\b",
 )
 
 
