@@ -2329,6 +2329,30 @@ def is_opaque_link_reason(reason):
     return str(reason or "").startswith(OPAQUE_LINK_REASON)
 
 
+def posting_check_warning(verdict, reason, url):
+    """Telegram-ready (HTML-safe) warning for one live posting check at /e, /eh or /letter, or None.
+
+    A single live fetch is one sample, so a dead verdict reads "looks closed", never "is closed":
+    only the nightly sweep, which needs two sightings, may retire a row. A permanent blind spot
+    (opaque host) gets a plain "could not verify" note. Every other 'unknown' is transient noise
+    (timeout, 5xx, odd status) and stays silent - warning on it would train Kevin to ignore this.
+    """
+    safe_url = html.escape(str(url or ""), quote=True)
+    safe_reason = html.escape(str(reason or ""))
+    if verdict == "dead":
+        return (
+            f"⚠️ <b>This posting looks closed</b> ({safe_reason}). "
+            f"Open the link before you send: {safe_url}"
+        )
+    if verdict == "unknown" and is_opaque_link_reason(reason):
+        host = html.escape(job_link_host(url) or "this site")
+        return (
+            f"ℹ️ <b>Could not verify this posting.</b> {host} does not show posting "
+            f"state to an automatic check, so it may be closed. Open the link before you send: {safe_url}"
+        )
+    return None
+
+
 def split_link_check_budget(row_counts, limit):
     """Divide one sweep's `limit` across tabs so an oversized tab cannot starve the rest.
 

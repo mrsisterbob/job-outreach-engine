@@ -4125,3 +4125,43 @@ def test_ghost_switch_review_followups_application_snooze_date_contract():
     assert pu.application_snooze_date("", next_followup="") is None and pu.application_snooze_date("garbage") is None
     assert pu.application_snooze_date("", date(2026, 6, 2)) == date(2026, 6, 2) + bury
     assert pu.application_snooze_date("", datetime(2026, 6, 2, 9, 30)) == date(2026, 6, 2) + bury
+
+
+# --- posting_check_at_send: the warning text the bot sends after /e, /eh or /letter ---
+
+def test_posting_check_at_send_dead_404_says_looks_closed_not_is_closed():
+    out = pu.posting_check_warning("dead", "HTTP 404", "https://boards.greenhouse.io/a/jobs/1")
+    assert "looks closed" in out and "HTTP 404" in out
+    assert "https://boards.greenhouse.io/a/jobs/1" in out and "before you send" in out
+    assert "is closed" not in out
+
+
+def test_posting_check_at_send_dead_redirect_quotes_the_destination():
+    out = pu.posting_check_warning("dead", "redirected to https://acme.com/careers", "https://acme.com/jobs/9")
+    assert "redirected to https://acme.com/careers" in out
+
+
+def test_posting_check_at_send_opaque_host_is_named():
+    reason = f"{pu.OPAQUE_LINK_REASON}: HTTP 200, posting state not exposed to a server-side fetch"
+    out = pu.posting_check_warning("unknown", reason, "https://www.linkedin.com/jobs/view/123")
+    assert "linkedin.com" in out and "Could not verify" in out and "before you send" in out
+
+
+def test_posting_check_at_send_alive_is_none():
+    assert pu.posting_check_warning("alive", "HTTP 200", "https://acme.com/jobs/1") is None
+
+
+@pytest.mark.parametrize("reason", ["fetch failed: timed out", "HTTP 503 (server error, not a retired posting)", "HTTP 418"])
+def test_posting_check_at_send_transient_unknown_is_none(reason):
+    assert pu.posting_check_warning("unknown", reason, "https://acme.com/jobs/1") is None
+
+
+def test_posting_check_at_send_escapes_html_in_reason_and_url():
+    out = pu.posting_check_warning("dead", 'page says "<b>gone</b>"', "https://acme.com/j?a=1&b=<2>")
+    assert "<b>gone</b>" not in out and "&lt;b&gt;gone&lt;/b&gt;" in out
+    assert "&amp;b=&lt;2&gt;" in out
+
+
+def test_posting_check_at_send_classifies_through_the_real_classifier():
+    verdict, reason = pu.classify_job_link("https://acme.com/jobs/1", 404, "https://acme.com/jobs/1", "")
+    assert "looks closed" in pu.posting_check_warning(verdict, reason, "https://acme.com/jobs/1")

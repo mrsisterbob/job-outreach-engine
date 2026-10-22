@@ -63,7 +63,7 @@ from pipeline_utils import (
     INBOUND_REPLY_NOTE_MARKER, LADDER_RESTART_NOTE_MARKER, LINKEDIN_TOUCH_NOTE_MARKER,
     MAX_AUTO_KILLS_PER_RUN,
     is_expired_matched_row, MATCHED_EXPIRY_DAYS,
-    classify_job_link, dead_verdict_confirmed, may_auto_retire, is_opaque_job_host, is_opaque_link_reason, split_link_check_budget,
+    classify_job_link, posting_check_warning, dead_verdict_confirmed, may_auto_retire, is_opaque_job_host, is_opaque_link_reason, split_link_check_budget,
     parse_job_command, parse_job_command_urls, parse_job_page_html, build_ingest_job_dict,
     is_expired_job_redirect, title_company_from_linkedin_slug, extract_jd_terms,
     canonical_job_url, canonical_linkedin_job_url, is_linkedin_job_url,
@@ -11527,15 +11527,90 @@ MAX_AUTO_RETIRE_PER_RUN = 10
 DEAD_LINK_REPORT_WINDOW_HOURS = 24
 
 
-def fetch_job_link_state(url):
-    """GET a job posting and return (status_code, final_url, text, error). Never raises."""
+def fetch_job_link_state(url, timeout=None):
+    """GET a job posting and return (status_code, final_url, text, error). Never raises.
+
+    `timeout` defaults to LINK_CHECK_TIMEOUT (the nightly sweep); /e, /eh and /letter pass a
+    shorter one because Kevin is waiting on them.
+    """
     try:
         res = requests.get(
-            url, headers=_JOB_SCRAPE_HEADERS, timeout=LINK_CHECK_TIMEOUT, allow_redirects=True
+            url, headers=_JOB_SCRAPE_HEADERS, timeout=timeout or LINK_CHECK_TIMEOUT, allow_redirects=True
         )
         return (res.status_code, res.url, res.text[:400000], None)
     except Exception as e:
         return (None, None, "", e)
+
+
+# Live check at the moment Kevin drafts or writes a letter. Advice only: it sends one Telegram
+# message and writes nothing - no CRM payload, no job_link_status row, no retire. The nightly
+# sweep (check_job_links) stays the only thing that can kill a row.
+POSTING_CHECK_TIMEOUT = 5
+POSTING_CHECK_CACHE_SECONDS = 600
+# sheet_uuid -> (monotonic time, verdict, reason, url). In-process, so /e then /letter on one card
+# fetches once. Tests clear it in their autouse fixture; a stale entry would hide a fetch.
+_POSTING_CHECK_CACHE = {}
+
+
+def _posting_link_for_check(job, sheet_uuid, use_ledger=True):
+    """The posting URL for a job: job_apply_link, then job_link, then the sweep ledger's row."""
+    for key in ("job_apply_link", "job_link"):
+        val = str((job or {}).get(key) or "").strip()
+        if val.lower().startswith("http"):
+            return val
+    if not use_ledger:
+        return ""
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT job_link FROM job_link_status WHERE sheet_uuid = ?", (sheet_uuid,)).fetchone()
+        val = str(row[0] or "").strip() if row else ""
+        if val.lower().startswith("http"):
+            return val
+    except Exception as e:
+        logging.error(f"[POSTCHECK] ledger link read error ({sheet_uuid}): {e}")
+    return ""
+
+
+def warn_if_posting_looks_closed(chat_id, job, mapping, from_card=False):
+    """After a draft or letter has landed, send ONE warning if the posting looks closed or cannot
+    be checked. Never raises, never blocks the command, writes nothing.
+
+    `from_card` means the job was rebuilt from the Telegram card after a cache wipe: no link
+    survives there, so we say nothing rather than guess one from the ledger."""
+    try:
+        sheet_uuid = (mapping or {}).get("sheet_uuid")
+        url = _posting_link_for_check(job, sheet_uuid, use_ledger=not from_card)
+        if not url:
+            logging.info(f"[POSTCHECK] no job link for {sheet_uuid}; staying silent")
+            return
+        now = time.monotonic()
+        cached = _POSTING_CHECK_CACHE.get(sheet_uuid)
+        if cached and (now - cached[0]) >= POSTING_CHECK_CACHE_SECONDS:
+            # Expired: drop it on read so the dict cannot grow for the life of the process.
+            _POSTING_CHECK_CACHE.pop(sheet_uuid, None)
+            cached = None
+        if cached and cached[3] == url:
+            verdict, reason = cached[1], cached[2]
+        else:
+            status, final_url, text, err = fetch_job_link_state(url, timeout=POSTING_CHECK_TIMEOUT)
+            verdict, reason = classify_job_link(url, status, final_url, text, fetch_error=err)
+            # Cache only a verdict that produced a decision (alive, dead, opaque-host unknown). A
+            # transient unknown (timeout, 5xx, odd status) is not one: the host may have recovered
+            # by the next command, so that command fetches again.
+            if verdict in ("alive", "dead") or (verdict == "unknown" and is_opaque_link_reason(reason)):
+                for key in [k for k, v in _POSTING_CHECK_CACHE.items()
+                            if (now - v[0]) >= POSTING_CHECK_CACHE_SECONDS]:
+                    _POSTING_CHECK_CACHE.pop(key, None)
+                _POSTING_CHECK_CACHE[sheet_uuid] = (now, verdict, reason, url)
+            else:
+                _POSTING_CHECK_CACHE.pop(sheet_uuid, None)
+        warning = posting_check_warning(verdict, reason, url)
+        if warning:
+            send_telegram_message(chat_id, warning)
+        elif verdict != "alive":
+            logging.info(f"[POSTCHECK] {sheet_uuid}: {verdict} ({reason}) - transient, no warning")
+    except Exception as e:
+        logging.error(f"[POSTCHECK] check failed: {e}")
 
 
 def check_job_links(limit=LINK_CHECK_MAX_ROWS, auto_retire=True, sleep_between=LINK_CHECK_SLEEP):
@@ -16014,6 +16089,7 @@ def process_webhook_payload_async(data):
                 chat_id, mapping, job, comp, title, is_warm, target,
                 f"🔍 <b>API Lookup Resolved ({confidence_badge}):</b> <code>{html.escape(target)}</code>", "/eh"
             )
+            warn_if_posting_looks_closed(chat_id, job, mapping, from_card=from_card)
             return
 
         if text in ("/e", "/email") or text.startswith("/e ") or text.startswith("/email "):
@@ -16092,6 +16168,7 @@ def process_webhook_payload_async(data):
                 new_email, company=comp, note=f"[{datetime.now().strftime('%Y-%m-%d')}] Emailed: {title}"
             ):
                 send_telegram_message(chat_id, f"👤 Logged <code>{html.escape(new_email)}</code> to Carmen Cold.")
+            warn_if_posting_looks_closed(chat_id, job, mapping, from_card=from_card)
             return
 
         if text == "/fillcontacts" or text == "/fillcontacts go":
@@ -16529,6 +16606,7 @@ def process_webhook_payload_async(data):
             # Text lands instantly; the PDF compile follows on a thread so the webhook is not held open.
             send_telegram_message(chat_id, letter_msg)
             send_cover_letter_pdf_async(chat_id, letter, comp, track, "/letter")
+            warn_if_posting_looks_closed(chat_id, job, mapping)
             return
 
         # [a-h], not [a-e]: the pattern predated tracks f/g/h, so "/cv h" matched nothing at all.
