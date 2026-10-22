@@ -11,6 +11,7 @@ import re
 import shutil
 import contextlib
 import hashlib
+import inspect
 import sqlite3
 import sys
 import threading
@@ -16587,22 +16588,46 @@ def process_webhook_payload_async(data):
                 # permanent no-op costing three HTTP calls on every future run.
                 added = []
                 resolved = []
+                check_failed = []   # board request failed (timeout/429/5xx/bad JSON): NOT a typo
+                unresolved = []     # every platform answered and none had a board
                 tried = set()   # a slug typed twice is probed and saved once
                 for slug in re.split(r"[\s,]+", arg):
                     if not slug or slug in slugs or slug in tried:
                         continue
                     tried.add(slug)
-                    found = len(fetch_greenhouse_jobs(slug)) + len(fetch_lever_jobs(slug)) + len(fetch_ashby_jobs(slug))
+                    probe_failures = []   # the fetchers append the slug here when their request FAILED
+                    found = 0
+                    for fetcher in (fetch_greenhouse_jobs, fetch_lever_jobs, fetch_ashby_jobs):
+                        # Stand-in fetchers that predate failures= are still called with the slug only.
+                        takes_failures = "failures" in inspect.signature(fetcher).parameters
+                        found += len(fetcher(slug, failures=probe_failures) if takes_failures else fetcher(slug))
                     if found:
                         resolved.append(slug)
                         added.append(f"{slug} ({found})")
+                    elif probe_failures:
+                        check_failed.append(slug)
+                    else:
+                        unresolved.append(slug)
                 # The probes above are HTTP and run outside the lock; the list update is inside it
                 # and re-reads, so a slug another thread added meanwhile is not lost.
                 with _ATS_SLUG_FILTER_LOCK:
                     current = list(safe_list(get_filter("ats_company_slugs", [])))
                     current += [s for s in resolved if s not in current]
                     set_filter("ats_company_slugs", current)
-                send_telegram_message(chat_id, f"➕ Added: {html.escape(', '.join(added))}" if added else "⚠️ No board resolved for that slug.")
+                reply_lines = []
+                if added:
+                    reply_lines.append(f"➕ Added: {html.escape(', '.join(added))}")
+                if check_failed:
+                    reply_lines.append(
+                        f"⚠️ Could not check {html.escape(', '.join(check_failed))}: the board request failed. "
+                        "Try again in a minute."
+                    )
+                if unresolved:
+                    reply_lines.append(
+                        f"⚠️ No board resolved for {html.escape(', '.join(unresolved))}." if added or check_failed
+                        else "⚠️ No board resolved for that slug."
+                    )
+                send_telegram_message(chat_id, "\n".join(reply_lines) or "⚠️ No board resolved for that slug.")
             elif action == "remove" and arg:
                 with _ATS_SLUG_FILTER_LOCK:
                     current = list(safe_list(get_filter("ats_company_slugs", [])))
