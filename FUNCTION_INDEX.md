@@ -52,24 +52,25 @@ grep -i "contact" FUNCTION_INDEX.md
 | 207 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 222 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
-## `linkedin_import.py` — 14 defs, 337 lines
+## `linkedin_import.py` — 15 defs, 382 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 80 | `ConnectionsFormatError` | The export is not shaped as expected; the message lists the columns that were found. |
-| 84 | `_collapse` | _(no docstring)_ |
-| 88 | `_header_key` | _(no docstring)_ |
-| 92 | `_find_header_index` | Index of the first line containing both 'first name' and 'last name'; else a fallback |
-| 110 | `parse_connections_csv` | Parse the export text into a list of dicts with canonical keys (first_name, last_name, |
-| 149 | `canonical_linkedin_url` | https://www.linkedin.com/in/<slug>, lowercase, no query, fragment or trailing slash; |
-| 171 | `_iso_date` | _(no docstring)_ |
-| 183 | `clean_connection` | One parsed row -> {name, company, title, url, email, connected_on}. Idempotent. |
-| 202 | `_is_non_employer` | _(no docstring)_ |
-| 209 | `to_warm_row` | Cleaned connection -> Carmen Warm named-object fields (Code.gs FIELD_ALIASES PEOPLE). |
-| 228 | `ImportPlan` | _(no docstring)_ |
-| 235 | `_alnum_only` | Drop punctuation the injected normalizer leaves behind ("acme," -> "acme"). |
-| 240 | `_name_company_key` | _(no docstring)_ |
-| 246 | `plan_import` | Clean, de-duplicate and map `rows`. `existing` is a list of PEOPLE-row dicts (name, |
+| 83 | `ConnectionsFormatError` | The export is not shaped as expected; the message lists the columns that were found. |
+| 87 | `_collapse` | _(no docstring)_ |
+| 91 | `_header_key` | _(no docstring)_ |
+| 95 | `_find_header_index` | Index of the first line containing both 'first name' and 'last name'; else a fallback |
+| 113 | `parse_connections_csv` | Parse the export text into a list of dicts with canonical keys (first_name, last_name, |
+| 152 | `canonical_linkedin_url` | https://www.linkedin.com/in/<slug>, lowercase, no query, fragment or trailing slash; |
+| 181 | `_parse_date` | (iso, status): status is "empty", "ok" or "unparsed". Never guesses an ambiguous date. |
+| 211 | `_iso_date` | YYYY-MM-DD, or "" when the value is empty or cannot be read as a date. |
+| 216 | `clean_connection` | One parsed row -> {name, company, title, url, email, connected_on}. Idempotent. |
+| 237 | `_is_non_employer` | _(no docstring)_ |
+| 244 | `to_warm_row` | Cleaned connection -> Carmen Warm named-object fields (Code.gs FIELD_ALIASES PEOPLE). |
+| 268 | `ImportPlan` | _(no docstring)_ |
+| 275 | `_alnum_only` | Drop punctuation the injected normalizer leaves behind ("acme," -> "acme"). |
+| 280 | `_name_company_key` | _(no docstring)_ |
+| 286 | `plan_import` | Clean, de-duplicate and map `rows`. `existing` is a list of PEOPLE-row dicts (name, |
 
 ## `main.py` — 419 defs, 18,361 lines
 
@@ -836,4 +837,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**697 definitions across 24 files + Code.gs.**
+**698 definitions across 24 files + Code.gs.**
