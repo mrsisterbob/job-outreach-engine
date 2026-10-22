@@ -4059,7 +4059,7 @@ def test_warm_swipe_atomic_enqueue_auth_hold_alerts_once(monkeypatch):
     behind a "Moved" the bot already sent, and it must not spend any retries."""
     m._CRM_AUTH_BACKOFF["until"] = 0.0
     with m.get_db_conn() as conn:
-        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'crm_outbox_auth_hold'")
+        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'crm_write_unauthorized'")
         conn.commit()
     alerts = _capture_alerts(monkeypatch)
     m.enqueue_crm_payloads([{"action": "update_status", "sheet_uuid": "u-hn", "new_tab": "Tetiana Warm"},
@@ -4076,7 +4076,7 @@ def test_warm_swipe_atomic_enqueue_auth_hold_alerts_once(monkeypatch):
     finally:
         m._CRM_AUTH_BACKOFF["until"] = 0.0
 
-    hold = [a for a in alerts if "secret rejected" in a]
+    hold = [a for a in alerts if "Unauthorized" in a]
     assert len(hold) == 1, alerts
     assert "2 queued" in hold[0]
     with m.get_db_conn() as conn:
@@ -5403,7 +5403,7 @@ def test_negative_layer1_modifiers_pass_through_uncapped():
 
 def test_evaluate_job_without_a_key_fails_closed_instead_of_passing(monkeypatch):
     monkeypatch.setattr(m, "GEMINI_API_KEY", "")
-    monkeypatch.setattr(m, "should_send_alert", lambda *a, **k: False)
+    monkeypatch.setattr(m, "send_debounced_alert", lambda *a, **k: False)
     result = m.evaluate_job_with_gemini({"job_title": "Ops Analyst", "employer_name": "Acme"})
 
     passed, score, reason = result[0], result[1], result[2]
@@ -5416,14 +5416,15 @@ def test_evaluate_job_without_a_key_fails_closed_instead_of_passing(monkeypatch)
 def test_evaluate_job_without_a_key_alerts_but_only_through_the_debounce(monkeypatch):
     monkeypatch.setattr(m, "GEMINI_API_KEY", "")
     alerts, gate = [], {"open": True}
-    monkeypatch.setattr(m, "send_health_alert", lambda msg: alerts.append(msg))
 
-    def fake_gate(key, cooldown_hours=6):
+    def fake_debounced(key, message, cooldown_hours=6, sender=None):
         assert key == "gemini_key_missing"
-        was_open, gate["open"] = gate["open"], False   # mirrors should_send_alert's one-shot cooldown
+        was_open, gate["open"] = gate["open"], False   # mirrors the one-shot cooldown
+        if was_open:
+            alerts.append(message)
         return was_open
 
-    monkeypatch.setattr(m, "should_send_alert", fake_gate)
+    monkeypatch.setattr(m, "send_debounced_alert", fake_debounced)
 
     for _ in range(20):   # the ThreadPoolExecutor width - an undebounced alert would fire 20 times
         m.evaluate_job_with_gemini({"job_title": "Ops Analyst", "employer_name": "Acme"})
@@ -8648,8 +8649,9 @@ def test_a_dead_refresh_token_tells_kevin_instead_of_going_quiet(monkeypatch):
         monkeypatch.setenv(var, "fake")
     monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
     monkeypatch.setattr(m, "get_gmail_access_token", lambda: None)
-    monkeypatch.setattr(m, "should_send_alert", lambda key, hours=6: True)
     alerts = []
+    monkeypatch.setattr(m, "send_debounced_alert",
+                        lambda key, message, cooldown_hours=6, sender=None: bool(sender(message)))
     monkeypatch.setattr(m, "send_telegram_message",
                         lambda cid, text: (alerts.append(text), 12345)[1])
 
@@ -8665,7 +8667,8 @@ def test_poller_failure_alert_is_debounced_across_restarts(monkeypatch):
     dict would reset with the container and re-alert on each boot."""
     monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "12345")
     seen = []
-    monkeypatch.setattr(m, "should_send_alert", lambda key, hours=6: seen.append((key, hours)) or False)
+    monkeypatch.setattr(m, "send_debounced_alert",
+                        lambda key, message, cooldown_hours=6, sender=None: seen.append((key, cooldown_hours)) or False)
     alerts = []
     monkeypatch.setattr(m, "send_telegram_message",
                         lambda cid, text: (alerts.append(text), 12345)[1])
@@ -13783,7 +13786,7 @@ def _outbox_rows():
 def _auth_reset():
     m._CRM_AUTH_BACKOFF["until"] = 0.0
     with m.get_db_conn() as conn:
-        conn.execute("DELETE FROM system_alerts WHERE alert_key IN ('crm_write_unauthorized', 'crm_outbox_auth_hold')")
+        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'crm_write_unauthorized'")
         conn.commit()
     yield
     m._CRM_AUTH_BACKOFF["until"] = 0.0
@@ -18507,3 +18510,179 @@ def test_posting_check_at_send_a_stale_entry_is_dropped_even_when_the_refetch_is
         time.monotonic() - m.POSTING_CHECK_CACHE_SECONDS - 1, "dead", "HTTP 404", _PC_LINK)
     _posting_check_env(monkeypatch, "/letter", _PC_LINK, lambda u, t: (None, None, "", TimeoutError("slow")))
     assert "uuid-pc" not in m._POSTING_CHECK_CACHE
+
+
+# ==============================================================================
+# TASK-103: a debounced alert is stamped only after Telegram accepted it
+# ==============================================================================
+
+def _alert_rows(key):
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT alert_key FROM system_alerts WHERE alert_key = ?", (key,)).fetchall()
+
+
+def test_alert_stamped_after_send_a_failed_send_leaves_no_row_and_retries(monkeypatch):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'k103'")
+        conn.commit()
+    results = iter([False, True, True])
+    attempts = []
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: attempts.append(msg) or next(results))
+
+    assert m.send_debounced_alert("k103", "m") is False
+    assert _alert_rows("k103") == [], "a failed send must not start the cooldown"
+    assert m.send_debounced_alert("k103", "m") is True
+    assert len(attempts) == 2
+    assert m.send_debounced_alert("k103", "m") is False   # inside the cooldown now
+    assert len(attempts) == 2, "a third call inside the cooldown must not send"
+    assert len(_alert_rows("k103")) == 1
+
+
+def test_alert_stamped_after_send_fails_open_when_the_database_check_raises(monkeypatch):
+    import sqlite3
+    sent = []
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: sent.append(msg) or True)
+
+    class _Broken:
+        def __enter__(self):
+            raise sqlite3.OperationalError("database is locked")
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(m, "get_db_conn", lambda *a, **k: _Broken())
+
+    assert m.send_debounced_alert("k103-open", "m") is True
+    assert sent == ["m"]
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: sent.append(msg) or False)
+    assert m.send_debounced_alert("k103-open", "m") is False   # returns the send result
+    assert len(sent) == 2
+
+
+def test_alert_stamped_after_send_a_rejected_secret_is_one_alert_per_outage(monkeypatch, _auth_reset):
+    """Through the REAL outbox pass and the real log_to_sheets_crm: two passes, one alert, and it
+    names the held count, Unauthorized and the Script Property fix."""
+    alerts = _capture_alerts(monkeypatch)
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "u-1", "new_tab": "Tetiana Warm"})
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "u-2", "new_tab": "Died"})
+    _crm_answers(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    for _ in range(2):
+        m._CRM_AUTH_BACKOFF["until"] = 0.0
+        m.process_crm_outbox_batch(inter_job_sleep=0)
+
+    assert len(alerts) == 1, alerts
+    assert "Unauthorized" in alerts[0] and "2 queued" in alerts[0]
+    assert "CRM_SHARED_SECRET" in alerts[0] and "redeploy the web app" in alerts[0]
+    assert len(_alert_rows("crm_write_unauthorized")) == 1
+    assert _alert_rows("crm_outbox_auth_hold") == []
+
+
+def test_alert_stamped_after_send_outbox_alert_retries_when_telegram_drops_it(monkeypatch, _auth_reset):
+    sent = []
+    outcomes = iter([False, True])
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: sent.append(msg) or next(outcomes))
+    m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": "u-1", "new_tab": "Tetiana Warm"})
+    _crm_answers(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    for _ in range(3):
+        m._CRM_AUTH_BACKOFF["until"] = 0.0
+        m.process_crm_outbox_batch(inter_job_sleep=0)
+    assert len(sent) == 2, "the dropped alert should be retried once, then debounced"
+
+
+def test_alert_stamped_after_send_a_direct_unauthorized_write_alerts_once(monkeypatch, _auth_reset):
+    alerts = _capture_alerts(monkeypatch)
+    _crm_answers(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    payload = {"action": "update_status", "sheet_uuid": "u-direct", "new_tab": "Died"}
+
+    assert m.log_to_sheets_crm(payload, max_retries=1) is False
+    assert m.log_to_sheets_crm(payload, max_retries=1) is False
+    assert len(alerts) == 1, alerts
+    assert "Unauthorized" in alerts[0]
+
+
+def test_alert_stamped_after_send_concurrent_callers_send_exactly_once(monkeypatch):
+    """The 20-worker evaluate_job_with_gemini pool: every worker reads 'no row' at once. Only one
+    may send, the others return False immediately, and exactly one row is written."""
+    import threading as _th
+    import time as _t
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'k103-race'")
+        conn.commit()
+    n = 20
+    sends, results = [], []
+    lock = _th.Lock()
+
+    def slow_send(msg):
+        _t.sleep(0.3)   # long enough that every other thread is inside the check-send-stamp window
+        with lock:
+            sends.append(msg)
+        return True
+    monkeypatch.setattr(m, "send_health_alert", slow_send)
+    barrier = _th.Barrier(n)
+
+    def worker():
+        barrier.wait()
+        r = m.send_debounced_alert("k103-race", "m")
+        with lock:
+            results.append(r)
+
+    threads = [_th.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert len(sends) == 1, f"{len(sends)} identical alerts sent"
+    assert results.count(True) == 1 and len(results) == n
+    assert len(_alert_rows("k103-race")) == 1
+
+
+def test_alert_stamped_after_send_failed_send_clears_the_in_flight_mark(monkeypatch):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'k103-clear'")
+        conn.commit()
+    outcomes = iter([False, True])
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: next(outcomes))
+    assert m.send_debounced_alert("k103-clear", "m") is False
+    assert "k103-clear" not in m._ALERT_IN_FLIGHT
+    assert m.send_debounced_alert("k103-clear", "m") is True   # retried, not stuck in flight
+    assert "k103-clear" not in m._ALERT_IN_FLIGHT
+
+    def boom(msg):
+        raise RuntimeError("transport exploded")
+    monkeypatch.setattr(m, "send_health_alert", boom)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM system_alerts WHERE alert_key = 'k103-clear'")
+        conn.commit()
+    with pytest.raises(RuntimeError):
+        m.send_debounced_alert("k103-clear", "m")
+    assert "k103-clear" not in m._ALERT_IN_FLIGHT, "an exception left the key stuck in flight"
+
+
+def test_alert_stamped_after_send_failed_count_is_worded_without_a_number(monkeypatch, _auth_reset):
+    """When the COUNT query fails the alert must not claim the fetch size (5) as the backlog."""
+    import contextlib as _cl
+    alerts = _capture_alerts(monkeypatch)
+    for i in range(7):
+        m.enqueue_crm_payload({"action": "update_status", "sheet_uuid": f"u-{i}", "new_tab": "Died"})
+    _crm_answers(monkeypatch, {"status": "error", "message": "Unauthorized"})
+    real = m.get_db_conn
+
+    class _Proxy:
+        def __init__(self, conn):
+            self._conn = conn
+        def execute(self, sql, *a, **k):
+            if "COUNT(*) FROM crm_outbox" in sql:
+                raise sqlite3.OperationalError("count failed")
+            return self._conn.execute(sql, *a, **k)
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    @_cl.contextmanager
+    def flaky(*a, **k):
+        with real(*a, **k) as conn:
+            yield _Proxy(conn)
+    monkeypatch.setattr(m, "get_db_conn", flaky)
+
+    m._CRM_AUTH_BACKOFF["until"] = 0.0
+    m.process_crm_outbox_batch(inter_job_sleep=0)
+    assert len(alerts) == 1, alerts
+    assert "Unauthorized" in alerts[0] and "some queued" in alerts[0]
+    assert "5 queued" not in alerts[0] and "0 queued" not in alerts[0]
