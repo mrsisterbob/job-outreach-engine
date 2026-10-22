@@ -156,7 +156,8 @@ WILDCARD_BONUS = max(0, int(os.environ.get("WILDCARD_BONUS", "2")))
 # tunable knob - raise toward 35 to loosen, drop toward 25 to force more spread.
 BONUS_STACK_CAP = 30
 from score_rules import (posted_age_adjustment, is_dead_posting, AGE_DEAD_CEILING, SENIORITY_TITLE_RE,
-                         seniority_ceiling, title_level, ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS)
+                         seniority_ceiling, title_level, ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS,
+                         years_of_experience_demanded)
 
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
@@ -4626,9 +4627,10 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
         bonus += PLAIN_FAMILY_TITLE_BONUS
 
     # Years-of-experience demand: a 0-2yr candidate is a real match at 0-3 and a stretch past 5.
-    exp_match = re.search(r'(\d+)\+?\s*(?:-\s*\d+\s*)?year', desc)
-    if exp_match:
-        years = safe_int(exp_match.group(1), 0)
+    # Only years the posting demands AS experience count (score_rules.years_of_experience_demanded);
+    # none found -> no adjustment, as before.
+    years = years_of_experience_demanded(desc)
+    if years is not None:
         if years >= 7:
             bonus -= 15
         elif years >= 5:

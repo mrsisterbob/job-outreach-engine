@@ -86,3 +86,29 @@ def seniority_ceiling(title):
     elif level == 2:
         caps.append(LEVEL2_CEILING)
     return min(caps) if caps else None
+
+
+# ---- Years of experience DEMANDED ----
+# Only a year figure attached to experience is a demand. "Serving families for 40 years", "grown for
+# 12 years" and "a 2-year associate degree" are not, and the old inline regex read all of them.
+# A figure counts when "year(s)" is followed within ~4 words (same sentence) by "experience"/"exp",
+# or when it directly follows minimum (of) / at least / require(s|d) ("Minimum of 3 years in a
+# similar role"). A range ("3-5", "3 to 5") reads its LOWER bound.
+_YEARS_FIGURE_RE = re.compile(
+    r"(?<![\d.])(\d+)\s*(?:\+|\s+plus\b)?\s*(?:(?:-|\u2013|to)\s*\d+\s*\+?\s*)?-?\s*(?:years?|yrs?)\b")
+_YEARS_EXPERIENCE_AFTER_RE = re.compile(
+    r"\s*(?:['\u2019]s?)?(?:\s+[\w'\u2019-]+){0,4}?\s+(?:experience|exp)\b")
+_YEARS_DEMAND_LEAD_RE = re.compile(r"(?:minimum(?:\s+of)?|at\s+least|requires?|required)\s+(?:an?\s+)?$")
+
+
+def years_of_experience_demanded(description):
+    """Largest lower-bound years figure a (lowercase) posting ties to experience, or None."""
+    text = str(description or "")
+    best = None
+    for found in _YEARS_FIGURE_RE.finditer(text):
+        if (_YEARS_EXPERIENCE_AFTER_RE.match(text, found.end())
+                or _YEARS_DEMAND_LEAD_RE.search(text[:found.start()])):
+            years = int(found.group(1))
+            if best is None or years > best:
+                best = years
+    return best
