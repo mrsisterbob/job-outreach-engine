@@ -9780,6 +9780,7 @@ def test_auto_fill_commits_and_notifies(monkeypatch):
     monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
     enqueued, sent = [], []
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p))
+    _bridge_batch_enqueue(monkeypatch)
     monkeypatch.setattr(m, "update_job_target_email", lambda *a, **k: True)
     monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, text, *a, **k: sent.append(text) or 1)
@@ -9838,6 +9839,7 @@ def test_fillcontacts_dry_run_writes_nothing(monkeypatch):
     monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(cold, jobs))
     enqueued = []
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p))
+    _bridge_batch_enqueue(monkeypatch)
     monkeypatch.setattr(m, "update_job_target_email", lambda *a, **k: True)
 
     m.backfill_job_contacts_from_carmen_cold(dry_run=True)
@@ -18897,3 +18899,159 @@ def test_commands_confirm_after_queue_failed_insert_changes_nothing(monkeypatch,
     assert side == [], f"side effects ran on a failed queue: {side}"
     if "must_not_cache" in extra:
         assert extra["must_not_cache"] not in m._APPLIED_CRM_CACHE["data"]
+
+
+# ---- /kill and the contact fill confirm only after their Sheets writes are queued (TASK-135) ----
+
+def _kill_queue_env(monkeypatch):
+    """Two live Trinity rows, a parked pick card, and the real /kill dispatcher."""
+    enqueued, outcomes = _rejection_env(monkeypatch, {
+        "TC": [_reject_job_row("uuid-a", "Trinity Health MI", "EHR Clinical Analyst")],
+        "TW": [_reject_job_row("uuid-b", "Trinity Health MI", "Data Analyst")],
+    })
+    died, sent = [], []
+    monkeypatch.setattr(m, "record_died_role", lambda company, title: died.append((company, title)))
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text, *a, **k: sent.append(text) or 1)
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    m.route_rejection_to_died("Trinity Health MI")
+    enqueued.clear()
+    return enqueued, outcomes, died, sent
+
+
+def test_kill_and_fillcontacts_confirm_after_queue_kill_failure_keeps_the_pick(monkeypatch):
+    enqueued, outcomes, died, sent = _kill_queue_env(monkeypatch)
+    monkeypatch.setattr(m, "enqueue_crm_payloads", lambda payloads: False)
+
+    _dispatch("/kill Trinity Health MI 2")
+
+    assert len(sent) == 1 and sent[0].startswith("⚠️ Couldn't queue") and "Nothing changed" in sent[0], sent
+    assert "Archived" not in sent[0]
+    assert outcomes == [] and died == []
+    assert m.PENDING_REJECTION_KILLS, "the pick was consumed by a failed enqueue"
+
+    # The enqueue works on the retry: the same pick is still there and now succeeds.
+    _bridge_batch_enqueue(monkeypatch)
+    sent.clear()
+    _dispatch("/kill Trinity Health MI 2")
+
+    assert [p["sheet_uuid"] for p in enqueued if p["action"] == "update_status"] == ["uuid-b"]
+    assert len(sent) == 1 and "Archived 1 role(s)" in sent[0] and "Data Analyst" in sent[0]
+    assert outcomes == [("uuid-b", "rejection")]
+    assert died == [("Trinity Health MI", "Data Analyst")]
+    assert m.PENDING_REJECTION_KILLS == {}
+
+
+def test_kill_and_fillcontacts_confirm_after_queue_kill_all_is_one_all_or_none_call(monkeypatch):
+    enqueued, outcomes, died, sent = _kill_queue_env(monkeypatch)
+    calls = []
+    monkeypatch.setattr(m, "enqueue_crm_payloads", lambda payloads: calls.append(list(payloads)) or True)
+
+    _dispatch("/kill Trinity Health MI all")
+
+    assert len(calls) == 1
+    assert [p["action"] for p in calls[0]] == ["update_status", "append_note", "update_status", "append_note"]
+    assert sorted(o[0] for o in outcomes) == ["uuid-a", "uuid-b"]
+    assert len(died) == 2
+    assert "Archived 2 role(s)" in sent[0]
+    assert m.PENDING_REJECTION_KILLS == {}
+
+
+_FILL_COLD = [
+    {"name": "Eina Assali", "company": "Affirm", "email": "eina.assali@affirm.com"},
+    {"name": "Dana Reed", "company": "Acme", "email": "dana.reed@acme.com"},
+]
+_FILL_JOBS = [
+    {"sheet_uuid": "u1", "company": "Affirm", "title": "Analyst", "email": "kjmiller406@gmail.com"},
+    {"sheet_uuid": "u2", "company": "Acme", "title": "Associate", "email": ""},
+]
+
+
+def _fill_queue_env(monkeypatch, outcomes):
+    """Fill with enqueue_crm_payloads answering `outcomes` in call order (one call per row)."""
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(_FILL_COLD, _FILL_JOBS))
+    queued_calls, stamped, sent = [], [], []
+    answers = iter(outcomes)
+
+    def _enqueue(payloads):
+        ok = next(answers)
+        if ok:
+            queued_calls.append(list(payloads))
+        return ok
+    monkeypatch.setattr(m, "enqueue_crm_payloads", _enqueue)
+    monkeypatch.setattr(m, "update_job_target_email", lambda uuid_val, email: stamped.append(uuid_val) or True)
+    monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, text, *a, **k: sent.append(text) or 1)
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    return queued_calls, stamped, sent
+
+
+def test_kill_and_fillcontacts_confirm_after_queue_fill_failure_stamps_nothing(monkeypatch):
+    queued_calls, stamped, _ = _fill_queue_env(monkeypatch, [False])
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(_FILL_COLD[:1], _FILL_JOBS[:1]))
+
+    updates, skipped = m.backfill_job_contacts_from_carmen_cold(dry_run=False)
+
+    assert updates == [] and stamped == [] and queued_calls == []
+    assert [s["company"] for s in skipped if s.get("not_queued")] == ["Affirm"]
+
+
+def test_kill_and_fillcontacts_confirm_after_queue_fill_success_is_unchanged(monkeypatch):
+    queued_calls, stamped, _ = _fill_queue_env(monkeypatch, [True])
+    monkeypatch.setattr(m, "crm_post", _fillcontacts_crm(_FILL_COLD[:1], _FILL_JOBS[:1]))
+
+    updates, skipped = m.backfill_job_contacts_from_carmen_cold(dry_run=False)
+
+    assert [u["sheet_uuid"] for u in updates] == ["u1"] and stamped == ["u1"]
+    assert [p["action"] for p in queued_calls[0]] == ["update_contact_email", "append_note"]
+    assert not any(s.get("not_queued") for s in skipped)
+
+
+def test_kill_and_fillcontacts_confirm_after_queue_two_rows_one_fails(monkeypatch):
+    queued_calls, stamped, _ = _fill_queue_env(monkeypatch, [True, False])
+
+    updates, skipped = m.backfill_job_contacts_from_carmen_cold(dry_run=False)
+
+    assert [u["company"] for u in updates] == ["Affirm"]
+    assert stamped == ["u1"]
+    assert [s["company"] for s in skipped if s.get("not_queued")] == ["Acme"]
+
+
+def test_kill_and_fillcontacts_confirm_after_queue_scheduled_summary_reports_the_failure(monkeypatch):
+    _, stamped, sent = _fill_queue_env(monkeypatch, [True, False])
+
+    assert m.auto_fill_job_contacts_from_carmen_cold() == 1
+
+    assert len(sent) == 1
+    assert "Auto-Filled (1)" in sent[0] and "eina.assali@affirm.com" in sent[0]
+    assert "dana.reed@acme.com" not in sent[0]
+    assert "1 not queued" in sent[0]
+
+
+def test_kill_and_fillcontacts_confirm_after_queue_scheduled_summary_when_nothing_queued(monkeypatch):
+    _, stamped, sent = _fill_queue_env(monkeypatch, [False, False])
+
+    assert m.auto_fill_job_contacts_from_carmen_cold() == 0
+
+    assert stamped == []
+    assert len(sent) == 1 and "2 not queued" in sent[0] and "Auto-Filled" not in sent[0]
+
+
+def test_kill_and_fillcontacts_confirm_after_queue_fillcontacts_go_reply(monkeypatch):
+    _, stamped, sent = _fill_queue_env(monkeypatch, [True, False])
+
+    class _SyncThread:
+        def __init__(self, target=None, args=(), kwargs=None, **kw):
+            self._t = target
+
+        def start(self):
+            self._t()
+    monkeypatch.setattr(m.threading, "Thread", _SyncThread)
+
+    _dispatch("/fillcontacts go")
+
+    replies = [t for t in sent if "Matching Carmen Cold" not in t]
+    assert len(replies) == 1, sent
+    assert "Filled 1 job contact(s)" in replies[0] and "eina.assali@affirm.com" in replies[0]
+    assert "dana.reed@acme.com" not in replies[0]
+    assert "1 not queued" in replies[0]
+    assert stamped == ["u1"]

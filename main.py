@@ -4022,16 +4022,27 @@ def backfill_job_contacts_from_carmen_cold(dry_run=True):
                 skipped.append({"company": company, "alternates": [c["email"] for c in candidates[1:]]})
 
     if not dry_run:
+        # A row counts as written only once BOTH of its Sheets writes are durably queued (all or
+        # none). A row that did not queue gets no local address stamp, is dropped from `updates`
+        # and is reported on `skipped` with "not_queued": True, so the caller's reply can say so
+        # instead of claiming a write that never happened. The signature stays (updates, skipped).
+        queued, not_queued = [], []
         for u in updates:
-            enqueue_crm_payload(build_crm_payload(
-                "update_contact_email", sheet_uuid=u["sheet_uuid"], email=u["new_email"]
-            ))
-            update_job_target_email(u["sheet_uuid"], u["new_email"])
-            enqueue_crm_payload(build_crm_payload(
-                "append_note", sheet_uuid=u["sheet_uuid"],
-                note=f"Contact filled from Carmen Cold: {u['contact_name']} <{u['new_email']}>"
-            ))
-        logging.info(f"[FILLCONTACTS] Wrote {len(updates)} job contact email(s)")
+            if enqueue_crm_payloads([
+                build_crm_payload("update_contact_email", sheet_uuid=u["sheet_uuid"], email=u["new_email"]),
+                build_crm_payload(
+                    "append_note", sheet_uuid=u["sheet_uuid"],
+                    note=f"Contact filled from Carmen Cold: {u['contact_name']} <{u['new_email']}>"),
+            ]):
+                update_job_target_email(u["sheet_uuid"], u["new_email"])
+                queued.append(u)
+            else:
+                not_queued.append(u)
+                logging.error(f"[FILLCONTACTS] NOT queued for {u['company']} ({u['new_email']}); nothing changed")
+        updates = queued
+        skipped.extend({"company": u["company"], "alternates": [], "not_queued": True} for u in not_queued)
+        logging.info(f"[FILLCONTACTS] Wrote {len(updates)} job contact email(s)"
+                     + (f", {len(not_queued)} not queued" if not_queued else ""))
 
     return updates, skipped
 
@@ -4048,8 +4059,15 @@ def auto_fill_job_contacts_from_carmen_cold():
     Idempotent by construction: once a row carries a real contact it no longer qualifies, so a
     re-run is a no-op rather than a repeated write. Returns the number of rows updated.
     """
-    updates, _ = backfill_job_contacts_from_carmen_cold(dry_run=False)
+    updates, skipped = backfill_job_contacts_from_carmen_cold(dry_run=False)
+    failed = sum(1 for s in skipped if s.get("not_queued"))
+    fail_line = (f"\n\n⚠️ <i>{failed} not queued, nothing changed for them; the next cycle retries.</i>"
+                 if failed else "")
     if not updates:
+        if failed and TELEGRAM_CHAT_ID:
+            send_telegram_message(
+                TELEGRAM_CHAT_ID,
+                f"⚠️ <b>Job Contacts: nothing filled</b>{fail_line}")
         return 0
 
     logging.info(f"[FILLCONTACTS] Auto-filled {len(updates)} job contact email(s)")
@@ -4065,7 +4083,7 @@ def auto_fill_job_contacts_from_carmen_cold():
         send_telegram_message(
             TELEGRAM_CHAT_ID,
             f"🔗 <b>Job Contacts Auto-Filled ({len(updates)})</b>\n"
-            f"<i>matched from Carmen Cold</i>\n\n" + "\n".join(lines) + more
+            f"<i>matched from Carmen Cold</i>\n\n" + "\n".join(lines) + more + fail_line
         )
     return len(updates)
 
@@ -10212,19 +10230,29 @@ def resolve_pending_kill(company_token, choice):
         picked = [rows[idx - 1]]
 
     today_str = datetime.now().strftime("%Y-%m-%d")
-    done = []
+    # Build every write first and queue them in ONE all-or-none call. Only after that commits do
+    # the outcome record, the Died record and the pending pick change, so a failed insert leaves
+    # the pick in place and a retry works instead of answering "Nothing pending".
+    payloads, plan = [], []
     for row in picked:
         new_tab = resolve_smart_target_tab(row["tab"], "kill")
-        enqueue_crm_payload(build_crm_payload(
+        payloads.append(build_crm_payload(
             "update_status", sheet_uuid=row["sheet_uuid"], new_tab=new_tab))
-        enqueue_crm_payload(build_crm_payload(
+        payloads.append(build_crm_payload(
             "append_note", sheet_uuid=row["sheet_uuid"],
             note=f"[{today_str}] Rejected - archived to {new_tab} via /kill."))
+        plan.append((row, new_tab))
+    if not enqueue_crm_payloads(payloads):
+        logging.error(f"/kill NOT queued for {pending['company']}: {len(picked)} row(s)")
+        return (f"⚠️ Couldn't queue the archive for {html.escape(pending['company'])}. "
+                f"Nothing changed; try again.")
+    done = []
+    for row, new_tab in plan:
         record_application_outcome(row["sheet_uuid"], "rejection", company=pending["company"])
         if new_tab == "Died":
             record_died_role(pending["company"], row.get("title"))
         done.append(f"• {html.escape(row['title'])} → {new_tab}")
-    # Cleared either way: a second /kill on the same card would re-archive rows already moved.
+    # Cleared only once queued: a second /kill on the same card would re-archive rows already moved.
     with _PENDING_KILL_LOCK:
         PENDING_REJECTION_KILLS.pop(key, None)
     return f"💀 <b>Archived {len(done)} role(s)</b> at {html.escape(pending['company'])}\n" + "\n".join(done)
@@ -16296,6 +16324,12 @@ def process_webhook_payload_async(data):
             def _fill_and_notify():
                 try:
                     updates, skipped = backfill_job_contacts_from_carmen_cold(dry_run=not commit)
+                    failed = sum(1 for s in skipped if s.get("not_queued"))
+                    fail_line = (f"\n\n⚠️ <i>{failed} not queued, nothing changed for them; "
+                                 f"run <code>/fillcontacts go</code> again.</i>" if failed else "")
+                    if not updates and failed:
+                        send_telegram_message(chat_id, f"⚠️ <b>Nothing filled.</b>{fail_line}")
+                        return
                     if not updates:
                         send_telegram_message(
                             chat_id,
@@ -16321,7 +16355,7 @@ def process_webhook_payload_async(data):
                     hdr = (f"✅ <b>Filled {len(updates)} job contact(s).</b>" if commit
                            else f"🔍 <b>Preview: {len(updates)} row(s) would change.</b>")
                     footer = "" if commit else "\n\nReply <code>/fillcontacts go</code> to write them."
-                    send_telegram_message(chat_id, f"{hdr}\n\n" + "\n".join(lines) + alt_note + footer)
+                    send_telegram_message(chat_id, f"{hdr}\n\n" + "\n".join(lines) + alt_note + fail_line + footer)
                 except Exception as e:
                     logging.error(f"/fillcontacts Error: {e}")
                     send_telegram_message(chat_id, f"❌ Fill failed: {html.escape(str(e))}")
