@@ -17693,6 +17693,60 @@ def test_warm_radar_scans_boards_in_batches_ats_add_with_a_repeated_slug_probes_
     assert filters["ats_company_slugs"] == ["acme", "beta"] and probes == ["acme", "beta"]
 
 
+# ---- TASK-134: /ats add says when the board check FAILED, not "No board resolved" ----
+
+def _ats_add_harness(monkeypatch, behaviors, existing=()):
+    filters = {"ats_company_slugs": list(existing)}
+    sent = []
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: list(filters.get(key, default or [])))
+    monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
+    monkeypatch.setattr(m.requests, "get", _ats_get(behaviors))
+
+    def run(text):
+        m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": text}})
+    return filters, sent, run
+
+
+def test_ats_add_probe_reports_fetch_failures_429_is_not_a_typo(monkeypatch):
+    filters, sent, run = _ats_add_harness(monkeypatch, {("busy", "greenhouse"): _AtsResp(429, {})})
+    run("/ats add busy")
+    assert len(sent) == 1 and "Could not check busy" in sent[0] and "Try again" in sent[0], sent
+    assert "No board resolved" not in sent[0]
+    assert filters["ats_company_slugs"] == []       # a failed check is never saved
+
+
+def test_ats_add_probe_reports_fetch_failures_clean_404_still_says_no_board(monkeypatch):
+    filters, sent, run = _ats_add_harness(monkeypatch, {})
+    run("/ats add typo")
+    assert sent == ["⚠️ No board resolved for that slug."], sent
+    assert filters["ats_company_slugs"] == []
+
+
+def test_ats_add_probe_reports_fetch_failures_timeout_counts_as_failed(monkeypatch):
+    filters, sent, run = _ats_add_harness(monkeypatch, {("slow", "ashby"): m.requests.exceptions.Timeout("t")})
+    run("/ats add slow")
+    assert len(sent) == 1 and "Could not check slow" in sent[0], sent
+    assert filters["ats_company_slugs"] == []
+
+
+def test_ats_add_probe_reports_fetch_failures_mixed_input_names_each_group(monkeypatch):
+    post = {"id": 7, "title": "Analyst", "absolute_url": "https://x/7", "location": {"name": "Detroit"}}
+    behaviors = {
+        ("good", "greenhouse"): _AtsResp(200, {"jobs": [post]}),
+        ("partial", "greenhouse"): _AtsResp(200, {"jobs": [post]}),   # resolved while lever 5xx'd
+        ("partial", "lever"): _AtsResp(503, {}),
+        ("down", "lever"): _AtsResp(500, {}),
+    }
+    filters, sent, run = _ats_add_harness(monkeypatch, behaviors)
+    run("/ats add good partial down typo")
+    assert len(sent) == 1, sent
+    text = sent[0]
+    assert "Added: good (1), partial (1)" in text
+    assert "Could not check down" in text and "No board resolved for typo" in text
+    assert filters["ats_company_slugs"] == ["good", "partial"]
+
+
 # ---- TASK-119: "sales" in a title rejects selling roles only ----
 
 def _sales_title_filters(monkeypatch):
