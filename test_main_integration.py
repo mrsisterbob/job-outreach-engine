@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import socket
 import sqlite3
 import threading
 import tempfile
@@ -63,6 +64,46 @@ def clean_tables():
     m._OPEN_FOLLOWUPS_CACHE.update(owed=None, at=None)
     m._OPEN_FOLLOWUPS_BUILD.update(running=False, error=None)
     yield
+
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network_guard(monkeypatch):
+    """A test that opens a non-loopback socket fails, naming the address. Code under test often
+    catches the connection error and falls back, so the failure is also raised at teardown from a
+    recorded list, not only inside the call. Unix sockets (str addresses) stay allowed."""
+    attempts = []
+    real_connect = socket.socket.connect
+
+    def guarded(sock, address):
+        if isinstance(address, tuple) and address[0] not in _LOOPBACK_HOSTS:
+            attempts.append(address)
+            raise OSError(f"real network connect blocked by test guard: {address!r}")
+        return real_connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded)
+    yield attempts
+    assert not attempts, f"test made real outbound connection(s): {attempts}"
+
+
+def test_no_real_network_guard_reports_non_local_and_allows_loopback(_no_real_network_guard):
+    attempts = _no_real_network_guard
+    with socket.socket() as s:
+        with pytest.raises(OSError, match="203.0.113.9"):
+            s.connect(("203.0.113.9", 443))
+    assert attempts == [("203.0.113.9", 443)]
+    attempts.clear()  # reported and checked; clear so this test's own teardown assertion passes
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    try:
+        with socket.socket() as c:
+            c.connect(listener.getsockname())
+    finally:
+        listener.close()
+    assert attempts == []
 
 
 @pytest.fixture(autouse=True)
@@ -1706,6 +1747,8 @@ def test_second_click_redirects_to_the_same_draft_without_a_telegram_ping(monkey
     # thread lookup makes a LIVE call to Gmail, which 401s on the fake token and lands on this same
     # branch by accident - a passing test that depended on the network and on nothing else.
     monkeypatch.setattr(m, "find_reply_thread", lambda email, token: None)
+    # Same reason for the Sent-mail name lookup (resolve_bump_first_name): None = Gmail unchecked.
+    monkeypatch.setattr(m, "first_name_from_sent_mail", lambda to_email: None)
     monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: pings.append(a) or 1)
     monkeypatch.setattr(m, "TELEGRAM_CHAT_ID", "123")
     _save_today([_ready_entry("cc-0")])
@@ -1726,6 +1769,9 @@ def _thread_env(monkeypatch):
         monkeypatch.setenv(var, val)
     monkeypatch.setattr(m, "get_gmail_access_token", lambda: "token")
     monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: 1)
+    # The Sent-mail name lookup (resolve_bump_first_name) would otherwise call Gmail with the fake
+    # bearer; None = "Gmail could not be checked", so the caller keeps its existing name.
+    monkeypatch.setattr(m, "first_name_from_sent_mail", lambda to_email: None)
     posts = []
 
     class Created:
@@ -6786,6 +6832,9 @@ def test_auto_supplier_watchlist_seeded_stage_1c_reads_the_boards_from_the_filte
     monkeypatch.setattr(m, "resolve_warm_company_ats_slugs", lambda *a, **k: [])
     monkeypatch.setattr(m, "build_jsearch_request_config", lambda: ({}, "https://x"))
     monkeypatch.setattr(m, "fetch_single_query_jobs", lambda task: [])
+    # The keyless remote feeds (RemoteOK, Himalayas, Remotive, WeWorkRemotely) are not what this
+    # test is about; unstubbed they made 14 live HTTPS attempts per run.
+    monkeypatch.setattr(m, "fetch_remote_feed_jobs", lambda limit=100: [])
     monkeypatch.setattr(m, "fetch_workday_jobs", fake_workday)
     for name in ("fetch_greenhouse_jobs", "fetch_lever_jobs", "fetch_ashby_jobs"):
         monkeypatch.setattr(m, name, lambda slug, _n=name: slug_calls.append((_n, slug)) or [])
@@ -13171,6 +13220,8 @@ def test_site_pageviews_reach_the_standup_end_to_end(analytics_env, monkeypatch)
     spec.loader.exec_module(site)
     import jobstats  # the site's modules, via the prepended path
     import visits
+    import buildstats
+    monkeypatch.setattr(buildstats, "_fetch", lambda: None)       # the GitHub raw snapshot: a live call otherwise
     monkeypatch.setattr(jobstats, "fetch", lambda: None)          # page content is not under test
     monkeypatch.setattr(visits, "_ensure_worker", lambda: None)   # drained by hand below
 
