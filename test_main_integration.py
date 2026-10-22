@@ -12352,6 +12352,63 @@ def test_phone_edit_keeps_bullet_metadata_on_every_dict_entry(monkeypatch, tmp_p
             assert not (isinstance(items[t], dict) and "same_claim_as" in items[t]), (pool, i, t)
 
 
+def test_phone_edit_reply_names_kept_metadata(monkeypatch, tmp_path):
+    """edit_reply_names_kept_metadata: a phone /edit of a bullet carrying a duplicate-claim link
+    keeps the link (TASK-99), so the reply must say so - otherwise the guard keeps hiding the
+    bullet and Kevin never learns the rewritten claim is still tied to its partner."""
+    import shutil
+    path = str(tmp_path / "resume_bullets_bank.json")
+    shutil.copy(resume_engine.RESUME_BULLETS_BANK_PATH, path)
+    with open(path, encoding="utf-8") as f:
+        before = json.load(f)
+
+    real_resolve = m.resolve_edit_target
+
+    def resolve_into_tmp(edit_id):
+        target = real_resolve(edit_id)
+        assert target is not None, edit_id
+        return (path, target[1], target[2])
+
+    monkeypatch.setattr(m, "resolve_edit_target", resolve_into_tmp)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+
+    def phone_edit(edit_id, prose):
+        m.process_webhook_payload_async(
+            {"message": {"chat": {"id": 1}, "text": f"/edit {edit_id} {prose}"}})
+        assert sent and "Template Updated" in sent[-1], sent[-1:]
+        return sent[-1]
+
+    # (1) TD7 keeps same_claim_as: 3 and says so, after the text.
+    prose = "A brand new claim about TD7."
+    reply = phone_edit("TD7", prose)
+    assert "Still linked" in reply and "same_claim_as" in reply and "[3]" in reply, reply
+    assert reply.index(prose) < reply.index("Still linked")
+    assert "Kept:" not in reply, "TD7 has no source_job/replaces to list"
+
+    # (2) TD8 keeps source_job/replaces/same_claim_as: all three are named.
+    reply = phone_edit("TD8", "A brand new claim about TD8.")
+    assert "source_job=3" in reply and "replaces=0" in reply and "[1]" in reply, reply
+    assert "Kept: source_job=3, replaces=0" in reply
+
+    # (3) A plain-string bullet's reply is exactly the old shape.
+    assert isinstance(before["track_d_business_intelligence"][0], str)
+    reply = phone_edit("TD0", "Plain bullet reworded.")
+    assert reply == (
+        "✅ <b>Template Updated:</b> <code>track_d_business_intelligence[0]</code>\n\n"
+        "<code>Plain bullet reworded.</code>"
+    ), reply
+    assert "Still linked" not in reply and "Kept:" not in reply
+
+    # (4) The file on disk keeps TASK-99's shape.
+    with open(path, encoding="utf-8") as f:
+        bank = json.load(f)
+    d = bank["track_d_business_intelligence"]
+    assert d[7] == dict(before["track_d_business_intelligence"][7], text="A brand new claim about TD7.")
+    assert {k: v for k, v in d[8].items() if k != "text"} == {"source_job": 3, "same_claim_as": 1, "replaces": 0}
+    assert d[0] == "Plain bullet reworded."
+
+
 def test_a_later_job_keeps_its_other_statics_when_a_routed_bullet_lands_on_it():
     """The rule differs by job, and this is the half that is easy to get wrong.
 

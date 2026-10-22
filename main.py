@@ -541,7 +541,7 @@ def resolve_edit_target(id_str):
     return None
 
 # /edit pools that hold candidate-facing outreach copy, mapped to the linter's `kind`.
-# The resume-bullet pools (TA0-TE9) are absent on purpose: they are resume prose, not
+# The resume-bullet pools (TA0-TH14) are absent on purpose: they are resume prose, not
 # outreach voice, so the email rules do not apply to them and they are never linted.
 _EDIT_LINT_KINDS = {
     "linkedin_templates": "linkedin",
@@ -575,8 +575,8 @@ def lint_edited_template(list_key, new_text):
     return f"\n\n<b>Voice check</b> (saved anyway)\n{lines}"
 
 def update_template_entry(file_path, list_key, idx, new_text):
-    """Atomically loads a template JSON bank, overwrites the string at (list_key, idx), and
-    writes it back to disk via a temp-file + os.replace swap (crash-safe, no partial writes on
+    """Atomically loads a template JSON bank, replaces the text at (list_key, idx) - a dict entry
+    keeps every metadata key and only its "text" changes - and writes it back to disk via a temp-file + os.replace swap (crash-safe, no partial writes on
     disk). Returns (ok: bool, message: str) - message is a ready-to-send Telegram HTML string.
 
     Voice-linter findings are appended to that message as a warning; they NEVER stop the write.
@@ -600,8 +600,21 @@ def update_template_entry(file_path, list_key, idx, new_text):
     # phone edit would undo either. So any dict keeps all its keys and only "text" is replaced.
     # Anything else in the bank stays a plain string, as it always was.
     existing = pool[idx]
+    kept_note = ""
     if isinstance(existing, dict):
         pool[idx] = dict(existing, text=new_text)
+        # Say out loud which metadata survived: a kept same_claim_as keeps the duplicate-claim
+        # guard hiding this bullet whenever its partner is also routed, even if the new text no
+        # longer restates that partner. Judging that is Kevin's call; this only makes it visible.
+        if "same_claim_as" in existing:
+            kept_note += (
+                f"\n\n🔗 Still linked: <code>same_claim_as → [{html.escape(str(existing['same_claim_as']))}]</code>. "
+                "If this edit no longer says the same thing as that bullet, it will be hidden "
+                "whenever both are chosen; tell the planner to clear the link."
+            )
+        others = [f"{k}={existing[k]}" for k in ("source_job", "replaces") if k in existing]
+        if others:
+            kept_note += ("\n\n" if not kept_note else "\n") + html.escape("Kept: " + ", ".join(others))
     else:
         pool[idx] = new_text
     try:
@@ -622,6 +635,7 @@ def update_template_entry(file_path, list_key, idx, new_text):
     return True, (
         f"✅ <b>Template Updated:</b> <code>{html.escape(str(list_key))}[{idx}]</code>\n\n"
         f"<code>{html.escape(new_text)}</code>"
+        f"{kept_note}"
         f"{warning}"
     )
 
