@@ -35,6 +35,8 @@ os.environ["JOBS_DB_PATH"] = _TMP_DB_PATH
 os.environ["JOB_ENGINE_NO_DAEMONS"] = "1"
 
 import main as m  # noqa: E402  (must import after JOBS_DB_PATH and JOB_ENGINE_NO_DAEMONS are set)
+from score_rules import (  # noqa: E402
+    ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS, SENIOR_CEILING, TIER1_FLOOR, seniority_ceiling)
 import resume_engine  # noqa: E402
 import track_registry  # noqa: E402
 import pipeline_utils  # noqa: E402
@@ -5184,7 +5186,7 @@ def test_hybrid_score_modifier_returns_the_signed_layer1_shift(monkeypatch):
     # word, so it earns the smaller family bonus rather than the +6 entry-level one. It previously
     # scored 0 here - this test's old comment credited a "+6 Analyst entry-level title" that never
     # fired, since the entry-level branch matches "analyst i" and not a bare "analyst".
-    assert layer1_bonus == 42  # 40 + the dateless 48h bucket now earns +10 (was +8)
+    assert layer1_bonus == 44  # 40 + the dateless 48h bucket's +10 + 2 more on the plain title (+6, was +4)
     # 100 raw, compressed by soft_cap_score() rather than flattened at the 100 clamp.
     assert final_score == 91
 
@@ -5205,10 +5207,11 @@ def test_plain_job_family_titles_earn_the_small_title_bonus(monkeypatch):
         return bonus - neutral
 
     for title in ("Operations Analyst", "EHR Clinical Analyst", "Business Administrator", "Office Assistant"):
-        assert shift(title) == 4, f"{title} should earn the plain job-family bonus, got {shift(title)}"
+        assert shift(title) == PLAIN_FAMILY_TITLE_BONUS, f"{title} should earn the plain job-family bonus, got {shift(title)}"
 
     # The explicit entry-level marker still outranks the generic family word.
-    assert shift("Junior Operations Analyst") == 6
+    assert shift("Junior Operations Analyst") == ENTRY_TITLE_BONUS
+    assert ENTRY_TITLE_BONUS > PLAIN_FAMILY_TITLE_BONUS
 
     # Seniority and wrong-family branches come first in the chain, so a family word never
     # rescues a title the filter is meant to reject.
@@ -7909,7 +7912,7 @@ def test_score_age_ladder_steps_and_ordering():
 def test_score_age_ladder_caps_a_dead_posting_below_tier_two(run_candidate):
     now = datetime.now(timezone.utc)
     maxed = {
-        "job_title": "Senior Operations Analyst", "job_city": "troy",
+        "job_title": "Operations Analyst", "job_city": "troy",
         "job_description": "python sql automation reconciliation reporting salesforce excel workflow",
         "job_min_salary": 90000, "job_max_salary": 110000,
     }
@@ -7924,6 +7927,50 @@ def test_score_age_ladder_caps_a_dead_posting_below_tier_two(run_candidate):
     assert dead["job"]["fit_score"] == dead["score"]
     assert dead["score_boost"] >= 0
     assert run(2)["score"] >= 80
+
+
+def test_score_seniority_ceiling_caps_senior_titles_and_weights_entry_titles(run_candidate):
+    """A senior/lead/manager title can no longer reach Tier 1, however strong its keyword stack, and
+    entry-level markers outweigh a bare job-family word.
+
+    Known matches of SENIORITY_TITLE_RE, kept so the next reader sees the cost: it matches WORDS, so
+    "Staff Accountant" (staff) and "Lead Generation Specialist" (lead) are capped exactly like a
+    "Senior Operations Manager". Same regex the -18 title penalty always used; accepted, and
+    TASK-82 owns anything smarter. "Assistant Manager" matches too (manager).
+    """
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    maxed = {
+        "job_city": "troy", "job_posted_at_datetime_utc": fresh,
+        "job_description": "Fintech payments platform. Salesforce, Python and SQL reporting.",
+        "job_min_salary": 100000, "job_max_salary": 120000,
+    }
+
+    def run(title):
+        job = dict(maxed, job_title=title)
+        _, l1 = m.calculate_hybrid_score_modifier(dict(job), 75)
+        return run_candidate(gemini_base=75, layer1_bonus=l1, **job), l1
+
+    senior, senior_l1 = run("Senior Operations Manager")
+    assert senior_l1 > 0                                   # the keyword stack still out-earns the -18
+    assert senior["score"] <= SENIOR_CEILING < TIER1_FLOOR   # (1) was 91
+    assert senior["job"]["fit_score"] == senior["score"]     # what the CRM/cache reads back
+    assert senior["score_boost"] >= 0
+
+    analyst, analyst_l1 = run("Operations Analyst")
+    assert analyst["score"] >= TIER1_FLOOR                   # (2) same posting, analyst title
+    junior, junior_l1 = run("Junior Operations Analyst")
+    assert junior_l1 - analyst_l1 == ENTRY_TITLE_BONUS - PLAIN_FAMILY_TITLE_BONUS   # (3)
+
+    # (4) known regex matches stay capped
+    for title in ("Staff Accountant", "Lead Generation Specialist", "Sr. Operations Analyst"):
+        assert run(title)[0]["score"] <= SENIOR_CEILING, title
+
+    # The lower of the age ceiling and the seniority ceiling wins.
+    dead = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    both = run_candidate(gemini_base=75, layer1_bonus=10,
+                         **dict(maxed, job_title="Senior Operations Manager", job_posted_at_datetime_utc=dead))
+    assert both["score"] <= min(SENIOR_CEILING, m.AGE_DEAD_CEILING)
+    assert seniority_ceiling("Operations Analyst") is None
 
 
 # ---- /dead decoy marking + /decoys report ----

@@ -155,7 +155,8 @@ WILDCARD_BONUS = max(0, int(os.environ.get("WILDCARD_BONUS", "2")))
 # The per-layer min(1, ...)/min(100, ...) clamps stay as a separate safety floor/ceiling. Single
 # tunable knob - raise toward 35 to loosen, drop toward 25 to force more spread.
 BONUS_STACK_CAP = 30
-from score_rules import posted_age_adjustment, is_dead_posting, AGE_DEAD_CEILING
+from score_rules import (posted_age_adjustment, is_dead_posting, AGE_DEAD_CEILING, SENIORITY_TITLE_RE,
+                         seniority_ceiling, ENTRY_TITLE_BONUS, PLAIN_FAMILY_TITLE_BONUS)
 
 def build_jsearch_request_config():
     """Prioritizes OPENWEBNINJA_KEY over RAPIDAPI_KEY when both are set."""
@@ -4596,7 +4597,9 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     # nothing downstream enforced it, so a "Senior Operations Manager" could still outscore a
     # genuine entry-level opening on keywords alone. Entry-level markers earn a bonus for the
     # same reason: they are the roles actually winnable at 0-2 years.
-    if re.search(r'\b(senior|sr\.?|lead|principal|staff|head of|director|vp|manager|mgr)\b', title):
+    # The -18 alone is not enough (a maxed keyword stack earns it back), so process_single_candidate
+    # also caps the final score at SENIOR_CEILING via seniority_ceiling().
+    if SENIORITY_TITLE_RE.search(title):
         bonus -= 18
     # Wrong job family, read off the title. Seniority words were the only title filter, so a
     # "Salesforce Developer" or "Data Engineer" - a different profession, not a senior version of
@@ -4607,7 +4610,7 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     elif re.search(r'\b(developer|engineer|engineering|architect|programmer|swe|sdet|devops)\b', title):
         bonus -= 30
     elif re.search(r'\b(junior|jr\.?|associate|entry[ -]?level|analyst i|i{1,2}\b|coordinator|specialist)\b', title):
-        bonus += 6
+        bonus += ENTRY_TITLE_BONUS
     # Plain job-family titles, no seniority marker either way. "Operations Analyst", "EHR Clinical
     # Analyst" and "Business Administrator" are the roles actually being targeted, but none of them
     # carry a junior/entry word, and the branch above only matches "analyst i" - so a bare "Analyst"
@@ -4615,7 +4618,7 @@ def calculate_hybrid_score_modifier(job, base_ai_score):
     # the word alone is weaker evidence than an explicit entry-level marker; the seniority and
     # wrong-family branches still win outright, since this is the last elif in the chain.
     elif re.search(r'\b(analyst|operations|administrator|assistant)\b', title):
-        bonus += 4
+        bonus += PLAIN_FAMILY_TITLE_BONUS
 
     # Years-of-experience demand: a 0-2yr candidate is a real match at 0-3 and a stretch past 5.
     exp_match = re.search(r'(\d+)\+?\s*(?:-\s*\d+\s*)?year', desc)
@@ -5868,6 +5871,12 @@ def process_single_candidate(job, force=False):
         # negative-nonsense); fit_score and the returned score both carry the ceilinged value.
         if is_dead_posting(parse_posted_hours(job.get("job_posted_at_datetime_utc"))):
             score = min(score, AGE_DEAD_CEILING)
+        # Seniority ceiling: a senior/lead/manager title keeps -18, but the keyword/salary stack
+        # earned +34 in the same function, so it still cleared the 80-point Tier-1 gate. Same spot
+        # as the dead-posting ceiling; when both apply the lower one wins.
+        _senior_cap = seniority_ceiling(job.get("job_title"))
+        if _senior_cap is not None:
+            score = min(score, _senior_cap)
 
         # Second write, same sheet_uuid: the fit reason, matched skills and final score are all
         # computed/adjusted below the first save, and /stage is now the only place they are shown.
