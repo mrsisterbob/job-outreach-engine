@@ -9376,6 +9376,18 @@ def enqueue_crm_payloads(payloads):
             pass
         return False
 
+def queue_or_tell(chat_id, payloads, what):
+    """Queue a command's Sheets writes (all or none); on failure tell Kevin nothing changed.
+
+    A phone command may say "done" only after this returns True. On False the failure reply has
+    already been sent and the caller must return before any confirmation or side effect.
+    """
+    if enqueue_crm_payloads(payloads):
+        return True
+    logging.error(f"{what} NOT queued: {[p.get('action') for p in payloads if isinstance(p, dict)]}")
+    send_telegram_message(chat_id, f"⚠️ Couldn't queue {what}. Nothing changed; try again.")
+    return False
+
 def _crm_outbox_giveup_alert_text(payload):
     return (
         crm_failure_alert_text(payload, 10)
@@ -15407,12 +15419,18 @@ def process_webhook_payload_async(data):
             older_left = _older_unretired_dead_count() - len(rows)
             today_str = datetime.now().strftime("%Y-%m-%d")
             archived = []
-            for uuid_v, company, role, _link, _status, reason, _retired, _first_dead in rows:
-                enqueue_crm_payload(build_crm_payload(
+            # Every row's writes go in as ONE batch, before anything is recorded or reported
+            # (TASK-104): on a failed queue nothing is half-archived and nothing is marked notified.
+            archive_payloads = []
+            for uuid_v, _company, _role, _link, _status, reason, _retired, _first_dead in rows:
+                archive_payloads.append(build_crm_payload(
                     "append_note", sheet_uuid=uuid_v,
                     note=f"[{today_str}] Archived via /linksx: job link dead ({reason})."))
-                enqueue_crm_payload(build_crm_payload(
+                archive_payloads.append(build_crm_payload(
                     "update_status", sheet_uuid=uuid_v, new_tab="Died"))
+            if not queue_or_tell(chat_id, archive_payloads, f"the archive of {len(rows)} dead posting(s)"):
+                return
+            for uuid_v, company, role, _link, _status, reason, _retired, _first_dead in rows:
                 # Died means died: record it locally so /t can never re-source the role, whatever
                 # state the Apps Script deployment is in.
                 record_died_role(company, role)
@@ -15976,9 +15994,12 @@ def process_webhook_payload_async(data):
             parts = text.split()
             days = safe_int(parts[1], 7) if len(parts) > 1 else 7
             next_followup = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            # Confirm only once the write is durably queued (TASK-104); the enqueue is a local insert.
+            if not queue_or_tell(chat_id, [build_crm_payload(
+                    "update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup)],
+                    "the follow-up snooze"):
+                return
             send_telegram_message(chat_id, f"📅 Follow-up snoozed to {next_followup}.")
-            enqueue_crm_payload(build_crm_payload("update_snooze", sheet_uuid=mapping["sheet_uuid"], next_followup=next_followup))
             return
 
         if text == "/linkedin" or text == "/li" or text.startswith(("/linkedin ", "/li ")):
@@ -16039,13 +16060,15 @@ def process_webhook_payload_async(data):
             who = str(payload.get("name") or "").strip() or raw_email
             company = str(payload.get("company") or "").strip()
             note = f"[{today_str}] {LINKEDIN_TOUCH_NOTE_MARKER} - connect/DM sent by hand."
+            if not queue_or_tell(chat_id, [build_crm_payload(
+                    "append_note", sheet_uuid=sheet_uuid, note=note)], "the LinkedIn touch note"):
+                return
             send_telegram_message(
                 chat_id,
                 f"🔗 <b>LinkedIn touch logged</b>\n"
                 f"{html.escape(who)}{' — ' + html.escape(company) if company else ''}\n"
                 f"<i>In {html.escape(match_tab)}. The email ladder re-anchors to today, so the next "
                 f"bump is spaced from this contact rather than from the original email.</i>")
-            enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=sheet_uuid, note=note))
             log_daily_activity("notes_logged")
             return
 
@@ -16058,9 +16081,11 @@ def process_webhook_payload_async(data):
             if not mapping:
                 return
             timestamped_note = f"[{today_str}] {html.escape(note_str)}"
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background - Code.gs auto-timestamps if this ever changes
+            # Confirm only once the write is durably queued (TASK-104) - Code.gs auto-timestamps if this ever changes
+            if not queue_or_tell(chat_id, [build_crm_payload(
+                    "append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note)], "the note"):
+                return
             send_telegram_message(chat_id, "📝 Note logged.")
-            enqueue_crm_payload(build_crm_payload("append_note", sheet_uuid=mapping["sheet_uuid"], note=timestamped_note))
             log_daily_activity("notes_logged")
             return
 
@@ -16740,6 +16765,12 @@ def process_webhook_payload_async(data):
             sheet_uuid = mapping["sheet_uuid"]
             job = get_job_by_sheet_uuid(sheet_uuid)
             company = mapping.get("contact_company") or job.get("employer_name")
+            # Canonical Status write on the row in place - no tab move (see set_status in Code.gs).
+            # Queued FIRST: the caches, cooldown, card edit and confirmation below all say "applied",
+            # so none of them may run unless the write is durably queued (TASK-104).
+            if not queue_or_tell(chat_id, [build_crm_payload(
+                    "set_status", sheet_uuid=sheet_uuid, status="Applied")], "the Applied status"):
+                return
             if company:
                 _APPLIED_CRM_CACHE["data"].add(str(company).strip().lower())
                 normalized_company = normalize_company_for_match(company)
@@ -16752,7 +16783,6 @@ def process_webhook_payload_async(data):
             if reply_card.get("message_id"):
                 original_text = html.escape(reply_card.get("text", ""))
                 edit_telegram_message(chat_id, reply_card["message_id"], f"{original_text}\n\n✅ <b>Applied - {applied_date}</b>")
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
             send_telegram_message(chat_id, f"✅ Applied - {applied_date}")
             log_metric_event("applied", sheet_uuid)
             log_daily_activity("applied_count")
@@ -16775,8 +16805,6 @@ def process_webhook_payload_async(data):
                     else ("cold" if not is_guessed_contact_email(job.get("target_email")) else "ats")
                 )
             )
-            # Canonical Status write on the row in place - no tab move (see set_status in Code.gs).
-            enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status="Applied"))
             return
 
         if text == "/dead":
@@ -16913,9 +16941,11 @@ def process_webhook_payload_async(data):
                 return
             sheet_uuid = mapping["sheet_uuid"]
             new_tab = resolve_smart_target_tab(mapping.get("sheet_tab"), "kill")
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            # Confirm only once the write is durably queued (TASK-104)
+            if not queue_or_tell(chat_id, [build_crm_payload(
+                    "update_status", sheet_uuid=sheet_uuid, new_tab=new_tab)], f"the move to {html.escape(new_tab)}"):
+                return
             send_telegram_message(chat_id, f"❌ Archived to {new_tab}.")
-            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=new_tab))
             # A JOB killed by hand is the most deliberate bury there is - record it locally so /t
             # can never re-source it, whatever state the Apps Script deployment is in.
             if new_tab == "Died":
@@ -17009,24 +17039,24 @@ def process_webhook_payload_async(data):
                     f"for <code>/{cmd}</code>. Please retry with /t or /c to regenerate it."
                 )
                 return
-            # Optimistic UI: confirm to Telegram first, dispatch the Sheets write in the background
+            # Confirm only once every write is durably queued, all together or none (TASK-104)
             confirm = f"✅ {new_status} - {datetime.now().strftime('%Y-%m-%d')}"
+            status_payloads = [build_crm_payload("set_status", sheet_uuid=sheet_uuid, status=new_status)]
             if interview_date:
                 # +1 day: a follow-up due the morning OF the interview is noise, and one due that
                 # evening is what Kevin actually wants to act on.
                 follow_up = (interview_date + timedelta(days=1)).strftime("%Y-%m-%d")
                 confirm += (f"\n📅 Interview: <b>{interview_date.strftime('%a %b %d, %Y').replace(' 0', ' ')}</b>"
                             f"\n🔔 Follow-up anchored to {follow_up}")
-            send_telegram_message(chat_id, confirm)
-            enqueue_crm_payload(build_crm_payload("set_status", sheet_uuid=sheet_uuid, status=new_status))
-            if interview_date:
-                enqueue_crm_payload(build_crm_payload(
-                    "update_snooze", sheet_uuid=sheet_uuid,
-                    next_followup=(interview_date + timedelta(days=1)).strftime("%Y-%m-%d")))
-                enqueue_crm_payload(build_crm_payload(
+                status_payloads.append(build_crm_payload(
+                    "update_snooze", sheet_uuid=sheet_uuid, next_followup=follow_up))
+                status_payloads.append(build_crm_payload(
                     "append_note", sheet_uuid=sheet_uuid,
                     note=f"[{datetime.now().strftime('%Y-%m-%d')}] Interview scheduled for "
                          f"{interview_date.strftime('%Y-%m-%d')} via /interview."))
+            if not queue_or_tell(chat_id, status_payloads, f"the {new_status} status"):
+                return
+            send_telegram_message(chat_id, confirm)
             return
 
         # Carmen contact lifecycle (no reply context): /promote <id> moves a contact who replied from
@@ -17091,25 +17121,29 @@ def process_webhook_payload_async(data):
             confirm = f"{'🔥' if cmd == 'promote' else '🪑'} {verb} {who} to {target_tab}."
             if cmd == "promote":
                 confirm += "\n📅 <i>Next Followup Date cleared - set the call time in Sheets.</i>"
-            send_telegram_message(chat_id, confirm)
-            enqueue_crm_payload(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=target_tab))
+            # Every write is built first and queued together; Kevin is told "Promoted" only after
+            # they are all durably queued (TASK-104).
+            move_payloads = [build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=target_tab)]
             # A promote carries the OUTREACH ladder's date across the move - Beth landed in Carmen
             # Hot showing 9/24, a nudge date for a conversation that had already happened. Carmen
             # Hot is not in SEQUENCER_SCAN_TABS, so nothing reads it; blanking it hands the column
             # to Kevin and Sheets' own date picker for the real call time. /demote keeps its date:
             # the bench IS a follow-up cadence.
             if cmd == "promote":
-                enqueue_crm_payload(build_crm_payload("clear_followup", sheet_uuid=sheet_uuid))
+                move_payloads.append(build_crm_payload("clear_followup", sheet_uuid=sheet_uuid))
                 # "Cold Lead" is false the moment someone replies and starts booking time, and it
                 # was what every promoted row still read. "Follow-up Due" is the honest neutral:
                 # it says a human owes this person something without asserting an interview that
                 # may turn out to be a networking call. Kevin picks the real one from the dropdown.
-                enqueue_crm_payload(build_crm_payload(
+                move_payloads.append(build_crm_payload(
                     "set_status", sheet_uuid=sheet_uuid, status=CARMEN_HOT_DEFAULT_STATUS))
-            enqueue_crm_payload(build_crm_payload(
+            move_payloads.append(build_crm_payload(
                 "append_note", sheet_uuid=sheet_uuid,
                 note=f"[{today_str}] {verb} from {source_tab} to {target_tab} via /{cmd}.",
             ))
+            if not queue_or_tell(chat_id, move_payloads, f"the move to {target_tab} for {who}"):
+                return
+            send_telegram_message(chat_id, confirm)
             return
 
         # Deterministic Template Bank Editor (/edit ID New Text) - no reply context required

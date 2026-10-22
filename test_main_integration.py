@@ -478,6 +478,7 @@ def test_linksx_archives_the_applied_rows_the_sweep_refuses_to_touch(monkeypatch
     sent, payloads = [], []
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p))
+    _bridge_batch_enqueue(monkeypatch)
 
     _dispatch("/linksx")
 
@@ -2840,6 +2841,7 @@ def _promote_env(monkeypatch, cold=(), hot=(), short_ids=None):
     monkeypatch.setattr(m, "get_sheet_uuid_by_short_id", lambda sid: (short_ids or {}).get(sid))
     monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    _bridge_batch_enqueue(monkeypatch)
     return sent, enqueued
 
 
@@ -2920,6 +2922,7 @@ def _rejection_env(monkeypatch, rows_by_code=None):
     monkeypatch.setattr(m, "fetch_networking_cards",
                         lambda code, qty=None: [dict(r) for r in rows_by_code.get(code, [])])
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    _bridge_batch_enqueue(monkeypatch)
     monkeypatch.setattr(m, "record_application_outcome",
                         lambda uuid_val, status, **kw: outcomes.append((uuid_val, status)) or True)
     return enqueued, outcomes
@@ -3218,6 +3221,7 @@ def _job_card_env(monkeypatch, job=None, logged=False, write_ok=True):
     monkeypatch.setattr(m, "get_sheet_uuid_by_short_id", lambda sid: None)
     monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: None)
+    _bridge_batch_enqueue(monkeypatch)
     monkeypatch.setattr(m, "get_job_from_cache", lambda t: dict(job) if job else {})
     monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda t: {})
     monkeypatch.setattr(m, "is_logged_person_contact", lambda e: logged)
@@ -3253,6 +3257,7 @@ def test_promote_from_a_job_card_never_moves_the_job_row(monkeypatch):
     sent, written, _ = _job_card_env(monkeypatch, job=_ALTARUM_JOB)
     enqueued = []
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    _bridge_batch_enqueue(monkeypatch)
     _dispatch("/promote 4e886991 Beth Young beth.young@altarum.org")
 
     assert enqueued == []                                    # no update_status, no tab move
@@ -3669,6 +3674,16 @@ def test_create_gmail_draft_allows_a_real_company_name(monkeypatch):
 
 # ---- Canonical Status writes: /apply, /replied, /interview (Status field only, no tab move) ----
 
+def _bridge_batch_enqueue(monkeypatch):
+    """Phone commands queue through enqueue_crm_payloads (one transaction, TASK-104). Route that
+    through whatever enqueue_crm_payload stub the test installed, so it still sees each payload."""
+    def _batch(payloads):
+        for p in payloads:
+            m.enqueue_crm_payload(p)
+        return True
+    monkeypatch.setattr(m, "enqueue_crm_payloads", _batch)
+
+
 def _dispatch(text, reply_to_message=None):
     msg = {"chat": {"id": 1}, "text": text}
     if reply_to_message is not None:
@@ -3798,6 +3813,7 @@ def _linkedin_env(monkeypatch, rows):
     sent, enqueued = [], []
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    _bridge_batch_enqueue(monkeypatch)
     monkeypatch.setattr(m, "log_daily_activity", lambda *a, **k: None)
     monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
     # /linkedin now asks Code.gs to search every tab instead of pulling tabs down and scanning
@@ -3905,6 +3921,7 @@ def test_apply_swipe_writes_status_applied_and_never_moves_tabs(monkeypatch):
         monkeypatch.setattr(m, name, lambda *a, **k: None)
     enqueued = []
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    _bridge_batch_enqueue(monkeypatch)
 
     _dispatch("/apply")
 
@@ -4217,6 +4234,7 @@ def test_status_short_id_commands_build_set_status_payload(monkeypatch, command,
     monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
     enqueued = []
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    _bridge_batch_enqueue(monkeypatch)
 
     _dispatch(f"{command} {short_id}")
 
@@ -4233,6 +4251,7 @@ def _interview_env(monkeypatch, short_id="abc123"):
                         lambda sid: "uuid-target" if sid == short_id else None)
     monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text, *a, **k: sent.append(text) or 1)
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: enqueued.append(p) or True)
+    _bridge_batch_enqueue(monkeypatch)
     return sent, enqueued
 
 
@@ -11127,6 +11146,7 @@ def test_links_quotes_the_count_linksx_will_actually_archive(monkeypatch):
     # Drive the real command: what it WRITES is the contract, not what /links advertised.
     moved = []
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: moved.append(p) or 1)
+    _bridge_batch_enqueue(monkeypatch)
     monkeypatch.setattr(m, "record_died_role", lambda *a, **k: None)
     _dispatch("/linksx")
 
@@ -18686,3 +18706,140 @@ def test_alert_stamped_after_send_failed_count_is_worded_without_a_number(monkey
     assert len(alerts) == 1, alerts
     assert "Unauthorized" in alerts[0] and "some queued" in alerts[0]
     assert "5 queued" not in alerts[0] and "0 queued" not in alerts[0]
+
+
+# --- TASK-104: a phone command says "done" only after its Sheets writes are durably queued ---------
+
+_QUEUE_SIDE_EFFECTS = ("edit_telegram_message", "log_metric_event", "log_daily_activity",
+                       "record_application_outcome", "add_company_cooldown", "upsert_company_identity",
+                       "record_died_role", "mark_dead_links_notified")
+
+
+class _LookupRes:
+    status_code = 200
+    def __init__(self, payload): self._p = payload
+    def json(self): return self._p
+
+
+def _cq_apply(monkeypatch):
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "u-apply", "sheet_tab": "Tetiana Cold", "contact_name": "", "contact_company": "Queue Co"})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {"job_title": "Ops Analyst", "job_id": "gh_x"})
+    m._APPLIED_CRM_CACHE["data"].discard("queue co")
+    return {"reply": {"message_id": 5, "text": "card"}, "must_not_cache": "queue co"}
+
+
+def _cq_x(monkeypatch):
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "u-x", "sheet_tab": "Tetiana Cold", "contact_company": "Queue Co"})
+    monkeypatch.setattr(m, "get_job_by_sheet_uuid", lambda u: {"employer_name": "Queue Co", "job_title": "Analyst"})
+    return {}
+
+
+def _cq_reply_mapping(monkeypatch):
+    monkeypatch.setattr(m, "resolve_reply_mapping", lambda msg, chat_id, label: {
+        "sheet_uuid": "u-r", "sheet_tab": "Tetiana Cold", "contact_company": "Queue Co"})
+    return {}
+
+
+def _cq_short_id(monkeypatch):
+    monkeypatch.setattr(m, "get_sheet_uuid_by_short_id", lambda short_id: "u-short")
+    return {}
+
+
+def _cq_contact(monkeypatch, tab):
+    monkeypatch.setattr(m, "find_carmen_contacts",
+                        lambda token: [("u-beth", tab, {"name": "Beth Young", "company": "Altarum"})])
+    return {}
+
+
+def _cq_linkedin(monkeypatch):
+    monkeypatch.setattr(m, "crm_get", lambda params: _LookupRes({
+        "status": "success", "found": True, "sheet_uuid": "u-li", "sheet_tab": "Carmen Cold",
+        "name": "Dana Reed", "company": "Acme"}))
+    return {}
+
+
+def _cq_linksx(monkeypatch):
+    _seed_dead_link("u-d1", "Deadco One", "Analyst", "Applied")
+    _seed_dead_link("u-d2", "Deadco Two", "Associate", "Applied")
+    return {}
+
+
+# id, command, setup, expected outbox actions in order, success-text prefix, side effects the happy path runs
+_QUEUE_CASES = [
+    ("apply", "/apply", _cq_apply, ["set_status"], "✅ Applied",
+     {"edit_telegram_message", "log_metric_event", "add_company_cooldown", "record_application_outcome"}),
+    ("x", "/x", _cq_x, ["update_status"], "❌ Archived to", {"record_died_role"}),
+    ("f", "/f 3", _cq_reply_mapping, ["update_snooze"], "📅 Follow-up snoozed", set()),
+    ("n", "/n called him", _cq_reply_mapping, ["append_note"], "📝 Note logged.", {"log_daily_activity"}),
+    ("replied", "/replied abc123", _cq_short_id, ["set_status"], "✅ Replied", set()),
+    ("interview", "/interview abc123 2026-11-03", _cq_short_id,
+     ["set_status", "update_snooze", "append_note"], "✅ Interviewing", set()),
+    ("promote", "/promote beth@altarum.org", lambda mp: _cq_contact(mp, "Carmen Cold"),
+     ["update_status", "clear_followup", "set_status", "append_note"], "🔥 Promoted", set()),
+    ("demote", "/demote beth@altarum.org", lambda mp: _cq_contact(mp, "Carmen Hot"),
+     ["update_status", "append_note"], "🪑 Demoted", set()),
+    ("linkedin", "/linkedin dana@acme.com", _cq_linkedin, ["append_note"], "🔗 <b>LinkedIn touch logged",
+     {"log_daily_activity"}),
+    ("linksx", "/linksx", _cq_linksx,
+     ["append_note", "update_status", "append_note", "update_status"], "⚰️ <b>Moved 2",
+     {"record_died_role", "mark_dead_links_notified"}),
+]
+
+
+def _queue_env(monkeypatch, setup):
+    """Real SQLite outbox, real dispatcher. Records each Telegram text with the outbox row count at
+    the moment it was sent, and every side effect that must wait for the queue."""
+    extra = setup(monkeypatch)
+    sent, side = [], []
+
+    def _send(chat_id, text, *a, **k):
+        try:
+            n = len(_outbox_payloads())
+        except Exception:
+            n = None
+        sent.append((text, n))
+    monkeypatch.setattr(m, "send_telegram_message", _send)
+    for name in _QUEUE_SIDE_EFFECTS:
+        monkeypatch.setattr(m, name, lambda *a, _n=name, **k: side.append(_n), raising=False)
+    monkeypatch.setattr(m, "send_health_alert", lambda msg: True)
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)  # usage stats, not the command
+    return sent, side, extra
+
+
+@pytest.mark.parametrize("case", _QUEUE_CASES, ids=[c[0] for c in _QUEUE_CASES])
+def test_commands_confirm_after_queue_happy_path(monkeypatch, case):
+    _id, command, setup, actions, prefix, must_run = case
+    sent, side, extra = _queue_env(monkeypatch, setup)
+
+    _dispatch(command, extra.get("reply"))
+
+    assert [p["action"] for p in _outbox_payloads()] == actions
+    confirmations = [s for s in sent if s[0].startswith(prefix)]
+    assert len(confirmations) == 1, sent
+    assert confirmations[0][1] == len(actions), "the confirmation went out before every write was queued"
+    assert must_run <= set(side), f"expected side effects missing: {must_run - set(side)}"
+
+
+@pytest.mark.parametrize("case", _QUEUE_CASES, ids=[c[0] for c in _QUEUE_CASES])
+def test_commands_confirm_after_queue_failed_insert_changes_nothing(monkeypatch, case):
+    _id, command, setup, actions, prefix, must_run = case
+    sent, side, extra = _queue_env(monkeypatch, setup)
+    real_retry = m.db_write_with_retry
+
+    def _insert_fails(fn, label, *a, **k):
+        if label == "crm_outbox_enqueue":
+            raise sqlite3.OperationalError("database is locked")
+        return real_retry(fn, label, *a, **k)
+    monkeypatch.setattr(m, "db_write_with_retry", _insert_fails)
+
+    _dispatch(command, extra.get("reply"))
+
+    assert _outbox_payloads() == [], "a failed queue left rows behind"
+    texts = [s[0] for s in sent]
+    assert len(texts) == 1 and texts[0].startswith("⚠️ Couldn't queue ") and "Nothing changed" in texts[0], texts
+    assert not any(t.startswith(prefix) for t in texts)
+    assert side == [], f"side effects ran on a failed queue: {side}"
+    if "must_not_cache" in extra:
+        assert extra["must_not_cache"] not in m._APPLIED_CRM_CACHE["data"]
