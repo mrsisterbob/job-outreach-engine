@@ -5259,6 +5259,41 @@ def test_seniority_and_experience_demands_push_a_role_down():
     assert m.calculate_hybrid_score_modifier(entry_exp, 70)[1] > m.calculate_hybrid_score_modifier(deep_exp, 70)[1]
 
 
+_YEARS_CASES = [
+    ("Entry level role. We have served Michigan families for 40 years.", None, 0),
+    ("Entry level role. Join a team that has grown for 12 years.", None, 0),
+    ("Entry level role. A 2-year associate degree is preferred.", None, 0),
+    ("Entry level role. 0-2 years of experience preferred.", 0, 6),
+    ("Requires 3-5 years of experience.", 3, -4),
+    ("Requires 5+ years of experience in operations.", 5, -10),
+    ("Minimum of 7 years in a similar role.", 7, -15),
+    ("Founded 30 years ago. Requires 5 years of experience.", 5, -10),
+    ("At least 4 years of relevant professional experience.", 4, -4),
+    ("2 to 3 years experience in operations.", 2, 6),
+    ("Looking for 3-5 years' experience.", 3, -4),
+]
+
+
+def test_score_years_context_unit_reads_only_experience_demands():
+    from score_rules import years_of_experience_demanded
+    for text, years, _delta in _YEARS_CASES:
+        assert years_of_experience_demanded(text.lower()) == years, text
+    assert years_of_experience_demanded("") is None
+    assert years_of_experience_demanded(None) is None
+    # the largest lower bound wins when several demands appear
+    assert years_of_experience_demanded("2 years of experience, or 6+ years of experience") == 6
+
+
+def test_score_years_context_moves_the_real_layer1_bonus():
+    """Through the real scorer: the delta against an empty description is the years branch."""
+    base = {"employer_name": "Acme", "job_city": "Detroit", "job_max_salary": 95000,
+            "job_title": "Operations Analyst", "job_description": ""}
+    floor = m.calculate_hybrid_score_modifier(base, 70)[1]
+    for text, _years, delta in _YEARS_CASES:
+        got = m.calculate_hybrid_score_modifier(dict(base, job_description=text), 70)[1] - floor
+        assert got == delta, (text, got, delta)
+
+
 class _FakeLookupResp:
     def __init__(self, body, status_code=200):
         self._body = body
