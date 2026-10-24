@@ -843,6 +843,12 @@ grep -i "contact" FUNCTION_INDEX.md
 | 50 | `build_stats_block` | _(no docstring)_ |
 | 61 | `main` | _(no docstring)_ |
 
+## `workday_board.py` — 1 defs, 61 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 21 | `board_triple_from_url` | Return 'tenant/wdN/site' for a Workday job/careers/CXS URL, else ''. |
+
 ## `Code.gs` — CRM actions (the Apps Script API surface)
 
 Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here before writing a CRM read or write by hand - a server-side action searches every tab, which a Python-side scan usually does not.
@@ -868,4 +874,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**724 definitions across 25 files + Code.gs.**
+**725 definitions across 26 files + Code.gs.**
