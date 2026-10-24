@@ -19903,7 +19903,7 @@ def test_warm_card_linkedin_named_contact_gets_escaped_link(monkeypatch):
     url = "https://www.linkedin.com/in/dana-w?a=1&b=2"
     text = _li_card(monkeypatch, [_li_row("Dana West", "Acme Robotics", url)])
     assert "Dana West" in text
-    assert "<a href='https://www.linkedin.com/in/dana-w?a=1&amp;b=2'>LinkedIn</a>" in text, text
+    assert "<a href='https://www.linkedin.com/in/dana-w?a=1&amp;b=2'>LinkedIn (unverified)</a>" in text, text
 
 
 def test_warm_card_linkedin_non_profile_values_add_no_link(monkeypatch):
@@ -19919,7 +19919,7 @@ def test_warm_card_linkedin_named_contact_with_link_beats_nameless_role_mailbox(
             _li_row("Dana West", "Acme Robotics", "https://www.linkedin.com/in/dana-w", priority=3, uuid_="u-dana")]
     m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
     text = _li_card(monkeypatch, rows)
-    assert "Dana West" in text and "linkedin.com/in/dana-w'>LinkedIn</a>" in text, text
+    assert "Dana West" in text and "linkedin.com/in/dana-w'>LinkedIn (unverified)</a>" in text, text
     assert "ghost" not in text and "info@acme.com" not in text, text
     best = m.get_warm_crm_contacts()[m.normalize_company_for_match("Acme Robotics")]
     assert best["name"] == "Dana West" and best["linkedin_url"].endswith("/in/dana-w")
@@ -19930,14 +19930,14 @@ def test_warm_card_linkedin_quote_cannot_break_out_of_the_href(monkeypatch):
     url = "https://www.linkedin.com/in/x'onmouseover='alert(1)"
     text = _li_card(monkeypatch, [_li_row("Dana West", "Acme Robotics", url)])
     assert "'onmouseover=" not in text, text
-    assert "&#x27;onmouseover=&#x27;alert(1)'>LinkedIn</a>" in text, text
+    assert "&#x27;onmouseover=&#x27;alert(1)'>LinkedIn (unverified)</a>" in text, text
 
 
 def test_warm_card_linkedin_multi_role_summary_carries_the_link():
     roles = [{"title": "Ops Analyst", "location": "Chicago", "link": "https://x.example/1"}]
     url = "https://www.linkedin.com/in/dana-w?a=1&b=2"
     text = m._warm_radar_summary_text("Acme Robotics", "Dana West", "note", 0, roles, 1, linkedin_url=url)
-    assert "Dana West <a href='https://www.linkedin.com/in/dana-w?a=1&amp;b=2'>LinkedIn</a>" in text
+    assert "Dana West <a href='https://www.linkedin.com/in/dana-w?a=1&amp;b=2'>LinkedIn (unverified)</a>" in text
     assert ">LinkedIn</a>" not in m._warm_radar_summary_text("Acme Robotics", "Dana West", "note", 0, roles, 1)
     assert ">LinkedIn</a>" not in m._warm_radar_summary_text("A", "D", "n", 0, roles, 1, linkedin_url="x" * 600)
 
@@ -19949,3 +19949,20 @@ def test_warm_card_linkedin_name_column_url_is_the_link_but_never_the_name(monke
     _stub_warm_tab(monkeypatch, [_li_row("https://www.linkedin.com/in/someone", "Zeta Corp", "")])
     z = m.get_warm_crm_contacts()[m.normalize_company_for_match("Zeta Corp")]
     assert z["name"] == "Contact" and z["linkedin_url"] == "https://www.linkedin.com/in/someone"
+
+
+def test_warm_linkedin_unverified_card_labels_by_connection(monkeypatch):
+    url = "https://www.linkedin.com/in/dana-w"
+    row = _li_row("Dana West", "Acme Robotics", url)
+    row["note"] = "Analyst at Acme Robotics. Connected 2024-03-05 (LinkedIn import)"
+    text = _li_card(monkeypatch, [row])
+    assert f"<a href='{url}'>LinkedIn</a>" in text and "unverified" not in text, text
+    m._WARM_CRM_CACHE.update(data={}, fetched_at=0.0)
+    row["note"] = "Active relationship"
+    text = _li_card(monkeypatch, [row])
+    assert f"<a href='{url}'>LinkedIn (unverified)</a>" in text, text
+
+
+def test_warm_linkedin_unverified_no_link_no_label(monkeypatch):
+    text = _li_card(monkeypatch, [_li_row("Dana West", "Acme Robotics", "")])
+    assert "Dana West" in text and "unverified" not in text and ">LinkedIn" not in text, text
