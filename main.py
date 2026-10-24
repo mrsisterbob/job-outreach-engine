@@ -3963,15 +3963,25 @@ def get_warm_crm_contacts():
     now = time.time()
     if now - _WARM_CRM_CACHE["fetched_at"] < _WARM_CRM_CACHE_TTL_SECONDS:
         return _WARM_CRM_CACHE["data"]
-    res = crm_post({"action": "get_followups", "tab": "CW"})
+    # Carmen Warm is ~8,000 rows; Apps Script needs well over the 10s default to serialize it.
+    res = None
+    for _attempt in range(2):
+        res = crm_post({"action": "get_followups", "tab": "CW"}, timeout=45)
+        if res is not None:
+            break
+    _WARM_CRM_CACHE["read_failed"] = True
     if not res:
+        logging.error("get_warm_crm_contacts: Carmen Warm read failed (no response after 2 tries)")
         return _WARM_CRM_CACHE["data"]
     try:
         if res.status_code != 200:
+            logging.error(f"get_warm_crm_contacts: Carmen Warm read returned HTTP {res.status_code}")
             return _WARM_CRM_CACHE["data"]
         data = res.json()
         if data.get("status") != "success":
+            logging.error(f"get_warm_crm_contacts: Carmen Warm read status={data.get('status')!r} {str(data.get('message') or '')[:200]}")
             return _WARM_CRM_CACHE["data"]
+        _WARM_CRM_CACHE["read_failed"] = False
         by_company = {}
         unplaced = []
         for row in data.get("followups", []):
@@ -14741,7 +14751,10 @@ def run_warm_radar_scan(chat_id=None):
     warm_contacts = get_warm_crm_contacts()
     if not warm_contacts:
         if chat_id:
-            lines = ["⚠️ <b>Warm Radar:</b> no Carmen Warm contacts found."]
+            if _WARM_CRM_CACHE.get("read_failed"):
+                lines = ["⚠️ <b>Warm Radar:</b> couldn't read Carmen Warm from the CRM (timeout or error). Your sheet is untouched; try /w again in a minute."]
+            else:
+                lines = ["⚠️ <b>Warm Radar:</b> no Carmen Warm contacts found."]
             unplaced_line = _warm_radar_unplaced_line()
             if unplaced_line:
                 lines.append(unplaced_line)
