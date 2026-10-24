@@ -484,3 +484,11 @@ def test_warm_contact_pick_and_ask_cap_date_and_title_survive_text_after_the_imp
     b = _c("Newer", note, uuid="u-b")
     assert [c["name"] for c in sorted([a, b], key=ra.contact_sort_key)] == ["Newer", "Older"]
     assert ra.pick_contact([a, b], ["Procurement Analyst"], "Acme")["name"] == "Newer"
+
+
+def test_alumni_note_title_is_read_from_the_headline():
+    note = "[2026-10-23] LinkedIn alumni | employer filter: Gentex | Supply Chain Analyst at Gentex Corporation"
+    assert ra.contact_title_and_date(note, "Gentex") == ("Supply Chain Analyst", "")
+    bare = "LinkedIn alumni | employer filter: Gentex | Supply Chain Analyst"
+    assert ra.contact_title_and_date(bare, "Gentex")[0] == "Supply Chain Analyst"
+    assert ra.contact_title_and_date("LinkedIn alumni | employer filter: Gentex", "Gentex")[0] == ""
