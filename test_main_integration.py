@@ -15686,6 +15686,8 @@ class _WarmRadarHarness:
         monkeypatch.setattr(m, "get_filter", lambda key, default=None: self.filters.get(key, default))
         monkeypatch.setattr(m, "set_filter", lambda key, val: self.filters.__setitem__(key, val))
         monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: self.fetched.append(list(slugs)) or [])
+        # /w spends JSearch requests on no-board companies: no /w harness may reach the network for it.
+        monkeypatch.setattr(m, "fetch_single_query_jobs", lambda query_args, pages=None, **kw: [])
         monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
         monkeypatch.setattr(m, "send_status_update", lambda chat_id, text: None)
         monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: self.messages.append(text) or 1)
@@ -19701,3 +19703,162 @@ def test_warm_applied_skip_closing_message_names_the_company_and_count(monkeypat
     h = _applied_skip_harness(monkeypatch, [{"company": "Acme Robotics", "date_added": _days_ago(3)}])
     text = h.run()
     assert "1 company skipped: applied to in the last 14 days (Acme Robotics)" in text, text
+
+
+# ---- /w looks up the biggest no-board warm companies on JSearch (TASK-146) ----
+
+def _jsearch_harness(monkeypatch, nobody=None, with_board=True):
+    """Acme Robotics (1 contact, cached board, no roles) plus no-board companies. `nobody` maps
+    company -> contact count. fetch_single_query_jobs is stubbed: h.queries records each query,
+    h.jsearch maps company display name -> postings returned for it."""
+    nobody = {"Nopeboard Labs": 3} if nobody is None else nobody
+    h = _warm_title_harness(monkeypatch, [])
+    if not with_board:
+        h.filters["ats_company_slugs"] = []
+    contacts = [{"company": "Acme Robotics", "name": "Ann Acme", "email": "ann@acme.example",
+                 "raw_priority": 5, "sheet_uuid": "u-ann"}]
+    for company, n in nobody.items():
+        for i in range(n):
+            contacts.append({"company": company, "name": f"Pat{i} Person", "email": f"pat{i}@{company.split()[0].lower()}.example",
+                             "raw_priority": 5 - i, "sheet_uuid": f"u-{company.split()[0].lower()}-{i}"})
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _AskResp({"status": "success", "followups": contacts}))
+    h.queries, h.jsearch = [], {}
+    h.gmail = []
+    monkeypatch.setattr(m, "create_gmail_draft", lambda *a, **kw: h.gmail.append((a, kw)))
+    with m.get_db_conn() as conn:   # the test DB outlives a test: start every harness with an empty ledger
+        conn.execute("DELETE FROM warm_jsearch_ledger")
+        conn.commit()
+    monkeypatch.setattr(m, "fetch_workday_jobs", lambda board: [])
+    monkeypatch.setenv("RAPIDAPI_KEY", "test-key")
+    monkeypatch.delenv("OPENWEBNINJA_KEY", raising=False)
+
+    def fake_fetch(query_args, pages=None, **kw):
+        query = query_args[0]
+        h.queries.append((query, pages))
+        for company, jobs in h.jsearch.items():
+            if query.startswith(company):
+                return list(jobs)
+        return []
+
+    monkeypatch.setattr(m, "fetch_single_query_jobs", fake_fetch)
+    for c in nobody:
+        _mark_board_checked_today(c)
+    return h
+
+
+def _js_job(employer, title, n=1):
+    return {"employer_name": employer, "job_title": title, "job_id": f"jsearch_{n}_{len(title)}",
+            "job_apply_link": f"https://careers.example.com/{n}{len(title)}", "job_description":
+            "Reconciliation workflows with SQL and reporting.", "job_city": "Troy", "job_state": "MI",
+            "job_country": "US"}
+
+
+def _ledger_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT company_key, spent_at, requests FROM warm_jsearch_ledger ORDER BY id").fetchall()
+
+
+def test_warm_jsearch_lookup_biggest_company_gets_a_card_and_a_stored_ask(monkeypatch):
+    h = _jsearch_harness(monkeypatch, {"Nopeboard Labs": 3, "Smallfry Inc": 1})
+    h.jsearch["Nopeboard Labs"] = [_js_job("Nopeboard Labs", "Operations Analyst")]
+    text = h.run()
+    assert h.queries[0] == ("Nopeboard Labs jobs Michigan", 1), h.queries
+    assert h.cards == ["Operations Analyst"], (h.cards, text)
+    rows = [r for p in h.payloads for r in p.get("rows", [])]
+    assert len(rows) == 1 and rows[0]["row_data"][1] == "Nopeboard Labs", rows
+    asks = _asks()
+    assert len(asks) == 1 and asks[0]["company"] == "Nopeboard Labs", asks
+    assert [r["title"] for r in json.loads(asks[0]["roles_json"])] == ["Operations Analyst"]
+    assert "JSearch lookups: 2 requests spent this run, 8 left this week (Nopeboard Labs, Smallfry Inc)" in text, text
+    assert len(_ledger_rows()) == 2
+
+
+def test_warm_jsearch_lookup_other_employer_posting_produces_no_card(monkeypatch):
+    h = _jsearch_harness(monkeypatch)
+    h.jsearch["Nopeboard Labs"] = [_js_job("Randomcorp Staffing", "Operations Analyst"),
+                                   _js_job("Acme Robotics", "Business Systems Analyst", 2)]
+    text = h.run()
+    assert len(h.queries) == 1
+    assert h.cards == [] and _asks() == [], (h.cards, text)
+
+
+def test_warm_jsearch_lookup_spent_allowance_makes_zero_requests(monkeypatch):
+    h = _jsearch_harness(monkeypatch)
+    now = m.datetime.now(m.timezone.utc)
+    for i in range(10):
+        assert m.warm_jsearch_ledger_append(f"other{i}", 1, now - m.timedelta(days=1))
+    h.jsearch["Nopeboard Labs"] = [_js_job("Nopeboard Labs", "Operations Analyst")]
+    text = h.run()
+    assert h.queries == [] and h.cards == []
+    assert len(_ledger_rows()) == 10
+    assert "0 requests spent this run, 0 left this week" in text, text
+
+
+def test_warm_jsearch_lookup_twice_never_exceeds_the_cap_and_skips_looked_up(monkeypatch):
+    companies = {f"Bigco{chr(65 + i)} Labs": 12 - i for i in range(12)}
+    h = _jsearch_harness(monkeypatch, companies)
+    h.run()
+    first = [q for q, _ in h.queries]
+    assert len(first) == 10 and len(_ledger_rows()) == 10
+    assert sum(r[2] for r in _ledger_rows()) == 10
+    h.queries.clear()
+    h.run()
+    assert h.queries == [], h.queries   # cap used up
+    assert sum(r[2] for r in _ledger_rows()) == 10
+    # Half the allowance back: the next run takes only companies the first one did not look up.
+    old = (m.datetime.now(m.timezone.utc) - m.timedelta(days=8)).isoformat()
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE warm_jsearch_ledger SET spent_at = ? WHERE id IN (SELECT id FROM warm_jsearch_ledger ORDER BY id LIMIT 5)", (old,))
+        conn.commit()
+    h.run()
+    second = [q for q, _ in h.queries]
+    # Five requests are free again, but the ten companies already looked up are inside the retry gap:
+    # only the two the first run never reached are searched.
+    assert second == ["BigcoK Labs jobs Michigan", "BigcoL Labs jobs Michigan"], (first, second)
+    week_ago = m.datetime.now(m.timezone.utc) - m.timedelta(days=7)
+    assert sum(r[2] for r in _ledger_rows() if m.datetime.fromisoformat(r[1]) > week_ago) == 7
+
+
+def test_warm_jsearch_lookup_company_with_a_board_is_never_searched(monkeypatch):
+    h = _jsearch_harness(monkeypatch, {"Nopeboard Labs": 1, "Slugged Systems": 5, "Workday Works": 4})
+    m.upsert_company_identity("Slugged Systems", ats_slug="slugged")
+    m.upsert_company_identity("Workday Works", workday_board="wdworks/wd5/Careers")
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE company_identities SET board_checked_at = ?",
+                     (m.datetime.now().strftime("%Y-%m-%d"),))
+        conn.commit()
+    h.run()
+    assert [q for q, _ in h.queries] == ["Nopeboard Labs jobs Michigan"], h.queries
+    assert [r[0] for r in _ledger_rows()] == [m.normalize_company_for_match("Nopeboard Labs")]
+
+
+def test_warm_jsearch_lookup_no_api_key_spends_and_records_nothing(monkeypatch):
+    h = _jsearch_harness(monkeypatch)
+    monkeypatch.delenv("RAPIDAPI_KEY", raising=False)
+    monkeypatch.delenv("OPENWEBNINJA_KEY", raising=False)
+    h.jsearch["Nopeboard Labs"] = [_js_job("Nopeboard Labs", "Operations Analyst")]
+    text = h.run()
+    assert h.queries == [] and _ledger_rows() == [], (h.queries, _ledger_rows())
+    assert "no JSearch API key is set, nothing was spent" in text, text
+    # Key arrives later: the company was not locked out.
+    monkeypatch.setenv("RAPIDAPI_KEY", "k")
+    h.run()
+    assert [q for q, _ in h.queries] == ["Nopeboard Labs jobs Michigan"]
+
+
+def test_warm_jsearch_lookup_a_429_is_not_retried_so_ledger_equals_http_calls(monkeypatch):
+    real_fetch = m.fetch_single_query_jobs
+    h = _jsearch_harness(monkeypatch, {"Nopeboard Labs": 3, "Smallfry Inc": 1})
+    calls = []
+
+    class _R429:
+        status_code = 429
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(m, "fetch_single_query_jobs", real_fetch)
+    monkeypatch.setattr(m.requests, "get", lambda url, **kw: calls.append(url) or _R429())
+    text = h.run()
+    assert len(calls) == 2, calls
+    assert sum(r[2] for r in _ledger_rows()) == len(calls)
+    assert "2 requests spent this run" in text, text

@@ -27,6 +27,7 @@ from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 import resume_engine
 import referral_asks
+import warm_jsearch_plan
 import warm_screen_plan
 import role_region
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
@@ -1380,6 +1381,13 @@ def init_db():
             provider TEXT NOT NULL,
             call_count INTEGER DEFAULT 0,
             PRIMARY KEY (month_key, provider)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS warm_jsearch_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_key TEXT NOT NULL,
+            spent_at TEXT NOT NULL,
+            requests INTEGER NOT NULL
         )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS query_pagination (
@@ -2892,6 +2900,36 @@ def get_monthly_api_usage():
     except Exception as e:
         logging.error(f"DB API Usage Read Error: {e}")
     return counts
+
+WARM_JSEARCH_LEDGER_KEEP_DAYS = 60   # rows older than this can no longer change a plan (cap window 7d, retry 28d)
+_WARM_JSEARCH_LOCK = threading.Lock()
+
+def warm_jsearch_ledger_read():
+    """Return [(company_key, iso_utc_timestamp, requests)] for the trailing WARM_JSEARCH_LEDGER_KEEP_DAYS days.
+    On a read error returns None, so the caller spends nothing rather than assuming an empty ledger."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=WARM_JSEARCH_LEDGER_KEEP_DAYS)).isoformat()
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT company_key, spent_at, requests FROM warm_jsearch_ledger WHERE spent_at >= ? ORDER BY id",
+                (cutoff,)).fetchall()
+        return [tuple(r) for r in rows]
+    except Exception as e:
+        logging.error(f"Warm JSearch Ledger Read Error: {e}")
+        return None
+
+def warm_jsearch_ledger_append(company_key, requests_spent, now=None):
+    """Record one JSearch spend. Written BEFORE the request goes out. True when the row is stored."""
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
+    try:
+        with get_db_conn() as conn:
+            conn.execute("INSERT INTO warm_jsearch_ledger (company_key, spent_at, requests) VALUES (?, ?, ?)",
+                         (company_key, stamp, int(requests_spent)))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Warm JSearch Ledger Write Error ({company_key}): {e}")
+        return False
 
 def log_email_enrichment_attempt(sheet_uuid, provider, returned_email, confidence):
     """Persist one resolve_email_waterfall() outcome (verified hit vs unverified fallback guess) so
@@ -12495,13 +12533,14 @@ def send_warm_radar_summary(company_raw, contact_name, contact_note, other_conta
 # ==============================================================================
 # 8. PARALLEL PIPELINE EXECUTION (PARALLEL JSEARCH + EARLY-EXIT CIRCUIT BREAKER)
 # ==============================================================================
-def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page):
+def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page, max_retries=None):
     """GETs one JSearch page with exponential backoff on timeout/429/5xx.
     Returns (jobs, stop_pagination) - stop_pagination is True once retries are exhausted or a
     non-retryable status is hit, so one query's failure never raises past this function.
     """
+    max_retries = JSEARCH_MAX_RETRIES if max_retries is None else max_retries   # /w's lookup passes 0: one HTTP call = one ledger request
     delay = 2.0
-    for attempt in range(JSEARCH_MAX_RETRIES + 1):
+    for attempt in range(max_retries + 1):
         try:
             logging.info(f"[JSEARCH OUTBOUND] Calling {api_url} with headers: {list(headers.keys())} for query: '{query}' page: {page}")
             with JSEARCH_SEMAPHORE:
@@ -12509,10 +12548,10 @@ def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page):
             if res.status_code == 200:
                 return res.json().get("data", []), False
             if res.status_code == 429 or res.status_code >= 500:
-                if attempt == JSEARCH_MAX_RETRIES:
+                if attempt == max_retries:
                     logging.error(f"JSearch {res.status_code} on page {page} ({query}) - retries exhausted")
                     return [], True
-                logging.warning(f"JSearch {res.status_code} on page {page} ({query}), attempt {attempt+1}/{JSEARCH_MAX_RETRIES+1} - retrying in {delay}s")
+                logging.warning(f"JSearch {res.status_code} on page {page} ({query}), attempt {attempt+1}/{max_retries+1} - retrying in {delay}s")
                 time.sleep(delay)
                 delay *= 2.0
                 continue
@@ -12526,7 +12565,7 @@ def _fetch_jsearch_page_with_retry(api_url, headers, params, query, page):
             return [], True
     return [], True
 
-def fetch_single_query_jobs(query_args):
+def fetch_single_query_jobs(query_args, pages=None, max_retries=None):
     """Worker function for parallel JSearch API query execution.
     Always fetches pages 1..JSEARCH_PAGES_PER_RUN - no rolling offset, so no query can drift onto a
     deep page that times out, and none ever skips page 1 (its best matches) to fetch a worse one.
@@ -12536,10 +12575,11 @@ def fetch_single_query_jobs(query_args):
     don't crowd out the local metro-area focus.
     """
     query, api_url, headers = query_args
+    pages = JSEARCH_PAGES_PER_RUN if pages is None else pages   # /w's lookup passes 1; /t keeps the default
     is_remote_query = "remote" in query.lower()
     radius_miles = safe_int(get_filter("radius_miles"), 45)
     all_jobs = []
-    for page in range(1, JSEARCH_PAGES_PER_RUN + 1):
+    for page in range(1, pages + 1):
         params = {
             "query": query,
             "page": str(page),
@@ -12553,7 +12593,8 @@ def fetch_single_query_jobs(query_args):
         if not is_remote_query and radius_miles:
             params["radius"] = str(radius_miles)
         time.sleep(0.3)  # stagger outbound requests to avoid slamming JSearch concurrently
-        page_jobs, should_stop = _fetch_jsearch_page_with_retry(api_url, headers, params, query, page)
+        page_jobs, should_stop = _fetch_jsearch_page_with_retry(
+            api_url, headers, params, query, page, *(() if max_retries is None else (max_retries,)))
         if page_jobs:
             all_jobs.extend(apply_direct_link(j) for j in page_jobs)
         if should_stop or not page_jobs:
@@ -14795,6 +14836,7 @@ def run_warm_radar_scan(chat_id=None):
 
     retry_cutoff = (datetime.now() - timedelta(days=WARM_RADAR_MISS_RETRY_DAYS)).strftime("%Y-%m-%d")
     checked_no_board = []   # looked up recently, nothing public found
+    no_board_candidates = []   # the same companies as (key, display name, warm contact count) for the JSearch planner
     unchecked_keys = []     # never looked up, or the last miss is older than the retry window
     not_company = 0
     contacts_by_bucket = {"scanned": 0, "no_board": 0, "unchecked": 0, "not_company": 0}
@@ -14809,6 +14851,7 @@ def run_warm_radar_scan(chat_id=None):
             contacts_by_bucket["not_company"] += people
         elif checked_on.get(key, "") > retry_cutoff:
             checked_no_board.append(display)
+            no_board_candidates.append((key, display, people))
             contacts_by_bucket["no_board"] += people
         else:
             unchecked_keys.append(key)
@@ -14860,7 +14903,12 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(coverage_line)
             return lines
 
-        if not slug_to_contact and not wd_to_contact:
+        jsearch_headers, jsearch_url = build_jsearch_request_config() if no_board_candidates else ({}, None)
+        jsearch_no_key = bool(no_board_candidates) and not jsearch_headers   # no key: nothing is planned, spent or recorded
+        jsearch_ledger = warm_jsearch_ledger_read() if no_board_candidates and not jsearch_no_key else None
+        jsearch_preview = (warm_jsearch_plan.plan_warm_jsearch(no_board_candidates, jsearch_ledger, datetime.now(timezone.utc))[0]
+                           if jsearch_ledger is not None else [])
+        if not slug_to_contact and not wd_to_contact and not jsearch_preview:
             if chat_id:
                 lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm entries has a cached job board yet."]
                 lines += _skipped_report()
@@ -14900,6 +14948,89 @@ def run_warm_radar_scan(chat_id=None):
         scanned_slugs = []      # boards fetched without a fetch error this run
         errored_slugs = []      # boards whose fetch raised or reported a failed platform
         keep_jobs = warm_screen_plan.CANDIDATES_PER_COMPANY   # roles per company that can be sent to Gemini
+        def _collect_posting(job, jsearch_keys=None):
+            """PASS 1 for ONE posting, board or JSearch: every gate and the grouping, one code path.
+            jsearch_keys (set of company keys), when given, drops a posting whose employer is not one of them."""
+            nonlocal board_index, title_filtered, region_filtered
+            company = job.get("employer_name") or ""
+            title = job.get("job_title") or ""
+            if is_banned_employer(company):
+                return
+            job_hash = generate_dedup_hash(company, title)
+            # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
+            # when the role is already tracked in a job tab - never merely because /t once saw it.
+            if job_hash in seen_hashes or is_role_tracked(company, title):
+                return
+
+            # Tie the posting back to its warm contact by the slug baked into its job_id
+            # (gh_/lever_/ashby_<slug>_...), falling back to a normalized-name match on the ATS
+            # employer label. Postings we can't attribute to a warm contact aren't /w's to surface.
+            job_id = str(job.get("job_id") or "")
+            role_slug = next(
+                (s for s in slug_to_contact if job_id.startswith((f"gh_{s}_", f"lever_{s}_", f"ashby_{s}_"))),
+                None)
+            contact = slug_to_contact[role_slug] if role_slug else None
+            if not contact and job_id.startswith("wd_"):
+                # Workday: the employer label is the tenant title-cased, so a posting is tied
+                # back by the tenant in its job_id (longest tenant wins), never by name. A
+                # tenant no warm company stores a triple for is dropped.
+                wd_matches = [b for b in wd_to_contact if job_id.startswith(f"wd_{b.split('/')[0]}_")]
+                role_slug = max(wd_matches, key=lambda b: len(b.split("/")[0])) if wd_matches else None
+                contact = wd_to_contact[role_slug] if role_slug else None
+                if not contact:
+                    return
+            contact = contact or warm_contacts.get(normalize_company_for_match(company))
+            if not contact:
+                return
+            if jsearch_keys is not None and normalize_company_for_match(company) not in jsearch_keys:
+                return   # a JSearch posting is kept only when its employer IS one of the companies searched
+
+            # The title gate /t uses (one shared function). A filtered role is counted, never stamped
+            # into seen_jobs (same reason _add_candidate does not): the rule can change and the role
+            # should be seen again.
+            if title_rejection_reason(title):
+                if job_hash not in filtered_hashes:
+                    filtered_hashes.add(job_hash)
+                    title_filtered += 1
+                return
+
+            # The region/language gate (role_region): the one location rule /w has. It drops only
+            # clearly foreign or non-English roles; an unreadable location is KEPT and counted.
+            # Counted and never stamped, exactly like the title gate.
+            verdict, _why = role_region.role_region_gate(job)
+            if verdict in (role_region.FOREIGN, role_region.NON_ENGLISH):
+                if job_hash not in region_hashes:
+                    region_hashes.add(job_hash)
+                    region_filtered += 1
+                return
+
+            # The role screen /t uses, called as-is (never copied): years required, industrial and
+            # trade-degree roles and the rest. Geography and company suppression are off for /w.
+            # A dropped role is counted by reason and never stamped, like the title gate.
+            if job_hash in screen_dropped:
+                return
+            if not passes_strict_filter(job, trace=screen_trace, check_geography=False,
+                                        check_company_suppression=False):
+                screen_dropped.add(job_hash)
+                return
+
+            seen_hashes.add(job_hash)
+            try:
+                track_hit = bool(track_for_title(title, employer=company))
+            except Exception:
+                track_hit = False
+            group_key = normalize_company_for_match(contact.get("raw_company") or company)
+            # A role matched by company NAME has no slug in its job id; map it back through the
+            # identity rows so a held or unsent role still keeps its board from being stamped.
+            role_slug = role_slug or name_to_slug.get(group_key) or name_to_slug.get(normalize_company_for_match(company))
+            group = groups.setdefault(group_key, {"contact": contact, "company": company, "roles": []})
+            group["roles"].append({
+                "job": job, "job_hash": job_hash, "company": company, "title": title,
+                "verdict": verdict, "slug": role_slug, "group_key": group_key,
+                "rank": role_region.role_rank_key(track_hit, verdict, board_index),
+            })
+            board_index += 1
+
         for chunk_start in range(0, len(slugs), WARM_RADAR_SCAN_CHUNK):
             chunk = slugs[chunk_start:chunk_start + WARM_RADAR_SCAN_CHUNK]
             chunk_failed = []
@@ -14925,82 +15056,7 @@ def run_warm_radar_scan(chat_id=None):
                     errored_slugs.append(wd_board)
             chunk = wd_ok + ats_chunk
             for job in chunk_jobs:
-                company = job.get("employer_name") or ""
-                title = job.get("job_title") or ""
-                if is_banned_employer(company):
-                    continue
-                job_hash = generate_dedup_hash(company, title)
-                # Mirror _add_candidate: collapse duplicates within this run, and suppress across runs only
-                # when the role is already tracked in a job tab - never merely because /t once saw it.
-                if job_hash in seen_hashes or is_role_tracked(company, title):
-                    continue
-
-                # Tie the posting back to its warm contact by the slug baked into its job_id
-                # (gh_/lever_/ashby_<slug>_...), falling back to a normalized-name match on the ATS
-                # employer label. Postings we can't attribute to a warm contact aren't /w's to surface.
-                job_id = str(job.get("job_id") or "")
-                role_slug = next(
-                    (s for s in slug_to_contact if job_id.startswith((f"gh_{s}_", f"lever_{s}_", f"ashby_{s}_"))),
-                    None)
-                contact = slug_to_contact[role_slug] if role_slug else None
-                if not contact and job_id.startswith("wd_"):
-                    # Workday: the employer label is the tenant title-cased, so a posting is tied
-                    # back by the tenant in its job_id (longest tenant wins), never by name. A
-                    # tenant no warm company stores a triple for is dropped.
-                    wd_matches = [b for b in wd_to_contact if job_id.startswith(f"wd_{b.split('/')[0]}_")]
-                    role_slug = max(wd_matches, key=lambda b: len(b.split("/")[0])) if wd_matches else None
-                    contact = wd_to_contact[role_slug] if role_slug else None
-                    if not contact:
-                        continue
-                contact = contact or warm_contacts.get(normalize_company_for_match(company))
-                if not contact:
-                    continue
-
-                # The title gate /t uses (one shared function). A filtered role is counted, never stamped
-                # into seen_jobs (same reason _add_candidate does not): the rule can change and the role
-                # should be seen again.
-                if title_rejection_reason(title):
-                    if job_hash not in filtered_hashes:
-                        filtered_hashes.add(job_hash)
-                        title_filtered += 1
-                    continue
-
-                # The region/language gate (role_region): the one location rule /w has. It drops only
-                # clearly foreign or non-English roles; an unreadable location is KEPT and counted.
-                # Counted and never stamped, exactly like the title gate.
-                verdict, _why = role_region.role_region_gate(job)
-                if verdict in (role_region.FOREIGN, role_region.NON_ENGLISH):
-                    if job_hash not in region_hashes:
-                        region_hashes.add(job_hash)
-                        region_filtered += 1
-                    continue
-
-                # The role screen /t uses, called as-is (never copied): years required, industrial and
-                # trade-degree roles and the rest. Geography and company suppression are off for /w.
-                # A dropped role is counted by reason and never stamped, like the title gate.
-                if job_hash in screen_dropped:
-                    continue
-                if not passes_strict_filter(job, trace=screen_trace, check_geography=False,
-                                            check_company_suppression=False):
-                    screen_dropped.add(job_hash)
-                    continue
-
-                seen_hashes.add(job_hash)
-                try:
-                    track_hit = bool(track_for_title(title, employer=company))
-                except Exception:
-                    track_hit = False
-                group_key = normalize_company_for_match(contact.get("raw_company") or company)
-                # A role matched by company NAME has no slug in its job id; map it back through the
-                # identity rows so a held or unsent role still keeps its board from being stamped.
-                role_slug = role_slug or name_to_slug.get(group_key) or name_to_slug.get(normalize_company_for_match(company))
-                group = groups.setdefault(group_key, {"contact": contact, "company": company, "roles": []})
-                group["roles"].append({
-                    "job": job, "job_hash": job_hash, "company": company, "title": title,
-                    "verdict": verdict, "slug": role_slug, "group_key": group_key,
-                    "rank": role_region.role_rank_key(track_hit, verdict, board_index),
-                })
-                board_index += 1
+                _collect_posting(job)
             # Drop the chunk's raw posting list BEFORE the next fetch: only the per-role records in
             # `groups` survive. A role keeps its job dict (description and all) only while it is in
             # its company's top WARM_RADAR_ROLES_PER_COMPANY; past that it can never be listed this
@@ -15021,6 +15077,55 @@ def run_warm_radar_scan(chat_id=None):
             failed_set = set(chunk_failed)
             errored_slugs.extend(s for s in chunk if s in failed_set)
             scanned_slugs.extend(s for s in chunk if s not in failed_set)
+
+        # JSEARCH LOOKUPS. The weekly allowance buys one JSearch page for each of the biggest no-board
+        # warm companies (warm_jsearch_plan). Plan again under the lock, and write every ledger row
+        # BEFORE any request goes out (the spend happened even if the call fails), so a redeploy or a
+        # second /w can never exceed the cap. What comes back joins the SAME pass 1 as a board role.
+        jsearch_spent = 0
+        jsearch_left = None
+        jsearch_names = []
+        if no_board_candidates and not jsearch_no_key:
+            with _WARM_JSEARCH_LOCK:
+                ledger_now = warm_jsearch_ledger_read()
+                picks = []
+                if ledger_now is not None:
+                    stamp_now = datetime.now(timezone.utc)
+                    picks, jsearch_left = warm_jsearch_plan.plan_warm_jsearch(no_board_candidates, ledger_now, stamp_now)
+                    picks = [pk for pk in picks if warm_jsearch_ledger_append(
+                        pk[0], warm_jsearch_plan.WARM_JSEARCH_PAGES_PER_COMPANY, stamp_now)]
+            jsearch_spent = len(picks) * warm_jsearch_plan.WARM_JSEARCH_PAGES_PER_COMPANY
+            if jsearch_left is not None:
+                jsearch_left = max(0, jsearch_left)
+            jsearch_names = [pk[1] for pk in picks]
+            if picks:
+                if chat_id:
+                    send_status_update(chat_id, f"Warm Radar: looking up {len(picks)} companies with no job board on JSearch...")
+                headers, api_url = jsearch_headers, jsearch_url
+                picked_keys = {pk[0] for pk in picks}
+
+                def _jsearch_lookup(pick):
+                    try:
+                        return fetch_single_query_jobs(
+                            (f"{pick[1]} jobs Michigan", api_url, headers),
+                            pages=warm_jsearch_plan.WARM_JSEARCH_PAGES_PER_COMPANY, max_retries=0) or []
+                    except Exception as e:
+                        logging.error(f"Warm Radar JSearch lookup failed for {pick[1]}: {e}")
+                        return []
+
+                with ThreadPoolExecutor(max_workers=2) as jpool:
+                    found = list(jpool.map(_jsearch_lookup, picks))
+                for jobs in found:
+                    for job in jobs:
+                        try:
+                            _collect_posting(job, jsearch_keys=picked_keys)
+                        except Exception as e:
+                            logging.error(f"Warm Radar JSearch posting error: {e}")
+                for group in groups.values():
+                    if len(group["roles"]) > keep_jobs:
+                        group["roles"].sort(key=lambda r: r["rank"])
+                        for dropped in group["roles"][keep_jobs:]:
+                            dropped["job"] = None
 
         # SCREEN + OUTPUT. Nothing has been stamped, cached, sent or written yet. A role leaves a
         # trace (seen_jobs stamp, referral-ask role) ONLY after what lists it was accepted: its card
@@ -15220,6 +15325,15 @@ def run_warm_radar_scan(chat_id=None):
             referral_line = _referral_summary_line(referral_summary)
             if referral_line:
                 lines.append(referral_line)
+            if jsearch_no_key:
+                lines.append("JSearch lookups skipped: no JSearch API key is set, nothing was spent")
+            if jsearch_left is not None:
+                jsearch_line = (f"JSearch lookups: {jsearch_spent} request{'' if jsearch_spent == 1 else 's'} spent this run, "
+                                f"{jsearch_left} left this week")
+                if jsearch_names:
+                    names_text, _used = _warm_radar_name_list(jsearch_names, 5)
+                    jsearch_line += f" ({names_text})"
+                lines.append(jsearch_line)
             if applied_skipped:
                 names_text, _used = _warm_radar_name_list(sorted(applied_skipped), 5)
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
