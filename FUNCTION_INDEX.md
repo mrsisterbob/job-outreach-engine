@@ -855,6 +855,16 @@ grep -i "contact" FUNCTION_INDEX.md
 | 30 | `_parse` | Parse an ISO timestamp to aware UTC; None on any failure. |
 | 41 | `plan_warm_jsearch` | Return (picks, requests_left). |
 
+## `warm_screen_plan.py` — 5 defs, 85 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 24 | `_parse_day` | Return a date from a YYYY-MM-DD string, or None if missing or malformed. |
+| 34 | `pick_to_screen` | Flat list of roles worth a Gemini call: best per_company by rank, minus recently memoed. |
+| 49 | `choose_outputs` | Split scored roles into cards, digest, held and rejected without mutating the input. |
+| 74 | `applied_recently` | True when the company's latest application is within days of today (future counts). |
+| 82 | `digest_lines` | Digest lines in /t's shape: score right-aligned, company and title truncated. |
+
 ## `workday_board.py` — 1 defs, 61 lines
 
 | Line | Name | Summary |
@@ -886,4 +896,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**732 definitions across 27 files + Code.gs.**
+**737 definitions across 28 files + Code.gs.**
