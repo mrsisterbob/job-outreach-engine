@@ -1454,6 +1454,11 @@ def init_db():
         # recently scanned first (never scanned first of all), so every board is reached in turn.
         if "board_scanned_at" not in identity_columns:
             conn.execute("ALTER TABLE company_identities ADD COLUMN board_scanned_at TEXT")
+        # workday_board: a Workday "tenant/wdN/site" triple stored against a warm company so /w can
+        # scan that board (fetch_workday_jobs) the way it scans an ats_slug. Nullable; the column
+        # is proof only that the triple has the right shape, not that it answers.
+        if "workday_board" not in identity_columns:
+            conn.execute("ALTER TABLE company_identities ADD COLUMN workday_board TEXT")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS system_alerts (
             alert_key TEXT PRIMARY KEY,
@@ -3444,7 +3449,23 @@ def normalize_company_for_match(company_name):
     company = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', company, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', company).strip()
 
-def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applied=False):
+def valid_workday_triple(board):
+    """True when `board` is a 'tenant/wdN/site' triple of three non-empty parts (shape only; the
+    same check fetch_workday_jobs makes)."""
+    parts = str(board or "").strip().split("/")
+    return len(parts) == 3 and all(parts)
+
+
+def set_company_workday_board(company_name, board):
+    """Store a Workday triple against a company's identity row (created if missing). A malformed
+    triple is refused (False); an empty one never clears a stored triple (COALESCE rule)."""
+    board = str(board or "").strip()
+    if not valid_workday_triple(board):
+        return False
+    return upsert_company_identity(company_name, workday_board=board)
+
+
+def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applied=False, workday_board=None):
     """Merge newly-learned facts about a company into the canonical company_identities record,
     keyed by normalize_company_for_match() so 'Acme Corp' and 'Acme Corp Inc.' share one row.
     Never overwrites a field with an empty value - only adds/updates what's newly known.
@@ -3468,15 +3489,17 @@ def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applie
                 merged_aliases = "|".join(sorted(aliases))
                 conn.execute(
                     "UPDATE company_identities SET display_name = ?, aliases = ?, ats_slug = COALESCE(?, ats_slug), "
-                    "crm_status = COALESCE(?, crm_status), applied_at = COALESCE(?, applied_at), updated_at = CURRENT_TIMESTAMP "
+                    "crm_status = COALESCE(?, crm_status), applied_at = COALESCE(?, applied_at), "
+                    "workday_board = COALESCE(?, workday_board), updated_at = CURRENT_TIMESTAMP "
                     "WHERE normalized_name = ?",
-                    (existing_display or display_name, merged_aliases, ats_slug, crm_status, applied_at, normalized)
+                    (existing_display or display_name, merged_aliases, ats_slug, crm_status, applied_at,
+                     workday_board or None, normalized)
                 )
             else:
                 conn.execute(
-                    "INSERT INTO company_identities (normalized_name, display_name, aliases, ats_slug, crm_status, applied_at) "
-                    "VALUES (?, ?, '', ?, ?, ?)",
-                    (normalized, display_name, ats_slug, crm_status, applied_at)
+                    "INSERT INTO company_identities (normalized_name, display_name, aliases, ats_slug, crm_status, applied_at, workday_board) "
+                    "VALUES (?, ?, '', ?, ?, ?, ?)",
+                    (normalized, display_name, ats_slug, crm_status, applied_at, workday_board or None)
                 )
             conn.commit()
         return True
@@ -13892,7 +13915,7 @@ def _warm_radar_lookup_batch(companies):
 
 
 def _stamp_boards_scanned(slugs, errored=False):
-    """Stamp the company_identities rows whose ats_slug is in `slugs`: board_scanned_at for a board
+    """Stamp the company_identities rows whose ats_slug or workday_board is in `slugs`: board_scanned_at for a board
     /w fetched cleanly, board_attempted_at (the lookup rotation stamp) for one whose fetch errored,
     so an erroring board sorts behind boards never tried instead of holding the front. Never raises."""
     slugs = sorted(set(slugs))
@@ -13906,7 +13929,8 @@ def _stamp_boards_scanned(slugs, errored=False):
             for start in range(0, len(slugs), 500):
                 part = slugs[start:start + 500]
                 conn.execute(f"UPDATE company_identities SET {column} = ? "
-                             f"WHERE ats_slug IN ({','.join('?' * len(part))})", [now] + part)
+                             f"WHERE ats_slug IN ({','.join('?' * len(part))}) "
+                             f"OR workday_board IN ({','.join('?' * len(part))})", [now] + part + part)
             conn.commit()
     except Exception as e:
         logging.error(f"Warm Radar Board Scan Stamp Error: {e}")
@@ -14517,7 +14541,7 @@ def run_warm_radar_scan(chat_id=None):
     try:
         with get_db_conn() as conn:
             identity_rows = conn.execute(
-                "SELECT normalized_name, ats_slug, board_checked_at, board_attempted_at, board_scanned_at FROM company_identities"
+                "SELECT normalized_name, ats_slug, board_checked_at, board_attempted_at, board_scanned_at, workday_board FROM company_identities"
             ).fetchall()
     except Exception as e:
         logging.error(f"Warm Radar Identity Lookup Error: {e}")
@@ -14529,12 +14553,22 @@ def run_warm_radar_scan(chat_id=None):
     slug_scanned = {}     # slug -> oldest board_scanned_at among its warm entries ("" = never)
     slug_attempted = {}   # slug -> newest board_attempted_at among its warm entries
     name_to_slug = {}     # warm normalized company name -> its cached slug (for roles matched by name)
-    for normalized_name, slug, board_checked_at, board_attempted_at, board_scanned_at in identity_rows:
+    wd_to_contact = {}    # stored Workday "tenant/wdN/site" triple -> warm contact (a board key like a slug)
+    for normalized_name, slug, board_checked_at, board_attempted_at, board_scanned_at, workday_board in identity_rows:
         contact = warm_contacts.get(normalized_name)
         if not contact:
             continue
         if board_attempted_at:
             attempted_at[normalized_name] = board_attempted_at
+        workday_board = str(workday_board or "").strip()
+        if valid_workday_triple(workday_board):
+            # A triple makes the company "have a board" even with no slug, so it is never queued
+            # for a Greenhouse/Lever/Ashby probe. Rotated by the same scan/attempt stamps as a slug.
+            wd_to_contact.setdefault(workday_board, contact)
+            name_to_slug.setdefault(normalized_name, workday_board)
+            slug_scanned[workday_board] = min(slug_scanned.get(workday_board, board_scanned_at or ""), board_scanned_at or "")
+            slug_attempted[workday_board] = max(slug_attempted.get(workday_board, ""), board_attempted_at or "")
+            scanned_keys.add(normalized_name)
         if slug:
             slug_to_contact.setdefault(slug, contact)
             name_to_slug[normalized_name] = slug
@@ -14543,7 +14577,7 @@ def run_warm_radar_scan(chat_id=None):
             # Every warm entry with a slug counts as scanned, including a second one that shares
             # a slug with the first ("Acme Robotics" / "Acme-Robotics"); slug_to_contact keeps one.
             scanned_keys.add(normalized_name)
-        elif board_checked_at:
+        elif board_checked_at and not workday_board:
             checked_on[normalized_name] = board_checked_at
 
     retry_cutoff = (datetime.now() - timedelta(days=WARM_RADAR_MISS_RETRY_DAYS)).strftime("%Y-%m-%d")
@@ -14613,7 +14647,7 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(coverage_line)
             return lines
 
-        if not slug_to_contact:
+        if not slug_to_contact and not wd_to_contact:
             if chat_id:
                 lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm entries has a cached job board yet."]
                 lines += _skipped_report()
@@ -14624,7 +14658,9 @@ def run_warm_radar_scan(chat_id=None):
         # first of all. A touch is a clean scan (board_scanned_at) OR a failed attempt
         # (board_attempted_at), so a board that keeps erroring moves to the back each time it is
         # tried instead of holding the front on its old scan stamp. sorted() is stable.
-        all_slugs = sorted(slug_to_contact, key=lambda s: max(slug_scanned.get(s, ""), slug_attempted.get(s, "")))
+        # Workday triples share this one budget and rotation: one Workday board is ONE slot here
+        # (it costs up to 9 list POSTs and 24 detail GETs, fetched one board at a time below).
+        all_slugs = sorted(dict.fromkeys([*slug_to_contact, *wd_to_contact]), key=lambda s: max(slug_scanned.get(s, ""), slug_attempted.get(s, "")))
         slugs = all_slugs[:WARM_RADAR_SCAN_BATCH]
         if chat_id:
             send_status_update(chat_id, f"Warm Radar: scanning {len(slugs)} of {len(all_slugs)} warm companies with a cached ATS board (no AI scoring)...")
@@ -14652,12 +14688,27 @@ def run_warm_radar_scan(chat_id=None):
         for chunk_start in range(0, len(slugs), WARM_RADAR_SCAN_CHUNK):
             chunk = slugs[chunk_start:chunk_start + WARM_RADAR_SCAN_CHUNK]
             chunk_failed = []
-            try:
-                chunk_jobs = fetch_ats_jobs(chunk, failed_slugs=chunk_failed)
-            except Exception as e:
-                logging.error(f"Warm Radar Board Fetch Error ({len(chunk)} boards, first {chunk[0]}): {e}")
-                errored_slugs.extend(chunk)
-                continue
+            chunk_jobs = []
+            ats_chunk = [k for k in chunk if k not in wd_to_contact]
+            if ats_chunk:
+                try:
+                    chunk_jobs = list(fetch_ats_jobs(ats_chunk, failed_slugs=chunk_failed))
+                except Exception as e:
+                    logging.error(f"Warm Radar Board Fetch Error ({len(ats_chunk)} boards, first {ats_chunk[0]}): {e}")
+                    errored_slugs.extend(ats_chunk)
+                    chunk_jobs = []
+                    ats_chunk = []
+            # fetch_workday_jobs returns [] for a failed list call and an empty board alike, so only
+            # a raise counts as a failed board here; an [] answer is stamped as a clean scan.
+            wd_ok = []
+            for wd_board in (k for k in chunk if k in wd_to_contact):
+                try:
+                    chunk_jobs.extend(fetch_workday_jobs(wd_board) or [])
+                    wd_ok.append(wd_board)
+                except Exception as e:
+                    logging.error(f"Warm Radar Workday Fetch Error ({wd_board}): {e}")
+                    errored_slugs.append(wd_board)
+            chunk = wd_ok + ats_chunk
             for job in chunk_jobs:
                 company = job.get("employer_name") or ""
                 title = job.get("job_title") or ""
@@ -14677,6 +14728,15 @@ def run_warm_radar_scan(chat_id=None):
                     (s for s in slug_to_contact if job_id.startswith((f"gh_{s}_", f"lever_{s}_", f"ashby_{s}_"))),
                     None)
                 contact = slug_to_contact[role_slug] if role_slug else None
+                if not contact and job_id.startswith("wd_"):
+                    # Workday: the employer label is the tenant title-cased, so a posting is tied
+                    # back by the tenant in its job_id (longest tenant wins), never by name. A
+                    # tenant no warm company stores a triple for is dropped.
+                    wd_matches = [b for b in wd_to_contact if job_id.startswith(f"wd_{b.split('/')[0]}_")]
+                    role_slug = max(wd_matches, key=lambda b: len(b.split("/")[0])) if wd_matches else None
+                    contact = wd_to_contact[role_slug] if role_slug else None
+                    if not contact:
+                        continue
                 contact = contact or warm_contacts.get(normalize_company_for_match(company))
                 if not contact:
                     continue

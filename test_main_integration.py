@@ -19195,3 +19195,82 @@ def test_warm_alumni_tie_no_headline_implies_a_track_falls_back_to_first_in_arri
     rows = _asks()
     assert len(rows) == 1, rows
     assert rows[0]["sheet_uuid"] == "u-alum-0" and rows[0]["contact_name"] == "Alum 0", rows[0]
+
+
+# ---- /w scans a Workday board stored against a warm company (TASK-142) ----
+
+_WD_TRIPLE = "borgwarner/wd5/BorgWarner_Careers"
+
+
+def _wd_jobs(tenant="borgwarner", titles=("Operations Analyst",)):
+    return [{"job_id": f"wd_{tenant}_R-{i}", "employer_name": tenant.replace("-", " ").title(),
+             "job_title": t, "job_description": "Reconciliation workflows with SQL and reporting.",
+             "job_apply_link": f"https://{tenant}.wd5.myworkdayjobs.com/Careers/job/{i}",
+             "job_city": "Auburn Hills, MI", "job_state": "", "job_is_remote": False,
+             "job_posted_at_datetime_utc": ""} for i, t in enumerate(titles)]
+
+
+def _wd_harness(monkeypatch, wd_jobs, triple=_WD_TRIPLE, slug=None):
+    contacts = [{"company": "BorgWarner Inc", "name": "Dana Reyes", "email": "dana@bw.example",
+                 "raw_priority": 5, "sheet_uuid": "u-dana"}]
+    h = _ask_harness(monkeypatch, [], contacts=contacts)
+    h.wd_fetched = []
+    monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: h.fetched.append(list(slugs)) or [])
+    monkeypatch.setattr(m, "fetch_workday_jobs", lambda board: h.wd_fetched.append(board) or list(wd_jobs))
+    m.upsert_company_identity("BorgWarner Inc", ats_slug=slug)
+    if triple:
+        assert m.set_company_workday_board("BorgWarner Inc", triple) is True
+    return h
+
+
+def test_warm_workday_board_only_a_triple_reaches_a_card_and_a_stored_ask(monkeypatch):
+    h = _wd_harness(monkeypatch, _wd_jobs())
+    text = h.run()
+    assert h.wd_fetched == [_WD_TRIPLE] and h.fetched == [], (h.wd_fetched, h.fetched)
+    assert h.cards == ["Operations Analyst"], h.cards
+    rows = _asks()
+    assert len(rows) == 1 and rows[0]["sheet_uuid"] == "u-dana" and rows[0]["company"] == "BorgWarner", rows
+    roles = json.loads(rows[0]["roles_json"])
+    assert [r["title"] for r in roles] == ["Operations Analyst"]
+    assert "1 new matches" in text, text
+    with m.get_db_conn() as conn:
+        stamp = conn.execute("SELECT board_scanned_at FROM company_identities WHERE workday_board = ?",
+                             (_WD_TRIPLE,)).fetchone()
+    assert stamp and stamp[0], "a clean Workday scan must stamp board_scanned_at"
+
+
+def test_warm_workday_board_tenant_label_differs_from_the_company_name(monkeypatch):
+    jobs = _wd_jobs()
+    assert jobs[0]["employer_name"] == "Borgwarner"
+    h = _wd_harness(monkeypatch, jobs)
+    h.run()
+    assert h.cards == ["Operations Analyst"], h.cards
+    assert [r["company"] for r in _asks()] == ["BorgWarner"]
+
+
+def test_warm_workday_board_posting_for_a_tenant_no_warm_company_owns_makes_no_card(monkeypatch):
+    h = _wd_harness(monkeypatch, _wd_jobs(tenant="somebody-else"))
+    h.run()
+    assert h.cards == [] and _asks() == [], (h.cards, _asks())
+
+
+def test_warm_workday_board_company_with_a_triple_is_not_queued_for_an_ats_lookup(monkeypatch):
+    h = _wd_harness(monkeypatch, [])
+    text = h.run()
+    assert h.http == [], h.http
+    assert "Not looked at yet" not in text, text
+    with m.get_db_conn() as conn:
+        checked = conn.execute("SELECT board_checked_at, board_attempted_at FROM company_identities "
+                               "WHERE workday_board = ?", (_WD_TRIPLE,)).fetchone()
+    assert checked[0] is None, checked
+
+
+def test_warm_workday_board_setter_rejects_a_malformed_triple_and_never_clears_a_stored_one(monkeypatch):
+    _wd_harness(monkeypatch, [], triple=None)
+    assert m.set_company_workday_board("BorgWarner Inc", "borgwarner/wd5") is False
+    assert m.set_company_workday_board("BorgWarner Inc", _WD_TRIPLE) is True
+    m.upsert_company_identity("BorgWarner Inc", crm_status="Warm")
+    m.set_company_workday_board("BorgWarner Inc", "")
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT workday_board FROM company_identities WHERE normalized_name = ?",
+                            (m.normalize_company_for_match("BorgWarner Inc"),)).fetchone()[0] == _WD_TRIPLE
