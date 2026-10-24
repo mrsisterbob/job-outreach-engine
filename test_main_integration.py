@@ -19398,3 +19398,82 @@ def test_t_records_workday_board_skips_non_workday_and_relist_links(run_candidat
     run_candidate(gemini_base=60, layer1_bonus=0, employer_name="Plain Link Co",
                   job_apply_link="https://www.linkedin.com/jobs/view/123")
     assert _stored_workday_board("Plain Link Co") == ""
+
+# --- TASK-152: passes_strict_filter scope switches ---------------------------------------------
+# The RECORDED table below was captured by running the UNMODIFIED function (before the switches
+# existed): (result, dict(trace.reasons)) per job.
+_SCOPE_BASE = {"employer_name": "Fine Co", "job_title": "Operations Analyst",
+               "job_description": "Reconciliation workflows with SQL.",
+               "job_city": "Detroit", "job_state": "MI"}
+_SCOPE_JOBS = {
+    "ok": {},
+    "applied": {"employer_name": "Applied Co"},
+    "cooldown": {"employer_name": "Cool Co"},
+    "out_of_state": {"job_state": "TX", "job_city": "Austin"},
+    "city_allowlist": {"job_city": "Austin", "job_state": ""},
+    "years": {"job_description": "Requires 5+ years of experience. SQL."},
+    "salary": {"job_min_salary": 20000, "job_max_salary": 30000, "job_salary_period": "YEAR"},
+}
+_SCOPE_RECORDED = {
+    "ok": (True, {}),
+    "applied": (False, {"already_applied": 1}),
+    "cooldown": (False, {"company_cooldown": 1}),
+    "out_of_state": (False, {"out_of_state": 1}),
+    "city_allowlist": (False, {"city_allowlist": 1}),
+    "years": (False, {"years_required": 1}),
+    "salary": (False, {"salary_floor": 1}),
+}
+
+
+@pytest.fixture
+def strict_filter_scope_env(monkeypatch):
+    cfg = {"min_salary": 50000, "valid_cities": ["farmington", "detroit"], "title_exclusions": [],
+           "company_exclusions": [], "hard_ban_keywords": [], "seniority_exclusions": []}
+    monkeypatch.setattr(m, "is_company_on_cooldown", lambda company: company == "cool co")
+    monkeypatch.setattr(m, "get_applied_crm_companies", lambda: {"applied co"})
+    monkeypatch.setattr(m, "get_filter",
+                        lambda key, default=None: cfg.get(key, default if default is not None else []))
+
+
+def _scope_run(name, **kw):
+    trace = m.FunnelTrace()
+    result = m.passes_strict_filter({**_SCOPE_BASE, **_SCOPE_JOBS[name]}, trace=trace, **kw)
+    return result, dict(trace.reasons)
+
+
+def test_strict_filter_scope_defaults_match_recorded_table(strict_filter_scope_env):
+    for name, recorded in _SCOPE_RECORDED.items():
+        assert _scope_run(name) == recorded, name
+
+
+def test_strict_filter_scope_geography_off_keeps_role_gates(strict_filter_scope_env):
+    for name in ("out_of_state", "city_allowlist"):
+        assert _scope_run(name, check_geography=False) == (True, {}), name
+    assert _scope_run("years", check_geography=False) == _SCOPE_RECORDED["years"]
+    far_and_senior = {**_SCOPE_BASE, "job_city": "Austin", "job_state": "TX",
+                      "job_description": "Requires 5+ years of experience."}
+    trace = m.FunnelTrace()
+    assert m.passes_strict_filter(far_and_senior, trace=trace, check_geography=False) is False
+    assert trace.reasons == {"years_required": 1}
+
+
+def test_strict_filter_scope_suppression_off_lets_applied_and_cooldown_pass(strict_filter_scope_env):
+    for name in ("applied", "cooldown"):
+        assert _scope_run(name, check_company_suppression=False) == (True, {}), name
+    # geography stays on
+    assert _scope_run("out_of_state", check_company_suppression=False) == _SCOPE_RECORDED["out_of_state"]
+
+
+def test_strict_filter_scope_both_off_only_role_quality_remains(strict_filter_scope_env):
+    off = dict(check_geography=False, check_company_suppression=False)
+    for name in ("applied", "cooldown", "out_of_state", "city_allowlist"):
+        assert _scope_run(name, **off) == (True, {}), name
+    for name in ("years", "salary"):
+        assert _scope_run(name, **off) == _SCOPE_RECORDED[name], name
+
+
+def test_strict_filter_scope_switch_never_removes_a_different_gates_reason(strict_filter_scope_env):
+    for kw in ({"check_geography": False}, {"check_company_suppression": False},
+               {"check_geography": False, "check_company_suppression": False}):
+        for name in ("years", "salary"):
+            assert _scope_run(name, **kw) == _SCOPE_RECORDED[name], (name, kw)
