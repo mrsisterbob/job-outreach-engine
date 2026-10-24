@@ -1,6 +1,7 @@
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures as _cf
 import hmac
 import html
 import io
@@ -26,6 +27,7 @@ from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 import resume_engine
 import referral_asks
+import warm_screen_plan
 import role_region
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from track_registry import (
@@ -1329,6 +1331,15 @@ def init_db():
             first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             seen_count INTEGER DEFAULT 1
+        )""")
+        # /w screen memo: what the warm screen decided about a role and when, so a rotation does not
+        # re-score every role that already failed. NOT a seen_jobs gate: /w only suppresses a role
+        # that is CRM-tracked (is_role_tracked); this only spares the Gemini call for RESCREEN_DAYS.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS warm_screen_memo (
+            job_hash TEXT PRIMARY KEY,
+            screened_at TEXT,
+            outcome TEXT
         )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS company_cooldown (
@@ -5802,9 +5813,14 @@ DEFAULT_FORCED_TRACK = "a"
 DEFAULT_FORCED_BULLET_INDICES = [1, 4, 7]
 
 
-def process_single_candidate(job, force=False):
+def process_single_candidate(job, force=False, outcome=None):
+    """Score one candidate. `outcome`, when a dict is passed, gets outcome["evaluation_failed"] set
+    to True when the AI call itself failed ("Evaluation Pending"), so a caller can tell that apart
+    from the AI saying no (both return None). Default None changes nothing for any other caller."""
     log_metric_event("ai_screened", source=derive_job_source(job.get("job_id"), job.get("job_apply_link")))
     ai_pass, score, reason, track, tone_mode, bullet_indices, linkedin_template_id, outreach_template_id, layer1_bonus, gemini_base = evaluate_job_with_gemini(job)
+    if outcome is not None:
+        outcome["evaluation_failed"] = (reason == "Evaluation Pending")
 
     # force=True (from /job!) makes the AI verdict ADVISORY instead of a gate. Kevin pasted this
     # link deliberately, so his judgment outranks the screener's - the score and reason still ride
@@ -12286,7 +12302,9 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
     return None
 
 def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid, other_contacts=0):
-    """Lean /w warm-radar card: no AI fit score, no fit reason, no tailored outreach copy - just
+    """Lean warm-radar card (no AI fit score). NO LONGER CALLED BY /w since TASK-154: /w now sends
+    /t-format cards through dispatch_tier1_matches after an AI screen; this helper is kept, not
+    removed. It showed just
     the role, the warm contact it maps to, and Apply. Swipe-replies (/apply, /dead, /x, /n, /f) resolve
     against the Clavicular tab via the embedded 🆔 marker, exactly like a Clavicular pipeline card.
     """
@@ -13236,7 +13254,7 @@ def resolve_warm_company_ats_slugs():
             slugs.append(row[0])
     return list(dict.fromkeys(slugs))  # de-dup while preserving discovery order
 
-def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
+def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline", sent_out=None):
     """Land a set of scored matches in the CRM, then card the ones whose row actually wrote.
 
     This is the single Tier-1 delivery path, shared by run_job_pipeline() and the manual-ingest
@@ -13255,6 +13273,9 @@ def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
     Rows route by the Clavicular flag (CL vs TC), matching what the caller already computed in
     process_single_candidate. `note_prefix` distinguishes a hand-pasted row from a sourced one in
     the sheet's note column; the Clavicular warm-referral note overrides it as before.
+
+    `sent_out`: when a list is passed, each item whose card was actually sent is appended to it
+    (the count alone cannot say WHICH cards went). Default None changes nothing.
 
     Returns the number of cards dispatched.
     """
@@ -13377,6 +13398,8 @@ def dispatch_tier1_matches(matches, note_prefix="Matched via Pipeline"):
             score_boost=item.get("score_boost", 0)
         )
         cards_sent += 1
+        if sent_out is not None:
+            sent_out.append(item)
         time.sleep(1.1)
 
     return cards_sent
@@ -14614,27 +14637,69 @@ def _warm_radar_coverage_line(contacts_by_bucket, unplaced):
             f"{unplaced} with no company")
 
 
+WARM_SCREEN_BUDGET_SECONDS = 150   # the planner's guess, NOT measured: nobody has timed ~60 Gemini calls here
+
+
+def _warm_screen_memo_read(job_hashes):
+    """{job_hash: screened_at 'YYYY-MM-DD'} for the hashes the /w screen already decided on."""
+    hashes = [h for h in dict.fromkeys(job_hashes) if h]
+    out = {}
+    if not hashes:
+        return out
+    try:
+        with get_db_conn() as conn:
+            for i in range(0, len(hashes), 500):
+                part = hashes[i:i + 500]
+                marks = ",".join("?" * len(part))
+                for h, at in conn.execute(
+                        f"SELECT job_hash, screened_at FROM warm_screen_memo WHERE job_hash IN ({marks})", part):
+                    out[h] = at
+    except Exception as e:
+        logging.error(f"Warm Screen Memo Read Error: {e}")
+    return out
+
+
+def _warm_screen_memo_write(job_hashes, outcome):
+    """Record that the /w screen decided `outcome` ('rejected' or 'digest') on these roles today."""
+    hashes = [h for h in dict.fromkeys(job_hashes) if h]
+    if not hashes:
+        return True
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany(
+                "INSERT OR REPLACE INTO warm_screen_memo (job_hash, screened_at, outcome) VALUES (?, ?, ?)",
+                [(h, today, outcome) for h in hashes])
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Warm Screen Memo Write Error ({outcome}): {e}")
+        return False
+
+
 def run_warm_radar_scan(chat_id=None):
-    """/w Warm Network Radar: a zero-LLM, near-instant scan of ONLY the companies where a Carmen
-    Warm CRM contact already exists. Resolves each warm company's ATS slug straight from the
-    company_identities cache (no live board probing at all - resolve_warm_company_ats_slugs() is
-    deliberately not called), pulls its Greenhouse/Lever/Ashby postings, and reports any new role
-    against the contact it maps to. Shares the /t dedup ledger (seen_jobs) so it never re-alerts a
-    role /t already surfaced, and only stamps the ones it newly surfaces itself. No Gemini scoring.
+    """/w Warm Network Radar: scans ONLY the companies where a Carmen Warm CRM contact already
+    exists, screens what it finds with /t's own filter and Gemini, and lists the survivors as /t
+    cards. Resolves each warm company's ATS slug straight from the company_identities cache (no
+    live board probing - resolve_warm_company_ats_slugs() is deliberately not called) and pulls
+    its Greenhouse/Lever/Ashby/Workday postings. Shares the /t dedup ledger (seen_jobs) so it never
+    re-alerts a role /t already surfaced, and only stamps the ones it newly surfaces itself.
 
-    Filtering: /w applies the shared title gate (title_rejection_reason, seniority on - the same
-    rejection /t uses), is_banned_employer, is_role_tracked, and one region/language gate
-    (role_region): a clearly foreign location or a non-English title is dropped, an unreadable
-    location is kept. It deliberately does NOT apply the city, state, salary, cooldown or
-    already-applied gates: a warm contact at a company is a reason to look at a US role anywhere
-    that company hires. Roles either gate drops are counted in the closing message and are NOT
-    stamped into seen_jobs (same as _add_candidate), so they can resurface if the rule changes.
+    Filtering (PASS 1): the shared title gate (title_rejection_reason), is_banned_employer,
+    is_role_tracked, one region/language gate (role_region), then passes_strict_filter with
+    geography and company suppression switched OFF (a warm contact is a reason to look at a US role
+    anywhere that company hires). Roles any gate drops are counted in the closing message and are
+    NOT stamped into seen_jobs, so they can resurface if a rule changes.
 
-    Sending: survivors are grouped per company first. One surviving role gets the old card; two or
-    more get ONE summary message (send_warm_radar_summary). At most WARM_RADAR_ROLES_PER_COMPANY
-    roles are listed per company and at most WARM_RADAR_MESSAGES_PER_RUN companies get a message.
-    Only LISTED roles are stamped, cached, given a Clavicular row or a referral-ask role; the rest
-    are held back, said so in the closing message, and come back on the next /w.
+    Screening: warm_screen_plan.pick_to_screen chooses at most 3 roles per company (minus roles
+    memoed in warm_screen_memo within the last 14 days); process_single_candidate scores them with
+    Gemini under WARM_SCREEN_BUDGET_SECONDS. A role needs 70+ BEFORE the warm boost
+    (result score minus score_boost). choose_outputs then gives at most 5 cards (CRM row first,
+    through dispatch_tier1_matches), a digest of at most 5, and never more than 2 roles per
+    company. Only roles whose card (or digest line) was accepted leave a trace (seen_jobs stamp,
+    referral-ask role); rejected roles are memoed; held, unscored and failed roles leave nothing
+    and keep their board unstamped so it comes back first.
     """
     warm_contacts = get_warm_crm_contacts()
     if not warm_contacts:
@@ -14774,7 +14839,7 @@ def run_warm_radar_scan(chat_id=None):
         all_slugs = sorted(dict.fromkeys([*slug_to_contact, *wd_to_contact]), key=lambda s: max(slug_scanned.get(s, ""), slug_attempted.get(s, "")))
         slugs = all_slugs[:WARM_RADAR_SCAN_BATCH]
         if chat_id:
-            send_status_update(chat_id, f"Warm Radar: scanning {len(slugs)} of {len(all_slugs)} warm companies with a cached ATS board (no AI scoring)...")
+            send_status_update(chat_id, f"Warm Radar: scanning {len(slugs)} of {len(all_slugs)} warm companies with a cached ATS board (AI screen on)...")
 
         seen_hashes = set()
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -14787,6 +14852,8 @@ def run_warm_radar_scan(chat_id=None):
         region_filtered = 0
         location_unknown = 0
         referral_pending = {}   # company key -> best contact + the roles that were LISTED this run
+        screen_trace = FunnelTrace()   # why the role screen (passes_strict_filter) dropped roles this run
+        screen_dropped = set()         # hashes the role screen already counted (a duplicate posting counts once)
         groups = {}             # company key -> {"contact", "company", "roles": [surviving roles]}
         board_index = 0
 
@@ -14795,7 +14862,7 @@ def run_warm_radar_scan(chat_id=None):
         # on the per-company and per-run caps, and only a listed role may leave a trace.
         scanned_slugs = []      # boards fetched without a fetch error this run
         errored_slugs = []      # boards whose fetch raised or reported a failed platform
-        keep_jobs = WARM_RADAR_ROLES_PER_COMPANY
+        keep_jobs = warm_screen_plan.CANDIDATES_PER_COMPANY   # roles per company that can be sent to Gemini
         for chunk_start in range(0, len(slugs), WARM_RADAR_SCAN_CHUNK):
             chunk = slugs[chunk_start:chunk_start + WARM_RADAR_SCAN_CHUNK]
             chunk_failed = []
@@ -14871,6 +14938,16 @@ def run_warm_radar_scan(chat_id=None):
                         region_filtered += 1
                     continue
 
+                # The role screen /t uses, called as-is (never copied): years required, industrial and
+                # trade-degree roles and the rest. Geography and company suppression are off for /w.
+                # A dropped role is counted by reason and never stamped, like the title gate.
+                if job_hash in screen_dropped:
+                    continue
+                if not passes_strict_filter(job, trace=screen_trace, check_geography=False,
+                                            check_company_suppression=False):
+                    screen_dropped.add(job_hash)
+                    continue
+
                 seen_hashes.add(job_hash)
                 try:
                     track_hit = bool(track_for_title(title, employer=company))
@@ -14883,7 +14960,7 @@ def run_warm_radar_scan(chat_id=None):
                 group = groups.setdefault(group_key, {"contact": contact, "company": company, "roles": []})
                 group["roles"].append({
                     "job": job, "job_hash": job_hash, "company": company, "title": title,
-                    "verdict": verdict, "slug": role_slug,
+                    "verdict": verdict, "slug": role_slug, "group_key": group_key,
                     "rank": role_region.role_rank_key(track_hit, verdict, board_index),
                 })
                 board_index += 1
@@ -14908,135 +14985,137 @@ def run_warm_radar_scan(chat_id=None):
             errored_slugs.extend(s for s in chunk if s in failed_set)
             scanned_slugs.extend(s for s in chunk if s not in failed_set)
 
-        # PASS 2 - rank, cap and send. Roles inside a company: track-rule titles, then a positively
-        # read US location, then the board's order. Companies: contact priority, role count, name.
-        # Roles past WARM_RADAR_ROLES_PER_COMPANY (or past what fits one message) and companies past
-        # WARM_RADAR_MESSAGES_PER_RUN are not stamped, tracked or written, so they come back on the
-        # next /w by themselves. A role also leaves a trace (seen_jobs stamp, Clavicular row,
-        # referral-ask role) ONLY after Telegram accepted the message that lists it: a failed send
-        # leaves the company's roles untouched, so the next /w retries them.
-        ordered = sorted(
-            groups.values(),
-            key=lambda g: role_region.company_order_key(
-                g["contact"].get("priority_score", 0), len(g["roles"]),
-                g["contact"].get("raw_company") or g["company"]))
+        # SCREEN + OUTPUT. Nothing has been stamped, cached, sent or written yet. A role leaves a
+        # trace (seen_jobs stamp, referral-ask role) ONLY after what lists it was accepted: its card
+        # (CRM row written first) or the digest message. Rejected roles leave a warm_screen_memo row
+        # and nothing else; held, unscored and failed roles leave nothing and keep their board
+        # unstamped (blocked_slugs) so the board comes back first.
         messages_sent = 0
         held_roles = 0
         held_companies = 0
         failed_companies = 0
-        blocked_slugs = set()   # boards with roles held back or unsent: not stamped, so they come back first
-        for group in ordered:
-            roles = sorted(group["roles"], key=lambda r: r["rank"])
-            total_roles = len(roles)
-            if messages_sent >= WARM_RADAR_MESSAGES_PER_RUN:
-                held_roles += total_roles
-                held_companies += 1
-                blocked_slugs.update(r["slug"] for r in roles if r["slug"])
-                continue
-            messages_sent += 1
-            listed = roles[:WARM_RADAR_ROLES_PER_COMPANY]
-            # ONE contact per company for everything below: the card or summary, the Clavicular row
-            # note and the referral ask all name this person. The company-level best is the default;
-            # among contacts tied at the top priority the one whose imported title (or alumni
-            # headline) fits the top role wins (referral_asks.pick_contact). A tie nothing breaks
-            # goes to the first in arrival order, i.e. the NEWEST sheet row (Code.gs reads bottom-up).
+        blocked_slugs = set()
+        today_date = datetime.now().date()
+        roles_by_company = {gk: [r for r in g["roles"] if r.get("job")] for gk, g in groups.items()}
+        memo = _warm_screen_memo_read([r["job_hash"] for rs in roles_by_company.values() for r in rs])
+        to_screen = warm_screen_plan.pick_to_screen(roles_by_company, memo, today_date)
+
+        screen_started = time.time()
+        deadline = screen_started + WARM_SCREEN_BUDGET_SECONDS
+        scored, ai_rejected, failed_roles, unscored_roles = [], [], [], []
+        pool = ThreadPoolExecutor(max_workers=8)
+        try:
+            futures = []
+            for role in to_screen:
+                oc = {}
+                futures.append((role, oc, pool.submit(process_single_candidate, role["job"], False, oc)))
+            for role, oc, fut in futures:
+                try:
+                    result = fut.result(timeout=max(0.0, min(45, deadline - time.time())))
+                except _cf.TimeoutError:
+                    # Over the budget: never scored, so held. Under it: this call timed out, a failure.
+                    (unscored_roles if time.time() >= deadline else failed_roles).append(role)
+                    continue
+                except Exception as e:
+                    logging.error(f"Warm Screen evaluation failed for {role['company']} - {role['title']}: {e}")
+                    failed_roles.append(role)
+                    continue
+                if result is None:
+                    # None = the AI said no OR the call failed; only `oc` can tell them apart. A
+                    # failure is never memoed (that would silence the role for the whole window).
+                    (failed_roles if oc.get("evaluation_failed") else ai_rejected).append(role)
+                    continue
+                scored.append({
+                    "company_key": role["group_key"], "job_hash": role["job_hash"], "role": role,
+                    "company": role["company"], "title": role["title"], "result": result,
+                    "pre_boost": result["score"] - result.get("score_boost", 0), "final": result["score"],
+                })
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        screen_seconds = time.time() - screen_started
+
+        plan = warm_screen_plan.choose_outputs(scored)
+        rejected_hashes = [r["job_hash"] for r in ai_rejected] + [i["job_hash"] for i in plan["rejected"]]
+        if rejected_hashes:
+            _warm_screen_memo_write(rejected_hashes, "rejected")
+
+        # Held (valid, did not fit), failed and unscored roles: untouched, board blocked.
+        not_listed = [i["role"] for i in plan["held"]] + failed_roles + unscored_roles
+        held_roles = len(plan["held"]) + len(unscored_roles)
+        held_companies = len({r["group_key"] for r in not_listed})
+        for r in not_listed:
+            if r.get("slug"):
+                blocked_slugs.add(r["slug"])
+
+        # Cards: dispatch_tier1_matches writes the CRM row first and withholds a card whose write
+        # failed; sent_out says which cards actually went.
+        sent_out = []
+        card_items = {id(i["result"]): i for i in plan["cards"]}
+        if plan["cards"]:
+            try:
+                dispatch_tier1_matches([i["result"] for i in plan["cards"]], note_prefix="Warm Radar Match",
+                                       sent_out=sent_out)
+            except Exception as e:
+                # Cards already sent stay in sent_out; the rest are treated as unsent below.
+                logging.error(f"Warm Radar card dispatch raised: {e}")
+        sent_items = [card_items[id(x)] for x in sent_out if id(x) in card_items]
+        sent_ids = {id(i) for i in sent_items}
+        for item in plan["cards"]:
+            if id(item) not in sent_ids:
+                failed_companies += 1
+                if item["role"].get("slug"):
+                    blocked_slugs.add(item["role"]["slug"])
+        messages_sent += len(sent_items)
+
+        digest_sent = []
+        if plan["digest"]:
+            ascii_lines = "\n".join(warm_screen_plan.digest_lines(plan["digest"]))
+            digest_msg = (f"📋 <b>Warm Radar - next best roles</b>\n<pre>{html.escape(ascii_lines)}</pre>")
+            if send_telegram_message(chat_id or TELEGRAM_CHAT_ID, digest_msg):
+                digest_sent = list(plan["digest"])
+                messages_sent += 1
+                for item in digest_sent:
+                    save_seen_job_db(item["job_hash"])
+                _warm_screen_memo_write([i["job_hash"] for i in digest_sent], "digest")
+            else:
+                logging.error("Warm Radar: Telegram did not accept the digest; its roles left unstamped")
+                for item in plan["digest"]:
+                    if item["role"].get("slug"):
+                        blocked_slugs.add(item["role"]["slug"])
+
+        # Roles whose card went: stamp, count, and collect for the referral ask.
+        sent_by_group = {}
+        for item in sent_items:
+            save_seen_job_db(item["job_hash"])
+            match_count += 1
+            if item["role"]["verdict"] == role_region.UNKNOWN:
+                location_unknown += 1
+            sent_by_group.setdefault(item["company_key"], []).append(item)
+        for group_key, items in sent_by_group.items():
+            group = groups[group_key]
+            # ONE contact per company for the ask. The card's Clavicular line names the cache's
+            # best contact (get_warm_crm_contacts()[company]); among contacts tied at the top
+            # priority pick_contact may choose a different person by title fit.
             best_contact = group["contact"]
             contact = best_contact
             picked = referral_asks.pick_contact(best_contact.get("contacts") or [best_contact],
-                                                [r["title"] for r in roles], group["company"])
+                                                [i["title"] for i in items], group["company"])
             if picked:
                 contact = dict(picked)
                 contact["count"] = best_contact.get("count") or 1
                 contact["contacts"] = best_contact.get("contacts") or [best_contact]
-            contact_name = contact.get("name", "Contact")
-            contact_note = contact.get("note", "Active relationship")
-            other_contacts = max(0, int(contact.get("count") or 1) - 1)
-
-            summary_roles = []
-            if total_roles > 1:
-                # short_id is a pure function of the posting id, so the Full Card links can be built
-                # (and the message cut to what fits) before anything is cached or stamped.
-                for entry in listed:
-                    job = entry["job"]
-                    raw_id = job.get("job_id") or f"{entry['company']}_{entry['title']}"
-                    entry["short_id"] = generate_short_key(raw_id, fallback=time.time())
-                    summary_roles.append({
-                        "title": entry["title"], "location": job.get("job_city", ""),
-                        "link": job.get("job_apply_link", ""),
-                        "req": referral_asks.valid_requisition_id(job.get("job_requisition_id", "")),
-                        "short_id": entry["short_id"],
-                    })
-                fit = warm_radar_summary_fit(group["company"], contact_name, contact_note, other_contacts,
-                                             summary_roles, total_roles)
-                listed, summary_roles = listed[:fit], summary_roles[:fit]
-
-            for entry in listed:
-                job = entry["job"]
-                company, title = entry["company"], entry["title"]
-                if "short_id" not in entry:
-                    raw_id = job.get("job_id") or f"{company}_{title}"
-                    entry["short_id"] = generate_short_key(raw_id, fallback=time.time())
-                target_email = resolve_target_email(company, title, job.get("employer_website"))
-                job["target_email"] = target_email
-                entry["target_email"] = target_email
-                entry["sheet_uuid"] = save_job_to_cache(entry["short_id"], job)
-
-            if total_roles == 1:
-                sent = send_warm_radar_card(listed[0]["job"], contact_name, contact_note,
-                                            listed[0]["sheet_uuid"], other_contacts=other_contacts)
-            else:
-                sent = send_warm_radar_summary(group["company"], contact_name, contact_note, other_contacts,
-                                               summary_roles, total_roles)
-            time.sleep(1.1)  # same inter-message Telegram pacing run_job_pipeline uses
-            if not sent:
-                failed_companies += 1
-                logging.error(f"Warm Radar: Telegram did not accept the message for {group['company']}; "
-                              f"{len(listed)} role(s) left unstamped for the next /w")
-                blocked_slugs.update(r["slug"] for r in roles if r["slug"])
-                continue
-
-            if total_roles > len(listed):
-                held_roles += total_roles - len(listed)
-                held_companies += 1
-                blocked_slugs.update(r["slug"] for r in roles if r["slug"])
-            for entry in listed:
-                job, job_hash = entry["job"], entry["job_hash"]
-                company, title = entry["company"], entry["title"]
-                target_email = entry["target_email"]
-                save_seen_job_db(job_hash)
-                match_count += 1
-                if entry["verdict"] == role_region.UNKNOWN:
-                    location_unknown += 1
+            for item in items:
                 try:
-                    # Collected only; the asks are rendered and stored AFTER the send loop so nothing
-                    # here can ever stop a card. Only roles in a message Telegram accepted are
-                    # collected. A role that ends up with no stored ask (gate, no CRM id, store
-                    # failure) is NOT picked up by a later /w: its Clavicular row below makes
-                    # is_role_tracked skip it next time, and no table records that an ask is owed.
-                    ask_company_raw = contact.get("raw_company") or company
+                    job = item["result"]["job"]
+                    ask_company_raw = contact.get("raw_company") or item["company"]
                     pending_entry = referral_pending.setdefault(
                         normalize_company_for_match(ask_company_raw),
                         {"contact": contact, "company": clean_company_for_copy(ask_company_raw), "roles": []})
                     pending_entry["roles"].append(referral_asks.build_role(
-                        title, job.get("job_apply_link", ""), job.get("job_requisition_id", ""), job_hash))
+                        item["title"], job.get("job_apply_link", ""), job.get("job_requisition_id", ""),
+                        item["job_hash"]))
                 except Exception as e:
                     logging.error(f"Warm Radar referral collect error: {e}")
-
-                clavicular_rows.append({
-                    "sheet_uuid": entry["sheet_uuid"],
-                    "row_data": [
-                        # Same rule as the standard rows below: a GUESS never reaches the sheet. The card
-                        # keeps target_email so it has something to draft to; the cell stays blank until
-                        # /e types a real address or the sent-mail back-fill promotes one.
-                        today_str, company, title,
-                        "" if is_guessed_contact_email(target_email) else target_email, "",
-                        "Matched", followup_date, job.get("job_apply_link", ""),
-                        f"Warm Radar Match (no AI score): {contact_name}"
-                    ]
-                })
-
-        if clavicular_rows:
-            enqueue_crm_payload(build_crm_payload("batch_add_rows", target_code="CL", rows=clavicular_rows))
 
         referral_summary = {}
         try:
@@ -15046,7 +15125,8 @@ def run_warm_radar_scan(chat_id=None):
             referral_summary = {"failed": 1}
 
         # Rotation stamps, written only now that the run's sends are settled. A board whose roles
-        # were held back (message cap, per-company cap) or whose message failed is NOT stamped, so
+        # were held back (per-company cap, card cap, time budget), failed to score or whose card or
+        # digest was not sent is NOT stamped, so
         # it stays at the front and the next /w offers those roles again; a board that errored is
         # stamped only in the attempt column, which orders it behind boards never tried.
         _stamp_boards_scanned([s for s in scanned_slugs if s not in blocked_slugs])
@@ -15055,7 +15135,8 @@ def run_warm_radar_scan(chat_id=None):
         logging.info(f"Warm Radar Complete: {match_count} roles listed in {messages_sent} messages across "
                      f"{len(scanned_slugs)} warm companies; {title_filtered} filtered by title, {region_filtered} by "
                      f"region/language, {location_unknown} listed with unknown location; held back "
-                     f"{held_roles} roles at {held_companies} companies; {failed_companies} companies failed to send.")
+                     f"{held_roles} roles at {held_companies} companies; {failed_companies} cards withheld; screened "
+                     f"{len(to_screen)} in {screen_seconds:.0f}s ({len(failed_roles)} failed).")
         if chat_id:
             done = f"🏁 Warm scan complete. {match_count} new matches across {len(scanned_slugs)} warm companies scanned"
             done += (f"; {title_filtered} role{'' if title_filtered == 1 else 's'} filtered out by title."
@@ -15075,9 +15156,21 @@ def run_warm_radar_scan(chat_id=None):
                              f"{held_companies} compan{'y' if held_companies == 1 else 'ies'} to keep this run short. "
                              "Run /w again to continue.")
             if failed_companies:
-                lines.append(f"{failed_companies} compan{'y' if failed_companies == 1 else 'ies'} failed to send "
-                             "(Telegram did not accept the message); nothing was recorded for "
+                lines.append(f"{failed_companies} card{'' if failed_companies == 1 else 's'} withheld "
+                             "(CRM write or send failed); nothing was recorded for "
                              f"{'it' if failed_companies == 1 else 'them'}. Run /w again.")
+            if screen_trace.reasons:
+                ranked = sorted(screen_trace.reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+                dropped = sum(screen_trace.reasons.values())
+                lines.append(f"{dropped} dropped by the role screen ("
+                             + ", ".join(f"{k} {v}" for k, v in ranked) + ")")
+            lines.append(f"Screened {len(to_screen)} role{'' if len(to_screen) == 1 else 's'} with AI in {screen_seconds:.0f} s: "
+                         f"{len(sent_items)} cards, {len(digest_sent)} in the digest, "
+                         f"{len(rejected_hashes)} below 70, {held_roles} held, {len(failed_roles)} failed.")
+            if unscored_roles:
+                lines.append(f"The {WARM_SCREEN_BUDGET_SECONDS} s screen budget ran out: "
+                             f"{len(unscored_roles)} role{'' if len(unscored_roles) == 1 else 's'} left unscored "
+                             "and held. Run /w again.")
             referral_line = _referral_summary_line(referral_summary)
             if referral_line:
                 lines.append(referral_line)
@@ -15170,9 +15263,9 @@ def process_webhook_payload_async(data):
                 send_telegram_message(chat_id, f"🏁 Pipeline Completed. {count} cards dispatched.")
             return
 
-        # 2b. Warm Network Radar (/w): zero-LLM, cache-only scan of warm-contact companies
+        # 2b. Warm Network Radar (/w): cache-only scan of warm-contact companies, AI-screened
         if re.match(r"^/w$", text):
-            send_telegram_message(chat_id, "🔭 <b>Warm Network Radar:</b> checking cached ATS boards for your warm contacts (no AI scoring)...")
+            send_telegram_message(chat_id, "🔭 <b>Warm Network Radar:</b> checking cached ATS boards for your warm contacts and screening new roles with AI...")
             run_warm_radar_scan(chat_id)
             return
 
@@ -17459,7 +17552,7 @@ def process_webhook_payload_async(data):
                 "<b>CORE COMMANDS:</b>\n"
                 "/t - Pull fresh job cards\n"
                 "/job, /j &lt;url&gt; - Add a job you found yourself (scores &amp; files it like /t)\n"
-                "/w - Warm radar: new roles at your warm-contact companies (no AI, instant)\n"
+                "/w - Warm radar: new roles at your warm-contact companies, AI-screened (up to 5 cards + a digest)\n"
                 "/search - View or update live search filters\n"
                 "/quick - Create contact (Name @ Firm Priority Note)\n"
                 "/cold, /warm - Quick-add a Cold/Warm contact (Name @ Firm Priority Note)\n"

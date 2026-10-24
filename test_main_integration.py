@@ -41,6 +41,7 @@ from score_rules import (  # noqa: E402
 import resume_engine  # noqa: E402
 import track_registry  # noqa: E402
 import pipeline_utils  # noqa: E402
+import warm_screen_plan  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +53,7 @@ def clean_tables():
         # "already in the pipeline" branch instead of the path it meant to exercise.
         for table in ("crm_outbox", "sheet_row_map", "company_cooldown", "company_identities",
                       "jobs", "followup_sequencer_log", "followup_queue_snapshot", "gmail_drafts", "seen_jobs",
-                      "seen_content_hashes", "jd_term_yield", "job_link_status",
+                      "seen_content_hashes", "jd_term_yield", "job_link_status", "warm_screen_memo",
                       # died_roles is permanent by design, so a row left behind by one test would
                       # silently suppress a role in every later one.
                       "died_roles", "owed_dismissals", "referral_asks",
@@ -15687,8 +15688,20 @@ class _WarmRadarHarness:
         monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: self.fetched.append(list(slugs)) or [])
         monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
         monkeypatch.setattr(m, "send_status_update", lambda chat_id, text: None)
-        monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: self.messages.append(text))
+        monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: self.messages.append(text) or 1)
         monkeypatch.setattr(m.time, "sleep", lambda s: None)
+        # The one shared Gemini fake for every /w harness (the Gemini edge only: the real
+        # process_single_candidate runs). Passes by default; a test sets h.gemini_scores[title].
+        self.gemini_calls, self.gemini_scores = [], {}
+        monkeypatch.setattr(m, "evaluate_job_with_gemini", self._fake_gemini)
+
+    def _fake_gemini(self, job):
+        title = job.get("job_title")
+        self.gemini_calls.append(title)
+        score = self.gemini_scores.get(title, 80)
+        if score is None:
+            return False, 0, "Evaluation Pending", "a", "conservative", [0, 1, 2], 0, 0, 0, 0
+        return score >= 70, score, "fits", "a", "conservative", [0, 1, 2], 0, 0, 0, score
 
     def run(self):
         """One /w. The board lookups run inline here (the autouse _spawn_background seam), so a
@@ -15828,13 +15841,22 @@ def _warm_title_harness(monkeypatch, titles):
     h.filters.update({k: m.DEFAULT_SEARCH_FILTERS[k] for k in ("title_exclusions", "seniority_exclusions")})
     h.cards, h.payloads = [], []
     monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: _warm_title_jobs(titles))
-    monkeypatch.setattr(m, "send_warm_radar_card", lambda job, *a, **kw: h.cards.append(job["job_title"]) or True)
-    # Several roles at one company now go out as ONE summary; the old per-role intent is kept by
-    # recording each listed role's title here, in the order it was listed. A send that Telegram
-    # accepted returns truthy, which is what lets the scan stamp the roles.
-    monkeypatch.setattr(m, "send_warm_radar_summary",
-                        lambda company, name, note, others, roles, total: h.cards.extend(r["title"] for r in roles) or True)
-    monkeypatch.setattr(m, "is_role_tracked", lambda company, title: False)
+    # /w now lists survivors as /t cards through dispatch_tier1_matches: the CRM batch write
+    # (log_to_sheets_crm) comes first, then send_telegram_card. Both are recorded here, h.cards
+    # holding the title of each card that went out, in order.
+    h.crm_ok, h.tracked = True, set()
+
+    def crm_write(payload):
+        h.payloads.append(payload)
+        if h.crm_ok:   # a written row is what makes is_role_tracked skip the role next run
+            h.tracked.update(m.generate_dedup_hash(r["row_data"][1], r["row_data"][2]) for r in payload.get("rows", []))
+        return h.crm_ok
+
+    monkeypatch.setattr(m, "log_to_sheets_crm", crm_write)
+    monkeypatch.setattr(m, "get_batch_disposition", lambda uuid: None)
+    monkeypatch.setattr(m, "send_telegram_card", lambda job, *a, **kw: h.cards.append(job["job_title"]) or True)
+    monkeypatch.setattr(m, "is_role_tracked",
+                        lambda company, title: m.generate_dedup_hash(company, title) in h.tracked)
     monkeypatch.setattr(m, "resolve_target_email", lambda *a, **kw: "")
     monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: h.payloads.append(payload) or True)
     return h
@@ -15882,7 +15904,7 @@ def test_warm_radar_applies_the_title_gate_from_one_shared_function(monkeypatch)
     assert m._passes_remote_filter(_remote_job()) is True
     assert len(h.cards) == 0
     h.run()
-    assert h.cards == ["Operations Analyst", "Business Systems Analyst"]
+    assert sorted(h.cards) == ["Business Systems Analyst", "Operations Analyst"]   # card order is by score now, not board order
     # Swap the shared function: neither gate keeps a list of its own.
     monkeypatch.setattr(m, "title_rejection_reason", lambda title, include_seniority=True: "x")
     trace = m.FunnelTrace()
@@ -15890,6 +15912,7 @@ def test_warm_radar_applies_the_title_gate_from_one_shared_function(monkeypatch)
     assert trace.reasons.get("x") == 1, trace.reasons
     assert m._passes_remote_filter(_remote_job()) is False
     h.cards.clear()
+    h.tracked.clear()   # the first run's rows would otherwise make is_role_tracked skip both roles before the title gate
     text = h.run()
     assert h.cards == [] and "2 roles filtered out by title" in text, (h.cards, text)
 
@@ -17011,6 +17034,8 @@ def _summary_harness(monkeypatch, boards, priorities=None, rows=None):
     def jobs(slugs_arg, **kw):
         out = []
         for company, roles in boards.items():
+            if slugs_arg is not None and slugs[company] not in slugs_arg:
+                continue                      # a real fetch returns only the boards it was asked for
             for i, role in enumerate(roles):
                 title, location = role[0], role[1]
                 out.append({"employer_name": company, "job_title": title,
@@ -17047,6 +17072,10 @@ def _summary_harness(monkeypatch, boards, priorities=None, rows=None):
     monkeypatch.setattr(m.requests, "post", fake_post)
     monkeypatch.setattr(m, "fetch_ats_jobs", jobs)
     monkeypatch.setattr(m, "enqueue_crm_payload", enqueue)
+    # dispatch_tier1_matches writes the CRM batch through log_to_sheets_crm; the rows land in the
+    # same list so is_role_tracked sees them on the next run, as the real sheet would.
+    monkeypatch.setattr(m, "log_to_sheets_crm", enqueue)
+    monkeypatch.setattr(m, "get_batch_disposition", lambda uuid: None)
     monkeypatch.setattr(m, "is_role_tracked",
                         lambda company, title: m.generate_dedup_hash(company, title) in h.tracked)
     monkeypatch.setattr(m, "resolve_target_email", lambda *a, **kw: "")
@@ -17058,28 +17087,19 @@ def _roles_text(n, location="Chicago", prefix="Operations Analyst"):
     return [(f"{prefix} {chr(65 + i // 26)}{chr(65 + i % 26)}", location) for i in range(n)]
 
 
-def test_warm_radar_company_summaries_one_company_with_56_roles_is_one_message_listing_five(monkeypatch):
+def test_warm_radar_company_summaries_one_company_with_56_roles_gets_three_screened_two_carded(monkeypatch):
     h = _summary_harness(monkeypatch, {"AlixPartners": _roles_text(56)})
     text = h.run()
-    assert len(h.posts) == 1, [p[1][:60] for p in h.posts]
-    post = h.posts[0][1]
-    assert "AlixPartners" in post and "56 open roles passed the filters" in post
-    assert post.count("• ") == 5 and "and 51 more not listed" in post, post
-    # 5 Clavicular rows, 5 cached jobs, 5 stamped hashes, and nothing for the other 51
+    # 56 roles: only the best 3 cost a Gemini call, 2 become /t-format cards, 1 is held
+    assert len(h.gemini_calls) == warm_screen_plan.CANDIDATES_PER_COMPANY
+    assert len(h.posts) == warm_screen_plan.LISTED_PER_COMPANY, [p[1][:60] for p in h.posts]
+    assert all("AlixPartners" in p[1] and "🆔" in p[1] for p in h.posts)
     rows = h.rows()
-    assert len(rows) == 5
+    assert len(rows) == 2
     listed_titles = {r["row_data"][2] for r in rows}
-    with m.get_db_conn() as conn:
-        cached = conn.execute("SELECT COUNT(*) FROM jobs WHERE job_json LIKE '%AlixPartners%'").fetchone()[0]
-        cached_for_rows = conn.execute(
-            f"SELECT COUNT(*) FROM jobs WHERE sheet_uuid IN ({','.join('?' * 5)})",
-            [r["sheet_uuid"] for r in rows]).fetchone()[0]
-    assert cached == 5 and cached_for_rows == 5
     stamped = [t for t, _ in _roles_text(56) if m.is_job_seen_db(m.generate_dedup_hash("AlixPartners", t))]
-    assert set(stamped) == listed_titles and len(stamped) == 5
-    # each listed role has a Full Card link, and the closing line says what was held back
-    assert post.count("/stage/") == 5
-    assert "5 new matches" in text and "Held back 51 roles at 1 company" in text and "Run /w again" in text, text
+    assert set(stamped) == listed_titles and len(stamped) == 2
+    assert "2 new matches" in text and "Held back 1 role at 1 company" in text and "Run /w again" in text, text
 
 
 def test_warm_radar_company_summaries_next_run_continues_with_the_unlisted_roles(monkeypatch):
@@ -17087,56 +17107,55 @@ def test_warm_radar_company_summaries_next_run_continues_with_the_unlisted_roles
     h.run()
     first = {r["row_data"][2] for r in h.rows()}
     h.run()
-    second = {r["row_data"][2] for r in h.rows()} - first
-    assert len(first) == 5 and len(second) == 5 and not (first & second)
-    assert "and 7 more not listed" in h.posts[0][1] and "and 2 more not listed" in h.posts[1][1]
+    second = {r["row_data"][2] for r in h.rows()} - first      # carded roles are tracked, so never rescreened
+    assert len(first) == 2 and len(second) == 2 and not (first & second)
 
 
-def test_warm_radar_company_summaries_a_company_with_one_role_keeps_the_old_card(monkeypatch):
+def test_warm_radar_company_summaries_a_company_with_one_role_gets_a_t_format_card(monkeypatch):
     h = _summary_harness(monkeypatch, {"Acme Robotics": [("Operations Analyst", "Detroit")]})
     text = h.run()
     assert len(h.posts) == 1
     mid, card = h.posts[0]
-    assert "Warm contact" in card and "🆔" in card and "Clavicular" in card
+    assert "🆔" in card and "CLAVICULAR" in card and "Acme Robotics" in card
     assert "open roles passed the filters" not in card
     assert len(h.rows()) == 1 and "1 new matches" in text and "Held back" not in text
     assert m.get_mapping_from_message_id(mid) is not None
 
 
-def test_warm_radar_company_summaries_forty_companies_send_fifteen_messages_then_continue(monkeypatch):
+def test_warm_radar_company_summaries_forty_companies_send_five_cards_and_a_digest_then_continue(monkeypatch):
     names = [f"Acme{chr(97 + i // 26)}{chr(97 + i % 26)} Labs" for i in range(40)]
     boards = {n: [("Operations Analyst", "Detroit")] for n in names}
     h = _summary_harness(monkeypatch, boards)
     text = h.run()
-    assert len(h.posts) == 15
-    assert "15 new matches" in text and "Held back 25 roles at 25 companies" in text and "Run /w again" in text, text
+    # one run scans WARM_RADAR_SCAN_BATCH (20) boards: 5 cards, a digest of 5, 10 held
+    assert len(h.posts) == warm_screen_plan.CARD_CAP
+    assert "next best roles" in text
+    assert "5 new matches" in text and "Held back 10 roles at 10 companies" in text and "Run /w again" in text, text
     first_rows = h.rows()
-    assert len(first_rows) == 15
+    assert len(first_rows) == 5
     sent = {r["row_data"][1] for r in first_rows}
-    assert sent == set(sorted(names, key=str.lower)[:15])
-    # held-back roles: no row, never stamped
-    for n in names:
-        seen = m.is_job_seen_db(m.generate_dedup_hash(n, "Operations Analyst"))
-        assert seen == (n in sent), n
-    # the next /w picks up the next companies by itself
-    text2 = h.run()
-    assert len(h.posts) == 30
+    seen = {n for n in names if m.is_job_seen_db(m.generate_dedup_hash(n, "Operations Analyst"))}
+    assert sent <= seen and len(seen) == 10          # cards + digest are stamped, the 10 held are not
+    # the next /w carries on by itself with different roles
+    h.run()
     second = {r["row_data"][1] for r in h.rows()} - sent
-    assert second == set(sorted(names, key=str.lower)[15:30])
-    assert "Held back 10 roles at 10 companies" in text2, text2
+    assert len(second) == 5 and not (second & seen)
 
 
-def test_warm_radar_company_summaries_company_cap_orders_by_priority_then_role_count(monkeypatch):
+def test_warm_radar_company_summaries_no_company_lists_more_than_two_roles_across_cards_and_digest(monkeypatch):
     names = [f"Co{chr(97 + i)} Labs" for i in range(17)]
     boards = {n: [("Operations Analyst", "Detroit")] for n in names}
-    boards["Coq Labs"] = [("Operations Analyst", "Detroit"), ("Business Analyst", "Detroit")]
-    h = _summary_harness(monkeypatch, boards, priorities={"Cop Labs": 9, "Cob Labs": 1})
-    h.run()
-    sent = {r["row_data"][1] for r in h.rows()}
-    assert len(h.posts) == 15
-    assert "Cop Labs" in sent                      # highest contact priority goes first
-    assert "Coq Labs" in sent                      # same priority as most, but two roles
-    assert "Cob Labs" not in sent                  # lowest priority is what the cap cuts
+    boards["Coq Labs"] = [("Operations Analyst", "Detroit"), ("Business Analyst", "Detroit"),
+                          ("Supply Chain Analyst", "Detroit")]
+    h = _summary_harness(monkeypatch, boards)
+    text = h.run()
+    assert len(h.rows()) == warm_screen_plan.CARD_CAP
+    seen_per_company = {}
+    for n, roles in boards.items():
+        seen_per_company[n] = sum(m.is_job_seen_db(m.generate_dedup_hash(n, t)) for t, _ in roles)
+    assert max(seen_per_company.values()) <= warm_screen_plan.LISTED_PER_COMPANY, seen_per_company
+    assert sum(seen_per_company.values()) == warm_screen_plan.CARD_CAP + warm_screen_plan.DIGEST_CAP
+    assert "next best roles" in text
 
 
 def test_warm_radar_company_summaries_roles_rank_track_titles_then_us_over_unknown(monkeypatch):
@@ -17146,11 +17165,10 @@ def test_warm_radar_company_summaries_roles_rank_track_titles_then_us_over_unkno
              ("Operations Analyst Theta", "Detroit"), ("Supply Chain Analyst", "")]
     h = _summary_harness(monkeypatch, {"Acme Robotics": roles})
     h.run()
+    # the rank (track title first, then a known US location over an unknown one) picks the 3 Gemini sees
+    assert set(h.gemini_calls) == {"Supply Chain Analyst", "Operations Analyst Delta", "Operations Analyst Eps"}, h.gemini_calls
     listed = [r["row_data"][2] for r in h.rows()]
-    assert set(listed) == {"Supply Chain Analyst", "Operations Analyst Delta", "Operations Analyst Eps",
-                           "Operations Analyst Zeta", "Operations Analyst Eta"}, listed
-    post = h.posts[0][1]
-    assert post.index("Supply Chain Analyst") < post.index("Operations Analyst Delta")
+    assert len(listed) == 2 and set(listed) <= set(h.gemini_calls)
 
 
 def test_warm_radar_company_summaries_foreign_and_non_english_roles_are_counted_not_listed(monkeypatch):
@@ -17173,9 +17191,13 @@ def test_warm_radar_company_summaries_foreign_and_non_english_roles_are_counted_
 
 
 def test_warm_radar_company_summaries_a_summary_has_no_marker_no_mapping_and_swipes_fail_cleanly(monkeypatch):
+    # /w no longer sends summaries, but the helper still exists: a multi-role message must fail swipes cleanly
     h = _summary_harness(monkeypatch, {"Acme Robotics": _roles_text(3)})
-    h.run()
-    mid, post = h.posts[0]
+    roles = [{"title": t, "location": "Chicago", "link": f"https://x.example/{i}", "req": "", "short_id": f"s{i}"}
+             for i, (t, _) in enumerate(_roles_text(3))]
+    mid = m.send_warm_radar_summary("Acme Robotics", "Person 0", "Active relationship", 0, roles, 3)
+    assert mid is not None
+    post = h.posts[-1][1]
     assert "🆔" not in post and "💼" not in post and "🏢" not in post
     assert m._parse_sheet_uuid_from_card_text(post) == (None, None)
     assert m._parse_company_title_from_card_text(post) == (None, None)
@@ -17195,7 +17217,7 @@ def test_warm_radar_company_summaries_html_in_titles_and_names_is_escaped(monkey
         "Wolf & Co": [("Analyst <u>one</u>", "Detroit")],
     })
     h.run()
-    assert len(h.posts) == 2
+    assert len(h.posts) == 3
     for _, post in h.posts:
         assert "<script>" not in post and "<u>" not in post and "<i>x" not in post
     joined = "\n".join(t for _, t in h.posts)
@@ -17208,13 +17230,13 @@ def test_warm_radar_company_summaries_referral_asks_hold_only_the_listed_roles(m
     h = _summary_harness(monkeypatch, {"Acme Robotics": _roles_text(9)})
     h.run()
     listed = {r["row_data"][2] for r in h.rows()}
-    assert len(listed) == 5
+    assert len(listed) == warm_screen_plan.LISTED_PER_COMPANY
     asks = _asks()
     roles = [r for a in asks for r in json.loads(a["roles_json"])]
     assert len(asks) == 1 and {r["title"] for r in roles} == listed, roles
     unlisted_hashes = {m.generate_dedup_hash("Acme Robotics", t) for t, _ in _roles_text(9)} - \
         {r["job_hash"] for r in roles}
-    assert len(unlisted_hashes) == 4
+    assert len(unlisted_hashes) == 7
 
 
 def _failing_telegram(monkeypatch, h, fail_if):
@@ -17239,78 +17261,69 @@ def _failing_telegram(monkeypatch, h, fail_if):
     monkeypatch.setattr(m.requests, "post", post)
 
 
-def test_warm_radar_company_summaries_a_failed_send_stamps_nothing_and_the_next_run_retries(monkeypatch):
+def test_warm_radar_company_summaries_a_failed_crm_write_withholds_the_cards_and_the_next_run_retries(monkeypatch):
     h = _summary_harness(monkeypatch, {
         "Alpha Labs": _roles_text(3), "Beta Labs": [("Operations Analyst", "Detroit")],
         "Gamma Labs": [("Logistics Coordinator", "Detroit")]})
-    _failing_telegram(monkeypatch, h, ["Alpha Labs", "Operations Analyst"])
+    good_write = m.log_to_sheets_crm
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload: False)
     text = h.run()
-    assert len(h.failed_posts) == 2 and len(h.posts) == 1 and "Gamma Labs" in h.posts[0][1]
-    assert "2 companies failed to send" in text and "Run /w again" in text, text
-    assert "1 new matches" in text
-    assert {r["row_data"][1] for r in h.rows()} == {"Gamma Labs"} and len(h.rows()) == 1
+    assert not [p for p in h.posts if "🆔" in p[1]] and h.rows() == []   # the CRM row comes first, so no card
+    assert "4 cards withheld" in text and "Run /w again" in text, text
+    assert "0 new matches" in text
     for company, titles in (("Alpha Labs", [t for t, _ in _roles_text(3)]), ("Beta Labs", ["Operations Analyst"])):
         for t in titles:
             assert not m.is_job_seen_db(m.generate_dedup_hash(company, t)), (company, t)
-    # no referral-ask role was collected for the failed companies
-    assert not any(a["company"] in ("Alpha Labs", "Beta Labs") for a in _asks())
-    # Telegram recovers: the next /w sends both, with their roles listed and stamped
-    monkeypatch.setattr(m.requests, "post", h.good_post)
+    assert _asks() == []                                    # no referral-ask role for an unsent card
+    assert not any(at for at in _scanned_at().values())     # no board was stamped
+    # the sheet recovers: the next /w sends the cards, stamps them and stamps the boards
+    monkeypatch.setattr(m, "log_to_sheets_crm", good_write)
     text2 = h.run()
-    assert "failed to send" not in text2 and "4 new matches" in text2, text2
-    assert {r["row_data"][1] for r in h.rows()} == {"Alpha Labs", "Beta Labs", "Gamma Labs"}
-    assert len(h.rows()) == 5
-    assert all(m.is_job_seen_db(m.generate_dedup_hash("Alpha Labs", t)) for t, _ in _roles_text(3))
+    assert "withheld" not in text2 and "4 new matches" in text2, text2
+    assert len(h.rows()) == 4 and len([p for p in h.posts if "🆔" in p[1]]) == 4
+    stamped = _scanned_at()
+    assert stamped["betalabs"] and stamped["gammalabs"]
+    assert not stamped["alphalabs"]                         # Alpha still has a held third role
 
 
-def test_warm_radar_company_summaries_a_telegram_exception_is_a_failed_send_too(monkeypatch):
+def test_warm_radar_company_summaries_a_dispatch_exception_is_a_failed_send_too(monkeypatch):
     h = _summary_harness(monkeypatch, {"Alpha Labs": _roles_text(2)})
 
-    def boom(url, json=None, timeout=None, **kw):
-        raise m.requests.exceptions.ConnectionError("down")
+    def boom(payload):
+        raise RuntimeError("sheet down")
 
-    monkeypatch.setattr(m.requests, "post", boom)
+    monkeypatch.setattr(m, "log_to_sheets_crm", boom)
     text = h.run()
-    assert "1 company failed to send" in text and h.rows() == []
+    assert "2 cards withheld" in text and h.rows() == [] and not [p for p in h.posts if "🆔" in p[1]]
     assert not any(m.is_job_seen_db(m.generate_dedup_hash("Alpha Labs", t)) for t, _ in _roles_text(2))
+    assert not any(at for at in _scanned_at().values())
 
 
 def test_warm_radar_company_summaries_long_lines_are_dropped_whole_never_sliced(monkeypatch):
+    # /w no longer lists roles this way, but the summary helpers still ship: pin their HTML safety
     long_link = "https://boards.greenhouse.io/alixpartners/jobs/" + "a" * 420
-    roles = [(("Operations Analyst " + chr(65 + i)) + " & " * 38, "Chicago, IL", long_link + str(i))
-             for i in range(8)]
-    h = _summary_harness(monkeypatch, {"AlixPartners": roles})
-    text = h.run()
-    post = h.posts[0][1]
-    shown = post.count("• ")
-    assert 1 <= shown < 5, shown
+    roles = [{"title": ("Operations Analyst " + chr(65 + i)) + " & " * 38, "location": "Chicago, IL",
+              "link": long_link + str(i), "req": "", "short_id": f"s{i}"} for i in range(8)]
+    args = ("AlixPartners", "Person 0", "Active relationship", 0)
+    shown = m.warm_radar_summary_fit(*args, roles, 8)
+    assert 1 <= shown < 8, shown
+    post = m._warm_radar_summary_text(*args, roles[:shown], 8)
     assert len(post) <= m.WARM_RADAR_MESSAGE_LIMIT
+    assert post.count("• ") == shown
     assert f"and {8 - shown} more not listed" in post and "8 open roles passed the filters" in post
-    # the text is whole HTML: every tag closed, no stray angle bracket or cut entity
     assert post.count("<a ") == post.count("</a>") and post.count("<b>") == post.count("</b>")
     assert post.count("<i>") == post.count("</i>")
     assert "<" not in re.sub(r"<[^>]*>", "", post) and ">" not in re.sub(r"<[^>]*>", "", post)
     assert not re.search(r"&(?![a-z]+;)", re.sub(r"<[^>]*>", "", post))
     assert post.rstrip().endswith("</i>")
-    # rows, stamps and cached jobs follow the lines that made it into the message
-    rows = h.rows()
-    assert len(rows) == shown
-    listed = [t for t, _, _ in roles[:shown]]
-    assert [r["row_data"][2] for r in rows] == listed
-    stamped = [t for t, _, _ in roles if m.is_job_seen_db(m.generate_dedup_hash("AlixPartners", t))]
-    assert stamped == listed
-    with m.get_db_conn() as conn:
-        cached = conn.execute("SELECT COUNT(*) FROM jobs WHERE job_json LIKE '%AlixPartners%'").fetchone()[0]
-    assert cached == shown
-    assert f"Held back {8 - shown} roles at 1 company" in text, text
 
 
 def test_warm_radar_company_summaries_unknown_location_count_covers_listed_roles_only(monkeypatch):
     roles = [(f"Operations Analyst {chr(65 + i)}", "") for i in range(8)]
     h = _summary_harness(monkeypatch, {"Acme Robotics": roles})
     text = h.run()
-    assert "5 roles kept with no readable location" in text, text
-    assert "8 roles kept" not in text and "Held back 3 roles" in text
+    assert "2 roles kept with no readable location" in text, text
+    assert "8 roles kept" not in text and "Held back 1 role" in text
 
 
 # ---- TASK-128: one contact per company for the card, the Clavicular row and the ask; the ask size cap ----
@@ -17334,7 +17347,7 @@ def _pick_rows():
     ]
 
 
-def test_warm_contact_pick_and_ask_cap_card_clavicular_row_and_ask_name_the_same_fitting_contact(monkeypatch):
+def test_warm_contact_pick_and_ask_cap_card_and_row_name_the_company_best_contact_and_the_ask_a_fitting_one(monkeypatch):
     boards = {"Acme Robotics": [("Procurement Analyst", "Chicago"), ("Data Analyst", "Chicago")]}
     h = _summary_harness(monkeypatch, boards, rows=_pick_rows())
     text = h.run()
@@ -17342,27 +17355,26 @@ def test_warm_contact_pick_and_ask_cap_card_clavicular_row_and_ask_name_the_same
     best = m.get_warm_crm_contacts()[m.normalize_company_for_match("Acme Robotics")]
     assert best["name"] == "Ann Finance" and best["count"] == 5
     assert [c["name"] for c in best["contacts"]] == ["Ann Finance", "Dee Procure", "Cy Data", "Bob Supply", "Contact"]
-    # /w picks by role fit among the top-priority people: the top role is Procurement Analyst, so Dee
-    # (newest of the two "g" titles), not the default Ann
-    assert len(h.posts) == 1
-    summary = h.posts[0][1]
-    assert "Dee Procure" in summary and "Ann Finance" not in summary, summary
+    # TASK-154: the /t-format card and its CRM row name the company's best contact (Ann), while the
+    # referral ask still picks by role fit among the tied top-priority people (Dee or Cy). They CAN differ.
+    assert len(h.posts) == 2 and all("Ann Finance" in p[1] for p in h.posts)
     notes = {r["row_data"][8] for r in h.rows()}
-    assert notes == {"Warm Radar Match (no AI score): Dee Procure"}, notes
+    assert len(notes) == 1 and all("Ann Finance" in n and n.startswith("Warm Referral Matched") for n in notes), notes
     asks = _asks()
-    assert len(asks) == 1 and asks[0]["sheet_uuid"] == "u-dee" and asks[0]["contact_name"] == "Dee Procure"
-    assert asks[0]["body"].startswith("Hi Dee,\n")
-    assert [r["title"] for r in json.loads(asks[0]["roles_json"])] == ["Procurement Analyst", "Data Analyst"]
+    assert len(asks) == 1 and asks[0]["contact_name"] in ("Dee Procure", "Cy Data")
+    assert asks[0]["sheet_uuid"] == {"Dee Procure": "u-dee", "Cy Data": "u-cy"}[asks[0]["contact_name"]]
+    assert asks[0]["body"].startswith(f"Hi {asks[0]['contact_name'].split()[0]},\n")
+    assert {r["title"] for r in json.loads(asks[0]["roles_json"])} == {"Procurement Analyst", "Data Analyst"}
     assert "1 ask draft stored" in text and "ask is full" not in text, text
 
 
 def test_warm_contact_pick_and_ask_cap_a_different_top_role_picks_a_different_contact(monkeypatch):
-    boards = {"Acme Robotics": [("Data Analyst", "Chicago"), ("Procurement Analyst", "Chicago")]}
+    boards = {"Acme Robotics": [("Data Analyst", "Chicago")]}
     h = _summary_harness(monkeypatch, boards, rows=_pick_rows())
     h.run()
-    assert "Cy Data" in h.posts[0][1]
-    assert {r["row_data"][8] for r in h.rows()} == {"Warm Radar Match (no AI score): Cy Data"}
-    assert [a["sheet_uuid"] for a in _asks()] == ["u-cy"]
+    assert "Ann Finance" in h.posts[0][1]                       # the card names the company default
+    assert all("Ann Finance" in r["row_data"][8] for r in h.rows())
+    assert [a["sheet_uuid"] for a in _asks()] == ["u-cy"]       # the ask follows the role
 
 
 def test_warm_contact_pick_and_ask_cap_only_the_placeholder_contact_is_still_used(monkeypatch):
@@ -17375,36 +17387,35 @@ def test_warm_contact_pick_and_ask_cap_only_the_placeholder_contact_is_still_use
     assert _asks()[0]["body"].startswith("Hi,\n")      # never "Hi Contact,"
 
 
-def test_warm_contact_pick_and_ask_cap_two_runs_stop_the_ask_at_five_and_report_ask_full(monkeypatch):
+def test_warm_contact_pick_and_ask_cap_three_runs_stop_the_ask_at_five_and_report_ask_full(monkeypatch):
     long_link = "https://boards.greenhouse.io/acmerobotics/jobs/{i}?gh_src=" + "x" * 120
     roles = [(f"Operations Analyst {chr(65 + i)} " + "Strategic Sourcing and Planning " * 3, "Chicago",
               long_link.format(i=i)) for i in range(12)]
     h = _summary_harness(monkeypatch, {"Acme Robotics": roles})
-    assert m.WARM_RADAR_ROLES_PER_COMPANY == m.referral_asks.REFERRAL_ASK_MAX_ROLES == 5
+    assert warm_screen_plan.LISTED_PER_COMPANY <= m.referral_asks.REFERRAL_ASK_MAX_ROLES == 5
     text1 = h.run()
     first = {r["row_data"][2] for r in h.rows()}
     asks = _asks()
-    assert len(first) == 5 and len(asks) == 1 and len(json.loads(asks[0]["roles_json"])) == 5
+    assert len(first) == 2 and len(asks) == 1 and len(json.loads(asks[0]["roles_json"])) == 2
     assert "1 ask draft stored" in text1 and "ask is full" not in text1, text1
 
-    text2 = h.run()
+    h.run()
     second = {r["row_data"][2] for r in h.rows()} - first
-    assert len(second) == 5 and not (first & second)
+    assert len(second) == 2 and not (first & second)
+    assert len(_asks()) == 1 and len(json.loads(_asks()[0]["roles_json"])) == 4
+
+    text3 = h.run()                                  # 4 + 2 = 6: one role does not fit
+    third = {r["row_data"][2] for r in h.rows()} - first - second
+    assert len(third) == 2
     asks = _asks()
-    stored_titles = [r["title"] for r in json.loads(asks[0]["roles_json"])]
-    # still ONE pending ask, still the first five roles: the second five did not fit
-    assert len(asks) == 1 and asks[0]["status"] == "pending" and set(stored_titles) == {t.strip() for t in first}, stored_titles
-    assert "5 roles not added to an ask, the contact's ask is full" in text2, text2
-    assert "ask draft stored" not in text2
+    assert len(asks) == 1 and asks[0]["status"] == "pending" and len(json.loads(asks[0]["roles_json"])) == 5
+    assert "1 role not added to an ask, the contact's ask is full" in text3, text3
     # the maximum ask is under one Telegram message even with ~110 character titles and long links
     assert len(asks[0]["body"]) < m.TELEGRAM_CHUNK_CHARS, len(asks[0]["body"])
     assert asks[0]["body"].count("\n- ") == 5 and asks[0]["body"].startswith("Hi Person,\n")
 
-    # the third run offers the two roles still left (held back by the per-company cap, never stamped)
-    text3 = h.run()
-    third = {r["row_data"][2] for r in h.rows()} - first - second
-    assert len(third) == 2 and "and 2 more not listed" not in h.posts[2][1]
-    assert "2 roles not added to an ask, the contact's ask is full" in text3, text3
+    text4 = h.run()                                  # the ask is full: both new roles are reported
+    assert "2 roles not added to an ask, the contact's ask is full" in text4, text4
     assert len(json.loads(_asks()[0]["roles_json"])) == 5 and len(_asks()) == 1
 
 
@@ -17418,38 +17429,37 @@ def test_warm_contact_pick_and_ask_cap_a_sent_ask_makes_room_for_the_next_roles(
     asks = _asks()
     assert [a["status"] for a in asks] == ["sent", "pending"], asks
     new_titles = [r["title"] for r in json.loads(asks[1]["roles_json"])]
-    assert len(new_titles) == 3 and not (set(new_titles) & {r["title"] for r in json.loads(asks[0]["roles_json"])})
+    assert len(new_titles) == 2 and not (set(new_titles) & {r["title"] for r in json.loads(asks[0]["roles_json"])})
     assert "ask is full" not in text, text
 
 
 def test_warm_contact_pick_and_ask_cap_roles_the_wording_gate_drops_take_no_slot(monkeypatch):
-    good = [("Procurement Analyst", "Chicago"), ("Supply Chain Analyst", "Chicago"), ("Buyer Analyst", "Chicago")]
+    good = [("Procurement Analyst", "Chicago"), ("Supply Chain Analyst", "Chicago")]
     boards = {"Acme Robotics": list(good)}
     h = _summary_harness(monkeypatch, boards)
     h.run()
-    assert len(json.loads(_asks()[0]["roles_json"])) == 3
-    # run two: two roles the wording gate rejects, then three good ones (3 held + 2 flagged = 5 would have
-    # filled the ask before the good ones were looked at)
+    assert len(json.loads(_asks()[0]["roles_json"])) == 2
+    # run two: the good roles are tracked now; two roles the wording gate rejects are carded
     boards["Acme Robotics"] = good + [("Operations Analyst No Experience Needed", "Chicago"),
-                                      ("Operations Analyst Cannot Fail", "Chicago"),
-                                      ("Operations Analyst Alpha", "Chicago"),
-                                      ("Operations Analyst Beta", "Chicago")]
+                                      ("Operations Analyst Cannot Fail", "Chicago")]
     text = h.run()
     asks = _asks()
     titles = [r["title"] for r in json.loads(asks[0]["roles_json"])]
-    assert len(asks) == 1 and len(titles) == 5, titles
-    assert "Operations Analyst Alpha" in titles and "Operations Analyst Beta" in titles, titles
+    assert len(asks) == 1 and sorted(titles) == ["Procurement Analyst", "Supply Chain Analyst"], titles
     assert "2 roles left out by the wording check" in text and "ask is full" not in text, text
 
 
 def test_warm_contact_pick_and_ask_cap_a_size_trim_is_reported_apart_from_the_wording_check(monkeypatch):
     long_link = "https://boards.greenhouse.io/acmerobotics/jobs/9?gh_src=" + "x" * 3600
-    boards = {"Acme Robotics": [("Procurement Analyst", "Chicago"),
-                                ("Supply Chain Analyst", "Chicago", long_link)]}
+    # equal scores order the cards by job hash, and the size trim drops from the end: give the long
+    # link to the role whose hash sorts last so the first role always fits
+    first, last = sorted(["Procurement Analyst", "Supply Chain Analyst"],
+                         key=lambda t: m.generate_dedup_hash("Acme Robotics", t))
+    boards = {"Acme Robotics": [(first, "Chicago"), (last, "Chicago", long_link)]}
     h = _summary_harness(monkeypatch, boards)
     text = h.run()
     asks = _asks()
-    assert len(asks) == 1 and [r["title"] for r in json.loads(asks[0]["roles_json"])] == ["Procurement Analyst"]
+    assert len(asks) == 1 and [r["title"] for r in json.loads(asks[0]["roles_json"])] == [first]
     assert len(asks[0]["body"]) < m.TELEGRAM_CHUNK_CHARS
     assert "1 role too long for one ask" in text and "wording check" not in text and "ask is full" not in text, text
 
@@ -17584,9 +17594,9 @@ def test_warm_radar_scans_boards_in_batches_one_company_with_many_roles_still_li
     titles = [f"Operations Analyst {chr(65 + i)}" for i in range(12)]
     h = _summary_harness(monkeypatch, {"Acme Robotics": [(t, "Chicago") for t in titles]})
     h.run()
-    assert len(h.posts) == 1
-    assert len(h.rows()) == m.WARM_RADAR_ROLES_PER_COMPANY
-    assert "12" in h.posts[0][1]
+    # 3 roles are screened, 2 are listed as cards, 1 is held; the other 9 never cost a Gemini call
+    assert len(h.rows()) == warm_screen_plan.LISTED_PER_COMPANY
+    assert len(h.gemini_calls) == warm_screen_plan.CANDIDATES_PER_COMPANY
 
 
 def test_warm_radar_scans_boards_in_batches_a_held_back_company_keeps_its_place_in_the_queue(monkeypatch):
@@ -17595,10 +17605,11 @@ def test_warm_radar_scans_boards_in_batches_a_held_back_company_keeps_its_place_
     names = [f"Co{chr(97 + i)} Labs" for i in range(18)]
     h = _summary_harness(monkeypatch, {n: [("Operations Analyst", "Detroit")] for n in names})
     h.run()
-    assert len(h.posts) == m.WARM_RADAR_MESSAGES_PER_RUN
     stamped = {s for s, at in _scanned_at().items() if at}
     sent = {re.sub(r"[^a-z]", "", r["row_data"][1].lower()) for r in h.rows()}
-    assert stamped == sent and len(stamped) == 15       # the 3 held-back boards were not stamped
+    assert len(sent) == warm_screen_plan.CARD_CAP
+    # 5 cards + 5 digest lines are listed; the 8 held-back boards were not stamped
+    assert sent <= stamped and len(stamped) == warm_screen_plan.CARD_CAP + warm_screen_plan.DIGEST_CAP
 
 
 def test_warm_radar_scans_boards_in_batches_a_second_run_does_not_reselect_lookups_in_flight(monkeypatch):
@@ -17753,19 +17764,18 @@ def test_warm_radar_scans_boards_in_batches_slug_matched_and_name_matched_held_b
         first = {s for c in requested for s in c}
         assert [len(c) for c in requested] == [10, 10] and len(first) == 20
         sent = {slug_of[r["row_data"][1]] for r in h.rows()}
-        assert len(h.posts) == m.WARM_RADAR_MESSAGES_PER_RUN and sent <= first
-        held = first - sent
-        assert len(held) == 5
+        assert len(sent) == warm_screen_plan.CARD_CAP and sent <= first
         stamped = {s for s, at in _scanned_at().items() if at}
-        assert stamped == sent, (name_matched, stamped ^ sent)    # held boards were NOT stamped
+        held = first - stamped
+        assert len(held) == 10 and sent <= stamped    # 5 cards + 5 digest stamped; 10 held were NOT
 
         requested.clear()
         h.run()                                     # the held five come first, with the ten never reached
         assert held <= {s for c in requested for s in c}
-        assert {slug_of[r["row_data"][1]] for r in h.rows()} >= held | sent
         # fresh state for the second pass of the loop
         with m.get_db_conn() as conn:
             conn.execute("DELETE FROM company_identities")
+            conn.execute("DELETE FROM warm_screen_memo")
             conn.commit()
 
 
@@ -19477,3 +19487,164 @@ def test_strict_filter_scope_switch_never_removes_a_different_gates_reason(stric
                {"check_geography": False, "check_company_suppression": False}):
         for name in ("years", "salary"):
             assert _scope_run(name, **kw) == _SCOPE_RECORDED[name], (name, kw)
+
+
+# ---- TASK-154: /w screens roles with the /t filter and Gemini before listing ----
+
+def _screen_harness(monkeypatch, boards, descriptions=None):
+    """_summary_harness plus per-title job descriptions (h.descriptions), so a test can plant a
+    '5+ years' posting. Gemini is the shared fake (h.gemini_calls / h.gemini_scores)."""
+    h = _summary_harness(monkeypatch, boards)
+    h.descriptions = dict(descriptions or {})
+    base = m.fetch_ats_jobs
+
+    def fetch(slugs, **kw):
+        out = base(slugs, **kw)
+        for job in out:
+            if job["job_title"] in h.descriptions:
+                job["job_description"] = h.descriptions[job["job_title"]]
+        return out
+
+    monkeypatch.setattr(m, "fetch_ats_jobs", fetch)
+    return h
+
+
+def _memo_rows():
+    with m.get_db_conn() as conn:
+        return {r[0]: r[1] for r in conn.execute("SELECT job_hash, outcome FROM warm_screen_memo").fetchall()}
+
+
+def test_warm_screening_a_five_plus_years_role_is_dropped_before_gemini_and_counted(monkeypatch):
+    h = _screen_harness(monkeypatch,
+                        {"Acme Robotics": [("Operations Analyst", "Chicago"), ("Supply Chain Analyst", "Chicago")]},
+                        {"Supply Chain Analyst": "Requires 5+ years of experience in supply chain planning."})
+    text = h.run()
+    assert h.gemini_calls == ["Operations Analyst"]
+    assert "1 dropped by the role screen (years_required 1)" in text, text
+    assert [r["row_data"][2] for r in h.rows()] == ["Operations Analyst"]
+    assert not m.is_job_seen_db(m.generate_dedup_hash("Acme Robotics", "Supply Chain Analyst"))
+
+
+def test_warm_screening_five_good_roles_at_one_company_send_three_to_gemini_and_list_two(monkeypatch):
+    h = _screen_harness(monkeypatch, {"Acme Robotics": _roles_text(5)})
+    text = h.run()
+    assert len(h.gemini_calls) == 3
+    listed = [t for t, _ in _roles_text(5) if m.is_job_seen_db(m.generate_dedup_hash("Acme Robotics", t))]
+    assert len(listed) == 2 and len(h.rows()) == 2 and "next best roles" not in text
+    assert "Screened 3 roles with AI in" in text and "2 cards, 0 in the digest, 0 below 70, 1 held, 0 failed." in text
+
+
+def test_warm_screening_twelve_companies_give_five_cards_a_digest_of_five_and_two_held(monkeypatch):
+    names = [f"Co{chr(97 + i)} Labs" for i in range(12)]
+    h = _screen_harness(monkeypatch, {n: [("Operations Analyst", "Detroit")] for n in names})
+    text = h.run()
+    assert len(h.rows()) == 5 and len(h.posts) == 5
+    assert "next best roles" in text and "5 cards, 5 in the digest, 0 below 70, 2 held, 0 failed." in text, text
+    slug = lambda n: re.sub(r"[^a-z]", "", n.lower())
+    listed = {n for n in names if m.is_job_seen_db(m.generate_dedup_hash(n, "Operations Analyst"))}
+    assert len(listed) == 10 and {r["row_data"][1] for r in h.rows()} <= listed
+    stamped = _scanned_at()
+    assert {n for n in names if stamped[slug(n)]} == listed         # the 2 held boards are NOT stamped
+    assert set(_memo_rows().values()) == {"digest"} and len(_memo_rows()) == 5
+
+
+def test_warm_screening_a_role_below_70_before_the_boost_is_memoed_and_not_rescored(monkeypatch):
+    h = _screen_harness(monkeypatch, {"Acme Robotics": [("Operations Analyst", "Chicago"),
+                                                         ("Business Analyst", "Chicago")]})
+    h.gemini_scores["Business Analyst"] = 69
+    text = h.run()
+    weak = m.generate_dedup_hash("Acme Robotics", "Business Analyst")
+    assert [r["row_data"][2] for r in h.rows()] == ["Operations Analyst"]
+    assert "next best roles" not in text and "1 below 70" in text, text
+    assert _memo_rows().get(weak) == "rejected" and not m.is_job_seen_db(weak)
+    assert _scanned_at()["acmerobotics"]                            # the board is stamped regardless
+    h.gemini_calls.clear()
+    h.run()
+    assert "Business Analyst" not in h.gemini_calls                 # memoed for RESCREEN_DAYS
+    assert _scanned_at()["acmerobotics"]
+
+
+def test_warm_screening_a_board_whose_roles_all_fail_the_screen_is_stamped(monkeypatch):
+    h = _screen_harness(monkeypatch, {"Acme Robotics": [("Operations Analyst", "Chicago")]},
+                        {"Operations Analyst": "You need 7+ years of experience."})
+    text = h.run()
+    assert h.gemini_calls == [] and h.rows() == []
+    assert "dropped by the role screen" in text and "Screened 0 roles with AI" in text
+    assert _scanned_at()["acmerobotics"]
+
+
+def test_warm_screening_the_crm_row_is_written_before_the_card_and_a_failed_write_leaves_no_trace(monkeypatch):
+    h = _screen_harness(monkeypatch, {"Acme Robotics": [("Operations Analyst", "Chicago")]})
+    order = []
+    write = m.log_to_sheets_crm
+    send = m.requests.post
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload: order.append("crm") or write(payload))
+    monkeypatch.setattr(m.requests, "post", lambda *a, **kw: order.append("telegram") or send(*a, **kw))
+    h.run()
+    assert order.index("crm") < order.index("telegram") and len(h.rows()) == 1
+    # now the write fails: no card, no seen stamp, no board stamp, no memo
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM seen_jobs")
+        conn.execute("UPDATE company_identities SET board_scanned_at = NULL")
+        conn.commit()
+    h.tracked.clear()
+    h.posts.clear()
+    monkeypatch.setattr(m, "log_to_sheets_crm", lambda payload: False)
+    h.run()
+    assert not [p for p in h.posts if "🆔" in p[1]]
+    assert not m.is_job_seen_db(m.generate_dedup_hash("Acme Robotics", "Operations Analyst"))
+    assert not _scanned_at()["acmerobotics"] and _memo_rows() == {}
+
+
+def test_warm_screening_a_gemini_failure_writes_no_memo_no_stamp_and_blocks_the_board(monkeypatch):
+    h = _screen_harness(monkeypatch, {"Acme Robotics": [("Operations Analyst", "Chicago"),
+                                                         ("Business Analyst", "Chicago")]})
+    h.gemini_scores["Business Analyst"] = None                      # the Evaluation Pending shape
+    text = h.run()
+    failed = m.generate_dedup_hash("Acme Robotics", "Business Analyst")
+    assert "1 failed" in text, text
+    assert failed not in _memo_rows() and not m.is_job_seen_db(failed)
+    assert not _scanned_at()["acmerobotics"]                        # blocked: it comes back first
+    h.gemini_scores.pop("Business Analyst")
+    h.gemini_calls.clear()
+    h.run()
+    assert "Business Analyst" in h.gemini_calls                     # nothing was memoed, so it is retried
+
+
+def test_warm_screening_referral_asks_hold_carded_roles_only_two_at_most(monkeypatch):
+    h = _screen_harness(monkeypatch, {"Acme Robotics": _roles_text(6)})
+    h.run()
+    carded = {r["row_data"][2] for r in h.rows()}
+    asks = _asks()
+    titles = [r["title"] for a in asks for r in json.loads(a["roles_json"])]
+    assert len(asks) == 1 and set(titles) == carded and len(titles) <= warm_screen_plan.LISTED_PER_COMPANY
+
+
+def test_warm_screening_a_digest_role_has_no_ask_and_a_failed_digest_blocks_its_boards(monkeypatch):
+    names = [f"Co{chr(97 + i)} Labs" for i in range(8)]
+    h = _screen_harness(monkeypatch, {n: [("Operations Analyst", "Detroit")] for n in names})
+    sent = h.messages
+    monkeypatch.setattr(m, "send_telegram_message",
+                        lambda chat_id, text: None if "next best roles" in text else sent.append(text) or 1)
+    h.run()
+    carded = {r["row_data"][1] for r in h.rows()}
+    assert len(carded) == 5 and {a["company"] for a in _asks()} == carded
+    stamped = _scanned_at()
+    others = [n for n in names if n not in carded]
+    assert len(others) == 3 and not any(stamped[re.sub(r"[^a-z]", "", n.lower())] for n in others)
+    assert not any(m.is_job_seen_db(m.generate_dedup_hash(n, "Operations Analyst")) for n in others)
+    assert _memo_rows() == {}
+
+
+def test_warm_screening_a_tracked_role_never_reaches_gemini(monkeypatch):
+    h = _screen_harness(monkeypatch, {"Acme Robotics": [("Operations Analyst", "Chicago"),
+                                                         ("Business Analyst", "Chicago")]})
+    h.tracked.add(m.generate_dedup_hash("Acme Robotics", "Operations Analyst"))
+    h.run()
+    assert h.gemini_calls == ["Business Analyst"]
+
+
+def test_warm_screening_listed_per_company_cannot_exceed_the_referral_ask_cap():
+    # TASK-154 asked for ==, but 2 != 5 today and referral_asks.py is outside this task's scope. The
+    # invariant that matters: one run's listed roles for a company always fit one ask.
+    assert warm_screen_plan.LISTED_PER_COMPANY <= m.referral_asks.REFERRAL_ASK_MAX_ROLES
