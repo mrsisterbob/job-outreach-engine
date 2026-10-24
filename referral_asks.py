@@ -282,14 +282,31 @@ _DATE_PREFIX_RE = re.compile(r"^\s*\[\d{4}-\d{2}-\d{2}\]\s*")
 _CONNECTED_RE = re.compile(r"Connected (\d{4})-(\d{2})-(\d{2})")
 
 
+# The alumni-import shape: `LinkedIn alumni | employer filter: <Company> | <headline>`. The headline is
+# free text from LinkedIn.
+_ALUMNI_NOTE_RE = re.compile(r"^LinkedIn alumni\s*\|\s*employer filter:[^|]*\|\s*(.+)$", re.IGNORECASE | re.DOTALL)
+
+
+def _headline_title(headline):
+    """The title a LinkedIn headline names: the text before its last " at " ("Supply Chain Analyst at
+    Gentex Corporation" -> "Supply Chain Analyst"), or the whole headline when it has no " at ". Whether
+    that text implies a track is derive_track's call; a headline that names no role simply matches none."""
+    headline = str(headline or "").strip().rstrip(".").strip()
+    if " at " in headline:
+        headline = headline.rsplit(" at ", 1)[0].strip()
+    return headline
+
+
 def contact_title_and_date(note, company=""):
     """(title, connected) read from a LinkedIn-import note, "" for what is not there.
 
     The note reads `<Title> at <Company>. Connected <YYYY-MM-DD> (LinkedIn import)`, optionally behind a
     `[YYYY-MM-DD] ` prefix and optionally followed by free text; a row with no title reads `Works at <Company>`. A title may itself contain
     " at " ("Analyst at Large Bank at Acme"), so the company is cut from the END: by name when
-    `company` is given and the sentence ends with it, otherwise at the last " at ". Any other note
-    ("Hiring manager", "Active relationship") has no title: nothing is guessed from free text.
+    `company` is given and the sentence ends with it, otherwise at the last " at ". The alumni
+    import shape `LinkedIn alumni | employer filter: <Company> | <headline>` reads its title from the
+    headline (see _headline_title). Any other note ("Hiring manager", "Active relationship") has no
+    title: nothing is guessed from free text.
     `connected` is the ISO date after "Connected", or "" when absent or not a real date.
     """
     text = _DATE_PREFIX_RE.sub("", str(note or "")).strip()
@@ -304,6 +321,9 @@ def contact_title_and_date(note, company=""):
             connected = ""
     marker = text.find(_IMPORT_SUFFIX)
     if marker < 0:
+        alumni = _ALUMNI_NOTE_RE.match(text)
+        if alumni:
+            return _headline_title(alumni.group(1)), connected
         return "", connected
     text = text[:marker]
     head = _CONNECTED_RE.search(text)
@@ -330,7 +350,9 @@ def is_placeholder_name(name) -> bool:
 def contact_sort_key(contact):
     """Sort key for the contacts at ONE company, best first: a real name before the placeholder, then
     higher priority, then a row with an email, then the more recent connection (a note with no date
-    last). sorted() is stable, so full ties keep sheet order."""
+    last). sorted() is stable, so a full tie keeps the order the contacts arrive in, which
+    is NEWEST sheet row first (Code.gs get_followups walks the sheet bottom-up and its sort returns 0
+    for equal followup and priority)."""
     _title, connected = contact_title_and_date(contact.get("note"), contact.get("raw_company", ""))
     ordinal = date.fromisoformat(connected).toordinal() if connected else 0
     try:
@@ -348,7 +370,7 @@ def pick_contact(contacts, role_titles, company=""):
     them a real name beats the placeholder, then a higher priority always wins; only contacts tied at
     that top priority are compared by role fit: the one whose imported title implies the same track
     as the company's top role (the first of `role_titles`). With no match, or no title rule firing
-    on either side, the best by contact_sort_key (email, then recency, then sheet order) is taken.
+    on either side, the best by contact_sort_key (email, then recency, then arrival order, which is newest sheet row first) is taken.
     """
     people = [c for c in (contacts or []) if c]
     if not people:
