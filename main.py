@@ -14446,16 +14446,37 @@ def handle_refer_command(chat_id, text):
         send_telegram_message(chat_id, _REFER_USAGE)
 
 
-def _warm_radar_unplaced_line():
-    """'N warm contacts have no company' (singular for 1), or "" when every contact has one."""
+def _warm_radar_unplaced_count():
+    """How many Carmen Warm rows have no usable company (0 when the read fails)."""
     try:
-        count = len(get_warm_contacts_without_company())
+        return len(get_warm_contacts_without_company())
     except Exception as e:
         logging.error(f"Warm Radar Unplaced Count Error: {e}")
-        return ""
+        return 0
+
+
+def _warm_radar_unplaced_line(count=None):
+    """'N warm contacts have no company' (singular for 1), or "" when every contact has one."""
+    if count is None:
+        count = _warm_radar_unplaced_count()
     if not count:
         return ""
     return f"{count} warm contact{' has' if count == 1 else 's have'} no company"
+
+
+def _warm_radar_coverage_line(contacts_by_bucket, unplaced):
+    """One counts-only line splitting every warm CONTACT by board status. contacts_by_bucket maps
+    scanned / no_board / unchecked / not_company to a contact total. Returns "" when every
+    contact has a board (nothing to say about missing ones)."""
+    missing = (contacts_by_bucket["no_board"] + contacts_by_bucket["unchecked"]
+               + contacts_by_bucket["not_company"] + unplaced)
+    if not missing:
+        return ""
+    return (f"Warm contacts by job board: {contacts_by_bucket['scanned']} at a company whose board /w scans, "
+            f"{contacts_by_bucket['no_board']} at a company checked with no public job board found, "
+            f"{contacts_by_bucket['unchecked']} at a company not looked at yet, "
+            f"{contacts_by_bucket['not_company']} at an entry that is not a company name, "
+            f"{unplaced} with no company")
 
 
 def run_warm_radar_scan(chat_id=None):
@@ -14529,16 +14550,22 @@ def run_warm_radar_scan(chat_id=None):
     checked_no_board = []   # looked up recently, nothing public found
     unchecked_keys = []     # never looked up, or the last miss is older than the retry window
     not_company = 0
+    contacts_by_bucket = {"scanned": 0, "no_board": 0, "unchecked": 0, "not_company": 0}
     for key, contact in warm_contacts.items():
+        people = contact.get("count") or 1
         if key in scanned_keys:
+            contacts_by_bucket["scanned"] += people
             continue
         display = contact.get("raw_company") or key
         if not is_probable_company_name(display):
             not_company += 1  # counted, never probed
+            contacts_by_bucket["not_company"] += people
         elif checked_on.get(key, "") > retry_cutoff:
             checked_no_board.append(display)
+            contacts_by_bucket["no_board"] += people
         else:
             unchecked_keys.append(key)
+            contacts_by_bucket["unchecked"] += people
     # Least-recently-attempted first, never-attempted ("") first of all; sorted() is stable, so
     # ties keep warm-contact order. A lookup that errored is "unchecked" again next run, and
     # without this rotation the same first batch would be retried forever.
@@ -14557,7 +14584,9 @@ def run_warm_radar_scan(chat_id=None):
     # and what they find shows up on the next /w.
     try:
         queued = len(unchecked) - len(lookup_now)
-        unplaced_line = _warm_radar_unplaced_line()
+        unplaced_count = _warm_radar_unplaced_count()
+        unplaced_line = _warm_radar_unplaced_line(unplaced_count)
+        coverage_line = _warm_radar_coverage_line(contacts_by_bucket, unplaced_count)
 
         def _skipped_report():
             lines = []
@@ -14580,6 +14609,8 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(f"{not_company} warm entries are not company names")
             if unplaced_line:
                 lines.append(unplaced_line)
+            if coverage_line:
+                lines.append(coverage_line)
             return lines
 
         if not slug_to_contact:
