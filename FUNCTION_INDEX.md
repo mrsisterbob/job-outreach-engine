@@ -848,6 +848,13 @@ grep -i "contact" FUNCTION_INDEX.md
 | 50 | `build_stats_block` | _(no docstring)_ |
 | 61 | `main` | _(no docstring)_ |
 
+## `warm_jsearch_plan.py` — 2 defs, 92 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 30 | `_parse` | Parse an ISO timestamp to aware UTC; None on any failure. |
+| 41 | `plan_warm_jsearch` | Return (picks, requests_left). |
+
 ## `workday_board.py` — 1 defs, 61 lines
 
 | Line | Name | Summary |
@@ -879,4 +886,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**730 definitions across 26 files + Code.gs.**
+**732 definitions across 27 files + Code.gs.**
