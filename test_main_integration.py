@@ -19862,3 +19862,22 @@ def test_warm_jsearch_lookup_a_429_is_not_retried_so_ledger_equals_http_calls(mo
     assert len(calls) == 2, calls
     assert sum(r[2] for r in _ledger_rows()) == len(calls)
     assert "2 requests spent this run" in text, text
+
+
+def test_warm_lookup_queue_skips_non_employers_and_takes_biggest_first(monkeypatch):
+    small = [f"Small{chr(65 + i)} Works" for i in range(17)]          # count 1 each
+    skipped = ["Grace Community Church", "Lakeview Christian School", "Hope Chapel Ministries"]
+    big = [f"Big{chr(65 + i)} Systems" for i in range(5)]             # count 3 each, LAST in arrival
+    names = small + skipped + [b for b in big for _ in range(3)]
+    # 25 distinct companies: 17 small + 3 skipped + 5 big
+    h = _WarmRadarHarness(monkeypatch, names)
+    looked_up = []
+    monkeypatch.setattr(m, "lookup_warm_company_board", lambda company: looked_up.append(company))
+    text = h.run()
+    assert len(looked_up) == 20
+    assert set(big) <= set(looked_up)
+    assert not set(skipped) & set(looked_up)
+    assert sum(1 for n in looked_up if n in small) == 15
+    assert "3 skipped as not employers: 2 school" not in text  # kinds are split, not lumped
+    assert "3 skipped as not employers: 1 school, 2 church" in text
+    assert "Grace Community Church" in text
