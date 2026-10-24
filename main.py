@@ -3841,7 +3841,7 @@ def get_warm_crm_contacts():
     """Fetch every Carmen Warm CRM contact keyed by normalize_company_for_match(company). Each value
     is the BEST contact at that company (a real name before the "Contact" placeholder, then highest
     priority_score, ties to the one with an email, then the most recent "Connected <date>" in the
-    note, then the earlier sheet row) with the keys callers read: name, raw_company, email, note,
+    note, then arrival order = newest sheet row first) with the keys callers read: name, raw_company, email, note,
     priority_score, sheet_uuid. Two more keys carry the rest of the company: `count` (how many Warm
     people Kevin has there) and `contacts` (every one of them, same keys, best first).
 
@@ -3894,7 +3894,7 @@ def get_warm_crm_contacts():
         for key, people in by_company.items():
             # A real name before the "Contact" placeholder (whatever the priority), then priority, then
             # an email, then the more recent "Connected <date>" in the note. sorted() is stable, so a
-            # full tie keeps sheet order (earlier row first).
+            # full tie keeps arrival order: Code.gs get_followups walks the sheet bottom-up, so NEWEST row first.
             ranked = sorted(people, key=referral_asks.contact_sort_key)
             best = dict(ranked[0])
             best["count"] = len(ranked)
@@ -14735,8 +14735,9 @@ def run_warm_radar_scan(chat_id=None):
             listed = roles[:WARM_RADAR_ROLES_PER_COMPANY]
             # ONE contact per company for everything below: the card or summary, the Clavicular row
             # note and the referral ask all name this person. The company-level best is the default;
-            # among contacts tied at the top priority the one whose imported title fits the top role
-            # wins (referral_asks.pick_contact).
+            # among contacts tied at the top priority the one whose imported title (or alumni
+            # headline) fits the top role wins (referral_asks.pick_contact). A tie nothing breaks
+            # goes to the first in arrival order, i.e. the NEWEST sheet row (Code.gs reads bottom-up).
             best_contact = group["contact"]
             contact = best_contact
             picked = referral_asks.pick_contact(best_contact.get("contacts") or [best_contact],
