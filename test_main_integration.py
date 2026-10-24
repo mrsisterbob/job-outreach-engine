@@ -19356,3 +19356,45 @@ def test_ats_workday_attach_company_not_in_warm_stores_nothing(monkeypatch):
     run(f"/ats workday {_WD_URL} Gentex")
     assert _stored_wd("Gentex") is None and _stored_wd("Plante Moran") is None
     assert posts == [] and "not in Carmen Warm" in sent[0], sent
+
+
+def _stored_workday_board(company):
+    with m.get_db_conn() as conn:
+        row = conn.execute("SELECT workday_board FROM company_identities WHERE normalized_name = ?",
+                           (m.normalize_company_for_match(company),)).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def _warm(monkeypatch, *names):
+    monkeypatch.setattr(m, "get_warm_crm_contacts", lambda: {
+        m.normalize_company_for_match(n): {"name": "Sam", "raw_company": n, "note": "n", "priority_score": 5}
+        for n in names})
+
+
+def test_t_records_workday_board_for_a_warm_company(run_candidate, monkeypatch):
+    _warm(monkeypatch, "Zephyr Meijer Inc.")
+    run_candidate(gemini_base=60, layer1_bonus=0, employer_name="Zephyr Meijer",
+                  job_apply_link="https://zmeijer.wd5.myworkdayjobs.com/en-US/Zephyr_Careers/job/Grand-Rapids/Analyst_R1")
+    assert _stored_workday_board("Zephyr Meijer") == "zmeijer/wd5/Zephyr_Careers"
+
+
+def test_t_records_workday_board_never_overwrites_a_stored_triple(run_candidate, monkeypatch):
+    _warm(monkeypatch, "Quill Bank")
+    assert m.set_company_workday_board("Quill Bank", "hand/wd1/Hand_Site")
+    run_candidate(gemini_base=60, layer1_bonus=0, employer_name="Quill Bank",
+                  job_apply_link="https://quill.wd5.myworkdayjobs.com/en-US/Other_Site/job/X/Analyst_R2")
+    assert _stored_workday_board("Quill Bank") == "hand/wd1/Hand_Site"
+
+
+def test_t_records_workday_board_ignores_a_company_not_in_warm(run_candidate, monkeypatch):
+    _warm(monkeypatch, "Somebody Else")
+    run_candidate(gemini_base=60, layer1_bonus=0, employer_name="Cold Corp Holdings",
+                  job_apply_link="https://cold.wd5.myworkdayjobs.com/en-US/Cold_Site/job/X/Analyst_R3")
+    assert _stored_workday_board("Cold Corp Holdings") == ""
+
+
+def test_t_records_workday_board_skips_non_workday_and_relist_links(run_candidate, monkeypatch):
+    _warm(monkeypatch, "Plain Link Co")
+    run_candidate(gemini_base=60, layer1_bonus=0, employer_name="Plain Link Co",
+                  job_apply_link="https://www.linkedin.com/jobs/view/123")
+    assert _stored_workday_board("Plain Link Co") == ""

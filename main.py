@@ -3465,6 +3465,42 @@ def set_company_workday_board(company_name, board):
     return upsert_company_identity(company_name, workday_board=board)
 
 
+def record_workday_board_from_posting(job, warm_contact):
+    """/t found a posting at a Carmen Warm company: when its apply link is a Workday address and the
+    company has no stored triple yet, keep the triple so /w scans that board. Best-effort and never
+    raises. Records an UNVERIFIED triple (a posting link proves a posting, not a board /w can list;
+    /w's own scan is the check). Makes no HTTP call. Returns the triple stored, else ''.
+
+    Guards: only a company already in Carmen Warm (warm_contact is that dict entry, matched by
+    normalize_company_for_match on employer_name, never a substring); an aggregator/relist link is
+    refused (is_aggregator_relist) and board_triple_from_url accepts only *.myworkdayjobs.com hosts;
+    a stored triple (hand-added via /ats workday) is never overwritten."""
+    try:
+        if not warm_contact:
+            return ""
+        link = job.get("job_apply_link")
+        if not link or is_aggregator_relist(link):
+            return ""
+        from workday_board import board_triple_from_url
+        board = board_triple_from_url(link)
+        if not board:
+            return ""
+        key = normalize_company_for_match(job.get("employer_name"))
+        if not key:
+            return ""
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT workday_board FROM company_identities WHERE normalized_name = ?", (key,)).fetchone()
+        if row and str(row[0] or "").strip():
+            return ""
+        display = str(warm_contact.get("raw_company") or job.get("employer_name") or "")
+        if set_company_workday_board(display, board):
+            logging.info(f"/t recorded unverified Workday board {board} for warm company {display}")
+            return board
+    except Exception as e:
+        logging.warning(f"record_workday_board_from_posting skipped: {e}")
+    return ""
+
+
 def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applied=False, workday_board=None):
     """Merge newly-learned facts about a company into the canonical company_identities record,
     keyed by normalize_company_for_match() so 'Acme Corp' and 'Acme Corp Inc.' share one row.
@@ -5864,6 +5900,7 @@ def process_single_candidate(job, force=False):
         # A company the Carmen Warm sheet already knows is read from the sheet: no live lookup, no new row.
         contact_info = get_warm_crm_contacts().get(normalize_company_for_match(job.get("employer_name")))
         alum = None if contact_info else resolve_live_alumni_at_company(job.get("employer_name"))
+        record_workday_board_from_posting(job, contact_info)
         if alum:
             score = min(100, score + 20)
             total_boost += 20
