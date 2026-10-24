@@ -492,3 +492,21 @@ def test_alumni_note_title_is_read_from_the_headline():
     bare = "LinkedIn alumni | employer filter: Gentex | Supply Chain Analyst"
     assert ra.contact_title_and_date(bare, "Gentex")[0] == "Supply Chain Analyst"
     assert ra.contact_title_and_date("LinkedIn alumni | employer filter: Gentex", "Gentex")[0] == ""
+
+
+def test_warm_linkedin_unverified_connection_true_for_import_note_with_date():
+    note = "Analyst at Acme. Connected 2024-03-05 (LinkedIn import)"
+    assert ra.is_linkedin_connection({"note": note, "raw_company": "Acme"}) is True
+
+
+def test_warm_linkedin_unverified_connection_false_for_hand_note():
+    assert ra.is_linkedin_connection({"note": "Active relationship"}) is False
+    assert ra.is_linkedin_connection({}) is False
+
+
+def test_warm_linkedin_unverified_connection_false_for_malformed_date():
+    assert ra.is_linkedin_connection({"note": "Analyst at Acme. Connected 2024-13-40 (LinkedIn import)"}) is False
+
+
+def test_warm_linkedin_unverified_connection_false_for_alumni_note():
+    assert ra.is_linkedin_connection({"note": "LinkedIn alumni | employer filter: Acme | Analyst at Acme"}) is False

@@ -4000,12 +4000,14 @@ def warm_linkedin_profile_url(*values):
     return ""
 
 
-def _linkedin_link_bit(url):
-    """`<a href='...'>LinkedIn</a>` for a card line, "" when there is no URL or it is over 500 chars."""
+def _linkedin_link_bit(url, contact=None):
+    """`<a href='...'>LinkedIn</a>` for a card line, "" when there is no URL or it is over 500 chars.
+    The text reads `LinkedIn (unverified)` unless the contact is a real LinkedIn connection."""
     attr = html.escape(str(url or "").strip(), quote=True)
     if not attr or len(attr) > 500:
         return ""
-    return f"<a href='{attr}'>LinkedIn</a>"
+    label = "LinkedIn" if referral_asks.is_linkedin_connection(contact) else "LinkedIn (unverified)"
+    return f"<a href='{attr}'>{label}</a>"
 
 
 def get_warm_crm_contacts():
@@ -6078,7 +6080,7 @@ def process_single_candidate(job, force=False, outcome=None):
                     is_clavicular = True
                     contact_name = contact_info.get("name", "Contact")
                     contact_note = contact_info.get("note", "Active relationship")
-                    _li = _linkedin_link_bit(contact_info.get("linkedin_url"))
+                    _li = _linkedin_link_bit(contact_info.get("linkedin_url"), contact_info)
                     alumni_line += (
                         f"🎯 <b>CLAVICULAR WARM REFERRAL (+30 pts):</b> "
                         f"{html.escape(contact_name)} "
@@ -6092,7 +6094,7 @@ def process_single_candidate(job, force=False, outcome=None):
                 priority_boost = min(30, priority_score * 3)
                 score = min(100, score + priority_boost)
                 total_boost += priority_boost
-                _li = _linkedin_link_bit(contact_info.get("linkedin_url"))
+                _li = _linkedin_link_bit(contact_info.get("linkedin_url"), contact_info)
                 alumni_line += (
                     f"🔥 <b>WARM REFERRAL AVAILABLE (+{priority_boost} pts):</b> "
                     f"{html.escape(contact_info.get('name', 'Contact'))} "
@@ -12492,7 +12494,8 @@ def _warm_radar_summary_text(company_raw, contact_name, contact_note, other_cont
     lines = [
         f"🤝 <b>{company}</b>",
         f"👤 <b>Warm contact:</b> {html.escape(str(contact_name or 'Contact')[:80])}{others_text}"
-        + (f" {_linkedin_link_bit(linkedin_url)}" if _linkedin_link_bit(linkedin_url) else ""),
+        + (f" {_linkedin_link_bit(linkedin_url, {'note': contact_note, 'raw_company': company_raw})}"
+           if _linkedin_link_bit(linkedin_url) else ""),
         f"📝 <i>{html.escape(str(contact_note or 'Active relationship')[:150])}</i>",
         "",
         f"{total} open roles passed the filters:",

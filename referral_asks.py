@@ -347,6 +347,15 @@ def is_placeholder_name(name) -> bool:
     return str(name or "").strip().lower() in ("", "contact")
 
 
+def is_linkedin_connection(contact):
+    """True only when the contact's note carries a real `Connected <YYYY-MM-DD>` date from the
+    LinkedIn import. Infers connection from that marker: a connection added by hand without it reads
+    as not connected (errs toward "check this link"). Pure."""
+    contact = contact or {}
+    _title, connected = contact_title_and_date(contact.get("note"), contact.get("raw_company") or contact.get("company") or "")
+    return bool(connected)
+
+
 def contact_sort_key(contact):
     """Sort key for the contacts at ONE company, best first: a real name before the placeholder, then
     higher priority, then a row with an email, then the more recent connection (a note with no date
