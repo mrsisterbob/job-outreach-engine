@@ -17931,7 +17931,23 @@ def test_ats_fetch_failures_are_reported(monkeypatch):
     assert m.fetch_ats_jobs(["solo"]) == [] and len(seen_calls) == 3
 
 
+def _strict_clock(monkeypatch):
+    """Make m.datetime.now() strictly increasing (1 ms per call) so two stamps can never land in one
+    clock tick. A subclass of the real datetime, so isinstance, strptime and arithmetic still work."""
+    real = m.datetime
+    state = {"t": real.now()}
+
+    class _TickDatetime(real):
+        @classmethod
+        def now(cls, tz=None):
+            state["t"] = state["t"] + timedelta(milliseconds=1)
+            return state["t"] if tz is None else state["t"].astimezone(tz)
+
+    monkeypatch.setattr(m, "datetime", _TickDatetime)
+
+
 def test_ats_fetch_failures_are_reported_and_warm_radar_leaves_the_failed_board_unstamped(monkeypatch):
+    _strict_clock(monkeypatch)
     h = _batch_harness(monkeypatch, 25)
     seen, failed_once = [], []
 
