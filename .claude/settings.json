@@ -13,6 +13,19 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/scope_guard.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking the edit is inside the task's scope..."
+          }
+        ]
+      }
     ]
   }
 }
