@@ -19274,3 +19274,85 @@ def test_warm_workday_board_setter_rejects_a_malformed_triple_and_never_clears_a
     with m.get_db_conn() as conn:
         assert conn.execute("SELECT workday_board FROM company_identities WHERE normalized_name = ?",
                             (m.normalize_company_for_match("BorgWarner Inc"),)).fetchone()[0] == _WD_TRIPLE
+
+
+# ---- TASK-143: /ats workday attaches a Workday board to a warm company ----
+
+class _WdResp:
+    def __init__(self, status, body):
+        self.status_code = status
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def _ats_workday_attach_harness(monkeypatch, post_result, warm=("Plante Moran",)):
+    sent, posts = [], []
+    monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: sent.append(text))
+    monkeypatch.setattr(m, "get_warm_crm_contacts",
+                        lambda: {m.normalize_company_for_match(c): {"raw_company": c, "name": "A"} for c in warm})
+
+    def fake_post(url, **kw):
+        posts.append(url)
+        if isinstance(post_result, Exception):
+            raise post_result
+        return post_result
+    monkeypatch.setattr(m.requests, "post", fake_post)
+
+    def run(text):
+        m.process_webhook_payload_async({"message": {"chat": {"id": 1}, "text": text}})
+    return sent, posts, run
+
+
+def _stored_wd(company):
+    with m.get_db_conn() as conn:
+        row = conn.execute("SELECT workday_board FROM company_identities WHERE normalized_name = ?",
+                           (m.normalize_company_for_match(company),)).fetchone()
+    return row[0] if row else None
+
+
+_WD_URL = "https://plantemoran.wd5.myworkdayjobs.com/en-US/PlanteMoran/job/Detroit/Analyst_R1"
+
+
+def test_ats_workday_attach_good_url_stores_triple_and_reports_total(monkeypatch):
+    sent, posts, run = _ats_workday_attach_harness(monkeypatch, _WdResp(200, {"total": 94}))
+    run(f"/ats workday {_WD_URL} Plante Moran")
+    assert _stored_wd("Plante Moran") == "plantemoran/wd5/PlanteMoran"
+    assert len(sent) == 1 and "94" in sent[0] and "attached" in sent[0], sent
+    assert posts == ["https://plantemoran.wd5.myworkdayjobs.com/wday/cxs/plantemoran/PlanteMoran/jobs"]
+    run(f"/ats workday {_WD_URL} Plante Moran")
+    assert "already" in sent[-1] and _stored_wd("Plante Moran") == "plantemoran/wd5/PlanteMoran"
+
+
+def test_ats_workday_attach_different_triple_replaces_and_names_old(monkeypatch):
+    sent, posts, run = _ats_workday_attach_harness(monkeypatch, _WdResp(200, {"total": 5}))
+    run(f"/ats workday {_WD_URL} Plante Moran")
+    run("/ats workday https://plantemoran.wd1.myworkdayjobs.com/Other/job/x Plante Moran")
+    assert _stored_wd("Plante Moran") == "plantemoran/wd1/Other"
+    assert "replaced plantemoran/wd5/PlanteMoran" in sent[-1], sent
+
+
+def test_ats_workday_attach_non_workday_url_stores_nothing(monkeypatch):
+    sent, posts, run = _ats_workday_attach_harness(monkeypatch, _WdResp(200, {"total": 9}))
+    run("/ats workday https://boards.greenhouse.io/acme/jobs/1 Plante Moran")
+    assert _stored_wd("Plante Moran") is None
+    assert posts == [] and "not a Workday URL" in sent[0], sent
+
+
+@pytest.mark.parametrize("result", [
+    _WdResp(422, {}), _WdResp(200, {"jobPostings": []}), _WdResp(500, {}),
+    m.requests.exceptions.Timeout("t"),
+])
+def test_ats_workday_attach_dead_board_stores_nothing(monkeypatch, result):
+    sent, posts, run = _ats_workday_attach_harness(monkeypatch, result)
+    run(f"/ats workday {_WD_URL} Plante Moran")
+    assert _stored_wd("Plante Moran") is None
+    assert len(sent) == 1 and "did not answer" in sent[0] and "attached" not in sent[0], sent
+
+
+def test_ats_workday_attach_company_not_in_warm_stores_nothing(monkeypatch):
+    sent, posts, run = _ats_workday_attach_harness(monkeypatch, _WdResp(200, {"total": 9}))
+    run(f"/ats workday {_WD_URL} Gentex")
+    assert _stored_wd("Gentex") is None and _stored_wd("Plante Moran") is None
+    assert posts == [] and "not in Carmen Warm" in sent[0], sent

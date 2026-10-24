@@ -12581,6 +12581,73 @@ WORKDAY_LOCATION_HINT = "Michigan"
 WORKDAY_FINANCE_DETAIL_FETCH_CAP = 12
 
 
+def probe_workday_board_total(board):
+    """Ask a Workday board how many postings it has. Returns (total, error): total is an int on HTTP
+    200 with a numeric `total`, else None with a short reason. Unfiltered on purpose (empty
+    searchText) - fetch_workday_jobs filters by search term and returns [] for a dead board and an
+    unmatched search alike, so it cannot tell the two apart."""
+    tenant, wd_host, site = str(board).split("/")
+    url = f"https://{tenant}.{wd_host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
+    headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": WORKDAY_USER_AGENT}
+    try:
+        res = requests.post(url, json={"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": ""},
+                            headers=headers, timeout=15)
+    except Exception as e:
+        return None, f"request failed ({type(e).__name__})"
+    if res.status_code == 422:
+        return None, "HTTP 422 - the site path is wrong or the tenant is unknown"
+    if res.status_code != 200:
+        return None, f"HTTP {res.status_code}"
+    try:
+        total = res.json().get("total")
+    except Exception:
+        return None, "the answer was not JSON"
+    if isinstance(total, bool) or not isinstance(total, int):
+        return None, "the answer carried no posting count"
+    return total, ""
+
+
+def attach_workday_board_reply(arg):
+    """/ats workday <workday url> <warm company>: parse the triple, confirm the board answers with a
+    real posting count, store it against that Carmen Warm company. Returns the HTML reply; changes
+    nothing unless every check passes."""
+    from workday_board import board_triple_from_url
+    tokens = str(arg or "").split()
+    url_tokens = [t for t in tokens if "." in t and ("/" in t or "myworkday" in t.lower())]
+    if not url_tokens:
+        return "⚠️ Usage: /ats workday &lt;Workday job URL&gt; &lt;warm company&gt;. Nothing changed."
+    url = url_tokens[0]
+    company_input = " ".join(t for t in tokens if t != url).strip()
+    if not company_input:
+        return "⚠️ Which warm company is this board for? /ats workday &lt;URL&gt; &lt;company&gt;. Nothing changed."
+    board = board_triple_from_url(url)
+    if not board:
+        return f"⚠️ {html.escape(url)} is not a Workday URL I can read a tenant/site from. Nothing changed."
+    key = normalize_company_for_match(company_input)
+    warm = get_warm_crm_contacts() or {}
+    if not key or key not in warm:
+        return f"⚠️ {html.escape(company_input)} is not in Carmen Warm. Nothing changed."
+    display = str(warm[key].get("raw_company") or company_input)
+    total, err = probe_workday_board_total(board)
+    if total is None:
+        return f"⚠️ {html.escape(board)} did not answer: {html.escape(err)}. Nothing stored for {html.escape(display)}."
+    old = ""
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT workday_board FROM company_identities WHERE normalized_name = ?", (key,)).fetchone()
+        old = str(row[0] or "").strip() if row else ""
+    except Exception:
+        old = ""
+    if old == board:
+        return f"ℹ️ {html.escape(display)} already has {html.escape(board)} ({total} postings). No change."
+    if not set_company_workday_board(display, board):
+        return f"⚠️ Could not store {html.escape(board)} for {html.escape(display)}."
+    if old:
+        return (f"✅ {html.escape(display)}: replaced {html.escape(old)} with {html.escape(board)} "
+                f"({total} postings on the board).")
+    return f"✅ {html.escape(display)}: attached {html.escape(board)} ({total} postings on the board)."
+
+
 def fetch_workday_jobs(board):
     """Pull postings from one Workday tenant's public CXS API.
 
@@ -16700,12 +16767,14 @@ def process_webhook_payload_async(data):
                     send_telegram_message(chat_id, message)
             return
 
-        ats_match = re.match(r"^/ats(?:\s+(on|off|list|add|remove)\s*(.*))?$", text, re.IGNORECASE)
+        ats_match = re.match(r"^/ats(?:\s+(on|off|list|add|remove|workday)\s*(.*))?$", text, re.IGNORECASE)
         if ats_match:
             action = (ats_match.group(1) or "list").lower()
             arg = (ats_match.group(2) or "").strip().lower()
             slugs = safe_list(get_filter("ats_company_slugs", []))
-            if action == "on":
+            if action == "workday":
+                send_telegram_message(chat_id, attach_workday_board_reply(ats_match.group(2)))
+            elif action == "on":
                 set_filter("ats_watchlist_enabled", True)
                 send_telegram_message(chat_id, f"✅ <b>ATS watchlist ON</b> - /t will now also source {len(slugs)} company boards directly.")
             elif action == "off":
@@ -16766,7 +16835,8 @@ def process_webhook_payload_async(data):
                     chat_id,
                     f"📋 <b>ATS Watchlist ({state})</b> - {len(slugs)} companies\n\n"
                     f"<code>{html.escape(', '.join(slugs)) or 'empty'}</code>\n\n"
-                    "/ats on · /ats off · /ats add &lt;slug&gt; · /ats remove &lt;slug&gt;"
+                    "/ats on · /ats off · /ats add &lt;slug&gt; · /ats remove &lt;slug&gt;\n"
+                    "/ats workday &lt;Workday job URL&gt; &lt;warm company&gt;"
                 )
             return
 
@@ -17387,7 +17457,7 @@ def process_webhook_payload_async(data):
                 "/track [a-h] [bullets] - Switch a card's resume track (bare /track shows the list)\n"
                 "/refs - Your references, tap-to-copy for application forms (/refs add, /refs remove)\n"
                 "/gear - Search breadth 1-5 (one dial for all sources)\n"
-                "/ats - Company board watchlist (on/off/add/remove)\n"
+                "/ats - Company board watchlist (on/off/add/remove/workday)\n"
                 "/ghost - Applied rows past day 21, 10 per page (/ghost 2), and the automatic burial switch (on/off)\n"
                 "/remote - Keyless remote feeds (on/off)\n"
                 "/poll - Run the email poll cycle now (scheduled: daily)\n"
