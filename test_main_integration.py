@@ -19648,3 +19648,56 @@ def test_warm_screening_listed_per_company_cannot_exceed_the_referral_ask_cap():
     # TASK-154 asked for ==, but 2 != 5 today and referral_asks.py is outside this task's scope. The
     # invariant that matters: one run's listed roles for a company always fit one ask.
     assert warm_screen_plan.LISTED_PER_COMPANY <= m.referral_asks.REFERRAL_ASK_MAX_ROLES
+
+
+# ---- TASK-155: /w skips every role at a company applied to in the last 14 days ----
+
+def _applied_skip_harness(monkeypatch, tw_rows, boards=None):
+    """_screen_harness with the Tetiana Warm get_followups response (tab TW) faked in crm_post."""
+    h = _screen_harness(monkeypatch, boards or {"Acme Robotics": [("Operations Analyst", "Chicago"),
+                                                                  ("Supply Chain Analyst", "Chicago")]})
+    warm_post = m.crm_post
+
+    def crm(payload, **kw):
+        if payload.get("action") == "get_followups" and payload.get("tab") == "TW":
+            return _AskResp({"status": "success", "followups": tw_rows})
+        return warm_post(payload, **kw)
+
+    monkeypatch.setattr(m, "crm_post", crm)
+    monkeypatch.setitem(m._APPLIED_DATES_CACHE, "fetched_at", 0.0)
+    monkeypatch.setitem(m._APPLIED_DATES_CACHE, "data", {})
+    return h
+
+
+def _days_ago(n):
+    return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def test_warm_applied_skip_recent_application_means_no_gemini_no_card_and_board_stamped(monkeypatch):
+    h = _applied_skip_harness(monkeypatch, [{"company": "Acme Robotics", "date_added": _days_ago(5)}])
+    h.run()
+    assert h.gemini_calls == [] and h.rows() == []
+    assert not m.is_job_seen_db(m.generate_dedup_hash("Acme Robotics", "Operations Analyst"))
+    assert _scanned_at()["acmerobotics"]
+
+
+def test_warm_applied_skip_application_20_days_ago_does_not_suppress(monkeypatch):
+    h = _applied_skip_harness(monkeypatch, [{"company": "Acme Robotics", "date_added": _days_ago(20)}])
+    text = h.run()
+    assert h.gemini_calls and h.rows()
+    assert "applied to in the last" not in text
+
+
+def test_warm_applied_skip_no_row_or_malformed_date_is_unaffected_and_never_raises(monkeypatch):
+    h = _applied_skip_harness(monkeypatch, [{"company": "Other Co", "date_added": _days_ago(1)},
+                                            {"company": "Acme Robotics", "date_added": "soon"},
+                                            {"company": "", "date_added": _days_ago(1)}])
+    text = h.run()
+    assert h.gemini_calls and h.rows()
+    assert "applied to in the last" not in text
+
+
+def test_warm_applied_skip_closing_message_names_the_company_and_count(monkeypatch):
+    h = _applied_skip_harness(monkeypatch, [{"company": "Acme Robotics", "date_added": _days_ago(3)}])
+    text = h.run()
+    assert "1 company skipped: applied to in the last 14 days (Acme Robotics)" in text, text
