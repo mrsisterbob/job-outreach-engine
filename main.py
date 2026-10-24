@@ -27,6 +27,7 @@ from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 import resume_engine
 import referral_asks
+import warm_company_kind
 import warm_jsearch_plan
 import warm_screen_plan
 import role_region
@@ -14852,6 +14853,8 @@ def run_warm_radar_scan(chat_id=None):
     no_board_candidates = []   # the same companies as (key, display name, warm contact count) for the JSearch planner
     unchecked_keys = []     # never looked up, or the last miss is older than the retry window
     not_company = 0
+    not_employer_kinds = {}   # school / church / law firm / cleaning -> how many entries (never probed)
+    not_employer_names = []
     contacts_by_bucket = {"scanned": 0, "no_board": 0, "unchecked": 0, "not_company": 0}
     for key, contact in warm_contacts.items():
         people = contact.get("count") or 1
@@ -14861,6 +14864,11 @@ def run_warm_radar_scan(chat_id=None):
         display = contact.get("raw_company") or key
         if not is_probable_company_name(display):
             not_company += 1  # counted, never probed
+            contacts_by_bucket["not_company"] += people
+        elif warm_company_kind.non_employer_kind(display):
+            kind = warm_company_kind.non_employer_kind(display)
+            not_employer_kinds[kind] = not_employer_kinds.get(kind, 0) + 1
+            not_employer_names.append(display)
             contacts_by_bucket["not_company"] += people
         elif checked_on.get(key, "") > retry_cutoff:
             checked_no_board.append(display)
@@ -14872,7 +14880,11 @@ def run_warm_radar_scan(chat_id=None):
     # Least-recently-attempted first, never-attempted ("") first of all; sorted() is stable, so
     # ties keep warm-contact order. A lookup that errored is "unchecked" again next run, and
     # without this rotation the same first batch would be retried forever.
-    unchecked_keys.sort(key=lambda k: attempted_at.get(k, ""))
+    # Never-attempted companies go biggest warm network first (count, then priority_score), so the
+    # 20-per-run batch is not whatever sits at the end of the sheet.
+    unchecked_keys = warm_company_kind.lookup_order(
+        (k, warm_contacts[k].get("count") or 1, warm_contacts[k].get("priority_score") or 0, attempted_at.get(k, ""))
+        for k in unchecked_keys)
     unchecked_all = [warm_contacts[k].get("raw_company") or k for k in unchecked_keys]
     # A company whose lookup from an earlier /w is still running is not chosen again. Choosing and
     # marking happen under one lock so two overlapping /w runs cannot take the same company.
@@ -14910,6 +14922,10 @@ def run_warm_radar_scan(chat_id=None):
                              if names else f"Checked, no public job board found: {len(checked_no_board)}")
             if not_company:
                 lines.append(f"{not_company} warm entries are not company names")
+            if not_employer_names:
+                parts = ", ".join(f"{not_employer_kinds[k]} {k}" for k in warm_company_kind.KINDS if not_employer_kinds.get(k))
+                lines.append(f"{len(not_employer_names)} skipped as not employers: {parts} "
+                             f"(e.g. {', '.join(html.escape(n) for n in not_employer_names[:5])})")
             if unplaced_line:
                 lines.append(unplaced_line)
             if coverage_line:
