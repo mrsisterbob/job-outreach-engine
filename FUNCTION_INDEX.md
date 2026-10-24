@@ -10,6 +10,27 @@ grep -i email FUNCTION_INDEX.md
 grep -i "contact" FUNCTION_INDEX.md
 ```
 
+## `.claude/hooks/queue_guard_common.py` — 10 defs, 129 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 17 | `norm` | Absolute, slash-normalised, case-folded path with .. and . resolved. |
+| 29 | `cut_at_worktrees` | Main folder implied by a path that sits under .worktrees, else None. |
+| 38 | `main_folders` | Candidate main folders: CLAUDE_PROJECT_DIR first, then payload cwd cut at .worktrees. |
+| 52 | `guards_off` | _(no docstring)_ |
+| 56 | `active_task_files` | Task files in .queue/active/ for this id. Trailing hyphen: TASK-7 never matches TASK-71. |
+| 68 | `read_scope` | List of scope entries from the first front-matter block, or None if absent. |
+| 87 | `scope_matches` | Whole-file match. Entries are repo-relative (resolved inside the worktree) or absolute. |
+| 106 | `log_deny` | _(no docstring)_ |
+| 114 | `deny` | _(no docstring)_ |
+| 121 | `run_failing_open` | Run a guard's main(payload); any exception, bad stdin or non-dict payload is an allow. |
+
+## `.claude/hooks/scope_guard.py` — 1 defs, 60 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 20 | `decide` | _(no docstring)_ |
+
 ## `.claude/hooks/verify_suites.py` — 13 defs, 386 lines
 
 | Line | Name | Summary |
@@ -901,4 +922,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**742 definitions across 28 files + Code.gs.**
+**753 definitions across 30 files + Code.gs.**
