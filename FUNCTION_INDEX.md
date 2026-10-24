@@ -10,6 +10,17 @@ grep -i email FUNCTION_INDEX.md
 grep -i "contact" FUNCTION_INDEX.md
 ```
 
+## `.claude/hooks/git_write_guard.py` — 6 defs, 209 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 38 | `split_segments` | Split on unquoted && \|\| ; \| & and newlines. |
+| 67 | `classify` | Return the denied subcommand description for words after 'git', else None. |
+| 96 | `branch_write` | Description if `git branch <args>` writes, else None. Read-only = flags plus --list patterns. |
+| 125 | `drop_heredoc_bodies` | _(no docstring)_ |
+| 143 | `find_git_write` | _(no docstring)_ |
+| 176 | `decide` | _(no docstring)_ |
+
 ## `.claude/hooks/queue_guard_common.py` — 10 defs, 129 lines
 
 | Line | Name | Summary |
@@ -922,4 +933,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**753 definitions across 30 files + Code.gs.**
+**759 definitions across 31 files + Code.gs.**
