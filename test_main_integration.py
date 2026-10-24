@@ -16913,6 +16913,49 @@ def test_warm_radar_review_followups_w_says_how_many_warm_contacts_have_no_compa
     assert "no company" not in h3.run()
 
 
+def _mark_board_checked_today(name):
+    m.upsert_company_identity(name)
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE company_identities SET board_checked_at = ? WHERE normalized_name = ?",
+                     (m.datetime.now().strftime("%Y-%m-%d"), m.normalize_company_for_match(name)))
+        conn.commit()
+
+
+def test_warm_board_coverage_sums_contacts_per_bucket(monkeypatch):
+    companies = (["Acme Robotics"] * 3 + ["Nopeboard Labs"] * 5 + ["Freshlook Systems"] * 7
+                 + ["cousin"] * 2 + [""] * 4)
+    h = _WarmRadarHarness(monkeypatch, companies)
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    _mark_board_checked_today("Nopeboard Labs")
+    text = h.run()
+    assert ("Warm contacts by job board: 3 at a company whose board /w scans, "
+            "5 at a company checked with no public job board found, "
+            "7 at a company not looked at yet, "
+            "2 at an entry that is not a company name, 4 with no company") in text, text
+    assert "4 warm contacts have no company" in text
+
+
+def test_warm_board_coverage_errored_board_fetch_still_counts_as_scanned(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"] * 4 + ["Freshlook Systems"] * 2)
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+
+    def boom(slugs, **kw):
+        raise RuntimeError("board down")
+
+    monkeypatch.setattr(m, "fetch_ats_jobs", boom)
+    text = h.run()
+    assert "1 board could not be fetched" in text, text
+    assert "4 at a company whose board /w scans, 0 at a company checked with no public job board found, 2 at a company not looked at yet" in text, text
+
+
+def test_warm_board_coverage_prints_nothing_when_every_contact_has_a_board(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"] * 3 + ["Globex Systems"] * 2)
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    m.upsert_company_identity("Globex Systems", ats_slug="globexsystems")
+    text = h.run()
+    assert "Warm contacts by job board" not in text and "no public job board" not in text, text
+
+
 def test_warm_radar_review_followups_w_with_only_unplaced_rows_still_names_the_count(monkeypatch):
     h = _WarmRadarHarness(monkeypatch, ["", "", ""])
     text = h.run()
