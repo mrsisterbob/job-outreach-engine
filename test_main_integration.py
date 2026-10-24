@@ -5504,14 +5504,10 @@ def test_stacking_cap_leaves_an_under_cap_stack_untouched(run_candidate):
 
 
 def test_card_boost_annotation_reflects_the_capped_layer2_delta_not_the_raw_sum(run_candidate, monkeypatch):
-    """Layer-1 +10, plus an alum (+20) and a priority-10 warm contact (+30) = +50 of Layer-2
-    signal on offer. The cap lets only +20 of it actually move the score, and the card's (+N)
-    must show that +20 - so 'score - (+N)' still reconstructs the Gemini+Layer-1 number."""
-    monkeypatch.setattr(
-        m, "resolve_live_alumni_at_company",
-        lambda *a, **k: {"name": "Dana Reyes", "linkedin_url": "https://linkedin.com/in/dana",
-                         "headline": "Ops Lead"},
-    )
+    """Layer-1 +10, plus a priority-10 warm contact (+30) = +40 of signal on offer (a warm company
+    skips the live alum lookup, so no +20 on top). The cap lets only +20 of it actually move the
+    score, and the card's (+N) must show that +20 - so 'score - (+N)' still reconstructs the
+    Gemini+Layer-1 number."""
     monkeypatch.setattr(
         m, "get_warm_crm_contacts",
         lambda: {m.normalize_company_for_match("Acme Co"):
@@ -5578,6 +5574,54 @@ def test_wildcard_bonus_does_not_open_the_clavicular_gate(run_candidate, monkeyp
                            job_description="logistics ops role")
     assert result["is_clavicular"] is False
     assert result["score"] == 70 and result["score_boost"] == 2
+
+
+def test_warm_company_candidate_skips_live_lookup_and_enqueues_no_row(run_candidate, monkeypatch):
+    calls, payloads = [], []
+    monkeypatch.setattr(m, "resolve_live_alumni_at_company",
+                        lambda *a, **k: calls.append(a) or {"name": "Dana", "linkedin_url": "https://x.co/d", "headline": "h"})
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p) or True)
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Sam", "raw_company": "Acme Co", "note": "n", "priority_score": 5, "count": 3}},
+    )
+    result = run_candidate(gemini_base=60, layer1_bonus=0)
+    assert calls == []
+    assert not [p for p in payloads if "quick_add" in str(p) or "CW" in str(p)]
+    assert "Hope Alum" not in result["alumni_line"]
+    # priority 5 -> +15 warm boost, no +20 live-alum boost, under the 30 cap
+    assert result["score"] == 75
+
+
+def test_warm_company_candidate_card_says_how_many_warm_contacts(run_candidate, monkeypatch):
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Sam", "raw_company": "Acme Co", "note": "n", "priority_score": 5, "count": 181}},
+    )
+    line = run_candidate(gemini_base=60, layer1_bonus=0)["alumni_line"]
+    assert "181 warm contacts there" in line
+    assert not __import__("pipeline_utils").negative_language_hits(line)
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Sam", "raw_company": "Acme Co", "note": "n", "priority_score": 5, "count": 1}},
+    )
+    assert "1 warm contact there" in run_candidate(gemini_base=60, layer1_bonus=0)["alumni_line"]
+
+
+def test_warm_company_candidate_fallback_keeps_live_path_when_sheet_has_no_one(run_candidate, monkeypatch):
+    calls, payloads = [], []
+    monkeypatch.setattr(m, "resolve_live_alumni_at_company",
+                        lambda *a, **k: calls.append(a) or {"name": "Dana", "linkedin_url": "https://x.co/d", "headline": "h"})
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p) or True)
+    monkeypatch.setattr(m, "get_warm_crm_contacts", lambda: {m.normalize_company_for_match("Other Corp"): {"name": "Z", "count": 2}})
+    result = run_candidate(gemini_base=60, layer1_bonus=0)
+    assert len(calls) == 1
+    assert len(payloads) == 1
+    assert "Hope Alum Connection" in result["alumni_line"]
+    assert result["score"] == 80
 
 
 # ---- Carmen Cold as the hot seat: inbound-reply routing (route_inbound_reply_to_crm) ----
