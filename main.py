@@ -3983,6 +3983,31 @@ def get_applied_crm_dates():
         logging.error(f"get_applied_crm_dates Error: {e}")
     return _APPLIED_DATES_CACHE["data"]
 
+def warm_linkedin_profile_url(*values):
+    """The first of `values` that is an http(s) URL on linkedin.com (or a subdomain) whose path holds
+    /in/ (a person's profile), else "". A company page, a bare note or a blank gives "". Pure."""
+    for value in values:
+        raw = str(value or "").strip()
+        if not raw.lower().startswith(("http://", "https://")):
+            continue
+        try:
+            parsed = urllib.parse.urlparse(raw)
+            host = (parsed.hostname or "").lower()
+        except ValueError:
+            continue
+        if (host == "linkedin.com" or host.endswith(".linkedin.com")) and "/in/" in parsed.path.lower():
+            return raw
+    return ""
+
+
+def _linkedin_link_bit(url):
+    """`<a href='...'>LinkedIn</a>` for a card line, "" when there is no URL or it is over 500 chars."""
+    attr = html.escape(str(url or "").strip(), quote=True)
+    if not attr or len(attr) > 500:
+        return ""
+    return f"<a href='{attr}'>LinkedIn</a>"
+
+
 def get_warm_crm_contacts():
     """Fetch every Carmen Warm CRM contact keyed by normalize_company_for_match(company). Each value
     is the BEST contact at that company (a real name before the "Contact" placeholder, then highest
@@ -4039,7 +4064,10 @@ def get_warm_crm_contacts():
                 "email": str(row.get("email") or "").strip(),
                 "note": row.get("note") or "Active relationship",
                 "priority_score": normalize_priority_value(row.get("raw_priority", row.get("priority"))),
-                "sheet_uuid": row.get("sheet_uuid", "")
+                "sheet_uuid": row.get("sheet_uuid", ""),
+                # Only a person's /in/ profile; a URL typed in the name column counts when the
+                # LinkedIn / Source cell has none. It is a link on the card, never a greeting.
+                "linkedin_url": warm_linkedin_profile_url(row.get("source_link"), raw_name),
             }
             # "Group", "Holdings Inc", "Co." normalize to "" - not a company, so never a shared key
             if not company_key:
@@ -6050,9 +6078,11 @@ def process_single_candidate(job, force=False, outcome=None):
                     is_clavicular = True
                     contact_name = contact_info.get("name", "Contact")
                     contact_note = contact_info.get("note", "Active relationship")
+                    _li = _linkedin_link_bit(contact_info.get("linkedin_url"))
                     alumni_line += (
                         f"🎯 <b>CLAVICULAR WARM REFERRAL (+30 pts):</b> "
                         f"{html.escape(contact_name)} "
+                        f"{_li + ' ' if _li else ''}"
                         f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))}, {warm_count_text})</i>\n"
                         f"📝 <b>Note:</b> {html.escape(contact_note)}\n"
                     )
@@ -6062,9 +6092,11 @@ def process_single_candidate(job, force=False, outcome=None):
                 priority_boost = min(30, priority_score * 3)
                 score = min(100, score + priority_boost)
                 total_boost += priority_boost
+                _li = _linkedin_link_bit(contact_info.get("linkedin_url"))
                 alumni_line += (
                     f"🔥 <b>WARM REFERRAL AVAILABLE (+{priority_boost} pts):</b> "
                     f"{html.escape(contact_info.get('name', 'Contact'))} "
+                    f"{_li + ' ' if _li else ''}"
                     f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10, {warm_count_text})</i>\n"
                     f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
                 )
@@ -12446,7 +12478,7 @@ def send_warm_radar_card(job, contact_name, contact_note, sheet_uuid, other_cont
 WARM_RADAR_MESSAGE_LIMIT = 3900   # characters of HTML text per summary; Telegram's hard limit is 4096
 
 
-def _warm_radar_summary_text(company_raw, contact_name, contact_note, other_contacts, roles, total_roles):
+def _warm_radar_summary_text(company_raw, contact_name, contact_note, other_contacts, roles, total_roles, linkedin_url=""):
     """The summary text for exactly these `roles`, plus the footer "and M more not listed" for the
     rest of `total_roles`. Pure; the string is never sliced (a slice can land inside a tag or an
     entity and Telegram answers 400), so the caller picks how many roles fit first."""
@@ -12459,7 +12491,8 @@ def _warm_radar_summary_text(company_raw, contact_name, contact_note, other_cont
     total = max(int(total_roles or 0), len(roles))
     lines = [
         f"🤝 <b>{company}</b>",
-        f"👤 <b>Warm contact:</b> {html.escape(str(contact_name or 'Contact')[:80])}{others_text}",
+        f"👤 <b>Warm contact:</b> {html.escape(str(contact_name or 'Contact')[:80])}{others_text}"
+        + (f" {_linkedin_link_bit(linkedin_url)}" if _linkedin_link_bit(linkedin_url) else ""),
         f"📝 <i>{html.escape(str(contact_note or 'Active relationship')[:150])}</i>",
         "",
         f"{total} open roles passed the filters:",
