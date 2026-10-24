@@ -789,6 +789,15 @@ grep -i "contact" FUNCTION_INDEX.md
 | 43 | `build` | _(no docstring)_ |
 | 60 | `main` | _(no docstring)_ |
 
+## `scripts/time_crm_reads.py` — 4 defs, 65 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 20 | `_load_main` | _(no docstring)_ |
+| 25 | `_default_timeout` | _(no docstring)_ |
+| 29 | `time_one` | Returns (line, ok) for one tab. |
+| 53 | `main` | _(no docstring)_ |
+
 ## `skills_footer.py` — 6 defs, 120 lines
 
 | Line | Name | Summary |
@@ -856,4 +865,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**717 definitions across 24 files + Code.gs.**
+**721 definitions across 25 files + Code.gs.**
