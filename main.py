@@ -27,6 +27,7 @@ from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 import resume_engine
 import referral_asks
+import warm_big_companies
 import warm_company_kind
 import warm_jsearch_plan
 import warm_screen_plan
@@ -14892,27 +14893,33 @@ def run_warm_radar_scan(chat_id=None):
     not_employer_kinds = {}   # school / church / law firm / cleaning -> how many entries (never probed)
     not_employer_names = []
     contacts_by_bucket = {"scanned": 0, "no_board": 0, "unchecked": 0, "not_company": 0}
+    big_rows = []   # (display, contact count, bucket) per company, for the 10+ report; "scanned" = a cached board exists, not "fetched OK this run"
     for key, contact in warm_contacts.items():
         people = contact.get("count") or 1
         if key in scanned_keys:
             contacts_by_bucket["scanned"] += people
+            big_rows.append((contact.get("raw_company") or key, people, "scanned"))
             continue
         display = contact.get("raw_company") or key
         if not is_probable_company_name(display):
             not_company += 1  # counted, never probed
             contacts_by_bucket["not_company"] += people
+            big_rows.append((display, people, "not_company"))
         elif warm_company_kind.non_employer_kind(display):
             kind = warm_company_kind.non_employer_kind(display)
             not_employer_kinds[kind] = not_employer_kinds.get(kind, 0) + 1
             not_employer_names.append(display)
             contacts_by_bucket["not_company"] += people
+            big_rows.append((display, people, "not_company"))
         elif checked_on.get(key, "") > retry_cutoff:
             checked_no_board.append(display)
             no_board_candidates.append((key, display, people))
             contacts_by_bucket["no_board"] += people
+            big_rows.append((display, people, "no_board"))
         else:
             unchecked_keys.append(key)
             contacts_by_bucket["unchecked"] += people
+            big_rows.append((display, people, "unchecked"))
     # Least-recently-attempted first, never-attempted ("") first of all; sorted() is stable, so
     # ties keep warm-contact order. A lookup that errored is "unchecked" again next run, and
     # without this rotation the same first batch would be retried forever.
@@ -14966,6 +14973,7 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(unplaced_line)
             if coverage_line:
                 lines.append(coverage_line)
+            lines += warm_big_companies.big_company_report(big_rows)
             return lines
 
         jsearch_headers, jsearch_url = build_jsearch_request_config() if no_board_candidates else ({}, None)

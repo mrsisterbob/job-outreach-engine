@@ -19966,3 +19966,16 @@ def test_warm_linkedin_unverified_card_labels_by_connection(monkeypatch):
 def test_warm_linkedin_unverified_no_link_no_label(monkeypatch):
     text = _li_card(monkeypatch, [_li_row("Dana West", "Acme Robotics", "")])
     assert "Dana West" in text and "unverified" not in text and ">LinkedIn" not in text, text
+
+
+def test_warm_big_companies_closing_message_names_big_companies(monkeypatch):
+    companies = ["Bigboard Corp"] * 12 + ["Nopeboard Labs"] * 11 + ["Smallco Inc"] * 3
+    h = _WarmRadarHarness(monkeypatch, companies)
+    m.upsert_company_identity("Bigboard Corp", ats_slug="bigboardcorp")
+    m.upsert_company_identity("Smallco Inc", ats_slug="smallcoinc")
+    h.run()                  # first /w looks Nopeboard Labs up and records the miss
+    text = h.run()
+    assert "Biggest warm companies (10+ contacts): 23. 12 have a board, 11 have none, 0 not looked up yet." in text
+    assert "• Bigboard Corp (12) - board scanned" in text
+    assert "• Nopeboard Labs (11) - no board found" in text
+    assert "Smallco" not in text.split("Biggest warm companies")[1]
