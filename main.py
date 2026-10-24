@@ -3268,6 +3268,8 @@ _WARM_CRM_CACHE = {"data": {}, "unplaced": [], "fetched_at": 0.0}
 _WARM_CRM_CACHE_TTL_SECONDS = 300
 _APPLIED_CRM_CACHE = {"data": set(), "fetched_at": 0.0}
 _APPLIED_CRM_CACHE_TTL_SECONDS = 300
+# Own cache for get_applied_crm_dates ({company key: latest date_added}); /t's set above is untouched.
+_APPLIED_DATES_CACHE = {"data": {}, "fetched_at": 0.0}
 # Separate cache from _APPLIED_CRM_CACHE: that one suppresses whole COMPANIES already applied to
 # (Tetiana Warm), while this one is keyed company+title and answers a different question - "is this
 # exact role already a row in a job tab?" A company can have one role in Tetiana Cold and another
@@ -3906,6 +3908,41 @@ def get_applied_crm_companies():
     except Exception as e:
         logging.error(f"get_applied_crm_companies Error: {e}")
     return _APPLIED_CRM_CACHE["data"]
+
+def get_applied_crm_dates():
+    """{normalize_company_for_match(company): latest YYYY-MM-DD} from the Tetiana Warm tab.
+
+    APPROXIMATE: the date is `date_added` (Column A), when the row was ADDED to Tetiana Warm, which
+    is when it was moved there, not necessarily the day the application was submitted. No other
+    column holds an applied date, so a 14-day skip built on it can run a few days either way.
+    Rows with no company or a malformed date are skipped; a failed read returns the last value."""
+    now = time.time()
+    if now - _APPLIED_DATES_CACHE["fetched_at"] < _APPLIED_CRM_CACHE_TTL_SECONDS:
+        return _APPLIED_DATES_CACHE["data"]
+    try:
+        res = crm_post({"action": "get_followups", "tab": "TW"})
+        if not res or res.status_code != 200:
+            return _APPLIED_DATES_CACHE["data"]
+        data = res.json()
+        if data.get("status") != "success":
+            return _APPLIED_DATES_CACHE["data"]
+        dates = {}
+        for row in data.get("followups", []):
+            key = normalize_company_for_match(str(row.get("company") or "").strip())
+            raw_date = str(row.get("date_added") or "").strip()[:10]
+            if not key:
+                continue
+            try:
+                datetime.strptime(raw_date, "%Y-%m-%d")
+            except ValueError:
+                continue
+            if raw_date > dates.get(key, ""):
+                dates[key] = raw_date
+        _APPLIED_DATES_CACHE["data"] = dates
+        _APPLIED_DATES_CACHE["fetched_at"] = now
+    except Exception as e:
+        logging.error(f"get_applied_crm_dates Error: {e}")
+    return _APPLIED_DATES_CACHE["data"]
 
 def get_warm_crm_contacts():
     """Fetch every Carmen Warm CRM contact keyed by normalize_company_for_match(company). Each value
@@ -14996,6 +15033,15 @@ def run_warm_radar_scan(chat_id=None):
         failed_companies = 0
         blocked_slugs = set()
         today_date = datetime.now().date()
+        # Companies applied to in the last 14 days are not listed at all (the exact tracked role was
+        # already skipped above; this covers the OTHER roles). Not screened, not stamped into
+        # seen_jobs; their boards stay in scanned_slugs, so they are stamped scanned. The date is
+        # approximate (see get_applied_crm_dates).
+        applied_dates = get_applied_crm_dates()
+        recent_keys = [gk for gk in groups if warm_screen_plan.applied_recently(applied_dates, gk, today_date)]
+        applied_skipped = [groups[gk]["company"] for gk in recent_keys]
+        for gk in recent_keys:
+            del groups[gk]
         roles_by_company = {gk: [r for r in g["roles"] if r.get("job")] for gk, g in groups.items()}
         memo = _warm_screen_memo_read([r["job_hash"] for rs in roles_by_company.values() for r in rs])
         to_screen = warm_screen_plan.pick_to_screen(roles_by_company, memo, today_date)
@@ -15174,6 +15220,10 @@ def run_warm_radar_scan(chat_id=None):
             referral_line = _referral_summary_line(referral_summary)
             if referral_line:
                 lines.append(referral_line)
+            if applied_skipped:
+                names_text, _used = _warm_radar_name_list(sorted(applied_skipped), 5)
+                lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
+                             f"applied to in the last {warm_screen_plan.APPLIED_SKIP_DAYS} days ({names_text})")
             lines += _skipped_report()
             send_telegram_message(chat_id, "\n".join(lines))
         return match_count
