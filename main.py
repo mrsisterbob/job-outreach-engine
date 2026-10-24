@@ -5648,9 +5648,15 @@ class FunnelTrace:
         return f"{self.raw} raw -> {self.passed} passed | " + " · ".join(parts)
 
 
-def passes_strict_filter(job, trace=None):
+def passes_strict_filter(job, trace=None, *, check_geography=True, check_company_suppression=True):
     """True when a job clears every hard gate. `trace`, if given, records WHICH gate rejected it -
-    see FunnelTrace above for why that is worth threading through."""
+    see FunnelTrace above for why that is worth threading through.
+
+    Two keyword-only switches skip a GROUP of gates without reordering any (first-failure counts in
+    `trace.reasons` depend on the order). Defaults keep every existing caller's behaviour:
+      check_company_suppression: already_applied, company_cooldown.
+      check_geography: out_of_state, city_allowlist.
+    A switched-off gate records nothing. Every other gate is always on."""
     def reject(reason):
         if trace is not None:
             trace.note(reason)
@@ -5681,13 +5687,14 @@ def passes_strict_filter(job, trace=None):
                      f"({str(job.get('job_apply_link') or '')[:60]})")
         return reject("aggregator_link")
 
-    if is_company_on_cooldown(company):
-        return reject("company_cooldown")
-    applied_companies = get_applied_crm_companies()
-    clean_company = normalize_company_for_match(company)
-    if company in applied_companies or clean_company in applied_companies:
-        logging.info(f"[EXCLUDED] {company} is already in Tetiana Warm (applied).")
-        return reject("already_applied")
+    if check_company_suppression:
+        if is_company_on_cooldown(company):
+            return reject("company_cooldown")
+        applied_companies = get_applied_crm_companies()
+        clean_company = normalize_company_for_match(company)
+        if company in applied_companies or clean_company in applied_companies:
+            logging.info(f"[EXCLUDED] {company} is already in Tetiana Warm (applied).")
+            return reject("already_applied")
 
     min_sal_floor = safe_int(get_filter("min_salary"), 50000)
     if max_sal > 0 and max_sal < min_sal_floor:
@@ -5695,7 +5702,7 @@ def passes_strict_filter(job, trace=None):
 
     # Same-named city in another state (e.g. Birmingham AL vs. Birmingham MI) would otherwise
     # pass the city substring check below - reject it first when the API told us the state.
-    if state and state not in ("mi", "michigan"):
+    if check_geography and state and state not in ("mi", "michigan"):
         return reject("out_of_state")
 
     valid_cities = get_filter("valid_cities", [])
@@ -5712,7 +5719,7 @@ def passes_strict_filter(job, trace=None):
     # than dropping a Farmington Hills job because the suburb was never typed into a list.
     is_in_metro_area = any(c in city for c in valid_cities)
     is_michigan = state in ("mi", "michigan") or bool(re.search(r",\s*mi\b", city)) or "michigan" in city
-    if not (is_in_metro_area or is_michigan):
+    if check_geography and not (is_in_metro_area or is_michigan):
         # Logged with the city, not just counted: a real in-radius suburb missing from the list
         # looks identical to a genuine out-of-area reject, and the city name is the only way to
         # tell them apart - or to know what is worth adding.
