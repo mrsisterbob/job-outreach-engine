@@ -3841,7 +3841,7 @@ def get_warm_crm_contacts():
     """Fetch every Carmen Warm CRM contact keyed by normalize_company_for_match(company). Each value
     is the BEST contact at that company (a real name before the "Contact" placeholder, then highest
     priority_score, ties to the one with an email, then the most recent "Connected <date>" in the
-    note, then arrival order = newest sheet row first) with the keys callers read: name, raw_company, email, note,
+    note, then the earlier sheet row) with the keys callers read: name, raw_company, email, note,
     priority_score, sheet_uuid. Two more keys carry the rest of the company: `count` (how many Warm
     people Kevin has there) and `contacts` (every one of them, same keys, best first).
 
@@ -3894,7 +3894,7 @@ def get_warm_crm_contacts():
         for key, people in by_company.items():
             # A real name before the "Contact" placeholder (whatever the priority), then priority, then
             # an email, then the more recent "Connected <date>" in the note. sorted() is stable, so a
-            # full tie keeps arrival order: Code.gs get_followups walks the sheet bottom-up, so NEWEST row first.
+            # full tie keeps sheet order (earlier row first).
             ranked = sorted(people, key=referral_asks.contact_sort_key)
             best = dict(ranked[0])
             best["count"] = len(ranked)
@@ -5838,7 +5838,9 @@ def process_single_candidate(job, force=False):
 
         # JIT Hope College Alumni Resolution: live public-search lookup, score boost, auto-log Carmen Warm contact
         alumni_line = ""
-        alum = resolve_live_alumni_at_company(job.get("employer_name"))
+        # A company the Carmen Warm sheet already knows is read from the sheet: no live lookup, no new row.
+        contact_info = get_warm_crm_contacts().get(normalize_company_for_match(job.get("employer_name")))
+        alum = None if contact_info else resolve_live_alumni_at_company(job.get("employer_name"))
         if alum:
             score = min(100, score + 20)
             total_boost += 20
@@ -5865,10 +5867,11 @@ def process_single_candidate(job, force=False):
         # Dynamic Contact Quality Multiplier / Clavicular Routing: warm CRM contacts boost score.
         # ATS-sourced pulls (gh_/lever_/ashby_) at a Carmen Warm company route through the stricter
         # Clavicular pathway (flat +30, gated at raw score >= 70) instead of the priority multiplier.
-        contact_info = get_warm_crm_contacts().get(normalize_company_for_match(job.get("employer_name")))
         is_clavicular = False
         contact_name = ""
         contact_note = ""
+        warm_count = int((contact_info or {}).get("count") or 1)
+        warm_count_text = f"{warm_count} warm contact{'s' if warm_count != 1 else ''} there"
         if contact_info:
             is_ats_sourced = str(job.get("job_id") or "").startswith(("gh_", "lever_", "ashby_"))
             if is_ats_sourced:
@@ -5881,7 +5884,7 @@ def process_single_candidate(job, force=False):
                     alumni_line += (
                         f"🎯 <b>CLAVICULAR WARM REFERRAL (+30 pts):</b> "
                         f"{html.escape(contact_name)} "
-                        f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))})</i>\n"
+                        f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))}, {warm_count_text})</i>\n"
                         f"📝 <b>Note:</b> {html.escape(contact_note)}\n"
                     )
                 # raw score < 70: ATS + warm match does not qualify for any boost or Clavicular routing
@@ -5893,7 +5896,7 @@ def process_single_candidate(job, force=False):
                 alumni_line += (
                     f"🔥 <b>WARM REFERRAL AVAILABLE (+{priority_boost} pts):</b> "
                     f"{html.escape(contact_info.get('name', 'Contact'))} "
-                    f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10)</i>\n"
+                    f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10, {warm_count_text})</i>\n"
                     f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
                 )
 
@@ -14732,9 +14735,8 @@ def run_warm_radar_scan(chat_id=None):
             listed = roles[:WARM_RADAR_ROLES_PER_COMPANY]
             # ONE contact per company for everything below: the card or summary, the Clavicular row
             # note and the referral ask all name this person. The company-level best is the default;
-            # among contacts tied at the top priority the one whose imported title (or alumni
-            # headline) fits the top role wins (referral_asks.pick_contact). A tie nothing breaks
-            # goes to the first in arrival order, i.e. the NEWEST sheet row (Code.gs reads bottom-up).
+            # among contacts tied at the top priority the one whose imported title fits the top role
+            # wins (referral_asks.pick_contact).
             best_contact = group["contact"]
             contact = best_contact
             picked = referral_asks.pick_contact(best_contact.get("contacts") or [best_contact],

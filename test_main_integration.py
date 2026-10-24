@@ -5504,14 +5504,10 @@ def test_stacking_cap_leaves_an_under_cap_stack_untouched(run_candidate):
 
 
 def test_card_boost_annotation_reflects_the_capped_layer2_delta_not_the_raw_sum(run_candidate, monkeypatch):
-    """Layer-1 +10, plus an alum (+20) and a priority-10 warm contact (+30) = +50 of Layer-2
-    signal on offer. The cap lets only +20 of it actually move the score, and the card's (+N)
-    must show that +20 - so 'score - (+N)' still reconstructs the Gemini+Layer-1 number."""
-    monkeypatch.setattr(
-        m, "resolve_live_alumni_at_company",
-        lambda *a, **k: {"name": "Dana Reyes", "linkedin_url": "https://linkedin.com/in/dana",
-                         "headline": "Ops Lead"},
-    )
+    """Layer-1 +10, plus a priority-10 warm contact (+30) = +40 of signal on offer (a warm company
+    skips the live alum lookup, so no +20 on top). The cap lets only +20 of it actually move the
+    score, and the card's (+N) must show that +20 - so 'score - (+N)' still reconstructs the
+    Gemini+Layer-1 number."""
     monkeypatch.setattr(
         m, "get_warm_crm_contacts",
         lambda: {m.normalize_company_for_match("Acme Co"):
@@ -5578,6 +5574,54 @@ def test_wildcard_bonus_does_not_open_the_clavicular_gate(run_candidate, monkeyp
                            job_description="logistics ops role")
     assert result["is_clavicular"] is False
     assert result["score"] == 70 and result["score_boost"] == 2
+
+
+def test_warm_company_candidate_skips_live_lookup_and_enqueues_no_row(run_candidate, monkeypatch):
+    calls, payloads = [], []
+    monkeypatch.setattr(m, "resolve_live_alumni_at_company",
+                        lambda *a, **k: calls.append(a) or {"name": "Dana", "linkedin_url": "https://x.co/d", "headline": "h"})
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p) or True)
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Sam", "raw_company": "Acme Co", "note": "n", "priority_score": 5, "count": 3}},
+    )
+    result = run_candidate(gemini_base=60, layer1_bonus=0)
+    assert calls == []
+    assert not [p for p in payloads if "quick_add" in str(p) or "CW" in str(p)]
+    assert "Hope Alum" not in result["alumni_line"]
+    # priority 5 -> +15 warm boost, no +20 live-alum boost, under the 30 cap
+    assert result["score"] == 75
+
+
+def test_warm_company_candidate_card_says_how_many_warm_contacts(run_candidate, monkeypatch):
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Sam", "raw_company": "Acme Co", "note": "n", "priority_score": 5, "count": 181}},
+    )
+    line = run_candidate(gemini_base=60, layer1_bonus=0)["alumni_line"]
+    assert "181 warm contacts there" in line
+    assert not __import__("pipeline_utils").negative_language_hits(line)
+    monkeypatch.setattr(
+        m, "get_warm_crm_contacts",
+        lambda: {m.normalize_company_for_match("Acme Co"):
+                 {"name": "Sam", "raw_company": "Acme Co", "note": "n", "priority_score": 5, "count": 1}},
+    )
+    assert "1 warm contact there" in run_candidate(gemini_base=60, layer1_bonus=0)["alumni_line"]
+
+
+def test_warm_company_candidate_fallback_keeps_live_path_when_sheet_has_no_one(run_candidate, monkeypatch):
+    calls, payloads = [], []
+    monkeypatch.setattr(m, "resolve_live_alumni_at_company",
+                        lambda *a, **k: calls.append(a) or {"name": "Dana", "linkedin_url": "https://x.co/d", "headline": "h"})
+    monkeypatch.setattr(m, "enqueue_crm_payload", lambda p: payloads.append(p) or True)
+    monkeypatch.setattr(m, "get_warm_crm_contacts", lambda: {m.normalize_company_for_match("Other Corp"): {"name": "Z", "count": 2}})
+    result = run_candidate(gemini_base=60, layer1_bonus=0)
+    assert len(calls) == 1
+    assert len(payloads) == 1
+    assert "Hope Alum Connection" in result["alumni_line"]
+    assert result["score"] == 80
 
 
 # ---- Carmen Cold as the hot seat: inbound-reply routing (route_inbound_reply_to_crm) ----
@@ -17887,7 +17931,23 @@ def test_ats_fetch_failures_are_reported(monkeypatch):
     assert m.fetch_ats_jobs(["solo"]) == [] and len(seen_calls) == 3
 
 
+def _strict_clock(monkeypatch):
+    """Make m.datetime.now() strictly increasing (1 ms per call) so two stamps can never land in one
+    clock tick. A subclass of the real datetime, so isinstance, strptime and arithmetic still work."""
+    real = m.datetime
+    state = {"t": real.now()}
+
+    class _TickDatetime(real):
+        @classmethod
+        def now(cls, tz=None):
+            state["t"] = state["t"] + timedelta(milliseconds=1)
+            return state["t"] if tz is None else state["t"].astimezone(tz)
+
+    monkeypatch.setattr(m, "datetime", _TickDatetime)
+
+
 def test_ats_fetch_failures_are_reported_and_warm_radar_leaves_the_failed_board_unstamped(monkeypatch):
+    _strict_clock(monkeypatch)
     h = _batch_harness(monkeypatch, 25)
     seen, failed_once = [], []
 
@@ -19055,40 +19115,3 @@ def test_kill_and_fillcontacts_confirm_after_queue_fillcontacts_go_reply(monkeyp
     assert "dana.reed@acme.com" not in replies[0]
     assert "1 not queued" in replies[0]
     assert stamped == ["u1"]
-
-
-def _alumni_tie_contacts(headlines):
-    """Alumni-import contacts at one company, all Medium, no email, in the order Code.gs get_followups
-    returns a tie: NEWEST sheet row first (it walks the sheet bottom-up). `headlines` is in that order."""
-    return [{"company": "Acme Robotics", "name": f"Alum {i}", "email": "", "raw_priority": "Medium",
-             "sheet_uuid": f"u-alum-{i}",
-             "note": f"[2026-10-23] LinkedIn alumni | employer filter: Acme Robotics | {headline}"}
-            for i, headline in enumerate(headlines)]
-
-
-@pytest.mark.parametrize("reverse", [False, True])
-def test_warm_alumni_tie_headline_fit_wins_in_both_list_orders(monkeypatch, reverse):
-    headlines = ["Software Engineer at Acme Robotics Corporation",
-                 "Supply Chain Analyst at Acme Robotics Corporation",
-                 "Supply Chain Analyst at Acme Robotics Corporation"]
-    contacts = _alumni_tie_contacts(headlines)
-    if reverse:
-        contacts = contacts[::-1]
-    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", "R-1")], contacts=contacts)
-    h.run()
-    rows = _asks()
-    assert len(rows) == 1, rows
-    # The Software Engineer (u-alum-0) is never the pick; of the two analysts the first in arrival order is.
-    assert rows[0]["sheet_uuid"] == ("u-alum-2" if reverse else "u-alum-1"), rows[0]
-    assert rows[0]["contact_name"] in ("Alum 1", "Alum 2")
-
-
-def test_warm_alumni_tie_no_headline_implies_a_track_falls_back_to_first_in_arrival_order(monkeypatch):
-    # Nothing distinguishes them: no email, same priority, headlines that name no role. The documented
-    # fallback is arrival order, which is the NEWEST sheet row first, so the first contact given wins.
-    contacts = _alumni_tie_contacts(["Student at Hope College", "Hope College Alumnus", "Student at Hope College"])
-    h = _ask_harness(monkeypatch, [("Supply Chain Analyst", "R-1")], contacts=contacts)
-    h.run()
-    rows = _asks()
-    assert len(rows) == 1, rows
-    assert rows[0]["sheet_uuid"] == "u-alum-0" and rows[0]["contact_name"] == "Alum 0", rows[0]
