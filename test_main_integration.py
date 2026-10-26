@@ -20172,3 +20172,391 @@ def test_warm_pick_after_memo_no_group_holds_more_than_three_job_dicts(monkeypat
     assert seen_groups and all(len(v) <= m.warm_screen_plan.CANDIDATES_PER_COMPANY
                                for v in seen_groups[0].values())
     assert sorted(r["title"] for v in seen_groups[0].values() for r in v) == sorted(titles[3:])
+
+
+def _apify_store_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM apify_feed_ledger")
+        conn.execute("DELETE FROM apify_seen_jobs")
+        conn.commit()
+
+
+def test_apify_store_reserve_then_read_shows_errored_worst_case():
+    _apify_store_clear()
+    rid = m.apify_ledger_reserve(["acme", "beta"], 0.35)
+    assert isinstance(rid, int)
+    rows = m.apify_ledger_read()
+    assert len(rows) == 1
+    ts, usd, status, keys = rows[0]
+    assert (usd, status, keys) == (0.35, "errored", ["acme", "beta"])
+
+
+def test_apify_store_settle_updates_same_row():
+    _apify_store_clear()
+    rid = m.apify_ledger_reserve(["acme"], 0.35)
+    assert m.apify_ledger_settle(rid, 0.12, "ok") is True
+    rows = m.apify_ledger_read()
+    assert len(rows) == 1
+    assert rows[0][1:] == (0.12, "ok", ["acme"])
+
+
+def test_apify_store_settle_missing_id_returns_false():
+    _apify_store_clear()
+    assert m.apify_ledger_settle(999999, 0.1, "ok") is False
+    assert m.apify_ledger_read() == []
+
+
+def test_apify_store_seen_mark_then_filter_returns_only_marked():
+    _apify_store_clear()
+    assert m.apify_seen_mark(["j1", "j2"]) is True
+    assert m.apify_seen_filter(["j1", "j2", "j3"]) == {"j1", "j2"}
+    assert m.apify_seen_filter([]) == set()
+
+
+def test_apify_store_seen_mark_twice_does_not_duplicate():
+    _apify_store_clear()
+    assert m.apify_seen_mark(["j1"]) is True
+    assert m.apify_seen_mark(["j1", "j2"]) is True
+    with m.get_db_conn() as conn:
+        n = conn.execute("SELECT COUNT(*) FROM apify_seen_jobs").fetchone()[0]
+    assert n == 2
+
+
+def test_apify_store_old_rows_not_returned():
+    _apify_store_clear()
+    old = datetime.now(timezone.utc) - timedelta(days=61)
+    m.apify_ledger_reserve(["old"], 0.5, now=old)
+    m.apify_ledger_reserve(["new"], 0.2)
+    rows = m.apify_ledger_read()
+    assert [r[3] for r in rows] == [["new"]]
+
+
+def test_apify_store_settle_invalid_status_and_errored():
+    _apify_store_clear()
+    rid = m.apify_ledger_reserve(["a"], 0.3)
+    assert m.apify_ledger_settle(rid, 0.1, "weird") is False
+    assert m.apify_ledger_settle(rid, float("nan"), "ok") is False
+    assert m.apify_ledger_settle(rid, -1, "ok") is False
+    assert m.apify_ledger_read()[0][1:3] == (0.3, "errored")
+    assert m.apify_ledger_settle(rid, 0.05, "errored") is True
+    assert m.apify_ledger_read()[0][1:3] == (0.05, "errored")
+
+
+def test_apify_store_reserve_rejects_nan_and_negative():
+    _apify_store_clear()
+    assert m.apify_ledger_reserve(["a"], float("nan")) is None
+    assert m.apify_ledger_reserve(["a"], float("inf")) is None
+    assert m.apify_ledger_reserve(["a"], -0.1) is None
+    assert m.apify_ledger_read() == []
+
+
+def test_apify_store_db_errors(monkeypatch):
+    _apify_store_clear()
+    def boom(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    assert m.apify_ledger_read() is None
+    assert m.apify_ledger_reserve(["a"], 0.1) is None
+    assert m.apify_ledger_settle(1, 0.1, "ok") is False
+    assert m.apify_seen_filter(["j1"]) == set()
+    assert m.apify_seen_mark(["j1"]) is False
+
+
+def test_apify_store_seen_filter_chunks_over_500():
+    _apify_store_clear()
+    ids = [f"job{i}" for i in range(1200)]
+    assert m.apify_seen_mark(ids) is True
+    assert m.apify_seen_filter(ids + ["other"]) == set(ids)
+
+
+def test_apify_store_garbage_company_keys_still_counts_usd():
+    _apify_store_clear()
+    stamp = datetime.now(timezone.utc).isoformat()
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, 0.4, 'ok', 'not json')", (stamp,))
+        conn.execute("INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, 0.6, 'ok', '{\"a\": 1}')", (stamp,))
+        conn.commit()
+    rows = m.apify_ledger_read()
+    assert [(r[1], r[3]) for r in rows] == [(0.4, []), (0.6, [])]
+
+
+def test_apify_store_non_utc_now_stored_as_utc():
+    _apify_store_clear()
+    est = timezone(timedelta(hours=-5))
+    m.apify_ledger_reserve(["a"], 0.1, now=datetime.now(est))
+    naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    m.apify_ledger_reserve(["b"], 0.1, now=naive)
+    with m.get_db_conn() as conn:
+        stamps = [r[0] for r in conn.execute("SELECT spent_at FROM apify_feed_ledger ORDER BY id")]
+    assert all(s.endswith("+00:00") for s in stamps)
+
+
+# ---- /w looks up the biggest no-board warm companies on the Apify feed (TASK-179) ----
+
+def _apify_hook_harness(monkeypatch, nobody=None, token="tok"):
+    h = _jsearch_harness(monkeypatch, nobody if nobody is not None else {"Nopeboard Labs": 3, "Smallfry Inc": 1})
+    monkeypatch.delenv("RAPIDAPI_KEY", raising=False)
+    if token:
+        monkeypatch.setenv("APIFY_TOKEN", token)
+    else:
+        monkeypatch.delenv("APIFY_TOKEN", raising=False)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM apify_feed_ledger")
+        conn.execute("DELETE FROM apify_seen_jobs")
+        conn.commit()
+    h.posts, h.feed = [], []
+
+    class _Resp:
+        status_code = 200
+        def __init__(self, rows):
+            self.rows = rows
+        def json(self):
+            return self.rows
+
+    def fake_post(url, **kw):
+        h.posts.append((url, kw))
+        return _Resp(list(h.feed))
+
+    monkeypatch.setattr(m.requests, "post", fake_post)
+    return h
+
+
+def _apify_row(org, title, n, loc="Troy, Michigan, United States"):
+    return {"id": f"{n}x{len(title)}", "title": title, "organization": org,
+            "url": f"https://careers.example.com/apify/{n}{len(title)}",
+            "locations_derived": [loc], "description_text": "Reconciliation workflows with SQL and reporting.",
+            "source_domain": org.split()[0].lower() + ".com"}
+
+
+def _apify_ledger_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT usd, status, company_keys FROM apify_feed_ledger ORDER BY id").fetchall()
+
+
+def test_apify_hook_biggest_company_gets_a_card_and_one_ask_from_one_call(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    text = h.run()
+    assert len(h.posts) == 1, h.posts
+    assert sorted(h.posts[0][1]["json"]["organizationSearch"]) == ["Nopeboard Labs", "Smallfry Inc"]
+    assert h.cards == ["Operations Analyst"], (h.cards, text)
+    asks = _asks()
+    assert len(asks) == 1 and asks[0]["company"] == "Nopeboard Labs", asks
+    led = _apify_ledger_rows()
+    assert len(led) == 1 and led[0][1] == "ok" and abs(led[0][0] - (0.10 + 0.0025 * 1)) < 1e-9, led
+    assert m.apify_seen_filter(["apify_" + h.feed[0]["id"]]) == {"apify_" + h.feed[0]["id"]}
+    h.cards.clear()
+    h.posts.clear()
+    h.run()   # same company inside the retry gap: no second call
+    assert h.posts == []
+
+
+def test_apify_hook_no_token_makes_no_call_and_leaves_the_text_alone(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, token=None)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    text = h.run()
+    assert h.posts == [] and _apify_ledger_rows() == []
+    assert "Apify" not in text and h.cards == [], (text, h.cards)
+
+
+def test_apify_hook_ledger_at_monthly_ceiling_makes_no_call(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, 4.0, 'ok', '[]')",
+                     (m.datetime.now(m.timezone.utc).isoformat(),))
+        conn.commit()
+    h.run()
+    assert h.posts == [] and h.cards == []
+    assert len(_apify_ledger_rows()) == 1
+
+
+def test_apify_hook_sibling_entity_and_non_michigan_rows_make_no_card(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, {"Haworth Inc": 3})
+    h.feed = [_apify_row("Haworth International", "Operations Analyst", 1),
+              _apify_row("Haworth Inc", "Business Systems Analyst", 2, loc="Orlando, Florida, United States")]
+    text = h.run()
+    assert len(h.posts) == 1
+    assert h.cards == [] and _asks() == [], (h.cards, text)
+
+
+def test_apify_hook_errored_call_keeps_worst_case_and_scan_survives(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+
+    def boom(url, **kw):
+        h.posts.append(url)
+        raise RuntimeError("secret-token-in-message")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    h.run()
+    led = _apify_ledger_rows()
+    assert len(h.posts) == 1 and len(led) == 1 and led[0][1] == "errored" and led[0][0] >= 0.5, led
+
+
+def test_apify_hook_marks_only_settled_rows_seen(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, {"Nopeboard Labs": 3, "Rejectco Labs": 2, "Failco Labs": 2, "Gateco Labs": 1})
+    h.gemini_scores["Rejected Role"] = 50
+    h.gemini_scores["Failed Role"] = None
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1),
+              _apify_row("Rejectco Labs", "Rejected Role", 2),
+              _apify_row("Failco Labs", "Failed Role", 3),
+              _apify_row("Gateco Labs", "Help Desk Technician", 4),
+              _apify_row("Gateco Labs", "Business Systems Analyst", 5, loc="Orlando, Florida, United States")]
+    ids = ["apify_" + r["id"] for r in h.feed]
+    h.run()
+    assert len(h.posts) == 1
+    assert h.cards == ["Operations Analyst"], h.cards
+    assert m.apify_seen_filter(ids) == {ids[0], ids[1]}, m.apify_seen_filter(ids)
+
+
+def test_apify_hook_failed_reserve_makes_no_call(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    monkeypatch.setattr(m, "apify_ledger_reserve", lambda *a, **kw: None)
+    h.run()
+    assert h.posts == [] and h.cards == [] and _apify_ledger_rows() == []
+
+
+def test_apify_hook_unreadable_ledger_makes_no_call(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    monkeypatch.setattr(m, "apify_ledger_read", lambda: None)
+    h.run()
+    assert h.posts == [] and h.cards == [] and _apify_ledger_rows() == []
+
+
+def test_apify_hook_no_cached_boards_still_reaches_the_hook(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.filters["ats_company_slugs"] = []
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE company_identities SET ats_slug = NULL, workday_board = NULL")
+        conn.commit()
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    assert len(h.posts) == 1 and h.cards == ["Operations Analyst"], (h.posts, h.cards)
+
+
+def test_apify_hook_status_update_raising_still_fetches_and_settles(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+
+    def boom(chat_id, text):
+        if "Apify" in text:
+            raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(m, "send_status_update", boom)
+    h.run()
+    led = _apify_ledger_rows()
+    assert len(h.posts) == 1 and len(led) == 1 and led[0][1] == "ok", led
+    assert abs(led[0][0] - 0.1025) < 1e-9, led
+
+
+# ---- TASK-180: the /w closing message reports what the Apify feed did ----
+def _apify_e2e_cost_text(rows_returned):
+    return f"${0.10 + 0.0025 * rows_returned:.3f} this run"
+
+
+def test_apify_e2e_errored_is_not_conflated_with_not_covered(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+
+    def boom(url, **kw):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    errored = h.run()
+    assert "Apify feed errored (2 companies not searched, retried on a later run)" in errored, errored
+    assert "reserved against the month" in errored and "not covered" not in errored, errored
+
+    h2 = _apify_hook_harness(monkeypatch)
+    h2.feed = []
+    covered = h2.run()
+    assert "not covered by the feed: Nopeboard Labs, Smallfry Inc" in covered, covered
+    assert "errored" not in covered, covered
+
+
+def test_apify_e2e_spend_line_reconciles_with_ledger_and_formula(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1),
+              _apify_row("Nopeboard Labs", "Business Systems Analyst", 2)]
+    text = h.run()
+    led = _apify_ledger_rows()
+    assert len(led) == 1 and led[0][1] == "ok"
+    expected = 0.10 + 0.0025 * len(h.feed)
+    assert abs(led[0][0] - expected) < 1e-9
+    assert "Apify feed: 2 companies, 2 rows returned, 2 kept, " + f"${led[0][0]:.3f} this run" in text, text
+    assert _apify_e2e_cost_text(len(h.feed)) in text
+    assert f"${4.00 - led[0][0]:.2f} left of $4.00 this month" in text, text
+    assert "capped" not in text
+
+
+def test_apify_e2e_capped_run_says_so(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)] + [
+        _apify_row("Elsewhere Corp", f"Role {i}", 1000 + i) for i in range(199)]
+    text = h.run()
+    assert h.posts[0][1]["json"]["limit"] == 200 and len(h.feed) == 200
+    assert "(capped at 200: older postings were dropped)" in text, text
+    assert "200 rows returned, 1 kept" in text, text
+
+
+def test_apify_e2e_second_run_has_no_second_card_or_ask_but_bills_again(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    assert h.cards == ["Operations Analyst"] and len(_asks()) == 1
+    old = (m.datetime.now(m.timezone.utc) - m.timedelta(days=8)).isoformat()
+    with m.get_db_conn() as conn:   # past the retry gap, so the company is searched again
+        conn.execute("UPDATE apify_feed_ledger SET spent_at = ?", (old,))
+        conn.commit()
+    h.cards.clear()
+    h.posts.clear()
+    text = h.run()
+    assert len(h.posts) == 1, "the second run must call the feed again"
+    assert h.cards == [] and len(_asks()) == 1, (h.cards, _asks())
+    assert "1 rows returned, 1 kept, " + _apify_e2e_cost_text(1) in text, text
+    assert len(_apify_ledger_rows()) == 2
+
+
+def test_apify_e2e_returned_counts_rows_that_kept_drops(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, {"Haworth Inc": 3})
+    h.feed = [_apify_row("Haworth Inc", "Operations Analyst", 1),
+              _apify_row("Haworth International", "Business Systems Analyst", 2),
+              _apify_row("Unrelated Corp", "Help Desk Technician", 3)]
+    text = h.run()
+    assert "1 companies, 3 rows returned, 1 kept, " + _apify_e2e_cost_text(3) in text, text
+
+
+def test_apify_e2e_token_never_leaks(monkeypatch, caplog):
+    secret = "apify_api_SECRETxyz123"
+    h = _apify_hook_harness(monkeypatch, token=secret)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    with caplog.at_level("DEBUG"):
+        text = h.run()
+    assert secret not in text and secret not in caplog.text
+    assert secret not in repr(_apify_ledger_rows()) and secret not in repr(h.payloads)
+    url, kw = h.posts[0]
+    assert secret not in url and secret in kw["headers"]["Authorization"]
+
+    def boom(url, **kw):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM apify_feed_ledger")
+        conn.commit()
+    caplog.clear()
+    with caplog.at_level("DEBUG"):
+        text = h.run()
+    assert "errored" in text and secret not in text and secret not in caplog.text
+
+
+def test_apify_e2e_no_apify_line_when_unconfigured_or_over_budget_says_so(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, token=None)
+    assert "Apify" not in h.run()
+    h = _apify_hook_harness(monkeypatch)
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, 4.0, 'ok', '[]')",
+                     (m.datetime.now(m.timezone.utc).isoformat(),))
+        conn.commit()
+    text = h.run()
+    assert "Apify feed skipped: monthly ceiling reached ($4.00 of $4.00)" in text, text
