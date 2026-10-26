@@ -48,3 +48,44 @@ def test_empty():
 
 def test_non_string():
     assert c(None, 123) == "unknown"
+
+
+# ---- scripts/measure_board_systems.py endpoint judging (fake responses, no network) ----
+import importlib.util
+import pathlib
+
+_spec = importlib.util.spec_from_file_location(
+    "measure_board_systems", pathlib.Path(__file__).parent / "scripts" / "measure_board_systems.py")
+mbs = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(mbs)
+
+
+class _Resp:
+    def __init__(self, status=200, data=None):
+        self.status_code, self._data, self.headers, self.text, self.url = status, data, {}, "", "u"
+
+    def json(self):
+        if self._data is None:
+            raise ValueError("no json")
+        return self._data
+
+
+def test_judge_smartrecruiters_needs_postings_and_workable_needs_name():
+    assert mbs.judge("smartrecruiters", _Resp(data={"totalFound": 0, "content": []})) == (False, "")
+    assert mbs.judge("smartrecruiters", _Resp(data={"totalFound": 3, "content": [{"company": {"name": "Acme"}}]})) == (True, "Acme")
+    assert mbs.judge("workable", _Resp(data={"name": "Acme", "jobs": [{}]})) == (True, "Acme")
+    assert mbs.judge("workable", _Resp(data={"name": "Acme", "jobs": []}))[0] is False
+    assert mbs.judge("workable", _Resp(404)) == (False, "")
+
+
+def test_judge_bamboohr_result_key_and_no_answer():
+    assert mbs.judge("bamboohr", _Resp(data={"meta": {}, "result": []}))[0] is True
+    assert mbs.judge("bamboohr", _Resp(302))[0] is False
+    assert mbs.judge("lever", None)[0] is None
+
+
+def test_measure_stays_within_nine_requests(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mbs, "_get", lambda req, url, pause=0: calls.append(url) or _Resp(404))
+    rec = mbs.measure(None, {"domains": []}, "acme", 0)
+    assert rec["bucket"] == "not_located" and rec["domain_source"] == "guess" and len(calls) <= 9
