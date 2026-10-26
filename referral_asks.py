@@ -395,3 +395,30 @@ def pick_contact(contacts, role_titles, company=""):
             if title and derive_track(title, company) == role_track:
                 return c
     return top
+
+
+# The planner's GUESS, NOT measured against Kevin's real contact notes: about 18 months.
+NOTE_OLD_AFTER_DAYS = 540
+
+
+def note_is_old(note, today, max_age_days=NOTE_OLD_AFTER_DAYS):
+    """True when the note carries a valid `Connected <date>` older than max_age_days before `today`.
+
+    False for no date or a malformed date. Pure: `today` is passed in (a date).
+    """
+    connected = contact_title_and_date(note)[1]
+    if not connected:
+        return False
+    try:
+        when = date.fromisoformat(connected)
+    except ValueError:
+        return False
+    return (today - when).days > max_age_days
+
+
+def old_note_suffix(note, today):
+    """` (connected 2023 - may be out of date)` for an old note, "" otherwise. Text only."""
+    if not note_is_old(note, today):
+        return ""
+    year = contact_title_and_date(note)[1][:4]
+    return f" (connected {year} - may be out of date)"

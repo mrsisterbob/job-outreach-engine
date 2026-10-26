@@ -4670,11 +4670,11 @@ def test_card_annotates_the_score_boost_only_when_nonzero(render_card):
     got it there are visible right next to the score."""
     boosted = render_card(score=100, score_boost=50)
     meta = next(ln for ln in boosted.splitlines() if "100/100" in ln)
-    assert "100/100</b> (+50)" in meta
+    assert "100/100</b> (base 50, +50)" in meta
 
     penalized = render_card(score_boost=-15)
     meta = next(ln for ln in penalized.splitlines() if "87/100" in ln)
-    assert "87/100</b> (-15)" in meta
+    assert "87/100</b> (base 102, -15)" in meta
 
     unboosted = render_card()  # score_boost defaults to 0
     meta = next(ln for ln in unboosted.splitlines() if "87/100" in ln)
@@ -15760,7 +15760,7 @@ def test_warm_radar_reports_skipped_companies_never_probes_non_company_names(mon
     h = _WarmRadarHarness(monkeypatch, ["cousin", "https://www.linkedin.com/in/someone", "Acme Robotics"])
     m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
     text = h.run()
-    assert "2 warm entries are not company names" in text
+    assert "2 warm companies are not company names" in text
     assert h.http == []
     assert "cousin" not in text and "linkedin" not in text
 
@@ -15804,7 +15804,7 @@ def test_warm_radar_reports_skipped_companies_with_zero_scanned_and_batch_cap(mo
     h = _WarmRadarHarness(monkeypatch, names)
     text = h.run()
     assert h.fetched == []
-    assert "none of your 25 warm entries" in text
+    assert "none of your 25 warm companies" in text
     assert "checking 20" in text and "5 more queued for the next run" in text
     assert text.count("Works") <= m.WARM_RADAR_NAME_CAP
     assert len(h.http) == 20 * 3  # one batch of probes, the remaining 5 wait
@@ -16936,7 +16936,7 @@ def test_warm_radar_review_followups_w_says_how_many_warm_contacts_have_no_compa
     # the "no warm board yet" message carries it too, singular when there is one
     h2 = _WarmRadarHarness(monkeypatch, ["Globex Systems", ""])
     text2 = h2.run()
-    assert "none of your 1 warm entries" in text2 and "1 warm contact has no company" in text2
+    assert "none of your 1 warm companies" in text2 and "1 warm contact has no company" in text2
     # and nothing is said when every contact has a company
     h3 = _WarmRadarHarness(monkeypatch, ["Acme Robotics"])
     assert "no company" not in h3.run()
@@ -20044,3 +20044,58 @@ def test_warm_rotation_report_budget_end_names_unscored_company_and_counts(monke
     assert "Budget ended: 2 unscored, first alphabetically: Alpha Labs, Bravo Labs" in text, text
     assert "Cards: 0 from 0 companies." in text
     assert "Boards held back to retry first next run: 2." in text
+
+
+# ---- TASK-162: warm card honesty ----
+
+def test_warm_card_honesty_boosted_card_shows_base_next_to_final(render_card):
+    text = render_card(score=95, score_boost=30, overlap_pct=60)
+    assert "<b>95/100</b> (base 65, +30)" in text, text
+    assert "low skills match" not in text
+
+
+def test_warm_card_honesty_unboosted_card_line_is_unchanged(render_card):
+    text = render_card(score=80, score_boost=0, overlap_pct=60)
+    assert "<b>80/100</b> ·" in text and "base" not in text
+
+
+def test_warm_card_honesty_negative_boost_prints_base(render_card):
+    text = render_card(score=80, score_boost=-5, overlap_pct=60)
+    assert "(base 85, -5)" in text
+
+
+def test_warm_card_honesty_low_skills_flag_only_with_big_boost_and_low_overlap(render_card):
+    assert "Skills 15% ⚠ low skills match" in render_card(score=95, score_boost=30, overlap_pct=15)
+    assert "low skills match" not in render_card(score=95, score_boost=30, overlap_pct=60)
+    assert "low skills match" not in render_card(score=80, score_boost=10, overlap_pct=15)
+
+
+def test_warm_card_honesty_note_is_old_dates():
+    import referral_asks as ra
+    today = date(2026, 10, 26)
+    assert ra.note_is_old("Analyst at Acme. Connected 2023-03-01 (LinkedIn import)", today) is True
+    assert ra.note_is_old("Analyst at Acme. Connected 2026-09-01 (LinkedIn import)", today) is False
+    assert ra.note_is_old("Analyst at Acme. Connected 2024-13-40 (LinkedIn import)", today) is False
+    assert ra.note_is_old("Active relationship", today) is False
+    assert ra.old_note_suffix("Analyst at Acme. Connected 2023-03-01 (LinkedIn import)", today) == \
+        " (connected 2023 - may be out of date)"
+
+
+def test_warm_card_honesty_old_note_text_on_the_real_w_card_path(monkeypatch):
+    note = "Analyst at Acme Robotics. Connected 2023-03-01 (LinkedIn import)"
+    rows = [{"company": "Acme Robotics", "name": "Person 0", "email": "p0@example.com", "note": note,
+             "raw_priority": 5, "sheet_uuid": "u0"}]
+    h = _summary_harness(monkeypatch, {"Acme Robotics": [("Operations Analyst", "Detroit")]}, rows=rows)
+    h.run()
+    assert len(h.posts) == 1
+    assert "(connected 2023 - may be out of date)" in h.posts[0][1], h.posts[0][1]
+
+
+def test_warm_card_honesty_closing_message_names_companies(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["cousin", "https://www.linkedin.com/in/someone", "Acme Robotics"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    assert "2 warm companies are not company names" in h.run()
+    names = [f"Company{chr(65 + i // 26)}{chr(65 + i % 26)} Works" for i in range(25)]
+    h2 = _WarmRadarHarness(monkeypatch, names)
+    text = h2.run()
+    assert "none of your 25 warm companies has a cached job board yet" in text and "warm entries" not in text
