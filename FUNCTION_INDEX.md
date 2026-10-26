@@ -100,20 +100,23 @@ grep -i "contact" FUNCTION_INDEX.md
 | 229 | `to_sheet_row` | The 12-column Carmen Warm row: date, name, company, email, priority, status, blank, URL, |
 | 240 | `build_master` | Classify every person. Returns {"people": [(status, person)], "rows": {handle: sheet row |
 
-## `apify_feed.py` — 10 defs, 222 lines
+## `apify_feed.py` — 13 defs, 297 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 42 | `build_run_input` | Actor input for a batch: plain names only (a "Name:*" prefix pulled affiliates), no date key |
-| 53 | `_get` | _(no docstring)_ |
-| 60 | `_split_location` | 'City, State, Country' -> (city, state, country), tolerating short forms: 'Michigan' or 'MI' |
-| 84 | `_pick_location` | The Michigan filter leaks, so take the first Michigan entry; else the first entry; else empty. |
-| 97 | `parse_row` | One feed row -> JSearch-shaped posting dict, or None when id, title, organization or url is missing. |
-| 126 | `_squash` | _(no docstring)_ |
-| 130 | `row_belongs_to` | True only when the normalized organization equals the company (strict: siblings like Haworth |
-| 156 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
-| 189 | `get_token` | Stripped APIFY_TOKEN from the given environment mapping, or None. Environment only: no default, no file. |
-| 195 | `fetch_feed` | One batched feed call. status is "ok", "errored" or "unconfigured". |
+| 43 | `build_run_input` | Actor input for a batch: plain names only (a "Name:*" prefix pulled affiliates), no date key |
+| 54 | `_get` | _(no docstring)_ |
+| 61 | `_split_location` | 'City, State, Country' -> (city, state, country), tolerating short forms: 'Michigan' or 'MI' |
+| 85 | `_pick_location` | The Michigan filter leaks, so take the first Michigan entry; else the first entry; else empty. |
+| 98 | `parse_row` | One feed row -> JSearch-shaped posting dict, or None when id, title, organization or url is missing. |
+| 127 | `_squash` | _(no docstring)_ |
+| 131 | `row_belongs_to` | True only when the normalized organization equals the company (strict: siblings like Haworth |
+| 157 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
+| 190 | `get_token` | Stripped APIFY_TOKEN from the given environment mapping, or None. Environment only: no default, no file. |
+| 196 | `fetch_feed` | One batched feed call. status is "ok", "errored" or "unconfigured". |
+| 236 | `actual_cost` | Billed cost of a run (MEASURED formula): excluded rows are free, zero rows is the flat fee. |
+| 241 | `_parse_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
+| 252 | `plan_apify_run` | Decide the one batched call: which companies, what limit, worst-case cost. |
 
 ## `build_function_index.py` — 6 defs, 196 lines
 
@@ -1026,4 +1029,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**812 definitions across 39 files + Code.gs.**
+**815 definitions across 39 files + Code.gs.**
