@@ -32,18 +32,27 @@ def _parse_day(value):
         return None
 
 
+def is_recently_memoed(memo_day, today, rescreen_days=RESCREEN_DAYS):
+    """True when a role's memo date is within rescreen_days of today (missing or malformed = False).
+
+    Boundary: a memo exactly rescreen_days old is NOT recent (it is screened again); a memo
+    rescreen_days - 1 days old is. A future memo date counts as recent.
+    """
+    seen = _parse_day(memo_day)
+    return seen is not None and seen + timedelta(days=rescreen_days) > today
+
+
 def pick_to_screen(roles_by_company, memo, today, *, per_company=CANDIDATES_PER_COMPANY,
                    rescreen_days=RESCREEN_DAYS):
-    """Flat list of roles worth a Gemini call: best per_company by rank, minus recently memoed."""
+    """Flat list of roles worth a Gemini call: per company, drop recently memoed roles first, then
+    take the best per_company by rank, so roles ranked below a decided top three still get screened."""
     out = []
     for company in sorted(roles_by_company):
         ranked = sorted(roles_by_company[company],
                         key=lambda r: (r["rank"], str(r.get("job_hash", ""))))
-        for role in ranked[:per_company]:
-            seen = _parse_day((memo or {}).get(role.get("job_hash")))
-            if seen is not None and seen + timedelta(days=rescreen_days) > today:
-                continue
-            out.append(role)
+        fresh = [r for r in ranked
+                 if not is_recently_memoed((memo or {}).get(r.get("job_hash")), today, rescreen_days)]
+        out.extend(fresh[:per_company])
     return out
 
 
