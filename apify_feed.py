@@ -9,6 +9,7 @@ hand-built rows that use the same guessed keys, so a wrong key name would still 
 TASK-176 turns an all-malformed batch into an error so wrong key names can never read as "no jobs".
 """
 import re
+from collections import namedtuple
 from urllib.parse import urlparse
 
 ACTOR_ID = "fantastic-jobs~career-site-job-listing-feed"  # the API form uses "~"; from the actor URL
@@ -176,3 +177,46 @@ def split_rows(rows, company_names, normalize):
         else:
             stats["unmatched"] += 1
     return kept, stats
+
+
+# ---------------------------------------------------------------------------
+# Fetch: ONE batched call. Endpoint form is from Apify's public API docs, NOT measured here.
+RUN_SYNC_URL = "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
+
+FetchResult = namedtuple("FetchResult", "status rows capped error")
+
+
+def get_token(environ):
+    """Stripped APIFY_TOKEN from the given environment mapping, or None. Environment only: no default, no file."""
+    tok = (environ.get("APIFY_TOKEN") or "").strip()
+    return tok or None
+
+
+def fetch_feed(run_input, token, http_post, timeout=240):
+    """One batched feed call. status is "ok", "errored" or "unconfigured".
+
+    "ok" with rows == [] means the feed does not cover these companies. It is NOT "no jobs".
+    A failed call, non-2xx, non-list body, or a non-empty list whose rows ALL fail parse_row
+    (a wrong ROW_KEYS guess) is "errored", never an empty ok. `error` carries only the
+    exception class name or status code, never str(exc), a body, or the token.
+    """
+    if not token:
+        return FetchResult("unconfigured", [], False, "no APIFY_TOKEN")
+    url = RUN_SYNC_URL.format(actor=ACTOR_ID)
+    try:
+        resp = http_post(url, json=run_input, headers={"Authorization": "Bearer " + token}, timeout=timeout)
+    except Exception as exc:
+        return FetchResult("errored", [], False, "post raised " + type(exc).__name__)
+    code = getattr(resp, "status_code", None)
+    if not isinstance(code, int) or not 200 <= code < 300:
+        return FetchResult("errored", [], False, "http status %s" % (code,))
+    try:
+        body = resp.json()
+    except Exception as exc:
+        return FetchResult("errored", [], False, "bad json " + type(exc).__name__)
+    if not isinstance(body, list):
+        return FetchResult("errored", [], False, "body is not a list")
+    if body and not any(parse_row(r) for r in body):
+        return FetchResult("errored", [], False, "all %d rows malformed" % len(body))
+    limit = run_input.get("limit") if isinstance(run_input, dict) else None
+    return FetchResult("ok", body, limit is not None and len(body) == limit, "")

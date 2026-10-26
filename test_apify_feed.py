@@ -119,3 +119,80 @@ def test_apify_parse_rejects_bad_url_and_non_scalar_fields():
     assert af.parse_row(_row(title=["Analyst"])) is None
     assert af.parse_row(_row(organization={"n": "x"})) is None
     assert af.parse_row(_row(id=123)) is not None
+
+
+TOK = "fake-token-abc"
+
+
+class _Resp:
+    def __init__(self, code=200, body=None, bad_json=False):
+        self.status_code, self._body, self._bad = code, body, bad_json
+
+    def json(self):
+        if self._bad:
+            raise ValueError("secret " + TOK)
+        return self._body
+
+
+class _Post:
+    def __init__(self, resp=None, exc=None):
+        self.resp, self.exc, self.calls = resp, exc, []
+
+    def __call__(self, url, **kw):
+        self.calls.append((url, kw))
+        if self.exc:
+            raise self.exc
+        return self.resp
+
+
+RUN_IN = {"limit": 3}
+
+
+def test_apify_fetch_no_token_makes_no_call():
+    post = _Post(_Resp(body=[]))
+    r = af.fetch_feed(RUN_IN, None, post)
+    assert r.status == "unconfigured" and post.calls == []
+    assert af.get_token({}) is None and af.get_token({"APIFY_TOKEN": "  "}) is None
+    assert af.get_token({"APIFY_TOKEN": " x "}) == "x"
+
+
+def test_apify_fetch_raising_post_is_errored():
+    r = af.fetch_feed(RUN_IN, TOK, _Post(exc=RuntimeError("boom " + TOK)))
+    assert r.status == "errored" and "RuntimeError" in r.error and TOK not in repr(r)
+
+
+def test_apify_fetch_500_is_errored():
+    r = af.fetch_feed(RUN_IN, TOK, _Post(_Resp(500, body="oops")))
+    assert r.status == "errored" and "500" in r.error
+
+
+def test_apify_fetch_non_list_body_is_errored():
+    assert af.fetch_feed(RUN_IN, TOK, _Post(_Resp(body={"error": "x"}))).status == "errored"
+    assert af.fetch_feed(RUN_IN, TOK, _Post(_Resp(bad_json=True))).status == "errored"
+
+
+def test_apify_fetch_all_malformed_rows_is_errored():
+    r = af.fetch_feed(RUN_IN, TOK, _Post(_Resp(body=[{"foo": 1}, {"bar": 2}])))
+    assert r.status == "errored" and r.rows == []
+
+
+def test_apify_fetch_empty_list_is_ok_no_rows():
+    r = af.fetch_feed(RUN_IN, TOK, _Post(_Resp(body=[])))
+    assert r.status == "ok" and r.rows == [] and not r.capped
+
+
+def test_apify_fetch_exactly_limit_rows_sets_capped():
+    rows = [_row(id=str(i)) for i in range(3)]
+    r = af.fetch_feed(RUN_IN, TOK, _Post(_Resp(body=rows)))
+    assert r.status == "ok" and r.capped
+    r2 = af.fetch_feed(RUN_IN, TOK, _Post(_Resp(body=rows[:2])))
+    assert r2.status == "ok" and not r2.capped
+
+
+def test_apify_fetch_token_only_in_authorization_header():
+    post = _Post(_Resp(body=[_row()]))
+    r = af.fetch_feed(RUN_IN, TOK, post)
+    url, kw = post.calls[0]
+    assert TOK not in repr(r) and TOK not in url
+    assert kw["headers"] == {"Authorization": "Bearer " + TOK}
+    assert TOK not in repr(kw["json"])
