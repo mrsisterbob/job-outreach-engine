@@ -122,3 +122,29 @@ def test_warm_rotation_report_escapes_names():
 def test_warm_rotation_report_no_cards_prints_cards_zero():
     got = w.rotation_report(["A"], ["A"], [], [], 0, 5, 150)
     assert "Cards: 0 from 0 companies." in got
+
+
+def _ranked(n):
+    return [_role(f"r{i}", i) for i in range(1, n + 1)]
+
+
+def test_warm_pick_after_memo_top_three_memoed_returns_roles_four_and_five():
+    memo = {"r1": "2026-10-23", "r2": "2026-10-23", "r3": "2026-10-23"}
+    got = w.pick_to_screen({"a": _ranked(5)}, memo, TODAY)
+    assert [r["job_hash"] for r in got] == ["r4", "r5"]
+
+
+def test_warm_pick_after_memo_only_top_one_memoed_returns_roles_two_three_four():
+    got = w.pick_to_screen({"a": _ranked(5)}, {"r1": "2026-10-23"}, TODAY)
+    assert [r["job_hash"] for r in got] == ["r2", "r3", "r4"]
+
+
+def test_warm_pick_after_memo_boundary_is_exactly_rescreen_days_not_recent():
+    on_edge = "2026-10-10"       # TODAY - 14 days: screened again
+    inside = "2026-10-11"        # TODAY - 13 days: still memoed
+    assert w.RESCREEN_DAYS == 14
+    assert w.is_recently_memoed(on_edge, TODAY) is False
+    assert w.is_recently_memoed(inside, TODAY) is True
+    assert w.is_recently_memoed(None, TODAY) is False and w.is_recently_memoed("junk", TODAY) is False
+    got = w.pick_to_screen({"a": _ranked(3)}, {"r1": on_edge, "r2": inside}, TODAY)
+    assert [r["job_hash"] for r in got] == ["r1", "r3"]

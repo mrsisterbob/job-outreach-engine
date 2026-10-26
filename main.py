@@ -15031,6 +15031,23 @@ def run_warm_radar_scan(chat_id=None):
         scanned_slugs = []      # boards fetched without a fetch error this run
         errored_slugs = []      # boards whose fetch raised or reported a failed platform
         keep_jobs = warm_screen_plan.CANDIDATES_PER_COMPANY   # roles per company that can be sent to Gemini
+
+        def _trim_group_jobs():
+            """Bound memory: per company over keep_jobs roles, keep `job` on the best keep_jobs roles
+            that are not recently memoed and drop it from the rest. One memo query per call."""
+            over = [g for g in groups.values() if len(g["roles"]) > keep_jobs]
+            if not over:
+                return
+            memo_now = _warm_screen_memo_read([r["job_hash"] for g in over for r in g["roles"]])
+            today_now = datetime.now().date()
+            for g in over:
+                g["roles"].sort(key=lambda r: r["rank"])
+                kept = 0
+                for r in g["roles"]:
+                    if kept < keep_jobs and not warm_screen_plan.is_recently_memoed(memo_now.get(r["job_hash"]), today_now):
+                        kept += 1
+                    else:
+                        r["job"] = None
         def _collect_posting(job, jsearch_keys=None):
             """PASS 1 for ONE posting, board or JSearch: every gate and the grouping, one code path.
             jsearch_keys (set of company keys), when given, drops a posting whose employer is not one of them."""
@@ -15151,15 +15168,11 @@ def run_warm_radar_scan(chat_id=None):
                 _collect_posting(job)
             # Drop the chunk's raw posting list BEFORE the next fetch: only the per-role records in
             # `groups` survive. A role keeps its job dict (description and all) only while it is in
-            # its company's top WARM_RADAR_ROLES_PER_COMPANY; past that it can never be listed this
-            # run, so just its title (for the contact pick), hash and slug are kept.
+            # its company's best keep_jobs roles that are not recently memoed (a memoed role is never
+            # screened); the rest keep just their title (for the contact pick), hash and slug.
             chunk_jobs = None
             job = None
-            for group in groups.values():
-                if len(group["roles"]) > keep_jobs:
-                    group["roles"].sort(key=lambda r: r["rank"])
-                    for dropped in group["roles"][keep_jobs:]:
-                        dropped["job"] = None
+            _trim_group_jobs()
             # A board whose fetch failed (the fetchers swallow errors and return []) is not "scanned":
             # it takes the same errored stamp a raising chunk gets. Its postings from a platform that
             # DID answer were still processed above - one failed platform does not discard real
@@ -15213,11 +15226,7 @@ def run_warm_radar_scan(chat_id=None):
                             _collect_posting(job, jsearch_keys=picked_keys)
                         except Exception as e:
                             logging.error(f"Warm Radar JSearch posting error: {e}")
-                for group in groups.values():
-                    if len(group["roles"]) > keep_jobs:
-                        group["roles"].sort(key=lambda r: r["rank"])
-                        for dropped in group["roles"][keep_jobs:]:
-                            dropped["job"] = None
+                _trim_group_jobs()
 
         # SCREEN + OUTPUT. Nothing has been stamped, cached, sent or written yet. A role leaves a
         # trace (seen_jobs stamp, referral-ask role) ONLY after what lists it was accepted: its card

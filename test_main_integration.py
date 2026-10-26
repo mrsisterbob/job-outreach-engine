@@ -20113,3 +20113,37 @@ def test_warm_harness_budget_pinned_in_radar_harness(monkeypatch):
 def test_warm_harness_budget_pinned_in_summary_harness(monkeypatch):
     _summary_harness(monkeypatch, {"Acme": [("Analyst", "Chicago")]})
     assert m.WARM_SCREEN_BUDGET_SECONDS >= 3600
+
+
+def test_warm_pick_after_memo_two_runs_screen_roles_four_and_five_not_the_rejected_three(monkeypatch):
+    titles = [t for t, _ in _roles_text(5)]
+    h = _screen_harness(monkeypatch, {"Acme Robotics": _roles_text(5)})
+    for t in titles[:3]:
+        h.gemini_scores[t] = 60                 # run 1: the three best-ranked are rejected
+    h.run()
+    assert h.gemini_calls == titles[:3]
+    assert set(_memo_rows().values()) == {"rejected"} and len(_memo_rows()) == 3
+    h.gemini_calls.clear()
+    h.run()                                     # same state: only roles 4 and 5 may reach Gemini
+    assert sorted(h.gemini_calls) == sorted(titles[3:])
+    assert not set(h.gemini_calls) & set(titles[:3])
+
+
+def test_warm_pick_after_memo_no_group_holds_more_than_three_job_dicts(monkeypatch):
+    titles = [t for t, _ in _roles_text(5)]
+    h = _screen_harness(monkeypatch, {"Acme Robotics": _roles_text(5)})
+    for t in titles[:3]:
+        h.gemini_scores[t] = 60
+    h.run()
+    seen_groups = []
+    real = m.warm_screen_plan.pick_to_screen
+
+    def spy(roles_by_company, memo, today, **kw):
+        seen_groups.append({k: list(v) for k, v in roles_by_company.items()})
+        return real(roles_by_company, memo, today, **kw)
+
+    monkeypatch.setattr(m.warm_screen_plan, "pick_to_screen", spy)
+    h.run()
+    assert seen_groups and all(len(v) <= m.warm_screen_plan.CANDIDATES_PER_COMPANY
+                               for v in seen_groups[0].values())
+    assert sorted(r["title"] for v in seen_groups[0].values() for r in v) == sorted(titles[3:])
