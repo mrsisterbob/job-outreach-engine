@@ -14982,6 +14982,9 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(unplaced_line)
             if coverage_line:
                 lines.append(coverage_line)
+            _target = warm_big_companies.board_target_line(big_rows)
+            if _target:
+                lines.append(_target)
             lines += warm_big_companies.big_company_report(big_rows)
             return lines
 
