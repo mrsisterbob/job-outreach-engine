@@ -10,6 +10,7 @@ TASK-176 turns an all-malformed batch into an error so wrong key names can never
 """
 import re
 from collections import namedtuple
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 ACTOR_ID = "fantastic-jobs~career-site-job-listing-feed"  # the API form uses "~"; from the actor URL
@@ -220,3 +221,77 @@ def fetch_feed(run_input, token, http_post, timeout=240):
         return FetchResult("errored", [], False, "all %d rows malformed" % len(body))
     limit = run_input.get("limit") if isinstance(run_input, dict) else None
     return FetchResult("ok", body, limit is not None and len(body) == limit, "")
+
+
+# ---------------------------------------------------------------------------
+# Spend guard: pure, no I/O, no clock reads (`now` is passed in). Modeled on
+# warm_jsearch_plan.plan_warm_jsearch.
+APIFY_COMPANIES_PER_RUN = 8  # DESIGN CHOICE, not a measurement: the size of Kevin's measured test batch
+APIFY_MONTHLY_CEILING_USD = 4.00  # DESIGN CHOICE, not a measurement: under the Free plan's $5 credit
+APIFY_COMPANY_RETRY_DAYS = 7  # DESIGN CHOICE, not a measurement: a re-search bills every old row again (no date filter)
+
+ApifyPlan = namedtuple("ApifyPlan", "picks limit worst_case_usd month_spent_usd month_left_usd skip_reason")
+
+
+def actual_cost(rows_returned):
+    """Billed cost of a run (MEASURED formula): excluded rows are free, zero rows is the flat fee."""
+    return START_FEE_USD + PER_JOB_USD * rows_returned
+
+
+def _parse_ts(ts, now):
+    """Aware-UTC datetime; malformed or future timestamps count as `now`."""
+    try:
+        dt = datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return now
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return now if dt > now else dt
+
+
+def plan_apify_run(candidates, ledger, now, per_run=APIFY_COMPANIES_PER_RUN,
+                   ceiling_usd=APIFY_MONTHLY_CEILING_USD, retry_days=APIFY_COMPANY_RETRY_DAYS):
+    """Decide the one batched call: which companies, what limit, worst-case cost.
+
+    candidates: iterable of (company_key, display_name, contact_count)
+    ledger: iterable of (iso_timestamp, usd, status, [company_keys]); status "ok" or "errored"
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    retry_gap = timedelta(days=retry_days)
+    month_spent = 0.0
+    last_ok = {}
+    for ts, usd, status, keys in ledger:
+        dt = _parse_ts(ts, now)
+        try:
+            usd = max(0.0, float(usd))
+        except (ValueError, TypeError):
+            usd = float(ceiling_usd)  # unparseable: assume the worst, never grant budget
+        if (dt.year, dt.month) == (now.year, now.month):
+            month_spent += usd  # errored rows count too: a failed call may still have billed
+        if status == "ok":
+            for k in keys or ():
+                if k not in last_ok or dt > last_ok[k]:
+                    last_ok[k] = dt
+    room = ceiling_usd - month_spent
+
+    best = {}
+    for c in candidates:
+        if c[0] not in best or c[2] > best[c[0]][2]:
+            best[c[0]] = c
+    ordered = sorted(best.values(), key=lambda c: (-c[2], c[0]))
+    eligible = [(k, n) for k, n, cnt in ordered
+                if k not in last_ok or now - last_ok[k] >= retry_gap]
+    picks = eligible[:max(0, per_run)]
+    if not picks:
+        return ApifyPlan([], 0, 0.0, month_spent, max(0.0, room), "nothing_eligible")
+
+    while True:
+        limit = max(LIMIT_MIN, LIMIT_PER_COMPANY * len(picks))
+        worst = actual_cost(limit)
+        if round(worst - room, 9) <= 0:
+            return ApifyPlan(picks, limit, worst, month_spent, max(0.0, room - worst), "")
+        if len(picks) > 1 and LIMIT_PER_COMPANY * (len(picks) - 1) >= LIMIT_MIN:
+            picks = picks[:-1]  # drop the smallest company
+            continue
+        return ApifyPlan([], 0, 0.0, month_spent, max(0.0, room), "monthly_ceiling")
