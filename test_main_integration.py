@@ -20011,3 +20011,36 @@ def test_warm_michigan_closing_message_counts_each_drop_and_lists_only_michigan(
     for gone in ("Austin", "Remote", "RemoteMI", "Nowhere"):
         title = f"Operations Analyst {gone}"
         assert not m.is_job_seen_db(m.generate_dedup_hash("Acme Robotics", title)), title
+
+
+def test_warm_rotation_report_budget_end_names_unscored_company_and_counts(monkeypatch):
+    import threading
+    names = ["Alpha Labs", "Bravo Labs"]
+    h = _screen_harness(monkeypatch, {n: [("Operations Analyst", "Detroit")] for n in names})
+    gate = threading.Event()
+    real = h._fake_gemini
+    done = []
+
+    def slow(job):
+        gate.wait(5)
+        try:
+            return real(job)
+        finally:
+            done.append(1)
+
+    monkeypatch.setattr(m, "evaluate_job_with_gemini", slow)
+    monkeypatch.setattr(m, "WARM_SCREEN_BUDGET_SECONDS", 0)
+    try:
+        text = h.run()
+    finally:
+        gate.set()
+        for _ in range(100):  # let the released workers finish before the test DB goes away
+            if len(done) >= 2:
+                break
+            threading.Event().wait(0.05)
+        threading.Event().wait(0.3)
+    assert "Screen: 2 companies picked, 0 finished in" in text, text
+    assert "of 0 s." in text
+    assert "Budget ended: 2 unscored, first alphabetically: Alpha Labs, Bravo Labs" in text, text
+    assert "Cards: 0 from 0 companies." in text
+    assert "Boards held back to retry first next run: 2." in text
