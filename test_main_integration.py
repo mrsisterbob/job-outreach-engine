@@ -15768,6 +15768,21 @@ def test_warm_radar_reports_skipped_companies_never_probes_non_company_names(mon
     assert "cousin" not in text and "linkedin" not in text
 
 
+def test_warm_radar_no_board_line_keeps_its_own_name_budget(monkeypatch):
+    """The lookup line (20 names) used to spend the whole shared name cap, so the no-board line
+    printed '(N):  and N more' with no names."""
+    missed = [f"Missedboard Co {chr(65 + i)}" for i in range(18)]
+    fresh = [f"Freshboard Co {chr(65 + i)}" for i in range(m.WARM_RADAR_LOOKUP_BATCH + 3)]
+    h = _WarmRadarHarness(monkeypatch, missed + fresh)
+    for name in missed:
+        m._stamp_board_lookup(name, True)
+    text = h.run()
+    line = next(l for l in text.splitlines() if l.startswith("Checked, no public job board found"))
+    assert "(18):" in line and "Missedboard Co A" in line, line
+    assert line.count("Missedboard Co") == min(18, m.WARM_RADAR_NAME_CAP), line
+    assert "Freshboard Co" in next(l for l in text.splitlines() if l.startswith("Not looked at yet"))
+
+
 def test_warm_radar_reports_skipped_companies_remembers_a_miss(monkeypatch):
     h = _WarmRadarHarness(monkeypatch, ["Nopeboard Labs"])
     first = h.run()

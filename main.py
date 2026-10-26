@@ -14958,10 +14958,10 @@ def run_warm_radar_scan(chat_id=None):
 
         def _skipped_report():
             lines = []
-            budget = WARM_RADAR_NAME_CAP
+            # Each list gets its own WARM_RADAR_NAME_CAP. A shared budget let the 20-name lookup line
+            # spend all of it, so the no-board line printed "(64):  and 64 more" with no names.
             if unchecked:
-                names, used = _warm_radar_name_list(lookup_now, budget)
-                budget -= used
+                names, _used = _warm_radar_name_list(lookup_now, WARM_RADAR_NAME_CAP)
                 lines.append(f"Not looked at yet, checking {len(lookup_now)} for a job board now"
                              f"{': ' + names if names else ''}")
                 if queued:
@@ -14969,8 +14969,7 @@ def run_warm_radar_scan(chat_id=None):
             if in_flight_skipped:
                 lines.append(f"{in_flight_skipped} more still being checked from the last run")
             if checked_no_board:
-                names, used = _warm_radar_name_list(checked_no_board, budget)
-                budget -= used
+                names, _used = _warm_radar_name_list(checked_no_board, WARM_RADAR_NAME_CAP)
                 lines.append(f"Checked, no public job board found ({len(checked_no_board)}): {names}"
                              if names else f"Checked, no public job board found: {len(checked_no_board)}")
             if not_company:
