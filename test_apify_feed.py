@@ -196,3 +196,85 @@ def test_apify_fetch_token_only_in_authorization_header():
     assert TOK not in repr(r) and TOK not in url
     assert kw["headers"] == {"Authorization": "Bearer " + TOK}
     assert TOK not in repr(kw["json"])
+
+
+# ---------------------------------------------------------------------------
+# plan_apify_run / actual_cost
+NOW = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+
+
+def _cands(n, start=0):
+    return [("co%02d" % i, "Co %d" % i, 100 - i) for i in range(start, start + n)]
+
+
+def _ago(days):
+    return (NOW - timedelta(days=days)).isoformat()
+
+
+def test_apify_plan_caps_companies_per_run():
+    plan = af.plan_apify_run(_cands(12), [], NOW)
+    assert len(plan.picks) == af.APIFY_COMPANIES_PER_RUN == 8
+    assert plan.skip_reason == ""
+
+
+def test_apify_plan_biggest_network_first_ties_by_key():
+    plan = af.plan_apify_run([("b", "B", 3), ("a", "A", 3), ("c", "C", 9)], [], NOW)
+    assert [k for k, _ in plan.picks] == ["c", "a", "b"]
+
+
+def test_apify_plan_limit_scales_but_not_below_min():
+    assert af.plan_apify_run(_cands(2), [], NOW).limit == 200
+    assert af.plan_apify_run(_cands(8), [], NOW).limit == 400
+    p = af.plan_apify_run(_cands(8), [], NOW)
+    assert abs(p.worst_case_usd - (0.10 + 0.0025 * 400)) < 1e-9
+
+
+def test_apify_plan_ok_row_blocks_for_retry_window():
+    ledger = [(_ago(3), 0.5, "ok", ["a"]), (_ago(8), 0.5, "ok", ["b"])]
+    plan = af.plan_apify_run([("a", "A", 5), ("b", "B", 4)], ledger, NOW)
+    assert [k for k, _ in plan.picks] == ["b"]
+
+
+def test_apify_plan_errored_row_allows_retry_but_counts_spend():
+    ledger = [(_ago(1), 0.30, "errored", ["a"])]
+    plan = af.plan_apify_run([("a", "A", 5)], ledger, NOW)
+    assert [k for k, _ in plan.picks] == ["a"]
+    assert abs(plan.month_spent_usd - 0.30) < 1e-9
+
+
+def test_apify_plan_month_rollover_ignores_last_month():
+    first = NOW.replace(day=1)
+    last_month = (first - timedelta(days=2)).isoformat()
+    plan = af.plan_apify_run(_cands(1), [(last_month, 3.9, "ok", ["zzz"])], NOW)
+    assert plan.month_spent_usd == 0.0
+    assert plan.skip_reason == ""
+
+
+def test_apify_plan_ceiling_too_low_for_min_run():
+    ledger = [(_ago(0), 3.50, "ok", ["x"])]  # room 0.50 < 0.60
+    plan = af.plan_apify_run(_cands(3), ledger, NOW)
+    assert plan.picks == [] and plan.skip_reason == "monthly_ceiling"
+
+
+def test_apify_plan_shrinks_picks_to_fit_ceiling():
+    ledger = [(_ago(0), 3.20, "ok", ["x"])]  # room 0.80: 8 picks cost 1.10, 6 picks (300) cost 0.85, 5 (250) 0.725
+    plan = af.plan_apify_run(_cands(8), ledger, NOW)
+    assert len(plan.picks) == 5 and plan.limit == 250
+    assert [k for k, _ in plan.picks] == ["co00", "co01", "co02", "co03", "co04"]
+    assert plan.worst_case_usd <= 0.80 + 1e-9
+
+
+def test_apify_plan_bad_timestamp_counts_as_now():
+    plan = af.plan_apify_run([("a", "A", 5)], [("garbage", 1.0, "ok", ["a"])], NOW)
+    assert plan.month_spent_usd == 1.0
+    assert plan.skip_reason == "nothing_eligible"
+
+
+def test_apify_plan_unparseable_usd_spends_whole_ceiling():
+    plan = af.plan_apify_run(_cands(2), [(_ago(1), "n/a", "ok", [])], NOW)
+    assert plan.skip_reason == "monthly_ceiling"
+
+
+def test_apify_plan_actual_cost():
+    assert abs(af.actual_cost(0) - 0.10) < 1e-9
+    assert abs(af.actual_cost(200) - 0.60) < 1e-9
