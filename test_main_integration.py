@@ -20289,3 +20289,163 @@ def test_apify_store_non_utc_now_stored_as_utc():
     with m.get_db_conn() as conn:
         stamps = [r[0] for r in conn.execute("SELECT spent_at FROM apify_feed_ledger ORDER BY id")]
     assert all(s.endswith("+00:00") for s in stamps)
+
+
+# ---- /w looks up the biggest no-board warm companies on the Apify feed (TASK-179) ----
+
+def _apify_hook_harness(monkeypatch, nobody=None, token="tok"):
+    h = _jsearch_harness(monkeypatch, nobody if nobody is not None else {"Nopeboard Labs": 3, "Smallfry Inc": 1})
+    monkeypatch.delenv("RAPIDAPI_KEY", raising=False)
+    if token:
+        monkeypatch.setenv("APIFY_TOKEN", token)
+    else:
+        monkeypatch.delenv("APIFY_TOKEN", raising=False)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM apify_feed_ledger")
+        conn.execute("DELETE FROM apify_seen_jobs")
+        conn.commit()
+    h.posts, h.feed = [], []
+
+    class _Resp:
+        status_code = 200
+        def __init__(self, rows):
+            self.rows = rows
+        def json(self):
+            return self.rows
+
+    def fake_post(url, **kw):
+        h.posts.append((url, kw))
+        return _Resp(list(h.feed))
+
+    monkeypatch.setattr(m.requests, "post", fake_post)
+    return h
+
+
+def _apify_row(org, title, n, loc="Troy, Michigan, United States"):
+    return {"id": f"{n}x{len(title)}", "title": title, "organization": org,
+            "url": f"https://careers.example.com/apify/{n}{len(title)}",
+            "locations_derived": [loc], "description_text": "Reconciliation workflows with SQL and reporting.",
+            "source_domain": org.split()[0].lower() + ".com"}
+
+
+def _apify_ledger_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT usd, status, company_keys FROM apify_feed_ledger ORDER BY id").fetchall()
+
+
+def test_apify_hook_biggest_company_gets_a_card_and_one_ask_from_one_call(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    text = h.run()
+    assert len(h.posts) == 1, h.posts
+    assert sorted(h.posts[0][1]["json"]["organizationSearch"]) == ["Nopeboard Labs", "Smallfry Inc"]
+    assert h.cards == ["Operations Analyst"], (h.cards, text)
+    asks = _asks()
+    assert len(asks) == 1 and asks[0]["company"] == "Nopeboard Labs", asks
+    led = _apify_ledger_rows()
+    assert len(led) == 1 and led[0][1] == "ok" and abs(led[0][0] - (0.10 + 0.0025 * 1)) < 1e-9, led
+    assert m.apify_seen_filter(["apify_" + h.feed[0]["id"]]) == {"apify_" + h.feed[0]["id"]}
+    h.cards.clear()
+    h.posts.clear()
+    h.run()   # same company inside the retry gap: no second call
+    assert h.posts == []
+
+
+def test_apify_hook_no_token_makes_no_call_and_leaves_the_text_alone(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, token=None)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    text = h.run()
+    assert h.posts == [] and _apify_ledger_rows() == []
+    assert "Apify" not in text and h.cards == [], (text, h.cards)
+
+
+def test_apify_hook_ledger_at_monthly_ceiling_makes_no_call(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, 4.0, 'ok', '[]')",
+                     (m.datetime.now(m.timezone.utc).isoformat(),))
+        conn.commit()
+    h.run()
+    assert h.posts == [] and h.cards == []
+    assert len(_apify_ledger_rows()) == 1
+
+
+def test_apify_hook_sibling_entity_and_non_michigan_rows_make_no_card(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, {"Haworth Inc": 3})
+    h.feed = [_apify_row("Haworth International", "Operations Analyst", 1),
+              _apify_row("Haworth Inc", "Business Systems Analyst", 2, loc="Orlando, Florida, United States")]
+    text = h.run()
+    assert len(h.posts) == 1
+    assert h.cards == [] and _asks() == [], (h.cards, text)
+
+
+def test_apify_hook_errored_call_keeps_worst_case_and_scan_survives(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+
+    def boom(url, **kw):
+        h.posts.append(url)
+        raise RuntimeError("secret-token-in-message")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    h.run()
+    led = _apify_ledger_rows()
+    assert len(h.posts) == 1 and len(led) == 1 and led[0][1] == "errored" and led[0][0] >= 0.5, led
+
+
+def test_apify_hook_marks_only_settled_rows_seen(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, {"Nopeboard Labs": 3, "Rejectco Labs": 2, "Failco Labs": 2, "Gateco Labs": 1})
+    h.gemini_scores["Rejected Role"] = 50
+    h.gemini_scores["Failed Role"] = None
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1),
+              _apify_row("Rejectco Labs", "Rejected Role", 2),
+              _apify_row("Failco Labs", "Failed Role", 3),
+              _apify_row("Gateco Labs", "Help Desk Technician", 4),
+              _apify_row("Gateco Labs", "Business Systems Analyst", 5, loc="Orlando, Florida, United States")]
+    ids = ["apify_" + r["id"] for r in h.feed]
+    h.run()
+    assert len(h.posts) == 1
+    assert h.cards == ["Operations Analyst"], h.cards
+    assert m.apify_seen_filter(ids) == {ids[0], ids[1]}, m.apify_seen_filter(ids)
+
+
+def test_apify_hook_failed_reserve_makes_no_call(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    monkeypatch.setattr(m, "apify_ledger_reserve", lambda *a, **kw: None)
+    h.run()
+    assert h.posts == [] and h.cards == [] and _apify_ledger_rows() == []
+
+
+def test_apify_hook_unreadable_ledger_makes_no_call(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    monkeypatch.setattr(m, "apify_ledger_read", lambda: None)
+    h.run()
+    assert h.posts == [] and h.cards == [] and _apify_ledger_rows() == []
+
+
+def test_apify_hook_no_cached_boards_still_reaches_the_hook(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.filters["ats_company_slugs"] = []
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE company_identities SET ats_slug = NULL, workday_board = NULL")
+        conn.commit()
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    assert len(h.posts) == 1 and h.cards == ["Operations Analyst"], (h.posts, h.cards)
+
+
+def test_apify_hook_status_update_raising_still_fetches_and_settles(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+
+    def boom(chat_id, text):
+        if "Apify" in text:
+            raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(m, "send_status_update", boom)
+    h.run()
+    led = _apify_ledger_rows()
+    assert len(h.posts) == 1 and len(led) == 1 and led[0][1] == "ok", led
+    assert abs(led[0][0] - 0.1025) < 1e-9, led
