@@ -27,6 +27,17 @@
         ]
       },
       {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/planner_guard.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking the planner session writes only to the inbox..."
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {
