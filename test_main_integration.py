@@ -15688,6 +15688,9 @@ class _WarmRadarHarness:
         monkeypatch.setattr(m, "fetch_ats_jobs", lambda slugs, **kw: self.fetched.append(list(slugs)) or [])
         # /w spends JSearch requests on no-board companies: no /w harness may reach the network for it.
         monkeypatch.setattr(m, "fetch_single_query_jobs", lambda query_args, pages=None, **kw: [])
+        # Pin the screen budget far above any test run so a slow machine cannot push roles into
+        # unscored_roles. A test that wants a short budget patches it again after building this.
+        monkeypatch.setattr(m, "WARM_SCREEN_BUDGET_SECONDS", 3600)
         monkeypatch.setattr(m, "enqueue_crm_payload", lambda payload: True)
         monkeypatch.setattr(m, "send_status_update", lambda chat_id, text: None)
         monkeypatch.setattr(m, "send_telegram_message", lambda chat_id, text: self.messages.append(text) or 1)
@@ -17025,6 +17028,7 @@ def _summary_harness(monkeypatch, boards, priorities=None, rows=None):
     captured in h.posts as (message_id, text)) and the Clavicular enqueue, whose rows also feed
     is_role_tracked so a second run sees what the first one wrote."""
     h = _WarmRadarHarness(monkeypatch, list(boards))
+    monkeypatch.setattr(m, "WARM_SCREEN_BUDGET_SECONDS", 3600)
     if rows is None:
         rows = [{"company": c, "name": f"Person {i}", "email": f"p{i}@example.com", "note": "Active relationship",
                  "raw_priority": (priorities or {}).get(c, 5), "sheet_uuid": f"u{i}"}
@@ -20099,3 +20103,13 @@ def test_warm_card_honesty_closing_message_names_companies(monkeypatch):
     h2 = _WarmRadarHarness(monkeypatch, names)
     text = h2.run()
     assert "none of your 25 warm companies has a cached job board yet" in text and "warm entries" not in text
+
+
+def test_warm_harness_budget_pinned_in_radar_harness(monkeypatch):
+    _WarmRadarHarness(monkeypatch, ["Acme"])
+    assert m.WARM_SCREEN_BUDGET_SECONDS >= 3600
+
+
+def test_warm_harness_budget_pinned_in_summary_harness(monkeypatch):
+    _summary_harness(monkeypatch, {"Acme": [("Analyst", "Chicago")]})
+    assert m.WARM_SCREEN_BUDGET_SECONDS >= 3600
