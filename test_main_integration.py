@@ -20012,6 +20012,16 @@ def test_warm_big_companies_closing_message_names_big_companies(monkeypatch):
     assert "Smallco" not in text.split("Biggest warm companies")[1]
 
 
+def test_warm_five_plus_closing_message_counts_companies_and_contacts(monkeypatch):
+    companies = ["Bigboard Corp"] * 6 + ["Nopeboard Labs"] * 5 + ["Fourco Inc"] * 4
+    h = _WarmRadarHarness(monkeypatch, companies)
+    m.upsert_company_identity("Bigboard Corp", ats_slug="bigboardcorp")
+    h.run()                  # first /w looks Nopeboard Labs up and records the miss
+    text = h.run()
+    assert ("Companies with 5+ contacts: 2 (11 contacts), of which 1 have a board connected (6 contacts), "
+            "1 checked with none found (5 contacts), 0 not looked up yet (0 contacts).") in text, text
+
+
 # ---- TASK-160: /w lists only in-person Michigan roles ----
 
 def test_warm_michigan_closing_message_counts_each_drop_and_lists_only_michigan(monkeypatch):
