@@ -15399,6 +15399,14 @@ def run_warm_radar_scan(chat_id=None):
             lines.append(f"Screened {len(to_screen)} role{'' if len(to_screen) == 1 else 's'} with AI in {screen_seconds:.0f} s: "
                          f"{len(sent_items)} cards, {len(digest_sent)} in the digest, "
                          f"{len(rejected_hashes)} below 70, {held_roles} held, {len(failed_roles)} failed.")
+            # Measurement only: who was picked, who finished before the budget, who was left, where cards came from.
+            _unscored_keys = {r["group_key"] for r in unscored_roles}
+            lines.extend(warm_screen_plan.rotation_report(
+                [r["company"] for r in to_screen],
+                [r["company"] for r in to_screen if r["group_key"] not in _unscored_keys],
+                [r["company"] for r in unscored_roles],
+                [i["company"] for i in sent_items],
+                len(blocked_slugs), screen_seconds, WARM_SCREEN_BUDGET_SECONDS))
             if unscored_roles:
                 lines.append(f"The {WARM_SCREEN_BUDGET_SECONDS} s screen budget ran out: "
                              f"{len(unscored_roles)} role{'' if len(unscored_roles) == 1 else 's'} left unscored "

@@ -91,3 +91,34 @@ def test_applied_recently():
 def test_digest_lines_shape():
     line = w.digest_lines([{"final": 7, "company": "C" * 40, "title": "T" * 60}])[0]
     assert line == "  7  " + "C" * 28 + " - " + "T" * 40
+
+
+def test_warm_rotation_report_full_shape_has_all_four_lines():
+    got = w.rotation_report(["B", "A", "C", "D"], ["A", "B"], ["D", "C"], ["A", "A", "B"], 3, 96.4, 150)
+    assert got == ["Screen: 4 companies picked, 2 finished in 96 s of 150 s.",
+                   "Budget ended: 2 unscored, first alphabetically: C, D",
+                   "Cards: 3 from 2 companies.",
+                   "Boards held back to retry first next run: 3."]
+
+
+def test_warm_rotation_report_no_unscored_prints_no_budget_line():
+    got = w.rotation_report(["A"], ["A"], [], ["A"], 0, 5, 150)
+    assert not any("Budget ended" in x for x in got)
+    assert not any("held back" in x for x in got)
+
+
+def test_warm_rotation_report_more_than_five_unscored_says_and_n_more():
+    names = [f"Co{c}" for c in "gfedcbah"]
+    got = w.rotation_report(names, [], names, [], 0, 150, 150)
+    assert "Budget ended: 8 unscored, first alphabetically: Coa, Cob, Coc, Cod, Coe and 3 more" in got
+
+
+def test_warm_rotation_report_escapes_names():
+    got = w.rotation_report(["<b>X</b> & Co"], [], ["<b>X</b> & Co"], [], 0, 150, 150)
+    assert any("&lt;b&gt;X&lt;/b&gt; &amp; Co" in x for x in got)
+    assert not any("<b>" in x for x in got)
+
+
+def test_warm_rotation_report_no_cards_prints_cards_zero():
+    got = w.rotation_report(["A"], ["A"], [], [], 0, 5, 150)
+    assert "Cards: 0 from 0 companies." in got
