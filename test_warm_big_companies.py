@@ -36,3 +36,27 @@ def test_warm_big_companies_escapes_angle_brackets():
 def test_warm_big_companies_nobody_big_gives_no_lines():
     assert w.big_company_report([("Tiny", 9, "scanned")]) == []
     assert w.big_company_report([]) == []
+
+
+FIVE = [("A", 5, "scanned"), ("B", 4, "scanned"), ("C", 9, "no_board"), ("D", 6, "unchecked"),
+        ("E", 40, "not_company")]
+
+
+def test_warm_five_plus_exactly_five_is_in_and_four_is_out():
+    line = w.board_target_line([("In", 5, "scanned"), ("Out", 4, "scanned")])
+    assert line.startswith("Companies with 5+ contacts: 1 (5 contacts)")
+
+
+def test_warm_five_plus_buckets_sum_to_total_and_not_company_is_left_out():
+    line = w.board_target_line(FIVE)
+    assert line == ("Companies with 5+ contacts: 3 (20 contacts), of which 1 have a board connected (5 contacts), "
+                    "1 checked with none found (9 contacts), 1 not looked up yet (6 contacts).")
+
+
+def test_warm_five_plus_no_rows_returns_nothing():
+    assert w.board_target_line([]) == ""
+    assert w.board_target_line([("X", 4, "scanned"), ("Y", 50, "not_company")]) == ""
+
+
+def test_warm_five_plus_threshold_defined_once():
+    assert w.WARM_BOARD_TARGET_MIN_CONTACTS == 5

@@ -6,6 +6,7 @@ Workday triple exists). It does NOT say the board was fetched successfully on th
 import html
 
 BIG_COMPANY_MIN_CONTACTS = 10
+WARM_BOARD_TARGET_MIN_CONTACTS = 5   # Kevin's number (2026-10-26): every company with this many warm contacts should get a board
 MAX_LINES = 12
 
 _WORDING = {
@@ -34,3 +35,21 @@ def big_company_report(rows):
     if len(big) > MAX_LINES:
         lines.append(f"and {len(big) - MAX_LINES} more")
     return lines
+
+
+def board_target_line(rows):
+    """One closing-message line: companies with WARM_BOARD_TARGET_MIN_CONTACTS+ warm contacts, how many
+    have a board connected (a cached board exists, not fetched OK this run). not_company rows are not
+    companies and are left out. Returns "" when there are none."""
+    co = [(int(c), s) for _n, c, s in rows
+          if int(c) >= WARM_BOARD_TARGET_MIN_CONTACTS and s != "not_company"]
+    if not co:
+        return ""
+
+    def part(status):
+        sel = [c for c, s in co if s == status]
+        return len(sel), sum(sel)
+    (hn, hc), (nn, nc), (un, uc) = part("scanned"), part("no_board"), part("unchecked")
+    return (f"Companies with {WARM_BOARD_TARGET_MIN_CONTACTS}+ contacts: {len(co)} ({sum(c for c, _ in co)} contacts), "
+            f"of which {hn} have a board connected ({hc} contacts), "
+            f"{nn} checked with none found ({nc} contacts), {un} not looked up yet ({uc} contacts).")
