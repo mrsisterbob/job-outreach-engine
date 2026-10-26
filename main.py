@@ -31,6 +31,7 @@ import warm_big_companies
 import warm_company_kind
 import warm_jsearch_plan
 import warm_screen_plan
+import warm_michigan
 import role_region
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from track_registry import (
@@ -15008,7 +15009,7 @@ def run_warm_radar_scan(chat_id=None):
         region_hashes = set()
         title_filtered = 0
         region_filtered = 0
-        location_unknown = 0
+        remote_hashes = set()
         referral_pending = {}   # company key -> best contact + the roles that were LISTED this run
         screen_trace = FunnelTrace()   # why the role screen (passes_strict_filter) dropped roles this run
         screen_dropped = set()         # hashes the role screen already counted (a duplicate posting counts once)
@@ -15077,12 +15078,21 @@ def run_warm_radar_scan(chat_id=None):
                     region_filtered += 1
                 return
 
+            # Pure Remote roles are not Michigan in-person roles. The shared Michigan rule below lets
+            # "Remote - Michigan" through (michigan is in the city text), so Remote is dropped here.
+            # job_is_remote is the posting source's flag; a hybrid role flagged remote without the
+            # word "hybrid" in its location is dropped (errs toward dropping). Never stamped.
+            if warm_michigan.is_pure_remote(job):
+                remote_hashes.add(job_hash)
+                return
+
             # The role screen /t uses, called as-is (never copied): years required, industrial and
-            # trade-degree roles and the rest. Geography and company suppression are off for /w.
+            # trade-degree roles and the rest. Michigan-only geography is ON for /w (an unreadable
+            # or non-Michigan location is dropped); company suppression stays off.
             # A dropped role is counted by reason and never stamped, like the title gate.
             if job_hash in screen_dropped:
                 return
-            if not passes_strict_filter(job, trace=screen_trace, check_geography=False,
+            if not passes_strict_filter(job, trace=screen_trace, check_geography=True,
                                         check_company_suppression=False):
                 screen_dropped.add(job_hash)
                 return
@@ -15312,8 +15322,6 @@ def run_warm_radar_scan(chat_id=None):
         for item in sent_items:
             save_seen_job_db(item["job_hash"])
             match_count += 1
-            if item["role"]["verdict"] == role_region.UNKNOWN:
-                location_unknown += 1
             sent_by_group.setdefault(item["company_key"], []).append(item)
         for group_key, items in sent_by_group.items():
             group = groups[group_key]
@@ -15358,7 +15366,7 @@ def run_warm_radar_scan(chat_id=None):
 
         logging.info(f"Warm Radar Complete: {match_count} roles listed in {messages_sent} messages across "
                      f"{len(scanned_slugs)} warm companies; {title_filtered} filtered by title, {region_filtered} by "
-                     f"region/language, {location_unknown} listed with unknown location; held back "
+                     f"region/language, {len(remote_hashes)} Remote dropped; held back "
                      f"{held_roles} roles at {held_companies} companies; {failed_companies} cards withheld; screened "
                      f"{len(to_screen)} in {screen_seconds:.0f}s ({len(failed_roles)} failed).")
         if chat_id:
@@ -15373,8 +15381,8 @@ def run_warm_radar_scan(chat_id=None):
                              "they are retried on a later run.")
             if region_filtered:
                 lines.append(f"{region_filtered} role{'' if region_filtered == 1 else 's'} outside the US/English filtered")
-            if location_unknown:
-                lines.append(f"{location_unknown} role{'' if location_unknown == 1 else 's'} kept with no readable location")
+            if remote_hashes:
+                lines.append(f"{len(remote_hashes)} Remote role{'' if len(remote_hashes) == 1 else 's'} dropped")
             if held_roles:
                 lines.append(f"Held back {held_roles} role{'' if held_roles == 1 else 's'} at "
                              f"{held_companies} compan{'y' if held_companies == 1 else 'ies'} to keep this run short. "
@@ -15387,7 +15395,7 @@ def run_warm_radar_scan(chat_id=None):
                 ranked = sorted(screen_trace.reasons.items(), key=lambda kv: (-kv[1], kv[0]))
                 dropped = sum(screen_trace.reasons.values())
                 lines.append(f"{dropped} dropped by the role screen ("
-                             + ", ".join(f"{k} {v}" for k, v in ranked) + ")")
+                             + ", ".join(f"{warm_michigan.reason_words(k)} {v}" for k, v in ranked) + ")")
             lines.append(f"Screened {len(to_screen)} role{'' if len(to_screen) == 1 else 's'} with AI in {screen_seconds:.0f} s: "
                          f"{len(sent_items)} cards, {len(digest_sent)} in the digest, "
                          f"{len(rejected_hashes)} below 70, {held_roles} held, {len(failed_roles)} failed.")

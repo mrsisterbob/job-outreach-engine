@@ -15833,6 +15833,7 @@ def test_warm_radar_reports_skipped_companies_shared_slug_counts_both_as_scanned
 def _warm_title_jobs(titles, slug="acmerobotics"):
     return [{"employer_name": "Acme Robotics", "job_title": t, "job_id": f"gh_{slug}_{i}",
              "job_apply_link": f"https://boards.greenhouse.io/{slug}/jobs/{i}",
+             "job_city": "Troy, MI",   # /w lists Michigan in-person roles only (TASK-160)
              "job_description": "Reconciliation workflows with SQL and reporting."}
             for i, t in enumerate(titles)]
 
@@ -15967,7 +15968,8 @@ def _ask_jobs(specs):
     """specs: [(title, requisition_id)] -> Greenhouse-shaped jobs for Acme Robotics."""
     return [{"employer_name": "Acme Robotics", "job_title": t, "job_id": f"gh_acmerobotics_{i}_{len(t)}",
              "job_apply_link": f"https://boards.greenhouse.io/acmerobotics/jobs/{len(t)}{i}",
-             "job_requisition_id": req, "job_description": "Reconciliation workflows with SQL and reporting."}
+             "job_requisition_id": req, "job_city": "Troy, MI",
+             "job_description": "Reconciliation workflows with SQL and reporting."}
             for i, (t, req) in enumerate(specs)]
 
 
@@ -17042,11 +17044,21 @@ def _summary_harness(monkeypatch, boards, priorities=None, rows=None):
                 continue                      # a real fetch returns only the boards it was asked for
             for i, role in enumerate(roles):
                 title, location = role[0], role[1]
+                state = ""
+                if location is None:
+                    location = ""           # a real no-location posting (stays unreadable)
+                elif location in ("", "Chicago"):
+                    # blank / Chicago are the old stand-in locations; /w is Michigan-only now (TASK-160)
+                    location = "Troy, MI"
+                elif location == "Austin, TX":
+                    location, state = "Austin", "TX"     # a real posting carries the state apart
+                elif location == "Detroit":
+                    location = "Detroit, MI"
                 out.append({"employer_name": company, "job_title": title,
                             "job_id": f"gh_{slugs[company]}_{i}",
                             "job_apply_link": (role[2] if len(role) > 2 else
                                                f"https://boards.greenhouse.io/{slugs[company]}/jobs/{i}"),
-                            "job_city": location, "job_state": "", "job_is_remote": False,
+                            "job_city": location, "job_state": state, "job_is_remote": False,
                             "job_requisition_id": "", "job_description": "Reconciliation workflows with SQL."})
         return out
 
@@ -17162,15 +17174,15 @@ def test_warm_radar_company_summaries_no_company_lists_more_than_two_roles_acros
     assert "next best roles" in text
 
 
-def test_warm_radar_company_summaries_roles_rank_track_titles_then_us_over_unknown(monkeypatch):
+def test_warm_radar_company_summaries_roles_rank_track_titles_first_then_board_order(monkeypatch):
     roles = [("Operations Analyst Alpha", ""), ("Operations Analyst Beta", ""), ("Operations Analyst Gamma", ""),
              ("Operations Analyst Delta", "Detroit"), ("Operations Analyst Eps", "Detroit"),
              ("Operations Analyst Zeta", "Detroit"), ("Operations Analyst Eta", "Detroit"),
              ("Operations Analyst Theta", "Detroit"), ("Supply Chain Analyst", "")]
     h = _summary_harness(monkeypatch, {"Acme Robotics": roles})
     h.run()
-    # the rank (track title first, then a known US location over an unknown one) picks the 3 Gemini sees
-    assert set(h.gemini_calls) == {"Supply Chain Analyst", "Operations Analyst Delta", "Operations Analyst Eps"}, h.gemini_calls
+    # the rank (track title first, then board order; every role is in Michigan now) picks the 3 Gemini sees
+    assert set(h.gemini_calls) == {"Supply Chain Analyst", "Operations Analyst Alpha", "Operations Analyst Beta"}, h.gemini_calls
     listed = [r["row_data"][2] for r in h.rows()]
     assert len(listed) == 2 and set(listed) <= set(h.gemini_calls)
 
@@ -17182,7 +17194,7 @@ def test_warm_radar_company_summaries_foreign_and_non_english_roles_are_counted_
     h = _summary_harness(monkeypatch, {"Acme Robotics": roles})
     text = h.run()
     assert "4 roles outside the US/English filtered" in text, text
-    assert "1 role kept with no readable location" in text, text
+    assert "kept with no readable location" not in text, text   # unreadable is dropped now, never kept
     assert "2 new matches" in text
     post = "\n".join(t for _, t in h.posts)
     for gone in ("Procurement Analyst", "Praktikum", "Werkstudent", "Reporting Analyst"):
@@ -17326,7 +17338,7 @@ def test_warm_radar_company_summaries_unknown_location_count_covers_listed_roles
     roles = [(f"Operations Analyst {chr(65 + i)}", "") for i in range(8)]
     h = _summary_harness(monkeypatch, {"Acme Robotics": roles})
     text = h.run()
-    assert "2 roles kept with no readable location" in text, text
+    assert "kept with no readable location" not in text, text   # TASK-160: the line is gone
     assert "8 roles kept" not in text and "Held back 1 role" in text
 
 
@@ -17759,7 +17771,7 @@ def test_warm_radar_scans_boards_in_batches_slug_matched_and_name_matched_held_b
             return [{"employer_name": n, "job_title": "Operations Analyst",
                      "job_id": (f"other_{i}" if name_matched else f"gh_{slug_of[n]}_0"),
                      "job_apply_link": f"https://boards.greenhouse.io/{slug_of[n]}/jobs/{i}",
-                     "job_city": "Detroit", "job_state": "", "job_is_remote": False,
+                     "job_city": "Detroit, MI", "job_state": "", "job_is_remote": False,
                      "job_requisition_id": "", "job_description": "Reconciliation workflows with SQL."}
                     for i, n in enumerate(names) if slug_of[n] in slugs]
 
@@ -19979,3 +19991,23 @@ def test_warm_big_companies_closing_message_names_big_companies(monkeypatch):
     assert "• Bigboard Corp (12) - board scanned" in text
     assert "• Nopeboard Labs (11) - no board found" in text
     assert "Smallco" not in text.split("Biggest warm companies")[1]
+
+
+# ---- TASK-160: /w lists only in-person Michigan roles ----
+
+def test_warm_michigan_closing_message_counts_each_drop_and_lists_only_michigan(monkeypatch):
+    roles = [("Operations Analyst Troy", "Troy, MI"), ("Operations Analyst Lansing", "Lansing, MI"),
+             ("Operations Analyst Austin", "Austin, TX"), ("Operations Analyst Remote", "Remote"),
+             ("Operations Analyst RemoteMI", "Remote - Michigan"), ("Operations Analyst Nowhere", None)]
+    h = _summary_harness(monkeypatch, {"Acme Robotics": roles})
+    h.filters["valid_cities"] = ["troy", "detroit"]     # Lansing is NOT in the configured list
+    text = h.run()
+    assert set(h.gemini_calls) == {"Operations Analyst Troy", "Operations Analyst Lansing"}, h.gemini_calls
+    assert {r["row_data"][2] for r in h.rows()} == set(h.gemini_calls)
+    assert "2 Remote roles dropped" in text, text
+    assert "outside Michigan 1" in text and "no Michigan location found 1" in text, text
+    assert "out_of_state" not in text and "city_allowlist" not in text, text
+    assert "kept with no readable location" not in text, text
+    for gone in ("Austin", "Remote", "RemoteMI", "Nowhere"):
+        title = f"Operations Analyst {gone}"
+        assert not m.is_job_seen_db(m.generate_dedup_hash("Acme Robotics", title)), title
