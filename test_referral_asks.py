@@ -510,3 +510,11 @@ def test_warm_linkedin_unverified_connection_false_for_malformed_date():
 
 def test_warm_linkedin_unverified_connection_false_for_alumni_note():
     assert ra.is_linkedin_connection({"note": "LinkedIn alumni | employer filter: Acme | Analyst at Acme"}) is False
+
+
+def test_warm_card_honesty_note_is_old_threshold():
+    from datetime import date
+    today = date(2026, 10, 26)
+    assert ra.note_is_old("Connected 2023-03-01", today) is True
+    assert ra.note_is_old("Connected 2026-01-01", today) is False
+    assert ra.note_is_old("", today) is False

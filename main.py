@@ -6088,7 +6088,7 @@ def process_single_candidate(job, force=False, outcome=None):
                         f"{html.escape(contact_name)} "
                         f"{_li + ' ' if _li else ''}"
                         f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))}, {warm_count_text})</i>\n"
-                        f"📝 <b>Note:</b> {html.escape(contact_note)}\n"
+                        f"📝 <b>Note:</b> {html.escape(contact_note)}{referral_asks.old_note_suffix(contact_note, datetime.now().date())}\n"
                     )
                 # raw score < 70: ATS + warm match does not qualify for any boost or Clavicular routing
             else:
@@ -6102,7 +6102,7 @@ def process_single_candidate(job, force=False, outcome=None):
                     f"{html.escape(contact_info.get('name', 'Contact'))} "
                     f"{_li + ' ' if _li else ''}"
                     f"<i>({html.escape(contact_info.get('raw_company', 'Firm'))} - Priority {priority_score}/10, {warm_count_text})</i>\n"
-                    f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}\n"
+                    f"📝 <b>Note:</b> {html.escape(contact_info.get('note', 'Active relationship'))}{referral_asks.old_note_suffix(contact_info.get('note', 'Active relationship'), datetime.now().date())}\n"
                 )
 
         # Wildcard bonus: applied after the warm/Clavicular walk so the Clavicular raw-score gate
@@ -12323,6 +12323,12 @@ def send_telegram_message(chat_id, text):
 SALARY_UNLISTED_SENTINEL = "Salary Unlisted"
 WORK_STYLE_UNSPECIFIED_SENTINEL = "On-Site / Unspecified"
 
+# Both are the planner's GUESSES, NOT measured against Kevin's real cards: a boost of 20+ on a
+# role whose skills overlap is under 30% gets the "low skills match" flag. Display only.
+LOW_SKILLS_FLAG_MIN_BOOST = 20
+LOW_SKILLS_FLAG_UNDER_PCT = 30
+
+
 def send_telegram_card(job, score, target_email, age_badge, salary_str, work_style, overlap_pct, short_id, sheet_uuid=None, alumni_line="", sheet_tab="Pipeline_Candidates", score_boost=0):
     """Send an executive-scannable job card as pure text - no inline keyboards, swipe-reply only.
     Captures the telegram_message_id and maps it to sheet_uuid for later swipe-reply resolution.
@@ -12370,7 +12376,7 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
 
     # Metadata line: score (+ the boost that got it there, if any) always first, then salary and
     # work style only when actually known, then age and keyword overlap unconditionally.
-    boost_suffix = f" ({score_boost:+d})" if score_boost else ""
+    boost_suffix = f" (base {score - score_boost}, {score_boost:+d})" if score_boost else ""
     meta_parts = [f"<b>{score}/100</b>{boost_suffix}"]
     salary_str_val = str(salary_str)
     if salary_str_val != SALARY_UNLISTED_SENTINEL:
@@ -12379,7 +12385,10 @@ def send_telegram_card(job, score, target_email, age_badge, salary_str, work_sty
     if work_style_val != WORK_STYLE_UNSPECIFIED_SENTINEL:
         meta_parts.append(html.escape(work_style_val))
     meta_parts.append(html.escape(str(age_badge)))
-    meta_parts.append(f"Skills {overlap_pct}%")
+    skills_text = f"Skills {overlap_pct}%"
+    if score_boost >= LOW_SKILLS_FLAG_MIN_BOOST and overlap_pct < LOW_SKILLS_FLAG_UNDER_PCT:
+        skills_text += " ⚠ low skills match"
+    meta_parts.append(skills_text)
     meta_line = f"{fit_dot} " + " · ".join(meta_parts)
 
     card_text = (
@@ -14965,7 +14974,7 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(f"Checked, no public job board found ({len(checked_no_board)}): {names}"
                              if names else f"Checked, no public job board found: {len(checked_no_board)}")
             if not_company:
-                lines.append(f"{not_company} warm entries are not company names")
+                lines.append(f"{not_company} warm companies are not company names")
             if not_employer_names:
                 parts = ", ".join(f"{not_employer_kinds[k]} {k}" for k in warm_company_kind.KINDS if not_employer_kinds.get(k))
                 lines.append(f"{len(not_employer_names)} skipped as not employers: {parts} "
@@ -14984,7 +14993,7 @@ def run_warm_radar_scan(chat_id=None):
                            if jsearch_ledger is not None else [])
         if not slug_to_contact and not wd_to_contact and not jsearch_preview:
             if chat_id:
-                lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm entries has a cached job board yet."]
+                lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm companies has a cached job board yet."]
                 lines += _skipped_report()
                 send_telegram_message(chat_id, "\n".join(lines))
             return 0
