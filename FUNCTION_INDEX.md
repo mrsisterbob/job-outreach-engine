@@ -100,18 +100,20 @@ grep -i "contact" FUNCTION_INDEX.md
 | 229 | `to_sheet_row` | The 12-column Carmen Warm row: date, name, company, email, priority, status, blank, URL, |
 | 240 | `build_master` | Classify every person. Returns {"people": [(status, person)], "rows": {handle: sheet row |
 
-## `apify_feed.py` — 8 defs, 178 lines
+## `apify_feed.py` — 10 defs, 222 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 41 | `build_run_input` | Actor input for a batch: plain names only (a "Name:*" prefix pulled affiliates), no date key |
-| 52 | `_get` | _(no docstring)_ |
-| 59 | `_split_location` | 'City, State, Country' -> (city, state, country), tolerating short forms: 'Michigan' or 'MI' |
-| 83 | `_pick_location` | The Michigan filter leaks, so take the first Michigan entry; else the first entry; else empty. |
-| 96 | `parse_row` | One feed row -> JSearch-shaped posting dict, or None when id, title, organization or url is missing. |
-| 125 | `_squash` | _(no docstring)_ |
-| 129 | `row_belongs_to` | True only when the normalized organization equals the company (strict: siblings like Haworth |
-| 155 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
+| 42 | `build_run_input` | Actor input for a batch: plain names only (a "Name:*" prefix pulled affiliates), no date key |
+| 53 | `_get` | _(no docstring)_ |
+| 60 | `_split_location` | 'City, State, Country' -> (city, state, country), tolerating short forms: 'Michigan' or 'MI' |
+| 84 | `_pick_location` | The Michigan filter leaks, so take the first Michigan entry; else the first entry; else empty. |
+| 97 | `parse_row` | One feed row -> JSearch-shaped posting dict, or None when id, title, organization or url is missing. |
+| 126 | `_squash` | _(no docstring)_ |
+| 130 | `row_belongs_to` | True only when the normalized organization equals the company (strict: siblings like Haworth |
+| 156 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
+| 189 | `get_token` | Stripped APIFY_TOKEN from the given environment mapping, or None. Environment only: no default, no file. |
+| 195 | `fetch_feed` | One batched feed call. status is "ok", "errored" or "unconfigured". |
 
 ## `build_function_index.py` — 6 defs, 196 lines
 
@@ -1024,4 +1026,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**810 definitions across 39 files + Code.gs.**
+**812 definitions across 39 files + Code.gs.**
