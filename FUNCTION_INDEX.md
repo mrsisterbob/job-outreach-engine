@@ -21,6 +21,15 @@ grep -i "contact" FUNCTION_INDEX.md
 | 143 | `find_git_write` | _(no docstring)_ |
 | 176 | `decide` | _(no docstring)_ |
 
+## `.claude/hooks/memory_stale_warning.py` — 4 defs, 86 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 21 | `frontmatter_date` | The stale_after date in the first frontmatter block, or None. |
+| 39 | `stale_files` | _(no docstring)_ |
+| 53 | `build_message` | _(no docstring)_ |
+| 62 | `main` | _(no docstring)_ |
+
 ## `.claude/hooks/planner_guard.py` — 3 defs, 81 lines
 
 | Line | Name | Summary |
@@ -1001,4 +1010,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**797 definitions across 37 files + Code.gs.**
+**801 definitions across 38 files + Code.gs.**
