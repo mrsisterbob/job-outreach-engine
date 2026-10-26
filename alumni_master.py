@@ -95,7 +95,13 @@ def employer_from_headline(headline):
 def file_label(source):
     """The company the file was searched under, from hope_alumni_<Company>_<date>; '' otherwise."""
     m = _LABEL_RE.match(str(source or ""))
-    return m.group(1).replace("_", " ").strip() if m else ""
+    if not m:
+        return ""
+    # The saver turned "&" into "_" and "." into "_" (Johnson___Johnson, C_H__Robinson); a plain
+    # replace("_", " ") left "Johnson   Johnson" as a second company next to "Johnson & Johnson".
+    label = m.group(1).replace("___", " & ")
+    label = re.sub(r"\b([A-Z])_([A-Z])__", r"\1.\2. ", label)
+    return label.replace("_", " ").strip()
 
 
 def company_is_headline_tail(company, headline):

@@ -60,7 +60,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 357 | `failure_summary` | The part of pytest's output that names what broke. |
 | 381 | `block` | _(no docstring)_ |
 
-## `alumni_master.py` — 18 defs, 253 lines
+## `alumni_master.py` — 18 defs, 259 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -71,17 +71,17 @@ grep -i "contact" FUNCTION_INDEX.md
 | 81 | `clean_headline` | Drop the connection-degree badges the page put in front of the headline. |
 | 88 | `employer_from_headline` | The text after the last ' at ' or ' @ ' in the first headline segment, '' when absent. |
 | 95 | `file_label` | The company the file was searched under, from hope_alumni_<Company>_<date>; '' otherwise. |
-| 101 | `company_is_headline_tail` | True when the Company cell is just a ' \| ' piece of the headline. Some saved files carry |
-| 110 | `_field` | _(no docstring)_ |
-| 117 | `parse_alumni_text` | Rows of one alumni file as dicts (name, headline, filter, url, handle, source). Raises |
-| 157 | `merge_people` | One person per handle: every filter they matched and every file they came from, in the |
-| 177 | `index_sheet` | (handles, names) over sheet rows. `handles` holds every handle in any cell of any row; |
-| 189 | `classify` | _(no docstring)_ |
-| 198 | `_usable_company` | A real employer name: not a search term, not the school (a 'Hope College studying ...' cell |
-| 205 | `pick_company` | First usable filter; else the usable employer named in the headline; else ''. |
-| 214 | `_note` | _(no docstring)_ |
-| 223 | `to_sheet_row` | The 12-column Carmen Warm row: date, name, company, email, priority, status, blank, URL, |
-| 234 | `build_master` | Classify every person. Returns {"people": [(status, person)], "rows": {handle: sheet row |
+| 107 | `company_is_headline_tail` | True when the Company cell is just a ' \| ' piece of the headline. Some saved files carry |
+| 116 | `_field` | _(no docstring)_ |
+| 123 | `parse_alumni_text` | Rows of one alumni file as dicts (name, headline, filter, url, handle, source). Raises |
+| 163 | `merge_people` | One person per handle: every filter they matched and every file they came from, in the |
+| 183 | `index_sheet` | (handles, names) over sheet rows. `handles` holds every handle in any cell of any row; |
+| 195 | `classify` | _(no docstring)_ |
+| 204 | `_usable_company` | A real employer name: not a search term, not the school (a 'Hope College studying ...' cell |
+| 211 | `pick_company` | First usable filter; else the usable employer named in the headline; else ''. |
+| 220 | `_note` | _(no docstring)_ |
+| 229 | `to_sheet_row` | The 12-column Carmen Warm row: date, name, company, email, priority, status, blank, URL, |
+| 240 | `build_master` | Classify every person. Returns {"people": [(status, person)], "rows": {handle: sheet row |
 
 ## `build_function_index.py` — 6 defs, 196 lines
 
@@ -127,7 +127,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 280 | `_name_company_key` | _(no docstring)_ |
 | 286 | `plan_import` | Clean, de-duplicate and map `rows`. `existing` is a list of PEOPLE-row dicts (name, |
 
-## `main.py` — 444 defs, 19,511 lines
+## `main.py` — 444 defs, 19,510 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -515,66 +515,66 @@ grep -i "contact" FUNCTION_INDEX.md
 | 14779 | `_warm_screen_memo_read` | {job_hash: screened_at 'YYYY-MM-DD'} for the hashes the /w screen already decided on. |
 | 14798 | `_warm_screen_memo_write` | Record that the /w screen decided `outcome` ('rejected' or 'digest') on these roles today. |
 | 14817 | `run_warm_radar_scan` | /w Warm Network Radar: scans ONLY the companies where a Carmen Warm CRM contact already |
-| 15464 | `process_webhook_payload_async` | Executes heavy workloads in background worker threads so HTTP return is instant. |
-| 17909 | `db_health_probe` | Read/write probe for the live SQLite file plus the filesystem facts a diagnosis needs. |
-| 17966 | `alert_if_db_unhealthy_at_boot` | Boot-time probe: Telegram Kevin once if SQLite is unreadable. Never retries or repairs. |
-| 17994 | `_is_oneshot_invocation` | True when this process was launched as `python main.py --once` (the CI batch entrypoint). |
-| 18010 | `_daemons_opted_out` | True when JOB_ENGINE_NO_DAEMONS is set to an affirmative value (1/true/yes/on). |
-| 18043 | `health_check` | Return JSON health status in <5ms. |
-| 18064 | `_run_pipeline_and_notify` | Background thread target for /t: runs the heavy pipeline off the request thread, |
-| 18076 | `_run_overdue_batch_and_notify` | Background target for the Tuesday batch-hub commands so webhook acknowledgement remains instant. |
-| 18102 | `telegram_webhook` | Instant non-blocking execution (<0.05s return). Validates Telegram's secret token header, |
-| 18130 | `format_ats_plaintext` | Builds a plain-text ATS-safe fallback block (identity/experience/education/bullets) for the |
-| 18164 | `_followups_page` | Wrap /followups content in the /stage page's shell: same CSS, same copyField() script. |
-| 18200 | `_requested_queue_date` | The queue date a /followups link asks for via ?date=YYYY-MM-DD, else today. |
-| 18215 | `_queue_date_query` | '?date=YYYY-MM-DD' for a link back into run_date's queue, or '' when there is no date. |
-| 18220 | `_followup_person_block` | One person on a follow-up page: "who — company", the caller's meta line, the full draft |
-| 18262 | `followup_queue_view` | The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail |
-| 18356 | `_open_followups_count_label` | _(no docstring)_ |
-| 18371 | `_open_followups_page_links` | One Telegram link per page: "1–20 · 21–40 · …", each opening its own slice. |
-| 18381 | `_prewarm_followup_names` | Resolve every item's greeting into _SENT_NAME_CACHE. Only rows whose CRM name is blank or |
-| 18392 | `_open_followups_page_number` | _(no docstring)_ |
-| 18403 | `_spawn_background` | Run fn on a daemon thread. A seam so tests can run it inline. |
-| 18408 | `_build_open_followups_cache` | The ~19s CRM + Sent scan, then the greeting prewarm, OFF the request thread. |
-| 18432 | `_start_open_followups_build` | Kick off one background build; a second request while one runs joins it, not doubles it. |
-| 18442 | `open_followups_view` | /owed's target: every follow-up still owed across the saved queues, oldest-due first, |
-| 18527 | `_followup_copy_page` | The fallback for an on-demand draft that could not be created: the reason, and the text to |
-| 18540 | `followup_draft_on_demand` | Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it. |
-| 18596 | `morning_brief_view` | One page holding everything the morning used to dump into Telegram as four messages. |
-| 18693 | `desktop_stage_view` | Desktop review page - the card's "Full Card" target. Everything the Telegram card used to |
-| 18811 | `desktop_stage_pdf` | Serves raw PDF bytes for browser preview and download. |
-| 18833 | `desktop_ingest` | Secure endpoint for desktop bookmarklet ingestion of manual job links/text. |
-| 18907 | `_public_stats_days_running` | Whole days from PUBLIC_STATS_START_DATE to today, floored at 0. |
-| 18914 | `build_public_stats` | Public pipeline counts from the per-role funnel, or None when it cannot be read. |
-| 18950 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
-| 18999 | `analytics_enabled` | ANALYTICS_ENABLED (default true). Read per call, so flipping it needs no code change. |
-| 19004 | `_analytics_own_hosts` | _(no docstring)_ |
-| 19009 | `_analytics_ignore_ips` | _(no docstring)_ |
-| 19013 | `visitor_salt_for` | Today's random salt. Asking for a new day replaces (and so forgets) the previous one. |
-| 19022 | `_visit_timestamp` | The site's UTC pageview time as 'YYYY-MM-DD HH:MM:SS' (CURRENT_TIMESTAMP's format), or None |
-| 19031 | `record_site_visits` | Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and |
-| 19060 | `prune_site_visits` | Delete pageviews older than the retention window. Returns rows removed. |
-| 19072 | `_maybe_prune_site_visits` | Prune at most hourly, riding on ingest traffic - no scheduled job of its own. |
-| 19085 | `analytics_ingest` | Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN. |
-| 19103 | `get_site_visit_rows` | READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises |
-| 19113 | `site_visitor_standup_line` | The standup's analytics line, or '' when analytics is switched off. Never raises: a failed |
-| 19142 | `_lead_attempt_stamp` | Now as an explicit UTC 'YYYY-MM-DD HH:MM:SS' (the format datetime('now') writes, so the |
-| 19148 | `record_inbound_lead` | Commit one validated lead (see validate_lead). Returns (lead_id, is_new, alert_lead). |
-| 19193 | `_record_lead_alert_result` | Write a send's outcome on the row. Delivered: alerted_at is set regardless of who owns the |
-| 19218 | `_send_lead_alert` | Tell Kevin about a committed lead. Runs off the request thread (send_telegram_message can |
-| 19234 | `_start_lead_alert` | Queue the alert. If the thread cannot be started the claim made for it is released (only |
-| 19244 | `get_recent_leads` | READ-ONLY. (id, received_at, source, name, email, message), newest first. |
-| 19254 | `leads_ingest` | One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN. |
-| 19316 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
-| 19329 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
-| 19338 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
-| 19349 | `get_cached_job_locations` | READ-ONLY. (job_city, job_state, job_is_remote) for every cached job. Screened roles only. |
-| 19358 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
-| 19368 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
-| 19405 | `_cached_drafting_timing` | _(no docstring)_ |
-| 19423 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
-| 19459 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
-| 19466 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
+| 15463 | `process_webhook_payload_async` | Executes heavy workloads in background worker threads so HTTP return is instant. |
+| 17908 | `db_health_probe` | Read/write probe for the live SQLite file plus the filesystem facts a diagnosis needs. |
+| 17965 | `alert_if_db_unhealthy_at_boot` | Boot-time probe: Telegram Kevin once if SQLite is unreadable. Never retries or repairs. |
+| 17993 | `_is_oneshot_invocation` | True when this process was launched as `python main.py --once` (the CI batch entrypoint). |
+| 18009 | `_daemons_opted_out` | True when JOB_ENGINE_NO_DAEMONS is set to an affirmative value (1/true/yes/on). |
+| 18042 | `health_check` | Return JSON health status in <5ms. |
+| 18063 | `_run_pipeline_and_notify` | Background thread target for /t: runs the heavy pipeline off the request thread, |
+| 18075 | `_run_overdue_batch_and_notify` | Background target for the Tuesday batch-hub commands so webhook acknowledgement remains instant. |
+| 18101 | `telegram_webhook` | Instant non-blocking execution (<0.05s return). Validates Telegram's secret token header, |
+| 18129 | `format_ats_plaintext` | Builds a plain-text ATS-safe fallback block (identity/experience/education/bullets) for the |
+| 18163 | `_followups_page` | Wrap /followups content in the /stage page's shell: same CSS, same copyField() script. |
+| 18199 | `_requested_queue_date` | The queue date a /followups link asks for via ?date=YYYY-MM-DD, else today. |
+| 18214 | `_queue_date_query` | '?date=YYYY-MM-DD' for a link back into run_date's queue, or '' when there is no date. |
+| 18219 | `_followup_person_block` | One person on a follow-up page: "who — company", the caller's meta line, the full draft |
+| 18261 | `followup_queue_view` | The morning card's "Open Follow-up Queue" target: full draft text, Copy buttons and Gmail |
+| 18355 | `_open_followups_count_label` | _(no docstring)_ |
+| 18370 | `_open_followups_page_links` | One Telegram link per page: "1–20 · 21–40 · …", each opening its own slice. |
+| 18380 | `_prewarm_followup_names` | Resolve every item's greeting into _SENT_NAME_CACHE. Only rows whose CRM name is blank or |
+| 18391 | `_open_followups_page_number` | _(no docstring)_ |
+| 18402 | `_spawn_background` | Run fn on a daemon thread. A seam so tests can run it inline. |
+| 18407 | `_build_open_followups_cache` | The ~19s CRM + Sent scan, then the greeting prewarm, OFF the request thread. |
+| 18431 | `_start_open_followups_build` | Kick off one background build; a second request while one runs joins it, not doubles it. |
+| 18441 | `open_followups_view` | /owed's target: every follow-up still owed across the saved queues, oldest-due first, |
+| 18526 | `_followup_copy_page` | The fallback for an on-demand draft that could not be created: the reason, and the text to |
+| 18539 | `followup_draft_on_demand` | Create one follow-up's Gmail draft when Kevin clicks "Open in Gmail", then redirect to it. |
+| 18595 | `morning_brief_view` | One page holding everything the morning used to dump into Telegram as four messages. |
+| 18692 | `desktop_stage_view` | Desktop review page - the card's "Full Card" target. Everything the Telegram card used to |
+| 18810 | `desktop_stage_pdf` | Serves raw PDF bytes for browser preview and download. |
+| 18832 | `desktop_ingest` | Secure endpoint for desktop bookmarklet ingestion of manual job links/text. |
+| 18906 | `_public_stats_days_running` | Whole days from PUBLIC_STATS_START_DATE to today, floored at 0. |
+| 18913 | `build_public_stats` | Public pipeline counts from the per-role funnel, or None when it cannot be read. |
+| 18949 | `public_stats` | Public, unauthenticated, counts-only pipeline aggregate. See section 11's header. |
+| 18998 | `analytics_enabled` | ANALYTICS_ENABLED (default true). Read per call, so flipping it needs no code change. |
+| 19003 | `_analytics_own_hosts` | _(no docstring)_ |
+| 19008 | `_analytics_ignore_ips` | _(no docstring)_ |
+| 19012 | `visitor_salt_for` | Today's random salt. Asking for a new day replaces (and so forgets) the previous one. |
+| 19021 | `_visit_timestamp` | The site's UTC pageview time as 'YYYY-MM-DD HH:MM:SS' (CURRENT_TIMESTAMP's format), or None |
+| 19030 | `record_site_visits` | Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and |
+| 19059 | `prune_site_visits` | Delete pageviews older than the retention window. Returns rows removed. |
+| 19071 | `_maybe_prune_site_visits` | Prune at most hourly, riding on ingest traffic - no scheduled job of its own. |
+| 19084 | `analytics_ingest` | Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN. |
+| 19102 | `get_site_visit_rows` | READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises |
+| 19112 | `site_visitor_standup_line` | The standup's analytics line, or '' when analytics is switched off. Never raises: a failed |
+| 19141 | `_lead_attempt_stamp` | Now as an explicit UTC 'YYYY-MM-DD HH:MM:SS' (the format datetime('now') writes, so the |
+| 19147 | `record_inbound_lead` | Commit one validated lead (see validate_lead). Returns (lead_id, is_new, alert_lead). |
+| 19192 | `_record_lead_alert_result` | Write a send's outcome on the row. Delivered: alerted_at is set regardless of who owns the |
+| 19217 | `_send_lead_alert` | Tell Kevin about a committed lead. Runs off the request thread (send_telegram_message can |
+| 19233 | `_start_lead_alert` | Queue the alert. If the thread cannot be started the claim made for it is released (only |
+| 19243 | `get_recent_leads` | READ-ONLY. (id, received_at, source, name, email, message), newest first. |
+| 19253 | `leads_ingest` | One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN. |
+| 19315 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
+| 19328 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
+| 19337 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
+| 19348 | `get_cached_job_locations` | READ-ONLY. (job_city, job_state, job_is_remote) for every cached job. Screened roles only. |
+| 19357 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
+| 19367 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
+| 19404 | `_cached_drafting_timing` | _(no docstring)_ |
+| 19422 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
+| 19458 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
+| 19465 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
 
 ## `open_followups.py` — 3 defs, 118 lines
 

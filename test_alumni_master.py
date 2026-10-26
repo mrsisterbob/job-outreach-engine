@@ -57,6 +57,14 @@ def test_headline_tail_in_company_cell_falls_back_to_file_label():
     assert [r["filter"] for r in rows] == ["Davenport University", "Elhart GMC"]
 
 
+def test_file_label_restores_ampersand_and_initials():
+    for fname, want in (("hope_alumni_Johnson___Johnson_2026-10-26.tsv", "Johnson & Johnson"),
+                        ("hope_alumni_Stanley_Black___Decker_2026-10-26.tsv", "Stanley Black & Decker"),
+                        ("hope_alumni_C_H__Robinson_2026-10-26.tsv", "C.H. Robinson"),
+                        ("hope_alumni_Johnson_Controls_2026-10-26.tsv", "Johnson Controls")):
+        assert am.file_label(fname) == want
+
+
 def test_school_fragments_and_mojibake_are_not_companies():
     for bad in ("Hope College studying Communication and Business", "Aurora � Autonomous Vehicles"):
         assert am.pick_company({"filters": [bad], "headline": ""}) == ""
