@@ -6,6 +6,7 @@ import hmac
 import html
 import io
 import json
+import math
 import logging
 import os
 import re
@@ -1391,6 +1392,19 @@ def init_db():
             company_key TEXT NOT NULL,
             spent_at TEXT NOT NULL,
             requests INTEGER NOT NULL
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS apify_feed_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spent_at TEXT NOT NULL,
+            usd REAL NOT NULL,
+            status TEXT NOT NULL,
+            company_keys TEXT NOT NULL
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS apify_seen_jobs (
+            job_id TEXT PRIMARY KEY,
+            seen_at TEXT NOT NULL
         )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS query_pagination (
@@ -2906,6 +2920,7 @@ def get_monthly_api_usage():
 
 WARM_JSEARCH_LEDGER_KEEP_DAYS = 60   # rows older than this can no longer change a plan (cap window 7d, retry 28d)
 _WARM_JSEARCH_LOCK = threading.Lock()
+_APIFY_LOCK = threading.Lock()   # held by the /w hook around read-plan-reserve; not used inside the helpers
 
 def warm_jsearch_ledger_read():
     """Return [(company_key, iso_utc_timestamp, requests)] for the trailing WARM_JSEARCH_LEDGER_KEEP_DAYS days.
@@ -2932,6 +2947,102 @@ def warm_jsearch_ledger_append(company_key, requests_spent, now=None):
         return True
     except Exception as e:
         logging.error(f"Warm JSearch Ledger Write Error ({company_key}): {e}")
+        return False
+
+APIFY_LEDGER_KEEP_DAYS = 60
+
+def _apify_usd_ok(usd):
+    try:
+        return math.isfinite(float(usd)) and float(usd) >= 0
+    except (TypeError, ValueError):
+        return False
+
+def apify_ledger_read():
+    """Return [(iso_ts, usd, status, [company_keys])] for the trailing 60 days (the shape
+    apify_feed.plan_apify_run reads). None on a read error, so the caller spends nothing."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=APIFY_LEDGER_KEEP_DAYS)).isoformat()
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT spent_at, usd, status, company_keys FROM apify_feed_ledger WHERE spent_at >= ? ORDER BY id",
+                (cutoff,)).fetchall()
+    except Exception as e:
+        logging.error(f"Apify Ledger Read Error: {e}")
+        return None
+    out = []
+    for r in rows:
+        try:
+            keys = json.loads(r[3])
+            if not isinstance(keys, list):
+                raise ValueError("company_keys is not a list")
+        except Exception as e:
+            logging.error(f"Apify Ledger Row Keys Unreadable (kept, usd counted): {e}")
+            keys = []
+        out.append((r[0], r[1], r[2], keys))
+    return out
+
+def apify_ledger_reserve(company_keys, worst_case_usd, now=None):
+    """Write the spend BEFORE the request goes out, as status 'errored' (spent, outcome unknown).
+    Returns the row id, or None when the write failed (caller must not call Apify)."""
+    if not _apify_usd_ok(worst_case_usd):
+        logging.error(f"Apify Ledger Reserve rejected usd={worst_case_usd!r}")
+        return None
+    now = now or datetime.now(timezone.utc)
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    stamp = now.isoformat()
+    try:
+        with get_db_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, ?, 'errored', ?)",
+                (stamp, float(worst_case_usd), json.dumps(list(company_keys))))
+            conn.commit()
+            return cur.lastrowid
+    except Exception as e:
+        logging.error(f"Apify Ledger Reserve Error: {e}")
+        return None
+
+def apify_ledger_settle(row_id, usd, status):
+    """Update a reserved row to the real cost and 'ok' or 'errored'. Never raises; True if a row changed."""
+    if status not in ("ok", "errored") or not _apify_usd_ok(usd):
+        return False
+    try:
+        with get_db_conn() as conn:
+            cur = conn.execute("UPDATE apify_feed_ledger SET usd = ?, status = ? WHERE id = ?",
+                               (float(usd), status, row_id))
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Apify Ledger Settle Error (row {row_id}): {e}")
+        return False
+
+def apify_seen_filter(job_ids):
+    """Return the subset of job_ids already stored. A read error returns an empty set (a repeat card
+    beats a lost job)."""
+    ids = [str(j) for j in job_ids or () if j]
+    found = set()
+    try:
+        with get_db_conn() as conn:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                found.update(r[0] for r in conn.execute(
+                    f"SELECT job_id FROM apify_seen_jobs WHERE job_id IN ({marks})", chunk).fetchall())
+        return found
+    except Exception as e:
+        logging.error(f"Apify Seen Filter Error: {e}")
+        return set()
+
+def apify_seen_mark(job_ids, now=None):
+    """Store job ids as seen (INSERT OR IGNORE). Never raises; True when the write went through."""
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
+    rows = [(str(j), stamp) for j in job_ids or () if j]
+    try:
+        with get_db_conn() as conn:
+            conn.executemany("INSERT OR IGNORE INTO apify_seen_jobs (job_id, seen_at) VALUES (?, ?)", rows)
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Apify Seen Mark Error: {e}")
         return False
 
 def log_email_enrichment_attempt(sheet_uuid, provider, returned_email, confidence):

@@ -20172,3 +20172,120 @@ def test_warm_pick_after_memo_no_group_holds_more_than_three_job_dicts(monkeypat
     assert seen_groups and all(len(v) <= m.warm_screen_plan.CANDIDATES_PER_COMPANY
                                for v in seen_groups[0].values())
     assert sorted(r["title"] for v in seen_groups[0].values() for r in v) == sorted(titles[3:])
+
+
+def _apify_store_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM apify_feed_ledger")
+        conn.execute("DELETE FROM apify_seen_jobs")
+        conn.commit()
+
+
+def test_apify_store_reserve_then_read_shows_errored_worst_case():
+    _apify_store_clear()
+    rid = m.apify_ledger_reserve(["acme", "beta"], 0.35)
+    assert isinstance(rid, int)
+    rows = m.apify_ledger_read()
+    assert len(rows) == 1
+    ts, usd, status, keys = rows[0]
+    assert (usd, status, keys) == (0.35, "errored", ["acme", "beta"])
+
+
+def test_apify_store_settle_updates_same_row():
+    _apify_store_clear()
+    rid = m.apify_ledger_reserve(["acme"], 0.35)
+    assert m.apify_ledger_settle(rid, 0.12, "ok") is True
+    rows = m.apify_ledger_read()
+    assert len(rows) == 1
+    assert rows[0][1:] == (0.12, "ok", ["acme"])
+
+
+def test_apify_store_settle_missing_id_returns_false():
+    _apify_store_clear()
+    assert m.apify_ledger_settle(999999, 0.1, "ok") is False
+    assert m.apify_ledger_read() == []
+
+
+def test_apify_store_seen_mark_then_filter_returns_only_marked():
+    _apify_store_clear()
+    assert m.apify_seen_mark(["j1", "j2"]) is True
+    assert m.apify_seen_filter(["j1", "j2", "j3"]) == {"j1", "j2"}
+    assert m.apify_seen_filter([]) == set()
+
+
+def test_apify_store_seen_mark_twice_does_not_duplicate():
+    _apify_store_clear()
+    assert m.apify_seen_mark(["j1"]) is True
+    assert m.apify_seen_mark(["j1", "j2"]) is True
+    with m.get_db_conn() as conn:
+        n = conn.execute("SELECT COUNT(*) FROM apify_seen_jobs").fetchone()[0]
+    assert n == 2
+
+
+def test_apify_store_old_rows_not_returned():
+    _apify_store_clear()
+    old = datetime.now(timezone.utc) - timedelta(days=61)
+    m.apify_ledger_reserve(["old"], 0.5, now=old)
+    m.apify_ledger_reserve(["new"], 0.2)
+    rows = m.apify_ledger_read()
+    assert [r[3] for r in rows] == [["new"]]
+
+
+def test_apify_store_settle_invalid_status_and_errored():
+    _apify_store_clear()
+    rid = m.apify_ledger_reserve(["a"], 0.3)
+    assert m.apify_ledger_settle(rid, 0.1, "weird") is False
+    assert m.apify_ledger_settle(rid, float("nan"), "ok") is False
+    assert m.apify_ledger_settle(rid, -1, "ok") is False
+    assert m.apify_ledger_read()[0][1:3] == (0.3, "errored")
+    assert m.apify_ledger_settle(rid, 0.05, "errored") is True
+    assert m.apify_ledger_read()[0][1:3] == (0.05, "errored")
+
+
+def test_apify_store_reserve_rejects_nan_and_negative():
+    _apify_store_clear()
+    assert m.apify_ledger_reserve(["a"], float("nan")) is None
+    assert m.apify_ledger_reserve(["a"], float("inf")) is None
+    assert m.apify_ledger_reserve(["a"], -0.1) is None
+    assert m.apify_ledger_read() == []
+
+
+def test_apify_store_db_errors(monkeypatch):
+    _apify_store_clear()
+    def boom(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    assert m.apify_ledger_read() is None
+    assert m.apify_ledger_reserve(["a"], 0.1) is None
+    assert m.apify_ledger_settle(1, 0.1, "ok") is False
+    assert m.apify_seen_filter(["j1"]) == set()
+    assert m.apify_seen_mark(["j1"]) is False
+
+
+def test_apify_store_seen_filter_chunks_over_500():
+    _apify_store_clear()
+    ids = [f"job{i}" for i in range(1200)]
+    assert m.apify_seen_mark(ids) is True
+    assert m.apify_seen_filter(ids + ["other"]) == set(ids)
+
+
+def test_apify_store_garbage_company_keys_still_counts_usd():
+    _apify_store_clear()
+    stamp = datetime.now(timezone.utc).isoformat()
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, 0.4, 'ok', 'not json')", (stamp,))
+        conn.execute("INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, 0.6, 'ok', '{\"a\": 1}')", (stamp,))
+        conn.commit()
+    rows = m.apify_ledger_read()
+    assert [(r[1], r[3]) for r in rows] == [(0.4, []), (0.6, [])]
+
+
+def test_apify_store_non_utc_now_stored_as_utc():
+    _apify_store_clear()
+    est = timezone(timedelta(hours=-5))
+    m.apify_ledger_reserve(["a"], 0.1, now=datetime.now(est))
+    naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    m.apify_ledger_reserve(["b"], 0.1, now=naive)
+    with m.get_db_conn() as conn:
+        stamps = [r[0] for r in conn.execute("SELECT spent_at FROM apify_feed_ledger ORDER BY id")]
+    assert all(s.endswith("+00:00") for s in stamps)
