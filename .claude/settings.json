@@ -1,6 +1,19 @@
 {
   "crossSessionInbound": "accept",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/memory_stale_warning.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking memory files for stale_after dates..."
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "matcher": "*",
