@@ -21,6 +21,14 @@ grep -i "contact" FUNCTION_INDEX.md
 | 143 | `find_git_write` | _(no docstring)_ |
 | 176 | `decide` | _(no docstring)_ |
 
+## `.claude/hooks/planner_guard.py` — 3 defs, 81 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 20 | `session_title` | Last customTitle in the transcript, or None. |
+| 36 | `strip_device_prefix` | Drop a leading device prefix (question-mark or dot form); UNC form maps to a plain UNC path. |
+| 47 | `decide` | _(no docstring)_ |
+
 ## `.claude/hooks/queue_guard_common.py` — 10 defs, 129 lines
 
 | Line | Name | Summary |
@@ -993,4 +1001,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**794 definitions across 36 files + Code.gs.**
+**797 definitions across 37 files + Code.gs.**
