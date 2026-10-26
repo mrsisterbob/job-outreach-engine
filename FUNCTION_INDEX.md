@@ -100,6 +100,19 @@ grep -i "contact" FUNCTION_INDEX.md
 | 229 | `to_sheet_row` | The 12-column Carmen Warm row: date, name, company, email, priority, status, blank, URL, |
 | 240 | `build_master` | Classify every person. Returns {"people": [(status, person)], "rows": {handle: sheet row |
 
+## `apify_feed.py` — 8 defs, 178 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 41 | `build_run_input` | Actor input for a batch: plain names only (a "Name:*" prefix pulled affiliates), no date key |
+| 52 | `_get` | _(no docstring)_ |
+| 59 | `_split_location` | 'City, State, Country' -> (city, state, country), tolerating short forms: 'Michigan' or 'MI' |
+| 83 | `_pick_location` | The Michigan filter leaks, so take the first Michigan entry; else the first entry; else empty. |
+| 96 | `parse_row` | One feed row -> JSearch-shaped posting dict, or None when id, title, organization or url is missing. |
+| 125 | `_squash` | _(no docstring)_ |
+| 129 | `row_belongs_to` | True only when the normalized organization equals the company (strict: siblings like Haworth |
+| 155 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
+
 ## `build_function_index.py` — 6 defs, 196 lines
 
 | Line | Name | Summary |
@@ -1011,4 +1024,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**802 definitions across 38 files + Code.gs.**
+**810 definitions across 39 files + Code.gs.**
