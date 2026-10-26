@@ -20449,3 +20449,114 @@ def test_apify_hook_status_update_raising_still_fetches_and_settles(monkeypatch)
     led = _apify_ledger_rows()
     assert len(h.posts) == 1 and len(led) == 1 and led[0][1] == "ok", led
     assert abs(led[0][0] - 0.1025) < 1e-9, led
+
+
+# ---- TASK-180: the /w closing message reports what the Apify feed did ----
+def _apify_e2e_cost_text(rows_returned):
+    return f"${0.10 + 0.0025 * rows_returned:.3f} this run"
+
+
+def test_apify_e2e_errored_is_not_conflated_with_not_covered(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+
+    def boom(url, **kw):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    errored = h.run()
+    assert "Apify feed errored (2 companies not searched, retried on a later run)" in errored, errored
+    assert "reserved against the month" in errored and "not covered" not in errored, errored
+
+    h2 = _apify_hook_harness(monkeypatch)
+    h2.feed = []
+    covered = h2.run()
+    assert "not covered by the feed: Nopeboard Labs, Smallfry Inc" in covered, covered
+    assert "errored" not in covered, covered
+
+
+def test_apify_e2e_spend_line_reconciles_with_ledger_and_formula(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1),
+              _apify_row("Nopeboard Labs", "Business Systems Analyst", 2)]
+    text = h.run()
+    led = _apify_ledger_rows()
+    assert len(led) == 1 and led[0][1] == "ok"
+    expected = 0.10 + 0.0025 * len(h.feed)
+    assert abs(led[0][0] - expected) < 1e-9
+    assert "Apify feed: 2 companies, 2 rows returned, 2 kept, " + f"${led[0][0]:.3f} this run" in text, text
+    assert _apify_e2e_cost_text(len(h.feed)) in text
+    assert f"${4.00 - led[0][0]:.2f} left of $4.00 this month" in text, text
+    assert "capped" not in text
+
+
+def test_apify_e2e_capped_run_says_so(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)] + [
+        _apify_row("Elsewhere Corp", f"Role {i}", 1000 + i) for i in range(199)]
+    text = h.run()
+    assert h.posts[0][1]["json"]["limit"] == 200 and len(h.feed) == 200
+    assert "(capped at 200: older postings were dropped)" in text, text
+    assert "200 rows returned, 1 kept" in text, text
+
+
+def test_apify_e2e_second_run_has_no_second_card_or_ask_but_bills_again(monkeypatch):
+    h = _apify_hook_harness(monkeypatch)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    assert h.cards == ["Operations Analyst"] and len(_asks()) == 1
+    old = (m.datetime.now(m.timezone.utc) - m.timedelta(days=8)).isoformat()
+    with m.get_db_conn() as conn:   # past the retry gap, so the company is searched again
+        conn.execute("UPDATE apify_feed_ledger SET spent_at = ?", (old,))
+        conn.commit()
+    h.cards.clear()
+    h.posts.clear()
+    text = h.run()
+    assert len(h.posts) == 1, "the second run must call the feed again"
+    assert h.cards == [] and len(_asks()) == 1, (h.cards, _asks())
+    assert "1 rows returned, 1 kept, " + _apify_e2e_cost_text(1) in text, text
+    assert len(_apify_ledger_rows()) == 2
+
+
+def test_apify_e2e_returned_counts_rows_that_kept_drops(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, {"Haworth Inc": 3})
+    h.feed = [_apify_row("Haworth Inc", "Operations Analyst", 1),
+              _apify_row("Haworth International", "Business Systems Analyst", 2),
+              _apify_row("Unrelated Corp", "Help Desk Technician", 3)]
+    text = h.run()
+    assert "1 companies, 3 rows returned, 1 kept, " + _apify_e2e_cost_text(3) in text, text
+
+
+def test_apify_e2e_token_never_leaks(monkeypatch, caplog):
+    secret = "apify_api_SECRETxyz123"
+    h = _apify_hook_harness(monkeypatch, token=secret)
+    h.feed = [_apify_row("Nopeboard Labs", "Operations Analyst", 1)]
+    with caplog.at_level("DEBUG"):
+        text = h.run()
+    assert secret not in text and secret not in caplog.text
+    assert secret not in repr(_apify_ledger_rows()) and secret not in repr(h.payloads)
+    url, kw = h.posts[0]
+    assert secret not in url and secret in kw["headers"]["Authorization"]
+
+    def boom(url, **kw):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM apify_feed_ledger")
+        conn.commit()
+    caplog.clear()
+    with caplog.at_level("DEBUG"):
+        text = h.run()
+    assert "errored" in text and secret not in text and secret not in caplog.text
+
+
+def test_apify_e2e_no_apify_line_when_unconfigured_or_over_budget_says_so(monkeypatch):
+    h = _apify_hook_harness(monkeypatch, token=None)
+    assert "Apify" not in h.run()
+    h = _apify_hook_harness(monkeypatch)
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO apify_feed_ledger (spent_at, usd, status, company_keys) VALUES (?, 4.0, 'ok', '[]')",
+                     (m.datetime.now(m.timezone.utc).isoformat(),))
+        conn.commit()
+    text = h.run()
+    assert "Apify feed skipped: monthly ceiling reached ($4.00 of $4.00)" in text, text

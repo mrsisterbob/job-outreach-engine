@@ -15359,6 +15359,9 @@ def run_warm_radar_scan(chat_id=None):
         apify_capped = False
         apify_picked_names = []
         apify_covered = 0
+        apify_uncovered = []
+        apify_month_before = 0.0
+        apify_limit = 0
         apify_hash_to_ids = {}   # job_hash -> apify job ids, so only settled roles are marked seen
         if apify_token:
             try:
@@ -15370,6 +15373,7 @@ def run_warm_radar_scan(chat_id=None):
                         apify_status = "ledger_unreadable"
                     else:
                         apify_plan = apify_feed.plan_apify_run(no_board_candidates, apify_ledger_now, datetime.now(timezone.utc))
+                        apify_month_before = apify_plan.month_spent_usd
                         if apify_plan.skip_reason or not apify_plan.picks:
                             apify_status = apify_plan.skip_reason or "nothing_eligible"
                             apify_plan = None
@@ -15380,6 +15384,7 @@ def run_warm_radar_scan(chat_id=None):
                                 apify_plan = None
                 if apify_plan is not None:
                     apify_picked_names = [pk[1] for pk in apify_plan.picks]
+                    apify_limit = apify_plan.limit
                     apify_picked_keys = {pk[0] for pk in apify_plan.picks}
                     apify_spent_usd = apify_plan.worst_case_usd
                     if chat_id:
@@ -15405,6 +15410,7 @@ def run_warm_radar_scan(chat_id=None):
                         kept, apify_stats = apify_feed.split_rows(fetched.rows, apify_picked_names, normalize_company_for_match)
                         apify_jobs = [j for js in kept.values() for j in js]
                         apify_covered = len(kept)
+                        apify_uncovered = [n for n in apify_picked_names if n not in kept]
                         already = apify_seen_filter([j["job_id"] for j in apify_jobs])
                         for job in apify_jobs:
                             if job["job_id"] in already:
@@ -15643,6 +15649,23 @@ def run_warm_radar_scan(chat_id=None):
                     names_text, _used = _warm_radar_name_list(jsearch_names, 5)
                     jsearch_line += f" ({names_text})"
                 lines.append(jsearch_line)
+            ceiling = apify_feed.APIFY_MONTHLY_CEILING_USD
+            if apify_status == "errored" and apify_picked_names:
+                lines.append(f"Apify feed errored ({len(apify_picked_names)} companies not searched, retried on a later run); "
+                             f"${apify_spent_usd:.2f} reserved against the month")
+            elif apify_status == "ok":
+                apify_line = (f"Apify feed: {len(apify_picked_names)} companies, {apify_stats.get('returned', 0)} rows returned, "
+                              f"{apify_stats.get('kept', 0)} kept, ${apify_spent_usd:.3f} this run, "
+                              f"${max(0.0, ceiling - apify_month_before - apify_spent_usd):.2f} left of ${ceiling:.2f} this month")
+                if apify_capped:
+                    apify_line += f" (capped at {apify_limit}: older postings were dropped)"
+                lines.append(apify_line)
+                if apify_uncovered:
+                    names_text, _used = _warm_radar_name_list(apify_uncovered, 5)
+                    lines.append(f"Searched but not covered by the feed: {names_text} (the feed has no verified postings for them; that is not the same as no jobs)")
+                lines.append(f"Apify feed covered {apify_covered} of {len(apify_picked_names)} companies searched")
+            elif apify_status == "monthly_ceiling":
+                lines.append(f"Apify feed skipped: monthly ceiling reached (${apify_month_before:.2f} of ${ceiling:.2f})")
             if applied_skipped:
                 names_text, _used = _warm_radar_name_list(sorted(applied_skipped), 5)
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
