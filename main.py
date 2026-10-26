@@ -31,6 +31,7 @@ import referral_asks
 import warm_big_companies
 import warm_company_kind
 import warm_jsearch_plan
+import apify_feed
 import warm_screen_plan
 import warm_michigan
 import role_region
@@ -15104,7 +15105,15 @@ def run_warm_radar_scan(chat_id=None):
         jsearch_ledger = warm_jsearch_ledger_read() if no_board_candidates and not jsearch_no_key else None
         jsearch_preview = (warm_jsearch_plan.plan_warm_jsearch(no_board_candidates, jsearch_ledger, datetime.now(timezone.utc))[0]
                            if jsearch_ledger is not None else [])
-        if not slug_to_contact and not wd_to_contact and not jsearch_preview:
+        # Apify feed (sibling of JSearch): preview only, to let a Kevin with no cached boards reach the hook.
+        # The real plan is made again under _APIFY_LOCK further down. No token: nothing is planned or read.
+        apify_token = apify_feed.get_token(os.environ)
+        apify_preview = []
+        if apify_token and no_board_candidates:
+            _apify_ledger_preview = apify_ledger_read()
+            if _apify_ledger_preview is not None:
+                apify_preview = apify_feed.plan_apify_run(no_board_candidates, _apify_ledger_preview, datetime.now(timezone.utc)).picks
+        if not slug_to_contact and not wd_to_contact and not jsearch_preview and not apify_preview:
             if chat_id:
                 lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm companies has a cached job board yet."]
                 lines += _skipped_report()
@@ -15341,6 +15350,76 @@ def run_warm_radar_scan(chat_id=None):
                             logging.error(f"Warm Radar JSearch posting error: {e}")
                 _trim_group_jobs()
 
+        # APIFY FEED LOOKUP. One batched call for the biggest no-board warm companies, after JSearch.
+        # Read-plan-reserve happens under _APIFY_LOCK and the ledger row is written BEFORE the request.
+        # Nothing here can fail the scan; unconfigured, down or over budget leaves /w exactly as it was.
+        apify_status = "unconfigured" if not apify_token else "skipped"
+        apify_stats = {}
+        apify_spent_usd = 0.0
+        apify_capped = False
+        apify_picked_names = []
+        apify_covered = 0
+        apify_hash_to_ids = {}   # job_hash -> apify job ids, so only settled roles are marked seen
+        if apify_token:
+            try:
+                apify_plan = None
+                apify_row_id = None
+                with _APIFY_LOCK:
+                    apify_ledger_now = apify_ledger_read()
+                    if apify_ledger_now is None:
+                        apify_status = "ledger_unreadable"
+                    else:
+                        apify_plan = apify_feed.plan_apify_run(no_board_candidates, apify_ledger_now, datetime.now(timezone.utc))
+                        if apify_plan.skip_reason or not apify_plan.picks:
+                            apify_status = apify_plan.skip_reason or "nothing_eligible"
+                            apify_plan = None
+                        else:
+                            apify_row_id = apify_ledger_reserve([pk[0] for pk in apify_plan.picks], apify_plan.worst_case_usd)
+                            if apify_row_id is None:
+                                apify_status = "reserve_failed"
+                                apify_plan = None
+                if apify_plan is not None:
+                    apify_picked_names = [pk[1] for pk in apify_plan.picks]
+                    apify_picked_keys = {pk[0] for pk in apify_plan.picks}
+                    apify_spent_usd = apify_plan.worst_case_usd
+                    if chat_id:
+                        try:
+                            send_status_update(chat_id, f"Warm Radar: looking up {len(apify_picked_names)} companies with no job board on the Apify feed...")
+                        except Exception as e:
+                            logging.error(f"Warm Radar Apify status update failed: {type(e).__name__}")
+                    fetched = None
+                    try:
+                        fetched = apify_feed.fetch_feed(apify_feed.build_run_input(apify_picked_names, apify_plan.limit),
+                                                        apify_token, requests.post)
+                    except Exception as e:
+                        logging.error(f"Warm Radar Apify fetch raised {type(e).__name__}")
+                    if fetched is None or fetched.status != "ok":
+                        apify_status = "errored"
+                        apify_ledger_settle(apify_row_id, apify_plan.worst_case_usd, "errored")
+                        logging.error(f"Warm Radar Apify call errored: {getattr(fetched, 'error', 'raised')}")
+                    else:
+                        apify_status = "ok"
+                        apify_capped = fetched.capped
+                        apify_spent_usd = apify_feed.actual_cost(len(fetched.rows))
+                        apify_ledger_settle(apify_row_id, apify_spent_usd, "ok")
+                        kept, apify_stats = apify_feed.split_rows(fetched.rows, apify_picked_names, normalize_company_for_match)
+                        apify_jobs = [j for js in kept.values() for j in js]
+                        apify_covered = len(kept)
+                        already = apify_seen_filter([j["job_id"] for j in apify_jobs])
+                        for job in apify_jobs:
+                            if job["job_id"] in already:
+                                continue
+                            try:
+                                apify_hash_to_ids.setdefault(
+                                    generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
+                                _collect_posting(job, jsearch_keys=apify_picked_keys)
+                            except Exception as e:
+                                logging.error(f"Warm Radar Apify posting error: {type(e).__name__}")
+                        _trim_group_jobs()
+            except Exception as e:
+                apify_status = "errored"
+                logging.error(f"Warm Radar Apify block raised {type(e).__name__}")
+
         # SCREEN + OUTPUT. Nothing has been stamped, cached, sent or written yet. A role leaves a
         # trace (seen_jobs stamp, referral-ask role) ONLY after what lists it was accepted: its card
         # (CRM row written first) or the digest message. Rejected roles leave a warm_screen_memo row
@@ -15447,6 +15526,16 @@ def run_warm_radar_scan(chat_id=None):
                 for item in plan["digest"]:
                     if item["role"].get("slug"):
                         blocked_slugs.add(item["role"]["slug"])
+
+        # Apify ids are marked seen ONLY for roles the screen settled: card sent, digest sent, or rejected.
+        # Held, failed, unscored roles and anything a gate dropped stay unmarked and resurface.
+        if apify_hash_to_ids:
+            try:
+                settled = ({i["job_hash"] for i in sent_items} | {i["job_hash"] for i in digest_sent}
+                           | set(rejected_hashes))
+                apify_seen_mark([jid for hsh in settled for jid in apify_hash_to_ids.get(hsh, ())])
+            except Exception as e:
+                logging.error(f"Warm Radar Apify seen mark failed: {type(e).__name__}")
 
         # Roles whose card went: stamp, count, and collect for the referral ask.
         sent_by_group = {}
