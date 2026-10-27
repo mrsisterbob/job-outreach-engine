@@ -5,6 +5,8 @@ The word lists below are a planner's guess, not measured against the live sheet.
 """
 import re
 
+from warm_big_companies import WARM_BOARD_TARGET_MIN_CONTACTS
+
 SCHOOL_WORDS = ("school", "schools", "university", "college", "academy", "seminary",
                 "preschool", "montessori")
 CHURCH_WORDS = ("church", "churches", "ministry", "ministries", "parish", "chapel",
@@ -51,10 +53,12 @@ def non_employer_kind(name):
     return ""
 
 
-def lookup_order(rows):
-    """rows: iterable of (key, count, priority_score, attempted_at). Returns keys: never-attempted
-    first (biggest count, then higher priority, then key), then attempted, oldest attempt first."""
+def lookup_order(rows, min_contacts=WARM_BOARD_TARGET_MIN_CONTACTS):
+    """rows: iterable of (key, count, priority_score, attempted_at). Returns keys: every company
+    with min_contacts+ warm contacts first, then the rest. Inside each group biggest count first
+    whether or not an earlier lookup errored; ties go never-attempted first, then oldest attempt,
+    then higher priority, then key. Attempt history never moves a company across the size gate."""
     rows = list(rows)
-    fresh = sorted((r for r in rows if not r[3]), key=lambda r: (-(r[1] or 0), -(r[2] or 0), r[0]))
-    tried = sorted((r for r in rows if r[3]), key=lambda r: (r[3], r[0]))
-    return [r[0] for r in fresh + tried]
+    rows.sort(key=lambda r: (0 if (r[1] or 0) >= min_contacts else 1, -(r[1] or 0),
+                             r[3] or "", -(r[2] or 0), r[0]))
+    return [r[0] for r in rows]

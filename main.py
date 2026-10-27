@@ -14206,7 +14206,7 @@ def run_job_pipeline(chat_id=None, top_n=2):
     
     return len(tier1_matches) + len(tier2_matches)
 
-WARM_RADAR_LOOKUP_BATCH = 20      # board lookups started per /w run (each is up to 3 HTTP calls of 8s)
+WARM_RADAR_LOOKUP_WORKERS = 2     # board lookups running at once inside the drain (each is up to 3 HTTP calls of 8s); a GUESS, see TASK-168 Log
 WARM_RADAR_MISS_RETRY_DAYS = 14   # a company with no public board is not probed again for this long
 WARM_RADAR_ROLES_PER_COMPANY = referral_asks.REFERRAL_ASK_MAX_ROLES   # roles listed for one company in one /w message; one ask holds the same number
 WARM_RADAR_MESSAGES_PER_RUN = 15   # company messages sent per /w run (~17s at the 1.1s pacing)
@@ -14283,17 +14283,45 @@ def _stamp_board_lookup(company_name, clean_miss):
         logging.error(f"Warm Radar Board Lookup Stamp Error ({company_name}): {e}")
 
 
+def _warm_radar_lookup_one(company):
+    """One company's lookup; a failure never escapes and the company always leaves the in-flight set."""
+    try:
+        lookup_warm_company_board(company)
+    except Exception as e:
+        logging.error(f"Warm Radar Board Lookup Error ({company}): {e}")
+    finally:
+        with _WARM_LOOKUPS_LOCK:
+            _WARM_LOOKUPS_IN_FLIGHT.discard(company)
+
+
 def _warm_radar_lookup_batch(companies):
-    """Run lookup_warm_company_board over `companies`, one failure never stopping the rest. Each
+    """Run lookup_warm_company_board over `companies`, in order, at most WARM_RADAR_LOOKUP_WORKERS
+    at a time, one failure never stopping the rest. Returns when every lookup has finished. Each
     company leaves _WARM_LOOKUPS_IN_FLIGHT when its own lookup ends, however it ends."""
-    for company in companies:
-        try:
-            lookup_warm_company_board(company)
-        except Exception as e:
-            logging.error(f"Warm Radar Board Lookup Error ({company}): {e}")
-        finally:
-            with _WARM_LOOKUPS_LOCK:
-                _WARM_LOOKUPS_IN_FLIGHT.discard(company)
+    companies = list(companies)
+    if not companies:
+        return
+    workers = max(1, min(WARM_RADAR_LOOKUP_WORKERS, len(companies)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_warm_radar_lookup_one, companies))
+
+
+def _warm_radar_lookup_drain(phases):
+    """Drain the whole board-lookup queue after one /w. `phases` is an ordered list of company
+    lists: the companies with WARM_BOARD_TARGET_MIN_CONTACTS+ warm contacts first, the rest after.
+    A phase starts only when every lookup of the one before has finished (hit, clean miss or
+    error), so no small company is touched while a big one is still untried. Each company is
+    looked up once per drain, so one that keeps erroring cannot hold the big phase open. Whatever
+    is not reached (an unexpected raise) leaves the in-flight set."""
+    remaining = [c for phase in phases for c in phase]
+    try:
+        for phase in phases:
+            _warm_radar_lookup_batch(phase)
+    except Exception:
+        logging.exception("Warm Radar: board lookup drain stopped early")
+    finally:
+        with _WARM_LOOKUPS_LOCK:
+            _WARM_LOOKUPS_IN_FLIGHT.difference_update(remaining)
 
 
 def _stamp_boards_scanned(slugs, errored=False):
@@ -15055,15 +15083,22 @@ def run_warm_radar_scan(chat_id=None):
     # marking happen under one lock so two overlapping /w runs cannot take the same company.
     with _WARM_LOOKUPS_LOCK:
         unchecked = [c for c in unchecked_all if c not in _WARM_LOOKUPS_IN_FLIGHT]
-        lookup_now = unchecked[:WARM_RADAR_LOOKUP_BATCH]
+        lookup_now = list(unchecked)   # the whole queue: one background drain works through it, biggest first
         _WARM_LOOKUPS_IN_FLIGHT.update(lookup_now)
+    _count_of = {}
+    for _k in unchecked_keys:
+        _n = warm_contacts[_k].get("raw_company") or _k
+        _count_of[_n] = max(_count_of.get(_n, 0), warm_contacts[_k].get("count") or 1)
+    lookup_phases = [
+        [c for c in lookup_now if _count_of.get(c, 1) >= warm_big_companies.WARM_BOARD_TARGET_MIN_CONTACTS],
+        [c for c in lookup_now if _count_of.get(c, 1) < warm_big_companies.WARM_BOARD_TARGET_MIN_CONTACTS],
+    ]
     in_flight_skipped = len(unchecked_all) - len(unchecked)
     # Everything after the batch is chosen sits in try/finally: the lookups start exactly once on
     # every path out (a raise in the scan loop, the early "no cached board" return, the normal
     # end). They run AFTER the closing message on a normal exit, because the lookups are slow
     # and what they find shows up on the next /w.
     try:
-        queued = len(unchecked) - len(lookup_now)
         unplaced_count = _warm_radar_unplaced_count()
         unplaced_line = _warm_radar_unplaced_line(unplaced_count)
         coverage_line = _warm_radar_coverage_line(contacts_by_bucket, unplaced_count)
@@ -15076,8 +15111,6 @@ def run_warm_radar_scan(chat_id=None):
                 names, _used = _warm_radar_name_list(lookup_now, WARM_RADAR_NAME_CAP)
                 lines.append(f"Not looked at yet, checking {len(lookup_now)} for a job board now"
                              f"{': ' + names if names else ''}")
-                if queued:
-                    lines.append(f"{queued} more queued for the next run")
             if in_flight_skipped:
                 lines.append(f"{in_flight_skipped} more still being checked from the last run")
             if checked_no_board:
@@ -15677,7 +15710,7 @@ def run_warm_radar_scan(chat_id=None):
         if lookup_now:
             # Must never replace the scan's own exception, or turn a good scan into an error.
             try:
-                _spawn_background(lambda: _warm_radar_lookup_batch(lookup_now))
+                _spawn_background(lambda: _warm_radar_lookup_drain(lookup_phases))
             except Exception:
                 logging.exception("Warm Radar: could not start the board lookups")
                 with _WARM_LOOKUPS_LOCK:   # they will never run, so they are not in flight
