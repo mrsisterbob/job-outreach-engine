@@ -5136,9 +5136,9 @@ def test_auto_expand_makes_zero_http_probes_for_non_company_names(ats_probe_reco
     assert ats_probe_recorder == [], "junk names must not reach the network at all"
 
 
-def test_auto_expand_still_probes_all_three_boards_for_a_real_company(ats_probe_recorder):
+def test_auto_expand_still_probes_all_boards_for_a_real_company(ats_probe_recorder):
     m.auto_expand_ats_slug("Guy Carpenter")
-    assert len(ats_probe_recorder) == 3
+    assert len(ats_probe_recorder) == 4  # greenhouse, lever, ashby, smartrecruiters (TASK-172)
     assert any("greenhouse.io" in u for u in ats_probe_recorder)
     assert any("lever.co" in u for u in ats_probe_recorder)
     assert any("ashbyhq.com" in u for u in ats_probe_recorder)
@@ -15884,11 +15884,11 @@ def test_warm_radar_no_board_line_keeps_its_own_name_budget(monkeypatch):
 def test_warm_radar_reports_skipped_companies_remembers_a_miss(monkeypatch):
     h = _WarmRadarHarness(monkeypatch, ["Nopeboard Labs"])
     first = h.run()
-    assert len(h.http) == 3  # greenhouse, lever, ashby: one probe
+    assert len(h.http) == 4  # greenhouse, lever, ashby, smartrecruiters: one probe
     assert _identity("Nopeboard Labs")[1] is not None
     assert "Nopeboard Labs" in first and "Not looked at yet" in first
     second = h.run()
-    assert len(h.http) == 3  # not probed again
+    assert len(h.http) == 4  # not probed again
     assert "Checked, no public job board found" in second and "Nopeboard Labs" in second
     assert "Not looked at yet" not in second
     # Past the retry window the miss expires and the company is looked up again.
@@ -15897,7 +15897,7 @@ def test_warm_radar_reports_skipped_companies_remembers_a_miss(monkeypatch):
         conn.execute("UPDATE company_identities SET board_checked_at = ?", (old,))
         conn.commit()
     h.run()
-    assert len(h.http) == 6
+    assert len(h.http) == 8
 
 
 def test_warm_radar_reports_skipped_companies_a_failed_probe_is_not_a_miss(monkeypatch):
@@ -15912,7 +15912,7 @@ def test_warm_radar_reports_skipped_companies_a_failed_probe_is_not_a_miss(monke
     row = _identity("Flaky Corp Labs")
     assert row is None or row[1] is None
     h.run()
-    assert len(h.http) == 6  # retried, because an error is not "no public board"
+    assert len(h.http) == 8  # retried, because an error is not "no public board"
 
 
 def test_warm_radar_reports_skipped_companies_with_zero_scanned_and_whole_queue_drained(monkeypatch):
@@ -15923,7 +15923,7 @@ def test_warm_radar_reports_skipped_companies_with_zero_scanned_and_whole_queue_
     assert "none of your 25 warm companies" in text
     assert "checking 25" in text and "queued for the next run" not in text
     assert text.count("Works") <= m.WARM_RADAR_NAME_CAP
-    assert len(h.http) == 25 * 3  # the drain probes all 25 in this one run
+    assert len(h.http) == 25 * 4  # the drain probes all 25 in this one run
 
 
 def test_warm_radar_reports_skipped_companies_escapes_html_in_names(monkeypatch):
@@ -16982,7 +16982,7 @@ def test_warm_radar_review_followups_401_and_403_are_errors_not_a_miss(monkeypat
                             lambda url, timeout=None, s=status, **kw: types.SimpleNamespace(status_code=s, json=lambda: {}))
         errors = []
         assert m.auto_expand_ats_slug(name, errors=errors) is None
-        assert errors == [f"greenhouse HTTP {status}", f"lever HTTP {status}", f"ashby HTTP {status}"]
+        assert errors == [f"greenhouse HTTP {status}", f"lever HTTP {status}", f"ashby HTTP {status}", f"smartrecruiters HTTP {status}"]
         assert m.lookup_warm_company_board(name) is None
         row = _identity(name)
         assert row is not None and row[1] is None  # attempted (row exists), never miss-stamped
@@ -17008,7 +17008,7 @@ def test_warm_radar_review_followups_lookups_start_once_even_if_the_scan_raises(
     with pytest.raises(RuntimeError):
         m.run_warm_radar_scan(chat_id=1)
     assert len(spawned) == 1
-    assert len(h.http) == 3  # Globex Systems was still looked up (greenhouse, lever, ashby)
+    assert len(h.http) == 4  # Globex Systems was still looked up (greenhouse, lever, ashby, smartrecruiters)
     # and a normal run starts them exactly once too
     spawned.clear()
     monkeypatch.setattr(m, "is_banned_employer", lambda company: False)
@@ -21032,3 +21032,92 @@ def test_hirebase_e2e_no_key_means_no_hirebase_line_and_budget_skip_line(monkeyp
     text = h.run()
     assert h.posts == []
     assert "Hirebase skipped: monthly job budget used (400 of 500, 100 held back)" in text, text
+
+
+# ---- TASK-172: SmartRecruiters boards (public Posting API, no key) ----
+
+_SR_LIST = {"offset": 0, "limit": 100, "totalFound": 2, "content": [
+    {"id": "744000158123737", "name": " Supply Chain Analyst ", "uuid": "95f2e54d", "jobAdId": "ecc0c124",
+     "company": {"identifier": "AcmeRobotics", "name": "Acme Robotics"},
+     "releasedDate": "2026-10-27T18:16:10.892Z",
+     "location": {"city": "Troy", "region": "Michigan", "country": "us", "remote": False, "hybrid": False,
+                  "fullLocation": "Troy, Michigan, United States"},
+     "department": {"id": "2294004", "label": "Operations"}, "function": {"id": "customer_service", "label": "Supply Chain"},
+     "typeOfEmployment": {"id": "permanent", "label": "Full-time"}},
+    {"id": "744000158118421", "name": "Logistics Coordinator", "company": {"identifier": "AcmeRobotics", "name": "Acme Robotics"},
+     "releasedDate": "2026-10-26T10:00:00.000Z", "location": {"city": "Detroit", "region": "Michigan", "remote": True}},
+]}
+
+
+def _sr_http(monkeypatch, sr_status=200, sr_body=None, patch_filters=True):
+    if patch_filters:
+        filters = {"ats_company_slugs": []}
+        monkeypatch.setattr(m, "get_filter", lambda key, default=None: list(filters.get(key, default) or []) if key == "ats_company_slugs" else filters.get(key, default))
+        monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
+    urls = []
+
+    def fake_get(url, timeout=None, **kw):
+        urls.append(url)
+        if "smartrecruiters.com" in url:
+            return types.SimpleNamespace(status_code=sr_status, json=lambda: sr_body if sr_body is not None else _SR_LIST)
+        return types.SimpleNamespace(status_code=404, json=lambda: {})
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    return urls
+
+
+def _board_stamps(name):
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT board_checked_at, board_attempted_at FROM company_identities "
+                            "WHERE normalized_name = ?", (m.normalize_company_for_match(name),)).fetchone()
+
+
+def test_warm_smartrecruiters_lookup_resolves_board_and_stores_system(monkeypatch):
+    urls = _sr_http(monkeypatch)
+    assert m.lookup_warm_company_board("Acme Robotics") == "acmerobotics"
+    assert _board_cols("Acme Robotics") == ("acmerobotics", None, "smartrecruiters", "own")
+    assert any("api.smartrecruiters.com/v1/companies/acmerobotics/postings" in u for u in urls)
+
+
+def test_warm_smartrecruiters_scan_fetches_the_board_and_posting_reaches_the_candidates(monkeypatch):
+    real_fetch = m.fetch_ats_jobs
+    h = _ask_harness(monkeypatch, [])
+    monkeypatch.setattr(m, "fetch_ats_jobs", real_fetch)
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics", board_system="smartrecruiters", board_source="own")
+    urls = _sr_http(monkeypatch, patch_filters=False)
+    h.run()
+    # Only SmartRecruiters was asked: one request for the board, none to the other three systems.
+    assert len(urls) == 1 and "api.smartrecruiters.com/v1/companies/acmerobotics/postings" in urls[0], urls
+    jobs = m.fetch_ats_jobs(["acmerobotics"])
+    first = next(j for j in jobs if j["job_title"] == "Supply Chain Analyst")
+    assert first["employer_name"] == "Acme Robotics" and first["job_city"] == "Troy"
+    assert first["job_apply_link"] == "https://jobs.smartrecruiters.com/AcmeRobotics/744000158123737"
+    # The posting reached the /w candidate path: the stored ask draft carries its title and link.
+    roles = json.loads(_asks()[0]["roles_json"]) if _asks() else []
+    assert "Supply Chain Analyst" in {r["title"] for r in roles}
+    assert any(r["link"] == "https://jobs.smartrecruiters.com/AcmeRobotics/744000158123737" for r in roles)
+
+
+def test_warm_smartrecruiters_404_is_a_clean_miss_and_500_is_an_error_not_stamped(monkeypatch):
+    _sr_http(monkeypatch, sr_status=404, sr_body={})
+    assert m.lookup_warm_company_board("Acme Robotics") is None
+    checked, attempted = _board_stamps("Acme Robotics")
+    assert checked and attempted
+    _sr_http(monkeypatch, sr_status=500, sr_body={})
+    assert m.lookup_warm_company_board("Zenith Tooling") is None
+    checked, attempted = _board_stamps("Zenith Tooling")
+    assert checked is None and attempted
+    # Unknown company id answers 200 with totalFound 0: no board, not a hit.
+    _sr_http(monkeypatch, sr_body={"offset": 0, "limit": 1, "totalFound": 0, "content": []})
+    assert m.lookup_warm_company_board("Quill Metals") is None
+    assert _board_cols("Quill Metals") == (None, None, None, None)
+
+
+def test_warm_smartrecruiters_greenhouse_company_is_unaffected(monkeypatch):
+    filters = _warm_board_system_http(monkeypatch, "greenhouse.io")
+    assert m.lookup_warm_company_board("Acme Robotics") == "acmerobotics"
+    assert _board_cols("Acme Robotics") == ("acmerobotics", None, "greenhouse", "own")
+    urls = []
+    orig = m.requests.get
+    monkeypatch.setattr(m.requests, "get", lambda url, **kw: urls.append(url) or orig(url, **kw))
+    m.fetch_ats_jobs(["acmerobotics"])
+    assert len(urls) == 3 and not any("smartrecruiters" in u for u in urls), urls
