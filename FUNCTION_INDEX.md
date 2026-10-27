@@ -151,6 +151,23 @@ grep -i "contact" FUNCTION_INDEX.md
 | 224 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 239 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
+## `hirebase_feed.py` — 12 defs, 187 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 43 | `_slugify` | Kebab-case: lowercase, punctuation dropped, whitespace and hyphens become single hyphens. |
+| 50 | `slug_guesses` | At most 2 distinct slugs: plain name first ('Fifth Third Bank' -> fifth-third-bank), then the |
+| 61 | `_clamp` | _(no docstring)_ |
+| 69 | `build_search_body` | Search body. Exact company_slugs only; no title or exclusion filter (none is known to exist). |
+| 83 | `_strip_html` | Tag removal plus entity unescape; block-ish tags become spaces so words do not fuse. |
+| 90 | `_loc_fields` | _(no docstring)_ |
+| 102 | `_pick_location` | The Michigan filter may leak and rows list several places: first Michigan entry, else the |
+| 116 | `_text` | _(no docstring)_ |
+| 122 | `parse_job` | One Hirebase job -> JSearch-shaped posting dict, or None when title, company_name, slug, |
+| 154 | `_squash` | _(no docstring)_ |
+| 158 | `job_belongs_to` | True only when company_slug is exactly one of `slugs` AND the normalized job company name |
+| 173 | `split_jobs` | One company per call -> (kept, stats); stats = returned / malformed / kept / unmatched. |
+
 ## `linkedin_import.py` — 15 defs, 382 lines
 
 | Line | Name | Summary |
@@ -1083,4 +1100,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**849 definitions across 43 files + Code.gs.**
+**861 definitions across 44 files + Code.gs.**
