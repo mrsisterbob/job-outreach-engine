@@ -101,3 +101,79 @@ def test_hirebase_belongs_rejects_matching_slug_different_name():
 
 def test_hirebase_belongs_accepts_exact():
     assert hf.job_belongs_to(make_job(), "Haworth Inc.", ["haworth-inc", "haworth"], norm)
+
+
+class _Resp:
+    def __init__(self, code=200, data=None, raises=False):
+        self.status_code, self._data, self._raises = code, data, raises
+
+    def json(self):
+        if self._raises:
+            raise ValueError("secret body text")
+        return self._data
+
+
+def _post(resp=None, exc=None):
+    calls = []
+
+    def post(url, json=None, headers=None, timeout=None):
+        calls.append({"url": url, "json": json, "headers": headers})
+        if exc:
+            raise exc
+        return resp
+    post.calls = calls
+    return post
+
+
+KEY = "sk-SECRET-123"
+
+
+def test_hirebase_fetch_no_key_makes_no_call():
+    post = _post(_Resp(200, {}))
+    assert hf.fetch_company_jobs({}, None, post).status == "unconfigured"
+    assert post.calls == []
+    assert hf.get_key({"HIREBASE_API_KEY": "  "}) is None
+    assert hf.get_key({"HIREBASE_API_KEY": " k "}) == "k"
+
+
+def test_hirebase_fetch_raising_post_is_errored():
+    r = hf.fetch_company_jobs({}, KEY, _post(exc=TimeoutError("boom " + KEY)))
+    assert r.status == "errored" and r.error == "post raised TimeoutError"
+
+
+def test_hirebase_fetch_500_and_429_are_errored_with_code():
+    for code in (500, 429):
+        r = hf.fetch_company_jobs({}, KEY, _post(_Resp(code, {"jobs": [], "total_count": 0})))
+        assert r.status == "errored" and str(code) in r.error and r.jobs == []
+
+
+def test_hirebase_fetch_bad_bodies_are_errored():
+    for data in ([], {"total_count": 0}, {"jobs": "x", "total_count": 0}, {"jobs": []},
+                 {"jobs": [], "total_count": "3"}):
+        assert hf.fetch_company_jobs({}, KEY, _post(_Resp(200, data))).status == "errored"
+    assert hf.fetch_company_jobs({}, KEY, _post(_Resp(200, raises=True))).status == "errored"
+
+
+def test_hirebase_fetch_all_malformed_jobs_are_errored():
+    r = hf.fetch_company_jobs({}, KEY, _post(_Resp(200, {"jobs": [{"x": 1}, "y"], "total_count": 2})))
+    assert r.status == "errored" and "malformed" in r.error
+
+
+def test_hirebase_fetch_empty_jobs_is_clean_zero():
+    r = hf.fetch_company_jobs({}, KEY, _post(_Resp(200, {"jobs": [], "total_count": 0})))
+    assert (r.status, r.jobs, r.capped) == ("ok", [], False)
+
+
+def test_hirebase_fetch_total_above_returned_is_capped():
+    jobs = [make_job(platform_job_id=str(i)) for i in range(5)]
+    r = hf.fetch_company_jobs({}, KEY, _post(_Resp(200, {"jobs": jobs, "total_count": 38})))
+    assert r.status == "ok" and r.capped and r.total_count == 38 and len(r.jobs) == 5
+
+
+def test_hirebase_fetch_key_only_in_header():
+    post = _post(_Resp(200, {"jobs": [make_job()], "total_count": 1}))
+    r = hf.fetch_company_jobs({"q": 1}, KEY, post)
+    assert KEY not in repr(r) and KEY not in post.calls[0]["url"]
+    assert post.calls[0]["headers"] == {"x-api-key": KEY}
+    bad = hf.fetch_company_jobs({}, KEY, _post(_Resp(200, raises=True)))
+    assert KEY not in repr(bad) and "secret body" not in repr(bad)
