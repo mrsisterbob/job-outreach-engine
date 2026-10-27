@@ -13456,6 +13456,67 @@ def fetch_remote_feed_jobs(limit=100):
     return all_jobs
 
 
+SMARTRECRUITERS_PAGE_LIMIT = 100
+
+
+def fetch_smartrecruiters_jobs(slug, failures=None):
+    """Pull unauthenticated postings from a SmartRecruiters board (public Posting API, no key).
+
+    One request, first page of SMARTRECRUITERS_PAGE_LIMIT. The list response carries no description
+    and no link, so the apply link is built from the posting id and the description is the department
+    and function labels (a detail fetch per posting would be N+1 requests). An unknown company id
+    answers 200 with totalFound 0, so it reads as an empty board. `failures`: same contract as
+    fetch_greenhouse_jobs()."""
+    try:
+        res = requests.get(f"https://api.smartrecruiters.com/v1/companies/{slug}/postings",
+                           params={"limit": SMARTRECRUITERS_PAGE_LIMIT}, timeout=10)
+        if res.status_code != 200:
+            if failures is not None and ats_status_is_failure(res.status_code):
+                failures.append(slug)
+            return []
+        jobs = []
+        for p in (res.json() or {}).get("content") or []:
+            loc = p.get("location") or {}
+            company = p.get("company") or {}
+            ident = company.get("identifier") or slug
+            labels = [(p.get(k) or {}).get("label") for k in ("department", "function", "typeOfEmployment")]
+            jobs.append({
+                "job_id": f"smartrecruiters_{slug}_{p.get('id')}",
+                "employer_name": company.get("name") or slug.replace("-", " ").title(),
+                "job_title": (p.get("name") or "").strip(),
+                "job_description": ". ".join(l for l in labels if l),
+                "job_apply_link": f"https://jobs.smartrecruiters.com/{ident}/{p.get('id')}",
+                "job_city": loc.get("city") or loc.get("fullLocation") or "",
+                "job_state": loc.get("region") or "",
+                "job_is_remote": bool(loc.get("remote")),
+                "job_posted_at_datetime_utc": p.get("releasedDate") or "",
+            })
+        return jobs
+    except Exception as e:
+        logging.error(f"SmartRecruiters Fetch Exception ({slug}): {e}")
+        if failures is not None:
+            failures.append(slug)
+        return []
+
+
+def _smartrecruiters_slugs(company_slugs):
+    """Which of these slugs TASK-169 recorded as board_system='smartrecruiters'. Those are fetched
+    from SmartRecruiters ONLY (1 request, not 4); every other slug keeps the three-fetcher path."""
+    slugs = [s for s in company_slugs if s]
+    if not slugs:
+        return set()
+    try:
+        with get_db_conn() as conn:
+            marks = ",".join("?" * len(slugs))
+            rows = conn.execute(
+                f"SELECT ats_slug FROM company_identities WHERE board_system = 'smartrecruiters' "
+                f"AND ats_slug IN ({marks})", slugs).fetchall()
+        return {r[0] for r in rows}
+    except Exception as e:
+        logging.error(f"SmartRecruiters Slug Lookup Error: {e}")
+        return set()
+
+
 def fetch_ats_jobs(company_slugs, include_workday=False, failed_slugs=None):
     """Pull unauthenticated Greenhouse + Lever + Ashby postings for a list of company slugs, in
     parallel; with include_workday=True, also every board in the `workday_boards` filter.
@@ -13482,7 +13543,8 @@ def fetch_ats_jobs(company_slugs, include_workday=False, failed_slugs=None):
     if not company_slugs and not workday_boards:
         return []
     all_jobs = []
-    worker_count = min(len(company_slugs) * 3 + len(workday_boards), 18) or 1
+    sr_slugs = _smartrecruiters_slugs(company_slugs)
+    worker_count = min((len(company_slugs) - len(sr_slugs)) * 3 + len(sr_slugs) + len(workday_boards), 18) or 1
     # Shared by the worker threads; list.append is atomic. Only passed to the fetchers when the
     # caller asked, so callers (and test stubs) that omit failed_slugs see the old one-arg calls.
     fetch_failures = [] if failed_slugs is not None else None
@@ -13491,7 +13553,9 @@ def fetch_ats_jobs(company_slugs, include_workday=False, failed_slugs=None):
         futures = []
         future_slugs = []
         for slug in company_slugs:
-            for fetcher in (fetch_greenhouse_jobs, fetch_lever_jobs, fetch_ashby_jobs):
+            fetchers = ((fetch_smartrecruiters_jobs,) if slug in sr_slugs
+                        else (fetch_greenhouse_jobs, fetch_lever_jobs, fetch_ashby_jobs))
+            for fetcher in fetchers:
                 futures.append(executor.submit(fetcher, slug, **fetch_kwargs))
                 future_slugs.append(slug)
         # Workday is two-stage (list + a detail fetch per posting), so it needs a longer timeout
@@ -13551,12 +13615,15 @@ def auto_expand_ats_slug(company_name, errors=None):
         ("lever", f"https://api.lever.co/v0/postings/{slug_guess}?mode=json"),
         ("ashby", f"https://api.ashbyhq.com/posting-api/job-board/{slug_guess}"),
     )
+    board_checks += (("smartrecruiters", f"https://api.smartrecruiters.com/v1/companies/{slug_guess}/postings?limit=1"),)
     for board_name, url in board_checks:
         try:
             res = requests.get(url, timeout=8)
             if errors is not None and ats_status_is_failure(res.status_code):
                 errors.append(f"{board_name} HTTP {res.status_code}")
-            if res.status_code == 200 and res.json():
+            if res.status_code == 200 and (
+                    ((res.json() or {}).get("totalFound") or 0) > 0 if board_name == "smartrecruiters"
+                    else res.json()):
                 # Re-read INSIDE the lock: the list read before the probes may be stale by now.
                 # The lock is never held across the HTTP calls above.
                 with _ATS_SLUG_FILTER_LOCK:
