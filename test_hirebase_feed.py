@@ -177,3 +177,107 @@ def test_hirebase_fetch_key_only_in_header():
     assert post.calls[0]["headers"] == {"x-api-key": KEY}
     bad = hf.fetch_company_jobs({}, KEY, _post(_Resp(200, raises=True)))
     assert KEY not in repr(bad) and "secret body" not in repr(bad)
+
+
+# ---- plan_hirebase_run ----
+NOW = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+
+
+def _iso(days_ago, now=NOW):
+    return (now - timedelta(days=days_ago)).isoformat()
+
+
+def _cands(n):
+    return [("co%02d" % i, "Co %d" % i, 100 - i) for i in range(n)]
+
+
+def test_hirebase_plan_per_run_company_cap():
+    plan = hf.plan_hirebase_run(_cands(20), [], NOW)
+    assert len(plan.picks) == hf.HIREBASE_COMPANIES_PER_RUN
+
+
+def test_hirebase_plan_biggest_network_first_ties_by_key():
+    c = [("b", "B", 3), ("a", "A", 3), ("z", "Z", 9)]
+    plan = hf.plan_hirebase_run(c, [], NOW)
+    assert [p[0] for p in plan.picks] == ["z", "a", "b"]
+
+
+def test_hirebase_plan_limits_never_exceed_usable_left():
+    ledgers = [
+        [],
+        [(_iso(1), 120, "ok", "x")],
+        [(_iso(1), 263, "errored", "x"), (_iso(2), 40, "capped", "y")],
+        [(_iso(1), 377, "ok", "x")],
+        [(_iso(1), "junk", "ok", "x")],
+    ]
+    for led in ledgers:
+        plan = hf.plan_hirebase_run(_cands(30), led, NOW)
+        assert sum(p[3] for p in plan.picks) == plan.reserved <= plan.usable_left
+        assert plan.month_used + plan.reserved <= hf.HIREBASE_MONTHLY_JOBS - hf.HIREBASE_RESERVE_JOBS or not plan.picks
+
+
+def test_hirebase_plan_last_pick_shrinks_and_under_minimum_not_made():
+    plan = hf.plan_hirebase_run(_cands(10), [(_iso(1), 342, "ok", "x")], NOW)  # 58 left
+    assert [p[3] for p in plan.picks] == [25, 25, 8]
+    plan = hf.plan_hirebase_run(_cands(10), [(_iso(1), 347, "ok", "x")], NOW)  # 53 left, 3 < min
+    assert [p[3] for p in plan.picks] == [25, 25]
+
+
+def test_hirebase_plan_first_search_14_days_later_is_days_since_plus_one():
+    c = [("a", "A", 5), ("b", "B", 4)]
+    plan = hf.plan_hirebase_run(c, [(_iso(10), 3, "ok", "a")], NOW)
+    assert {p[0]: p[2] for p in plan.picks} == {"a": 11, "b": 14}
+
+
+def test_hirebase_plan_days_ago_capped_at_30():
+    plan = hf.plan_hirebase_run([("a", "A", 5)], [(_iso(60), 3, "ok", "a")], NOW)
+    assert plan.picks[0][2] == 30
+
+
+def test_hirebase_plan_capped_row_keeps_old_watermark():
+    led = [(_iso(10), 3, "ok", "a"), (_iso(5), 25, "capped", "a")]
+    plan = hf.plan_hirebase_run([("a", "A", 5)], led, NOW)
+    assert plan.picks[0][2] == 11
+
+
+def test_hirebase_plan_recent_ok_skipped_older_not():
+    c = [("a", "A", 5), ("b", "B", 4)]
+    plan = hf.plan_hirebase_run(c, [(_iso(2), 3, "ok", "a"), (_iso(4), 3, "ok", "b")], NOW)
+    assert [p[0] for p in plan.picks] == ["b"]
+
+
+def test_hirebase_plan_errored_counts_toward_month_but_does_not_block():
+    led = [(_iso(1), 10, "errored", "a"), (_iso(1), 5, "capped", "a")]
+    plan = hf.plan_hirebase_run([("a", "A", 5)], led, NOW)
+    assert plan.month_used == 15
+    assert [p[0] for p in plan.picks] == ["a"] and plan.picks[0][2] == 14
+
+
+def test_hirebase_plan_month_rollover():
+    now = datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)
+    plan = hf.plan_hirebase_run(_cands(3), [(_iso(1, now), 390, "ok", "x")], now)  # Oct 31
+    assert plan.month_used == 0 and plan.usable_left == 400
+
+
+def test_hirebase_plan_monthly_cap_when_used_400_or_more():
+    for used in (400, 450):
+        plan = hf.plan_hirebase_run(_cands(5), [(_iso(1), used, "ok", "x")], NOW)
+        assert plan.picks == [] and plan.skip_reason == "monthly_cap" and plan.reserved == 0
+
+
+def test_hirebase_plan_nothing_eligible():
+    plan = hf.plan_hirebase_run([("a", "A", 5)], [(_iso(1), 3, "ok", "a")], NOW)
+    assert plan.picks == [] and plan.skip_reason == "nothing_eligible"
+
+
+def test_hirebase_plan_bad_or_future_timestamp_is_now():
+    led = [("garbage", 30, "ok", "a"), (_iso(-5), 30, "errored", "b")]
+    plan = hf.plan_hirebase_run([("a", "A", 5), ("b", "B", 4)], led, NOW)
+    assert plan.month_used == 60
+    assert [p[0] for p in plan.picks] == ["b"]
+
+
+def test_hirebase_plan_unparseable_jobs_count_as_full_cap():
+    plan = hf.plan_hirebase_run(_cands(3), [(_iso(1), "n/a", "errored", "x")], NOW)
+    assert plan.month_used == hf.HIREBASE_MONTHLY_JOBS
+    assert plan.skip_reason == "monthly_cap" and plan.picks == []

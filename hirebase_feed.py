@@ -11,8 +11,10 @@ green here. TASK-182 turns an all-malformed response into an error so a wrong ke
 read as "no jobs".
 """
 import html
+import math
 import re
 from collections import namedtuple
+from datetime import datetime, timedelta, timezone
 
 # Our name -> the Hirebase job key.
 # MEASURED present (Kevin, Playground, 2026-10-26): job_title, application_link, location_raw,
@@ -236,3 +238,80 @@ def fetch_company_jobs(body, key, http_post, timeout=60):
     if jobs and not any(parse_job(j) for j in jobs):
         return HirebaseResult("errored", [], 0, False, "all %d jobs malformed" % len(jobs))
     return HirebaseResult("ok", jobs, total, total > len(jobs), "")
+
+
+HIREBASE_MONTHLY_JOBS = 500      # MEASURED: Free plan cap, job rows returned per billing month
+# DESIGN CHOICE, not a measurement: the meter is account-wide, so Playground tests spend from the
+# same pool and the ledger cannot see them.
+HIREBASE_RESERVE_JOBS = 100
+HIREBASE_COMPANIES_PER_RUN = 8   # DESIGN CHOICE, not a measurement
+HIREBASE_LIMIT_PER_COMPANY = 25  # DESIGN CHOICE, not a measurement (Fifth Third alone was 38 MI jobs/7 days)
+HIREBASE_MIN_LIMIT = 5           # DESIGN CHOICE, not a measurement: a pick under this is not made
+HIREBASE_FIRST_DAYS = 14         # DESIGN CHOICE, not a measurement: window for a never-searched company
+HIREBASE_RETRY_DAYS = 3          # DESIGN CHOICE, not a measurement: a recent ok search is skipped
+
+HirebasePlan = namedtuple("HirebasePlan", "picks month_used usable_left reserved skip_reason")
+
+
+def _plan_ts(ts, now):
+    """Aware-UTC datetime; malformed or future timestamps count as `now`."""
+    try:
+        dt = datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return now
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return now if dt > now else dt
+
+
+def plan_hirebase_run(candidates, ledger, now, per_run=HIREBASE_COMPANIES_PER_RUN,
+                      monthly=HIREBASE_MONTHLY_JOBS, reserve=HIREBASE_RESERVE_JOBS,
+                      limit_per_company=HIREBASE_LIMIT_PER_COMPANY, min_limit=HIREBASE_MIN_LIMIT,
+                      first_days=HIREBASE_FIRST_DAYS, retry_days=HIREBASE_RETRY_DAYS):
+    """Pure spend guard: which no-board companies to search, each with days_ago and limit.
+
+    candidates: iterable of (company_key, display_name, contact_count)
+    ledger: iterable of (iso_timestamp, jobs, status, company_key); status "ok", "capped" or
+    "errored", one row per request. The sum of the picks' limits never exceeds usable_left, because
+    the cap check uses the REQUESTED limit as worst case (per docs, NOT measured).
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    month_used = 0
+    last_ok = {}
+    for ts, jobs, status, key in ledger:
+        dt = _plan_ts(ts, now)
+        try:
+            n = max(0, int(jobs))
+        except (ValueError, TypeError, OverflowError):
+            n = monthly  # unparseable: assume the worst, never grant budget
+        if (dt.year, dt.month) == (now.year, now.month):
+            month_used += n  # errored rows count too: a failed request may have billed
+        if status == "ok" and (key not in last_ok or dt > last_ok[key]):
+            last_ok[key] = dt  # a capped row never advances the watermark
+    usable_left = max(0, monthly - reserve - month_used)
+    if usable_left < min_limit:
+        return HirebasePlan([], month_used, usable_left, 0, "monthly_cap")
+    retry_gap = timedelta(days=retry_days)
+    eligible = []
+    for key, name, contacts in candidates:
+        wm = last_ok.get(key)
+        if wm is not None and now - wm < retry_gap:
+            continue
+        eligible.append((key, name, contacts, wm))
+    eligible.sort(key=lambda c: (-(c[2] or 0), c[0]))
+    picks = []
+    remaining = usable_left
+    for key, name, _contacts, wm in eligible:
+        if len(picks) >= per_run or remaining < min_limit:
+            break
+        limit = min(limit_per_company, remaining)
+        if wm is None:
+            days = first_days
+        else:
+            days = min(DAYS_AGO_MAX, max(1, math.ceil((now - wm).total_seconds() / 86400) + 1))
+        picks.append((key, name, days, limit))
+        remaining -= limit
+    if not picks:
+        return HirebasePlan([], month_used, usable_left, 0, "nothing_eligible")
+    return HirebasePlan(picks, month_used, usable_left, usable_left - remaining, "")
