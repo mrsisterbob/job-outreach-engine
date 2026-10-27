@@ -1496,6 +1496,15 @@ def init_db():
         # is proof only that the triple has the right shape, not that it answers.
         if "workday_board" not in identity_columns:
             conn.execute("ALTER TABLE company_identities ADD COLUMN workday_board TEXT")
+        # board_system: which job-board system the stored board is on (greenhouse, lever, ashby,
+        # workday; later systems add more lowercase names). Nullable: NULL means "not recorded" and is
+        # never filled by a guess, so a later run can select companies by system.
+        if "board_system" not in identity_columns:
+            conn.execute("ALTER TABLE company_identities ADD COLUMN board_system TEXT")
+        # board_source: where the board came from. 'own' = the engine or Kevin found it; 'bought' = a
+        # paid discovery source did (reserved, nothing writes it yet). NULL = not recorded.
+        if "board_source" not in identity_columns:
+            conn.execute("ALTER TABLE company_identities ADD COLUMN board_source TEXT")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS system_alerts (
             alert_key TEXT PRIMARY KEY,
@@ -3628,7 +3637,31 @@ def set_company_workday_board(company_name, board):
     board = str(board or "").strip()
     if not valid_workday_triple(board):
         return False
-    return upsert_company_identity(company_name, workday_board=board)
+    return upsert_company_identity(company_name, workday_board=board,
+                                   board_system="workday", board_source="own")
+
+
+def list_bought_boards():
+    """Companies whose board came from a paid source (board_source='bought'): a list of
+    (display_name, slug or Workday triple, board_system). Read-only."""
+    with get_db_conn() as conn:
+        rows = conn.execute(
+            "SELECT display_name, COALESCE(NULLIF(ats_slug, ''), workday_board), board_system "
+            "FROM company_identities WHERE board_source = 'bought' ORDER BY display_name").fetchall()
+    return [tuple(r) for r in rows]
+
+
+def switch_off_bought_boards():
+    """Clear ats_slug, workday_board and board_system on 'bought' rows ONLY, so /w stops scanning
+    them. 'own' and unrecorded rows are never touched. board_source stays 'bought' so the row still
+    lists as a switched-off paid board. Returns the number of rows switched off."""
+    with get_db_conn() as conn:
+        cur = conn.execute(
+            "UPDATE company_identities SET ats_slug = NULL, workday_board = NULL, board_system = NULL, "
+            "updated_at = CURRENT_TIMESTAMP WHERE board_source = 'bought' "
+            "AND (ats_slug IS NOT NULL OR workday_board IS NOT NULL OR board_system IS NOT NULL)")
+        conn.commit()
+        return cur.rowcount
 
 
 def record_workday_board_from_posting(job, warm_contact):
@@ -3667,7 +3700,8 @@ def record_workday_board_from_posting(job, warm_contact):
     return ""
 
 
-def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applied=False, workday_board=None):
+def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applied=False, workday_board=None,
+                           board_system=None, board_source=None):
     """Merge newly-learned facts about a company into the canonical company_identities record,
     keyed by normalize_company_for_match() so 'Acme Corp' and 'Acme Corp Inc.' share one row.
     Never overwrites a field with an empty value - only adds/updates what's newly known.
@@ -3692,16 +3726,21 @@ def upsert_company_identity(company_name, ats_slug=None, crm_status=None, applie
                 conn.execute(
                     "UPDATE company_identities SET display_name = ?, aliases = ?, ats_slug = COALESCE(?, ats_slug), "
                     "crm_status = COALESCE(?, crm_status), applied_at = COALESCE(?, applied_at), "
-                    "workday_board = COALESCE(?, workday_board), updated_at = CURRENT_TIMESTAMP "
+                    "workday_board = COALESCE(?, workday_board), board_system = COALESCE(?, board_system), "
+                    # a 'bought' source is never overwritten to 'own' by a re-find: the paid source
+                    # still produced the board, and switching it off must keep finding the row.
+                    "board_source = CASE WHEN board_source = 'bought' THEN 'bought' "
+                    "ELSE COALESCE(?, board_source) END, updated_at = CURRENT_TIMESTAMP "
                     "WHERE normalized_name = ?",
                     (existing_display or display_name, merged_aliases, ats_slug, crm_status, applied_at,
-                     workday_board or None, normalized)
+                     workday_board or None, board_system or None, board_source or None, normalized)
                 )
             else:
                 conn.execute(
-                    "INSERT INTO company_identities (normalized_name, display_name, aliases, ats_slug, crm_status, applied_at, workday_board) "
-                    "VALUES (?, ?, '', ?, ?, ?, ?)",
-                    (normalized, display_name, ats_slug, crm_status, applied_at, workday_board or None)
+                    "INSERT INTO company_identities (normalized_name, display_name, aliases, ats_slug, crm_status, applied_at, workday_board, board_system, board_source) "
+                    "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
+                    (normalized, display_name, ats_slug, crm_status, applied_at, workday_board or None,
+                     board_system or None, board_source or None)
                 )
             conn.commit()
         return True
@@ -13460,7 +13499,8 @@ def auto_expand_ats_slug(company_name, errors=None):
                     if slug_guess not in current_slugs:
                         current_slugs.append(slug_guess)
                         set_filter("ats_company_slugs", current_slugs)
-                upsert_company_identity(company_name, ats_slug=slug_guess)
+                upsert_company_identity(company_name, ats_slug=slug_guess,
+                                        board_system=board_name, board_source="own")
                 logging.info(f"[ATS EXPANSION] '{company_name}' resolved to '{slug_guess}' on {board_name} - added to ats_company_slugs")
                 return slug_guess
         except Exception as e:

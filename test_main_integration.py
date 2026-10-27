@@ -20724,3 +20724,79 @@ def test_warm_lookup_drain_peak_memory_over_120_companies(monkeypatch):
         tracemalloc.stop()
     print(f"DRAIN_PEAK_BYTES={peak}")
     assert peak < 64 * 1024 * 1024
+
+
+# ---- TASK-169: company identity records which board system and where the board came from ----
+
+def _board_cols(name):
+    with m.get_db_conn() as conn:
+        return conn.execute(
+            "SELECT ats_slug, workday_board, board_system, board_source FROM company_identities "
+            "WHERE normalized_name = ?", (m.normalize_company_for_match(name),)).fetchone()
+
+
+def _warm_board_system_http(monkeypatch, live_host):
+    filters = {"ats_company_slugs": []}
+    monkeypatch.setattr(m, "get_filter", lambda key, default=None: list(filters.get(key, default)))
+    monkeypatch.setattr(m, "set_filter", lambda key, val: filters.__setitem__(key, list(val)))
+
+    def fake_get(url, timeout=None, **kw):
+        if live_host in url:
+            return types.SimpleNamespace(status_code=200, json=lambda: {"jobs": [{"id": 1}]})
+        return types.SimpleNamespace(status_code=404, json=lambda: {})
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    return filters
+
+
+@pytest.mark.parametrize("host,system", [("greenhouse.io", "greenhouse"), ("lever.co", "lever"),
+                                         ("ashbyhq.com", "ashby")])
+def test_warm_board_system_lookup_records_system_and_own_source(monkeypatch, host, system):
+    _warm_board_system_http(monkeypatch, host)
+    assert m.lookup_warm_company_board("Acme Robotics") == "acmerobotics"
+    assert _board_cols("Acme Robotics") == ("acmerobotics", None, system, "own")
+
+
+def test_warm_board_system_workday_attach_records_workday_and_own(monkeypatch):
+    sent, posts, run = _ats_workday_attach_harness(monkeypatch, _WdResp(200, {"total": 94}))
+    run(f"/ats workday {_WD_URL} Plante Moran")
+    assert _board_cols("Plante Moran") == (None, "plantemoran/wd5/PlanteMoran", "workday", "own")
+
+
+def test_warm_board_system_no_probe_path_stays_null_and_reupsert_does_not_clear(monkeypatch):
+    filters = _warm_board_system_http(monkeypatch, "greenhouse.io")
+    filters["ats_company_slugs"] = ["acmerobotics"]  # already tracked: no board answers, system unknown
+    assert m.lookup_warm_company_board("Acme Robotics") == "acmerobotics"
+    assert _board_cols("Acme Robotics") == ("acmerobotics", None, None, None)
+    m.upsert_company_identity("Acme Robotics", board_system="lever", board_source="own")
+    assert m.lookup_warm_company_board("Acme Robotics") == "acmerobotics"
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    assert _board_cols("Acme Robotics") == ("acmerobotics", None, "lever", "own")
+
+
+def test_warm_board_system_bought_source_is_not_overwritten_by_a_refind():
+    m.upsert_company_identity("Paid Co", ats_slug="paidco", board_system="lever")
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE company_identities SET board_source = 'bought' WHERE normalized_name = ?",
+                     (m.normalize_company_for_match("Paid Co"),))
+        conn.commit()
+    m.upsert_company_identity("Paid Co", ats_slug="paidco", board_system="lever", board_source="own")
+    assert _board_cols("Paid Co")[3] == "bought"
+
+
+def test_warm_board_system_list_and_switch_off_touch_only_bought_rows():
+    m.upsert_company_identity("Own Co", ats_slug="ownco", board_system="greenhouse", board_source="own")
+    m.upsert_company_identity("Bought Co", ats_slug="boughtco", board_system="ashby")
+    m.upsert_company_identity("Bought Wd", workday_board="bw/wd1/Site", board_system="workday")
+    m.upsert_company_identity("Unrecorded Co", ats_slug="unrecorded")
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE company_identities SET board_source = 'bought' WHERE normalized_name IN (?, ?)",
+                     (m.normalize_company_for_match("Bought Co"), m.normalize_company_for_match("Bought Wd")))
+        conn.commit()
+    before_own, before_unrec = _board_cols("Own Co"), _board_cols("Unrecorded Co")
+    assert m.list_bought_boards() == [("Bought Co", "boughtco", "ashby"), ("Bought Wd", "bw/wd1/Site", "workday")]
+    assert m.switch_off_bought_boards() == 2
+    assert _board_cols("Bought Co") == (None, None, None, "bought")
+    assert _board_cols("Bought Wd") == (None, None, None, "bought")
+    assert _board_cols("Own Co") == before_own == ("ownco", None, "greenhouse", "own")
+    assert _board_cols("Unrecorded Co") == before_unrec
+    assert m.switch_off_bought_boards() == 0
