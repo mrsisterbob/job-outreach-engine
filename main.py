@@ -32,6 +32,7 @@ import warm_big_companies
 import warm_company_kind
 import warm_jsearch_plan
 import apify_feed
+import hirebase_feed
 import warm_screen_plan
 import warm_michigan
 import role_region
@@ -15241,15 +15242,15 @@ def run_warm_radar_scan(chat_id=None):
         jsearch_ledger = warm_jsearch_ledger_read() if no_board_candidates and not jsearch_no_key else None
         jsearch_preview = (warm_jsearch_plan.plan_warm_jsearch(no_board_candidates, jsearch_ledger, datetime.now(timezone.utc))[0]
                            if jsearch_ledger is not None else [])
-        # Apify feed (sibling of JSearch): preview only, to let a Kevin with no cached boards reach the hook.
-        # The real plan is made again under _APIFY_LOCK further down. No token: nothing is planned or read.
-        apify_token = apify_feed.get_token(os.environ)
-        apify_preview = []
-        if apify_token and no_board_candidates:
-            _apify_ledger_preview = apify_ledger_read()
-            if _apify_ledger_preview is not None:
-                apify_preview = apify_feed.plan_apify_run(no_board_candidates, _apify_ledger_preview, datetime.now(timezone.utc)).picks
-        if not slug_to_contact and not wd_to_contact and not jsearch_preview and not apify_preview:
+        # Hirebase feed (sibling of JSearch): preview only, to let a Kevin with no cached boards reach the hook.
+        # The real plan is made again under _HIREBASE_LOCK further down. No key: nothing is planned or read.
+        hirebase_key = hirebase_feed.get_key(os.environ)
+        hirebase_preview = []
+        if hirebase_key and no_board_candidates:
+            _hirebase_ledger_preview = hirebase_ledger_read()
+            if _hirebase_ledger_preview is not None:
+                hirebase_preview = hirebase_feed.plan_hirebase_run(no_board_candidates, _hirebase_ledger_preview, datetime.now(timezone.utc)).picks
+        if not slug_to_contact and not wd_to_contact and not jsearch_preview and not hirebase_preview:
             if chat_id:
                 lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm companies has a cached job board yet."]
                 lines += _skipped_report()
@@ -15486,81 +15487,100 @@ def run_warm_radar_scan(chat_id=None):
                             logging.error(f"Warm Radar JSearch posting error: {e}")
                 _trim_group_jobs()
 
-        # APIFY FEED LOOKUP. One batched call for the biggest no-board warm companies, after JSearch.
-        # Read-plan-reserve happens under _APIFY_LOCK and the ledger row is written BEFORE the request.
-        # Nothing here can fail the scan; unconfigured, down or over budget leaves /w exactly as it was.
-        apify_status = "unconfigured" if not apify_token else "skipped"
-        apify_stats = {}
-        apify_spent_usd = 0.0
-        apify_capped = False
-        apify_picked_names = []
-        apify_covered = 0
-        apify_uncovered = []
-        apify_month_before = 0.0
-        apify_limit = 0
-        apify_hash_to_ids = {}   # job_hash -> apify job ids, so only settled roles are marked seen
-        if apify_token:
+        # HIREBASE LOOKUP. One exact-slug request per no-board warm company, biggest network first, after JSearch.
+        # Read-plan-reserve happens under _HIREBASE_LOCK and the ledger row is written BEFORE each request.
+        # The first errored request stops the loop (the rest are retried on a later run). Nothing here can
+        # fail the scan; unconfigured, down or over budget leaves /w exactly as it was.
+        hirebase_status = "unconfigured" if not hirebase_key else "skipped"
+        hirebase_stats = {"returned": 0, "malformed": 0, "kept": 0, "unmatched": 0}
+        hirebase_per_company = []   # (name, status, returned, kept) per company requested
+        hirebase_jobs_used_this_run = 0
+        hirebase_month_before = 0
+        hirebase_picked_names = []
+        hirebase_hash_to_ids = {}   # job_hash -> hirebase job ids, so only settled roles are marked seen
+        if hirebase_key:
             try:
-                apify_plan = None
-                apify_row_id = None
-                with _APIFY_LOCK:
-                    apify_ledger_now = apify_ledger_read()
-                    if apify_ledger_now is None:
-                        apify_status = "ledger_unreadable"
+                hirebase_plan = None
+                with _HIREBASE_LOCK:
+                    hirebase_ledger_now = hirebase_ledger_read()
+                    if hirebase_ledger_now is None:
+                        hirebase_status = "ledger_unreadable"
                     else:
-                        apify_plan = apify_feed.plan_apify_run(no_board_candidates, apify_ledger_now, datetime.now(timezone.utc))
-                        apify_month_before = apify_plan.month_spent_usd
-                        if apify_plan.skip_reason or not apify_plan.picks:
-                            apify_status = apify_plan.skip_reason or "nothing_eligible"
-                            apify_plan = None
-                        else:
-                            apify_row_id = apify_ledger_reserve([pk[0] for pk in apify_plan.picks], apify_plan.worst_case_usd)
-                            if apify_row_id is None:
-                                apify_status = "reserve_failed"
-                                apify_plan = None
-                if apify_plan is not None:
-                    apify_picked_names = [pk[1] for pk in apify_plan.picks]
-                    apify_limit = apify_plan.limit
-                    apify_picked_keys = {pk[0] for pk in apify_plan.picks}
-                    apify_spent_usd = apify_plan.worst_case_usd
+                        hirebase_plan = hirebase_feed.plan_hirebase_run(no_board_candidates, hirebase_ledger_now, datetime.now(timezone.utc))
+                        hirebase_month_before = hirebase_plan.month_used
+                        if hirebase_plan.skip_reason or not hirebase_plan.picks:
+                            hirebase_status = hirebase_plan.skip_reason or "nothing_eligible"
+                            hirebase_plan = None
+                if hirebase_plan is not None:
+                    hirebase_picked_names = [pk[1] for pk in hirebase_plan.picks]
+                    hirebase_picked_keys = {pk[0] for pk in hirebase_plan.picks}
+                    hirebase_status = "ok"
                     if chat_id:
                         try:
-                            send_status_update(chat_id, f"Warm Radar: looking up {len(apify_picked_names)} companies with no job board on the Apify feed...")
+                            send_status_update(chat_id, f"Warm Radar: looking up {len(hirebase_picked_names)} companies with no job board on Hirebase...")
                         except Exception as e:
-                            logging.error(f"Warm Radar Apify status update failed: {type(e).__name__}")
-                    fetched = None
-                    try:
-                        fetched = apify_feed.fetch_feed(apify_feed.build_run_input(apify_picked_names, apify_plan.limit),
-                                                        apify_token, requests.post)
-                    except Exception as e:
-                        logging.error(f"Warm Radar Apify fetch raised {type(e).__name__}")
-                    if fetched is None or fetched.status != "ok":
-                        apify_status = "errored"
-                        apify_ledger_settle(apify_row_id, apify_plan.worst_case_usd, "errored")
-                        logging.error(f"Warm Radar Apify call errored: {getattr(fetched, 'error', 'raised')}")
-                    else:
-                        apify_status = "ok"
-                        apify_capped = fetched.capped
-                        apify_spent_usd = apify_feed.actual_cost(len(fetched.rows))
-                        apify_ledger_settle(apify_row_id, apify_spent_usd, "ok")
-                        kept, apify_stats = apify_feed.split_rows(fetched.rows, apify_picked_names, normalize_company_for_match)
-                        apify_jobs = [j for js in kept.values() for j in js]
-                        apify_covered = len(kept)
-                        apify_uncovered = [n for n in apify_picked_names if n not in kept]
-                        already = apify_seen_filter([j["job_id"] for j in apify_jobs])
-                        for job in apify_jobs:
-                            if job["job_id"] in already:
-                                continue
-                            try:
-                                apify_hash_to_ids.setdefault(
-                                    generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
-                                _collect_posting(job, jsearch_keys=apify_picked_keys)
-                            except Exception as e:
-                                logging.error(f"Warm Radar Apify posting error: {type(e).__name__}")
-                        _trim_group_jobs()
+                            logging.error(f"Warm Radar Hirebase status update failed: {type(e).__name__}")
+                    for pick_key, pick_name, _pd, _pl in hirebase_plan.picks:
+                        hirebase_row_id = None
+                        hirebase_outcome = "errored"
+                        hirebase_result = None
+                        hirebase_limit = 0
+                        hirebase_days = 1
+                        hirebase_slugs = []
+                        try:
+                            with _HIREBASE_LOCK:
+                                hirebase_ledger_now = hirebase_ledger_read()
+                                if hirebase_ledger_now is None:
+                                    hirebase_status = "ledger_unreadable"
+                                    break
+                                hirebase_replan = hirebase_feed.plan_hirebase_run(no_board_candidates, hirebase_ledger_now, datetime.now(timezone.utc))
+                                hirebase_mine = [pk for pk in hirebase_replan.picks if pk[0] == pick_key]
+                                if not hirebase_mine:
+                                    continue
+                                _k, _n, hirebase_days, hirebase_limit = hirebase_mine[0]
+                                hirebase_row_id = hirebase_ledger_reserve(pick_key, hirebase_limit)
+                                if hirebase_row_id is None:
+                                    hirebase_status = "reserve_failed"
+                                    break
+                            hirebase_slugs = hirebase_feed.slug_guesses(pick_name, normalize_company_for_match)
+                            hirebase_result = hirebase_feed.fetch_company_jobs(
+                                hirebase_feed.build_search_body(hirebase_slugs, hirebase_days, hirebase_limit),
+                                hirebase_key, requests.post)
+                            if hirebase_result.status == "ok":
+                                hirebase_outcome = "capped" if hirebase_result.capped else "ok"
+                        except Exception as e:
+                            hirebase_result = None
+                            hirebase_outcome = "errored"
+                            logging.error(f"Warm Radar Hirebase request raised {type(e).__name__}")
+                        returned_n = len(hirebase_result.jobs) if (hirebase_result is not None and hirebase_outcome != "errored") else 0
+                        hirebase_ledger_settle(hirebase_row_id, returned_n, hirebase_outcome)
+                        if hirebase_outcome == "errored":
+                            hirebase_status = "errored"
+                            hirebase_per_company.append((pick_name, "errored", 0, 0))
+                            logging.error(f"Warm Radar Hirebase call errored: {getattr(hirebase_result, 'error', 'raised')}")
+                            break
+                        hirebase_jobs_used_this_run += returned_n
+                        try:
+                            kept_jobs, co_stats = hirebase_feed.split_jobs(hirebase_result.jobs, pick_name, hirebase_slugs, normalize_company_for_match)
+                            for stat_key in hirebase_stats:
+                                hirebase_stats[stat_key] += co_stats.get(stat_key, 0)
+                            hirebase_per_company.append((pick_name, hirebase_outcome, returned_n, len(kept_jobs)))
+                            already = apify_seen_filter([j["job_id"] for j in kept_jobs])
+                            for job in kept_jobs:
+                                if job["job_id"] in already:
+                                    continue
+                                try:
+                                    hirebase_hash_to_ids.setdefault(
+                                        generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
+                                    _collect_posting(job, jsearch_keys=hirebase_picked_keys)
+                                except Exception as e:
+                                    logging.error(f"Warm Radar Hirebase posting error: {type(e).__name__}")
+                            _trim_group_jobs()
+                        except Exception as e:
+                            logging.error(f"Warm Radar Hirebase screen feed raised {type(e).__name__}")
             except Exception as e:
-                apify_status = "errored"
-                logging.error(f"Warm Radar Apify block raised {type(e).__name__}")
+                hirebase_status = "errored"
+                logging.error(f"Warm Radar Hirebase block raised {type(e).__name__}")
 
         # SCREEN + OUTPUT. Nothing has been stamped, cached, sent or written yet. A role leaves a
         # trace (seen_jobs stamp, referral-ask role) ONLY after what lists it was accepted: its card
@@ -15669,15 +15689,15 @@ def run_warm_radar_scan(chat_id=None):
                     if item["role"].get("slug"):
                         blocked_slugs.add(item["role"]["slug"])
 
-        # Apify ids are marked seen ONLY for roles the screen settled: card sent, digest sent, or rejected.
+        # Hirebase ids are marked seen ONLY for roles the screen settled: card sent, digest sent, or rejected.
         # Held, failed, unscored roles and anything a gate dropped stay unmarked and resurface.
-        if apify_hash_to_ids:
+        if hirebase_hash_to_ids:
             try:
                 settled = ({i["job_hash"] for i in sent_items} | {i["job_hash"] for i in digest_sent}
                            | set(rejected_hashes))
-                apify_seen_mark([jid for hsh in settled for jid in apify_hash_to_ids.get(hsh, ())])
+                apify_seen_mark([jid for hsh in settled for jid in hirebase_hash_to_ids.get(hsh, ())])
             except Exception as e:
-                logging.error(f"Warm Radar Apify seen mark failed: {type(e).__name__}")
+                logging.error(f"Warm Radar Hirebase seen mark failed: {type(e).__name__}")
 
         # Roles whose card went: stamp, count, and collect for the referral ask.
         sent_by_group = {}
@@ -15785,23 +15805,6 @@ def run_warm_radar_scan(chat_id=None):
                     names_text, _used = _warm_radar_name_list(jsearch_names, 5)
                     jsearch_line += f" ({names_text})"
                 lines.append(jsearch_line)
-            ceiling = apify_feed.APIFY_MONTHLY_CEILING_USD
-            if apify_status == "errored" and apify_picked_names:
-                lines.append(f"Apify feed errored ({len(apify_picked_names)} companies not searched, retried on a later run); "
-                             f"${apify_spent_usd:.2f} reserved against the month")
-            elif apify_status == "ok":
-                apify_line = (f"Apify feed: {len(apify_picked_names)} companies, {apify_stats.get('returned', 0)} rows returned, "
-                              f"{apify_stats.get('kept', 0)} kept, ${apify_spent_usd:.3f} this run, "
-                              f"${max(0.0, ceiling - apify_month_before - apify_spent_usd):.2f} left of ${ceiling:.2f} this month")
-                if apify_capped:
-                    apify_line += f" (capped at {apify_limit}: older postings were dropped)"
-                lines.append(apify_line)
-                if apify_uncovered:
-                    names_text, _used = _warm_radar_name_list(apify_uncovered, 5)
-                    lines.append(f"Searched but not covered by the feed: {names_text} (the feed has no verified postings for them; that is not the same as no jobs)")
-                lines.append(f"Apify feed covered {apify_covered} of {len(apify_picked_names)} companies searched")
-            elif apify_status == "monthly_ceiling":
-                lines.append(f"Apify feed skipped: monthly ceiling reached (${apify_month_before:.2f} of ${ceiling:.2f})")
             if applied_skipped:
                 names_text, _used = _warm_radar_name_list(sorted(applied_skipped), 5)
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
