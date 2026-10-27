@@ -63,7 +63,7 @@ def test_blank_and_missing_files_give_empty_set(tmp_path):
     assert wer.parse_rows("", "a") == ({}, {"rows": 0, "bad_rows": 0, "no_company": 0})
     blank = tmp_path / "blank.tsv"
     blank.write_text("")
-    companies, _ = wer.read_files([str(blank), str(tmp_path / "missing.tsv")])
+    companies, _ = wer.read_files([str(blank)])
     assert wer.companies_at_least(companies) == {}
 
 
@@ -73,3 +73,11 @@ def test_read_files_combines_on_disk(tmp_path):
     p2.write_text("\n".join([row("Acme")] * 2))
     companies, _ = wer.read_files([str(p1), str(p2)])
     assert companies["acme"]["count"] == 5
+
+
+def test_missing_file_raises_not_silently_smaller(tmp_path):
+    import pytest
+    good = tmp_path / "g.tsv"
+    good.write_text(row("Acme"))
+    with pytest.raises(OSError):
+        wer.read_files([str(good), str(tmp_path / "missing.tsv")])

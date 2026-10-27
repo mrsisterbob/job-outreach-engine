@@ -53,6 +53,7 @@ def parse_rows(text, source="", normalizer=None):
             continue
         stats["rows"] += 1
         c = companies.setdefault(key, {"name": name, "count": 0, "domains": [], "by_source": {}})
+        c["name"] = min(c["name"], name)  # order-independent display name
         c["count"] += 1
         c["by_source"][source] = c["by_source"].get(source, 0) + 1
         d = _email_domain(cols[EMAIL_COL])
@@ -69,6 +70,7 @@ def combine(parsed_list):
             stats[k] += st.get(k, 0)
         for key, c in companies.items():
             o = out.setdefault(key, {"name": c["name"], "count": 0, "domains": [], "by_source": {}})
+            o["name"] = min(o["name"], c["name"])
             o["count"] += c["count"]
             o["domains"].extend(c["domains"])
             for s, n in c["by_source"].items():
@@ -82,13 +84,13 @@ def companies_at_least(companies, minimum=MIN_CONTACTS):
 
 
 def read_files(paths, normalizer=None):
-    """Read each TSV path (label = file's position) and combine. A missing/blank file adds nothing."""
+    """Read each TSV path (label = file's position) and combine. A blank file adds nothing; a missing/unreadable one raises (never a silently smaller set)."""
     parsed = []
     for i, p in enumerate(paths):
         try:
             with open(p, encoding="utf-8", errors="replace", newline="") as f:
                 text = f.read()
-        except OSError:
-            text = ""
+        except OSError as e:
+            raise OSError(f"cannot read export file {p!r}: {type(e).__name__}") from e
         parsed.append(parse_rows(text, source=f"file{i + 1}", normalizer=normalizer))
     return combine(parsed)

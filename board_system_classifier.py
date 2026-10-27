@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 # vendor -> host substrings (checked against a URL host or a markup link target)
 VENDOR_MARKERS = {
-    "workday": ("myworkdayjobs.com", "myworkdaysite.com", ".wd1.", ".wd3.", ".wd5."),
+    "workday": ("myworkdayjobs.com", "myworkdaysite.com"),
     "greenhouse": ("greenhouse.io",),
     "lever": ("lever.co",),
     "ashby": ("ashbyhq.com",),
@@ -30,9 +30,27 @@ _LINK_RE = re.compile(r"""(?:src|href|action|data-src)\s*=\s*["']([^"']+)["']"""
 _JOB_WORDS = re.compile(r"open (positions|roles)|current openings|job openings|apply now|view (all )?jobs|job search|search jobs", re.I)
 
 
+def _marker_hits(host, path, marker):
+    """Domain-boundary match: host == m or host endswith '.'+m. A marker with a path part
+    (adp.com/recruit) matches its domain on the boundary and the path as a prefix."""
+    dom, _, mpath = marker.partition("/")
+    if not (host == dom or host.endswith("." + dom)):
+        return False
+    return not mpath or path.startswith("/" + mpath)
+
+
+def _split(text):
+    low = text.lower().strip()
+    low = re.sub(r"^[a-z][a-z0-9+.-]*://", "", low).lstrip("/")
+    low = low.split("?", 1)[0].split("#", 1)[0]
+    hostpart, _, rest = low.partition("/")
+    hostpart = hostpart.rsplit("@", 1)[-1].split(":", 1)[0]
+    return hostpart, "/" + rest
+
+
 def _vendor_for(text):
-    low = text.lower()
-    return [v for v, marks in VENDOR_MARKERS.items() if any(m in low for m in marks)]
+    host, path = _split(text)
+    return [v for v, marks in VENDOR_MARKERS.items() if any(_marker_hits(host, path, m) for m in marks)]
 
 
 def classify_board_system(final_url, html):
@@ -41,12 +59,12 @@ def classify_board_system(final_url, html):
     page = html if isinstance(html, str) else ""
     host = (urlparse(url).netloc or "").lower()
     if host:
-        hits = _vendor_for(host)
+        hits = _vendor_for(url)
         if hits:
             return hits[0] if len(hits) == 1 else "unknown"
     found = []
     for target in _LINK_RE.findall(page):
-        for v in _vendor_for(urlparse(target).netloc or target.split("/")[0]):
+        for v in _vendor_for(target):
             if v not in found:
                 found.append(v)
     if len(found) == 1:
