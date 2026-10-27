@@ -36,6 +36,7 @@ import hirebase_feed
 import warm_screen_plan
 import warm_michigan
 import role_region
+import visit_alert
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from track_registry import (
     TRACK_PROMPT_LINE, TRACK_TRIGGER_GUIDANCE, normalize_track, pool_key_for,
@@ -19390,6 +19391,7 @@ ANALYTICS_RETENTION_DAYS = int(os.environ.get("ANALYTICS_RETENTION_DAYS", "90"))
 ANALYTICS_PRUNE_EVERY_SECONDS = 3600
 ANALYTICS_MAX_BATCH = 200
 _visitor_salt = {"day": None, "salt": None}
+_VISIT_ALERT_GATE = visit_alert.VisitAlertGate()
 _visitor_salt_lock = threading.Lock()
 _analytics_last_prune = {"at": 0.0}
 
@@ -19426,10 +19428,11 @@ def _visit_timestamp(value):
         return None
 
 
-def record_site_visits(views, day=None):
+def record_site_visits(views, day=None, alerts=None):
     """Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and
     ua fields of each view are read here and dropped - only (visited_at, path, visitor_id,
-    referrer, bot) reach SQLite."""
+    referrer, bot) reach SQLite. When `alerts` is a list, the stored rows are appended to it AFTER
+    the commit (so a failed write alerts nobody) for the visit-alert path."""
     day = day or datetime.now().date()
     salt = visitor_salt_for(day)
     own, ignore = _analytics_own_hosts(), _analytics_ignore_ips()
@@ -19452,6 +19455,8 @@ def record_site_visits(views, day=None):
             "INSERT INTO site_visits (visited_at, path, visitor_id, referrer, bot) "
             "VALUES (COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)", rows)
         conn.commit()
+    if alerts is not None:
+        alerts.extend(rows)
     return len(rows)
 
 
@@ -19479,6 +19484,45 @@ def _maybe_prune_site_visits():
         logging.error(f"[ANALYTICS] prune failed: {e}")
 
 
+def _visit_when_text(visited_at):
+    """The view time (UTC text from the site, else now) in America/Detroit, the zone the rest of
+    the bot schedules in; falls back to a UTC label if the zone database is unavailable."""
+    try:
+        dt = datetime.strptime(visited_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)             if visited_at else datetime.now(timezone.utc)
+    except ValueError:
+        dt = datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        local = dt.astimezone(ZoneInfo("America/Detroit"))
+        return local.strftime("%a %b %d, %I:%M %p").replace(" 0", " ")
+    except Exception:
+        return dt.strftime("%a %b %d, %I:%M %p UTC").replace(" 0", " ")
+
+
+def _send_visit_alert(when_text, path, referrer):
+    """Runs off the request thread. A failed send is logged (class name only) and not retried."""
+    try:
+        if not send_telegram_message(TELEGRAM_CHAT_ID, visit_alert.format_visit_alert(when_text, path, referrer)):
+            logging.error("[ANALYTICS] visit alert was not delivered to Telegram")
+    except Exception as e:
+        logging.error(f"[ANALYTICS] visit alert send raised {type(e).__name__}")
+
+
+def _start_visit_alerts(candidates):
+    """Gate each stored view on the request thread, queue the send of each admitted one."""
+    for visited_at, path, visitor_id, referrer, bot in candidates:
+        try:
+            view_epoch = (datetime.strptime(visited_at, "%Y-%m-%d %H:%M:%S")
+                          .replace(tzinfo=timezone.utc).timestamp()) if visited_at else None
+        except ValueError:
+            view_epoch = None
+        ok, _reason = _VISIT_ALERT_GATE.admit(visitor_id, path, bot, view_epoch, time.time())
+        if not ok:
+            continue
+        when_text = _visit_when_text(visited_at)
+        _spawn_background(lambda w=when_text, p=path, r=referrer: _send_visit_alert(w, p, r))
+
+
 @app.route("/analytics/ingest", methods=["POST"])
 def analytics_ingest():
     """Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN."""
@@ -19489,11 +19533,17 @@ def analytics_ingest():
     if not analytics_enabled():
         return jsonify({"status": "disabled", "stored": 0}), 200
     data = request.get_json(silent=True) or {}
+    candidates = []
     try:
-        stored = record_site_visits(data.get("views"))
+        stored = record_site_visits(data.get("views"), alerts=candidates)
     except Exception as e:
         logging.error(f"[ANALYTICS] ingest write failed: {e}")
         return jsonify({"status": "error"}), 500
+    try:
+        if visit_alert.visit_alerts_enabled(os.environ):
+            _start_visit_alerts(candidates)
+    except Exception as e:
+        logging.error(f"[ANALYTICS] visit alerts failed: {type(e).__name__}")
     _maybe_prune_site_visits()
     return jsonify({"status": "ok", "stored": stored}), 200
 
