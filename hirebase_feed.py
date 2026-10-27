@@ -12,6 +12,7 @@ read as "no jobs".
 """
 import html
 import re
+from collections import namedtuple
 
 # Our name -> the Hirebase job key.
 # MEASURED present (Kevin, Playground, 2026-10-26): job_title, application_link, location_raw,
@@ -185,3 +186,53 @@ def split_jobs(jobs, company_name, slugs, normalize):
         else:
             stats["unmatched"] += 1
     return kept, stats
+
+
+SEARCH_URL = "https://api.hirebase.org/v2/jobs/search"
+HirebaseResult = namedtuple("HirebaseResult", "status jobs total_count capped error")
+
+
+def get_key(environ):
+    """Stripped HIREBASE_API_KEY from the given environment mapping, or None. Environment only."""
+    key = (environ.get("HIREBASE_API_KEY") or "").strip()
+    return key or None
+
+
+def fetch_company_jobs(body, key, http_post, timeout=60):
+    """ONE Hirebase search request. status is "ok", "errored" or "unconfigured".
+
+    "ok" with jobs == [] is a clean zero for this request only: the exact slug matched nothing in
+    the window (or the slug guess is wrong; the two cannot be told apart). It is NOT proof the
+    company has no jobs. `capped` is True when total_count > len(jobs): rows exist this request did
+    not return, so the caller must not move that company's date watermark forward.
+    Any failure is "errored", never an empty ok: a raising post, non-2xx (429 included), a
+    non-object body, jobs missing or not a list, total_count not an int, or a non-empty jobs list
+    whose every job fails parse_job (a wrong JOB_KEYS guess). 429 is not told apart from other
+    failures: whether it means the monthly cap or the 100 requests per 60 s rate limit (docs, NOT
+    measured) is unmeasured. `error` carries only the exception class name or status code, never
+    str(exc), a response body, or the key.
+    """
+    if not key:
+        return HirebaseResult("unconfigured", [], 0, False, "no HIREBASE_API_KEY")
+    try:
+        resp = http_post(SEARCH_URL, json=body, headers={"x-api-key": key}, timeout=timeout)
+    except Exception as exc:
+        return HirebaseResult("errored", [], 0, False, "post raised " + type(exc).__name__)
+    code = getattr(resp, "status_code", None)
+    if not isinstance(code, int) or isinstance(code, bool) or not 200 <= code < 300:
+        return HirebaseResult("errored", [], 0, False, "http status %s" % (code,))
+    try:
+        data = resp.json()
+    except Exception as exc:
+        return HirebaseResult("errored", [], 0, False, "bad json " + type(exc).__name__)
+    if not isinstance(data, dict):
+        return HirebaseResult("errored", [], 0, False, "body is not an object")
+    jobs = data.get("jobs")
+    if not isinstance(jobs, list):
+        return HirebaseResult("errored", [], 0, False, "jobs missing or not a list")
+    total = data.get("total_count")
+    if isinstance(total, bool) or not isinstance(total, int):
+        return HirebaseResult("errored", [], 0, False, "total_count is not an int")
+    if jobs and not any(parse_job(j) for j in jobs):
+        return HirebaseResult("errored", [], 0, False, "all %d jobs malformed" % len(jobs))
+    return HirebaseResult("ok", jobs, total, total > len(jobs), "")
