@@ -20263,6 +20263,73 @@ def test_apify_store_db_errors(monkeypatch):
     assert m.apify_seen_mark(["j1"]) is False
 
 
+def _hirebase_store_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM hirebase_jobs_ledger")
+        conn.commit()
+
+
+def test_hirebase_store_reserve_then_read_shows_errored_limit():
+    _hirebase_store_clear()
+    rid = m.hirebase_ledger_reserve("acme", 10)
+    assert isinstance(rid, int)
+    rows = m.hirebase_ledger_read()
+    assert len(rows) == 1
+    assert rows[0][1:] == (10, "errored", "acme")
+    assert rows[0][0].endswith("+00:00")
+
+
+def test_hirebase_store_settle_ok_updates_same_row():
+    _hirebase_store_clear()
+    rid = m.hirebase_ledger_reserve("acme", 10)
+    assert m.hirebase_ledger_settle(rid, 7, "ok") is True
+    rows = m.hirebase_ledger_read()
+    assert len(rows) == 1
+    assert rows[0][1:] == (7, "ok", "acme")
+    assert m.hirebase_ledger_settle(rid, 10, "capped") is True
+    assert m.hirebase_ledger_read()[0][1:3] == (10, "capped")
+
+
+def test_hirebase_store_settle_errored_keeps_reserved_jobs():
+    _hirebase_store_clear()
+    rid = m.hirebase_ledger_reserve("acme", 10)
+    assert m.hirebase_ledger_settle(rid, 0, "errored") is True
+    assert m.hirebase_ledger_read()[0][1:] == (10, "errored", "acme")
+
+
+def test_hirebase_store_settle_missing_id_and_bad_status_false():
+    _hirebase_store_clear()
+    assert m.hirebase_ledger_settle(999999, 3, "ok") is False
+    rid = m.hirebase_ledger_reserve("acme", 10)
+    assert m.hirebase_ledger_settle(rid, 3, "weird") is False
+    assert m.hirebase_ledger_read()[0][1:3] == (10, "errored")
+
+
+def test_hirebase_store_reserve_rejects_bad_limits():
+    _hirebase_store_clear()
+    for bad in (0, -5, 2.5, "10", None, True):
+        assert m.hirebase_ledger_reserve("acme", bad) is None
+    assert m.hirebase_ledger_read() == []
+
+
+def test_hirebase_store_old_rows_not_returned():
+    _hirebase_store_clear()
+    old = datetime.now(timezone.utc) - timedelta(days=61)
+    m.hirebase_ledger_reserve("old", 5, now=old)
+    m.hirebase_ledger_reserve("new", 6)
+    assert [r[3] for r in m.hirebase_ledger_read()] == ["new"]
+
+
+def test_hirebase_store_db_errors(monkeypatch):
+    _hirebase_store_clear()
+    def boom(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    assert m.hirebase_ledger_read() is None
+    assert m.hirebase_ledger_reserve("a", 5) is None
+    assert m.hirebase_ledger_settle(1, 1, "ok") is False
+
+
 def test_apify_store_seen_filter_chunks_over_500():
     _apify_store_clear()
     ids = [f"job{i}" for i in range(1200)]
