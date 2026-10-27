@@ -118,6 +118,15 @@ grep -i "contact" FUNCTION_INDEX.md
 | 241 | `_parse_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
 | 252 | `plan_apify_run` | Decide the one batched call: which companies, what limit, worst-case cost. |
 
+## `board_system_classifier.py` — 4 defs, 76 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 33 | `_marker_hits` | Domain-boundary match: host == m or host endswith '.'+m. A marker with a path part |
+| 42 | `_split` | _(no docstring)_ |
+| 51 | `_vendor_for` | _(no docstring)_ |
+| 56 | `classify_board_system` | Return one of SYSTEMS. Never raises; non-string input is treated as empty. |
+
 ## `build_function_index.py` — 6 defs, 196 lines
 
 | Line | Name | Summary |
@@ -911,6 +920,23 @@ grep -i "contact" FUNCTION_INDEX.md
 | 43 | `build` | _(no docstring)_ |
 | 60 | `main` | _(no docstring)_ |
 
+## `scripts/measure_board_systems.py` — 12 defs, 298 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 57 | `_get` | _(no docstring)_ |
+| 65 | `_json` | _(no docstring)_ |
+| 72 | `probe_url` | _(no docstring)_ |
+| 83 | `judge` | (hit, board_name) for one endpoint response. hit is None when there was no answer at all. |
+| 116 | `_get_url` | _(no docstring)_ |
+| 124 | `_unanswered` | _(no docstring)_ |
+| 128 | `measure` | Cache record for one company: 6 board probes + at most 3 careers fetches (9 requests). |
+| 188 | `load_cache` | Read the cache; a corrupt or unreadable file is ignored with a message, never fatal. |
+| 202 | `save_cache` | Atomic write: temp file in the same directory, then os.replace. |
+| 210 | `mismatch` | True when a board's own name does not match the company's slug. |
+| 217 | `report` | _(no docstring)_ |
+| 239 | `main` | _(no docstring)_ |
+
 ## `scripts/time_crm_reads.py` — 4 defs, 65 lines
 
 | Line | Name | Summary |
@@ -969,6 +995,15 @@ grep -i "contact" FUNCTION_INDEX.md
 | 20 | `big_company_report` | rows: (display_name, contact_count, status), status in scanned / no_board / unchecked / |
 | 40 | `board_target_line` | One closing-message line: companies with WARM_BOARD_TARGET_MIN_CONTACTS+ warm contacts, how many |
 
+## `warm_company_domain.py` — 4 defs, 46 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 13 | `email_domain` | Lowercase domain of a well-formed email, else ''. Never raises. |
+| 23 | `is_corporate_domain` | _(no docstring)_ |
+| 29 | `corporate_domain` | The corporate domain most of `emails` share ('' when none). Ties go to the domain seen first. |
+| 43 | `guess_domain` | Last-resort guess, counted separately from evidence by callers. |
+
 ## `warm_company_kind.py` — 4 defs, 60 lines
 
 | Line | Name | Summary |
@@ -977,6 +1012,17 @@ grep -i "contact" FUNCTION_INDEX.md
 | 29 | `_has_phrase` | _(no docstring)_ |
 | 34 | `non_employer_kind` | 'school', 'church', 'law firm', 'cleaning', or '' when the name may be an employer. |
 | 54 | `lookup_order` | rows: iterable of (key, count, priority_score, attempted_at). Returns keys: never-attempted |
+
+## `warm_export_reader.py` — 6 defs, 96 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 20 | `_key` | _(no docstring)_ |
+| 25 | `_email_domain` | _(no docstring)_ |
+| 33 | `parse_rows` | Parse TSV text. Returns (companies, stats). |
+| 65 | `combine` | Merge several (companies, stats) results into one. |
+| 81 | `companies_at_least` | The companies with `minimum` or more contacts (exactly 5 is in, 4 is out). |
+| 86 | `read_files` | Read each TSV path (label = file's position) and combine. A blank file adds nothing; a missing/unreadable one raises (never a silently smaller set). |
 
 ## `warm_jsearch_plan.py` — 2 defs, 92 lines
 
@@ -1035,4 +1081,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**821 definitions across 39 files + Code.gs.**
+**847 definitions across 43 files + Code.gs.**
