@@ -1007,6 +1007,18 @@ grep -i "contact" FUNCTION_INDEX.md
 | 50 | `build_stats_block` | _(no docstring)_ |
 | 61 | `main` | _(no docstring)_ |
 
+## `visit_alert.py` — 7 defs, 79 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 22 | `is_alertable_path` | False for the resume PDF download path (resume_alert.py already alerts on it). |
+| 27 | `VisitAlertGate` | One alert per distinct visitor per window, with an hourly ceiling on all alerts. |
+| 30 | `VisitAlertGate.__init__` | _(no docstring)_ |
+| 35 | `VisitAlertGate.reset` | _(no docstring)_ |
+| 40 | `VisitAlertGate.admit` | Return (ok, reason). Only an admitted view records anything. |
+| 66 | `format_visit_alert` | Telegram HTML text: time, path (cut to 100 chars) and referrer host only. |
+| 76 | `visit_alerts_enabled` | VISIT_ALERTS_ENABLED, default on; read per call. |
+
 ## `warm_big_companies.py` — 2 defs, 55 lines
 
 | Line | Name | Summary |
@@ -1100,4 +1112,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**861 definitions across 44 files + Code.gs.**
+**868 definitions across 45 files + Code.gs.**
