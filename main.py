@@ -1403,6 +1403,15 @@ def init_db():
             company_keys TEXT NOT NULL
         )""")
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS hirebase_jobs_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spent_at TEXT NOT NULL,
+            jobs INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            company_key TEXT NOT NULL
+        )""")
+        # Also holds Hirebase job ids: they carry a hirebase_<slug>_ prefix, so they never collide.
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS apify_seen_jobs (
             job_id TEXT PRIMARY KEY,
             seen_at TEXT NOT NULL
@@ -2930,6 +2939,7 @@ def get_monthly_api_usage():
 
 WARM_JSEARCH_LEDGER_KEEP_DAYS = 60   # rows older than this can no longer change a plan (cap window 7d, retry 28d)
 _WARM_JSEARCH_LOCK = threading.Lock()
+_HIREBASE_LOCK = threading.Lock()   # held by the /w hook around Hirebase read-plan-reserve
 _APIFY_LOCK = threading.Lock()   # held by the /w hook around read-plan-reserve; not used inside the helpers
 
 def warm_jsearch_ledger_read():
@@ -3023,6 +3033,59 @@ def apify_ledger_settle(row_id, usd, status):
             return cur.rowcount > 0
     except Exception as e:
         logging.error(f"Apify Ledger Settle Error (row {row_id}): {e}")
+        return False
+
+def hirebase_ledger_read():
+    """Return [(iso_ts, jobs, status, company_key)] for the trailing 60 days. None on a read
+    error, so the caller spends nothing."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=APIFY_LEDGER_KEEP_DAYS)).isoformat()
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT spent_at, jobs, status, company_key FROM hirebase_jobs_ledger WHERE spent_at >= ? ORDER BY id",
+                (cutoff,)).fetchall()
+        return [tuple(r) for r in rows]
+    except Exception as e:
+        logging.error(f"Hirebase Ledger Read Error: {e}")
+        return None
+
+def hirebase_ledger_reserve(company_key, limit, now=None):
+    """Write the spend BEFORE the request goes out, as 'errored' with jobs=limit (spent, outcome
+    unknown). Returns the row id, or None when the write failed or limit is not a positive int."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        logging.error(f"Hirebase Ledger Reserve rejected limit={limit!r}")
+        return None
+    try:
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        with get_db_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO hirebase_jobs_ledger (spent_at, jobs, status, company_key) VALUES (?, ?, 'errored', ?)",
+                (now.isoformat(), limit, str(company_key)))
+            conn.commit()
+            return cur.lastrowid
+    except Exception as e:
+        logging.error(f"Hirebase Ledger Reserve Error: {e}")
+        return None
+
+def hirebase_ledger_settle(row_id, jobs_returned, status):
+    """Update a reserved row to the rows actually returned and ok/capped/errored. For errored the
+    reserved jobs stay (a failed request may still have billed). Never raises; True if a row changed."""
+    if status not in ("ok", "capped", "errored"):
+        return False
+    try:
+        with get_db_conn() as conn:
+            if status == "errored":
+                cur = conn.execute("UPDATE hirebase_jobs_ledger SET status = ? WHERE id = ?", (status, row_id))
+            else:
+                if not isinstance(jobs_returned, int) or isinstance(jobs_returned, bool) or jobs_returned < 0:
+                    return False
+                cur = conn.execute("UPDATE hirebase_jobs_ledger SET jobs = ?, status = ? WHERE id = ?",
+                                   (jobs_returned, status, row_id))
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Hirebase Ledger Settle Error (row {row_id}): {e}")
         return False
 
 def apify_seen_filter(job_ids):
