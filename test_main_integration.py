@@ -13434,7 +13434,11 @@ def analytics_env(monkeypatch):
     monkeypatch.delenv("ANALYTICS_IGNORE_IPS", raising=False)
     m._visitor_salt.update(day=None, salt=None)
     m._analytics_last_prune["at"] = 0.0
-    yield
+    m._VISIT_ALERT_GATE.reset()
+    monkeypatch.delenv("VISIT_ALERTS_ENABLED", raising=False)
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
+    yield sent
 
 
 def _ingest(views, token=_ANALYTICS_TOKEN):
@@ -13492,6 +13496,100 @@ def test_no_raw_ip_or_user_agent_is_ever_persisted(analytics_env):
     assert visitor_id == m.daily_visitor_id(ip, _HUMAN_UA, m.visitor_salt_for(today))
     assert visitor_id != m.daily_visitor_id(ip, _HUMAN_UA, b"\x00" * 32)
     assert row[4] == "linkedin.com"  # a bare host, never the referring URL
+
+
+def _utc_ts(seconds_ago=0):
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def test_visit_alert_ingest_human_view_sends_one_alert_with_path_and_referrer_host(analytics_env):
+    r = _ingest([_view(path="/job-engine", referrer="https://www.linkedin.com/in/x")])
+    assert r.status_code == 200
+    assert len(analytics_env) == 1
+    assert "/job-engine" in analytics_env[0] and "linkedin.com" in analytics_env[0]
+
+
+def test_visit_alert_ingest_repeat_visitor_is_silent_but_still_stored(analytics_env):
+    _ingest([_view()])
+    _ingest([_view()])
+    assert len(analytics_env) == 1
+    _ingest([_view(ip="198.51.100.9")])
+    assert len(analytics_env) == 2
+    assert len(_stored_rows()) == 3
+
+
+def test_visit_alert_ingest_text_has_no_ip_ua_visitor_id_or_referrer_path(analytics_env):
+    _ingest([_view(ip="203.0.113.7", referrer="https://www.linkedin.com/in/x")])
+    text = analytics_env[0]
+    vid = _stored_rows()[0][3]
+    for secret in ("203.0.113.7", "Chrome", "Mozilla", vid, "/in/x"):
+        assert secret not in text
+
+
+def test_visit_alert_ingest_non_people_send_nothing_and_use_no_slot(analytics_env):
+    for ua in ("Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)",
+               "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)",
+               "python-requests/2.32.3", ""):
+        _ingest([_view(ua=ua)])
+    _ingest([_view(is_self=True)])
+    assert analytics_env == []
+    _ingest([_view()])
+    assert len(analytics_env) == 1
+
+
+def test_visit_alert_ingest_resume_pdf_is_stored_but_silent(analytics_env):
+    _ingest([_view(path="/resume/kevin-miller-resume.pdf?x=1")])
+    assert analytics_env == []
+    assert len(_stored_rows()) == 1
+    _ingest([_view(path="/job-engine")])
+    assert len(analytics_env) == 1
+
+
+def test_visit_alert_ingest_failed_send_never_fails_ingest_and_runs_off_thread(analytics_env, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("telegram down")
+    monkeypatch.setattr(m, "send_telegram_message", boom)
+    r = _ingest([_view()])
+    assert r.status_code == 200 and r.get_json() == {"status": "ok", "stored": 1}
+    m._VISIT_ALERT_GATE.reset()
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: None)
+    r = _ingest([_view(ip="198.51.100.1")])
+    assert r.status_code == 200 and r.get_json() == {"status": "ok", "stored": 1}
+    assert len(_stored_rows()) == 2
+    m._VISIT_ALERT_GATE.reset()
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: analytics_env.append(t) or 1)
+    queued = []
+    monkeypatch.setattr(m, "_spawn_background", lambda fn: queued.append(fn))
+    r = _ingest([_view(ip="198.51.100.2")])
+    assert r.status_code == 200 and len(queued) == 1 and analytics_env == []
+    queued[0]()
+    assert len(analytics_env) == 1
+
+
+def test_visit_alert_ingest_switch_ceiling_batch_and_analytics_off(analytics_env, monkeypatch):
+    monkeypatch.setenv("VISIT_ALERTS_ENABLED", "false")
+    _ingest([_view()])
+    assert analytics_env == []
+    monkeypatch.delenv("VISIT_ALERTS_ENABLED")
+    _ingest([_view(ip=f"192.0.2.{i}") for i in range(11)])
+    assert len(analytics_env) == 10
+    m._VISIT_ALERT_GATE.reset()
+    del analytics_env[:]
+    _ingest([_view(path="/a"), _view(path="/b"), _view(path="/c")])
+    assert len(analytics_env) == 1
+    m._VISIT_ALERT_GATE.reset()
+    del analytics_env[:]
+    monkeypatch.setenv("ANALYTICS_ENABLED", "false")
+    _ingest([_view()])
+    assert analytics_env == []
+
+
+def test_visit_alert_ingest_old_backlog_view_alerts_nobody(analytics_env):
+    _ingest([_view(ts=_utc_ts(900))])
+    assert analytics_env == []
+    assert len(_stored_rows()) == 1
+    _ingest([_view(ip="198.51.100.5", ts=_utc_ts(5))])
+    assert len(analytics_env) == 1
 
 
 def test_salt_rotates_daily_and_forgets_yesterday(analytics_env):
