@@ -15772,7 +15772,7 @@ def test_warm_radar_no_board_line_keeps_its_own_name_budget(monkeypatch):
     """The lookup line (20 names) used to spend the whole shared name cap, so the no-board line
     printed '(N):  and N more' with no names."""
     missed = [f"Missedboard Co {chr(65 + i)}" for i in range(18)]
-    fresh = [f"Freshboard Co {chr(65 + i)}" for i in range(m.WARM_RADAR_LOOKUP_BATCH + 3)]
+    fresh = [f"Freshboard Co {chr(65 + i)}" for i in range(23)]
     h = _WarmRadarHarness(monkeypatch, missed + fresh)
     for name in missed:
         m._stamp_board_lookup(name, True)
@@ -15817,15 +15817,15 @@ def test_warm_radar_reports_skipped_companies_a_failed_probe_is_not_a_miss(monke
     assert len(h.http) == 6  # retried, because an error is not "no public board"
 
 
-def test_warm_radar_reports_skipped_companies_with_zero_scanned_and_batch_cap(monkeypatch):
+def test_warm_radar_reports_skipped_companies_with_zero_scanned_and_whole_queue_drained(monkeypatch):
     names = [f"Company{chr(65 + i // 26)}{chr(65 + i % 26)} Works" for i in range(25)]
     h = _WarmRadarHarness(monkeypatch, names)
     text = h.run()
     assert h.fetched == []
     assert "none of your 25 warm companies" in text
-    assert "checking 20" in text and "5 more queued for the next run" in text
+    assert "checking 25" in text and "queued for the next run" not in text
     assert text.count("Works") <= m.WARM_RADAR_NAME_CAP
-    assert len(h.http) == 20 * 3  # one batch of probes, the remaining 5 wait
+    assert len(h.http) == 25 * 3  # the drain probes all 25 in this one run
 
 
 def test_warm_radar_reports_skipped_companies_escapes_html_in_names(monkeypatch):
@@ -17648,6 +17648,7 @@ def test_warm_radar_scans_boards_in_batches_a_held_back_company_keeps_its_place_
 
 
 def test_warm_radar_scans_boards_in_batches_a_second_run_does_not_reselect_lookups_in_flight(monkeypatch):
+    monkeypatch.setattr(m, "WARM_RADAR_LOOKUP_WORKERS", 1)   # one at a time, so only the first is started
     h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "Globex Systems"])
     started, release, calls, threads = threading.Event(), threading.Event(), [], []
 
@@ -19907,10 +19908,10 @@ def test_warm_lookup_queue_skips_non_employers_and_takes_biggest_first(monkeypat
     looked_up = []
     monkeypatch.setattr(m, "lookup_warm_company_board", lambda company: looked_up.append(company))
     text = h.run()
-    assert len(looked_up) == 20
-    assert set(big) <= set(looked_up)
+    assert len(looked_up) == 22                      # the whole queue drains; no 20-per-run cap
+    assert looked_up[:5] == big or set(looked_up[:5]) == set(big)   # biggest first
     assert not set(skipped) & set(looked_up)
-    assert sum(1 for n in looked_up if n in small) == 15
+    assert sum(1 for n in looked_up if n in small) == 17
     assert "3 skipped as not employers: 2 school" not in text  # kinds are split, not lumped
     assert "3 skipped as not employers: 1 school, 2 church" in text
     assert "Grace Community Church" in text
@@ -20560,3 +20561,166 @@ def test_apify_e2e_no_apify_line_when_unconfigured_or_over_budget_says_so(monkey
         conn.commit()
     text = h.run()
     assert "Apify feed skipped: monthly ceiling reached ($4.00 of $4.00)" in text, text
+
+
+# ---- TASK-168: the board-lookup queue drains from one /w ----
+
+def _drain_rows(spec):
+    """CRM rows for {company: warm contact count}."""
+    rows, i = [], 0
+    for company, n in spec.items():
+        for _ in range(n):
+            rows.append({"company": company, "name": f"Person {i}", "email": f"p{i}@example.com",
+                         "note": "Active relationship", "raw_priority": 5, "sheet_uuid": f"u{i}"})
+            i += 1
+    return rows
+
+
+def _drain_harness(monkeypatch, spec):
+    h = _WarmRadarHarness(monkeypatch, list(spec))
+    rows = _drain_rows(spec)
+    monkeypatch.setattr(m, "crm_post", lambda payload, **kw: _AskResp({"status": "success", "followups": rows}))
+    return h
+
+
+def _attempted(name):
+    with m.get_db_conn() as conn:
+        r = conn.execute("SELECT board_attempted_at FROM company_identities WHERE normalized_name = ?",
+                         (m.normalize_company_for_match(name),)).fetchone()
+    return bool(r and r[0])
+
+
+def _names(prefix, n):
+    return [f"{prefix} Zq{chr(97 + i // 26)}{chr(97 + i % 26)} Works" for i in range(n)]
+
+
+def test_warm_lookup_drain_one_w_looks_up_every_queued_company(monkeypatch):
+    names = _names("Drainone", 45)
+    h = _drain_harness(monkeypatch, {n: 1 for n in names})
+    h.run()
+    assert [n for n in names if not _attempted(n)] == []
+    assert not m._WARM_LOOKUPS_IN_FLIGHT
+
+
+def test_warm_lookup_drain_never_exceeds_the_worker_limit_and_never_repeats_a_company(monkeypatch):
+    names = _names("Drainlim", 30)
+    h = _drain_harness(monkeypatch, {n: 1 for n in names})
+    lock, state, calls = threading.Lock(), {"now": 0, "peak": 0}, []
+
+    def spy(company):
+        with lock:
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+            calls.append(company)
+        time.sleep(0.01)
+        with lock:
+            state["now"] -= 1
+
+    monkeypatch.setattr(m, "lookup_warm_company_board", spy)
+    h.run()
+    assert sorted(calls) == sorted(names) and len(set(calls)) == len(calls)
+    assert 1 <= state["peak"] <= m.WARM_RADAR_LOOKUP_WORKERS
+
+
+def test_warm_lookup_drain_in_progress_does_not_stop_a_second_w_scanning_and_sending(monkeypatch):
+    boards = {"Scanned Alpha": [("Operations Analyst", "Detroit")]}
+    waiting = _names("Drainwait", 6)
+    spec = {"Scanned Alpha": 1, **{n: 1 for n in waiting}}
+    h = _summary_harness(monkeypatch, boards, rows=_drain_rows(spec))
+    started, release, threads, calls = threading.Event(), threading.Event(), [], []
+
+    def blocked(company):
+        calls.append(company)
+        started.set()
+        release.wait(timeout=10)
+
+    monkeypatch.setattr(m, "lookup_warm_company_board", blocked)
+
+    def spawn(fn):
+        t = threading.Thread(target=fn, daemon=True)
+        threads.append(t)
+        t.start()
+
+    monkeypatch.setattr(m, "_spawn_background", spawn)
+    try:
+        h.run()
+        assert started.wait(timeout=10)
+        assert m._WARM_LOOKUPS_IN_FLIGHT == set(waiting)      # the drain is still running
+        h.tracked.clear()
+        before = len(h.rows())
+        text = h.run()                                        # second /w while the drain is blocked
+        assert len(h.rows()) > before, text                   # it scanned its board and wrote a card row
+        assert any("Operations Analyst" in t for _, t in h.posts)
+        assert f"{len(waiting)} more still being checked" in text
+    finally:
+        release.set()
+        for t in threads:
+            t.join(timeout=10)
+    assert not m._WARM_LOOKUPS_IN_FLIGHT
+
+
+def test_warm_lookup_drain_big_company_whose_lookup_errored_goes_before_a_fresh_one_person_company(monkeypatch):
+    monkeypatch.setattr(m, "WARM_RADAR_LOOKUP_WORKERS", 1)
+    big, small = "Drainerr Bigco Works", "Drainerr Solo Works"
+    h = _drain_harness(monkeypatch, {small: 1, big: 30})
+    m._stamp_board_lookup(big, False)                          # an earlier lookup errored
+    assert _attempted(big) and not _attempted(small)
+    order = []
+    monkeypatch.setattr(m, "lookup_warm_company_board", lambda c: order.append(c))
+    h.run()
+    assert order == [big, small]
+
+
+def test_warm_lookup_drain_nobody_under_five_is_looked_up_until_every_five_plus_company_has_finished(monkeypatch):
+    bigs = _names("Drainbig", 8)
+    smalls = _names("Drainsml", 40)
+    spec = {**{n: 5 + i % 3 for i, n in enumerate(bigs)}, **{n: 1 + i % 4 for i, n in enumerate(smalls)}}
+    h = _drain_harness(monkeypatch, spec)
+    m._stamp_board_lookup(bigs[0], False)                      # one big company already errored once
+    lock, finished, violations, calls = threading.Lock(), set(), [], []
+
+    def spy(company):
+        with lock:
+            calls.append(company)
+            if company in smalls and not set(bigs) <= finished:
+                violations.append(company)
+        time.sleep(0.005)
+        with lock:
+            finished.add(company)
+
+    monkeypatch.setattr(m, "lookup_warm_company_board", spy)
+    h.run()
+    assert violations == []
+    assert set(calls[:8]) == set(bigs)
+    assert sorted(calls) == sorted(bigs + smalls)              # and once they are, the rest are
+
+
+def test_warm_lookup_drain_a_company_that_keeps_raising_does_not_hold_the_five_plus_set_open(monkeypatch):
+    bigs, smalls = _names("Drainraise", 3), _names("Drainsmall", 3)
+    h = _drain_harness(monkeypatch, {**{n: 6 for n in bigs}, **{n: 1 for n in smalls}})
+    calls = []
+
+    def spy(company):
+        calls.append(company)
+        if company == bigs[0]:
+            raise RuntimeError("always errors")
+
+    monkeypatch.setattr(m, "lookup_warm_company_board", spy)
+    h.run()
+    assert sorted(calls) == sorted(bigs + smalls) and calls.count(bigs[0]) == 1
+    assert not m._WARM_LOOKUPS_IN_FLIGHT
+
+
+def test_warm_lookup_drain_peak_memory_over_120_companies(monkeypatch):
+    import tracemalloc
+    names = _names("Drainmem", 120)
+    h = _drain_harness(monkeypatch, {n: 1 + i % 7 for i, n in enumerate(names)})
+    monkeypatch.setattr(m, "lookup_warm_company_board", lambda c: None)
+    tracemalloc.start()
+    try:
+        h.run()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    print(f"DRAIN_PEAK_BYTES={peak}")
+    assert peak < 64 * 1024 * 1024

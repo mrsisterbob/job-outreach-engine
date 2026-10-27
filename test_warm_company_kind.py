@@ -38,6 +38,11 @@ def test_warm_lookup_queue_priority_then_key_break_ties():
     assert lookup_order(rows) == ["c", "a", "b"]
 
 
-def test_warm_lookup_queue_attempted_after_every_never_attempted():
+def test_warm_lookup_queue_bigger_attempted_company_beats_smaller_never_attempted():
     rows = [("old", 30, 9, "2026-01-01"), ("new", 1, 1, ""), ("older", 2, 2, "2025-12-01")]
-    assert lookup_order(rows) == ["new", "older", "old"]
+    assert lookup_order(rows) == ["old", "older", "new"]
+
+
+def test_warm_lookup_queue_five_plus_group_comes_before_every_smaller_company():
+    rows = [("tiny", 4, 99, ""), ("five", 5, 0, "2026-01-01"), ("big", 9, 0, "")]
+    assert lookup_order(rows) == ["big", "five", "tiny"]
