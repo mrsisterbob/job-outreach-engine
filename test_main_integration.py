@@ -20770,3 +20770,167 @@ def test_warm_board_system_list_and_switch_off_touch_only_bought_rows():
     assert _board_cols("Own Co") == before_own == ("ownco", None, "greenhouse", "own")
     assert _board_cols("Unrecorded Co") == before_unrec
     assert m.switch_off_bought_boards() == 0
+
+
+# ---- /w closing message reports what Hirebase did, and a second run plans from the stored ledger (TASK-186) ----
+
+def _hb_backdate(company_key, delta):
+    stamp = (m.datetime.now(m.timezone.utc) - delta).isoformat()
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE hirebase_jobs_ledger SET spent_at = ? WHERE company_key = ?", (stamp, company_key))
+        conn.commit()
+
+
+def _hb_month_sum():
+    month = m.datetime.now(m.timezone.utc).strftime("%Y-%m")
+    return sum(r[1] for r in m.hirebase_ledger_read() if r[0][:7] == month)
+
+
+def _hb_set_post(h, monkeypatch, total_extra=None):
+    """Replace the fake post: records the call; total_extra maps slug -> total_count override."""
+    total_extra = total_extra or {}
+
+    class _R:
+        status_code = 200
+        def __init__(self, jobs, total):
+            self.jobs, self.total = jobs, total
+        def json(self):
+            return {"jobs": self.jobs, "total_count": self.total}
+
+    def post(url, **kw):
+        h.posts.append((url, kw))
+        slugs = set(kw["json"]["company_slugs"])
+        rows = [j for j in h.feed if j["company_slug"] in slugs]
+        total = max([total_extra.get(s, 0) for s in slugs] + [len(rows)])
+        return _R(rows, total)
+
+    monkeypatch.setattr(m.requests, "post", post)
+
+
+def test_hirebase_e2e_errored_reads_differently_from_nothing_found(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+
+    def boom(url, **kw):
+        h.posts.append((url, kw))
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    errored = h.run()
+    assert "Hirebase errored for Nopeboard Labs" in errored and "nothing found" not in errored, errored
+    assert "0 companies not searched" in errored and "jobs reserved against the month" in errored
+    h2 = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h2.feed = []
+    empty = h2.run()
+    assert "Searched Hirebase, nothing found for: Nopeboard Labs" in empty, empty
+    assert "errored" not in empty, empty
+
+
+def test_hirebase_e2e_usage_line_reconciles_with_the_ledger(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1),
+              _hirebase_job("Nopeboard Labs", "Business Systems Analyst", 2)]
+    text = h.run()
+    rows = m.hirebase_ledger_read()
+    assert sum(r[1] for r in rows) == 2 == _hb_month_sum()
+    assert ("Hirebase: 1 companies, 2 jobs returned, 2 kept, 2 used this run, 2 of 500 used this month "
+            "(100 held back)") in text, text
+
+
+def test_hirebase_e2e_capped_company_is_named_and_stored_capped(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    _hb_set_post(h, monkeypatch, {"nopeboard-labs": 60})
+    text = h.run()
+    assert "Nopeboard Labs cut off at 25 jobs; the rest are re-requested next run" in text, text
+    assert _hirebase_ledger_rows() == [(1, "capped", "nopeboard labs")]
+
+
+def test_hirebase_e2e_second_run_plans_from_the_stored_ledger(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3, "Capco Labs": 2, "Freshco Labs": 1})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1),
+              _hirebase_job("Capco Labs", "Reporting Analyst", 2)]
+    _hb_set_post(h, monkeypatch, {"capco-labs": 50})
+    first = h.run()
+    assert len(h.posts) == 3, h.posts
+    first_capco = [kw["json"] for _u, kw in h.posts if kw["json"]["company_slugs"][0] == "capco-labs"][0]
+    assert "cut off" in first
+    run1_month = _hb_month_sum()
+    _hb_backdate("nopeboard labs", m.timedelta(days=4, hours=23))
+    _hb_backdate("capco labs", m.timedelta(days=4, hours=23))
+    _hb_backdate("freshco labs", m.timedelta(days=1))
+    h.posts.clear()
+    second = h.run()
+    by_slug = {kw["json"]["company_slugs"][0]: kw["json"] for _u, kw in h.posts}
+    assert "freshco-labs" not in by_slug, "an ok row 1 day old must not be requested"
+    assert by_slug["nopeboard-labs"]["days_ago"] == 6, by_slug
+    assert by_slug["capco-labs"]["days_ago"] == first_capco["days_ago"], (by_slug, first_capco)
+    assert _hb_month_sum() > run1_month
+    assert f"{_hb_month_sum()} of 500 used this month" in second, second
+
+
+def test_hirebase_e2e_second_run_makes_no_second_card_or_ask(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    assert h.cards == ["Operations Analyst"] and len(_asks()) == 1
+    _hb_backdate("nopeboard labs", m.timedelta(days=5))
+    h.posts.clear()
+    h.run()
+    assert len(h.posts) == 1, "the second run must really request the company again"
+    assert h.cards == ["Operations Analyst"], h.cards
+    assert len(_asks()) == 1
+
+
+def test_hirebase_e2e_returned_exceeds_kept_for_sibling_and_out_of_state(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Haworth Inc": 3})
+    good = _hirebase_job("Haworth Inc", "Operations Analyst", 1)
+    sibling = _hirebase_job("Haworth International", "Reporting Analyst", 2)
+    away = _hirebase_job("Haworth Inc", "Business Systems Analyst", 3, region="Florida", city="Orlando")
+    for j in (good, sibling, away):
+        j["company_slug"] = "haworth"
+    h.feed = [good, sibling, away]
+    text = h.run()
+    # The sibling is cut by the feed's own ownership check (returned, not kept); the Florida job is kept by
+    # the feed and dropped by the role screen, which the closing text reports on its own line.
+    assert "3 jobs returned, 2 kept, 3 used this run" in text, text
+    assert "outside Michigan 1" in text, text
+    assert h.cards == ["Operations Analyst"], h.cards
+
+
+def test_hirebase_e2e_key_never_leaks(monkeypatch, caplog):
+    secret = "hbkey-SECRET-9f3a7c"
+    caplog.set_level("DEBUG")
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3, "Smallfry Inc": 1}, key=secret)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    texts = [h.run()]
+
+    def boom(url, **kw):
+        h.posts.append((url, kw))
+        raise RuntimeError("leaky " + kw["headers"]["x-api-key"])
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    _hb_backdate("nopeboard labs", m.timedelta(days=5))
+    _hb_backdate("smallfry inc", m.timedelta(days=5))
+    texts.append(h.run())
+    assert h.posts and all(kw["headers"]["x-api-key"] == secret for _u, kw in h.posts)
+    for url, kw in h.posts:
+        assert secret not in url and secret not in str(kw["json"])
+    assert all(secret not in t for t in texts), texts
+    assert secret not in caplog.text
+    with m.get_db_conn() as conn:
+        assert secret not in str(conn.execute("SELECT * FROM hirebase_jobs_ledger").fetchall())
+
+
+def test_hirebase_e2e_no_key_means_no_hirebase_line_and_budget_skip_line(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, key=None)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    assert "Hirebase" not in h.run()
+    h = _hirebase_hook_harness(monkeypatch)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO hirebase_jobs_ledger (spent_at, jobs, status, company_key) VALUES (?, 400, 'ok', 'other')",
+                     (m.datetime.now(m.timezone.utc).isoformat(),))
+        conn.commit()
+    text = h.run()
+    assert h.posts == []
+    assert "Hirebase skipped: monthly job budget used (400 of 500, 100 held back)" in text, text

@@ -15496,6 +15496,9 @@ def run_warm_radar_scan(chat_id=None):
         hirebase_per_company = []   # (name, status, returned, kept) per company requested
         hirebase_jobs_used_this_run = 0
         hirebase_month_before = 0
+        hirebase_errored_reserved = 0   # jobs reserved against the month by the request that errored
+        hirebase_capped_cos = []        # (name, limit) per company whose rows hit the limit
+        hirebase_err_detail = ""
         hirebase_picked_names = []
         hirebase_hash_to_ids = {}   # job_hash -> hirebase job ids, so only settled roles are marked seen
         if hirebase_key:
@@ -15557,6 +15560,8 @@ def run_warm_radar_scan(chat_id=None):
                         if hirebase_outcome == "errored":
                             hirebase_status = "errored"
                             hirebase_per_company.append((pick_name, "errored", 0, 0))
+                            hirebase_errored_reserved = hirebase_limit
+                            hirebase_err_detail = str(getattr(hirebase_result, "error", "") or "exception")
                             logging.error(f"Warm Radar Hirebase call errored: {getattr(hirebase_result, 'error', 'raised')}")
                             break
                         hirebase_jobs_used_this_run += returned_n
@@ -15565,6 +15570,8 @@ def run_warm_radar_scan(chat_id=None):
                             for stat_key in hirebase_stats:
                                 hirebase_stats[stat_key] += co_stats.get(stat_key, 0)
                             hirebase_per_company.append((pick_name, hirebase_outcome, returned_n, len(kept_jobs)))
+                            if hirebase_outcome == "capped":
+                                hirebase_capped_cos.append((pick_name, hirebase_limit))
                             already = apify_seen_filter([j["job_id"] for j in kept_jobs])
                             for job in kept_jobs:
                                 if job["job_id"] in already:
@@ -15805,6 +15812,33 @@ def run_warm_radar_scan(chat_id=None):
                     names_text, _used = _warm_radar_name_list(jsearch_names, 5)
                     jsearch_line += f" ({names_text})"
                 lines.append(jsearch_line)
+            # Hirebase. The meter is account-wide: Kevin's own Playground use makes the real meter higher than
+            # this line, which counts only what the ledger saw. Errored, nothing found and found never merge.
+            if hirebase_status == "monthly_cap":
+                lines.append(f"Hirebase skipped: monthly job budget used ({hirebase_month_before} of "
+                             f"{hirebase_feed.HIREBASE_MONTHLY_JOBS}, {hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
+            elif hirebase_per_company:
+                hb_rows = hirebase_ledger_read() or []
+                hb_now = datetime.now(timezone.utc)
+                hb_month_used = sum(max(0, int(r[1])) for r in hb_rows
+                                    if str(r[0])[:7] == hb_now.strftime("%Y-%m"))
+                for hb_name, hb_cap in hirebase_capped_cos:
+                    lines.append(f"{html.escape(hb_name)} cut off at {hb_cap} jobs; the rest are re-requested next run")
+                hb_empty = [n for n, st, ret, _k in hirebase_per_company if st == "ok" and ret == 0]
+                if hb_empty:
+                    names_text, _used = _warm_radar_name_list(hb_empty, 5)
+                    lines.append(f"Searched Hirebase, nothing found for: {names_text} (the slug may be wrong or the "
+                                 "company may not be covered; that is not the same as no jobs)")
+                hb_err = [n for n, st, _r, _k in hirebase_per_company if st == "errored"]
+                if hb_err:
+                    hb_unsearched = max(0, len(hirebase_picked_names) - len(hirebase_per_company))
+                    lines.append(f"Hirebase errored for {html.escape(hb_err[0])} ({html.escape(hirebase_err_detail)}); "
+                                 f"{hb_unsearched} companies not searched, retried on a later run; "
+                                 f"{hirebase_errored_reserved} jobs reserved against the month")
+                lines.append(f"Hirebase: {len(hirebase_picked_names)} companies, {hirebase_jobs_used_this_run} jobs returned, "
+                             f"{hirebase_stats['kept']} kept, {hirebase_jobs_used_this_run} used this run, "
+                             f"{hb_month_used} of {hirebase_feed.HIREBASE_MONTHLY_JOBS} used this month "
+                             f"({hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
             if applied_skipped:
                 names_text, _used = _warm_radar_name_list(sorted(applied_skipped), 5)
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
