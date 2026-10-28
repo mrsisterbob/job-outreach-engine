@@ -1,0 +1,29 @@
+---
+id: TASK-232
+scope: main.py, test_main_integration.py
+verify: python -m pytest test_main_integration.py -q -p no:cacheprovider -k "visit_probe_ingest or visit_alert_ingest" 2>&1 | tail -n 1 | grep -E "^(1[2-9]|[2-9][0-9]|[1-9][0-9]{2,}) passed" | grep -Ev "failed|error"
+---
+
+## Target
+A pageview for a path that is not a real site page, posted to `/analytics/ingest`, is stored with bot `"probe"`, raises no "Someone opened" Telegram alert, and shows up in the standup line as a filtered bot hit instead of a visitor. Depends on TASK-205 having merged (it adds the `path` parameter to `visit_bot_flag` and the site-page list).
+
+**Replaces TASK-206**, which the cloud worker built and then BLOCKED because the change necessarily breaks one existing test and the standing rule forbids editing tests. The built work lives only on a container-local branch (`task/TASK-206`) and is not recoverable, so this task carries the whole original target and gives permission for the ONE test edit below.
+
+## Permission to edit exactly one existing test, and why
+Edit **only** `test_visit_alert_ingest_switch_ceiling_batch_and_analytics_off` in `test_main_integration.py` (starts line 13569 on da008fd; find it by name). At line 13578 it ingests `_view(path="/a"), _view(path="/b"), _view(path="/c")` from one visitor and expects 1 alert (`assert len(analytics_env) == 1`). After this task `/a`, `/b` and `/c` are not site pages, so they are probes by design and send 0 alerts (`assert 0 == 1`, observed by the cloud worker). The test is checking the batch-collapse behaviour (three views by one visitor, one alert), not those three strings, so change only the three paths to real site pages taken from the site-page list TASK-205 added (find it by symbol: `grep -n SITE_PAGE_PATHS pipeline_utils.py`; on da008fd it does not exist yet, which is why this depends on 205; use three DIFFERENT real paths such as `"/"`, `"/job-engine"`, `"/lattice"` only if they are in that list). Change nothing else in that test: not the 11-view ceiling, not the env switches, not the two assertions. **No other existing test may change.** If any other existing test fails, do not edit it: block the task and name that test in the Log.
+
+## Proof it is needed
+`python -m pytest test_main_integration.py -q -p no:cacheprovider -k "visit_probe_ingest or visit_alert_ingest"` on 2026-10-28 (main at da008fd): the 8 existing `visit_alert_ingest` tests pass and no `visit_probe_ingest` test exists, so the last line is `8 passed`, which is below the required 12, and the verify exits 1. Pass-regex proven able to pass: `python -m pytest test_apify_feed.py -q` ends `44 passed` and matches. Today `record_site_visits` (main.py, search by name; 19872 on da008fd) calls `visit_bot_flag(ua, ip, self, ignore)` with no path, so a `/.env` view is stored with bot NULL, passes `_VISIT_ALERT_GATE.admit` (`bot is not None` is the only person/bot test) and counts as a visitor in `site_visitor_standup_line` (the 2026-10-28 standup read "111 visitors (24h) · 4 → Job Engine · 28 bot hits filtered").
+
+## Notes
+- The cloud worker's finding, from its Log: with the `path=path` change and 5 new `visit_probe_ingest` tests the verify passed, and `-k "visit or analytics or standup"` gave 1 failed (the test above), 18 passed, 1 skipped. So the production change is one line and the only collateral is that test.
+- One change in `record_site_visits` (main.py:19885-19889 on da008fd): pass the already-stripped `path` to `visit_bot_flag(..., path=path)`. The stored bot column carries it, so the alert gate and the standup both see it with no further change. Do not add a second filter in `_start_visit_alerts`.
+- `path` there is cut at 200 chars after splitting off `?`; classify on that same value. A real page cut at 200 chars cannot happen (all real paths are short).
+- Existing visit tests are around test_main_integration.py:13437-13640 (they call `record_site_visits` and `visit_bot_flag` directly and reset `m._VISIT_ALERT_GATE`; helpers `_view()`, `_ingest()`, `_stored_rows()`, fixture `analytics_env`). Read that range first and reuse their style.
+- **Test the write path, not the return value.** Drive the real route: POST to `/analytics/ingest` with `X-Analytics-Token`, a batch of views, then read `site_visits` back and the text the fake Telegram sender received, then call `site_visitor_standup_line()`. Do not call `visit_bot_flag` and assert on it here (that is TASK-205's test).
+- New tests (`-k visit_probe_ingest`, at least 4; name them `test_visit_probe_ingest_...`): (1) a batch of the probe paths from the 2026-10-28 list plus one real `/` view: stored rows hold `bot='probe'` for the probes and NULL for `/`, and exactly ONE alert is sent (the `/` view); (2) a probe alone sends no alert and stores one row per probe; (3) the standup line after (1) counts the human `/` as 1 visitor and the probes in "bot hits filtered", not in the visitor count; (4) an unchanged real page, `/job-engine?r=abc`, is still a person and still alerts. Also assert the hourly ceiling is not consumed by probes: after 30 probes, a real view still alerts.
+- Dependents now point here: TASK-209, 210 and 211 wait on THIS task (232), not on the blocked TASK-206.
+
+## Log
+- Attempt 1 (built): main.py record_site_visits now passes path=path to visit_bot_flag. Edited only the 3 paths in test_visit_alert_ingest_switch_ceiling_batch_and_analytics_off to "/", "/job-engine", "/lattice" (all in SITE_PAGE_PATHS). Added 5 tests test_visit_probe_ingest_*. Verify exit 0 ("13 passed, 1409 deselected"); full test_main_integration.py: "1421 passed, 1 skipped".
+- Worker re-check: verify exit 0 (13 passed). review skipped: 2 non-test lines. Existing-test edit limited to the one permitted line (_ingest path /a /b /c -> real site pages) of test_visit_alert_ingest_switch_ceiling_batch_and_analytics_off, confirmed from git diff (only removed line). Worktree full-suite gate exit 0.
