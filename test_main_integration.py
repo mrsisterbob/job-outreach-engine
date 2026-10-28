@@ -20373,7 +20373,7 @@ def test_hirebase_store_reserve_then_read_shows_errored_limit():
     assert isinstance(rid, int)
     rows = m.hirebase_ledger_read()
     assert len(rows) == 1
-    assert rows[0][1:] == (10, "errored", "acme")
+    assert rows[0][1:4] == (10, "errored", "acme")
     assert rows[0][0].endswith("+00:00")
 
 
@@ -20383,7 +20383,7 @@ def test_hirebase_store_settle_ok_updates_same_row():
     assert m.hirebase_ledger_settle(rid, 7, "ok") is True
     rows = m.hirebase_ledger_read()
     assert len(rows) == 1
-    assert rows[0][1:] == (7, "ok", "acme")
+    assert rows[0][1:4] == (7, "ok", "acme")
     assert m.hirebase_ledger_settle(rid, 10, "capped") is True
     assert m.hirebase_ledger_read()[0][1:3] == (10, "capped")
 
@@ -20392,7 +20392,7 @@ def test_hirebase_store_settle_errored_keeps_reserved_jobs():
     _hirebase_store_clear()
     rid = m.hirebase_ledger_reserve("acme", 10)
     assert m.hirebase_ledger_settle(rid, 0, "errored") is True
-    assert m.hirebase_ledger_read()[0][1:] == (10, "errored", "acme")
+    assert m.hirebase_ledger_read()[0][1:4] == (10, "errored", "acme")
 
 
 def test_hirebase_store_settle_missing_id_and_bad_status_false():
@@ -21668,3 +21668,119 @@ def test_warm_stage_samples_run_wstages_is_in_help_menu_and_the_help_lookup_answ
     assert ch.lookup_command_help("/wstages") is None   # the bare command is not swallowed by the help handler
     src = open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()
     assert "/wstages - Last /w run" in src
+
+
+# ---- TASK-198: /w stores page + window and fetches the next page of a capped search ----
+
+def _hirebase_cappedrun_setup(monkeypatch, names=None, company="Cappedrun Labs"):
+    """Real run_warm_radar_scan; only requests.post is faked. Page 1 = 25 rows, total_count 38; page 2 = 13 rows."""
+    h = _hirebase_hook_harness(monkeypatch, names or {company: 3})
+    slug = company.lower().replace(" ", "-")
+    all_jobs = [_hirebase_job(company, f"Operations Analyst {i}", i) for i in range(1, 39)]
+
+    class _R:
+        status_code = 200
+        def __init__(self, jobs):
+            self.jobs = jobs
+        def json(self):
+            return {"jobs": self.jobs, "total_count": 38}
+
+    def post(url, **kw):
+        if url.endswith("/companies/search"):
+            return type("_C", (), {"status_code": 200, "json": lambda self: {"companies": []}})()
+        h.posts.append((url, kw))
+        body = kw["json"]
+        if slug not in body["company_slugs"]:
+            return _R([])
+        limit, page = body["limit"], body.get("page", 1)
+        return _R(all_jobs[(page - 1) * limit:(page - 1) * limit + limit])
+
+    monkeypatch.setattr(m.requests, "post", post)
+    return h
+
+
+def _hirebase_cappedrun_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT status, page, days_ago, jobs FROM hirebase_jobs_ledger ORDER BY id").fetchall()
+
+
+def test_hirebase_cappedrun_second_run_requests_page_two_of_the_same_window(monkeypatch):
+    h = _hirebase_cappedrun_setup(monkeypatch)
+    h.run()
+    first = h.posts[0][1]["json"]
+    assert first.get("page", 1) == 1
+    h.posts.clear()
+    h.run()
+    assert len(h.posts) == 1, h.posts
+    second = h.posts[0][1]["json"]
+    assert second["page"] == 2 and second["days_ago"] == first["days_ago"], (first, second)
+    rows = _hirebase_cappedrun_rows()
+    assert [r[0] for r in rows] == ["capped", "ok"], rows
+
+
+def test_hirebase_cappedrun_no_page_three_after_the_last_page_settles_ok(monkeypatch):
+    h = _hirebase_cappedrun_setup(monkeypatch)
+    h.run()
+    h.run()
+    assert len(h.posts) == 2
+    h.posts.clear()
+    _hb_backdate("cappedrun labs", m.timedelta(hours=1))
+    h.run()
+    assert h.posts == [], "page 3 must not be requested and the retry gap must bench the company"
+
+
+def test_hirebase_cappedrun_page_two_after_eight_days_is_a_fresh_window(monkeypatch):
+    h = _hirebase_cappedrun_setup(monkeypatch)
+    h.run()
+    h.posts.clear()
+    _hb_backdate("cappedrun labs", m.timedelta(days=8))
+    h.run()
+    assert len(h.posts) == 1
+    body = h.posts[0][1]["json"]
+    assert body.get("page", 1) == 1, body
+    assert _hirebase_cappedrun_rows()[-1][1] == 1
+
+
+def test_hirebase_cappedrun_ledger_stores_the_page_and_window_actually_sent(monkeypatch):
+    h = _hirebase_cappedrun_setup(monkeypatch)
+    h.run()
+    h.run()
+    sent = [kw["json"] for _u, kw in h.posts]
+    rows = _hirebase_cappedrun_rows()
+    assert [(r[1], r[2]) for r in rows] == [(s.get("page", 1), s["days_ago"]) for s in sent], (rows, sent)
+    assert rows[0][2] > 0 and rows[0][2] == rows[1][2]
+
+
+def test_hirebase_cappedrun_old_schema_table_gains_columns_and_still_runs(monkeypatch):
+    h = _hirebase_cappedrun_setup(monkeypatch)
+    with m.get_db_conn() as conn:
+        conn.execute("DROP TABLE hirebase_jobs_ledger")
+        conn.execute("""CREATE TABLE hirebase_jobs_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, spent_at TEXT NOT NULL, jobs INTEGER NOT NULL,
+            status TEXT NOT NULL, company_key TEXT NOT NULL)""")
+        conn.execute("INSERT INTO hirebase_jobs_ledger (spent_at, jobs, status, company_key) VALUES (?, 3, 'ok', 'other co')",
+                     (m.datetime.now(m.timezone.utc).isoformat(),))
+        conn.commit()
+    m.init_db()
+    with m.get_db_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(hirebase_jobs_ledger)")}
+    assert {"page", "days_ago"} <= cols
+    old = m.hirebase_ledger_read()
+    assert len(old) == 1 and old[0][3] == "other co" and old[0][4] == 1 and old[0][5] == 0, old
+    m.init_db()   # idempotent: a second boot must not raise on the existing columns
+    h.run()
+    assert len(h.posts) == 1
+
+
+def test_hirebase_cappedrun_budget_holds_on_a_second_page(monkeypatch):
+    h = _hirebase_cappedrun_setup(monkeypatch)
+    h.run()
+    h.posts.clear()
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO hirebase_jobs_ledger (spent_at, jobs, status, company_key) VALUES (?, 400, 'ok', 'other')",
+                     (m.datetime.now(m.timezone.utc).isoformat(),))
+        conn.commit()
+    month_used = _hb_month_sum()
+    usable_left = max(0, m.hirebase_feed.HIREBASE_MONTHLY_JOBS - m.hirebase_feed.HIREBASE_RESERVE_JOBS - month_used)
+    h.run()
+    assert sum(kw["json"]["limit"] for _u, kw in h.posts) <= usable_left, (h.posts, usable_left)
