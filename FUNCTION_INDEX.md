@@ -154,6 +154,23 @@ grep -i "contact" FUNCTION_INDEX.md
 | 230 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 245 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
+## `company_source.py` — 12 defs, 202 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 14 | `_s` | Any value as stripped text; None and non-text junk read as blank. |
+| 24 | `_ts` | Aware datetime for an ISO text, or None when blank or unparseable. |
+| 36 | `_newest` | _(no docstring)_ |
+| 45 | `_earliest` | _(no docstring)_ |
+| 54 | `_int` | _(no docstring)_ |
+| 61 | `_identity` | _(no docstring)_ |
+| 69 | `_registry` | _(no docstring)_ |
+| 77 | `_feed` | (job_board, rows, checked_at) or None when nothing usable is recorded. |
+| 87 | `_resolution_rows` | _(no docstring)_ |
+| 104 | `build_source_records` | One dict per company, sorted contacts descending then key ascending. |
+| 176 | `covered_contact_share` | (covered_contacts, total_contacts): sums contacts, never counts records. |
+| 190 | `record_row` | Sheet row in COMPANIES_HEADER order: all text, covered as yes/no, never None. |
+
 ## `hirebase_feed.py` — 25 defs, 600 lines
 
 | Line | Name | Summary |
@@ -1173,4 +1190,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**919 definitions across 47 files + Code.gs.**
+**931 definitions across 48 files + Code.gs.**
