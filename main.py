@@ -33,6 +33,7 @@ import warm_company_kind
 import warm_jsearch_plan
 import apify_feed
 import hirebase_feed
+import hirebase_registry
 import warm_screen_plan
 import warm_michigan
 import role_region
@@ -1411,6 +1412,18 @@ def init_db():
             jobs INTEGER NOT NULL,
             status TEXT NOT NULL,
             company_key TEXT NOT NULL
+        )""")
+        # Hirebase slug registry. STORAGE DECISION: SQLite on the persistent disk (Render mounts
+        # /var/data, JOBS_DB_PATH), beside hirebase_jobs_ledger, plus the checked-in
+        # hirebase_slug_seed.json re-applied at startup so a lost disk cannot lose the measured slugs.
+        # Not a Google Sheet: this is machine-written at volume, and a Sheet round trip per company per
+        # /w would be slow and add another Code.gs/main.py contract with no shared schema.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS hirebase_slug_registry (
+            company_key TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            status TEXT NOT NULL,
+            checked_at TEXT NOT NULL
         )""")
         # Also holds Hirebase job ids: they carry a hirebase_<slug>_ prefix, so they never collide.
         conn.execute("""
@@ -3090,6 +3103,92 @@ def hirebase_ledger_settle(row_id, jobs_returned, status):
         logging.error(f"Hirebase Ledger Settle Error (row {row_id}): {e}")
         return False
 
+def hirebase_registry_read():
+    """Return {company_key: RegistryEntry} for the slug registry, or None on a DB error (the caller
+    then uses no registry and /w behaves as it did before the registry existed)."""
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute("SELECT company_key, slug, status, checked_at FROM hirebase_slug_registry").fetchall()
+        return {r[0]: hirebase_registry.RegistryEntry(r[0], r[1], r[2], r[3]) for r in rows}
+    except Exception as e:
+        logging.error(f"Hirebase Registry Read Error: {type(e).__name__}")
+        return None
+
+def hirebase_registry_upsert(key, slug, status, now=None):
+    """Insert or refresh one registry row. True on success; False (never raises) on a bad status, an
+    empty key, an empty slug for covered/no_jobs, or a DB error."""
+    try:
+        if status not in hirebase_registry.STATUSES or not str(key or "").strip():
+            return False
+        slug = str(slug or "").strip()
+        if status in ("covered", "no_jobs") and not slug:
+            return False
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        with get_db_conn() as conn:
+            conn.execute(
+                "INSERT INTO hirebase_slug_registry (company_key, slug, status, checked_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(company_key) DO UPDATE SET slug = excluded.slug, status = excluded.status, "
+                "checked_at = excluded.checked_at", (str(key), slug, status, now.isoformat()))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Hirebase Registry Upsert Error: {type(e).__name__}")
+        return False
+
+HIREBASE_SLUG_SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hirebase_slug_seed.json")
+
+def hirebase_registry_seed():
+    """INSERT OR IGNORE every entry of hirebase_slug_seed.json: a row a run already learned or
+    refreshed is never overwritten. Returns rows inserted; a missing or bad seed is logged and returns 0."""
+    try:
+        with open(HIREBASE_SLUG_SEED_PATH, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        entries, rejected = hirebase_registry.parse_seed(text, normalize_company_for_match)
+        if rejected:
+            logging.warning(f"Hirebase seed: {rejected} entries rejected")
+        added = 0
+        with get_db_conn() as conn:
+            for e in entries:
+                if not e.key:
+                    continue
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO hirebase_slug_registry (company_key, slug, status, checked_at) VALUES (?, ?, ?, ?)",
+                    (e.key, e.slug, e.status, e.checked_at))
+                added += max(0, cur.rowcount)
+            conn.commit()
+        return added
+    except Exception as e:
+        logging.error(f"Hirebase Registry Seed Error: {type(e).__name__}")
+        return 0
+
+def hirebase_route_candidates(candidates, registry, ledger, now):
+    """Filter the no-board candidates through the slug registry -> (candidates, {key: slug}, unbench_keys).
+    skip is dropped; search_slug keeps the key and maps it to its slug; search_guesses keeps the key.
+    A registry of None routes nothing (every candidate stays, no slug map). unbench_keys: keys whose
+    registry row is strictly newer than that key's newest ledger row AND whose slug is not one the guesses
+    already searched (a slug the ledger never tried)."""
+    if registry is None:
+        return list(candidates), {}, frozenset()
+    newest = {}
+    for ts, _jobs, _status, key in ledger or ():
+        dt = hirebase_feed._plan_ts(ts, now)
+        if key not in newest or dt > newest[key]:
+            newest[key] = dt
+    kept, slug_map, unbench = [], {}, set()
+    for cand in candidates:
+        key = cand[0]
+        route = hirebase_registry.route_company(registry.get(key), now)
+        if route.action == "skip":
+            continue
+        kept.append(cand)
+        if route.action == "search_slug":
+            slug_map[key] = route.slug
+            if (key in newest and route.slug not in hirebase_feed.slug_guesses(cand[1], normalize_company_for_match)
+                    and hirebase_feed._plan_ts(registry[key].checked_at, now) > newest[key]):
+                unbench.add(key)
+    return kept, slug_map, frozenset(unbench)
+
 def apify_seen_filter(job_ids):
     """Return the subset of job_ids already stored. A read error returns an empty set (a repeat card
     beats a lost job)."""
@@ -3688,6 +3787,12 @@ def normalize_company_for_match(company_name):
     company = str(company_name or "").strip().lower()
     company = re.sub(r'\b(inc|llc|ltd|corp|corporation|co|holdings|plc|group)\b\.?', '', company, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', company).strip()
+
+# Startup seed of the Hirebase slug registry. It sits here, not in init_db_or_record(), because the seed keys
+# companies with normalize_company_for_match (defined just above) and init_db_or_record() runs earlier at import.
+# A bad or missing seed is logged inside and never stops startup.
+hirebase_registry_seed()
+
 
 def valid_workday_triple(board):
     """True when `board` is a 'tenant/wdN/site' triple of three non-empty parts (shape only; the
@@ -15314,10 +15419,20 @@ def run_warm_radar_scan(chat_id=None):
         # The real plan is made again under _HIREBASE_LOCK further down. No key: nothing is planned or read.
         hirebase_key = hirebase_feed.get_key(os.environ)
         hirebase_preview = []
+        hirebase_candidates = list(no_board_candidates)   # the registry-filtered list; ALL THREE plan calls use it
+        hirebase_registry_slugs = {}   # key -> registry slug to search exactly
+        hirebase_unbench = frozenset()
         if hirebase_key and no_board_candidates:
             _hirebase_ledger_preview = hirebase_ledger_read()
             if _hirebase_ledger_preview is not None:
-                hirebase_preview = hirebase_feed.plan_hirebase_run(no_board_candidates, _hirebase_ledger_preview, datetime.now(timezone.utc)).picks
+                try:
+                    hirebase_candidates, hirebase_registry_slugs, hirebase_unbench = hirebase_route_candidates(
+                        no_board_candidates, hirebase_registry_read(), _hirebase_ledger_preview, datetime.now(timezone.utc))
+                except Exception as e:
+                    logging.error(f"Warm Radar Hirebase registry routing raised {type(e).__name__}")
+                    hirebase_candidates, hirebase_registry_slugs, hirebase_unbench = list(no_board_candidates), {}, frozenset()
+                hirebase_preview = hirebase_feed.plan_hirebase_run(hirebase_candidates, _hirebase_ledger_preview, datetime.now(timezone.utc),
+                                                                   unbench_keys=hirebase_unbench).picks
         if not slug_to_contact and not wd_to_contact and not jsearch_preview and not hirebase_preview:
             if chat_id:
                 lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm companies has a cached job board yet."]
@@ -15577,7 +15692,8 @@ def run_warm_radar_scan(chat_id=None):
                     if hirebase_ledger_now is None:
                         hirebase_status = "ledger_unreadable"
                     else:
-                        hirebase_plan = hirebase_feed.plan_hirebase_run(no_board_candidates, hirebase_ledger_now, datetime.now(timezone.utc))
+                        hirebase_plan = hirebase_feed.plan_hirebase_run(hirebase_candidates, hirebase_ledger_now, datetime.now(timezone.utc),
+                                                                         unbench_keys=hirebase_unbench)
                         hirebase_month_before = hirebase_plan.month_used
                         if hirebase_plan.skip_reason or not hirebase_plan.picks:
                             hirebase_status = hirebase_plan.skip_reason or "nothing_eligible"
@@ -15598,22 +15714,29 @@ def run_warm_radar_scan(chat_id=None):
                         hirebase_limit = 0
                         hirebase_days = 1
                         hirebase_slugs = []
+                        hirebase_trusted = []
+                        hirebase_ledger_before = []
+                        hirebase_req_now = datetime.now(timezone.utc)
                         try:
                             with _HIREBASE_LOCK:
                                 hirebase_ledger_now = hirebase_ledger_read()
                                 if hirebase_ledger_now is None:
                                     hirebase_status = "ledger_unreadable"
                                     break
-                                hirebase_replan = hirebase_feed.plan_hirebase_run(no_board_candidates, hirebase_ledger_now, datetime.now(timezone.utc))
+                                hirebase_replan = hirebase_feed.plan_hirebase_run(hirebase_candidates, hirebase_ledger_now, datetime.now(timezone.utc),
+                                                                         unbench_keys=hirebase_unbench)
                                 hirebase_mine = [pk for pk in hirebase_replan.picks if pk[0] == pick_key]
                                 if not hirebase_mine:
                                     continue
                                 _k, _n, hirebase_days, hirebase_limit = hirebase_mine[0]
-                                hirebase_row_id = hirebase_ledger_reserve(pick_key, hirebase_limit)
+                                hirebase_ledger_before = list(hirebase_ledger_now)
+                                hirebase_req_now = datetime.now(timezone.utc)
+                                hirebase_row_id = hirebase_ledger_reserve(pick_key, hirebase_limit, now=hirebase_req_now)
                                 if hirebase_row_id is None:
                                     hirebase_status = "reserve_failed"
                                     break
-                            hirebase_slugs = hirebase_feed.slug_guesses(pick_name, normalize_company_for_match)
+                            hirebase_trusted = [hirebase_registry_slugs[pick_key]] if pick_key in hirebase_registry_slugs else []
+                            hirebase_slugs = hirebase_trusted or hirebase_feed.slug_guesses(pick_name, normalize_company_for_match)
                             hirebase_result = hirebase_feed.fetch_company_jobs(
                                 hirebase_feed.build_search_body(hirebase_slugs, hirebase_days, hirebase_limit),
                                 hirebase_key, requests.post)
@@ -15634,17 +15757,33 @@ def run_warm_radar_scan(chat_id=None):
                             break
                         hirebase_jobs_used_this_run += returned_n
                         try:
-                            kept_jobs, co_stats = hirebase_feed.split_jobs(hirebase_result.jobs, pick_name, hirebase_slugs, normalize_company_for_match)
+                            kept_jobs, co_stats = hirebase_feed.split_jobs(hirebase_result.jobs, pick_name, hirebase_slugs, normalize_company_for_match,
+                                                                           trusted_slugs=hirebase_trusted)
                             for stat_key in hirebase_stats:
                                 hirebase_stats[stat_key] += co_stats.get(stat_key, 0)
                             hirebase_per_company.append((pick_name, hirebase_outcome, returned_n, len(kept_jobs)))
                             if hirebase_outcome == "capped":
                                 hirebase_capped_cos.append((pick_name, hirebase_limit))
+                            try:   # what this search learned goes back to the registry; a failure never fails the scan
+                                if kept_jobs:
+                                    _pid = str(kept_jobs[0].get("job_requisition_id") or "")
+                                    _jid = str(kept_jobs[0]["job_id"])[len("hirebase_"):]
+                                    _learned = _jid[:-(len(_pid) + 1)] if _pid and _jid.endswith("_" + _pid) else ""
+                                    if _learned:
+                                        hirebase_registry_upsert(pick_key, _learned, "covered", now=hirebase_req_now)
+                                elif hirebase_trusted and returned_n == 0 and hirebase_feed.first_search_was_empty(
+                                        pick_key, hirebase_ledger_before + [(hirebase_req_now.isoformat(), 0, hirebase_outcome, pick_key)],
+                                        hirebase_req_now):
+                                    hirebase_registry_upsert(pick_key, hirebase_trusted[0], "no_jobs", now=hirebase_req_now)
+                            except Exception as e:
+                                logging.error(f"Warm Radar Hirebase registry write raised {type(e).__name__}")
                             already = apify_seen_filter([j["job_id"] for j in kept_jobs])
                             for job in kept_jobs:
                                 if job["job_id"] in already:
                                     continue
                                 try:
+                                    if hirebase_trusted:   # slug verified against the company: attribute to the warm company's name
+                                        job = dict(job, employer_name=pick_name)
                                     hirebase_hash_to_ids.setdefault(
                                         generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
                                     _collect_posting(job, jsearch_keys=hirebase_picked_keys)

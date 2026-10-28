@@ -329,3 +329,24 @@ def test_hirebase_empty_helper_agrees_with_planner_for_every_shape():
     for led, benched in shapes:
         assert hf.first_search_was_empty("acme", led, NOW) is benched, led
         assert (_picked(led) == []) is benched, led   # inside 3-14 days only the bench holds it back
+
+
+def _slugreg_row(name, slug):
+    return {"job_title": "Analyst", "company_name": name, "company_slug": slug, "platform_job_id": "1",
+            "application_link": "https://x.example/1", "locations": [{"city": "Troy", "region": "Michigan", "country": "United States"}]}
+
+
+def test_hirebase_slugreg_trusted_slug_passes_on_slug_alone_guessed_keeps_name_rule():
+    norm = lambda s: s.lower()   # noqa: E731
+    row = _slugreg_row("Trinity Health System", "trinity-health-system")
+    kept, _ = hf.split_jobs([row], "Trinity Health", ["trinity-health-system"], norm)
+    assert kept == []   # guessed: the strict name rule rejects
+    kept, st = hf.split_jobs([row], "Trinity Health", ["trinity-health-system"], norm, trusted_slugs=["trinity-health-system"])
+    assert len(kept) == 1 and st["kept"] == 1
+
+
+def test_hirebase_slugreg_sibling_slug_fails_even_under_a_trusted_slug():
+    norm = lambda s: s.lower()   # noqa: E731
+    row = _slugreg_row("Haworth International", "haworth-international")
+    kept, st = hf.split_jobs([row], "Haworth", ["haworth"], norm, trusted_slugs=["haworth"])
+    assert kept == [] and st["unmatched"] == 1
