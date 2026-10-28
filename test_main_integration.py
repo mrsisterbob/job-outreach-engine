@@ -21292,3 +21292,74 @@ def test_hirebase_slugreg_unreadable_registry_runs_as_before_and_all_plans_share
     h.posts.clear()
     h.run()   # no registry: Steelcase plans as before this task, with its guessed slug
     assert "steelcase" in _hb_slugs(h) and any("steelcase" in [x[0] for x in c] for c in seen), h.posts
+
+
+def _hirebase_companyledger_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM hirebase_company_ledger")
+        conn.commit()
+
+
+def test_hirebase_companyledger_reserve_then_read():
+    _hirebase_companyledger_clear()
+    rid = m.hirebase_company_ledger_reserve("acme", 2)
+    assert isinstance(rid, int)
+    rows = m.hirebase_company_ledger_read()
+    assert len(rows) == 1 and rows[0][1:] == (2, "errored", "acme")
+
+
+def test_hirebase_companyledger_settle_ok_rows_become_units():
+    _hirebase_companyledger_clear()
+    r1 = m.hirebase_company_ledger_reserve("a", 2)
+    r2 = m.hirebase_company_ledger_reserve("b", 2)
+    assert m.hirebase_company_ledger_settle(r1, "ok", 1) is True
+    assert m.hirebase_company_ledger_settle(r2, "ok", 0) is True
+    rows = m.hirebase_company_ledger_read()
+    assert [r[1:] for r in rows] == [(1, "ok", "a"), (0, "ok", "b")]
+
+
+def test_hirebase_companyledger_settle_errored_keeps_units():
+    _hirebase_companyledger_clear()
+    rid = m.hirebase_company_ledger_reserve("a", 2)
+    assert m.hirebase_company_ledger_settle(rid, "errored", 0) is True
+    assert m.hirebase_company_ledger_read()[0][1:] == (2, "errored", "a")
+    assert m.hirebase_company_ledger_settle(rid, "weird", 1) is False
+    assert m.hirebase_company_ledger_settle(999999, "ok", 1) is False
+
+
+def test_hirebase_companyledger_unsettled_reservation_still_counts():
+    _hirebase_companyledger_clear()
+    m.hirebase_company_ledger_reserve("crashed", 2)
+    rows = m.hirebase_company_ledger_read()
+    assert rows[0][1:3] == (2, "errored")
+    for bad in (0, -1, 2.5, "2", None, True):
+        assert m.hirebase_company_ledger_reserve("x", bad) is None
+    assert len(m.hirebase_company_ledger_read()) == 1
+
+
+def test_hirebase_companyledger_old_rows_not_returned():
+    _hirebase_companyledger_clear()
+    m.hirebase_company_ledger_reserve("old", 2, now=datetime.now(timezone.utc) - timedelta(days=61))
+    m.hirebase_company_ledger_reserve("new", 2)
+    assert [r[3] for r in m.hirebase_company_ledger_read()] == ["new"]
+
+
+def test_hirebase_companyledger_db_error_never_raises(monkeypatch):
+    _hirebase_companyledger_clear()
+    def boom(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    assert m.hirebase_company_ledger_read() is None
+    assert m.hirebase_company_ledger_reserve("a", 2) is None
+    assert m.hirebase_company_ledger_settle(1, "ok", 1) is False
+
+
+def test_hirebase_companyledger_feeds_planner_and_reservation_lowers_usable_left():
+    _hirebase_companyledger_clear()
+    now = datetime.now(timezone.utc)
+    cands = [("zeta", "Zeta", 5)]
+    before = m.hirebase_feed.plan_company_lookups(cands, m.hirebase_company_ledger_read(), now)
+    m.hirebase_company_ledger_reserve("other", 2)
+    after = m.hirebase_feed.plan_company_lookups(cands, m.hirebase_company_ledger_read(), now)
+    assert after.usable_left == before.usable_left - 2
+    assert [p[0] for p in after.picks] == ["zeta"]
