@@ -22198,3 +22198,103 @@ def test_resolution_store_second_init_keeps_rows():
     m.resolution_record("acme", "hirebase", "empty")
     m.init_db()
     assert m.resolution_read()[("acme", "hirebase")][0] == "empty"
+
+
+# ---------------------------------------------------------------------------
+# source_config_read: fresh sheet read, last-seen fallback
+# ---------------------------------------------------------------------------
+
+class _SCResp:
+    def __init__(self, status=200, body=None):
+        self.status_code = status
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def _sc_setup(monkeypatch, reply):
+    """reply: a callable returning a response (or raising). Wipes the six keys; records crm_post."""
+    with m.get_db_conn() as conn:
+        for k in m.SOURCE_CONFIG_KEYS:
+            conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+        conn.commit()
+    posts = []
+    monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: reply())
+    monkeypatch.setattr(m, "crm_post", lambda *a, **k: posts.append(a) or None)
+    return posts
+
+
+def _sc_good(filters):
+    return _SCResp(200, {"status": "success", "filters": filters})
+
+
+def _sc_raise():
+    raise RuntimeError("sheet down")
+
+
+def test_source_config_read_sheet_value_wins(monkeypatch):
+    posts = _sc_setup(monkeypatch, lambda: _sc_good({"source_apify_enabled": False}))
+    cfg, origin = m.source_config_read()
+    assert origin == "sheet" and cfg.apify_enabled is False and cfg.hirebase_enabled is True
+    assert posts == []
+
+
+def test_source_config_read_unreadable_returns_last_seen(monkeypatch):
+    state = {"reply": lambda: _sc_good({"source_apify_enabled": False})}
+    _sc_setup(monkeypatch, lambda: state["reply"]())
+    assert m.source_config_read()[1] == "sheet"
+    bad = [
+        _sc_raise,
+        lambda: _SCResp(500, {"status": "success", "filters": {"source_apify_enabled": True}}),
+        lambda: _SCResp(200, {"status": "error", "filters": {"source_apify_enabled": True}}),
+        lambda: _SCResp(200, {"status": "success", "filters": []}),
+        lambda: None,
+    ]
+    for reply in bad:
+        state["reply"] = reply
+        cfg, origin = m.source_config_read()
+        assert origin == "last seen" and cfg.apify_enabled is False and cfg.apify_on is False
+
+
+def test_source_config_read_never_stored_unreadable_is_defaults(monkeypatch):
+    _sc_setup(monkeypatch, _sc_raise)
+    cfg, origin = m.source_config_read()
+    assert origin == "defaults" and cfg.apify_enabled is True and cfg.hirebase_enabled is True
+
+
+def test_source_config_read_removed_key_returns_to_default(monkeypatch):
+    state = {"reply": lambda: _sc_good({"source_apify_enabled": False, "source_apify_companies_per_run": 2})}
+    _sc_setup(monkeypatch, lambda: state["reply"]())
+    cfg, _ = m.source_config_read()
+    assert cfg.apify_enabled is False and cfg.apify_per_run == 2
+    state["reply"] = lambda: _sc_good({})
+    cfg, origin = m.source_config_read()
+    assert origin == "sheet" and cfg.apify_enabled is True and cfg.apify_per_run != 2
+    state["reply"] = _sc_raise
+    cfg, origin = m.source_config_read()
+    assert origin == "defaults" and cfg.apify_enabled is True
+
+
+def test_source_config_read_bad_value_listed_and_defaulted(monkeypatch):
+    _sc_setup(monkeypatch, lambda: _sc_good({"source_hirebase_enabled": "maybe"}))
+    cfg, origin = m.source_config_read()
+    assert origin == "sheet" and cfg.hirebase_enabled is True
+    assert any("source_hirebase_enabled" in p for p in cfg.problems)
+
+
+def test_source_config_read_stores_locally_without_sheet_write(monkeypatch):
+    posts = _sc_setup(monkeypatch, lambda: _sc_good({"source_apify_monthly_usd": 3}))
+    m.source_config_read()
+    assert m.get_filter("source_apify_monthly_usd", None) == 3
+    assert m.get_filter("source_hirebase_enabled", "absent") == "absent"
+    assert posts == []
+
+
+def test_source_config_read_db_error_does_not_change_result(monkeypatch):
+    _sc_setup(monkeypatch, lambda: _sc_good({"source_apify_enabled": False}))
+    def boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    cfg, origin = m.source_config_read()
+    assert origin == "sheet" and cfg.apify_enabled is False
