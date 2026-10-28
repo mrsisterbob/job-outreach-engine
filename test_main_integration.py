@@ -21784,3 +21784,45 @@ def test_hirebase_cappedrun_budget_holds_on_a_second_page(monkeypatch):
     usable_left = max(0, m.hirebase_feed.HIREBASE_MONTHLY_JOBS - m.hirebase_feed.HIREBASE_RESERVE_JOBS - month_used)
     h.run()
     assert sum(kw["json"]["limit"] for _u, kw in h.posts) <= usable_left, (h.posts, usable_left)
+
+
+# ---- company_feed_source table and helpers (TASK-201) ----
+
+def _feedsource_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_feed_source")
+        conn.commit()
+
+
+def test_feedsource_round_trip_and_upsert_replaces():
+    _feedsource_clear()
+    assert m.feed_source_upsert("acme", "boards.example.com", "greenhouse", 4) is True
+    assert m.feed_source_read()["acme"][:3] == ("boards.example.com", "greenhouse", 4)
+    assert m.feed_source_upsert("acme", "jobs.other.com", "lever", 9) is True
+    got = m.feed_source_read()
+    assert got["acme"][:3] == ("jobs.other.com", "lever", 9) and len(got) == 1
+
+
+def test_feedsource_blank_domain_does_not_erase_and_blank_key_refused():
+    _feedsource_clear()
+    m.feed_source_upsert("acme", "boards.example.com", "greenhouse", 4)
+    assert m.feed_source_upsert("acme", "  ", "", 0) is True
+    assert m.feed_source_read()["acme"][:3] == ("boards.example.com", "", 0)
+    assert m.feed_source_upsert("", "x.com", "b", 1) is False
+    assert m.feed_source_upsert("   ", "x.com", "b", 1) is False
+    assert list(m.feed_source_read()) == ["acme"]
+
+
+def test_feedsource_db_error_read_none_upsert_false(monkeypatch):
+    def boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    assert m.feed_source_read() is None
+    assert m.feed_source_upsert("acme", "a.com", "b", 1) is False
+
+
+def test_feedsource_second_init_keeps_rows():
+    _feedsource_clear()
+    m.feed_source_upsert("acme", "a.com", "greenhouse", 2)
+    m.init_db()
+    assert m.feed_source_read()["acme"][:3] == ("a.com", "greenhouse", 2)
