@@ -523,3 +523,97 @@ def test_hirebase_company_plan_per_run_and_ordering():
 def test_hirebase_company_plan_skip_reasons():
     assert hf.plan_company_lookups([], [], NOW_C).skip_reason == "no candidates"
     assert hf.plan_company_lookups([("a", "A", 1)], [], NOW_C).skip_reason == ""
+
+
+# ---- capped continuation (TASK-197) ----
+def _cap_plan(led, cands=None, **kw):
+    return hf.plan_hirebase_run(cands or [("a", "A", 5)], led, NOW, **kw)
+
+
+def test_hirebase_capped_page_one_row_plans_page_two_with_pinned_days():
+    led = [(_iso(1), 25, "capped", "a", 1, 14)]
+    plan = _cap_plan(led)
+    assert plan.pages == {"a": 2}
+    assert plan.picks[0][:3] == ("a", "A", 14)  # pinned, not recomputed from now
+
+
+def test_hirebase_capped_page_two_row_ends_the_window():
+    led = [(_iso(1), 25, "capped", "a", 1, 14), (_iso(0.5), 25, "capped", "a", 2, 14)]
+    plan = _cap_plan(led)
+    assert plan.picks == [] and plan.skip_reason == "nothing_eligible"  # retry gap applies
+    plan = _cap_plan([(_iso(4), 25, "capped", "a", 2, 14)])
+    assert plan.pages == {}  # no page 3
+    assert plan.picks[0][2] == 5  # next window starts at the capped row's time (4 days + 1)
+
+
+def test_hirebase_capped_older_than_seven_days_is_not_a_continuation():
+    plan = _cap_plan([(_iso(8), 25, "capped", "a", 1, 14)])
+    assert plan.pages == {}
+    assert plan.picks[0][2] == hf.HIREBASE_FIRST_DAYS
+
+
+def test_hirebase_capped_four_tuple_plans_as_today():
+    plan = _cap_plan([(_iso(1), 25, "capped", "a")])
+    assert plan.pages == {} and plan.picks[0][2] == hf.HIREBASE_FIRST_DAYS
+
+
+def test_hirebase_capped_continuation_bounded_by_usable_left():
+    led = [(_iso(1), 25, "capped", "a", 1, 14)]
+    plan = _cap_plan(led, monthly=128, reserve=100)
+    assert plan.picks == [] and plan.skip_reason == "monthly_cap"
+    plan = _cap_plan(led, monthly=100 + 25 + 30, reserve=100)
+    assert plan.picks[0][3] <= plan.usable_left
+    plan = _cap_plan(led, monthly=100 + 25 + 25, reserve=100)
+    assert plan.picks[0][3] == 25 and plan.pages == {"a": 2}
+
+
+def test_hirebase_capped_continuation_skipped_when_full_limit_does_not_fit():
+    led = [(_iso(1), 25, "capped", "a", 1, 14)]
+    plan = _cap_plan(led, monthly=100 + 25 + 8, reserve=100)  # 8 left < 25
+    assert plan.picks == [] and plan.pages == {}  # not page 2 at limit 8, not page 1 again
+
+
+def _rows(n, total, page, limit):
+    jobs = [{"id": i} for i in range(n)]
+    return _Resp(200, {"jobs": jobs, "total_count": total})
+
+
+def test_hirebase_capped_fetch_marks_capped_only_when_rows_remain(monkeypatch):
+    monkeypatch.setattr(hf, "parse_job", lambda j: {"ok": 1})
+    r = hf.fetch_company_jobs({"page": 1, "limit": 25}, KEY, _post(_rows(25, 38, 1, 25)))
+    assert r.capped is True
+    r = hf.fetch_company_jobs({"page": 2, "limit": 25}, KEY, _post(_rows(13, 38, 2, 25)))
+    assert r.capped is False
+    r = hf.fetch_company_jobs({"page": 2, "limit": 25}, KEY, _post(_rows(25, 80, 2, 25)))
+    assert r.capped is True
+    r = hf.fetch_company_jobs({}, KEY, _post(_rows(13, 38, 1, 25)))
+    assert r.capped is True  # no usable page: page 1
+
+
+def test_hirebase_capped_build_search_body_carries_page():
+    assert hf.build_search_body(["a"], 7, 25, page=2)["page"] == 2
+    assert hf.build_search_body(["a"], 7, 25)["page"] == 1
+    for bad in (0, -3, "x", None):
+        assert hf.build_search_body(["a"], 7, 25, page=bad)["page"] == 1
+
+
+def test_hirebase_capped_ok_row_newer_than_capped_is_not_a_continuation():
+    led = [(_iso(2), 25, "capped", "a", 1, 14), (_iso(1), 10, "ok", "a")]
+    plan = _cap_plan(led)
+    assert plan.pages == {} and plan.picks == []  # fresh ok, retry gap
+
+
+def test_hirebase_capped_total_pages_bounded_over_three_rounds(monkeypatch):
+    monkeypatch.setattr(hf, "parse_job", lambda j: {"ok": 1})
+    ledger, requests = [], []
+    for rnd in range(3):
+        now = NOW + timedelta(hours=rnd)
+        plan = hf.plan_hirebase_run([("a", "A", 5)], ledger, now)
+        for key, _n, days, limit in plan.picks:
+            page = plan.pages.get(key, 1)
+            body = hf.build_search_body([key], days, limit, page=page)
+            n = min(limit, 80 - (page - 1) * limit)
+            res = hf.fetch_company_jobs(body, KEY, _post(_rows(n, 80, page, limit)))
+            requests.append(page)
+            ledger.append((now.isoformat(), n, "capped" if res.capped else "ok", key, page, days))
+    assert requests == [1, 2] and len(requests) <= hf.HIREBASE_MAX_PAGES_PER_WINDOW
