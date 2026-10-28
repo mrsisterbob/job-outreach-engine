@@ -890,6 +890,18 @@ grep -i "contact" FUNCTION_INDEX.md
 | ---: | :--- | :--- |
 | 10 | `banned_hits` | Returns the sorted unique banned words/phrases found in text (lowercased); empty if clean. |
 
+## `resolve_plan.py` — 7 defs, 122 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 26 | `_parse` | Aware-UTC datetime from an ISO string or datetime; None when missing or malformed. |
+| 38 | `_weight` | people as an int; None, '' or junk count as 0 so a bad count cannot raise. |
+| 46 | `_heaviest_first` | _(no docstring)_ |
+| 50 | `next_eligible` | ISO date-time when a company may be re-resolved for a source. |
+| 63 | `_in_cooldown` | True when `row` (outcome, attempted_at, next_eligible_at) blocks a new attempt. |
+| 73 | `plan_resolution` | Up to `per_run` (key, display, people) to resolve for `source`, heaviest first. |
+| 96 | `reserve_order` | At most `per_run` (key, display, people), holding slots for unresolved companies. |
+
 ## `response_schema.py` — 4 defs, 46 lines
 
 | Line | Name | Summary |
@@ -1190,4 +1202,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**931 definitions across 48 files + Code.gs.**
+**938 definitions across 49 files + Code.gs.**
