@@ -226,7 +226,7 @@ def test_apify_plan_limit_scales_but_not_below_min():
     assert af.plan_apify_run(_cands(2), [], NOW).limit == 200
     assert af.plan_apify_run(_cands(8), [], NOW).limit == 400
     p = af.plan_apify_run(_cands(8), [], NOW)
-    assert abs(p.worst_case_usd - (0.10 + 0.0025 * 400)) < 1e-9
+    assert abs(p.worst_case_usd - (0.001 + 0.002 * 400)) < 1e-9
 
 
 def test_apify_plan_ok_row_blocks_for_retry_window():
@@ -251,16 +251,16 @@ def test_apify_plan_month_rollover_ignores_last_month():
 
 
 def test_apify_plan_ceiling_too_low_for_min_run():
-    ledger = [(_ago(0), 3.50, "ok", ["x"])]  # room 0.50 < 0.60
+    ledger = [(_ago(0), 9.80, "ok", ["x"])]  # room 0.20 < 0.401
     plan = af.plan_apify_run(_cands(3), ledger, NOW)
     assert plan.picks == [] and plan.skip_reason == "monthly_ceiling"
 
 
 def test_apify_plan_shrinks_picks_to_fit_ceiling():
-    ledger = [(_ago(0), 3.20, "ok", ["x"])]  # room 0.80: 8 picks cost 1.10, 6 picks (300) cost 0.85, 5 (250) 0.725
+    ledger = [(_ago(0), 9.20, "ok", ["x"])]  # room 0.80: 8 picks (400) cost 0.801, 7 picks (350) cost 0.701
     plan = af.plan_apify_run(_cands(8), ledger, NOW)
-    assert len(plan.picks) == 5 and plan.limit == 250
-    assert [k for k, _ in plan.picks] == ["co00", "co01", "co02", "co03", "co04"]
+    assert len(plan.picks) == 7 and plan.limit == 350
+    assert [k for k, _ in plan.picks] == ["co00", "co01", "co02", "co03", "co04", "co05", "co06"]
     assert plan.worst_case_usd <= 0.80 + 1e-9
 
 
@@ -276,5 +276,65 @@ def test_apify_plan_unparseable_usd_spends_whole_ceiling():
 
 
 def test_apify_plan_actual_cost():
-    assert abs(af.actual_cost(0) - 0.10) < 1e-9
-    assert abs(af.actual_cost(200) - 0.60) < 1e-9
+    assert abs(af.actual_cost(0) - 0.001) < 1e-9
+    assert abs(af.actual_cost(200) - 0.401) < 1e-9
+
+
+def test_apify_fallthrough_prices_and_ceiling():
+    assert af.START_FEE_USD == 0.001 and af.PER_JOB_USD == 0.002
+    assert af.APIFY_MONTHLY_CEILING_USD == 10.00
+
+
+def _ft(searched, registry, cands):
+    return af.fallthrough_candidates(cands, searched, registry)
+
+
+C = [("a", "A", []), ("b", "B", []), ("c", "C", []), ("d", "D", []), ("e", "E", []), ("f", "F", [])]
+
+
+def test_apify_fallthrough_searched_zero_ok_and_capped():
+    s = {"a": ("ok", 0, 0), "b": ("capped", 0, 0)}
+    assert _ft(s, {}, C) == [C[0], C[1]]
+
+
+def test_apify_fallthrough_errored_excluded():
+    assert _ft({"a": ("errored", 0, 0)}, {"a": ("", "no_jobs")}, C) == []
+
+
+def test_apify_fallthrough_returned_but_none_kept_excluded():
+    assert _ft({"a": ("ok", 5, 0)}, {}, C) == []
+
+
+def test_apify_fallthrough_registry_no_jobs_and_unknown_empty_slug():
+    r = {"a": ("x", "no_jobs"), "b": ("", "unknown"), "c": ("slug", "unknown"), "d": ("slug", "covered")}
+    assert _ft({}, r, C) == [C[0], C[1]]
+
+
+def test_apify_fallthrough_unsearched_without_registry_row_excluded():
+    assert _ft({}, {}, C) == []
+
+
+def test_apify_fallthrough_order_and_duplicate_key():
+    cands = [C[2], C[0], C[2]]
+    s = {"a": ("ok", 0, 0), "c": ("ok", 0, 0)}
+    assert _ft(s, {}, cands) == [C[2], C[0], C[2]]
+
+
+def test_apify_fallthrough_domain_board():
+    assert af.domain_board("  Acme.MyWorkdayJobs.com ") == "workday"
+    assert af.domain_board("boards.greenhouse.io") == ""
+    assert af.domain_board(None) == ""
+    assert af.domain_board("myworkdayjobs.com") == ""
+
+
+def test_apify_fallthrough_summarize_sources():
+    kept = {"A": [{"apify_source_domain": "z.com"}, {"apify_source_domain": "b.com"},
+                  {"apify_source_domain": "x.myworkdayjobs.com"}, {"apify_source_domain": ""}],
+            "B": [{"apify_source_domain": "x.myworkdayjobs.com"}, {"apify_source_domain": "x.myworkdayjobs.com"},
+                  {"apify_source_domain": "q.com"}],
+            "C": [{}]}
+    out = af.summarize_feed_sources(kept)
+    assert out["A"] == {"source_domain": "b.com", "job_board": "", "rows": 4}
+    assert out["B"] == {"source_domain": "x.myworkdayjobs.com", "job_board": "workday", "rows": 3}
+    assert out["C"] == {"source_domain": "", "job_board": "", "rows": 1}
+    assert af.summarize_feed_sources({}) == {}
