@@ -41,6 +41,7 @@ import warm_stage_samples
 import warm_michigan
 import role_region
 import visit_alert
+import hot_promotion
 from source_config import parse_source_config
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from track_registry import (
@@ -7883,6 +7884,95 @@ def passes_email_prefilter(sender: str, subject: str, snippet: str, internal_dat
 
     return True, ""
 
+def _live_crm_contact(email):
+    """Fresh find_contact_by_email against the live CRM (every tab), never the SQLite cache.
+
+    Returns (live_tab, record): live_tab is the tab name, None when the CRM answered and the
+    person is on no tab, or hot_promotion.LOOKUP_FAILED on no response / non-200 / bad JSON / a
+    found row with no sheet_tab or sheet_uuid. record is the CRM's answer dict ({} otherwise).
+    """
+    res = crm_get({"action": "find_contact_by_email", "email": email})
+    if res is None or getattr(res, "status_code", None) != 200:
+        return hot_promotion.LOOKUP_FAILED, {}
+    try:
+        body = res.json()
+    except Exception:
+        return hot_promotion.LOOKUP_FAILED, {}
+    if not isinstance(body, dict):
+        return hot_promotion.LOOKUP_FAILED, {}
+    if not body.get("found"):
+        return None, {}
+    tab = str(body.get("sheet_tab") or "").strip()
+    if not tab or not str(body.get("sheet_uuid") or "").strip():
+        return hot_promotion.LOOKUP_FAILED, {}
+    return tab, body
+
+
+def promote_to_hot_on_exchange(crm_match, sender, header_list, status_label, subject,
+                               thread_id, access_token, internal_date_ms):
+    """Move a verified CRM contact into Carmen Hot once the thread holds their reply AND a
+    message Kevin sent (Kevin's rule, 2026-10-28). Returns "promoted", "already_hot" or "".
+
+    Callers must NOT run route_inbound_reply_to_crm for "promoted" / "already_hot": its outbox
+    writes (Carmen Cold move, +4 day snooze) drain after the direct writes here and would undo
+    the move. Writes go straight to the CRM (log_to_sheets_crm), not the SQLite outbox that every
+    Render deploy wipes. The decision reads the LIVE tab, so it stays idempotent across polls.
+    """
+    email = hot_promotion.sender_address(sender)
+    headers_lc = {str(h.get("name", "")).lower(): h.get("value", "") for h in (header_list or [])}
+    disqualifier = hot_promotion.sender_disqualifier(
+        sender, [GMAIL_USER or ""], ATS_ROBOT_DOMAINS, hot_promotion.auto_reply_flag(headers_lc))
+    kevin_sent = False
+    if not disqualifier and status_label == "GENERAL":
+        kevin_sent = is_thread_kevin_started(thread_id, access_token)
+    live_tab, live = hot_promotion.LOOKUP_FAILED, {}
+    if not disqualifier and status_label == "GENERAL" and kevin_sent:
+        live_tab, live = _live_crm_contact(email)
+    decision = hot_promotion.decide_promotion(status_label, kevin_sent, live_tab, disqualifier)
+    if decision.action == "none":
+        logging.info(f"[HOT PROMOTE] skip: {decision.reason} ({email or sender})")
+        return "already_hot" if decision.reason == "already_hot" else ""
+    if decision.action != "move":
+        # "create" (person not in the CRM) is TASK-229; a verified sender should not reach it.
+        logging.info(f"[HOT PROMOTE] skip: {decision.reason} ({email})")
+        return ""
+
+    sheet_uuid = str(live.get("sheet_uuid") or "").strip()
+    name = str(live.get("name") or crm_match.get("name") or "").strip() or email
+    company = str(live.get("company") or crm_match.get("company") or "").strip()
+    exchange_date = hot_promotion.exchange_date_from_internal_ms(internal_date_ms, datetime.now().date())
+
+    def _write(payload):
+        return log_to_sheets_crm(payload, max_retries=1, alert_on_exhaustion=False)
+
+    if not _write(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Carmen Hot")):
+        logging.error(f"[HOT PROMOTE] update_status to Carmen Hot failed for {email}; stopping")
+        send_telegram_message(
+            TELEGRAM_CHAT_ID,
+            f"\u26a0\ufe0f Could not move {html.escape(name)} to Hot; /promote by hand.")
+        return ""
+    missing = []
+    for label, payload in (
+        ("status", build_crm_payload("set_status", sheet_uuid=sheet_uuid, status=CARMEN_HOT_DEFAULT_STATUS)),
+        ("next followup", build_crm_payload(
+            "update_snooze", sheet_uuid=sheet_uuid, next_followup=hot_promotion.hot_followup_date(exchange_date))),
+        ("note", build_crm_payload("append_note", sheet_uuid=sheet_uuid, note=hot_promotion.promotion_note(
+            exchange_date, "move", live_tab, subject))),
+    ):
+        if not _write(payload):
+            missing.append(label)
+            logging.error(f"[HOT PROMOTE] {label} write failed for {email} after the move")
+    record_captured_contact(sheet_uuid, "Carmen Hot", name, company, email)
+    log_daily_activity("notes_logged")
+    alert = hot_promotion.promotion_alert_html(
+        name, email, company, "move", live_tab, exchange_date, subject)
+    if missing:
+        alert += f"\n\u26a0\ufe0f Write(s) missing, set by hand: {', '.join(missing)}"
+    send_telegram_message(TELEGRAM_CHAT_ID, alert)
+    logging.info(f"[HOT PROMOTE] moved {email} from {live_tab} to Carmen Hot (missing={missing})")
+    return "promoted"
+
+
 def route_inbound_reply_to_crm(crm_match, status_label, subject, snippet):
     """Carmen Cold is the hot seat: every verified inbound reply gets its follow-up pulled in, and a
     live human conversation additionally gets its contact moved into Carmen Cold with a dated note.
@@ -8554,7 +8644,15 @@ def check_inbound_gmail_replies():
             # the *system* treat the thread as a priority, not a second notification.
             if not is_unverified:
                 try:
-                    route_inbound_reply_to_crm(crm_match, status_label, subject, snippet)
+                    promoted = ""
+                    if str(crm_match.get("sheet_uuid") or "").strip():
+                        promoted = promote_to_hot_on_exchange(
+                            crm_match, sender, header_list, status_label, subject,
+                            thread_id, access_token, internal_date_ms)
+                    # A promoted / already-Hot row must not be routed: the outbox would pull it
+                    # back to Carmen Cold and overwrite the +7 day date.
+                    if not promoted:
+                        route_inbound_reply_to_crm(crm_match, status_label, subject, snippet)
                 except Exception as e:
                     logging.error(f"Inbound Reply CRM Routing Error ({msg_id}): {e}")
 
@@ -11137,11 +11235,11 @@ def promote_job_card_contact(chat_id, token, extra):
     # exact condition /promote's Cold->Hot move is for. Routing via Carmen Cold would need a
     # second command to undo.
     #
-    # next_followup is left BLANK on purpose. Carmen Hot is not in SEQUENCER_SCAN_TABS, so no
-    # automation reads this column here - a ladder date written into it is not a schedule, it is
-    # decoration that looks like a commitment. The column is Kevin's to fill with the actual call
-    # time from Sheets' own date picker, and an empty cell reads as "fill me in" where a wrong
-    # date reads as "already handled".
+    # /promote is now the MANUAL override of the poller's auto-promotion (promote_to_hot_on_exchange,
+    # which moves a contact to Carmen Hot on a two-way Gmail exchange and sets Next Followup to the
+    # exchange date + 7 days). This hand-made row leaves next_followup BLANK: Carmen Hot is not in
+    # SEQUENCER_SCAN_TABS, so nothing auto-sends from it, and the column is Kevin's to fill with
+    # the real call time from Sheets' own date picker.
     payload = build_crm_payload(
         "quick_add",
         target_code="CH",
@@ -19020,11 +19118,13 @@ def process_webhook_payload_async(data):
             # Every write is built first and queued together; Kevin is told "Promoted" only after
             # they are all durably queued (TASK-104).
             move_payloads = [build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=target_tab)]
-            # A promote carries the OUTREACH ladder's date across the move - Beth landed in Carmen
-            # Hot showing 9/24, a nudge date for a conversation that had already happened. Carmen
-            # Hot is not in SEQUENCER_SCAN_TABS, so nothing reads it; blanking it hands the column
-            # to Kevin and Sheets' own date picker for the real call time. /demote keeps its date:
-            # the bench IS a follow-up cadence.
+            # /promote is the MANUAL override of the poller's auto-promotion
+            # (promote_to_hot_on_exchange sets exchange date + 7 days). Done by hand it still
+            # clears the OUTREACH ladder's date - Beth landed in Carmen Hot showing 9/24, a nudge
+            # date for a conversation that had already happened - and leaves the column to Kevin
+            # and Sheets' own date picker for the real call time. Carmen Hot is not in
+            # SEQUENCER_SCAN_TABS, so nothing auto-sends from it. /demote keeps its date: the
+            # bench IS a follow-up cadence.
             if cmd == "promote":
                 move_payloads.append(build_crm_payload("clear_followup", sheet_uuid=sheet_uuid))
                 # "Cold Lead" is false the moment someone replies and starts booking time, and it
