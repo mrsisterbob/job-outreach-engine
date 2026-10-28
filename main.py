@@ -1413,6 +1413,14 @@ def init_db():
             status TEXT NOT NULL,
             company_key TEXT NOT NULL
         )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS hirebase_company_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spent_at TEXT NOT NULL,
+            units INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            company_key TEXT NOT NULL
+        )""")
         # Hirebase slug registry. STORAGE DECISION: SQLite on the persistent disk (Render mounts
         # /var/data, JOBS_DB_PATH), beside hirebase_jobs_ledger, plus the checked-in
         # hirebase_slug_seed.json re-applied at startup so a lost disk cannot lose the measured slugs.
@@ -3101,6 +3109,65 @@ def hirebase_ledger_settle(row_id, jobs_returned, status):
             return cur.rowcount > 0
     except Exception as e:
         logging.error(f"Hirebase Ledger Settle Error (row {row_id}): {e}")
+        return False
+
+def hirebase_company_ledger_read(now=None):
+    """Company Search meter: [(iso_ts, units, status, company_key)] for the trailing 60 days, the
+    shape hirebase_feed.plan_company_lookups takes. None on a DB error (caller makes NO lookup).
+    The cap is decided by the planner, not here."""
+    now = now or datetime.now(timezone.utc)
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    cutoff = (now - timedelta(days=APIFY_LEDGER_KEEP_DAYS)).isoformat()
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT spent_at, units, status, company_key FROM hirebase_company_ledger WHERE spent_at >= ? ORDER BY id",
+                (cutoff,)).fetchall()
+        return [tuple(r) for r in rows]
+    except Exception as e:
+        logging.error(f"Hirebase Company Ledger Read Error: {e}")
+        return None
+
+def hirebase_company_ledger_reserve(key, units, now=None):
+    """Write the spend BEFORE the lookup goes out, as 'errored' (the jobs ledger's reservation word,
+    which the planner counts as spent) so a crash leaves it counted. Insert runs under
+    _HIREBASE_LOCK; the caller must not already hold that lock (it is not reentrant). Returns the
+    row id, or None on a bad units value or a DB error."""
+    if not isinstance(units, int) or isinstance(units, bool) or units <= 0:
+        logging.error(f"Hirebase Company Ledger Reserve rejected units={units!r}")
+        return None
+    try:
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        with _HIREBASE_LOCK:
+            with get_db_conn() as conn:
+                cur = conn.execute(
+                    "INSERT INTO hirebase_company_ledger (spent_at, units, status, company_key) VALUES (?, ?, 'errored', ?)",
+                    (now.isoformat(), units, str(key)))
+                conn.commit()
+                return cur.lastrowid
+    except Exception as e:
+        logging.error(f"Hirebase Company Ledger Reserve Error: {e}")
+        return None
+
+def hirebase_company_ledger_settle(row_id, status, rows_returned):
+    """ok sets units to the rows returned (1 unit per row per the docs, not measured; 0 rows settles
+    to 0). errored keeps the reserved units. Never raises; True if a row changed."""
+    if status not in ("ok", "errored"):
+        return False
+    try:
+        with get_db_conn() as conn:
+            if status == "errored":
+                cur = conn.execute("UPDATE hirebase_company_ledger SET status = ? WHERE id = ?", (status, row_id))
+            else:
+                if not isinstance(rows_returned, int) or isinstance(rows_returned, bool) or rows_returned < 0:
+                    return False
+                cur = conn.execute("UPDATE hirebase_company_ledger SET units = ?, status = ? WHERE id = ?",
+                                   (rows_returned, status, row_id))
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Hirebase Company Ledger Settle Error (row {row_id}): {e}")
         return False
 
 def hirebase_registry_read():
