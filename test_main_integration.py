@@ -22135,3 +22135,66 @@ def test_apify_learn_company_with_zero_rows_writes_nothing(monkeypatch):
     assert len(h.apify_posts) == 1
     assert m.feed_source_read().get(m.normalize_company_for_match("Smallfry Inc")) is None
     assert _apify_learn_stored_triple("Smallfry Inc") == ""
+
+
+# ---- company_resolution table and helpers (TASK-214) ----
+
+def _resolution_store_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
+
+
+def test_resolution_store_round_trip_each_outcome():
+    from datetime import datetime, timezone
+    _resolution_store_clear()
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    for i, outcome in enumerate(("resolved", "empty", "error")):
+        assert m.resolution_record(f"co{i}", "hirebase", outcome, now=now) is True
+    got = m.resolution_read()
+    for i, outcome in enumerate(("resolved", "empty", "error")):
+        assert got[(f"co{i}", "hirebase")] == (outcome, now.isoformat(), m.resolve_plan.next_eligible(outcome, now))
+    assert got[("co0", "hirebase")][2] == "" and got[("co1", "hirebase")][2] != ""
+
+
+def test_resolution_store_same_key_source_replaced_two_sources_two_rows():
+    _resolution_store_clear()
+    m.resolution_record("acme", "hirebase", "error")
+    m.resolution_record("acme", "hirebase", "empty")
+    m.resolution_record("acme", "apify", "empty")
+    got = m.resolution_read()
+    assert len(got) == 2 and got[("acme", "hirebase")][0] == "empty" and ("acme", "apify") in got
+
+
+def test_resolution_store_resolved_survives_empty_and_yields_to_force():
+    _resolution_store_clear()
+    assert m.resolution_record("acme", "hirebase", "resolved") is True
+    assert m.resolution_record("acme", "hirebase", "empty") is False
+    assert m.resolution_record("acme", "hirebase", "error") is False
+    assert m.resolution_read()[("acme", "hirebase")][0] == "resolved"
+    assert m.resolution_record("acme", "hirebase", "empty", force=True) is True
+    assert m.resolution_read()[("acme", "hirebase")][0] == "empty"
+
+
+def test_resolution_store_refuses_blank_key_source_and_unknown_outcome():
+    _resolution_store_clear()
+    assert m.resolution_record("", "hirebase", "empty") is False
+    assert m.resolution_record("   ", "hirebase", "empty") is False
+    assert m.resolution_record("acme", " ", "empty") is False
+    assert m.resolution_record("acme", "hirebase", "bogus") is False
+    assert m.resolution_read() == {}
+
+
+def test_resolution_store_db_error_read_none_record_false(monkeypatch):
+    def boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    assert m.resolution_read() is None
+    assert m.resolution_record("acme", "hirebase", "empty") is False
+
+
+def test_resolution_store_second_init_keeps_rows():
+    _resolution_store_clear()
+    m.resolution_record("acme", "hirebase", "empty")
+    m.init_db()
+    assert m.resolution_read()[("acme", "hirebase")][0] == "empty"
