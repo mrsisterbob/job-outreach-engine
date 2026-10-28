@@ -22298,3 +22298,161 @@ def test_source_config_read_db_error_does_not_change_result(monkeypatch):
     monkeypatch.setattr(m, "get_db_conn", boom)
     cfg, origin = m.source_config_read()
     assert origin == "sheet" and cfg.apify_enabled is False
+
+
+# ---- TASK-219: Companies tab mirror -------------------------------------------------------
+
+class _MirrorResp:
+    def __init__(self, status=200, body=None):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return self._body
+
+
+def _companies_mirror_harness(monkeypatch, companies, reply="ok"):
+    """_WarmRadarHarness plus a recording crm_post/crm_get. `reply` is "ok", None, a (status, body)
+    pair, or a callable(payload) -> that."""
+    h = _WarmRadarHarness(monkeypatch, companies)
+    h.posts_seen, h.gets_seen = [], []
+    base_post = m.crm_post
+
+    def fake_post(payload, **kw):
+        h.posts_seen.append(dict(payload))
+        if payload.get("action") != "replace_companies_tab":
+            return base_post(payload, **kw)
+        r = reply(payload) if callable(reply) else reply
+        if r == "ok":
+            return _MirrorResp(200, {"status": "success", "rows": len(payload["rows"])})
+        if r is None:
+            return None
+        return _MirrorResp(*r)
+
+    monkeypatch.setattr(m, "crm_post", fake_post)
+    monkeypatch.setattr(m, "crm_get", lambda params=None, **kw: h.gets_seen.append(dict(params or {})) or None)
+    h.mirror_posts = lambda: [p for p in h.posts_seen if p.get("action") == "replace_companies_tab"]
+    return h
+
+
+def _mirror_rows_by_key(post):
+    return {r[0]: dict(zip(post["header"], r)) for r in post["rows"]}
+
+
+def test_companies_mirror_one_post_matches_real_stores(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics", "Hireco Labs", "Plain Widgets"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    hk = m.normalize_company_for_match("Hireco Labs")
+    pk = m.normalize_company_for_match("Plain Widgets")
+    assert m.hirebase_registry_upsert(hk, "hireco-labs", "covered")
+    assert m.resolution_record(pk, "apify", "empty")
+    text = h.run()
+    posts = h.mirror_posts()
+    assert len(posts) == 1, [p.get("action") for p in h.posts_seen]
+    assert "Warm Radar" in text or text
+    rows = _mirror_rows_by_key(posts[0])
+    assert rows[m.normalize_company_for_match("Acme Robotics")]["board_token"] == "acmerobotics"
+    assert rows[hk]["covered_by"] == "hirebase" and rows[hk]["covered"] == "yes"
+    assert rows[pk]["covered_by"] == "" and rows[pk]["board_token"] == ""
+    assert rows[pk]["next_eligible_at"] == m.resolution_read()[(pk, "apify")][2] != ""
+
+
+def test_companies_mirror_header_and_row_lengths(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    h.run()
+    (post,) = h.mirror_posts()
+    assert post["header"] == list(m.company_source.COMPANIES_HEADER)
+    assert post["rows"] and all(len(r) == len(post["header"]) for r in post["rows"])
+
+
+def test_companies_mirror_second_run_rewrites_with_new_state(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Plain Widgets"])
+    h.run()
+    pk = m.normalize_company_for_match("Plain Widgets")
+    assert m.resolution_record(pk, "seeded_between_runs", "empty")
+    seeded_next = m.resolution_read()[(pk, "seeded_between_runs")][2]
+    h.run()
+    first, second = h.mirror_posts()
+    assert len(h.mirror_posts()) == 2
+    assert _mirror_rows_by_key(first)[pk]["last_result"] != _mirror_rows_by_key(second)[pk]["last_result"] \
+        or _mirror_rows_by_key(first)[pk]["next_eligible_at"] != _mirror_rows_by_key(second)[pk]["next_eligible_at"] \
+        or seeded_next >= _mirror_rows_by_key(second)[pk]["next_eligible_at"]
+    assert m.hirebase_registry_upsert(pk, "plain-widgets", "covered")
+    h.run()
+    third = h.mirror_posts()[2]
+    assert _mirror_rows_by_key(second)[pk]["covered_by"] == ""
+    assert _mirror_rows_by_key(third)[pk]["covered_by"] == "hirebase"
+
+
+@pytest.mark.parametrize("reply", [
+    None,
+    (500, {"status": "error"}),
+    (200, {"status": "error", "message": "boom"}),
+    (200, {"status": "error", "message": "Invalid action type"}),
+    (200, {"status": "success", "rows": 999}),
+])
+def test_companies_mirror_failures_return_false_and_w_still_closes(monkeypatch, reply):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics"], reply=reply)
+    text = h.run()
+    assert text, "closing message missing"
+    assert len(h.mirror_posts()) == 1
+    assert m.mirror_company_sources([{"key": "k", "display": "K", "contacts": 1}]) is False
+
+
+def test_companies_mirror_success_returns_true(monkeypatch):
+    _companies_mirror_harness(monkeypatch, ["Acme Robotics"])
+    assert m.mirror_company_sources([{"key": "k", "display": "K", "contacts": 1}]) is True
+
+
+@pytest.mark.parametrize("store", ["hirebase_registry_read", "feed_source_read", "resolution_read"])
+def test_companies_mirror_unreadable_store_skips_post(monkeypatch, store):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics"])
+    monkeypatch.setattr(m, store, lambda: None)
+    assert h.run()
+    assert h.mirror_posts() == []
+
+
+def test_companies_mirror_unreadable_identity_read_skips_post(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics"])
+    assert m.warm_radar_source_records({"acme": {"count": 1}}, None, set()) is None
+    assert m._warm_radar_mirror_run({"acme": {"count": 1}}, None, set()) is False
+    assert h.mirror_posts() == []
+
+
+def test_companies_mirror_excludes_non_employers(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics", "Hope College", "Self Employed"])
+    h.run()
+    (post,) = h.mirror_posts()
+    keys = {r[0] for r in post["rows"]}
+    assert m.normalize_company_for_match("Acme Robotics") in keys
+    assert m.normalize_company_for_match("Hope College") not in keys
+
+
+def test_companies_mirror_caps_rows(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, [])
+    recs = [{"key": f"k{i}", "display": f"K{i}", "contacts": 1} for i in range(m.COMPANIES_MIRROR_MAX_ROWS + 3)]
+    assert m.mirror_company_sources(recs) is True
+    (post,) = h.mirror_posts()
+    assert len(post["rows"]) == m.COMPANIES_MIRROR_MAX_ROWS
+
+
+def test_companies_mirror_engine_never_reads_the_tab(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    h.run()
+    others = [p for p in h.posts_seen if p.get("action") != "replace_companies_tab"]
+    assert all("Companies" not in (p.get("tab"), p.get("action")) for p in others + h.gets_seen)
+    assert all(p.get("tab") != "Companies" for p in h.mirror_posts())
+
+
+def test_companies_mirror_code_gs_validates_before_it_touches_the_sheet():
+    src = open("Code.gs", encoding="utf-8").read()
+    start = src.index('action === "replace_companies_tab"')
+    block = src[start:src.index('return respondJSON({ status: "error", message: "Invalid action type" })', start)]
+    assert block.index("Array.isArray(header)") < block.index("clearContents()")
+    assert block.index("rows.length > 5000") < block.index("clearContents()")
+    assert block.index("rows[i].length !== header.length") < block.index("clearContents()")
+    assert 'getSheetByName("Companies")' in block and 'insertSheet("Companies")' in block
+    assert "getOrCreateSheet" not in block and "TAB_MAP" not in block and "formatSheet" not in block
+    assert block.count("setValues(") == 1 and 'setNumberFormat("@")' in block
+    assert block.index('setNumberFormat("@")') < block.index("setValues(")
+    assert "setFrozenRows(1)" in block and 'setFontWeight("bold")' in block
+    assert "status: \"success\", rows: rows.length" in block.replace("'", '"') or "rows: rows.length" in block

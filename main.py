@@ -28,6 +28,7 @@ from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 import resume_engine
 import referral_asks
+import company_source
 import warm_big_companies
 import warm_company_kind
 import warm_jsearch_plan
@@ -15558,6 +15559,77 @@ def _warm_screen_memo_write(job_hashes, outcome):
         return False
 
 
+COMPANIES_MIRROR_MAX_ROWS = 5000
+
+
+def warm_radar_source_records(warm_contacts, identity_rows, excluded_keys, now=None):
+    """The per-company source records for the warm companies (employer-like only), built from the
+    REAL stores, or None when any store read failed (a half-empty tab would look like lost
+    coverage). identity_rows are the company_identities rows /w already read (None = that read
+    failed); the other three stores are read here, once. TASK-220 reuses this."""
+    try:
+        if identity_rows is None:
+            logging.error("Warm Radar source records skipped: identity read failed")
+            return None
+        registry = hirebase_registry_read()
+        feed = feed_source_read()
+        resolution = resolution_read()
+        if registry is None or feed is None or resolution is None:
+            logging.error("Warm Radar source records skipped: a store read failed")
+            return None
+        identities = {}
+        for row in identity_rows:
+            name, slug, workday = row[0], row[1], row[5]
+            workday = str(workday or "").strip()
+            identities[name] = {"ats_slug": slug, "workday_board": workday if valid_workday_triple(workday) else ""}
+        companies = [(k, c.get("raw_company") or k, c.get("count") or 1)
+                     for k, c in warm_contacts.items() if k not in excluded_keys]
+        return company_source.build_source_records(
+            companies, identities, registry, feed, resolution, now or datetime.now(timezone.utc))
+    except Exception as e:
+        logging.error(f"Warm Radar source records error: {type(e).__name__}")
+        return None
+
+
+def mirror_company_sources(records):
+    """One-way mirror of the records to the CRM 'Companies' tab (action replace_companies_tab).
+    True only on HTTP 200 + status success + rows equal to what was sent. Never raises; logs the
+    action and class/status only, never the rows."""
+    action = "replace_companies_tab"
+    try:
+        rows = [company_source.record_row(r) for r in records]
+        if len(rows) > COMPANIES_MIRROR_MAX_ROWS:
+            logging.error(f"CRM mirror {action}: {len(rows)} rows, capped at {COMPANIES_MIRROR_MAX_ROWS}")
+            rows = rows[:COMPANIES_MIRROR_MAX_ROWS]
+        resp = crm_post({"action": action, "header": list(company_source.COMPANIES_HEADER), "rows": rows}, timeout=30)
+        if resp is None:
+            logging.error(f"CRM mirror {action}: no response")
+            return False
+        if resp.status_code != 200:
+            logging.error(f"CRM mirror {action}: HTTP {resp.status_code}")
+            return False
+        body = resp.json()
+        if not isinstance(body, dict) or body.get("status") != "success" or body.get("rows") != len(rows):
+            logging.error(f"CRM mirror {action}: not accepted (status {body.get('status') if isinstance(body, dict) else type(body).__name__})")
+            return False
+        return True
+    except Exception as e:
+        logging.error(f"CRM mirror {action}: {type(e).__name__}")
+        return False
+
+
+def _warm_radar_mirror_run(warm_contacts, identity_rows, excluded_keys):
+    """Build the records once and mirror them. Never raises."""
+    try:
+        records = warm_radar_source_records(warm_contacts, identity_rows, excluded_keys)
+        if records is None:
+            return False
+        return mirror_company_sources(records)
+    except Exception as e:
+        logging.error(f"Warm Radar mirror error: {type(e).__name__}")
+        return False
+
+
 def run_warm_radar_scan(chat_id=None):
     """/w Warm Network Radar: scans ONLY the companies where a Carmen Warm CRM contact already
     exists, screens what it finds with /t's own filter and Gemini, and lists the survivors as /t
@@ -15597,6 +15669,7 @@ def run_warm_radar_scan(chat_id=None):
     # Cache-only slug resolution: every warm company that already has a verified ats_slug row.
     # A warm company without one is no longer silent: it is named in the closing message and,
     # when it looks like a company, queued for a board lookup that runs after that message.
+    identity_read_failed = False
     try:
         with get_db_conn() as conn:
             identity_rows = conn.execute(
@@ -15605,6 +15678,7 @@ def run_warm_radar_scan(chat_id=None):
     except Exception as e:
         logging.error(f"Warm Radar Identity Lookup Error: {e}")
         identity_rows = []
+        identity_read_failed = True
     slug_to_contact = {}
     checked_on = {}
     attempted_at = {}
@@ -15648,6 +15722,7 @@ def run_warm_radar_scan(chat_id=None):
     not_employer_names = []
     contacts_by_bucket = {"scanned": 0, "no_board": 0, "unchecked": 0, "not_company": 0}
     big_rows = []   # (display, contact count, bucket) per company, for the 10+ report; "scanned" = a cached board exists, not "fetched OK this run"
+    not_employer_keys = set()   # not_company + non_employer buckets: no job source to report, left out of the Companies tab
     for key, contact in warm_contacts.items():
         people = contact.get("count") or 1
         if key in scanned_keys:
@@ -15657,12 +15732,14 @@ def run_warm_radar_scan(chat_id=None):
         display = contact.get("raw_company") or key
         if not is_probable_company_name(display):
             not_company += 1  # counted, never probed
+            not_employer_keys.add(key)
             contacts_by_bucket["not_company"] += people
             big_rows.append((display, people, "not_company"))
         elif warm_company_kind.non_employer_kind(display):
             kind = warm_company_kind.non_employer_kind(display)
             not_employer_kinds[kind] = not_employer_kinds.get(kind, 0) + 1
             not_employer_names.append(display)
+            not_employer_keys.add(key)
             contacts_by_bucket["not_company"] += people
             big_rows.append((display, people, "not_company"))
         elif checked_on.get(key, "") > retry_cutoff:
@@ -16582,12 +16659,18 @@ def run_warm_radar_scan(chat_id=None):
         _warm_stage_samples_write(stage_sampler.snapshot())
         return match_count
     finally:
-        if lookup_now:
-            # Must never replace the scan's own exception, or turn a good scan into an error.
-            try:
-                _spawn_background(lambda: _warm_radar_lookup_drain(lookup_phases))
-            except Exception:
-                logging.exception("Warm Radar: could not start the board lookups")
+        # Must never replace the scan's own exception, or turn a good scan into an error. One
+        # background job: the board lookups first (if any), then the Companies-tab mirror, so the
+        # mirror runs after the closing message and reads the stores once.
+        def _warm_radar_after_scan():
+            if lookup_now:
+                _warm_radar_lookup_drain(lookup_phases)
+            _warm_radar_mirror_run(warm_contacts, None if identity_read_failed else identity_rows, not_employer_keys)
+        try:
+            _spawn_background(_warm_radar_after_scan)
+        except Exception:
+            logging.exception("Warm Radar: could not start the background lookups and mirror")
+            if lookup_now:
                 with _WARM_LOOKUPS_LOCK:   # they will never run, so they are not in flight
                     _WARM_LOOKUPS_IN_FLIGHT.difference_update(lookup_now)
 
