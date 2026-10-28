@@ -2,7 +2,8 @@
 
 No I/O, no clock of its own (`now` is passed in), no Telegram, no Flask. The in-memory window is
 modelled on the site's resume_alert.py. The message carries only the time, the page path and the
-referrer host: no IP, user agent or visitor id can reach it.
+referrer host, plus optionally a coarse place, a company name and a contact label: no IP, user agent
+or visitor id can reach it.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ VISIT_ALERT_STALE_SECONDS = 600  # DESIGN CHOICE, not a measurement
 RESUME_PATH_PREFIX = "/resume/"  # DESIGN CHOICE, not a measurement
 _HOUR_SECONDS = 3600
 _PATH_CAP = 100
+_LABEL_CAP = 80
 _OFF_VALUES = ("0", "false", "no", "off")
 
 
@@ -63,14 +65,32 @@ class VisitAlertGate:
             return True, ""
 
 
-def format_visit_alert(when_text, path, referrer):
-    """Telegram HTML text: time, path (cut to 100 chars) and referrer host only."""
+def format_visit_alert(when_text, path, referrer, place=None, org="", who=None):
+    """Telegram HTML text: time, path (cut to 100 chars) and referrer host, plus optional extras.
+
+    place None: no lookup attempted, no line. place "": lookup gave nothing, "location unknown".
+    who: contact label, shown under the title. place/org/who are capped at 80 chars.
+    """
     esc = lambda s: html.escape(str(s or ""), quote=False)
+    cap = lambda s: str(s or "").strip()[:_LABEL_CAP]
     shown = str(path or "/")[:_PATH_CAP]
     host = str(referrer or "").strip()
     via = f"via {esc(host)}" if host else "direct"
-    return (f"👀 <b>Someone opened montelattice.com</b>\n"
-            f"<code>{esc(shown)}</code> · {via}\n{esc(when_text)}")
+    lines = ["👀 <b>Someone opened montelattice.com</b>"]
+    who_text = cap(who)
+    if who_text:
+        lines.append(f"👤 Opened by {esc(who_text)}")
+    lines.append(f"<code>{esc(shown)}</code> · {via}")
+    if place is not None:
+        place_text = cap(place)
+        if place_text:
+            org_text = cap(org)
+            tail = f" · {esc(org_text)}" if org_text else ""
+            lines.append(f"📍 {esc(place_text)}{tail}")
+        else:
+            lines.append("📍 location unknown")
+    lines.append(esc(when_text))
+    return "\n".join(lines)
 
 
 def visit_alerts_enabled(environ):

@@ -35,13 +35,14 @@ import tempfile
 import time
 from collections import Counter
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import warm_export_reader as wer  # noqa: E402
 from board_system_classifier import classify_board_system  # noqa: E402
+from workday_board import board_triple_from_url  # noqa: E402
 from warm_company_domain import corporate_domain, guess_domain  # noqa: E402
 
 UA = "job-outreach-measure/1.0 (read-only careers board survey; contact kjmiller406@gmail.com)"
@@ -50,7 +51,7 @@ PAUSE = 0.7
 CAREERS_PATHS = ("/careers", "/jobs", "/careers/")
 DEFAULT_WARM = "C:/Users/kjmil/Downloads/Job_Outreach_CRM - Carmen Warm.tsv"
 DEFAULT_ALUMNI = "C:/Users/kjmil/Downloads/alumni_master_2026-10-26/PASTE_new.tsv"
-CACHE_NAME = "measure_board_systems_171_v2.json"  # bump the version when measurement logic changes
+CACHE_NAME = "measure_board_systems_171_v3.json"  # bump the version when measurement logic changes
 SYSTEMS = ("greenhouse", "lever", "ashby", "smartrecruiters", "workable", "bamboohr")
 
 
@@ -121,6 +122,28 @@ def _get_url(requests, url, pause):
         return None
 
 
+def _board_url(url):
+    """host + path of the URL that decided the bucket; no scheme, query string or fragment."""
+    try:
+        parts = urlsplit(url)
+        return (parts.hostname or "") + parts.path
+    except ValueError:
+        return ""
+
+
+def _record_vendor(rec, bucket, url):
+    """Set bucket and, for a vendor bucket, where it was found (+ Workday tenant/wdN/site shape).
+
+    workday_triple_shape is a URL shape check only; it does not prove the board answers.
+    """
+    rec["bucket"] = bucket
+    if bucket in ("own_site", "unknown_system"):
+        return
+    rec["board_url"] = _board_url(url)
+    if bucket == "workday":
+        rec["workday_triple_shape"] = board_triple_from_url(url)
+
+
 def _unanswered(r):
     return r is None or r.status_code == 429 or r.status_code >= 500
 
@@ -167,7 +190,7 @@ def measure(requests, entry, slug, pause):
             # a redirect straight onto a vendor host is evidence by itself, whatever it then answers
             via_host = classify_board_system(loc, "")
             if via_host not in ("unknown", "own_site"):
-                rec["bucket"] = via_host
+                _record_vendor(rec, via_host, loc)
                 return rec
             if budget <= 0:
                 continue
@@ -179,8 +202,9 @@ def measure(requests, entry, slug, pause):
                     no_answer.append("careers")
                 continue
         if r.status_code == 200 and isinstance(r.text, str):
-            system = classify_board_system(getattr(r, "url", None) or url, r.text)
-            rec["bucket"] = "unknown_system" if system == "unknown" else system
+            final = getattr(r, "url", None) or url
+            system = classify_board_system(final, r.text)
+            _record_vendor(rec, "unknown_system" if system == "unknown" else system, final)
             return rec
     return rec
 
@@ -221,6 +245,8 @@ def report(cache, target, norm):
     counts = Counter(r["bucket"] for r in recs)
     for b, n in counts.most_common():
         print(f"  {b}: {n} ({100 * n / total:.1f}%)")
+    print("workday records with a tenant/wdN/site shape:",
+          sum(1 for r in recs if r.get("workday_triple_shape")))
     print("slug hits per system (a company can hit several):")
     for s in SYSTEMS:
         print(f"  {s}: {sum(1 for r in recs if s in r.get('boards', []))}")

@@ -13575,13 +13575,55 @@ def test_visit_alert_ingest_switch_ceiling_batch_and_analytics_off(analytics_env
     assert len(analytics_env) == 10
     m._VISIT_ALERT_GATE.reset()
     del analytics_env[:]
-    _ingest([_view(path="/a"), _view(path="/b"), _view(path="/c")])
+    _ingest([_view(path="/"), _view(path="/job-engine"), _view(path="/lattice")])
     assert len(analytics_env) == 1
     m._VISIT_ALERT_GATE.reset()
     del analytics_env[:]
     monkeypatch.setenv("ANALYTICS_ENABLED", "false")
     _ingest([_view()])
     assert analytics_env == []
+
+
+_PROBE_PATHS = ["/.env", "/wp-login.php", "/admin", "/.git/config", "/phpmyadmin/index.php"]
+
+
+def test_visit_probe_ingest_probes_stored_as_probe_and_only_real_view_alerts(analytics_env):
+    views = [_view(ip=f"198.51.100.{i}", path=p) for i, p in enumerate(_PROBE_PATHS)]
+    views.append(_view(ip="203.0.113.50", path="/"))
+    assert _ingest(views).get_json()["stored"] == len(views)
+    assert [(r[2], r[5]) for r in _stored_rows()] == [(p, "probe") for p in _PROBE_PATHS] + [("/", None)]
+    assert len(analytics_env) == 1
+
+
+def test_visit_probe_ingest_probe_alone_sends_no_alert_and_is_stored(analytics_env):
+    _ingest([_view(ip=f"198.51.100.{i}", path=p) for i, p in enumerate(_PROBE_PATHS)])
+    assert analytics_env == []
+    rows = _stored_rows()
+    assert len(rows) == len(_PROBE_PATHS)
+    assert {r[5] for r in rows} == {"probe"}
+
+
+def test_visit_probe_ingest_standup_counts_human_as_visitor_and_probes_as_filtered(analytics_env):
+    views = [_view(ip=f"198.51.100.{i}", path=p) for i, p in enumerate(_PROBE_PATHS)]
+    views.append(_view(ip="203.0.113.50", path="/"))
+    _ingest(views)
+    line = m.site_visitor_standup_line()
+    assert "1 visitor (24h)" in line
+    assert f"{len(_PROBE_PATHS)} bot hits filtered" in line
+
+
+def test_visit_probe_ingest_real_page_with_query_is_still_a_person_and_alerts(analytics_env):
+    _ingest([_view(path="/job-engine?r=abc")])
+    rows = _stored_rows()
+    assert [(r[2], r[5]) for r in rows] == [("/job-engine", None)]
+    assert len(analytics_env) == 1
+
+
+def test_visit_probe_ingest_probes_do_not_consume_the_hourly_ceiling(analytics_env):
+    _ingest([_view(ip=f"192.0.2.{i}", path=f"/.env{i}") for i in range(30)])
+    assert analytics_env == []
+    _ingest([_view(ip="203.0.113.60", path="/")])
+    assert len(analytics_env) == 1
 
 
 def test_visit_alert_ingest_old_backlog_view_alerts_nobody(analytics_env):
@@ -21827,3 +21869,1127 @@ def test_feedsource_second_init_keeps_rows():
     m.feed_source_upsert("acme", "a.com", "greenhouse", 2)
     m.init_db()
     assert m.feed_source_read()["acme"][:3] == ("a.com", "greenhouse", 2)
+
+
+# ---- /w calls Apify once for the no-board companies Hirebase could not answer (TASK-202) ----
+
+_APIFY_TEST_TOKEN = "apify_api_SECRETtoken0123456789"
+
+
+def _apify_wire_harness(monkeypatch, nobody=None, token=_APIFY_TEST_TOKEN):
+    h = _hirebase_hook_harness(monkeypatch, nobody if nobody is not None else {"Nopeboard Labs": 3, "Smallfry Inc": 1})
+    if token:
+        monkeypatch.setenv("APIFY_TOKEN", token)
+    else:
+        monkeypatch.delenv("APIFY_TOKEN", raising=False)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM apify_feed_ledger")
+        conn.commit()
+    h.apify_posts, h.apify_rows, h.apify_mode, h.apify_ledger_at_post = [], [], "ok", []
+    hirebase_post = m.requests.post
+
+    class _AResp:
+        def __init__(self, code, body):
+            self.status_code, self._body = code, body
+        def json(self):
+            return self._body
+
+    def router(url, **kw):
+        if "api.apify.com" in url:
+            h.apify_posts.append((url, kw))
+            with m.get_db_conn() as conn:   # the reserve row must already exist when the request goes out
+                h.apify_ledger_at_post.append(conn.execute("SELECT usd, status FROM apify_feed_ledger ORDER BY id").fetchall())
+            if h.apify_mode == "raise":
+                raise RuntimeError("apify down")
+            if h.apify_mode == "500":
+                return _AResp(500, {})
+            return _AResp(200, list(h.apify_rows))
+        return hirebase_post(url, **kw)
+
+    monkeypatch.setattr(m.requests, "post", router)
+    return h
+
+
+def _apify_row(org, title, n, domain=None):
+    compact = org.lower().replace(" ", "")
+    return {"id": f"{compact}{n}", "title": title, "organization": org,
+            "url": f"https://careers.{compact}.com/job/{n}", "locations_derived": ["Troy, Michigan, United States"],
+            "date_posted": (m.datetime.now(m.timezone.utc) - m.timedelta(days=2)).isoformat(),
+            "description_text": "Reconciliation workflows with SQL and reporting.",
+            "source_domain": domain or f"careers.{compact}.com", "organization_url": f"https://www.{compact}.com"}
+
+
+def _apify_ledger():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT usd, status, company_keys FROM apify_feed_ledger ORDER BY id").fetchall()
+
+
+def test_apify_wire_hirebase_empty_company_reaches_apify_once_and_covered_one_does_not(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]   # Hirebase answers Nopeboard, not Smallfry
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    h.run()
+    assert len(h.apify_posts) == 1, h.apify_posts
+    assert h.apify_posts[0][1]["json"]["organizationSearch"] == ["Smallfry Inc"]
+    assert sorted(h.cards) == ["Finance Analyst", "Operations Analyst"], h.cards
+
+
+def test_apify_wire_ledger_row_exists_at_post_and_settles_to_real_cost(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = []
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1), _apify_row("Nopeboard Labs", "Ops Analyst", 2)]
+    h.run()
+    assert len(h.apify_posts) == 1
+    at_post = h.apify_ledger_at_post[0]
+    assert len(at_post) == 1 and at_post[0][1] == "errored" and at_post[0][0] > 0, at_post
+    rows = _apify_ledger()
+    assert len(rows) == 1 and rows[0][1] == "ok", rows
+    assert abs(rows[0][0] - m.apify_feed.actual_cost(2)) < 1e-9, rows
+    assert rows[0][0] < at_post[0][0]
+
+
+@pytest.mark.parametrize("mode", ["raise", "500"])
+def test_apify_wire_failure_completes_scan_marks_nothing_and_ledger_errored(monkeypatch, mode):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = []
+    h.apify_mode = mode
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    text = h.run()
+    assert len(h.apify_posts) == 1 and text, text
+    assert h.cards == []
+    assert m.apify_seen_filter(["apify_smallfryinc1"]) == set()
+    rows = _apify_ledger()
+    assert len(rows) == 1 and rows[0][1] == "errored" and rows[0][0] > 0, rows
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM hirebase_slug_registry WHERE status = 'no_jobs'").fetchone()[0] == 0
+
+
+def test_apify_wire_no_token_makes_no_apify_post_and_run_equals_apify_absent(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, token=None)
+    h.feed = []
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    with_rows = h.run()
+    assert h.apify_posts == [] and _apify_ledger() == [] and h.cards == []
+    h2 = _apify_wire_harness(monkeypatch, token=None)
+    h2.feed = []
+    assert h2.run() == with_rows
+
+
+def test_apify_wire_second_run_neither_resurfaces_seen_role_nor_recalls_apify(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    h.feed = []
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    h.run()
+    assert h.cards == ["Finance Analyst"] and len(h.apify_posts) == 1
+    assert m.apify_seen_filter(["apify_smallfryinc1"]) == {"apify_smallfryinc1"}
+    h.cards.clear()
+    h.run()
+    assert h.cards == [] and len(h.apify_posts) == 1 and len(_apify_ledger()) == 1
+    # Direct retry-window check: even with the company offered again, the ledger blocks a second call.
+    now = m.datetime.now(m.timezone.utc)
+    plan = m.apify_feed.plan_apify_run(
+        [(m.normalize_company_for_match("Smallfry Inc"), "Smallfry Inc", 2)], m.apify_ledger_read(), now)
+    assert plan.picks == [] and plan.skip_reason == "nothing_eligible"
+
+
+def test_apify_wire_hirebase_errored_company_is_not_sent_to_apify(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.apify_rows = [_apify_row("Nopeboard Labs", "Ops Analyst", 1)]
+    router = m.requests.post
+
+    def hb_boom(url, **kw):
+        if "api.apify.com" in url:
+            return router(url, **kw)
+        if url.endswith("/companies/search"):
+            return router(url, **kw)
+        raise RuntimeError("hirebase down")
+
+    monkeypatch.setattr(m.requests, "post", hb_boom)
+    h.run()
+    assert h.apify_posts == [] and _apify_ledger() == [] and h.cards == []
+
+
+def test_apify_wire_token_never_appears_in_logs(monkeypatch, caplog):
+    import logging as _lg
+    caplog.set_level(_lg.DEBUG)
+    for mode in ("ok", "raise", "500"):
+        h = _apify_wire_harness(monkeypatch)
+        h.feed = []
+        h.apify_mode = mode
+        h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+        h.run()
+        assert len(h.apify_posts) == 1
+        assert h.apify_posts[0][1]["headers"]["Authorization"].endswith(_APIFY_TEST_TOKEN)
+    assert _APIFY_TEST_TOKEN not in caplog.text
+
+
+# ---- /w closing message shows Apify spend and the Hirebase vs Apify split (TASK-203) ----
+
+def _apify_closing_run(monkeypatch, rows, mode="ok", nobody=None, token=_APIFY_TEST_TOKEN, feed=None):
+    h = _apify_wire_harness(monkeypatch, nobody, token=token)
+    h.feed = feed if feed is not None else []
+    h.apify_mode = mode
+    h.apify_rows = rows
+    return h, h.run()
+
+
+def test_apify_closing_success_prints_spend_with_exact_dollars_and_ceiling(monkeypatch):
+    rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1), _apify_row("Nopeboard Labs", "Ops Analyst", 2)]
+    _h, text = _apify_closing_run(monkeypatch, rows)
+    spent = m.apify_feed.actual_cost(2)
+    ceiling = m.apify_feed.APIFY_MONTHLY_CEILING_USD
+    assert 0 < spent < 0.01   # under a cent: three decimals so it cannot read $0.00
+    assert f"Apify: 2 companies, 2 rows returned, 2 kept, ${spent:.3f} this run, ${spent:.3f} of ${ceiling:.2f} this month" in text, text
+    assert "ledger saw" in text
+
+
+def test_apify_closing_split_line_counts_hirebase_and_apify_separately(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    text = h.run()
+    assert "Postings collected by source (before screening): Hirebase 1, Apify 1" in text, text
+
+
+def test_apify_closing_error_prints_errored_line_and_no_zero_spend(monkeypatch):
+    _h, text = _apify_closing_run(monkeypatch, [_apify_row("Smallfry Inc", "Finance Analyst", 1)], mode="500")
+    assert "Apify errored (http status 500); 2 companies not searched, retried on a later run; $" in text, text
+    assert "reserved against the month" in text
+    assert "$0.00 this run" not in text and "rows returned" not in text.split("Apify errored")[1]
+    assert _APIFY_TEST_TOKEN not in text
+
+
+def test_apify_closing_zero_rows_says_feed_may_not_cover_not_an_error(monkeypatch):
+    _h, text = _apify_closing_run(monkeypatch, [])
+    # an empty list is a valid ok body, billed at the flat fee
+    assert "Searched Apify, no rows for:" in text and "not the same as no jobs" in text, text
+    assert "Apify errored" not in text
+    assert "0 rows returned" in text
+
+
+def test_apify_closing_no_token_prints_no_apify_line_and_run_completes(monkeypatch):
+    _h, text = _apify_closing_run(monkeypatch, [_apify_row("Smallfry Inc", "Finance Analyst", 1)], token=None)
+    assert text, "the run must complete and send its closing message"
+    assert "Apify" not in text and "not sent to Apify" not in text, text
+
+
+def test_apify_closing_unreadable_ledger_is_not_silent(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = []
+    monkeypatch.setattr(m, "apify_ledger_read", lambda: None)
+    text = h.run()
+    assert "Apify skipped: ledger unreadable, nothing was spent" in text, text
+    assert h.apify_posts == []
+
+
+def test_apify_closing_failed_reserve_is_not_silent(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = []
+    monkeypatch.setattr(m, "apify_ledger_reserve", lambda *a, **k: None)
+    text = h.run()
+    assert "Apify skipped: could not record the spend first, nothing was spent" in text, text
+    assert h.apify_posts == []
+
+
+def test_apify_closing_money_under_a_cent_shows_three_decimals(monkeypatch):
+    monkeypatch.setattr(m.apify_feed, "actual_cost", lambda n: 0.004)
+    _h, text = _apify_closing_run(monkeypatch, [_apify_row("Smallfry Inc", "Finance Analyst", 1)])
+    assert "$0.004 this run" in text, text
+
+
+# ---- /w learns each Apify company's source domain and Workday board (TASK-204) ----
+
+_APIFY_LEARN_WD = "fifththird/wd5/FifthThird_Careers"
+
+
+def _apify_learn_wd_row(org="Smallfry Inc"):
+    row = _apify_row(org, "Finance Analyst", 1, domain="fifththird.wd5.myworkdayjobs.com")
+    row["url"] = "https://fifththird.wd5.myworkdayjobs.com/en-US/FifthThird_Careers/job/Troy-MI/Finance-Analyst_R1"
+    return row
+
+
+def _apify_learn_stored_triple(name):
+    with m.get_db_conn() as conn:
+        r = conn.execute("SELECT workday_board FROM company_identities WHERE normalized_name = ?",
+                         (m.normalize_company_for_match(name),)).fetchone()
+    return (r[0] or "") if r else ""
+
+
+def _apify_learn_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_feed_source")
+        conn.execute("UPDATE company_identities SET workday_board = NULL WHERE normalized_name = ?",
+                     (m.normalize_company_for_match("Smallfry Inc"),))
+        conn.commit()
+
+
+def test_apify_learn_workday_row_is_scanned_free_on_the_next_run(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = [_apify_learn_wd_row()]
+    wd_calls = []
+    monkeypatch.setattr(m, "fetch_workday_jobs", lambda board: wd_calls.append(board) or [])
+    h.run()
+    assert len(h.apify_posts) == 1
+    assert _apify_learn_stored_triple("Smallfry Inc") == _APIFY_LEARN_WD
+    src = m.feed_source_read()[m.normalize_company_for_match("Smallfry Inc")]
+    assert src[:3] == ("fifththird.wd5.myworkdayjobs.com", "workday", 1), src
+    assert wd_calls == []
+    h.run()
+    assert len(h.apify_posts) == 1, "company must not be sent to Apify again"
+    assert wd_calls == [_APIFY_LEARN_WD], wd_calls
+
+
+def test_apify_learn_non_workday_domain_stores_blank_board_and_no_triple(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    h.run()
+    assert len(h.apify_posts) == 1
+    src = m.feed_source_read()[m.normalize_company_for_match("Smallfry Inc")]
+    assert src[0] == "careers.smallfryinc.com" and src[1] == "", src
+    assert _apify_learn_stored_triple("Smallfry Inc") == ""
+
+
+def test_apify_learn_stored_triple_is_not_overwritten(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = [_apify_learn_wd_row()]
+    # Seed a hand-added triple; with a board the company is no longer an Apify candidate, so call
+    # the learn path by pre-seeding after the identity exists but forcing the candidate via the helper.
+    assert m.set_company_workday_board("Smallfry Inc", "hand/wd1/Added")
+    job = {"employer_name": "Smallfry Inc", "job_apply_link": h.apify_rows[0]["url"]}
+    contact = m.get_warm_crm_contacts().get(m.normalize_company_for_match("Smallfry Inc"))
+    assert contact
+    assert m.record_workday_board_from_posting(job, contact) == ""
+    assert _apify_learn_stored_triple("Smallfry Inc") == "hand/wd1/Added"
+
+
+def test_apify_learn_company_with_zero_rows_writes_nothing(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = []
+    h.run()
+    assert len(h.apify_posts) == 1
+    assert m.feed_source_read().get(m.normalize_company_for_match("Smallfry Inc")) is None
+    assert _apify_learn_stored_triple("Smallfry Inc") == ""
+
+
+# ---- company_resolution table and helpers (TASK-214) ----
+
+def _resolution_store_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
+
+
+def test_resolution_store_round_trip_each_outcome():
+    from datetime import datetime, timezone
+    _resolution_store_clear()
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    for i, outcome in enumerate(("resolved", "empty", "error")):
+        assert m.resolution_record(f"co{i}", "hirebase", outcome, now=now) is True
+    got = m.resolution_read()
+    for i, outcome in enumerate(("resolved", "empty", "error")):
+        assert got[(f"co{i}", "hirebase")] == (outcome, now.isoformat(), m.resolve_plan.next_eligible(outcome, now))
+    assert got[("co0", "hirebase")][2] == "" and got[("co1", "hirebase")][2] != ""
+
+
+def test_resolution_store_same_key_source_replaced_two_sources_two_rows():
+    _resolution_store_clear()
+    m.resolution_record("acme", "hirebase", "error")
+    m.resolution_record("acme", "hirebase", "empty")
+    m.resolution_record("acme", "apify", "empty")
+    got = m.resolution_read()
+    assert len(got) == 2 and got[("acme", "hirebase")][0] == "empty" and ("acme", "apify") in got
+
+
+def test_resolution_store_resolved_survives_empty_and_yields_to_force():
+    _resolution_store_clear()
+    assert m.resolution_record("acme", "hirebase", "resolved") is True
+    assert m.resolution_record("acme", "hirebase", "empty") is False
+    assert m.resolution_record("acme", "hirebase", "error") is False
+    assert m.resolution_read()[("acme", "hirebase")][0] == "resolved"
+    assert m.resolution_record("acme", "hirebase", "empty", force=True) is True
+    assert m.resolution_read()[("acme", "hirebase")][0] == "empty"
+
+
+def test_resolution_store_refuses_blank_key_source_and_unknown_outcome():
+    _resolution_store_clear()
+    assert m.resolution_record("", "hirebase", "empty") is False
+    assert m.resolution_record("   ", "hirebase", "empty") is False
+    assert m.resolution_record("acme", " ", "empty") is False
+    assert m.resolution_record("acme", "hirebase", "bogus") is False
+    assert m.resolution_read() == {}
+
+
+def test_resolution_store_db_error_read_none_record_false(monkeypatch):
+    def boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    assert m.resolution_read() is None
+    assert m.resolution_record("acme", "hirebase", "empty") is False
+
+
+def test_resolution_store_second_init_keeps_rows():
+    _resolution_store_clear()
+    m.resolution_record("acme", "hirebase", "empty")
+    m.init_db()
+    assert m.resolution_read()[("acme", "hirebase")][0] == "empty"
+
+
+# ---------------------------------------------------------------------------
+# source_config_read: fresh sheet read, last-seen fallback
+# ---------------------------------------------------------------------------
+
+class _SCResp:
+    def __init__(self, status=200, body=None):
+        self.status_code = status
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def _sc_setup(monkeypatch, reply):
+    """reply: a callable returning a response (or raising). Wipes the six keys; records crm_post."""
+    with m.get_db_conn() as conn:
+        for k in m.SOURCE_CONFIG_KEYS:
+            conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+        conn.commit()
+    posts = []
+    monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: reply())
+    monkeypatch.setattr(m, "crm_post", lambda *a, **k: posts.append(a) or None)
+    return posts
+
+
+def _sc_good(filters):
+    return _SCResp(200, {"status": "success", "filters": filters})
+
+
+def _sc_raise():
+    raise RuntimeError("sheet down")
+
+
+def test_source_config_read_sheet_value_wins(monkeypatch):
+    posts = _sc_setup(monkeypatch, lambda: _sc_good({"source_apify_enabled": False}))
+    cfg, origin = m.source_config_read()
+    assert origin == "sheet" and cfg.apify_enabled is False and cfg.hirebase_enabled is True
+    assert posts == []
+
+
+def test_source_config_read_unreadable_returns_last_seen(monkeypatch):
+    state = {"reply": lambda: _sc_good({"source_apify_enabled": False})}
+    _sc_setup(monkeypatch, lambda: state["reply"]())
+    assert m.source_config_read()[1] == "sheet"
+    bad = [
+        _sc_raise,
+        lambda: _SCResp(500, {"status": "success", "filters": {"source_apify_enabled": True}}),
+        lambda: _SCResp(200, {"status": "error", "filters": {"source_apify_enabled": True}}),
+        lambda: _SCResp(200, {"status": "success", "filters": []}),
+        lambda: None,
+    ]
+    for reply in bad:
+        state["reply"] = reply
+        cfg, origin = m.source_config_read()
+        assert origin == "last seen" and cfg.apify_enabled is False and cfg.apify_on is False
+
+
+def test_source_config_read_never_stored_unreadable_is_defaults(monkeypatch):
+    _sc_setup(monkeypatch, _sc_raise)
+    cfg, origin = m.source_config_read()
+    assert origin == "defaults" and cfg.apify_enabled is True and cfg.hirebase_enabled is True
+
+
+def test_source_config_read_removed_key_returns_to_default(monkeypatch):
+    state = {"reply": lambda: _sc_good({"source_apify_enabled": False, "source_apify_companies_per_run": 2})}
+    _sc_setup(monkeypatch, lambda: state["reply"]())
+    cfg, _ = m.source_config_read()
+    assert cfg.apify_enabled is False and cfg.apify_per_run == 2
+    state["reply"] = lambda: _sc_good({})
+    cfg, origin = m.source_config_read()
+    assert origin == "sheet" and cfg.apify_enabled is True and cfg.apify_per_run != 2
+    state["reply"] = _sc_raise
+    cfg, origin = m.source_config_read()
+    assert origin == "defaults" and cfg.apify_enabled is True
+
+
+def test_source_config_read_bad_value_listed_and_defaulted(monkeypatch):
+    _sc_setup(monkeypatch, lambda: _sc_good({"source_hirebase_enabled": "maybe"}))
+    cfg, origin = m.source_config_read()
+    assert origin == "sheet" and cfg.hirebase_enabled is True
+    assert any("source_hirebase_enabled" in p for p in cfg.problems)
+
+
+def test_source_config_read_stores_locally_without_sheet_write(monkeypatch):
+    posts = _sc_setup(monkeypatch, lambda: _sc_good({"source_apify_monthly_usd": 3}))
+    m.source_config_read()
+    assert m.get_filter("source_apify_monthly_usd", None) == 3
+    assert m.get_filter("source_hirebase_enabled", "absent") == "absent"
+    assert posts == []
+
+
+def test_source_config_read_db_error_does_not_change_result(monkeypatch):
+    _sc_setup(monkeypatch, lambda: _sc_good({"source_apify_enabled": False}))
+    def boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    cfg, origin = m.source_config_read()
+    assert origin == "sheet" and cfg.apify_enabled is False
+
+
+# ---- TASK-219: Companies tab mirror -------------------------------------------------------
+
+class _MirrorResp:
+    def __init__(self, status=200, body=None):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return self._body
+
+
+def _companies_mirror_harness(monkeypatch, companies, reply="ok"):
+    """_WarmRadarHarness plus a recording crm_post/crm_get. `reply` is "ok", None, a (status, body)
+    pair, or a callable(payload) -> that."""
+    h = _WarmRadarHarness(monkeypatch, companies)
+    h.posts_seen, h.gets_seen = [], []
+    base_post = m.crm_post
+
+    def fake_post(payload, **kw):
+        h.posts_seen.append(dict(payload))
+        if payload.get("action") != "replace_companies_tab":
+            return base_post(payload, **kw)
+        r = reply(payload) if callable(reply) else reply
+        if r == "ok":
+            return _MirrorResp(200, {"status": "success", "rows": len(payload["rows"])})
+        if r is None:
+            return None
+        return _MirrorResp(*r)
+
+    monkeypatch.setattr(m, "crm_post", fake_post)
+    monkeypatch.setattr(m, "crm_get", lambda params=None, **kw: h.gets_seen.append(dict(params or {})) or None)
+    h.mirror_posts = lambda: [p for p in h.posts_seen if p.get("action") == "replace_companies_tab"]
+    return h
+
+
+def _mirror_rows_by_key(post):
+    return {r[0]: dict(zip(post["header"], r)) for r in post["rows"]}
+
+
+def test_companies_mirror_one_post_matches_real_stores(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics", "Hireco Labs", "Plain Widgets"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    hk = m.normalize_company_for_match("Hireco Labs")
+    pk = m.normalize_company_for_match("Plain Widgets")
+    assert m.hirebase_registry_upsert(hk, "hireco-labs", "covered")
+    assert m.resolution_record(pk, "apify", "empty")
+    text = h.run()
+    posts = h.mirror_posts()
+    assert len(posts) == 1, [p.get("action") for p in h.posts_seen]
+    assert "Warm Radar" in text or text
+    rows = _mirror_rows_by_key(posts[0])
+    assert rows[m.normalize_company_for_match("Acme Robotics")]["board_token"] == "acmerobotics"
+    assert rows[hk]["covered_by"] == "hirebase" and rows[hk]["covered"] == "yes"
+    assert rows[pk]["covered_by"] == "" and rows[pk]["board_token"] == ""
+    assert rows[pk]["next_eligible_at"] == m.resolution_read()[(pk, "apify")][2] != ""
+
+
+def test_companies_mirror_header_and_row_lengths(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    h.run()
+    (post,) = h.mirror_posts()
+    assert post["header"] == list(m.company_source.COMPANIES_HEADER)
+    assert post["rows"] and all(len(r) == len(post["header"]) for r in post["rows"])
+
+
+def test_companies_mirror_second_run_rewrites_with_new_state(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Plain Widgets"])
+    h.run()
+    pk = m.normalize_company_for_match("Plain Widgets")
+    assert m.resolution_record(pk, "seeded_between_runs", "empty")
+    seeded_next = m.resolution_read()[(pk, "seeded_between_runs")][2]
+    h.run()
+    first, second = h.mirror_posts()
+    assert len(h.mirror_posts()) == 2
+    assert _mirror_rows_by_key(first)[pk]["last_result"] != _mirror_rows_by_key(second)[pk]["last_result"] \
+        or _mirror_rows_by_key(first)[pk]["next_eligible_at"] != _mirror_rows_by_key(second)[pk]["next_eligible_at"] \
+        or seeded_next >= _mirror_rows_by_key(second)[pk]["next_eligible_at"]
+    assert m.hirebase_registry_upsert(pk, "plain-widgets", "covered")
+    h.run()
+    third = h.mirror_posts()[2]
+    assert _mirror_rows_by_key(second)[pk]["covered_by"] == ""
+    assert _mirror_rows_by_key(third)[pk]["covered_by"] == "hirebase"
+
+
+@pytest.mark.parametrize("reply", [
+    None,
+    (500, {"status": "error"}),
+    (200, {"status": "error", "message": "boom"}),
+    (200, {"status": "error", "message": "Invalid action type"}),
+    (200, {"status": "success", "rows": 999}),
+])
+def test_companies_mirror_failures_return_false_and_w_still_closes(monkeypatch, reply):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics"], reply=reply)
+    text = h.run()
+    assert text, "closing message missing"
+    assert len(h.mirror_posts()) == 1
+    assert m.mirror_company_sources([{"key": "k", "display": "K", "contacts": 1}]) is False
+
+
+def test_companies_mirror_success_returns_true(monkeypatch):
+    _companies_mirror_harness(monkeypatch, ["Acme Robotics"])
+    assert m.mirror_company_sources([{"key": "k", "display": "K", "contacts": 1}]) is True
+
+
+@pytest.mark.parametrize("store", ["hirebase_registry_read", "feed_source_read", "resolution_read"])
+def test_companies_mirror_unreadable_store_skips_post(monkeypatch, store):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics"])
+    monkeypatch.setattr(m, store, lambda: None)
+    assert h.run()
+    assert h.mirror_posts() == []
+
+
+def test_companies_mirror_unreadable_identity_read_skips_post(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics"])
+    assert m.warm_radar_source_records({"acme": {"count": 1}}, None, set()) is None
+    assert m._warm_radar_mirror_run({"acme": {"count": 1}}, None, set()) is False
+    assert h.mirror_posts() == []
+
+
+def test_companies_mirror_excludes_non_employers(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics", "Hope College", "Self Employed"])
+    h.run()
+    (post,) = h.mirror_posts()
+    keys = {r[0] for r in post["rows"]}
+    assert m.normalize_company_for_match("Acme Robotics") in keys
+    assert m.normalize_company_for_match("Hope College") not in keys
+
+
+def test_companies_mirror_caps_rows(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, [])
+    recs = [{"key": f"k{i}", "display": f"K{i}", "contacts": 1} for i in range(m.COMPANIES_MIRROR_MAX_ROWS + 3)]
+    assert m.mirror_company_sources(recs) is True
+    (post,) = h.mirror_posts()
+    assert len(post["rows"]) == m.COMPANIES_MIRROR_MAX_ROWS
+
+
+def test_companies_mirror_engine_never_reads_the_tab(monkeypatch):
+    h = _companies_mirror_harness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    h.run()
+    others = [p for p in h.posts_seen if p.get("action") != "replace_companies_tab"]
+    assert all("Companies" not in (p.get("tab"), p.get("action")) for p in others + h.gets_seen)
+    assert all(p.get("tab") != "Companies" for p in h.mirror_posts())
+
+
+def test_companies_mirror_code_gs_validates_before_it_touches_the_sheet():
+    src = open("Code.gs", encoding="utf-8").read()
+    start = src.index('action === "replace_companies_tab"')
+    block = src[start:src.index('return respondJSON({ status: "error", message: "Invalid action type" })', start)]
+    assert block.index("Array.isArray(header)") < block.index("clearContents()")
+    assert block.index("rows.length > 5000") < block.index("clearContents()")
+    assert block.index("rows[i].length !== header.length") < block.index("clearContents()")
+    assert 'getSheetByName("Companies")' in block and 'insertSheet("Companies")' in block
+    assert "getOrCreateSheet" not in block and "TAB_MAP" not in block and "formatSheet" not in block
+    assert block.count("setValues(") == 1 and 'setNumberFormat("@")' in block
+    assert block.index('setNumberFormat("@")') < block.index("setValues(")
+    assert "setFrozenRows(1)" in block and 'setFontWeight("bold")' in block
+    assert "status: \"success\", rows: rows.length" in block.replace("'", '"') or "rows: rows.length" in block
+
+
+# ---- TASK-220: /w closing message share of warm contacts with a working job source ----
+
+def _share_line(text):
+    return next((ln for ln in text.splitlines() if "working job source" in ln or "coverage unavailable" in ln), "")
+
+
+def test_source_share_line_counts_contacts_not_companies(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"] * 40 + ["Globex Systems", "Initech Labs"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    text = h.run()
+    assert "Warm contacts with a working job source: 40 of 42 (95%)" in _share_line(text)
+    assert "1 of 3" not in text
+
+
+def test_source_share_line_hirebase_covered_counts_no_jobs_does_not(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Hireco Labs", "Hireco Labs", "Emptyco Labs"])
+    assert m.hirebase_registry_upsert(m.normalize_company_for_match("Hireco Labs"), "hireco-labs", "covered")
+    assert m.hirebase_registry_upsert(m.normalize_company_for_match("Emptyco Labs"), "emptyco-labs", "no_jobs")
+    assert "working job source: 2 of 3 (67%)" in _share_line(h.run())
+
+
+def test_source_share_line_apify_rows_count_zero_rows_do_not(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Feedco Labs", "Feedco Labs", "Feedco Labs", "Dryco Labs"])
+    assert m.feed_source_upsert(m.normalize_company_for_match("Feedco Labs"), "feedco.com", "apify", 7)
+    assert m.feed_source_upsert(m.normalize_company_for_match("Dryco Labs"), "dryco.com", "apify", 0)
+    assert "working job source: 3 of 4 (75%)" in _share_line(h.run())
+
+
+def test_source_share_line_not_company_raises_total_only(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "cousin", "https://www.linkedin.com/in/someone"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    assert "working job source: 1 of 3 (33%)" in _share_line(h.run())
+
+
+def test_source_share_line_unplaced_contacts_raise_total_only(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "", ""])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    line = _share_line(h.run())
+    unplaced = len(m.get_warm_contacts_without_company())
+    assert unplaced == 2
+    assert f"working job source: 1 of {1 + unplaced} (33%)" in line
+
+
+@pytest.mark.parametrize("store", ["hirebase_registry_read", "feed_source_read", "resolution_read"])
+def test_source_share_line_unreadable_store_prints_unavailable(monkeypatch, store):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    monkeypatch.setattr(m, store, lambda: None)
+    text = h.run()
+    assert "Job-source coverage unavailable this run" in text
+    assert "working job source:" not in text
+
+
+def test_source_share_line_helper_zero_total_prints_nothing():
+    assert m._warm_radar_source_share_line(0, 0) == ""
+    assert m._warm_radar_source_share_line(None, None) == "Job-source coverage unavailable this run"
+
+
+# ---- TASK-228: hot_promote_tracked - a two-way exchange moves a tracked contact to Carmen Hot ----
+
+_HOT_TAB_CODES = {"Carmen Cold": "CC", "Carmen Warm": "CW", "Carmen Hot": "CH", "Tetiana Cold": "TC"}
+_HOT_SENDER = "Dana Lee <dana@acmecorp.com>"
+_HOT_SNIPPET = "Thanks Kevin, good to hear from you. Happy to answer a couple of questions about the team."
+
+
+class _HotWorld(_FakeCarmenSheet):
+    """_FakeCarmenSheet plus the live CRM: find_contact_by_email reads the tabs and crm_post writes
+    land in them (update_status really moves the row), so the poller is judged on where the row
+    ENDS UP. `enqueued` holds only what went through the outbox."""
+
+    def __init__(self, monkeypatch, tab, row_extra=None, tab_hot_uuid=None):
+        super().__init__(monkeypatch, [])
+        self.tabs = {"CC": [], "CW": [], "CH": [], "TC": []}
+        row = _person("dana", "2026-09-01", email="dana@acmecorp.com")
+        row.update({"name": "Dana Lee", "company": "Acme", **(row_extra or {})})
+        self.tabs[_HOT_TAB_CODES[tab]].append(row)
+        self.cached_tab = tab
+        self.enqueued, self.posts, self.recorded = [], [], []
+        self.lookup_mode, self.fail_actions = "ok", set()
+        monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "http://crm.invalid/exec")
+        monkeypatch.setattr(m, "crm_get", self._crm_get)
+        monkeypatch.setattr(m, "crm_post", self._crm_post)
+        monkeypatch.setattr(m, "enqueue_crm_payload", self._enqueue)
+        monkeypatch.setattr(m, "record_captured_contact", lambda *a, **k: self.recorded.append(a))
+        monkeypatch.setattr(m, "GMAIL_USER", "kevin@example.com")
+
+    def _enqueue(self, payload):
+        self.enqueued.append(dict(payload))
+        return self.apply(payload)
+
+    def apply(self, payload):
+        row = self.row(payload["sheet_uuid"])
+        if payload["action"] == "update_status" and row is not None:
+            for rows in self.tabs.values():
+                if row in rows:
+                    rows.remove(row)
+            self.tabs[_HOT_TAB_CODES[payload["new_tab"]]].append(row)
+            self.moves.append((payload["sheet_uuid"], payload["new_tab"]))
+            return True
+        if payload["action"] == "set_status" and row is not None:
+            row["status"] = payload["status"]
+            return True
+        return super().apply(payload) if row is not None else False
+
+    def tab_of(self, sheet_uuid):
+        names = {v: k for k, v in _HOT_TAB_CODES.items()}
+        return next((names[c] for c, rows in self.tabs.items() for r in rows if r["sheet_uuid"] == sheet_uuid), None)
+
+    def count_rows(self):
+        return sum(len(rows) for rows in self.tabs.values())
+
+    def _crm_get(self, params, timeout=10):
+        if params.get("action") != "find_contact_by_email":
+            return _HotResp(200, {"status": "success"})
+        if self.lookup_mode == "none":
+            return None
+        if self.lookup_mode == "500":
+            return _HotResp(500, {})
+        if self.lookup_mode == "badjson":
+            return _HotResp(200, None)
+        for tab, rows in ((n, self.tabs[c]) for n, c in _HOT_TAB_CODES.items()):
+            for r in rows:
+                if r["email"] == params.get("email"):
+                    return _HotResp(200, {"status": "success", "found": True, "sheet_uuid": r["sheet_uuid"],
+                                          "sheet_tab": tab, "name": r["name"], "company": r["company"]})
+        return _HotResp(200, {"status": "success", "found": False})
+
+    def _crm_post(self, payload, timeout=10):
+        self.posts.append(dict(payload))
+        if payload["action"] in self.fail_actions:
+            return _HotResp(200, {"status": "error", "message": "boom"})
+        return _HotResp(200, {"status": "success" if self.apply(payload) else "error", "message": "no row"})
+
+    def crm_lookup(self, sender):
+        row = next((r for rows in self.tabs.values() for r in rows if r["sheet_uuid"] == "dana"), None)
+        if "dana@acmecorp.com" not in sender.lower() or row is None:
+            return None
+        return {"name": "Dana Lee", "company": "Acme", "tab": self.cached_tab, "sheet_uuid": "dana"}
+
+
+class _HotResp:
+    def __init__(self, status_code, body):
+        self.status_code, self._body, self.text = status_code, body, "x"
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+def _hot_poll(monkeypatch, world, snippet=_HOT_SNIPPET, sender=_HOT_SENDER, kevin_sent=True,
+              extra_headers=None, msg_id="hot1", age_seconds=3 * 86400):
+    # A fixed internalDate several days back makes exchange + 7 differ from today + 7; the age
+    # ceiling would otherwise drop a 3-day-old message before it reached the CRM branch.
+    monkeypatch.setattr(m, "INBOUND_ALERT_MAX_AGE_SECONDS", 10 * 86400)
+    msg = _gmail_message(msg_id, sender, "Re: Operations role", snippet,
+                         extra_headers=extra_headers, age_seconds=age_seconds)
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [msg], crm_lookup=world.crm_lookup,
+                                          thread_started=kevin_sent)
+    ms = int(msg["internalDate"])
+    return alerts, datetime.fromtimestamp(ms / 1000).date()
+
+
+def _hot_alerts(alerts):
+    return [a for a in alerts if "is now in Carmen Hot" in a]
+
+
+@pytest.mark.parametrize("tab", ["Carmen Cold", "Carmen Warm", "Tetiana Cold"])
+def test_hot_promote_tracked_two_way_exchange_moves_row_to_hot(monkeypatch, tab):
+    world = _HotWorld(monkeypatch, tab)
+    alerts, exchange = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Hot"
+    assert world.count_rows() == 1  # moved, not duplicated
+    row = world.row("dana")
+    assert row["status"] == m.CARMEN_HOT_DEFAULT_STATUS == "Follow-up Due"
+    assert row["next_followup"] == (exchange + timedelta(days=7)).strftime("%Y-%m-%d")
+    assert row["next_followup"] != (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+    assert m.INBOUND_REPLY_NOTE_MARKER in row["note"]
+    assert len(_hot_alerts(alerts)) == 1 and tab in _hot_alerts(alerts)[0]
+    assert [r[1] for r in world.recorded] == ["Carmen Hot"]
+
+
+def test_hot_promote_tracked_reply_without_kevin_in_thread_moves_nothing(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    alerts, _ = _hot_poll(monkeypatch, world, kevin_sent=False)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not _hot_alerts(alerts)
+    assert not any(p["action"] == "update_status" for p in world.posts)
+
+
+def test_hot_promote_tracked_already_hot_is_left_alone_across_polls(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Hot", row_extra={"status": "Interviewing"})
+    world.cached_tab = "Carmen Cold"  # stale cache still says Cold
+    alerts, _ = _hot_poll(monkeypatch, world)
+    alerts2, _ = _hot_poll(monkeypatch, world)
+    assert not _hot_alerts(alerts) and not _hot_alerts(alerts2)
+    assert world.posts == [] and world.enqueued == []
+    assert world.count_rows() == 1 and len(world.tabs["CH"]) == 1
+    assert world.row("dana")["status"] == "Interviewing"
+
+
+def test_hot_promote_tracked_second_poll_of_a_promoted_message_adds_nothing(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    alerts, _ = _hot_poll(monkeypatch, world)
+    writes = len(world.posts)
+    world.cached_tab = "Carmen Cold"  # cache never caught up (e.g. SQLite wiped by a deploy)
+    alerts2, _ = _hot_poll(monkeypatch, world)
+    assert len(_hot_alerts(alerts)) == 1 and not _hot_alerts(alerts2)
+    assert len(world.posts) == writes
+    assert len(world.tabs["CH"]) == 1 and world.count_rows() == 1
+
+
+def test_hot_promote_tracked_stale_cache_cold_but_live_hot_does_not_move(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Hot")
+    world.cached_tab = "Carmen Cold"
+    alerts, _ = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Hot"
+    assert not _hot_alerts(alerts)
+    assert not any(p["action"] == "update_status" for p in world.posts + world.enqueued)
+
+
+@pytest.mark.parametrize("mode", ["none", "500", "badjson"])
+def test_hot_promote_tracked_failed_live_lookup_writes_nothing(monkeypatch, caplog, mode):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    world.lookup_mode = mode
+    with caplog.at_level("INFO"):
+        alerts, _ = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Cold" and world.count_rows() == 1
+    assert not _hot_alerts(alerts)
+    assert world.posts == []
+    assert "[HOT PROMOTE] skip: lookup_failed" in caplog.text
+
+
+@pytest.mark.parametrize("snippet", [
+    "We would like to schedule an interview with you next Tuesday at 2pm.",
+    "Unfortunately we have decided to move forward with other candidates for this position.",
+])
+def test_hot_promote_tracked_status_events_stay_put(monkeypatch, snippet):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    alerts, _ = _hot_poll(monkeypatch, world, snippet=snippet)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not _hot_alerts(alerts)
+    assert not any(p["action"] == "update_status" for p in world.posts)
+
+
+def test_hot_promote_tracked_move_is_not_undone_and_sequencer_leaves_hot_alone(monkeypatch):
+    world = _HotWorld(monkeypatch, "Tetiana Cold")
+    _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Hot"
+    # route_inbound_reply_to_crm's writes would drain AFTER the direct ones and undo the move.
+    assert not any(p["action"] == "update_status" for p in world.enqueued)
+    assert not any(p["action"] == "update_snooze" for p in world.enqueued)
+    assert world.enqueued == []
+    before = list(world.posts)
+    result = m.run_followup_sequencer(today=date.today() + timedelta(days=60))
+    assert world.enqueued == [] and world.posts == before
+    assert world.tab_of("dana") == "Carmen Hot"
+
+
+def test_hot_promote_tracked_update_status_failure_warns_once_without_success_alert(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    world.fail_actions = {"update_status"}
+    alerts, _ = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not _hot_alerts(alerts)
+    warnings = [a for a in alerts if "Could not move" in a]
+    assert len(warnings) == 1 and "/promote by hand" in warnings[0]
+    assert [p["action"] for p in world.posts] == ["update_status"]  # nothing after the gate failed
+
+
+def test_hot_promote_tracked_later_write_failure_still_alerts_and_names_it(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    world.fail_actions = {"update_snooze"}
+    alerts, _ = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Hot"
+    assert len(_hot_alerts(alerts)) == 1 and "next followup" in _hot_alerts(alerts)[0]
+
+
+@pytest.mark.parametrize("sender,extra", [
+    ("Dana Lee <dana@acmecorp.com>", {"Auto-Submitted": "auto-replied"}),
+    ("Kevin <kevin@example.com>", None),
+])
+def test_hot_promote_tracked_auto_replies_and_own_address_never_promote(monkeypatch, sender, extra):
+    world = _HotWorld(monkeypatch, "Carmen Cold", row_extra={"email": "kevin@example.com"} if "kevin@" in sender else None)
+    alerts, _ = _hot_poll(monkeypatch, world, sender=sender, extra_headers=extra)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not _hot_alerts(alerts)
+
+
+# ---- TASK-229: hot_promote_untracked - an unknown person replying in Kevin's thread gets a Hot row ----
+
+_UNT_SENDER = "Prof Ann Lee <ann.lee@gmail.com>"
+_UNT_TABS = {"Carmen Cold": "CC", "Carmen Warm": "CW", "Carmen Hot": "CH", "Killed": "KD"}
+
+
+class _UntrackedWorld(_HotWorld):
+    """The live CRM with NOBODY in it: find_contact_by_email searches every tab (Killed included)
+    and a quick_add really appends a nine-column row, so the test reads back what Code.gs would."""
+
+    def __init__(self, monkeypatch):
+        super().__init__(monkeypatch, "Carmen Cold")
+        self.tabs = {"CC": [], "CW": [], "CH": [], "KD": [], "TC": []}
+        self.cached = []
+        monkeypatch.setattr(m, "record_captured_contact", lambda *a, **k: self.cached.append(a))
+
+    def seed(self, tab_code, email):
+        self.tabs[tab_code].append({"sheet_uuid": f"seed-{tab_code}", "email": email, "name": "Ann Lee",
+                                    "company": "", "status": "Cold Lead", "next_followup": "", "note": ""})
+
+    def _crm_get(self, params, timeout=10):
+        names = {"CC": "Carmen Cold", "CW": "Carmen Warm", "CH": "Carmen Hot", "KD": "Killed", "TC": "Tetiana Cold"}
+        if params.get("action") != "find_contact_by_email":
+            return _HotResp(200, {"status": "success"})
+        if self.lookup_mode == "none":
+            return None
+        if self.lookup_mode == "500":
+            return _HotResp(500, {})
+        for code, rows in self.tabs.items():
+            for r in rows:
+                if r["email"] == params.get("email"):
+                    return _HotResp(200, {"status": "success", "found": True, "sheet_uuid": r["sheet_uuid"],
+                                          "sheet_tab": names[code], "name": r["name"], "company": r["company"]})
+        return _HotResp(200, {"status": "success", "found": False})
+
+    def _crm_post(self, payload, timeout=10):
+        if payload["action"] != "quick_add":
+            return super()._crm_post(payload, timeout)
+        self.posts.append(dict(payload))
+        if payload["action"] in self.fail_actions:
+            return _HotResp(200, {"status": "error", "message": "boom"})
+        self.tabs[payload["target_code"]].append({
+            "sheet_uuid": payload["sheet_uuid"], "email": payload["email"], "name": payload["name"],
+            "company": payload["company"], "status": payload["status"],
+            "next_followup": payload["next_followup"], "note": payload["note"],
+            "source": payload["source"], "last_contact": payload["last_contact"],
+            "priority": payload["priority"]})
+        return _HotResp(200, {"status": "success", "message": "Contact created successfully"})
+
+    def total(self):
+        return sum(len(r) for r in self.tabs.values())
+
+
+def _unt_poll(monkeypatch, world, **kw):
+    kw.setdefault("sender", _UNT_SENDER)
+    return _hot_poll(monkeypatch, world, **kw)
+
+
+def test_hot_promote_untracked_gmail_professor_gets_one_hot_row(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, exchange = _unt_poll(monkeypatch, world)
+    assert world.total() == 1 and len(world.tabs["CH"]) == 1
+    row = world.tabs["CH"][0]
+    assert (row["name"], row["company"], row["email"]) == ("Prof Ann Lee", "", "ann.lee@gmail.com")
+    assert row["status"] == "Follow-up Due" == m.CARMEN_HOT_DEFAULT_STATUS
+    assert row["next_followup"] == (exchange + timedelta(days=7)).strftime("%Y-%m-%d")
+    assert row["next_followup"] != (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+    assert row["last_contact"] == exchange.strftime("%Y-%m-%d") and row["priority"] == 9
+    assert row["source"] == "Auto-promoted: two-way exchange"
+    assert m.INBOUND_REPLY_NOTE_MARKER in row["note"] and "Operations role" in row["note"]
+    assert len(_hot_alerts(alerts)) == 1 and "ann.lee@gmail.com" in _hot_alerts(alerts)[0]
+    assert "Unknown" not in row["company"]
+    # the existing unverified alert is untouched
+    assert any("Unverified Reply (thread participant)" in a for a in alerts)
+    assert [(a[1], a[4]) for a in world.cached] == [("Carmen Hot", "ann.lee@gmail.com")]
+
+
+def test_hot_promote_untracked_repolls_and_deploy_wipe_leave_one_row_one_alert(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    first, _ = _unt_poll(monkeypatch, world)
+    second, _ = _unt_poll(monkeypatch, world)  # same mail polled again
+    world.cached.clear()  # a Render deploy wipes SQLite: only the live CRM remembers
+    third, _ = _unt_poll(monkeypatch, world)
+    assert len(_hot_alerts(first)) == 1 and not _hot_alerts(second) and not _hot_alerts(third)
+    assert world.total() == 1 and len(world.tabs["CH"]) == 1
+    assert [p["action"] for p in world.posts].count("quick_add") == 1
+
+
+def test_hot_promote_untracked_stranger_in_a_thread_kevin_did_not_send_in_creates_nothing(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, _ = _unt_poll(monkeypatch, world, kevin_sent=False)
+    assert world.total() == 0 and world.posts == [] and not _hot_alerts(alerts)
+
+
+@pytest.mark.parametrize("mode", ["none", "500"])
+def test_hot_promote_untracked_failed_lookup_creates_nothing_and_logs_why(monkeypatch, caplog, mode):
+    world = _UntrackedWorld(monkeypatch)
+    world.lookup_mode = mode
+    with caplog.at_level("INFO"):
+        alerts, _ = _unt_poll(monkeypatch, world)
+    assert world.total() == 0 and world.posts == [] and not _hot_alerts(alerts)
+    assert "[HOT PROMOTE] skip: lookup_failed" in caplog.text
+
+
+@pytest.mark.parametrize("code", ["CC", "CW", "CH", "KD"])
+def test_hot_promote_untracked_person_already_on_any_tab_gets_no_second_row(monkeypatch, code):
+    world = _UntrackedWorld(monkeypatch)
+    world.seed(code, "ann.lee@gmail.com")
+    alerts, _ = _unt_poll(monkeypatch, world)
+    assert world.total() == 1 and len(world.tabs[code]) == 1
+    assert not any(p["action"] == "quick_add" for p in world.posts)
+    assert not _hot_alerts(alerts)
+
+
+@pytest.mark.parametrize("sender,extra", [
+    ("Mail Delivery Subsystem <mailer-daemon@googlemail.com>", None),
+    ("Talent <ann@greenhouse.io>", None),
+    ("Careers <careers@gmail.com>", None),
+    ("Kevin <kevin@example.com>", None),
+    ("Ann Lee <ann.lee@gmail.com>", {"Auto-Submitted": "auto-replied"}),
+])
+def test_hot_promote_untracked_machines_roles_and_own_address_create_nothing(monkeypatch, sender, extra):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, _ = _unt_poll(monkeypatch, world, sender=sender, extra_headers=extra)
+    assert world.total() == 0 and not any(p["action"] == "quick_add" for p in world.posts)
+    assert not _hot_alerts(alerts)
+
+
+def test_hot_promote_untracked_interview_reply_creates_nothing_and_alert_is_unchanged(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, _ = _unt_poll(
+        monkeypatch, world, snippet="We would like to schedule an interview with you next Tuesday at 2pm.")
+    assert world.total() == 0 and world.posts == [] and not _hot_alerts(alerts)
+    assert len(alerts) == 1 and "Interview" in alerts[0] and "No CRM changes were made" in alerts[0]
+
+
+def test_hot_promote_untracked_write_failure_warns_once_without_success_alert_or_cache(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    world.fail_actions = {"quick_add"}
+    alerts, _ = _unt_poll(monkeypatch, world)
+    assert world.total() == 0 and world.cached == [] and not _hot_alerts(alerts)
+    warnings = [a for a in alerts if "Could not add" in a]
+    assert len(warnings) == 1 and "ann.lee@gmail.com" in warnings[0] and "mail.google.com" in warnings[0]
+
+
+def test_hot_promote_untracked_colleague_at_tracked_company_gets_own_row_and_company(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    monkeypatch.setattr(m, "match_unknown_sender_to_crm_company", lambda s: {
+        "name": "x", "company": "Acme", "tab": "Carmen Cold", "sheet_uuid": ""})
+    # domain-match path: the harness takes domain_match from _run_poll_with_fake_gmail's argument
+    msg = _gmail_message("dm1", "Bo Chen <bo.chen@acmecorp.com>", "Re: Operations role", _HOT_SNIPPET,
+                         age_seconds=3 * 86400)
+    monkeypatch.setattr(m, "INBOUND_ALERT_MAX_AGE_SECONDS", 10 * 86400)
+    alerts, _ = _run_poll_with_fake_gmail(
+        monkeypatch, [msg], thread_started=True,
+        domain_match=lambda s: {"name": "x", "company": "Acme", "tab": "Carmen Cold", "sheet_uuid": ""})
+    assert len(world.tabs["CH"]) == 1 and world.total() == 1
+    assert world.tabs["CH"][0]["company"] == "Acmecorp" and world.tabs["CH"][0]["name"] == "Bo Chen"
+    assert len(_hot_alerts(alerts)) == 1
+
+
+def test_hot_promote_untracked_new_hot_row_is_never_touched_by_the_sequencer(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    _unt_poll(monkeypatch, world)
+    assert len(world.tabs["CH"]) == 1
+    assert "Carmen Hot" not in str(getattr(m, "SEQUENCER_SCAN_TABS", ""))
+    before = (list(world.posts), list(world.enqueued), dict(world.tabs["CH"][0]))
+    m.run_followup_sequencer(today=date.today() + timedelta(days=60))
+    assert (world.posts, world.enqueued, world.tabs["CH"][0]) == before
+    assert len(world.tabs["CH"]) == 1
+
+
+def _code_gs_text():
+    import pathlib
+    return (pathlib.Path(m.__file__).parent / "Code.gs").read_text(encoding="utf-8")
+
+
+def _gs_action_block(gs, action):
+    start = gs.index(f'if (action === "{action}")')
+    nxt = re.search(r'\n    if \(action === "', gs[start + 10:])
+    return gs[start:start + 10 + nxt.start()] if nxt else gs[start:]
+
+
+def test_hot_promote_untracked_code_gs_contract_quick_add_ch_and_uuid_lookups():
+    gs = _code_gs_text()
+    qa = _gs_action_block(gs, "quick_add")
+    assert 'payload.target_code === "CH" ? "Carmen Hot"' in qa
+    row = qa[qa.index("const rowData = ["):qa.index("];", qa.index("const rowData = ["))]
+    for field in ("last_contact", "name", "company", "email", "priority", "status",
+                  "next_followup", "source", "note"):
+        assert f"payload.{field}" in row, field
+    order = [row.index(f"payload.{f}") for f in
+             ("last_contact", "name", "company", "email", "priority", "status", "next_followup", "source", "note")]
+    assert order == sorted(order)
+    assert "getRange(newRow, 1, 1, rowData.length)" in qa and "Columns A-I" in qa
+    assert "getRange(newRow, UUID_COL).setValue(payload.sheet_uuid" in qa
+    assert re.search(r"const UUID_COL = 10;", gs)
+    us = _gs_action_block(gs, "update_status")
+    assert "findRecordBySheetUuid(ss, sheetUuid)" in us and "transposeRowValues(rowValues" in us
+    finder = gs[gs.index("function findRecordBySheetUuid"):]
+    assert "for (const tabName of ALL_TABS)" in finder[:finder.index("\n}\n")]
+    assert "const ALL_TABS = Object.keys(TAB_MAP);" in gs and '"Carmen Hot": "PEOPLE"' in gs
+    for action in ("set_status", "update_snooze", "append_note"):
+        assert "findRecordBySheetUuid(ss, sheetUuid)" in _gs_action_block(gs, action), action

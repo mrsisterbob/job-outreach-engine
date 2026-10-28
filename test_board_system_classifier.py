@@ -145,3 +145,49 @@ def test_report_counts_only_target_keys(capsys):
     mbs.report(cache, {"in": {}}, lambda s: s)
     out = capsys.readouterr().out
     assert "DENOMINATOR 1" in out and "Stale" not in out
+
+
+# ---- board_url / workday_triple_shape recorded by measure (fake responses, no network) ----
+def _measure_careers(monkeypatch, first, second=None):
+    seq = iter([first] + ([second] if second else []))
+    monkeypatch.setattr(mbs, "_get", lambda req, url, pause=0: _Resp(404))
+    monkeypatch.setattr(mbs, "_get_url", lambda req, url, pause: next(seq))
+    return mbs.measure(None, {"domains": []}, "acme", 0)
+
+
+def test_board_url_redirect_onto_workday_keeps_host_path_and_triple(monkeypatch):
+    r302 = _Resp(302)
+    r302.headers = {"Location": "https://acme.wd5.myworkdayjobs.com/en-US/External_Careers?q=1#top"}
+    rec = _measure_careers(monkeypatch, r302)
+    assert rec["bucket"] == "workday"
+    assert rec["board_url"] == "acme.wd5.myworkdayjobs.com/en-US/External_Careers"
+    assert rec["workday_triple_shape"] == "acme/wd5/External_Careers"
+
+
+def test_board_url_200_lever_sets_url_and_no_triple(monkeypatch):
+    r = _Resp(200)
+    r.url, r.text = "https://jobs.lever.co/acme", "<html></html>"
+    rec = _measure_careers(monkeypatch, r)
+    assert rec["bucket"] == "lever"
+    assert rec["board_url"] == "jobs.lever.co/acme"
+    assert "workday_triple_shape" not in rec
+
+
+def test_board_url_absent_for_own_site(monkeypatch):
+    r = _Resp(200)
+    r.url, r.text = "https://acme.com/careers", "<h1>Open positions</h1><ul><li>Engineer</li></ul>"
+    rec = _measure_careers(monkeypatch, r)
+    assert rec["bucket"] == "own_site"
+    assert "board_url" not in rec and "workday_triple_shape" not in rec
+
+
+def test_board_url_never_carries_query_or_fragment(monkeypatch):
+    r = _Resp(200)
+    r.url, r.text = "https://jobs.lever.co/acme?lever-source=x&token=secret#apply", ""
+    rec = _measure_careers(monkeypatch, r)
+    assert rec["board_url"] == "jobs.lever.co/acme"
+    assert "?" not in rec["board_url"] and "#" not in rec["board_url"]
+
+
+def test_board_url_cache_file_name_is_v3():
+    assert "v3" in mbs.CACHE_NAME and "v2" not in mbs.CACHE_NAME

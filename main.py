@@ -28,17 +28,21 @@ from flask import Flask, jsonify, request, Response, redirect
 from apscheduler.schedulers.background import BackgroundScheduler
 import resume_engine
 import referral_asks
+import company_source
 import warm_big_companies
 import warm_company_kind
 import warm_jsearch_plan
 import apify_feed
 import hirebase_feed
 import hirebase_registry
+import resolve_plan
 import warm_screen_plan
 import warm_stage_samples
 import warm_michigan
 import role_region
 import visit_alert
+import hot_promotion
+from source_config import parse_source_config
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from track_registry import (
     TRACK_PROMPT_LINE, TRACK_TRIGGER_GUIDANCE, normalize_track, pool_key_for,
@@ -1466,6 +1470,18 @@ def init_db():
             rows INTEGER NOT NULL DEFAULT 0,
             checked_at TEXT NOT NULL
         )""")
+        # What the last paid resolution attempt for (company, source) came back as, and when it may be
+        # tried again. Separate from hirebase_slug_registry and company_feed_source on purpose: their
+        # rows carry routing meaning or record only what a feed returned.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_resolution (
+            company_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            attempted_at TEXT NOT NULL,
+            next_eligible_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (company_key, source)
+        )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS query_pagination (
             query_text TEXT PRIMARY KEY,
@@ -1839,6 +1855,56 @@ def hydrate_filters_from_sheets():
         logging.info(f"Hydrated {len(remote_filters)} filters from Google Sheets System_Config")
     except Exception as e:
         logging.error(f"Filter Hydration Error: {e}")
+
+SOURCE_CONFIG_KEYS = (
+    "source_hirebase_enabled", "source_hirebase_companies_per_run", "source_hirebase_monthly_jobs",
+    "source_apify_enabled", "source_apify_companies_per_run", "source_apify_monthly_usd",
+)
+_SOURCE_CONFIG_MISSING = object()
+
+def source_config_read():
+    """(SourceConfig, origin): the per-source on/off and budgets from the System_Config sheet, read now.
+
+    origin is "sheet" (good read), "last seen" (sheet unreadable; values a past read or the boot
+    hydration stored locally) or "defaults" (unreadable and nothing ever stored). A good read
+    mirrors the six raw values into search_filters locally (never set_filter: no write back to the
+    sheet); a key missing from the sheet is deleted locally so the default returns. Never raises.
+    """
+    try:
+        remote = None
+        try:
+            res = crm_get({"action": "load_system_config"})
+            if res is not None and res.status_code == 200:
+                body = res.json()
+                if isinstance(body, dict) and body.get("status") == "success" and isinstance(body.get("filters"), dict):
+                    remote = body["filters"]
+        except Exception as e:
+            logging.error(f"source_config_read: sheet read failed ({type(e).__name__})")
+            remote = None
+        if remote is not None:
+            raw = {k: remote[k] for k in SOURCE_CONFIG_KEYS if k in remote}
+            try:
+                with get_db_conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for k in SOURCE_CONFIG_KEYS:
+                        if k in raw:
+                            conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)",
+                                         (k, json.dumps(raw[k])))
+                        else:
+                            conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+                    conn.commit()
+            except Exception as e:
+                logging.error(f"source_config_read: local store failed ({type(e).__name__})")
+            return parse_source_config(raw), "sheet"
+        stored = {}
+        for k in SOURCE_CONFIG_KEYS:
+            v = get_filter(k, _SOURCE_CONFIG_MISSING)
+            if v is not _SOURCE_CONFIG_MISSING:
+                stored[k] = v
+        return parse_source_config(stored), ("last seen" if stored else "defaults")
+    except Exception as e:
+        logging.error(f"source_config_read: failed ({type(e).__name__})")
+        return parse_source_config({}), "defaults"
 
 def restore_core_sourcing_filters():
     """Put target_queries back from DEFAULT_SEARCH_FILTERS if it is missing, not a list, or empty.
@@ -3269,6 +3335,48 @@ def feed_source_upsert(company_key, source_domain, job_board, rows, now=None):
         return True
     except Exception as e:
         logging.error(f"Feed Source Upsert Error: {type(e).__name__}")
+        return False
+
+def resolution_read():
+    """Return {(company_key, source): (outcome, attempted_at, next_eligible_at)} from company_resolution,
+    or None on a DB error (None, never {}: an unreadable table must not read as nothing tried yet,
+    or every cooldown would vanish)."""
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT company_key, source, outcome, attempted_at, next_eligible_at FROM company_resolution").fetchall()
+        return {(r[0], r[1]): (r[2], r[3], r[4]) for r in rows}
+    except Exception as e:
+        logging.error(f"Resolution Read Error: {type(e).__name__}")
+        return None
+
+def resolution_record(company_key, source, outcome, now=None, force=False):
+    """Replace the company_resolution row for (company_key, source). next_eligible_at comes from
+    resolve_plan.next_eligible. A stored "resolved" row is kept against a later "empty"/"error"
+    unless force=True. True when written; False (never raises) on a blank key/source, an unknown
+    outcome, a kept resolved row, or a DB error."""
+    try:
+        key = str(company_key or "").strip()
+        src = str(source or "").strip()
+        if not key or not src or outcome not in (resolve_plan.RESOLVED, resolve_plan.EMPTY, resolve_plan.ERROR):
+            return False
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        with get_db_conn() as conn:
+            if not force and outcome != resolve_plan.RESOLVED:
+                row = conn.execute(
+                    "SELECT outcome FROM company_resolution WHERE company_key = ? AND source = ?",
+                    (key, src)).fetchone()
+                if row and row[0] == resolve_plan.RESOLVED:
+                    return False
+            conn.execute(
+                "INSERT OR REPLACE INTO company_resolution "
+                "(company_key, source, outcome, attempted_at, next_eligible_at) VALUES (?, ?, ?, ?, ?)",
+                (key, src, outcome, now.isoformat(), resolve_plan.next_eligible(outcome, now)))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Resolution Record Error: {type(e).__name__}")
         return False
 
 HIREBASE_SLUG_SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hirebase_slug_seed.json")
@@ -7776,6 +7884,142 @@ def passes_email_prefilter(sender: str, subject: str, snippet: str, internal_dat
 
     return True, ""
 
+def _live_crm_contact(email):
+    """Fresh find_contact_by_email against the live CRM (every tab), never the SQLite cache.
+
+    Returns (live_tab, record): live_tab is the tab name, None when the CRM answered and the
+    person is on no tab, or hot_promotion.LOOKUP_FAILED on no response / non-200 / bad JSON / a
+    found row with no sheet_tab or sheet_uuid. record is the CRM's answer dict ({} otherwise).
+    """
+    res = crm_get({"action": "find_contact_by_email", "email": email})
+    if res is None or getattr(res, "status_code", None) != 200:
+        return hot_promotion.LOOKUP_FAILED, {}
+    try:
+        body = res.json()
+    except Exception:
+        return hot_promotion.LOOKUP_FAILED, {}
+    if not isinstance(body, dict):
+        return hot_promotion.LOOKUP_FAILED, {}
+    if not body.get("found"):
+        return None, {}
+    tab = str(body.get("sheet_tab") or "").strip()
+    if not tab or not str(body.get("sheet_uuid") or "").strip():
+        return hot_promotion.LOOKUP_FAILED, {}
+    return tab, body
+
+
+def _create_hot_contact_on_exchange(sender, email, subject, thread_id, internal_date_ms):
+    """Create ONE Carmen Hot row for a person the CRM has never seen who replied in a thread Kevin
+    sent in. Caller has already confirmed absence on every tab via _live_crm_contact. The write is
+    direct (log_to_sheets_crm), not the outbox, which a Render deploy wipes. Returns "promoted"
+    or "". next_followup is always a real date: Code.gs turns "" into +14 days."""
+    name = display_name_from_sender(sender)
+    if not name or name.strip().lower() == email.lower() or name == "Unknown":
+        name = name_from_email_local_part(email)
+    company = (company_domain_of(email) or "").split(".")[0].title()
+    today = datetime.now().date()
+    exchange_date = hot_promotion.exchange_date_from_internal_ms(internal_date_ms, today)
+    new_uuid = str(uuid.uuid4())
+    payload = build_crm_payload(
+        "quick_add",
+        target_code="CH",
+        sheet_uuid=new_uuid,
+        first_contact=today.strftime("%Y-%m-%d"),
+        last_contact=exchange_date.strftime("%Y-%m-%d"),
+        name=name,
+        company=company,
+        email=email,
+        priority=9,
+        status=CARMEN_HOT_DEFAULT_STATUS,
+        next_followup=hot_promotion.hot_followup_date(exchange_date),
+        source="Auto-promoted: two-way exchange",
+        note=hot_promotion.promotion_note(exchange_date, "create", None, subject),
+    )
+    if not log_to_sheets_crm(payload, max_retries=1, alert_on_exhaustion=False):
+        logging.error(f"[HOT PROMOTE] quick_add to Carmen Hot failed for {email}; no row created")
+        link = f"https://mail.google.com/mail/u/0/#inbox/{thread_id}"
+        send_telegram_message(
+            TELEGRAM_CHAT_ID,
+            f"\u26a0\ufe0f Could not add {html.escape(name)} ({html.escape(email)}) to Hot; "
+            f"<a href='{link}'>open the thread</a> and /promote by hand.")
+        return ""
+    record_captured_contact(new_uuid, "Carmen Hot", name, company, email)
+    log_daily_activity("notes_logged")
+    send_telegram_message(TELEGRAM_CHAT_ID, hot_promotion.promotion_alert_html(
+        name, email, company, "create", None, exchange_date, subject))
+    logging.info(f"[HOT PROMOTE] created {email} in Carmen Hot (new contact)")
+    return "promoted"
+
+
+def promote_to_hot_on_exchange(crm_match, sender, header_list, status_label, subject,
+                               thread_id, access_token, internal_date_ms):
+    """Move a verified CRM contact into Carmen Hot once the thread holds their reply AND a
+    message Kevin sent (Kevin's rule, 2026-10-28). Returns "promoted", "already_hot" or "".
+
+    Callers must NOT run route_inbound_reply_to_crm for "promoted" / "already_hot": its outbox
+    writes (Carmen Cold move, +4 day snooze) drain after the direct writes here and would undo
+    the move. Writes go straight to the CRM (log_to_sheets_crm), not the SQLite outbox that every
+    Render deploy wipes. The decision reads the LIVE tab, so it stays idempotent across polls.
+    """
+    email = hot_promotion.sender_address(sender)
+    headers_lc = {str(h.get("name", "")).lower(): h.get("value", "") for h in (header_list or [])}
+    disqualifier = hot_promotion.sender_disqualifier(
+        sender, [GMAIL_USER or ""], ATS_ROBOT_DOMAINS, hot_promotion.auto_reply_flag(headers_lc))
+    kevin_sent = False
+    if not disqualifier and status_label == "GENERAL":
+        kevin_sent = is_thread_kevin_started(thread_id, access_token)
+    live_tab, live = hot_promotion.LOOKUP_FAILED, {}
+    if not disqualifier and status_label == "GENERAL" and kevin_sent:
+        live_tab, live = _live_crm_contact(email)
+    decision = hot_promotion.decide_promotion(status_label, kevin_sent, live_tab, disqualifier)
+    if decision.action == "none":
+        logging.info(f"[HOT PROMOTE] skip: {decision.reason} ({email or sender})")
+        return "already_hot" if decision.reason == "already_hot" else ""
+    if decision.action == "create" and not str((crm_match or {}).get("sheet_uuid") or "").strip():
+        # Unverified sender (domain match / thread participant / stranger) the CRM has never heard of.
+        return _create_hot_contact_on_exchange(sender, email, subject, thread_id, internal_date_ms)
+    if decision.action != "move" or not str((crm_match or {}).get("sheet_uuid") or "").strip():
+        # An unverified caller (no sheet_uuid) only ever creates; a "move" for it is left alone.
+        # A VERIFIED sender (cached sheet_uuid) the live CRM cannot find: never create a second row.
+        logging.info(f"[HOT PROMOTE] skip: {decision.reason} ({email})")
+        return ""
+
+    sheet_uuid = str(live.get("sheet_uuid") or "").strip()
+    name = str(live.get("name") or crm_match.get("name") or "").strip() or email
+    company = str(live.get("company") or crm_match.get("company") or "").strip()
+    exchange_date = hot_promotion.exchange_date_from_internal_ms(internal_date_ms, datetime.now().date())
+
+    def _write(payload):
+        return log_to_sheets_crm(payload, max_retries=1, alert_on_exhaustion=False)
+
+    if not _write(build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab="Carmen Hot")):
+        logging.error(f"[HOT PROMOTE] update_status to Carmen Hot failed for {email}; stopping")
+        send_telegram_message(
+            TELEGRAM_CHAT_ID,
+            f"\u26a0\ufe0f Could not move {html.escape(name)} to Hot; /promote by hand.")
+        return ""
+    missing = []
+    for label, payload in (
+        ("status", build_crm_payload("set_status", sheet_uuid=sheet_uuid, status=CARMEN_HOT_DEFAULT_STATUS)),
+        ("next followup", build_crm_payload(
+            "update_snooze", sheet_uuid=sheet_uuid, next_followup=hot_promotion.hot_followup_date(exchange_date))),
+        ("note", build_crm_payload("append_note", sheet_uuid=sheet_uuid, note=hot_promotion.promotion_note(
+            exchange_date, "move", live_tab, subject))),
+    ):
+        if not _write(payload):
+            missing.append(label)
+            logging.error(f"[HOT PROMOTE] {label} write failed for {email} after the move")
+    record_captured_contact(sheet_uuid, "Carmen Hot", name, company, email)
+    log_daily_activity("notes_logged")
+    alert = hot_promotion.promotion_alert_html(
+        name, email, company, "move", live_tab, exchange_date, subject)
+    if missing:
+        alert += f"\n\u26a0\ufe0f Write(s) missing, set by hand: {', '.join(missing)}"
+    send_telegram_message(TELEGRAM_CHAT_ID, alert)
+    logging.info(f"[HOT PROMOTE] moved {email} from {live_tab} to Carmen Hot (missing={missing})")
+    return "promoted"
+
+
 def route_inbound_reply_to_crm(crm_match, status_label, subject, snippet):
     """Carmen Cold is the hot seat: every verified inbound reply gets its follow-up pulled in, and a
     live human conversation additionally gets its contact moved into Carmen Cold with a dated note.
@@ -8445,9 +8689,26 @@ def check_inbound_gmail_replies():
             # Follow-up bump for every verified reply; Carmen Cold move + dated note for a live
             # human conversation (GENERAL). Never changes the alert text below - this is what makes
             # the *system* treat the thread as a priority, not a second notification.
+            if is_unverified and status_label == "GENERAL" and not str(crm_match.get("sheet_uuid") or "").strip():
+                # Separate from the verified path: creates a Hot row only. No stage, outcome or
+                # reply-routing write is made for an unresolved sender.
+                try:
+                    promote_to_hot_on_exchange(
+                        crm_match, sender, header_list, status_label, subject,
+                        thread_id, access_token, internal_date_ms)
+                except Exception as e:
+                    logging.error(f"Unverified Hot promotion error ({msg_id}): {e}")
             if not is_unverified:
                 try:
-                    route_inbound_reply_to_crm(crm_match, status_label, subject, snippet)
+                    promoted = ""
+                    if str(crm_match.get("sheet_uuid") or "").strip():
+                        promoted = promote_to_hot_on_exchange(
+                            crm_match, sender, header_list, status_label, subject,
+                            thread_id, access_token, internal_date_ms)
+                    # A promoted / already-Hot row must not be routed: the outbox would pull it
+                    # back to Carmen Cold and overwrite the +7 day date.
+                    if not promoted:
+                        route_inbound_reply_to_crm(crm_match, status_label, subject, snippet)
                 except Exception as e:
                     logging.error(f"Inbound Reply CRM Routing Error ({msg_id}): {e}")
 
@@ -11030,11 +11291,11 @@ def promote_job_card_contact(chat_id, token, extra):
     # exact condition /promote's Cold->Hot move is for. Routing via Carmen Cold would need a
     # second command to undo.
     #
-    # next_followup is left BLANK on purpose. Carmen Hot is not in SEQUENCER_SCAN_TABS, so no
-    # automation reads this column here - a ladder date written into it is not a schedule, it is
-    # decoration that looks like a commitment. The column is Kevin's to fill with the actual call
-    # time from Sheets' own date picker, and an empty cell reads as "fill me in" where a wrong
-    # date reads as "already handled".
+    # /promote is now the MANUAL override of the poller's auto-promotion (promote_to_hot_on_exchange,
+    # which moves a contact to Carmen Hot on a two-way Gmail exchange and sets Next Followup to the
+    # exchange date + 7 days). This hand-made row leaves next_followup BLANK: Carmen Hot is not in
+    # SEQUENCER_SCAN_TABS, so nothing auto-sends from it, and the column is Kevin's to fill with
+    # the real call time from Sheets' own date picker.
     payload = build_crm_payload(
         "quick_add",
         target_code="CH",
@@ -15380,6 +15641,29 @@ def _warm_radar_coverage_line(contacts_by_bucket, unplaced):
             f"{unplaced} with no company")
 
 
+def _warm_radar_source_share_line(covered, total):
+    """ONE counts-only line: of all warm CONTACTS, how many work at a company with a working job
+    source (a board /w scans, a Hirebase slug with jobs, or an Apify feed with rows). covered=None
+    means the source records could not be built (a store read failed): say so, never guess.
+    total == 0 prints nothing."""
+    if covered is None or total is None:
+        return "Job-source coverage unavailable this run"
+    if not total:
+        return ""
+    return f"Warm contacts with a working job source: {covered} of {total} ({round(100 * covered / total)}%)"
+
+
+def _warm_radar_source_share(records, not_company_contacts, unplaced):
+    """(covered, total) for the closing line. DENOMINATOR DECISION: total is ALL warm contacts the
+    run read, so contacts at not_company / non-employer entries and unplaced contacts (no company)
+    are added to the total and never to the covered side. Conservative, and tied to the Carmen Warm
+    row count. records None (build failed) -> (None, None)."""
+    if records is None:
+        return None, None
+    covered, total = company_source.covered_contact_share(records)
+    return covered, total + not_company_contacts + unplaced
+
+
 WARM_SCREEN_BUDGET_SECONDS = 150   # the planner's guess, NOT measured: nobody has timed ~60 Gemini calls here
 
 
@@ -15452,6 +15736,77 @@ def _warm_screen_memo_write(job_hashes, outcome):
         return False
 
 
+COMPANIES_MIRROR_MAX_ROWS = 5000
+
+
+def warm_radar_source_records(warm_contacts, identity_rows, excluded_keys, now=None):
+    """The per-company source records for the warm companies (employer-like only), built from the
+    REAL stores, or None when any store read failed (a half-empty tab would look like lost
+    coverage). identity_rows are the company_identities rows /w already read (None = that read
+    failed); the other three stores are read here, once. TASK-220 reuses this."""
+    try:
+        if identity_rows is None:
+            logging.error("Warm Radar source records skipped: identity read failed")
+            return None
+        registry = hirebase_registry_read()
+        feed = feed_source_read()
+        resolution = resolution_read()
+        if registry is None or feed is None or resolution is None:
+            logging.error("Warm Radar source records skipped: a store read failed")
+            return None
+        identities = {}
+        for row in identity_rows:
+            name, slug, workday = row[0], row[1], row[5]
+            workday = str(workday or "").strip()
+            identities[name] = {"ats_slug": slug, "workday_board": workday if valid_workday_triple(workday) else ""}
+        companies = [(k, c.get("raw_company") or k, c.get("count") or 1)
+                     for k, c in warm_contacts.items() if k not in excluded_keys]
+        return company_source.build_source_records(
+            companies, identities, registry, feed, resolution, now or datetime.now(timezone.utc))
+    except Exception as e:
+        logging.error(f"Warm Radar source records error: {type(e).__name__}")
+        return None
+
+
+def mirror_company_sources(records):
+    """One-way mirror of the records to the CRM 'Companies' tab (action replace_companies_tab).
+    True only on HTTP 200 + status success + rows equal to what was sent. Never raises; logs the
+    action and class/status only, never the rows."""
+    action = "replace_companies_tab"
+    try:
+        rows = [company_source.record_row(r) for r in records]
+        if len(rows) > COMPANIES_MIRROR_MAX_ROWS:
+            logging.error(f"CRM mirror {action}: {len(rows)} rows, capped at {COMPANIES_MIRROR_MAX_ROWS}")
+            rows = rows[:COMPANIES_MIRROR_MAX_ROWS]
+        resp = crm_post({"action": action, "header": list(company_source.COMPANIES_HEADER), "rows": rows}, timeout=30)
+        if resp is None:
+            logging.error(f"CRM mirror {action}: no response")
+            return False
+        if resp.status_code != 200:
+            logging.error(f"CRM mirror {action}: HTTP {resp.status_code}")
+            return False
+        body = resp.json()
+        if not isinstance(body, dict) or body.get("status") != "success" or body.get("rows") != len(rows):
+            logging.error(f"CRM mirror {action}: not accepted (status {body.get('status') if isinstance(body, dict) else type(body).__name__})")
+            return False
+        return True
+    except Exception as e:
+        logging.error(f"CRM mirror {action}: {type(e).__name__}")
+        return False
+
+
+def _warm_radar_mirror_run(warm_contacts, identity_rows, excluded_keys):
+    """Build the records once and mirror them. Never raises."""
+    try:
+        records = warm_radar_source_records(warm_contacts, identity_rows, excluded_keys)
+        if records is None:
+            return False
+        return mirror_company_sources(records)
+    except Exception as e:
+        logging.error(f"Warm Radar mirror error: {type(e).__name__}")
+        return False
+
+
 def run_warm_radar_scan(chat_id=None):
     """/w Warm Network Radar: scans ONLY the companies where a Carmen Warm CRM contact already
     exists, screens what it finds with /t's own filter and Gemini, and lists the survivors as /t
@@ -15491,6 +15846,7 @@ def run_warm_radar_scan(chat_id=None):
     # Cache-only slug resolution: every warm company that already has a verified ats_slug row.
     # A warm company without one is no longer silent: it is named in the closing message and,
     # when it looks like a company, queued for a board lookup that runs after that message.
+    identity_read_failed = False
     try:
         with get_db_conn() as conn:
             identity_rows = conn.execute(
@@ -15499,6 +15855,7 @@ def run_warm_radar_scan(chat_id=None):
     except Exception as e:
         logging.error(f"Warm Radar Identity Lookup Error: {e}")
         identity_rows = []
+        identity_read_failed = True
     slug_to_contact = {}
     checked_on = {}
     attempted_at = {}
@@ -15542,6 +15899,7 @@ def run_warm_radar_scan(chat_id=None):
     not_employer_names = []
     contacts_by_bucket = {"scanned": 0, "no_board": 0, "unchecked": 0, "not_company": 0}
     big_rows = []   # (display, contact count, bucket) per company, for the 10+ report; "scanned" = a cached board exists, not "fetched OK this run"
+    not_employer_keys = set()   # not_company + non_employer buckets: no job source to report, left out of the Companies tab
     for key, contact in warm_contacts.items():
         people = contact.get("count") or 1
         if key in scanned_keys:
@@ -15551,12 +15909,14 @@ def run_warm_radar_scan(chat_id=None):
         display = contact.get("raw_company") or key
         if not is_probable_company_name(display):
             not_company += 1  # counted, never probed
+            not_employer_keys.add(key)
             contacts_by_bucket["not_company"] += people
             big_rows.append((display, people, "not_company"))
         elif warm_company_kind.non_employer_kind(display):
             kind = warm_company_kind.non_employer_kind(display)
             not_employer_kinds[kind] = not_employer_kinds.get(kind, 0) + 1
             not_employer_names.append(display)
+            not_employer_keys.add(key)
             contacts_by_bucket["not_company"] += people
             big_rows.append((display, people, "not_company"))
         elif checked_on.get(key, "") > retry_cutoff:
@@ -15592,6 +15952,7 @@ def run_warm_radar_scan(chat_id=None):
         [c for c in lookup_now if _count_of.get(c, 1) < warm_big_companies.WARM_BOARD_TARGET_MIN_CONTACTS],
     ]
     in_flight_skipped = len(unchecked_all) - len(unchecked)
+    source_records = None   # set inside the try below; None also covers a raise before it
     # Everything after the batch is chosen sits in try/finally: the lookups start exactly once on
     # every path out (a raise in the scan loop, the early "no cached board" return, the normal
     # end). They run AFTER the closing message on a normal exit, because the lookups are slow
@@ -15600,6 +15961,11 @@ def run_warm_radar_scan(chat_id=None):
         unplaced_count = _warm_radar_unplaced_count()
         unplaced_line = _warm_radar_unplaced_line(unplaced_count)
         coverage_line = _warm_radar_coverage_line(contacts_by_bucket, unplaced_count)
+        # The ONE record build of this /w (stores read once); the share line and the Companies-tab
+        # mirror below both use it.
+        source_records = warm_radar_source_records(warm_contacts, None if identity_read_failed else identity_rows, not_employer_keys)
+        _share_c, _share_t = _warm_radar_source_share(source_records, contacts_by_bucket["not_company"], unplaced_count)
+        source_share_line = _warm_radar_source_share_line(_share_c, _share_t)
 
         def _skipped_report():
             lines = []
@@ -15625,6 +15991,8 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(unplaced_line)
             if coverage_line:
                 lines.append(coverage_line)
+            if source_share_line:
+                lines.append(source_share_line)
             _target = warm_big_companies.board_target_line(big_rows)
             if _target:
                 lines.append(_target)
@@ -15929,8 +16297,10 @@ def run_warm_radar_scan(chat_id=None):
         hirebase_errored_reserved = 0   # jobs reserved against the month by the request that errored
         hirebase_capped_cos = []        # (name, limit) per company whose rows hit the limit
         hirebase_err_detail = ""
+        hirebase_collected = 0   # postings handed to _collect_posting from the Hirebase loop
         hirebase_picked_names = []
         hirebase_hash_to_ids = {}   # job_hash -> hirebase job ids, so only settled roles are marked seen
+        hirebase_searched = {}      # company key -> (outcome, returned, kept); read by the Apify fallthrough
         if hirebase_key:
             try:
                 hirebase_plan = None
@@ -16001,6 +16371,7 @@ def run_warm_radar_scan(chat_id=None):
                         if hirebase_outcome == "errored":
                             hirebase_status = "errored"
                             hirebase_per_company.append((pick_name, "errored", 0, 0))
+                            hirebase_searched[pick_key] = ("errored", 0, 0)
                             hirebase_errored_reserved = hirebase_limit
                             hirebase_err_detail = str(getattr(hirebase_result, "error", "") or "exception")
                             logging.error(f"Warm Radar Hirebase call errored: {getattr(hirebase_result, 'error', 'raised')}")
@@ -16012,6 +16383,7 @@ def run_warm_radar_scan(chat_id=None):
                             for stat_key in hirebase_stats:
                                 hirebase_stats[stat_key] += co_stats.get(stat_key, 0)
                             hirebase_per_company.append((pick_name, hirebase_outcome, returned_n, len(kept_jobs)))
+                            hirebase_searched[pick_key] = (hirebase_outcome, returned_n, len(kept_jobs))
                             if hirebase_outcome == "capped":
                                 hirebase_capped_cos.append((pick_name, hirebase_limit))
                             try:   # what this search learned goes back to the registry; a failure never fails the scan
@@ -16037,6 +16409,7 @@ def run_warm_radar_scan(chat_id=None):
                                         job = dict(job, employer_name=pick_name)
                                     hirebase_hash_to_ids.setdefault(
                                         generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
+                                    hirebase_collected += 1
                                     _collect_posting(job, jsearch_keys=hirebase_picked_keys)
                                 except Exception as e:
                                     logging.error(f"Warm Radar Hirebase posting error: {type(e).__name__}")
@@ -16046,6 +16419,114 @@ def run_warm_radar_scan(chat_id=None):
             except Exception as e:
                 hirebase_status = "errored"
                 logging.error(f"Warm Radar Hirebase block raised {type(e).__name__}")
+
+        # APIFY FEED. At most ONE batched call per run, for the no-board companies Hirebase could not answer.
+        # The ledger row is reserved under _APIFY_LOCK BEFORE the request. Errors are never "no jobs": an errored
+        # call marks nothing seen and records nothing. Nothing here can fail the scan; unconfigured, down or over
+        # budget leaves /w exactly as it was.
+        apify_status = "unconfigured"
+        apify_picked_names = []
+        apify_stats = {"returned": 0, "malformed": 0, "kept": 0, "unmatched": 0}
+        apify_rows_returned = 0
+        apify_spent_usd = None
+        apify_month_before = 0.0
+        apify_collected = 0
+        apify_err_detail = ""        # fetch_feed error string only, never a body or the token
+        apify_reserved_usd = 0.0     # worst-case dollars reserved for the call
+        apify_kept_by_company = {}
+        apify_key_by_name = {}
+        apify_hash_to_ids = {}   # job_hash -> apify job ids, so only settled roles are marked seen
+        try:
+            apify_token = apify_feed.get_token(os.environ)
+            if apify_token and no_board_candidates:
+                apify_status = "skipped"
+                _reg = hirebase_registry_read()
+                if _reg is None:
+                    apify_status = "registry_unreadable"
+                else:
+                    apify_cands = apify_feed.fallthrough_candidates(
+                        no_board_candidates, hirebase_searched, {k: (e.slug, e.status) for k, e in _reg.items()})
+                    apify_plan = None
+                    apify_row_id = None
+                    with _APIFY_LOCK:
+                        apify_ledger_now = apify_ledger_read()
+                        if apify_ledger_now is None:
+                            apify_status = "ledger_unreadable"
+                        else:
+                            _plan = apify_feed.plan_apify_run(apify_cands, apify_ledger_now, datetime.now(timezone.utc))
+                            apify_month_before = _plan.month_spent_usd
+                            if _plan.skip_reason or not _plan.picks:
+                                apify_status = _plan.skip_reason or "nothing_eligible"
+                            else:
+                                apify_row_id = apify_ledger_reserve([pk[0] for pk in _plan.picks], _plan.worst_case_usd)
+                                if apify_row_id is None:
+                                    apify_status = "reserve_failed"
+                                else:
+                                    apify_plan = _plan
+                    if apify_plan is not None:
+                        apify_picked_names = [pk[1] for pk in apify_plan.picks]
+                        apify_picked_keys = {pk[0] for pk in apify_plan.picks}
+                        apify_key_by_name = {pk[1]: pk[0] for pk in apify_plan.picks}
+                        apify_result = None
+                        try:
+                            apify_result = apify_feed.fetch_feed(
+                                apify_feed.build_run_input(apify_picked_names, apify_plan.limit), apify_token, requests.post)
+                        except Exception as e:
+                            logging.error(f"Warm Radar Apify request raised {type(e).__name__}")
+                        if apify_result is not None and apify_result.status == "ok":
+                            apify_status = "ok"
+                            apify_rows_returned = len(apify_result.rows)
+                            apify_spent_usd = apify_feed.actual_cost(apify_rows_returned)
+                            apify_ledger_settle(apify_row_id, apify_spent_usd, "ok")
+                        else:
+                            apify_status = "errored"
+                            apify_spent_usd = apify_plan.worst_case_usd   # a failed call may still have billed
+                            apify_reserved_usd = apify_plan.worst_case_usd
+                            apify_err_detail = getattr(apify_result, "error", "") or "request raised"
+                            apify_ledger_settle(apify_row_id, apify_plan.worst_case_usd, "errored")
+                            logging.error(f"Warm Radar Apify call errored: {getattr(apify_result, 'error', 'raised')}")
+                        if apify_status == "ok":
+                            try:
+                                apify_kept_by_company, apify_stats = apify_feed.split_rows(
+                                    apify_result.rows, apify_picked_names, normalize_company_for_match)
+                                # Learn from the rows before they are screened (best effort, never fails the
+                                # scan): the feed source per company that has kept rows, and a Workday triple
+                                # (UNVERIFIED: a posting link proves a posting; /w's own scan is the check).
+                                try:
+                                    for _an, _summary in apify_feed.summarize_feed_sources(apify_kept_by_company).items():
+                                        _ajobs = apify_kept_by_company.get(_an) or []
+                                        if not _ajobs:
+                                            continue
+                                        feed_source_upsert(apify_key_by_name.get(_an) or normalize_company_for_match(_an),
+                                                           _summary["source_domain"], _summary["job_board"], _summary["rows"])
+                                        for _aj in _ajobs:
+                                            _ajob = dict(_aj, employer_name=_an)
+                                            if record_workday_board_from_posting(
+                                                    _ajob, warm_contacts.get(normalize_company_for_match(_an))):
+                                                break
+                                except Exception as e:
+                                    logging.error(f"Warm Radar Apify learn raised {type(e).__name__}")
+                                apify_all_jobs = [j for jobs in apify_kept_by_company.values() for j in jobs]
+                                # The seen filter runs AFTER billing, as the Hirebase block does.
+                                apify_already = apify_seen_filter([j["job_id"] for j in apify_all_jobs])
+                                for apify_name, apify_jobs in apify_kept_by_company.items():
+                                    for job in apify_jobs:
+                                        if job["job_id"] in apify_already:
+                                            continue
+                                        try:
+                                            job = dict(job, employer_name=apify_name)
+                                            apify_hash_to_ids.setdefault(
+                                                generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
+                                            apify_collected += 1
+                                            _collect_posting(job, jsearch_keys=apify_picked_keys)
+                                        except Exception as e:
+                                            logging.error(f"Warm Radar Apify posting error: {type(e).__name__}")
+                                _trim_group_jobs()
+                            except Exception as e:
+                                logging.error(f"Warm Radar Apify screen feed raised {type(e).__name__}")
+        except Exception as e:
+            apify_status = "errored"
+            logging.error(f"Warm Radar Apify block raised {type(e).__name__}")
 
         # SCREEN + OUTPUT. Nothing has been stamped, cached, sent or written yet. A role leaves a
         # trace (seen_jobs stamp, referral-ask role) ONLY after what lists it was accepted: its card
@@ -16167,6 +16648,13 @@ def run_warm_radar_scan(chat_id=None):
                 apify_seen_mark([jid for hsh in settled for jid in hirebase_hash_to_ids.get(hsh, ())])
             except Exception as e:
                 logging.error(f"Warm Radar Hirebase seen mark failed: {type(e).__name__}")
+        if apify_hash_to_ids:
+            try:
+                settled = ({i["job_hash"] for i in sent_items} | {i["job_hash"] for i in digest_sent}
+                           | set(rejected_hashes))
+                apify_seen_mark([jid for hsh in settled for jid in apify_hash_to_ids.get(hsh, ())])
+            except Exception as e:
+                logging.error(f"Warm Radar Apify seen mark failed: {type(e).__name__}")
 
         # Roles whose card went: stamp, count, and collect for the referral ask.
         sent_by_group = {}
@@ -16311,6 +16799,42 @@ def run_warm_radar_scan(chat_id=None):
                                  + (f", {hirebase_lookup['errored']} errored" if hirebase_lookup["errored"] else "")
                                  + f", {hirebase_lookup['units_used'] if hirebase_lookup['units_used'] is not None else '?'} of "
                                  f"{hirebase_feed.COMPANY_MONTHLY_UNITS} units used this month")
+            # Apify. Counts only what the ledger saw: Kevin's own console runs are not in it. Unreadable
+            # registry / ledger / reserve are NOT silent: Apify was configured and could not run.
+            def _usd_text(v):
+                return f"${v:.3f}" if 0 < v < 0.01 else f"${v:.2f}"
+            if apify_status == "registry_unreadable":
+                lines.append("Apify skipped: registry unreadable, nothing was spent")
+            elif apify_status == "ledger_unreadable":
+                lines.append("Apify skipped: ledger unreadable, nothing was spent")
+            elif apify_status == "reserve_failed":
+                lines.append("Apify skipped: could not record the spend first, nothing was spent")
+            elif apify_status == "monthly_ceiling":
+                lines.append(f"Apify skipped: monthly budget used ({_usd_text(apify_month_before)} of "
+                             f"{_usd_text(apify_feed.APIFY_MONTHLY_CEILING_USD)})")
+            elif apify_status == "errored":
+                lines.append(f"Apify errored ({html.escape(apify_err_detail or 'unknown')}); "
+                             f"{len(apify_picked_names)} companies not searched, retried on a later run; "
+                             f"{_usd_text(apify_reserved_usd)} reserved against the month")
+            elif apify_status == "ok":
+                ap_empty = [n for n in apify_picked_names if not apify_kept_by_company.get(n)]
+                if ap_empty:
+                    names_text, _used = _warm_radar_name_list(ap_empty, 5)
+                    lines.append(f"Searched Apify, no rows for: {names_text} (the feed may not cover them; "
+                                 "that is not the same as no jobs)")
+                lines.append(f"Apify: {len(apify_picked_names)} companies, {apify_rows_returned} rows returned, "
+                             f"{apify_stats['kept']} kept, {_usd_text(apify_spent_usd)} this run, "
+                             f"{_usd_text(apify_month_before + apify_spent_usd)} of "
+                             f"{_usd_text(apify_feed.APIFY_MONTHLY_CEILING_USD)} this month "
+                             "(counts only what the ledger saw, not console runs)")
+            if apify_status != "unconfigured":
+                hb_unmatched = [n for n, _st, ret, kp in hirebase_per_company if ret > 0 and kp == 0]
+                if hb_unmatched:
+                    names_text, _used = _warm_radar_name_list(hb_unmatched, 5)
+                    lines.append(f"Hirebase returned rows but none matched for: {names_text} (not sent to Apify)")
+            if hirebase_collected or apify_collected:
+                lines.append("Postings collected by source (before screening): "
+                             f"Hirebase {hirebase_collected}, Apify {apify_collected}")
             if applied_skipped:
                 names_text, _used = _warm_radar_name_list(sorted(applied_skipped), 5)
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
@@ -16320,12 +16844,19 @@ def run_warm_radar_scan(chat_id=None):
         _warm_stage_samples_write(stage_sampler.snapshot())
         return match_count
     finally:
-        if lookup_now:
-            # Must never replace the scan's own exception, or turn a good scan into an error.
-            try:
-                _spawn_background(lambda: _warm_radar_lookup_drain(lookup_phases))
-            except Exception:
-                logging.exception("Warm Radar: could not start the board lookups")
+        # Must never replace the scan's own exception, or turn a good scan into an error. One
+        # background job: the board lookups first (if any), then the Companies-tab mirror, so the
+        # mirror runs after the closing message and reads the stores once.
+        def _warm_radar_after_scan():
+            if lookup_now:
+                _warm_radar_lookup_drain(lookup_phases)
+            if source_records is not None:   # built once above; None = a store read failed, nothing to mirror
+                mirror_company_sources(source_records)
+        try:
+            _spawn_background(_warm_radar_after_scan)
+        except Exception:
+            logging.exception("Warm Radar: could not start the background lookups and mirror")
+            if lookup_now:
                 with _WARM_LOOKUPS_LOCK:   # they will never run, so they are not in flight
                     _WARM_LOOKUPS_IN_FLIGHT.difference_update(lookup_now)
 
@@ -18643,11 +19174,13 @@ def process_webhook_payload_async(data):
             # Every write is built first and queued together; Kevin is told "Promoted" only after
             # they are all durably queued (TASK-104).
             move_payloads = [build_crm_payload("update_status", sheet_uuid=sheet_uuid, new_tab=target_tab)]
-            # A promote carries the OUTREACH ladder's date across the move - Beth landed in Carmen
-            # Hot showing 9/24, a nudge date for a conversation that had already happened. Carmen
-            # Hot is not in SEQUENCER_SCAN_TABS, so nothing reads it; blanking it hands the column
-            # to Kevin and Sheets' own date picker for the real call time. /demote keeps its date:
-            # the bench IS a follow-up cadence.
+            # /promote is the MANUAL override of the poller's auto-promotion
+            # (promote_to_hot_on_exchange sets exchange date + 7 days). Done by hand it still
+            # clears the OUTREACH ladder's date - Beth landed in Carmen Hot showing 9/24, a nudge
+            # date for a conversation that had already happened - and leaves the column to Kevin
+            # and Sheets' own date picker for the real call time. Carmen Hot is not in
+            # SEQUENCER_SCAN_TABS, so nothing auto-sends from it. /demote keeps its date: the
+            # bench IS a follow-up cadence.
             if cmd == "promote":
                 move_payloads.append(build_crm_payload("clear_followup", sheet_uuid=sheet_uuid))
                 # "Cold Lead" is false the moment someone replies and starts booking time, and it
@@ -19937,7 +20470,7 @@ def record_site_visits(views, day=None, alerts=None):
         rows.append((
             _visit_timestamp(v.get("ts")), path, daily_visitor_id(ip, ua, salt),
             normalize_referrer_host(v.get("referrer"), own) or None,
-            visit_bot_flag(ua, ip, bool(v.get("self")), ignore),
+            visit_bot_flag(ua, ip, bool(v.get("self")), ignore, path=path),
         ))
     if not rows:
         return 0

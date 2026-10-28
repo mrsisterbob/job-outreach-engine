@@ -546,6 +546,41 @@ function doPost(e) {
       return respondJSON({ status: "success", message: `System_Config updated: ${key}` });
     }
 
+    // 8. Companies tab: one-way mirror of the engine's per-company source records.
+    // Written fresh on every /w, never read back. Touches no CRM tab. Validation comes first so
+    // a bad payload leaves the tab exactly as it was. Cells are written as plain text (number
+    // format "@" before setValues) so a value starting with "=" or "+" is never a formula.
+    if (action === "replace_companies_tab") {
+      const header = payload.header;
+      const rows = payload.rows;
+      if (!Array.isArray(header) || !Array.isArray(rows)) {
+        return respondJSON({ status: "error", message: "replace_companies_tab: header and rows must be arrays" });
+      }
+      if (header.length === 0) {
+        return respondJSON({ status: "error", message: "replace_companies_tab: header is empty" });
+      }
+      if (rows.length > 5000) {
+        return respondJSON({ status: "error", message: "replace_companies_tab: more than 5000 rows" });
+      }
+      for (let i = 0; i < rows.length; i++) {
+        if (!Array.isArray(rows[i]) || rows[i].length !== header.length) {
+          return respondJSON({ status: "error", message: "replace_companies_tab: row " + i + " does not match the header length" });
+        }
+      }
+      let companiesSheet = ss.getSheetByName("Companies");
+      if (!companiesSheet) {
+        companiesSheet = ss.insertSheet("Companies");
+      }
+      companiesSheet.clearContents();
+      const allValues = [header].concat(rows);
+      const target = companiesSheet.getRange(1, 1, allValues.length, header.length);
+      target.setNumberFormat("@");
+      target.setValues(allValues);
+      companiesSheet.getRange(1, 1, 1, header.length).setFontWeight("bold");
+      companiesSheet.setFrozenRows(1);
+      return respondJSON({ status: "success", rows: rows.length });
+    }
+
     return respondJSON({ status: "error", message: "Invalid action type" });
 
   } catch (err) {

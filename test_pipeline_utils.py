@@ -4189,3 +4189,58 @@ def test_ups_ban_edge_names():
         assert pu.is_banned_employer(name) is True, name
     for name in allowed:
         assert pu.is_banned_employer(name) is False, name
+
+
+_VISIT_PROBE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+_VISIT_PROBE_PATHS = ["/.env", "/wp-config.php", "/composer.json", "/appsettings.json",
+                      "/config/parameters.yml", "/web.config", "/.env.js", "/.env-config.js",
+                      "/settings.php", "/phpinfo.php", "/wp-login.php", "/litellm/config.yml"]
+
+
+def test_visit_probe_paths_are_probes():
+    for path in _VISIT_PROBE_PATHS:
+        assert pu.classify_visit(_VISIT_PROBE_UA, "1.2.3.4", False, path=path) == "probe", path
+        assert pu.visit_bot_flag(_VISIT_PROBE_UA, "1.2.3.4", False, path=path) == "probe", path
+
+
+def test_visit_probe_real_pages_are_people():
+    pages = ["/", "/lattice", "/code", "/job-engine", "/docfiler", "/crypto", "/budget",
+             "/budget/login", "/budget/logout", "/console", "/console/login", "/console/logout",
+             "/console/demo", "/resume/anything.pdf", "", None, 5]
+    for path in pages:
+        assert pu.visit_bot_flag(_VISIT_PROBE_UA, "1.2.3.4", False, path=path) is None, path
+
+
+def test_visit_probe_query_string_is_ignored():
+    assert pu.visit_bot_flag(_VISIT_PROBE_UA, "1.2.3.4", False, path="/lattice?r=abc") is None
+    assert pu.visit_bot_flag(_VISIT_PROBE_UA, "1.2.3.4", False, path="/.env?x=1") == "probe"
+    assert pu.visit_bot_flag(_VISIT_PROBE_UA, "1.2.3.4", False, path="/code#top") is None
+
+
+def test_visit_probe_is_case_and_slash_sensitive():
+    assert pu.visit_bot_flag(_VISIT_PROBE_UA, "1.2.3.4", False, path="/Lattice") == "probe"
+    assert pu.visit_bot_flag(_VISIT_PROBE_UA, "1.2.3.4", False, path="/code/") == "probe"
+
+
+def test_visit_probe_self_and_ignored_ip_stay_self():
+    assert pu.visit_bot_flag(_VISIT_PROBE_UA, "1.2.3.4", True, path="/.env") == "self"
+    assert pu.visit_bot_flag(_VISIT_PROBE_UA, "9.9.9.9", False, ignore_ips=("9.9.9.9",),
+                             path="/.env") == "self"
+
+
+def test_visit_probe_preview_and_crawler_keep_their_labels():
+    assert pu.visit_bot_flag("LinkedInBot/1.0", "1.2.3.4", False, path="/.env") == "preview:LinkedIn"
+    assert pu.visit_bot_flag("Googlebot/2.1", "1.2.3.4", False, path="/.env") == "crawler"
+
+
+def test_visit_probe_no_path_keeps_old_result():
+    assert pu.classify_visit(_VISIT_PROBE_UA, "1.2.3.4", False) is None
+    assert pu.classify_visit(_VISIT_PROBE_UA, "1.2.3.4", False, path=None) is None
+
+
+def test_visit_probe_counts_as_bot_not_visitor():
+    rows = [("a", "/code", "", pu.visit_bot_flag(_VISIT_PROBE_UA, "1.1.1.1", False, path="/code")),
+            ("b", "/.env", "", pu.visit_bot_flag(_VISIT_PROBE_UA, "2.2.2.2", False, path="/.env"))]
+    summary = pu.summarize_visits(rows)
+    assert summary["visitors"] == 1 and summary["bots"] == {"probe": 1}
+    assert "1 bot hit filtered" in pu.format_visitor_line(summary)
