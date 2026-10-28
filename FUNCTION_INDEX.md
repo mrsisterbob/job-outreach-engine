@@ -209,6 +209,22 @@ grep -i "contact" FUNCTION_INDEX.md
 | 31 | `route_company` | What /w does next: search_slug, skip, or search_guesses (with or without a lookup). |
 | 53 | `parse_seed` | Seed JSON text -> (entries, rejected). Bad elements are counted and dropped. Never raises. |
 
+## `hot_promotion.py` — 11 defs, 163 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 37 | `sender_address` | Lower-cased address from 'Name <a@b.com>' or a bare address; '' when there is none. |
+| 47 | `_strip_plus_tag` | _(no docstring)_ |
+| 52 | `sender_disqualifier` | Why this sender cannot earn Carmen Hot, or '' when they can. First hit wins. |
+| 78 | `auto_reply_flag` | True when lower-cased header name -> value marks a machine auto-reply (out of office). |
+| 89 | `decide_promotion` | Decide create / move / none. live_tab is the LIVE CRM lookup: a tab name, None when the |
+| 111 | `exchange_date_from_internal_ms` | Local date of a Gmail internalDate (epoch ms); fallback when missing or unparseable. |
+| 119 | `hot_followup_date` | YYYY-MM-DD, exchange date + HOT_FOLLOWUP_DAYS. |
+| 124 | `_clean_subject` | _(no docstring)_ |
+| 128 | `_origin` | _(no docstring)_ |
+| 134 | `promotion_note` | One dated notes line; carmen_reply_anchor reads the marker back as the reply date. |
+| 143 | `promotion_alert_html` | Telegram HTML naming who was promoted to Carmen Hot and why. |
+
 ## `linkedin_import.py` — 15 defs, 382 lines
 
 | Line | Name | Summary |
@@ -1272,4 +1288,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**983 definitions across 54 files + Code.gs.**
+**994 definitions across 55 files + Code.gs.**
