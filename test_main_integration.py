@@ -21121,3 +21121,44 @@ def test_warm_smartrecruiters_greenhouse_company_is_unaffected(monkeypatch):
     monkeypatch.setattr(m.requests, "get", lambda url, **kw: urls.append(url) or orig(url, **kw))
     m.fetch_ats_jobs(["acmerobotics"])
     assert len(urls) == 3 and not any("smartrecruiters" in u for u in urls), urls
+
+
+def _hb_slugs(h):
+    return sorted(s for _u, kw in h.posts for s in kw["json"]["company_slugs"])
+
+
+def test_hirebase_empty_e2e_zero_row_company_is_not_requested_again_next_day(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3, "Freshco Labs": 1})
+    h.feed = []
+    h.run()
+    assert "nopeboard-labs" in _hb_slugs(h), h.posts
+    assert m.hirebase_ledger_read()   # run 1 wrote zero-row ok rows
+    _hb_backdate("nopeboard labs", m.timedelta(days=1))
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM hirebase_jobs_ledger WHERE company_key = ?", ("freshco labs",))
+        conn.commit()
+    h.posts.clear()
+    h.run()
+    slugs = _hb_slugs(h)
+    assert "nopeboard-labs" not in slugs, slugs
+    assert "freshco-labs" in slugs, slugs
+    _hb_backdate("nopeboard labs", m.timedelta(days=15))
+    h.posts.clear()
+    h.run()
+    assert "nopeboard-labs" in _hb_slugs(h)
+
+
+def test_hirebase_empty_e2e_company_that_once_returned_rows_retries_after_4_days(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    assert [r[0] for r in _hirebase_ledger_rows()][0] == 1
+    _hb_backdate("nopeboard labs", m.timedelta(days=4))
+    h.feed = []
+    h.posts.clear()
+    h.run()   # narrow window, zero rows
+    assert "nopeboard-labs" in _hb_slugs(h)
+    _hb_backdate("nopeboard labs", m.timedelta(days=4))
+    h.posts.clear()
+    h.run()
+    assert "nopeboard-labs" in _hb_slugs(h), "an earlier row-returning search keeps the 3-day retry"

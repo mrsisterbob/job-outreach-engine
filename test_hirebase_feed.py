@@ -281,3 +281,51 @@ def test_hirebase_plan_unparseable_jobs_count_as_full_cap():
     plan = hf.plan_hirebase_run(_cands(3), [(_iso(1), "n/a", "errored", "x")], NOW)
     assert plan.month_used == hf.HIREBASE_MONTHLY_JOBS
     assert plan.skip_reason == "monthly_cap" and plan.picks == []
+
+
+# ---- empty bench (TASK-189) ----
+def _picked(ledger, **kw):
+    plan = hf.plan_hirebase_run([("acme", "Acme", 5)], ledger, NOW, **kw)
+    return [p[0] for p in plan.picks]
+
+
+def test_hirebase_empty_first_zero_waits_14_days_not_3():
+    led = [(_iso(4), 0, "ok", "acme")]
+    assert _picked(led) == [] and hf.first_search_was_empty("acme", led, NOW)
+    assert _picked([(_iso(13), 0, "ok", "acme")]) == []
+    assert _picked([(_iso(15), 0, "ok", "acme")]) == ["acme"]
+
+
+def test_hirebase_empty_earlier_rows_keep_the_3_day_retry():
+    led = [(_iso(20), 7, "ok", "acme"), (_iso(4), 0, "ok", "acme")]
+    assert _picked(led) == ["acme"] and not hf.first_search_was_empty("acme", led, NOW)
+    led = [(_iso(20), 7, "capped", "acme"), (_iso(4), 0, "ok", "acme")]
+    assert _picked(led) == ["acme"] and not hf.first_search_was_empty("acme", led, NOW)
+
+
+def test_hirebase_empty_errored_row_never_benches_or_counts_as_rows():
+    led = [(_iso(4), 25, "errored", "acme")]
+    assert _picked(led) == ["acme"] and not hf.first_search_was_empty("acme", led, NOW)
+    led = [(_iso(10), 25, "errored", "acme"), (_iso(4), 0, "ok", "acme")]
+    assert _picked(led) == [] and hf.first_search_was_empty("acme", led, NOW)
+
+
+def test_hirebase_empty_unbench_keys_plans_a_first_search():
+    led = [(_iso(4), 0, "ok", "acme")]
+    plan = hf.plan_hirebase_run([("acme", "Acme", 5)], led, NOW, unbench_keys=frozenset({"acme"}))
+    assert [(p[0], p[2]) for p in plan.picks] == [("acme", hf.HIREBASE_FIRST_DAYS)]
+
+
+def test_hirebase_empty_window_still_runs_from_last_ok_row():
+    plan = hf.plan_hirebase_run([("acme", "Acme", 5)], [(_iso(15), 0, "ok", "acme")], NOW)
+    assert plan.picks[0][2] == 16
+
+
+def test_hirebase_empty_helper_agrees_with_planner_for_every_shape():
+    shapes = [([(_iso(4), 0, "ok", "acme")], True),
+              ([(_iso(20), 3, "ok", "acme"), (_iso(4), 0, "ok", "acme")], False),
+              ([(_iso(4), 25, "errored", "acme")], False),
+              ([(_iso(4), 0, "capped", "acme")], False), ([], False)]
+    for led, benched in shapes:
+        assert hf.first_search_was_empty("acme", led, NOW) is benched, led
+        assert (_picked(led) == []) is benched, led   # inside 3-14 days only the bench holds it back
