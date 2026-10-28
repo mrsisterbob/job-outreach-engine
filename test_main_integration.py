@@ -21827,3 +21827,155 @@ def test_feedsource_second_init_keeps_rows():
     m.feed_source_upsert("acme", "a.com", "greenhouse", 2)
     m.init_db()
     assert m.feed_source_read()["acme"][:3] == ("a.com", "greenhouse", 2)
+
+
+# ---- /w calls Apify once for the no-board companies Hirebase could not answer (TASK-202) ----
+
+_APIFY_TEST_TOKEN = "apify_api_SECRETtoken0123456789"
+
+
+def _apify_wire_harness(monkeypatch, nobody=None, token=_APIFY_TEST_TOKEN):
+    h = _hirebase_hook_harness(monkeypatch, nobody if nobody is not None else {"Nopeboard Labs": 3, "Smallfry Inc": 1})
+    if token:
+        monkeypatch.setenv("APIFY_TOKEN", token)
+    else:
+        monkeypatch.delenv("APIFY_TOKEN", raising=False)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM apify_feed_ledger")
+        conn.commit()
+    h.apify_posts, h.apify_rows, h.apify_mode, h.apify_ledger_at_post = [], [], "ok", []
+    hirebase_post = m.requests.post
+
+    class _AResp:
+        def __init__(self, code, body):
+            self.status_code, self._body = code, body
+        def json(self):
+            return self._body
+
+    def router(url, **kw):
+        if "api.apify.com" in url:
+            h.apify_posts.append((url, kw))
+            with m.get_db_conn() as conn:   # the reserve row must already exist when the request goes out
+                h.apify_ledger_at_post.append(conn.execute("SELECT usd, status FROM apify_feed_ledger ORDER BY id").fetchall())
+            if h.apify_mode == "raise":
+                raise RuntimeError("apify down")
+            if h.apify_mode == "500":
+                return _AResp(500, {})
+            return _AResp(200, list(h.apify_rows))
+        return hirebase_post(url, **kw)
+
+    monkeypatch.setattr(m.requests, "post", router)
+    return h
+
+
+def _apify_row(org, title, n, domain=None):
+    compact = org.lower().replace(" ", "")
+    return {"id": f"{compact}{n}", "title": title, "organization": org,
+            "url": f"https://careers.{compact}.com/job/{n}", "locations_derived": ["Troy, Michigan, United States"],
+            "date_posted": (m.datetime.now(m.timezone.utc) - m.timedelta(days=2)).isoformat(),
+            "description_text": "Reconciliation workflows with SQL and reporting.",
+            "source_domain": domain or f"careers.{compact}.com", "organization_url": f"https://www.{compact}.com"}
+
+
+def _apify_ledger():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT usd, status, company_keys FROM apify_feed_ledger ORDER BY id").fetchall()
+
+
+def test_apify_wire_hirebase_empty_company_reaches_apify_once_and_covered_one_does_not(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]   # Hirebase answers Nopeboard, not Smallfry
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    h.run()
+    assert len(h.apify_posts) == 1, h.apify_posts
+    assert h.apify_posts[0][1]["json"]["organizationSearch"] == ["Smallfry Inc"]
+    assert sorted(h.cards) == ["Finance Analyst", "Operations Analyst"], h.cards
+
+
+def test_apify_wire_ledger_row_exists_at_post_and_settles_to_real_cost(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = []
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1), _apify_row("Nopeboard Labs", "Ops Analyst", 2)]
+    h.run()
+    assert len(h.apify_posts) == 1
+    at_post = h.apify_ledger_at_post[0]
+    assert len(at_post) == 1 and at_post[0][1] == "errored" and at_post[0][0] > 0, at_post
+    rows = _apify_ledger()
+    assert len(rows) == 1 and rows[0][1] == "ok", rows
+    assert abs(rows[0][0] - m.apify_feed.actual_cost(2)) < 1e-9, rows
+    assert rows[0][0] < at_post[0][0]
+
+
+@pytest.mark.parametrize("mode", ["raise", "500"])
+def test_apify_wire_failure_completes_scan_marks_nothing_and_ledger_errored(monkeypatch, mode):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = []
+    h.apify_mode = mode
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    text = h.run()
+    assert len(h.apify_posts) == 1 and text, text
+    assert h.cards == []
+    assert m.apify_seen_filter(["apify_smallfryinc1"]) == set()
+    rows = _apify_ledger()
+    assert len(rows) == 1 and rows[0][1] == "errored" and rows[0][0] > 0, rows
+    with m.get_db_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM hirebase_slug_registry WHERE status = 'no_jobs'").fetchone()[0] == 0
+
+
+def test_apify_wire_no_token_makes_no_apify_post_and_run_equals_apify_absent(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, token=None)
+    h.feed = []
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    with_rows = h.run()
+    assert h.apify_posts == [] and _apify_ledger() == [] and h.cards == []
+    h2 = _apify_wire_harness(monkeypatch, token=None)
+    h2.feed = []
+    assert h2.run() == with_rows
+
+
+def test_apify_wire_second_run_neither_resurfaces_seen_role_nor_recalls_apify(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    h.feed = []
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    h.run()
+    assert h.cards == ["Finance Analyst"] and len(h.apify_posts) == 1
+    assert m.apify_seen_filter(["apify_smallfryinc1"]) == {"apify_smallfryinc1"}
+    h.cards.clear()
+    h.run()
+    assert h.cards == [] and len(h.apify_posts) == 1 and len(_apify_ledger()) == 1
+    # Direct retry-window check: even with the company offered again, the ledger blocks a second call.
+    now = m.datetime.now(m.timezone.utc)
+    plan = m.apify_feed.plan_apify_run(
+        [(m.normalize_company_for_match("Smallfry Inc"), "Smallfry Inc", 2)], m.apify_ledger_read(), now)
+    assert plan.picks == [] and plan.skip_reason == "nothing_eligible"
+
+
+def test_apify_wire_hirebase_errored_company_is_not_sent_to_apify(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.apify_rows = [_apify_row("Nopeboard Labs", "Ops Analyst", 1)]
+    router = m.requests.post
+
+    def hb_boom(url, **kw):
+        if "api.apify.com" in url:
+            return router(url, **kw)
+        if url.endswith("/companies/search"):
+            return router(url, **kw)
+        raise RuntimeError("hirebase down")
+
+    monkeypatch.setattr(m.requests, "post", hb_boom)
+    h.run()
+    assert h.apify_posts == [] and _apify_ledger() == [] and h.cards == []
+
+
+def test_apify_wire_token_never_appears_in_logs(monkeypatch, caplog):
+    import logging as _lg
+    caplog.set_level(_lg.DEBUG)
+    for mode in ("ok", "raise", "500"):
+        h = _apify_wire_harness(monkeypatch)
+        h.feed = []
+        h.apify_mode = mode
+        h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+        h.run()
+        assert len(h.apify_posts) == 1
+        assert h.apify_posts[0][1]["headers"]["Authorization"].endswith(_APIFY_TEST_TOKEN)
+    assert _APIFY_TEST_TOKEN not in caplog.text
