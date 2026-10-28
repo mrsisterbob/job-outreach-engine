@@ -22,3 +22,4 @@ A command runs the real free resolver, `auto_expand_ats_slug`, over the 60-compa
 
 ## Log
 
+- BLOCKED by worker: needs two things this container lacks: (1) the fixed 60-company sample file TASK-221 writes outside the repo from Kevin's Carmen Warm export (export absent here, so no sample exists), and (2) live outbound network for the real free resolver auto_expand_ats_slug to probe ATS hosts (curl through this proxy returns 403 CONNECT for every host tried). The task exists to measure the real resolver; mocking it would defeat it, so nothing was built or faked. Kevin: run TASK-221's command first, then re-queue.
