@@ -1046,6 +1046,13 @@ grep -i "contact" FUNCTION_INDEX.md
 | 217 | `report` | _(no docstring)_ |
 | 239 | `main` | _(no docstring)_ |
 
+## `scripts/score_source.py` — 2 defs, 99 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 23 | `_per_source` | _(no docstring)_ |
+| 40 | `main` | _(no docstring)_ |
+
 ## `scripts/time_crm_reads.py` — 4 defs, 65 lines
 
 | Line | Name | Summary |
@@ -1077,6 +1084,27 @@ grep -i "contact" FUNCTION_INDEX.md
 | 44 | `_parse_bool` | _(no docstring)_ |
 | 59 | `_parse_number` | _(no docstring)_ |
 | 82 | `parse_source_config` | Raw System_Config dict (or None) -> SourceConfig; bad values fall back and are listed. |
+
+## `source_scoring.py` — 16 defs, 226 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 45 | `ColumnError` | A named column is not in the file's header. Message names the header that was found. |
+| 49 | `Columns` | Result-file column names. Any subset of company/domain and of system+token/url. |
+| 51 | `Columns.__init__` | _(no docstring)_ |
+| 54 | `Columns.named` | _(no docstring)_ |
+| 58 | `_clean` | _(no docstring)_ |
+| 62 | `board_from_url` | (system, token) for a board URL, or ("", "") when no board can be named. |
+| 85 | `_read_csv` | _(no docstring)_ |
+| 95 | `read_truth` | ({company_key: (system, token)}, not_labelled). Labelled `none` rows keep ("none", ""). |
+| 110 | `_domain_of` | _(no docstring)_ |
+| 118 | `read_result` | ({company_key: (system, token)}, unjoined) for one source's file. |
+| 149 | `verdict` | One verdict per labelled company. truth is (system, token); answer is (system, token) or None. |
+| 167 | `score` | {"overall": {n, HIT, ...}, tier: {...}, "unlabelled": N}. Rates use n = labelled companies. |
+| 183 | `_rate` | _(no docstring)_ |
+| 187 | `_per_hit` | _(no docstring)_ |
+| 191 | `format_report` | Printable lines. scores: {source: score(...)}; cost/seconds: {source: float} or None. |
+| 212 | `write_truth_template` | Write the labelling CSV (system and token blank). Returns (ok, reason). |
 
 ## `summary_figures.py` — 4 defs, 51 lines
 
@@ -1242,4 +1270,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**963 definitions across 52 files + Code.gs.**
+**981 definitions across 54 files + Code.gs.**
