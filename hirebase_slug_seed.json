@@ -1,0 +1,6 @@
+[
+  {"name": "Steelcase", "slug": "steelcase", "status": "no_jobs", "checked": "2026-10-27"},
+  {"name": "Trinity Health", "slug": "trinity-health-system", "status": "no_jobs", "checked": "2026-10-27"},
+  {"name": "Haworth", "slug": "haworth", "status": "covered", "checked": "2026-10-26"},
+  {"name": "Fifth Third Bank", "slug": "fifth-third-bank", "status": "covered", "checked": "2026-10-26"}
+]
