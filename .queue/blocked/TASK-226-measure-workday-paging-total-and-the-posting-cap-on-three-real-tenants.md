@@ -26,3 +26,4 @@ A read-only command measures, on three real Workday tenants, how the public CXS 
 
 ## Log
 
+- BLOCKED by worker: needs live outbound network to page three real Workday tenants' CXS endpoint and measure page size, total, and the ~2000 cap; this container's proxy returns 403 CONNECT for every external host (verified with curl for example.com and three geo hosts earlier; Workday host not allowed). Task is a measurement; no mocks/fakes substituted. No build attempted.
