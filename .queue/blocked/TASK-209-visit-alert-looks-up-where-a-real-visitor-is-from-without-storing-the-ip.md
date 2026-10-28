@@ -22,3 +22,4 @@ For each real-page human view that is ADMITTED to alert, the background alert th
 - Not in scope and for Kevin to know: the site's own `visits.py` docstring says the IP exists only in memory, in transit over HTTPS and in the engine's memory. With this task a third party receives the visitor's IP (alerted views only). The site footer ("sets no cookies and loads no trackers") stays literally true; that docstring does not. Do not edit montelattice-site.
 
 ## Log
+- BLOCKED by worker: dependency not done: TASK-206 (blocked, replaced by TASK-232 which IS merged), TASK-207 (blocked: needs outbound network, none here), TASK-208 (blocked, replaced by TASK-233 which IS merged). 207 is the real blocker. No build attempted.
