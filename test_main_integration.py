@@ -21536,3 +21536,135 @@ def test_hirebase_lookupstep_disabled_safely_without_key_or_ledger(monkeypatch):
     monkeypatch.setattr(m, "hirebase_company_ledger_read", lambda now=None: None)
     h2.run()
     assert h2.company_posts == []
+
+
+# ---- TASK-196: /w records per-stage title samples and /wstages shows the last run ----
+
+def _stage_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT run_at, snapshot FROM warm_stage_samples ORDER BY run_at, rowid").fetchall()
+
+
+def _stage_snapshot(nth_newest=1):
+    return json.loads(_stage_rows()[-nth_newest][1])
+
+
+def _stage_dispatch(monkeypatch, text):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    _dispatch(text)
+    return sent
+
+
+def _stage_boards():
+    return {
+        "Acme Robotics": [("Senior Operations Analyst", "Troy, MI"), ("Analista de Operaciones", "Troy, MI"),
+                          ("Operations Analyst Remote", "Remote"), ("Operations Analyst Columbus", "Columbus"),
+                          ("Operations Analyst Keep", "Troy, MI")],
+        "Globex Systems": [("Operations Analyst Weak", "Troy, MI")],
+    }
+
+
+def test_warm_stage_samples_run_each_stage_gets_the_right_sample_and_title_total_matches(monkeypatch):
+    h = _summary_harness(monkeypatch, _stage_boards())
+    h.gemini_scores["Operations Analyst Weak"] = 50
+    text = h.run()
+    snap = _stage_snapshot()
+
+    def titles(stage):
+        return {(x["company"], x["title"]) for x in snap[stage]["samples"]}
+
+    assert ("Acme Robotics", "Senior Operations Analyst") in titles("title_filter")
+    assert snap["title_filter"]["samples"][0]["detail"]
+    assert ("Acme Robotics", "Analista de Operaciones") in titles("region")
+    assert ("Acme Robotics", "Operations Analyst Remote") in titles("remote")
+    assert ("Acme Robotics", "Operations Analyst Columbus") in titles("michigan_screen")
+    ms = [x for x in snap["michigan_screen"]["samples"] if x["title"].endswith("Columbus")][0]
+    assert ms["detail"] == "city_allowlist", ms
+    assert ("Globex Systems", "Operations Analyst Weak") in titles("ai_screen")
+    assert ("Acme Robotics", "Operations Analyst Keep") in titles("card")
+    assert snap["card"]["samples"][0]["detail"].startswith("score ")
+    assert snap["pulled"]["total"] == 6
+    reported = int(re.search(r"(\d+) roles? filtered out by title", text).group(1))
+    assert snap["title_filter"]["total"] == reported == 1, (snap["title_filter"], text)
+
+
+def test_warm_stage_samples_run_caps_hold_in_the_stored_snapshot(monkeypatch):
+    boards = {c: [(f"Senior Analyst {c[0]}{i}", "Troy, MI") for i in range(10)]
+              for c in ("Acme Robotics", "Globex Systems", "Initech Labs")}
+    h = _summary_harness(monkeypatch, boards)
+    text = h.run()
+    snap = _stage_snapshot()["title_filter"]
+    assert snap["total"] == 30 and "30 roles filtered out by title" in text
+    assert len(snap["samples"]) <= 10
+    for c in boards:
+        assert sum(1 for x in snap["samples"] if x["company"] == c) <= 2
+
+
+def test_warm_stage_samples_run_wstages_reads_back_what_the_run_stored(monkeypatch):
+    h = _summary_harness(monkeypatch, {"Acme <Robotics>": [("Senior Analyst <b>", "Troy, MI"),
+                                                           ("Operations Analyst Keep", "Troy, MI")]})
+    h.run()
+    sent = _stage_dispatch(monkeypatch, "/wstages")
+    assert len(sent) == 1
+    assert "Senior Analyst &lt;b&gt;" in sent[0] and "Acme &lt;Robotics&gt;" in sent[0], sent[0]
+    assert "Operations Analyst Keep" in sent[0] and "<b>Senior" not in sent[0]
+    run_at = _stage_rows()[-1][0]
+    assert "/w run #1, " + run_at[:16] in sent[0], sent[0]
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM warm_stage_samples")
+        conn.commit()
+    assert _stage_dispatch(monkeypatch, "/wstages") == ["No /w run recorded yet."]
+    assert "Usage" in _stage_dispatch(monkeypatch, "/wstages 9")[0]
+    assert "Usage" in _stage_dispatch(monkeypatch, "/wstages abc")[0]
+
+
+def test_warm_stage_samples_run_keeps_five_runs_and_wstages_2_shows_the_previous_one(monkeypatch):
+    boards = {"Acme Robotics": [("Senior Analyst One", "Troy, MI")]}
+    h = _summary_harness(monkeypatch, boards)
+    h.run()
+    assert len(_stage_rows()) == 1
+    boards["Acme Robotics"][0] = ("Senior Analyst Two", "Troy, MI")
+    h.run()
+    assert len(_stage_rows()) == 2
+    for n in range(3, 8):
+        boards["Acme Robotics"][0] = (f"Senior Analyst N{n}", "Troy, MI")
+        h.run()
+    rows = _stage_rows()
+    assert len(rows) == 5
+    assert "Senior Analyst One" not in rows[0][1] and "Senior Analyst Two" not in rows[0][1]
+    newest = _stage_dispatch(monkeypatch, "/wstages")[0]
+    previous = _stage_dispatch(monkeypatch, "/wstages 2")[0]
+    assert "Senior Analyst N7" in newest and "Senior Analyst N6" in previous and "N7" not in previous
+
+
+def test_warm_stage_samples_run_a_raising_sampler_changes_neither_message_nor_cards(monkeypatch):
+    def run_once():
+        h = _summary_harness(monkeypatch, _stage_boards())
+        text = h.run()
+        return text, [r["row_data"][2] for r in h.rows()]
+
+    base_text, base_cards = run_once()
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM seen_jobs")
+        conn.execute("DELETE FROM warm_screen_memo")
+        conn.execute("DELETE FROM referral_asks")
+        conn.commit()
+
+    def boom(self, *a, **k):
+        raise RuntimeError("sampler broke")
+
+    monkeypatch.setattr(m.warm_stage_samples.StageSampler, "note", boom)
+    text, cards = run_once()
+    assert cards == base_cards and cards
+    strip = lambda t: re.sub(r"\d+ s\b", "N s", t)
+    assert strip(text) == strip(base_text)
+
+
+def test_warm_stage_samples_run_wstages_is_in_help_menu_and_the_help_lookup_answers_it():
+    import command_help as ch
+    assert ch.lookup_command_help("/wstages/")          # a string either way; HELP entry lives in command_help.py
+    assert ch.lookup_command_help("/wstages") is None   # the bare command is not swallowed by the help handler
+    src = open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()
+    assert "/wstages - Last /w run" in src
