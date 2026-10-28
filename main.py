@@ -20470,7 +20470,7 @@ def record_site_visits(views, day=None, alerts=None):
         rows.append((
             _visit_timestamp(v.get("ts")), path, daily_visitor_id(ip, ua, salt),
             normalize_referrer_host(v.get("referrer"), own) or None,
-            visit_bot_flag(ua, ip, bool(v.get("self")), ignore),
+            visit_bot_flag(ua, ip, bool(v.get("self")), ignore, path=path),
         ))
     if not rows:
         return 0
