@@ -15929,6 +15929,7 @@ def run_warm_radar_scan(chat_id=None):
         hirebase_errored_reserved = 0   # jobs reserved against the month by the request that errored
         hirebase_capped_cos = []        # (name, limit) per company whose rows hit the limit
         hirebase_err_detail = ""
+        hirebase_collected = 0   # postings handed to _collect_posting from the Hirebase loop
         hirebase_picked_names = []
         hirebase_hash_to_ids = {}   # job_hash -> hirebase job ids, so only settled roles are marked seen
         hirebase_searched = {}      # company key -> (outcome, returned, kept); read by the Apify fallthrough
@@ -16040,6 +16041,7 @@ def run_warm_radar_scan(chat_id=None):
                                         job = dict(job, employer_name=pick_name)
                                     hirebase_hash_to_ids.setdefault(
                                         generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
+                                    hirebase_collected += 1
                                     _collect_posting(job, jsearch_keys=hirebase_picked_keys)
                                 except Exception as e:
                                     logging.error(f"Warm Radar Hirebase posting error: {type(e).__name__}")
@@ -16061,6 +16063,8 @@ def run_warm_radar_scan(chat_id=None):
         apify_spent_usd = None
         apify_month_before = 0.0
         apify_collected = 0
+        apify_err_detail = ""        # fetch_feed error string only, never a body or the token
+        apify_reserved_usd = 0.0     # worst-case dollars reserved for the call
         apify_kept_by_company = {}
         apify_key_by_name = {}
         apify_hash_to_ids = {}   # job_hash -> apify job ids, so only settled roles are marked seen
@@ -16109,6 +16113,8 @@ def run_warm_radar_scan(chat_id=None):
                         else:
                             apify_status = "errored"
                             apify_spent_usd = apify_plan.worst_case_usd   # a failed call may still have billed
+                            apify_reserved_usd = apify_plan.worst_case_usd
+                            apify_err_detail = getattr(apify_result, "error", "") or "request raised"
                             apify_ledger_settle(apify_row_id, apify_plan.worst_case_usd, "errored")
                             logging.error(f"Warm Radar Apify call errored: {getattr(apify_result, 'error', 'raised')}")
                         if apify_status == "ok":
@@ -16408,6 +16414,42 @@ def run_warm_radar_scan(chat_id=None):
                                  + (f", {hirebase_lookup['errored']} errored" if hirebase_lookup["errored"] else "")
                                  + f", {hirebase_lookup['units_used'] if hirebase_lookup['units_used'] is not None else '?'} of "
                                  f"{hirebase_feed.COMPANY_MONTHLY_UNITS} units used this month")
+            # Apify. Counts only what the ledger saw: Kevin's own console runs are not in it. Unreadable
+            # registry / ledger / reserve are NOT silent: Apify was configured and could not run.
+            def _usd_text(v):
+                return f"${v:.3f}" if 0 < v < 0.01 else f"${v:.2f}"
+            if apify_status == "registry_unreadable":
+                lines.append("Apify skipped: registry unreadable, nothing was spent")
+            elif apify_status == "ledger_unreadable":
+                lines.append("Apify skipped: ledger unreadable, nothing was spent")
+            elif apify_status == "reserve_failed":
+                lines.append("Apify skipped: could not record the spend first, nothing was spent")
+            elif apify_status == "monthly_ceiling":
+                lines.append(f"Apify skipped: monthly budget used ({_usd_text(apify_month_before)} of "
+                             f"{_usd_text(apify_feed.APIFY_MONTHLY_CEILING_USD)})")
+            elif apify_status == "errored":
+                lines.append(f"Apify errored ({html.escape(apify_err_detail or 'unknown')}); "
+                             f"{len(apify_picked_names)} companies not searched, retried on a later run; "
+                             f"{_usd_text(apify_reserved_usd)} reserved against the month")
+            elif apify_status == "ok":
+                ap_empty = [n for n in apify_picked_names if not apify_kept_by_company.get(n)]
+                if ap_empty:
+                    names_text, _used = _warm_radar_name_list(ap_empty, 5)
+                    lines.append(f"Searched Apify, no rows for: {names_text} (the feed may not cover them; "
+                                 "that is not the same as no jobs)")
+                lines.append(f"Apify: {len(apify_picked_names)} companies, {apify_rows_returned} rows returned, "
+                             f"{apify_stats['kept']} kept, {_usd_text(apify_spent_usd)} this run, "
+                             f"{_usd_text(apify_month_before + apify_spent_usd)} of "
+                             f"{_usd_text(apify_feed.APIFY_MONTHLY_CEILING_USD)} this month "
+                             "(counts only what the ledger saw, not console runs)")
+            if apify_status != "unconfigured":
+                hb_unmatched = [n for n, _st, ret, kp in hirebase_per_company if ret > 0 and kp == 0]
+                if hb_unmatched:
+                    names_text, _used = _warm_radar_name_list(hb_unmatched, 5)
+                    lines.append(f"Hirebase returned rows but none matched for: {names_text} (not sent to Apify)")
+            if hirebase_collected or apify_collected:
+                lines.append("Postings collected by source (before screening): "
+                             f"Hirebase {hirebase_collected}, Apify {apify_collected}")
             if applied_skipped:
                 names_text, _used = _warm_radar_name_list(sorted(applied_skipped), 5)
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
