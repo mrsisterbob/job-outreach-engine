@@ -23,3 +23,5 @@ verify: python -m pytest test_visit_alert.py -q -k "visit_alert_geo" 2>&1 | tail
 - Wiring is TASK-209 and TASK-210. Do not touch `main.py`.
 
 ## Log
+- Attempt 1 (worker): implemented new signature in visit_alert.py and added 4 test_visit_alert_geo_* tests. verify exit=0 (4 passed, 14 deselected). Full test_visit_alert.py: 1 failed, 17 passed. Failing existing test: test_visit_alert_format_carries_path_host_and_escapes, line 77 `assert len(inspect.signature(va.format_visit_alert).parameters) == 3` -> `assert 6 == 3`. The mandated signature (place, org, who) necessarily breaks this signature-arity guard; existing tests may not be edited, so BLOCKED. Change left uncommitted in the worktree; that test's line 77 needs Kevin's decision (update it to 6).
+- BLOCKED by worker: built; its 4 visit_alert_geo tests pass, but the task's mandated 6-parameter signature breaks existing test_visit_alert_format_carries_path_host_and_escapes (test_visit_alert.py:77 asserts len(parameters) == 3, got 6). Fix needs editing that arity guard (3 -> 6); Kevin's order is no test edits, so held for his OK. Work on branch task/TASK-208.
