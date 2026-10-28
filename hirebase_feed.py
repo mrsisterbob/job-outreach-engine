@@ -250,6 +250,13 @@ HIREBASE_MIN_LIMIT = 5           # DESIGN CHOICE, not a measurement: a pick unde
 HIREBASE_FIRST_DAYS = 14         # DESIGN CHOICE, not a measurement: window for a never-searched company
 HIREBASE_RETRY_DAYS = 3          # DESIGN CHOICE, not a measurement: a recent ok search is skipped
 
+# DESIGN CHOICE, not a measurement. A company whose first completed search returned zero rows and
+# which never returned a row since waits this long, not retry_days. TRAP: the body ALWAYS carries
+# geo_locations Michigan and days_ago, so that zero means "no Michigan jobs in the window" OR "wrong
+# slug" OR "Hirebase holds nothing", and the three cannot be told apart. Hence two weeks, not months.
+# The permanent answer is the slug registry, not this bench.
+HIREBASE_EMPTY_RETRY_DAYS = 14
+
 HirebasePlan = namedtuple("HirebasePlan", "picks month_used usable_left reserved skip_reason")
 
 
@@ -264,21 +271,60 @@ def _plan_ts(ts, now):
     return now if dt > now else dt
 
 
+def _ledger_marks(ledger, now):
+    """(last_ok, newest_ok_jobs, ever_rows) per key. errored jobs is a RESERVED limit, never rows.
+
+    Ledger window caveat: hirebase_ledger_read returns only the trailing 60 days, so a company's
+    zero row ages out and it plans as never searched again (first window).
+    """
+    last_ok, newest_jobs, ever_rows = {}, {}, {}
+    for ts, jobs, status, key in ledger:
+        if status not in ("ok", "capped"):
+            continue
+        dt = _plan_ts(ts, now)
+        try:
+            n = max(0, int(jobs))
+        except (ValueError, TypeError, OverflowError):
+            n = 1  # unparseable: not provably empty
+        if n > 0:
+            ever_rows[key] = True
+        if status == "ok" and (key not in last_ok or dt > last_ok[key]):
+            last_ok[key] = dt
+            newest_jobs[key] = n
+    return last_ok, newest_jobs, ever_rows
+
+
+def _empty_benched(key, last_ok, newest_jobs, ever_rows):
+    return key in last_ok and not ever_rows.get(key) and newest_jobs.get(key) == 0
+
+
+def first_search_was_empty(key, ledger, now):
+    """True when key's newest ok search returned zero rows and it has never returned a row."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    last_ok, newest_jobs, ever_rows = _ledger_marks(ledger, now)
+    return _empty_benched(key, last_ok, newest_jobs, ever_rows)
+
+
 def plan_hirebase_run(candidates, ledger, now, per_run=HIREBASE_COMPANIES_PER_RUN,
                       monthly=HIREBASE_MONTHLY_JOBS, reserve=HIREBASE_RESERVE_JOBS,
                       limit_per_company=HIREBASE_LIMIT_PER_COMPANY, min_limit=HIREBASE_MIN_LIMIT,
-                      first_days=HIREBASE_FIRST_DAYS, retry_days=HIREBASE_RETRY_DAYS):
+                      first_days=HIREBASE_FIRST_DAYS, retry_days=HIREBASE_RETRY_DAYS,
+                      empty_retry_days=HIREBASE_EMPTY_RETRY_DAYS, unbench_keys=frozenset()):
     """Pure spend guard: which no-board companies to search, each with days_ago and limit.
 
     candidates: iterable of (company_key, display_name, contact_count)
     ledger: iterable of (iso_timestamp, jobs, status, company_key); status "ok", "capped" or
     "errored", one row per request. The sum of the picks' limits never exceeds usable_left, because
     the cap check uses the REQUESTED limit as worst case (per docs, NOT measured).
+    An empty-benched company (see first_search_was_empty) waits empty_retry_days, not retry_days.
+    unbench_keys: keys with a newly resolved slug; for them the bench and the retry gap are ignored
+    and they plan as a first search (first_days, no watermark).
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     month_used = 0
-    last_ok = {}
+    last_ok, newest_jobs, ever_rows = _ledger_marks(ledger, now)
     for ts, jobs, status, key in ledger:
         dt = _plan_ts(ts, now)
         try:
@@ -287,17 +333,20 @@ def plan_hirebase_run(candidates, ledger, now, per_run=HIREBASE_COMPANIES_PER_RU
             n = monthly  # unparseable: assume the worst, never grant budget
         if (dt.year, dt.month) == (now.year, now.month):
             month_used += n  # errored rows count too: a failed request may have billed
-        if status == "ok" and (key not in last_ok or dt > last_ok[key]):
-            last_ok[key] = dt  # a capped row never advances the watermark
     usable_left = max(0, monthly - reserve - month_used)
     if usable_left < min_limit:
         return HirebasePlan([], month_used, usable_left, 0, "monthly_cap")
     retry_gap = timedelta(days=retry_days)
+    empty_gap = timedelta(days=empty_retry_days)
     eligible = []
     for key, name, contacts in candidates:
         wm = last_ok.get(key)
-        if wm is not None and now - wm < retry_gap:
-            continue
+        if key in unbench_keys:
+            wm = None
+        elif wm is not None:
+            gap = empty_gap if _empty_benched(key, last_ok, newest_jobs, ever_rows) else retry_gap
+            if now - wm < gap:
+                continue
         eligible.append((key, name, contacts, wm))
     eligible.sort(key=lambda c: (-(c[2] or 0), c[0]))
     picks = []
