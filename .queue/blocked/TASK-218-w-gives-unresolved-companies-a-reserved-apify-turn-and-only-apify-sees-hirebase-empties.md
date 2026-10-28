@@ -21,3 +21,4 @@ The Apify fall-through sees every company Hirebase answered with zero rows (this
 
 ## Log
 
+- BLOCKED by worker: dependency TASK-217 not done (blocked: 5 existing tests need company_resolution cleared between their /w runs; see TASK-217 Log). No build attempted.
