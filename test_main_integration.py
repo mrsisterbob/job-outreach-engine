@@ -22514,3 +22514,234 @@ def test_source_share_line_unreadable_store_prints_unavailable(monkeypatch, stor
 def test_source_share_line_helper_zero_total_prints_nothing():
     assert m._warm_radar_source_share_line(0, 0) == ""
     assert m._warm_radar_source_share_line(None, None) == "Job-source coverage unavailable this run"
+
+
+# ---- TASK-228: hot_promote_tracked - a two-way exchange moves a tracked contact to Carmen Hot ----
+
+_HOT_TAB_CODES = {"Carmen Cold": "CC", "Carmen Warm": "CW", "Carmen Hot": "CH", "Tetiana Cold": "TC"}
+_HOT_SENDER = "Dana Lee <dana@acmecorp.com>"
+_HOT_SNIPPET = "Thanks Kevin, good to hear from you. Happy to answer a couple of questions about the team."
+
+
+class _HotWorld(_FakeCarmenSheet):
+    """_FakeCarmenSheet plus the live CRM: find_contact_by_email reads the tabs and crm_post writes
+    land in them (update_status really moves the row), so the poller is judged on where the row
+    ENDS UP. `enqueued` holds only what went through the outbox."""
+
+    def __init__(self, monkeypatch, tab, row_extra=None, tab_hot_uuid=None):
+        super().__init__(monkeypatch, [])
+        self.tabs = {"CC": [], "CW": [], "CH": [], "TC": []}
+        row = _person("dana", "2026-09-01", email="dana@acmecorp.com")
+        row.update({"name": "Dana Lee", "company": "Acme", **(row_extra or {})})
+        self.tabs[_HOT_TAB_CODES[tab]].append(row)
+        self.cached_tab = tab
+        self.enqueued, self.posts, self.recorded = [], [], []
+        self.lookup_mode, self.fail_actions = "ok", set()
+        monkeypatch.setattr(m, "CRM_WEBHOOK_URL", "http://crm.invalid/exec")
+        monkeypatch.setattr(m, "crm_get", self._crm_get)
+        monkeypatch.setattr(m, "crm_post", self._crm_post)
+        monkeypatch.setattr(m, "enqueue_crm_payload", self._enqueue)
+        monkeypatch.setattr(m, "record_captured_contact", lambda *a, **k: self.recorded.append(a))
+        monkeypatch.setattr(m, "GMAIL_USER", "kevin@example.com")
+
+    def _enqueue(self, payload):
+        self.enqueued.append(dict(payload))
+        return self.apply(payload)
+
+    def apply(self, payload):
+        row = self.row(payload["sheet_uuid"])
+        if payload["action"] == "update_status" and row is not None:
+            for rows in self.tabs.values():
+                if row in rows:
+                    rows.remove(row)
+            self.tabs[_HOT_TAB_CODES[payload["new_tab"]]].append(row)
+            self.moves.append((payload["sheet_uuid"], payload["new_tab"]))
+            return True
+        if payload["action"] == "set_status" and row is not None:
+            row["status"] = payload["status"]
+            return True
+        return super().apply(payload) if row is not None else False
+
+    def tab_of(self, sheet_uuid):
+        names = {v: k for k, v in _HOT_TAB_CODES.items()}
+        return next((names[c] for c, rows in self.tabs.items() for r in rows if r["sheet_uuid"] == sheet_uuid), None)
+
+    def count_rows(self):
+        return sum(len(rows) for rows in self.tabs.values())
+
+    def _crm_get(self, params, timeout=10):
+        if params.get("action") != "find_contact_by_email":
+            return _HotResp(200, {"status": "success"})
+        if self.lookup_mode == "none":
+            return None
+        if self.lookup_mode == "500":
+            return _HotResp(500, {})
+        if self.lookup_mode == "badjson":
+            return _HotResp(200, None)
+        for tab, rows in ((n, self.tabs[c]) for n, c in _HOT_TAB_CODES.items()):
+            for r in rows:
+                if r["email"] == params.get("email"):
+                    return _HotResp(200, {"status": "success", "found": True, "sheet_uuid": r["sheet_uuid"],
+                                          "sheet_tab": tab, "name": r["name"], "company": r["company"]})
+        return _HotResp(200, {"status": "success", "found": False})
+
+    def _crm_post(self, payload, timeout=10):
+        self.posts.append(dict(payload))
+        if payload["action"] in self.fail_actions:
+            return _HotResp(200, {"status": "error", "message": "boom"})
+        return _HotResp(200, {"status": "success" if self.apply(payload) else "error", "message": "no row"})
+
+    def crm_lookup(self, sender):
+        row = next((r for rows in self.tabs.values() for r in rows if r["sheet_uuid"] == "dana"), None)
+        if "dana@acmecorp.com" not in sender.lower() or row is None:
+            return None
+        return {"name": "Dana Lee", "company": "Acme", "tab": self.cached_tab, "sheet_uuid": "dana"}
+
+
+class _HotResp:
+    def __init__(self, status_code, body):
+        self.status_code, self._body, self.text = status_code, body, "x"
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+def _hot_poll(monkeypatch, world, snippet=_HOT_SNIPPET, sender=_HOT_SENDER, kevin_sent=True,
+              extra_headers=None, msg_id="hot1", age_seconds=3 * 86400):
+    # A fixed internalDate several days back makes exchange + 7 differ from today + 7; the age
+    # ceiling would otherwise drop a 3-day-old message before it reached the CRM branch.
+    monkeypatch.setattr(m, "INBOUND_ALERT_MAX_AGE_SECONDS", 10 * 86400)
+    msg = _gmail_message(msg_id, sender, "Re: Operations role", snippet,
+                         extra_headers=extra_headers, age_seconds=age_seconds)
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [msg], crm_lookup=world.crm_lookup,
+                                          thread_started=kevin_sent)
+    ms = int(msg["internalDate"])
+    return alerts, datetime.fromtimestamp(ms / 1000).date()
+
+
+def _hot_alerts(alerts):
+    return [a for a in alerts if "is now in Carmen Hot" in a]
+
+
+@pytest.mark.parametrize("tab", ["Carmen Cold", "Carmen Warm", "Tetiana Cold"])
+def test_hot_promote_tracked_two_way_exchange_moves_row_to_hot(monkeypatch, tab):
+    world = _HotWorld(monkeypatch, tab)
+    alerts, exchange = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Hot"
+    assert world.count_rows() == 1  # moved, not duplicated
+    row = world.row("dana")
+    assert row["status"] == m.CARMEN_HOT_DEFAULT_STATUS == "Follow-up Due"
+    assert row["next_followup"] == (exchange + timedelta(days=7)).strftime("%Y-%m-%d")
+    assert row["next_followup"] != (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+    assert m.INBOUND_REPLY_NOTE_MARKER in row["note"]
+    assert len(_hot_alerts(alerts)) == 1 and tab in _hot_alerts(alerts)[0]
+    assert [r[1] for r in world.recorded] == ["Carmen Hot"]
+
+
+def test_hot_promote_tracked_reply_without_kevin_in_thread_moves_nothing(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    alerts, _ = _hot_poll(monkeypatch, world, kevin_sent=False)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not _hot_alerts(alerts)
+    assert not any(p["action"] == "update_status" for p in world.posts)
+
+
+def test_hot_promote_tracked_already_hot_is_left_alone_across_polls(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Hot", row_extra={"status": "Interviewing"})
+    world.cached_tab = "Carmen Cold"  # stale cache still says Cold
+    alerts, _ = _hot_poll(monkeypatch, world)
+    alerts2, _ = _hot_poll(monkeypatch, world)
+    assert not _hot_alerts(alerts) and not _hot_alerts(alerts2)
+    assert world.posts == [] and world.enqueued == []
+    assert world.count_rows() == 1 and len(world.tabs["CH"]) == 1
+    assert world.row("dana")["status"] == "Interviewing"
+
+
+def test_hot_promote_tracked_second_poll_of_a_promoted_message_adds_nothing(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    alerts, _ = _hot_poll(monkeypatch, world)
+    writes = len(world.posts)
+    world.cached_tab = "Carmen Cold"  # cache never caught up (e.g. SQLite wiped by a deploy)
+    alerts2, _ = _hot_poll(monkeypatch, world)
+    assert len(_hot_alerts(alerts)) == 1 and not _hot_alerts(alerts2)
+    assert len(world.posts) == writes
+    assert len(world.tabs["CH"]) == 1 and world.count_rows() == 1
+
+
+def test_hot_promote_tracked_stale_cache_cold_but_live_hot_does_not_move(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Hot")
+    world.cached_tab = "Carmen Cold"
+    alerts, _ = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Hot"
+    assert not _hot_alerts(alerts)
+    assert not any(p["action"] == "update_status" for p in world.posts + world.enqueued)
+
+
+@pytest.mark.parametrize("mode", ["none", "500", "badjson"])
+def test_hot_promote_tracked_failed_live_lookup_writes_nothing(monkeypatch, caplog, mode):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    world.lookup_mode = mode
+    with caplog.at_level("INFO"):
+        alerts, _ = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Cold" and world.count_rows() == 1
+    assert not _hot_alerts(alerts)
+    assert world.posts == []
+    assert "[HOT PROMOTE] skip: lookup_failed" in caplog.text
+
+
+@pytest.mark.parametrize("snippet", [
+    "We would like to schedule an interview with you next Tuesday at 2pm.",
+    "Unfortunately we have decided to move forward with other candidates for this position.",
+])
+def test_hot_promote_tracked_status_events_stay_put(monkeypatch, snippet):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    alerts, _ = _hot_poll(monkeypatch, world, snippet=snippet)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not _hot_alerts(alerts)
+    assert not any(p["action"] == "update_status" for p in world.posts)
+
+
+def test_hot_promote_tracked_move_is_not_undone_and_sequencer_leaves_hot_alone(monkeypatch):
+    world = _HotWorld(monkeypatch, "Tetiana Cold")
+    _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Hot"
+    # route_inbound_reply_to_crm's writes would drain AFTER the direct ones and undo the move.
+    assert not any(p["action"] == "update_status" for p in world.enqueued)
+    assert not any(p["action"] == "update_snooze" for p in world.enqueued)
+    assert world.enqueued == []
+    before = list(world.posts)
+    result = m.run_followup_sequencer(today=date.today() + timedelta(days=60))
+    assert world.enqueued == [] and world.posts == before
+    assert world.tab_of("dana") == "Carmen Hot"
+
+
+def test_hot_promote_tracked_update_status_failure_warns_once_without_success_alert(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    world.fail_actions = {"update_status"}
+    alerts, _ = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not _hot_alerts(alerts)
+    warnings = [a for a in alerts if "Could not move" in a]
+    assert len(warnings) == 1 and "/promote by hand" in warnings[0]
+    assert [p["action"] for p in world.posts] == ["update_status"]  # nothing after the gate failed
+
+
+def test_hot_promote_tracked_later_write_failure_still_alerts_and_names_it(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    world.fail_actions = {"update_snooze"}
+    alerts, _ = _hot_poll(monkeypatch, world)
+    assert world.tab_of("dana") == "Carmen Hot"
+    assert len(_hot_alerts(alerts)) == 1 and "next followup" in _hot_alerts(alerts)[0]
+
+
+@pytest.mark.parametrize("sender,extra", [
+    ("Dana Lee <dana@acmecorp.com>", {"Auto-Submitted": "auto-replied"}),
+    ("Kevin <kevin@example.com>", None),
+])
+def test_hot_promote_tracked_auto_replies_and_own_address_never_promote(monkeypatch, sender, extra):
+    world = _HotWorld(monkeypatch, "Carmen Cold", row_extra={"email": "kevin@example.com"} if "kevin@" in sender else None)
+    alerts, _ = _hot_poll(monkeypatch, world, sender=sender, extra_headers=extra)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not _hot_alerts(alerts)
