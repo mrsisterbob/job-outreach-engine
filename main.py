@@ -15487,6 +15487,29 @@ def _warm_radar_coverage_line(contacts_by_bucket, unplaced):
             f"{unplaced} with no company")
 
 
+def _warm_radar_source_share_line(covered, total):
+    """ONE counts-only line: of all warm CONTACTS, how many work at a company with a working job
+    source (a board /w scans, a Hirebase slug with jobs, or an Apify feed with rows). covered=None
+    means the source records could not be built (a store read failed): say so, never guess.
+    total == 0 prints nothing."""
+    if covered is None or total is None:
+        return "Job-source coverage unavailable this run"
+    if not total:
+        return ""
+    return f"Warm contacts with a working job source: {covered} of {total} ({round(100 * covered / total)}%)"
+
+
+def _warm_radar_source_share(records, not_company_contacts, unplaced):
+    """(covered, total) for the closing line. DENOMINATOR DECISION: total is ALL warm contacts the
+    run read, so contacts at not_company / non-employer entries and unplaced contacts (no company)
+    are added to the total and never to the covered side. Conservative, and tied to the Carmen Warm
+    row count. records None (build failed) -> (None, None)."""
+    if records is None:
+        return None, None
+    covered, total = company_source.covered_contact_share(records)
+    return covered, total + not_company_contacts + unplaced
+
+
 WARM_SCREEN_BUDGET_SECONDS = 150   # the planner's guess, NOT measured: nobody has timed ~60 Gemini calls here
 
 
@@ -15775,6 +15798,7 @@ def run_warm_radar_scan(chat_id=None):
         [c for c in lookup_now if _count_of.get(c, 1) < warm_big_companies.WARM_BOARD_TARGET_MIN_CONTACTS],
     ]
     in_flight_skipped = len(unchecked_all) - len(unchecked)
+    source_records = None   # set inside the try below; None also covers a raise before it
     # Everything after the batch is chosen sits in try/finally: the lookups start exactly once on
     # every path out (a raise in the scan loop, the early "no cached board" return, the normal
     # end). They run AFTER the closing message on a normal exit, because the lookups are slow
@@ -15783,6 +15807,11 @@ def run_warm_radar_scan(chat_id=None):
         unplaced_count = _warm_radar_unplaced_count()
         unplaced_line = _warm_radar_unplaced_line(unplaced_count)
         coverage_line = _warm_radar_coverage_line(contacts_by_bucket, unplaced_count)
+        # The ONE record build of this /w (stores read once); the share line and the Companies-tab
+        # mirror below both use it.
+        source_records = warm_radar_source_records(warm_contacts, None if identity_read_failed else identity_rows, not_employer_keys)
+        _share_c, _share_t = _warm_radar_source_share(source_records, contacts_by_bucket["not_company"], unplaced_count)
+        source_share_line = _warm_radar_source_share_line(_share_c, _share_t)
 
         def _skipped_report():
             lines = []
@@ -15808,6 +15837,8 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(unplaced_line)
             if coverage_line:
                 lines.append(coverage_line)
+            if source_share_line:
+                lines.append(source_share_line)
             _target = warm_big_companies.board_target_line(big_rows)
             if _target:
                 lines.append(_target)
@@ -16665,7 +16696,8 @@ def run_warm_radar_scan(chat_id=None):
         def _warm_radar_after_scan():
             if lookup_now:
                 _warm_radar_lookup_drain(lookup_phases)
-            _warm_radar_mirror_run(warm_contacts, None if identity_read_failed else identity_rows, not_employer_keys)
+            if source_records is not None:   # built once above; None = a store read failed, nothing to mirror
+                mirror_company_sources(source_records)
         try:
             _spawn_background(_warm_radar_after_scan)
         except Exception:

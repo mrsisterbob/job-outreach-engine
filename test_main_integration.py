@@ -22456,3 +22456,61 @@ def test_companies_mirror_code_gs_validates_before_it_touches_the_sheet():
     assert block.index('setNumberFormat("@")') < block.index("setValues(")
     assert "setFrozenRows(1)" in block and 'setFontWeight("bold")' in block
     assert "status: \"success\", rows: rows.length" in block.replace("'", '"') or "rows: rows.length" in block
+
+
+# ---- TASK-220: /w closing message share of warm contacts with a working job source ----
+
+def _share_line(text):
+    return next((ln for ln in text.splitlines() if "working job source" in ln or "coverage unavailable" in ln), "")
+
+
+def test_source_share_line_counts_contacts_not_companies(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"] * 40 + ["Globex Systems", "Initech Labs"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    text = h.run()
+    assert "Warm contacts with a working job source: 40 of 42 (95%)" in _share_line(text)
+    assert "1 of 3" not in text
+
+
+def test_source_share_line_hirebase_covered_counts_no_jobs_does_not(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Hireco Labs", "Hireco Labs", "Emptyco Labs"])
+    assert m.hirebase_registry_upsert(m.normalize_company_for_match("Hireco Labs"), "hireco-labs", "covered")
+    assert m.hirebase_registry_upsert(m.normalize_company_for_match("Emptyco Labs"), "emptyco-labs", "no_jobs")
+    assert "working job source: 2 of 3 (67%)" in _share_line(h.run())
+
+
+def test_source_share_line_apify_rows_count_zero_rows_do_not(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Feedco Labs", "Feedco Labs", "Feedco Labs", "Dryco Labs"])
+    assert m.feed_source_upsert(m.normalize_company_for_match("Feedco Labs"), "feedco.com", "apify", 7)
+    assert m.feed_source_upsert(m.normalize_company_for_match("Dryco Labs"), "dryco.com", "apify", 0)
+    assert "working job source: 3 of 4 (75%)" in _share_line(h.run())
+
+
+def test_source_share_line_not_company_raises_total_only(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "cousin", "https://www.linkedin.com/in/someone"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    assert "working job source: 1 of 3 (33%)" in _share_line(h.run())
+
+
+def test_source_share_line_unplaced_contacts_raise_total_only(monkeypatch):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "", ""])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    line = _share_line(h.run())
+    unplaced = len(m.get_warm_contacts_without_company())
+    assert unplaced == 2
+    assert f"working job source: 1 of {1 + unplaced} (33%)" in line
+
+
+@pytest.mark.parametrize("store", ["hirebase_registry_read", "feed_source_read", "resolution_read"])
+def test_source_share_line_unreadable_store_prints_unavailable(monkeypatch, store):
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics", "Globex Systems"])
+    m.upsert_company_identity("Acme Robotics", ats_slug="acmerobotics")
+    monkeypatch.setattr(m, store, lambda: None)
+    text = h.run()
+    assert "Job-source coverage unavailable this run" in text
+    assert "working job source:" not in text
+
+
+def test_source_share_line_helper_zero_total_prints_nothing():
+    assert m._warm_radar_source_share_line(0, 0) == ""
+    assert m._warm_radar_source_share_line(None, None) == "Job-source coverage unavailable this run"
