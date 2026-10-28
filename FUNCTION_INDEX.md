@@ -121,6 +121,24 @@ grep -i "contact" FUNCTION_INDEX.md
 | 325 | `domain_board` | 'workday' for a host ending .myworkdayjobs.com, else ''. Other boards' domains are unmeasured. |
 | 331 | `summarize_feed_sources` | kept dict from split_rows -> display name -> {source_domain, job_board, rows}. |
 
+## `ats_endpoint_report.py` — 13 defs, 199 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 32 | `_check_parts` | _(no docstring)_ |
+| 42 | `parse_board_arg` | 'icims=acme/jobs' -> ('icims', 'acme/jobs'). ValueError with a reason on any bad form. |
+| 55 | `build_url` | Fill the spec's {0}, {1} placeholders with the parts of ref. ValueError on mismatch / non-https. |
+| 71 | `resolve_path` | Value at path (dict keys / list indexes) or None when any step is missing or mistyped. |
+| 89 | `_text_of` | _(no docstring)_ |
+| 102 | `first_value` | (value, index of the winning path) for the first path giving non-empty text, else (None, None). |
+| 111 | `_result` | _(no docstring)_ |
+| 122 | `no_answer_result` | _(no docstring)_ |
+| 126 | `no_public_endpoint_result` | _(no docstring)_ |
+| 130 | `not_measured_result` | _(no docstring)_ |
+| 134 | `measure_reply` | One raw reply -> the plain result dict (counts and key names only). |
+| 167 | `_frac` | _(no docstring)_ |
+| 171 | `render_report` | Lines in UNFETCHED_SYSTEMS order, then one plain-words summary line. |
+
 ## `board_system_classifier.py` — 4 defs, 76 lines
 
 | Line | Name | Summary |
@@ -1291,4 +1309,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**997 definitions across 55 files + Code.gs.**
+**1010 definitions across 56 files + Code.gs.**
