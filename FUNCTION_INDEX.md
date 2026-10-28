@@ -1054,6 +1054,18 @@ grep -i "contact" FUNCTION_INDEX.md
 | 76 | `fit_one_line` | Flatten [(label, desc)] pairs into ONE line of skill names no longer than max_chars. |
 | 100 | `fit_labeled_lines` | Keep each (label, desc) pair its own line, none longer than max_line_chars. |
 
+## `source_config.py` — 7 defs, 99 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 22 | `SourceConfig` | _(no docstring)_ |
+| 32 | `SourceConfig.hirebase_on` | _(no docstring)_ |
+| 36 | `SourceConfig.apify_on` | _(no docstring)_ |
+| 40 | `_unset` | _(no docstring)_ |
+| 44 | `_parse_bool` | _(no docstring)_ |
+| 59 | `_parse_number` | _(no docstring)_ |
+| 82 | `parse_source_config` | Raw System_Config dict (or None) -> SourceConfig; bad values fall back and are listed. |
+
 ## `summary_figures.py` — 4 defs, 51 lines
 
 | Line | Name | Summary |
@@ -1204,4 +1216,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**940 definitions across 49 files + Code.gs.**
+**947 definitions across 50 files + Code.gs.**
