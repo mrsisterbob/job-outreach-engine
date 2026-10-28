@@ -74,7 +74,7 @@ def test_visit_alert_format_carries_path_host_and_escapes():
     assert "<script>" not in bad and "&lt;script&gt;" in bad
     assert va.format_visit_alert("t", "/", "").count("direct") == 1
     assert len(va.format_visit_alert("t", "/" + "a" * 500, "")) < 250
-    assert len(inspect.signature(va.format_visit_alert).parameters) == 3
+    assert len(inspect.signature(va.format_visit_alert).parameters) == 6
 
 
 def test_visit_alert_enabled_env():
@@ -82,3 +82,32 @@ def test_visit_alert_enabled_env():
     for v in ("0", "false", "no", "off", "OFF"):
         assert va.visit_alerts_enabled({"VISIT_ALERTS_ENABLED": v}) is False
     assert va.visit_alerts_enabled({"VISIT_ALERTS_ENABLED": "1"}) is True
+
+
+def test_visit_alert_geo_three_args_unchanged():
+    out = va.format_visit_alert("3:42 PM", "/job-engine", "linkedin.com")
+    assert out == ("👀 <b>Someone opened montelattice.com</b>\n"
+                   "<code>/job-engine</code> · via linkedin.com\n3:42 PM")
+    assert va.format_visit_alert("t", "/", "", None, "", None) == va.format_visit_alert("t", "/", "")
+
+
+def test_visit_alert_geo_empty_place_reads_unknown():
+    out = va.format_visit_alert("t", "/", "", place="", org="Acme")
+    assert "📍 location unknown" in out and "Acme" not in out and "📍 \n" not in out
+
+
+def test_visit_alert_geo_place_and_org():
+    both = va.format_visit_alert("t", "/", "", place="Grand Rapids, Michigan", org="Steelcase Inc.")
+    assert "📍 Grand Rapids, Michigan · Steelcase Inc." in both
+    solo = va.format_visit_alert("t", "/", "", place="Grand Rapids, Michigan", org="")
+    assert "📍 Grand Rapids, Michigan\n" in solo and "·  " not in solo and "Steelcase" not in solo
+
+
+def test_visit_alert_geo_who_under_title_and_escaped():
+    out = va.format_visit_alert("t", "/", "", place="<b>p</b>", org="<b>o</b>", who="<b>w</b>")
+    lines = out.split("\n")
+    assert lines[1] == "👤 Opened by &lt;b&gt;w&lt;/b&gt;"
+    assert "&lt;b&gt;p&lt;/b&gt; · &lt;b&gt;o&lt;/b&gt;" in out and "<b>p" not in out
+    assert "Opened by" not in va.format_visit_alert("t", "/", "", who="  ")
+    capped = va.format_visit_alert("t", "/", "", place="p" * 500, org="o" * 500, who="w" * 500)
+    assert "w" * 81 not in capped and "p" * 81 not in capped and "o" * 81 not in capped
