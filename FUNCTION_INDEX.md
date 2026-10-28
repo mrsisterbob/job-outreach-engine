@@ -1119,6 +1119,20 @@ grep -i "contact" FUNCTION_INDEX.md
 | 92 | `digest_lines` | Digest lines in /t's shape: score right-aligned, company and title truncated. |
 | 101 | `rotation_report` | Closing-message lines that make the screen order visible (a measurement, no behavior). |
 
+## `warm_stage_samples.py` — 9 defs, 104 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 24 | `_clean` | _(no docstring)_ |
+| 30 | `StageSampler` | Counts every note per stage; keeps samples only under both caps. |
+| 33 | `StageSampler.__init__` | _(no docstring)_ |
+| 37 | `StageSampler.note` | _(no docstring)_ |
+| 49 | `StageSampler.snapshot` | _(no docstring)_ |
+| 56 | `snapshot_is_empty` | True when every stage total is 0 (or the snapshot is unusable). |
+| 64 | `_sample_line` | _(no docstring)_ |
+| 71 | `_render` | _(no docstring)_ |
+| 88 | `format_stage_report` | Telegram HTML report, at most REPORT_MAX chars. 'no stage data' if malformed. |
+
 ## `workday_board.py` — 1 defs, 61 lines
 
 | Line | Name | Summary |
@@ -1150,4 +1164,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**901 definitions across 46 files + Code.gs.**
+**910 definitions across 47 files + Code.gs.**
