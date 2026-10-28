@@ -1,0 +1,33 @@
+---
+id: TASK-227
+scope: hot_promotion.py, test_hot_promotion.py
+verify: python -m pytest test_hot_promotion.py -q -p no:cacheprovider 2>&1 | tail -n 1 | grep -E "^[1-9][0-9]+ passed" | grep -Ev "failed|error"
+---
+
+## Target
+A new pure module `hot_promotion.py` decides, with no I/O, whether a reply earns a person a place in Carmen Hot (create a row, move their existing row, or do nothing and why), and builds the follow-up date, the note and the Telegram alert text for it.
+
+## Proof it is needed
+`python -m pytest test_hot_promotion.py -q -p no:cacheprovider` on 2026-10-28 (main at da008fd): `no tests ran in 0.00s`, pytest exit 4 (the file does not exist), so the verify exits 1. Pass-regex proven able to pass: `python -m pytest test_apify_feed.py -q` ends `44 passed in 0.10s`.
+
+## Notes
+Kevin's rule (2026-10-28, this REVERSES the old "Carmen Hot is manual /promote only"): a real person goes to Carmen Hot once the Gmail thread holds BOTH one inbound reply from them AND one message Kevin sent. Nothing goes to Hot on a first send alone. TASK-228 (people the CRM tracks) and TASK-229 (people it does not) wire this module into the poller; this task is only the decisions, so it is tested without Gmail or the CRM.
+
+Run `grep -i -E "role_mailbox|automated|screen_reason|company_domain" FUNCTION_INDEX.md` first. Reuse from `pipeline_utils.py`, do not re-implement: `is_role_mailbox` (1124), `is_automated_sender` (1033), `inbound_sender_screen_reason` (1063). Do NOT import from `main.py` and do no I/O: the module takes everything as arguments, like `apify_feed.py` and the `warm_*` modules do. Its tests live in their own file `test_hot_promotion.py` (same pattern as `test_apify_feed.py`).
+
+Build exactly these public names (TASK-228 and 229 call them):
+
+- `HOT_FOLLOWUP_DAYS = 7`, `LOOKUP_FAILED = "lookup_failed"`.
+- `PROMOTABLE_SOURCE_TABS = ("Carmen Cold", "Carmen Warm", "Tetiana Cold", "Tetiana Warm", "Clavicular")`. Kevin named Cold and Warm; the three job tabs are included for parity with today's behaviour (`route_inbound_reply_to_crm`, main.py:7816, already moves a job-tab contact to Carmen Cold on a GENERAL reply). Say so in a comment. `Carmen Hot`, `Killed` and `Died` are never moved.
+- `sender_address(raw)`: lower-cased address from `"Name <a@b.com>"` or a bare address; `""` when there is none. Keeps plus-tags.
+- `sender_disqualifier(raw_sender, own_addresses, ats_domains=(), auto_reply=False)` -> a reason string or `""`. Checked in this order, first hit wins: `"no_address"`, `"own_address"` (compare with the +tag stripped on both sides), `"auto_reply"`, `"role_mailbox"`, `"ats_domain"` (domain equals or ends with `"." + d` for any d in `ats_domains`; an ATS address NEVER qualifies, even a non-robot local part), `"automated_sender"`, `"relay_domain"` (the last two from `inbound_sender_screen_reason(addr, (), False)`). Personal mail domains (gmail.com etc.) must come back `""`: a professor on gmail is exactly who this is for. Do not use `company_domain_of` as a gate (it returns `""` for consumer mail, which is why `/promote` refuses them).
+- `auto_reply_flag(headers)` -> bool, over a dict of lower-cased header name -> value: True when `auto-submitted` is present and not `"no"`, or `precedence` is `bulk`, `junk` or `auto_reply`, or `x-autoreply` / `x-autorespond` is present. An out-of-office from a real person's address is not a reply by them.
+- `PromotionDecision` (namedtuple `action reason`) and `decide_promotion(status_label, kevin_sent_in_thread, live_tab, disqualifier="")`. `live_tab` is the tab the LIVE CRM lookup reported (never the local cache): a tab name, `None` for "the CRM answered and the person is nowhere", or `LOOKUP_FAILED`. Order: disqualifier -> `none`/that reason; `status_label != "GENERAL"` -> `none`/`"status_event"` (interview, offer and rejection mail is Tetiana's pipeline and stays put); not `kevin_sent_in_thread` -> `none`/`"no_kevin_message"`; `LOOKUP_FAILED` -> `none`/`"lookup_failed"` (never guess: a failed read must not become a duplicate row); `None` -> `create`/`"new_person"`; `"Carmen Hot"` -> `none`/`"already_hot"`; in `PROMOTABLE_SOURCE_TABS` -> `move`/`"two_way_exchange"`; `Killed`/`Died` -> `none`/`"archived"`; anything else -> `none`/`"unknown_tab"`.
+- `exchange_date_from_internal_ms(internal_date_ms, fallback)` -> `datetime.date`: the message's own Gmail `internalDate` (epoch ms) as a LOCAL date via `datetime.fromtimestamp` (the rest of the poller uses local time and Render pins TZ); `fallback` (a date the caller passes) when it is missing or unparseable.
+- `hot_followup_date(exchange_date)` -> `"YYYY-MM-DD"`, exchange date + `HOT_FOLLOWUP_DAYS`.
+- `promotion_note(exchange_date, action, source_tab, subject)` -> one dated line starting `[YYYY-MM-DD] ` followed immediately by `pipeline_utils.INBOUND_REPLY_NOTE_MARKER` (imported, not retyped; `carmen_reply_anchor`, pipeline_utils.py:1584, parses it to tell a responder from a ghost, and TASK-228 skips `route_inbound_reply_to_crm` for a promoted row, so this note is the only place that marker gets written for the reply; test it by feeding the note to `carmen_reply_anchor` and getting the exchange date back). The line says they replied and Kevin sent a message in the same thread, where the row came from (`"moved from <tab>"` or `"new contact, not previously in the CRM"`), and the follow-up date. Subject collapsed to single spaces and cut at 120 characters.
+- `promotion_alert_html(name, email, company, action, source_tab, exchange_date, subject)` -> Telegram HTML naming WHO and WHY. `html.escape` every field. Must contain the name, the address, and the reason in plain words (`they replied and you had sent a message in the thread`); for `move` it names the tab it came from. No negations in the wording.
+
+Tests (`test_hot_promotion.py`, at least 14, all through the public names): every disqualifier reason and its order (an ATS robot that is also a role mailbox reports `role_mailbox`... decide the order from the list above and pin it); `gmail.com` and a company domain both pass; own address with and without a +tag and with a display name; each header combination for `auto_reply_flag`; every branch of `decide_promotion` including that `LOOKUP_FAILED` never returns `create`, that `"Carmen Hot"` never returns `move`, and that a non-GENERAL label never promotes even with Kevin in the thread; `exchange_date_from_internal_ms` with a mid-day-UTC instant (12:00 UTC keeps one calendar date from UTC-11 to UTC+11), with `None`, and with garbage; `hot_followup_date` across a month and a year boundary; the note and alert text escape `<` and `&` in a hostile subject and contain no `<script` .
+
+## Log
