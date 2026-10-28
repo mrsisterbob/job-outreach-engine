@@ -19,3 +19,4 @@ Both halves fail now (observed 2026-10-28 for the pattern; re-run before startin
 - Tests (`-k vlink`, at least 5 in `test_main_integration.py`; drive the real command entry the way the `/wstages` tests do): first call creates a tag and returns a link whose tag is in `visit_tags`; second call with the same name returns the SAME link and adds no row; two names get different links; `/vlink` with no argument lists them with the opened count (seed two tagged `site_visits` rows by POSTing to `/analytics/ingest`, then assert "opened 2 times"); a blank name and a DB write failure create no link. Help (`-k vlink_help`, at least 2 in `test_pipeline_utils.py`): `/vlink` returns a real help entry, not the "No per-command help" fallback, and it mentions the `?r=` link.
 
 ## Log
+- BLOCKED by worker: dependency TASK-210 not done (blocked on 206/208 lineage). No build attempted.
