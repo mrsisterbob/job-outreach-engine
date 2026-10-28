@@ -1419,8 +1419,17 @@ def init_db():
             spent_at TEXT NOT NULL,
             jobs INTEGER NOT NULL,
             status TEXT NOT NULL,
-            company_key TEXT NOT NULL
+            company_key TEXT NOT NULL,
+            page INTEGER NOT NULL DEFAULT 1,
+            days_ago INTEGER NOT NULL DEFAULT 0
         )""")
+        # page and days_ago arrived after hirebase_jobs_ledger existed in production (CREATE TABLE IF
+        # NOT EXISTS is a no-op there), so they are PRAGMA-guarded ALTERs like posted_hours below.
+        hirebase_ledger_columns = {row[1] for row in conn.execute("PRAGMA table_info(hirebase_jobs_ledger)")}
+        if "page" not in hirebase_ledger_columns:
+            conn.execute("ALTER TABLE hirebase_jobs_ledger ADD COLUMN page INTEGER NOT NULL DEFAULT 1")
+        if "days_ago" not in hirebase_ledger_columns:
+            conn.execute("ALTER TABLE hirebase_jobs_ledger ADD COLUMN days_ago INTEGER NOT NULL DEFAULT 0")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS hirebase_company_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3067,20 +3076,20 @@ def apify_ledger_settle(row_id, usd, status):
         return False
 
 def hirebase_ledger_read():
-    """Return [(iso_ts, jobs, status, company_key)] for the trailing 60 days. None on a read
-    error, so the caller spends nothing."""
+    """Return [(iso_ts, jobs, status, company_key, page, days_ago)] for the trailing 60 days
+    (days_ago 0 = unknown). None on a read error, so the caller spends nothing."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=APIFY_LEDGER_KEEP_DAYS)).isoformat()
     try:
         with get_db_conn() as conn:
             rows = conn.execute(
-                "SELECT spent_at, jobs, status, company_key FROM hirebase_jobs_ledger WHERE spent_at >= ? ORDER BY id",
+                "SELECT spent_at, jobs, status, company_key, page, days_ago FROM hirebase_jobs_ledger WHERE spent_at >= ? ORDER BY id",
                 (cutoff,)).fetchall()
         return [tuple(r) for r in rows]
     except Exception as e:
         logging.error(f"Hirebase Ledger Read Error: {e}")
         return None
 
-def hirebase_ledger_reserve(company_key, limit, now=None):
+def hirebase_ledger_reserve(company_key, limit, now=None, page=1, days_ago=0):
     """Write the spend BEFORE the request goes out, as 'errored' with jobs=limit (spent, outcome
     unknown). Returns the row id, or None when the write failed or limit is not a positive int."""
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
@@ -3091,8 +3100,8 @@ def hirebase_ledger_reserve(company_key, limit, now=None):
         now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
         with get_db_conn() as conn:
             cur = conn.execute(
-                "INSERT INTO hirebase_jobs_ledger (spent_at, jobs, status, company_key) VALUES (?, ?, 'errored', ?)",
-                (now.isoformat(), limit, str(company_key)))
+                "INSERT INTO hirebase_jobs_ledger (spent_at, jobs, status, company_key, page, days_ago) VALUES (?, ?, 'errored', ?, ?, ?)",
+                (now.isoformat(), limit, str(company_key), int(page), int(days_ago)))
             conn.commit()
             return cur.lastrowid
     except Exception as e:
@@ -3246,7 +3255,8 @@ def hirebase_route_candidates(candidates, registry, ledger, now):
     if registry is None:
         return list(candidates), {}, frozenset()
     newest = {}
-    for ts, _jobs, _status, key in ledger or ():
+    for _row in ledger or ():
+        ts, _jobs, _status, key = _row[:4]
         dt = hirebase_feed._plan_ts(ts, now)
         if key not in newest or dt > newest[key]:
             newest[key] = dt
@@ -15899,6 +15909,7 @@ def run_warm_radar_scan(chat_id=None):
                         hirebase_result = None
                         hirebase_limit = 0
                         hirebase_days = 1
+                        hirebase_page = 1
                         hirebase_slugs = []
                         hirebase_trusted = []
                         hirebase_ledger_before = []
@@ -15915,16 +15926,18 @@ def run_warm_radar_scan(chat_id=None):
                                 if not hirebase_mine:
                                     continue
                                 _k, _n, hirebase_days, hirebase_limit = hirebase_mine[0]
+                                hirebase_page = hirebase_replan.pages.get(pick_key, 1)
                                 hirebase_ledger_before = list(hirebase_ledger_now)
                                 hirebase_req_now = datetime.now(timezone.utc)
-                                hirebase_row_id = hirebase_ledger_reserve(pick_key, hirebase_limit, now=hirebase_req_now)
+                                hirebase_row_id = hirebase_ledger_reserve(pick_key, hirebase_limit, now=hirebase_req_now,
+                                                                          page=hirebase_page, days_ago=hirebase_days)
                                 if hirebase_row_id is None:
                                     hirebase_status = "reserve_failed"
                                     break
                             hirebase_trusted = [hirebase_registry_slugs[pick_key]] if pick_key in hirebase_registry_slugs else []
                             hirebase_slugs = hirebase_trusted or hirebase_feed.slug_guesses(pick_name, normalize_company_for_match)
                             hirebase_result = hirebase_feed.fetch_company_jobs(
-                                hirebase_feed.build_search_body(hirebase_slugs, hirebase_days, hirebase_limit),
+                                hirebase_feed.build_search_body(hirebase_slugs, hirebase_days, hirebase_limit, page=hirebase_page),
                                 hirebase_key, requests.post)
                             if hirebase_result.status == "ok":
                                 hirebase_outcome = "capped" if hirebase_result.capped else "ok"
@@ -15963,6 +15976,7 @@ def run_warm_radar_scan(chat_id=None):
                                     hirebase_registry_upsert(pick_key, hirebase_trusted[0], "no_jobs", now=hirebase_req_now)
                             except Exception as e:
                                 logging.error(f"Warm Radar Hirebase registry write raised {type(e).__name__}")
+                            # The seen filter runs AFTER billing (vendor meter): a continuation page's rows are paid for either way.
                             already = apify_seen_filter([j["job_id"] for j in kept_jobs])
                             for job in kept_jobs:
                                 if job["job_id"] in already:
