@@ -14,8 +14,11 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 ACTOR_ID = "fantastic-jobs~career-site-job-listing-feed"  # the API form uses "~"; from the actor URL
-START_FEE_USD = 0.10   # MEASURED: 4 runs matched to the cent (memory apify-feed-measured-facts.md)
-PER_JOB_USD = 0.0025   # MEASURED: 4 runs matched to the cent
+# Free plan (the only MEASURED numbers, 4 runs matched to the cent, memory apify-feed-measured-facts.md):
+#   start fee 0.10, per job 0.0025.
+# Starter plan below: Kevin-reported from the Starter pricing page, NOT verified by a billed run.
+START_FEE_USD = 0.001  # $0.001 per run start (Starter)
+PER_JOB_USD = 0.002    # $2.00 per 1,000 jobs (Starter)
 LIMIT_MIN = 200        # MEASURED: the actor refuses a lower limit
 LIMIT_PER_COMPANY = 50  # NOT measured: three data points were 46, 81, 148 jobs per company; change freely
 # Full strings: the exclusion appears to match whole words, so "CSR" alone would not remove "CSR/Teller".
@@ -227,7 +230,10 @@ def fetch_feed(run_input, token, http_post, timeout=240):
 # Spend guard: pure, no I/O, no clock reads (`now` is passed in). Modeled on
 # warm_jsearch_plan.plan_warm_jsearch.
 APIFY_COMPANIES_PER_RUN = 8  # DESIGN CHOICE, not a measurement: the size of Kevin's measured test batch
-APIFY_MONTHLY_CEILING_USD = 4.00  # DESIGN CHOICE, not a measurement: under the Free plan's $5 credit
+# DESIGN CHOICE, not a measurement: the worst case of one run at 8 companies (limit 400) is
+# 0.001 + 0.002 * 400 = $0.801. NOT checked: whether the $19 plan includes $19 of usage credit, and the
+# ledger only sees /w spend, not Kevin's console use.
+APIFY_MONTHLY_CEILING_USD = 10.00
 APIFY_COMPANY_RETRY_DAYS = 7  # DESIGN CHOICE, not a measurement: a re-search bills every old row again (no date filter)
 
 ApifyPlan = namedtuple("ApifyPlan", "picks limit worst_case_usd month_spent_usd month_left_usd skip_reason")
@@ -295,3 +301,42 @@ def plan_apify_run(candidates, ledger, now, per_run=APIFY_COMPANIES_PER_RUN,
             picks = picks[:-1]  # drop the smallest company
             continue
         return ApifyPlan([], 0, 0.0, month_spent, max(0.0, room), "monthly_ceiling")
+
+
+# ---------------------------------------------------------------------------
+# Fallthrough: which no-board companies Hirebase could not answer. Pure, no I/O.
+def fallthrough_candidates(candidates, searched, registry):
+    """Subset of candidates ((key, display, people)), same order, that Hirebase could not answer.
+    searched: key -> (outcome, returned, kept); registry: key -> (slug, status), taken AFTER the Hirebase block."""
+    out = []
+    for cand in candidates or []:
+        key = cand[0]
+        if key in searched:
+            outcome, returned = searched[key][0], searched[key][1]
+            if outcome in ("ok", "capped") and returned == 0:
+                out.append(cand)
+        elif key in registry:
+            slug, status = registry[key]
+            if status == "no_jobs" or (status == "unknown" and not slug):
+                out.append(cand)
+    return out
+
+
+def domain_board(source_domain):
+    """'workday' for a host ending .myworkdayjobs.com, else ''. Other boards' domains are unmeasured."""
+    host = str(source_domain or "").strip().lower()
+    return "workday" if host.endswith(".myworkdayjobs.com") else ""
+
+
+def summarize_feed_sources(kept_by_company):
+    """kept dict from split_rows -> display name -> {source_domain, job_board, rows}."""
+    out = {}
+    for name, jobs in (kept_by_company or {}).items():
+        counts = {}
+        for j in jobs:
+            d = str(j.get("apify_source_domain") or "").strip()
+            if d:
+                counts[d] = counts.get(d, 0) + 1
+        dom = min(counts, key=lambda d: (-counts[d], d)) if counts else ""
+        out[name] = {"source_domain": dom, "job_board": domain_board(dom), "rows": len(jobs)}
+    return out
