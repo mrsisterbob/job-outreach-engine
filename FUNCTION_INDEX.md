@@ -151,7 +151,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 224 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 239 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
-## `hirebase_feed.py` — 16 defs, 317 lines
+## `hirebase_feed.py` — 19 defs, 366 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -169,8 +169,11 @@ grep -i "contact" FUNCTION_INDEX.md
 | 176 | `split_jobs` | One company per call -> (kept, stats); stats = returned / malformed / kept / unmatched. |
 | 197 | `get_key` | Stripped HIREBASE_API_KEY from the given environment mapping, or None. Environment only. |
 | 203 | `fetch_company_jobs` | ONE Hirebase search request. status is "ok", "errored" or "unconfigured". |
-| 256 | `_plan_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
-| 267 | `plan_hirebase_run` | Pure spend guard: which no-board companies to search, each with days_ago and limit. |
+| 263 | `_plan_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
+| 274 | `_ledger_marks` | (last_ok, newest_ok_jobs, ever_rows) per key. errored jobs is a RESERVED limit, never rows. |
+| 297 | `_empty_benched` | _(no docstring)_ |
+| 301 | `first_search_was_empty` | True when key's newest ok search returned zero rows and it has never returned a row. |
+| 309 | `plan_hirebase_run` | Pure spend guard: which no-board companies to search, each with days_ago and limit. |
 
 ## `linkedin_import.py` — 15 defs, 382 lines
 
@@ -1126,4 +1129,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**882 definitions across 45 files + Code.gs.**
+**885 definitions across 45 files + Code.gs.**
