@@ -100,23 +100,26 @@ grep -i "contact" FUNCTION_INDEX.md
 | 229 | `to_sheet_row` | The 12-column Carmen Warm row: date, name, company, email, priority, status, blank, URL, |
 | 240 | `build_master` | Classify every person. Returns {"people": [(status, person)], "rows": {handle: sheet row |
 
-## `apify_feed.py` — 13 defs, 297 lines
+## `apify_feed.py` — 16 defs, 342 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 43 | `build_run_input` | Actor input for a batch: plain names only (a "Name:*" prefix pulled affiliates), no date key |
-| 54 | `_get` | _(no docstring)_ |
-| 61 | `_split_location` | 'City, State, Country' -> (city, state, country), tolerating short forms: 'Michigan' or 'MI' |
-| 85 | `_pick_location` | The Michigan filter leaks, so take the first Michigan entry; else the first entry; else empty. |
-| 98 | `parse_row` | One feed row -> JSearch-shaped posting dict, or None when id, title, organization or url is missing. |
-| 127 | `_squash` | _(no docstring)_ |
-| 131 | `row_belongs_to` | True only when the normalized organization equals the company (strict: siblings like Haworth |
-| 157 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
-| 190 | `get_token` | Stripped APIFY_TOKEN from the given environment mapping, or None. Environment only: no default, no file. |
-| 196 | `fetch_feed` | One batched feed call. status is "ok", "errored" or "unconfigured". |
-| 236 | `actual_cost` | Billed cost of a run (MEASURED formula): excluded rows are free, zero rows is the flat fee. |
-| 241 | `_parse_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
-| 252 | `plan_apify_run` | Decide the one batched call: which companies, what limit, worst-case cost. |
+| 46 | `build_run_input` | Actor input for a batch: plain names only (a "Name:*" prefix pulled affiliates), no date key |
+| 57 | `_get` | _(no docstring)_ |
+| 64 | `_split_location` | 'City, State, Country' -> (city, state, country), tolerating short forms: 'Michigan' or 'MI' |
+| 88 | `_pick_location` | The Michigan filter leaks, so take the first Michigan entry; else the first entry; else empty. |
+| 101 | `parse_row` | One feed row -> JSearch-shaped posting dict, or None when id, title, organization or url is missing. |
+| 130 | `_squash` | _(no docstring)_ |
+| 134 | `row_belongs_to` | True only when the normalized organization equals the company (strict: siblings like Haworth |
+| 160 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
+| 193 | `get_token` | Stripped APIFY_TOKEN from the given environment mapping, or None. Environment only: no default, no file. |
+| 199 | `fetch_feed` | One batched feed call. status is "ok", "errored" or "unconfigured". |
+| 242 | `actual_cost` | Billed cost of a run (MEASURED formula): excluded rows are free, zero rows is the flat fee. |
+| 247 | `_parse_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
+| 258 | `plan_apify_run` | Decide the one batched call: which companies, what limit, worst-case cost. |
+| 308 | `fallthrough_candidates` | Subset of candidates ((key, display, people)), same order, that Hirebase could not answer. |
+| 325 | `domain_board` | 'workday' for a host ending .myworkdayjobs.com, else ''. Other boards' domains are unmeasured. |
+| 331 | `summarize_feed_sources` | kept dict from split_rows -> display name -> {source_domain, job_board, rows}. |
 
 ## `board_system_classifier.py` — 4 defs, 76 lines
 
@@ -1167,4 +1170,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**913 definitions across 47 files + Code.gs.**
+**916 definitions across 47 files + Code.gs.**
