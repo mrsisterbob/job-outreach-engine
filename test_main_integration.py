@@ -21979,3 +21979,77 @@ def test_apify_wire_token_never_appears_in_logs(monkeypatch, caplog):
         assert len(h.apify_posts) == 1
         assert h.apify_posts[0][1]["headers"]["Authorization"].endswith(_APIFY_TEST_TOKEN)
     assert _APIFY_TEST_TOKEN not in caplog.text
+
+
+# ---- /w closing message shows Apify spend and the Hirebase vs Apify split (TASK-203) ----
+
+def _apify_closing_run(monkeypatch, rows, mode="ok", nobody=None, token=_APIFY_TEST_TOKEN, feed=None):
+    h = _apify_wire_harness(monkeypatch, nobody, token=token)
+    h.feed = feed if feed is not None else []
+    h.apify_mode = mode
+    h.apify_rows = rows
+    return h, h.run()
+
+
+def test_apify_closing_success_prints_spend_with_exact_dollars_and_ceiling(monkeypatch):
+    rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1), _apify_row("Nopeboard Labs", "Ops Analyst", 2)]
+    _h, text = _apify_closing_run(monkeypatch, rows)
+    spent = m.apify_feed.actual_cost(2)
+    ceiling = m.apify_feed.APIFY_MONTHLY_CEILING_USD
+    assert 0 < spent < 0.01   # under a cent: three decimals so it cannot read $0.00
+    assert f"Apify: 2 companies, 2 rows returned, 2 kept, ${spent:.3f} this run, ${spent:.3f} of ${ceiling:.2f} this month" in text, text
+    assert "ledger saw" in text
+
+
+def test_apify_closing_split_line_counts_hirebase_and_apify_separately(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    text = h.run()
+    assert "Postings collected by source (before screening): Hirebase 1, Apify 1" in text, text
+
+
+def test_apify_closing_error_prints_errored_line_and_no_zero_spend(monkeypatch):
+    _h, text = _apify_closing_run(monkeypatch, [_apify_row("Smallfry Inc", "Finance Analyst", 1)], mode="500")
+    assert "Apify errored (http status 500); 2 companies not searched, retried on a later run; $" in text, text
+    assert "reserved against the month" in text
+    assert "$0.00 this run" not in text and "rows returned" not in text.split("Apify errored")[1]
+    assert _APIFY_TEST_TOKEN not in text
+
+
+def test_apify_closing_zero_rows_says_feed_may_not_cover_not_an_error(monkeypatch):
+    _h, text = _apify_closing_run(monkeypatch, [])
+    # an empty list is a valid ok body, billed at the flat fee
+    assert "Searched Apify, no rows for:" in text and "not the same as no jobs" in text, text
+    assert "Apify errored" not in text
+    assert "0 rows returned" in text
+
+
+def test_apify_closing_no_token_prints_no_apify_line_and_run_completes(monkeypatch):
+    _h, text = _apify_closing_run(monkeypatch, [_apify_row("Smallfry Inc", "Finance Analyst", 1)], token=None)
+    assert text, "the run must complete and send its closing message"
+    assert "Apify" not in text and "not sent to Apify" not in text, text
+
+
+def test_apify_closing_unreadable_ledger_is_not_silent(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = []
+    monkeypatch.setattr(m, "apify_ledger_read", lambda: None)
+    text = h.run()
+    assert "Apify skipped: ledger unreadable, nothing was spent" in text, text
+    assert h.apify_posts == []
+
+
+def test_apify_closing_failed_reserve_is_not_silent(monkeypatch):
+    h = _apify_wire_harness(monkeypatch)
+    h.feed = []
+    monkeypatch.setattr(m, "apify_ledger_reserve", lambda *a, **k: None)
+    text = h.run()
+    assert "Apify skipped: could not record the spend first, nothing was spent" in text, text
+    assert h.apify_posts == []
+
+
+def test_apify_closing_money_under_a_cent_shows_three_decimals(monkeypatch):
+    monkeypatch.setattr(m.apify_feed, "actual_cost", lambda n: 0.004)
+    _h, text = _apify_closing_run(monkeypatch, [_apify_row("Smallfry Inc", "Finance Analyst", 1)])
+    assert "$0.004 this run" in text, text
