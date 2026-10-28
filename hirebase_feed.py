@@ -69,13 +69,18 @@ def _clamp(value, lo, hi):
     return max(lo, min(hi, v))
 
 
-def build_search_body(slugs, days_ago, limit):
-    """Search body. Exact company_slugs only; no title or exclusion filter (none is known to exist)."""
+def build_search_body(slugs, days_ago, limit, page=1):
+    """Search body. Exact company_slugs only; no title or exclusion filter (none is known to exist).
+
+    page: clamped to an int of at least 1. `page` is a body field and total_pages comes back
+    (MEASURED, Fifth Third). NOT measured: that page 2 returns the rows AFTER page 1 with no
+    overlap, or what order a search is sorted in (newest first is assumed).
+    """
     return {
         "company_slugs": list(slugs),
         "geo_locations": [{"region": "Michigan"}],
         "days_ago": _clamp(days_ago, 1, DAYS_AGO_MAX),
-        "page": 1,
+        "page": _clamp(page, 1, 10 ** 6),
         "limit": _clamp(limit, 1, LIMIT_MAX),
     }
 
@@ -244,7 +249,14 @@ def fetch_company_jobs(body, key, http_post, timeout=60):
         return HirebaseResult("errored", [], 0, False, "total_count is not an int")
     if jobs and not any(parse_job(j) for j in jobs):
         return HirebaseResult("errored", [], 0, False, "all %d jobs malformed" % len(jobs))
-    return HirebaseResult("ok", jobs, total, total > len(jobs), "")
+    page = body.get("page") if isinstance(body, dict) else None
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        page = 1
+    limit = body.get("limit") if isinstance(body, dict) else None
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        limit = len(jobs)
+    # capped only when rows remain beyond the page just fetched; page 1 equals total > len(jobs).
+    return HirebaseResult("ok", jobs, total, total > (page - 1) * limit + len(jobs), "")
 
 
 HIREBASE_MONTHLY_JOBS = 500      # MEASURED: Free plan cap, job rows returned per billing month
@@ -264,7 +276,31 @@ HIREBASE_RETRY_DAYS = 3          # DESIGN CHOICE, not a measurement: a recent ok
 # The permanent answer is the slug registry, not this bench.
 HIREBASE_EMPTY_RETRY_DAYS = 14
 
-HirebasePlan = namedtuple("HirebasePlan", "picks month_used usable_left reserved skip_reason")
+# DESIGN CHOICE, not a measurement: at most 50 rows per company per pinned window (Fifth Third's 38
+# in 7 days fits in two pages). One big employer can never cost more than
+# 2 x HIREBASE_LIMIT_PER_COMPANY per window, which is what stops it eating the monthly 500.
+HIREBASE_MAX_PAGES_PER_WINDOW = 2
+# DESIGN CHOICE: a continuation must start within 7 days of the capped request, or the window is
+# abandoned (a pinned window drifts stale) and the company plans as a plain search.
+HIREBASE_CAPPED_CONTINUE_DAYS = 7
+
+# pages: {key: page}; a key absent from it means page 1. picks stay 4-tuples (key, name, days, limit).
+HirebasePlan = namedtuple("HirebasePlan", "picks month_used usable_left reserved skip_reason pages",
+                          defaults=({},))
+
+
+def _ledger_rows(ledger):
+    """Normalize ledger rows to (ts, jobs, status, key, page, days_ago).
+
+    Rows are 4-tuples (page 1, days_ago unknown) or 6-tuples (iso_ts, jobs, status, key, page, days_ago).
+    """
+    out = []
+    for row in ledger:
+        ts, jobs, status, key = row[:4]
+        page = row[4] if len(row) > 4 else 1
+        days_ago = row[5] if len(row) > 5 else None
+        out.append((ts, jobs, status, key, page, days_ago))
+    return out
 
 
 def _plan_ts(ts, now):
@@ -285,7 +321,7 @@ def _ledger_marks(ledger, now):
     zero row ages out and it plans as never searched again (first window).
     """
     last_ok, newest_jobs, ever_rows = {}, {}, {}
-    for ts, jobs, status, key in ledger:
+    for ts, jobs, status, key, _pg, _da in _ledger_rows(ledger):
         if status not in ("ok", "capped"):
             continue
         dt = _plan_ts(ts, now)
@@ -332,7 +368,8 @@ def plan_hirebase_run(candidates, ledger, now, per_run=HIREBASE_COMPANIES_PER_RU
         now = now.replace(tzinfo=timezone.utc)
     month_used = 0
     last_ok, newest_jobs, ever_rows = _ledger_marks(ledger, now)
-    for ts, jobs, status, key in ledger:
+    rows = _ledger_rows(ledger)
+    for ts, jobs, status, key, _pg, _da in rows:
         dt = _plan_ts(ts, now)
         try:
             n = max(0, int(jobs))
@@ -345,9 +382,35 @@ def plan_hirebase_run(candidates, ledger, now, per_run=HIREBASE_COMPANIES_PER_RU
         return HirebasePlan([], month_used, usable_left, 0, "monthly_cap")
     retry_gap = timedelta(days=retry_days)
     empty_gap = timedelta(days=empty_retry_days)
+    # Newest capped row per key that is newer than its newest ok row, with a known pinned window.
+    capped_last = {}
+    for ts, _jobs, status, key, pg, da in rows:
+        if status != "capped" or da is None:
+            continue
+        dt = _plan_ts(ts, now)
+        if key in last_ok and dt <= last_ok[key]:
+            continue
+        if key not in capped_last or dt > capped_last[key][0]:
+            capped_last[key] = (dt, pg, da)
+    cont_gap = timedelta(days=HIREBASE_CAPPED_CONTINUE_DAYS)
     eligible = []
+    cont = []
+    pages = {}
     for key, name, contacts in candidates:
         wm = last_ok.get(key)
+        cap = capped_last.get(key)
+        if cap is not None and key not in unbench_keys and now - cap[0] <= cont_gap:
+            try:
+                cpage = max(1, int(cap[1]))
+            except (ValueError, TypeError, OverflowError):
+                cpage = 1
+            if cpage < HIREBASE_MAX_PAGES_PER_WINDOW:
+                # CONTINUATION: next page of the pinned window, retry gap bypassed.
+                cont.append((key, name, contacts, cpage + 1, _clamp(cap[2], 1, DAYS_AGO_MAX)))
+                continue
+            # Window ended at the last allowed page. The rows beyond it were never fetched (a known,
+            # chosen loss, not hidden); the next window starts at this capped row's time.
+            wm = cap[0]
         if key in unbench_keys:
             wm = None
         elif wm is not None:
@@ -358,6 +421,19 @@ def plan_hirebase_run(candidates, ledger, now, per_run=HIREBASE_COMPANIES_PER_RU
     eligible.sort(key=lambda c: (-(c[2] or 0), c[0]))
     picks = []
     remaining = usable_left
+    cont.sort(key=lambda c: (-(c[2] or 0), c[0]))
+    for key, name, _contacts, page, days in cont:
+        if len(picks) >= per_run or remaining < min_limit:
+            break
+        if remaining < limit_per_company:
+            # Every page of a window must use the same limit (the ledger carries none, and the
+            # (page-1)*limit offset assumes it); a smaller limit would re-fetch rows already paid for.
+            # Not continued, and not re-planned as page 1 either: the window waits for budget.
+            continue
+        limit = limit_per_company
+        picks.append((key, name, days, limit))
+        pages[key] = page
+        remaining -= limit
     for key, name, _contacts, wm in eligible:
         if len(picks) >= per_run or remaining < min_limit:
             break
@@ -370,7 +446,7 @@ def plan_hirebase_run(candidates, ledger, now, per_run=HIREBASE_COMPANIES_PER_RU
         remaining -= limit
     if not picks:
         return HirebasePlan([], month_used, usable_left, 0, "nothing_eligible")
-    return HirebasePlan(picks, month_used, usable_left, usable_left - remaining, "")
+    return HirebasePlan(picks, month_used, usable_left, usable_left - remaining, "", pages)
 
 
 # ---- Company Search (find the real company row; TASK-192) ------------------------------------
