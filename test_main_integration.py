@@ -20005,6 +20005,7 @@ def test_warm_lookup_queue_skips_non_employers_and_takes_biggest_first(monkeypat
     h = _WarmRadarHarness(monkeypatch, names)
     looked_up = []
     monkeypatch.setattr(m, "lookup_warm_company_board", lambda company: looked_up.append(company))
+    monkeypatch.setattr(m, "WARM_RADAR_LOOKUP_WORKERS", 1)   # two workers start items 5 and 6 together; the order is the test's point
     text = h.run()
     assert len(looked_up) == 22                      # the whole queue drains; no 20-per-run cap
     assert looked_up[:5] == big or set(looked_up[:5]) == set(big)   # biggest first
@@ -20245,7 +20246,7 @@ def test_warm_pick_after_memo_two_runs_screen_roles_four_and_five_not_the_reject
     for t in titles[:3]:
         h.gemini_scores[t] = 60                 # run 1: the three best-ranked are rejected
     h.run()
-    assert h.gemini_calls == titles[:3]
+    assert sorted(h.gemini_calls) == sorted(titles[:3])   # screening runs on a thread pool: which roles, not call order
     assert set(_memo_rows().values()) == {"rejected"} and len(_memo_rows()) == 3
     h.gemini_calls.clear()
     h.run()                                     # same state: only roles 4 and 5 may reach Gemini
