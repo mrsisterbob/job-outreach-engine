@@ -22745,3 +22745,209 @@ def test_hot_promote_tracked_auto_replies_and_own_address_never_promote(monkeypa
     alerts, _ = _hot_poll(monkeypatch, world, sender=sender, extra_headers=extra)
     assert world.tab_of("dana") == "Carmen Cold"
     assert not _hot_alerts(alerts)
+
+
+# ---- TASK-229: hot_promote_untracked - an unknown person replying in Kevin's thread gets a Hot row ----
+
+_UNT_SENDER = "Prof Ann Lee <ann.lee@gmail.com>"
+_UNT_TABS = {"Carmen Cold": "CC", "Carmen Warm": "CW", "Carmen Hot": "CH", "Killed": "KD"}
+
+
+class _UntrackedWorld(_HotWorld):
+    """The live CRM with NOBODY in it: find_contact_by_email searches every tab (Killed included)
+    and a quick_add really appends a nine-column row, so the test reads back what Code.gs would."""
+
+    def __init__(self, monkeypatch):
+        super().__init__(monkeypatch, "Carmen Cold")
+        self.tabs = {"CC": [], "CW": [], "CH": [], "KD": [], "TC": []}
+        self.cached = []
+        monkeypatch.setattr(m, "record_captured_contact", lambda *a, **k: self.cached.append(a))
+
+    def seed(self, tab_code, email):
+        self.tabs[tab_code].append({"sheet_uuid": f"seed-{tab_code}", "email": email, "name": "Ann Lee",
+                                    "company": "", "status": "Cold Lead", "next_followup": "", "note": ""})
+
+    def _crm_get(self, params, timeout=10):
+        names = {"CC": "Carmen Cold", "CW": "Carmen Warm", "CH": "Carmen Hot", "KD": "Killed", "TC": "Tetiana Cold"}
+        if params.get("action") != "find_contact_by_email":
+            return _HotResp(200, {"status": "success"})
+        if self.lookup_mode == "none":
+            return None
+        if self.lookup_mode == "500":
+            return _HotResp(500, {})
+        for code, rows in self.tabs.items():
+            for r in rows:
+                if r["email"] == params.get("email"):
+                    return _HotResp(200, {"status": "success", "found": True, "sheet_uuid": r["sheet_uuid"],
+                                          "sheet_tab": names[code], "name": r["name"], "company": r["company"]})
+        return _HotResp(200, {"status": "success", "found": False})
+
+    def _crm_post(self, payload, timeout=10):
+        if payload["action"] != "quick_add":
+            return super()._crm_post(payload, timeout)
+        self.posts.append(dict(payload))
+        if payload["action"] in self.fail_actions:
+            return _HotResp(200, {"status": "error", "message": "boom"})
+        self.tabs[payload["target_code"]].append({
+            "sheet_uuid": payload["sheet_uuid"], "email": payload["email"], "name": payload["name"],
+            "company": payload["company"], "status": payload["status"],
+            "next_followup": payload["next_followup"], "note": payload["note"],
+            "source": payload["source"], "last_contact": payload["last_contact"],
+            "priority": payload["priority"]})
+        return _HotResp(200, {"status": "success", "message": "Contact created successfully"})
+
+    def total(self):
+        return sum(len(r) for r in self.tabs.values())
+
+
+def _unt_poll(monkeypatch, world, **kw):
+    kw.setdefault("sender", _UNT_SENDER)
+    return _hot_poll(monkeypatch, world, **kw)
+
+
+def test_hot_promote_untracked_gmail_professor_gets_one_hot_row(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, exchange = _unt_poll(monkeypatch, world)
+    assert world.total() == 1 and len(world.tabs["CH"]) == 1
+    row = world.tabs["CH"][0]
+    assert (row["name"], row["company"], row["email"]) == ("Prof Ann Lee", "", "ann.lee@gmail.com")
+    assert row["status"] == "Follow-up Due" == m.CARMEN_HOT_DEFAULT_STATUS
+    assert row["next_followup"] == (exchange + timedelta(days=7)).strftime("%Y-%m-%d")
+    assert row["next_followup"] != (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+    assert row["last_contact"] == exchange.strftime("%Y-%m-%d") and row["priority"] == 9
+    assert row["source"] == "Auto-promoted: two-way exchange"
+    assert m.INBOUND_REPLY_NOTE_MARKER in row["note"] and "Operations role" in row["note"]
+    assert len(_hot_alerts(alerts)) == 1 and "ann.lee@gmail.com" in _hot_alerts(alerts)[0]
+    assert "Unknown" not in row["company"]
+    # the existing unverified alert is untouched
+    assert any("Unverified Reply (thread participant)" in a for a in alerts)
+    assert [(a[1], a[4]) for a in world.cached] == [("Carmen Hot", "ann.lee@gmail.com")]
+
+
+def test_hot_promote_untracked_repolls_and_deploy_wipe_leave_one_row_one_alert(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    first, _ = _unt_poll(monkeypatch, world)
+    second, _ = _unt_poll(monkeypatch, world)  # same mail polled again
+    world.cached.clear()  # a Render deploy wipes SQLite: only the live CRM remembers
+    third, _ = _unt_poll(monkeypatch, world)
+    assert len(_hot_alerts(first)) == 1 and not _hot_alerts(second) and not _hot_alerts(third)
+    assert world.total() == 1 and len(world.tabs["CH"]) == 1
+    assert [p["action"] for p in world.posts].count("quick_add") == 1
+
+
+def test_hot_promote_untracked_stranger_in_a_thread_kevin_did_not_send_in_creates_nothing(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, _ = _unt_poll(monkeypatch, world, kevin_sent=False)
+    assert world.total() == 0 and world.posts == [] and not _hot_alerts(alerts)
+
+
+@pytest.mark.parametrize("mode", ["none", "500"])
+def test_hot_promote_untracked_failed_lookup_creates_nothing_and_logs_why(monkeypatch, caplog, mode):
+    world = _UntrackedWorld(monkeypatch)
+    world.lookup_mode = mode
+    with caplog.at_level("INFO"):
+        alerts, _ = _unt_poll(monkeypatch, world)
+    assert world.total() == 0 and world.posts == [] and not _hot_alerts(alerts)
+    assert "[HOT PROMOTE] skip: lookup_failed" in caplog.text
+
+
+@pytest.mark.parametrize("code", ["CC", "CW", "CH", "KD"])
+def test_hot_promote_untracked_person_already_on_any_tab_gets_no_second_row(monkeypatch, code):
+    world = _UntrackedWorld(monkeypatch)
+    world.seed(code, "ann.lee@gmail.com")
+    alerts, _ = _unt_poll(monkeypatch, world)
+    assert world.total() == 1 and len(world.tabs[code]) == 1
+    assert not any(p["action"] == "quick_add" for p in world.posts)
+    assert not _hot_alerts(alerts)
+
+
+@pytest.mark.parametrize("sender,extra", [
+    ("Mail Delivery Subsystem <mailer-daemon@googlemail.com>", None),
+    ("Talent <ann@greenhouse.io>", None),
+    ("Careers <careers@gmail.com>", None),
+    ("Kevin <kevin@example.com>", None),
+    ("Ann Lee <ann.lee@gmail.com>", {"Auto-Submitted": "auto-replied"}),
+])
+def test_hot_promote_untracked_machines_roles_and_own_address_create_nothing(monkeypatch, sender, extra):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, _ = _unt_poll(monkeypatch, world, sender=sender, extra_headers=extra)
+    assert world.total() == 0 and not any(p["action"] == "quick_add" for p in world.posts)
+    assert not _hot_alerts(alerts)
+
+
+def test_hot_promote_untracked_interview_reply_creates_nothing_and_alert_is_unchanged(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, _ = _unt_poll(
+        monkeypatch, world, snippet="We would like to schedule an interview with you next Tuesday at 2pm.")
+    assert world.total() == 0 and world.posts == [] and not _hot_alerts(alerts)
+    assert len(alerts) == 1 and "Interview" in alerts[0] and "No CRM changes were made" in alerts[0]
+
+
+def test_hot_promote_untracked_write_failure_warns_once_without_success_alert_or_cache(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    world.fail_actions = {"quick_add"}
+    alerts, _ = _unt_poll(monkeypatch, world)
+    assert world.total() == 0 and world.cached == [] and not _hot_alerts(alerts)
+    warnings = [a for a in alerts if "Could not add" in a]
+    assert len(warnings) == 1 and "ann.lee@gmail.com" in warnings[0] and "mail.google.com" in warnings[0]
+
+
+def test_hot_promote_untracked_colleague_at_tracked_company_gets_own_row_and_company(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    monkeypatch.setattr(m, "match_unknown_sender_to_crm_company", lambda s: {
+        "name": "x", "company": "Acme", "tab": "Carmen Cold", "sheet_uuid": ""})
+    # domain-match path: the harness takes domain_match from _run_poll_with_fake_gmail's argument
+    msg = _gmail_message("dm1", "Bo Chen <bo.chen@acmecorp.com>", "Re: Operations role", _HOT_SNIPPET,
+                         age_seconds=3 * 86400)
+    monkeypatch.setattr(m, "INBOUND_ALERT_MAX_AGE_SECONDS", 10 * 86400)
+    alerts, _ = _run_poll_with_fake_gmail(
+        monkeypatch, [msg], thread_started=True,
+        domain_match=lambda s: {"name": "x", "company": "Acme", "tab": "Carmen Cold", "sheet_uuid": ""})
+    assert len(world.tabs["CH"]) == 1 and world.total() == 1
+    assert world.tabs["CH"][0]["company"] == "Acmecorp" and world.tabs["CH"][0]["name"] == "Bo Chen"
+    assert len(_hot_alerts(alerts)) == 1
+
+
+def test_hot_promote_untracked_new_hot_row_is_never_touched_by_the_sequencer(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    _unt_poll(monkeypatch, world)
+    assert len(world.tabs["CH"]) == 1
+    assert "Carmen Hot" not in str(getattr(m, "SEQUENCER_SCAN_TABS", ""))
+    before = (list(world.posts), list(world.enqueued), dict(world.tabs["CH"][0]))
+    m.run_followup_sequencer(today=date.today() + timedelta(days=60))
+    assert (world.posts, world.enqueued, world.tabs["CH"][0]) == before
+    assert len(world.tabs["CH"]) == 1
+
+
+def _code_gs_text():
+    import pathlib
+    return (pathlib.Path(m.__file__).parent / "Code.gs").read_text(encoding="utf-8")
+
+
+def _gs_action_block(gs, action):
+    start = gs.index(f'if (action === "{action}")')
+    nxt = re.search(r'\n    if \(action === "', gs[start + 10:])
+    return gs[start:start + 10 + nxt.start()] if nxt else gs[start:]
+
+
+def test_hot_promote_untracked_code_gs_contract_quick_add_ch_and_uuid_lookups():
+    gs = _code_gs_text()
+    qa = _gs_action_block(gs, "quick_add")
+    assert 'payload.target_code === "CH" ? "Carmen Hot"' in qa
+    row = qa[qa.index("const rowData = ["):qa.index("];", qa.index("const rowData = ["))]
+    for field in ("last_contact", "name", "company", "email", "priority", "status",
+                  "next_followup", "source", "note"):
+        assert f"payload.{field}" in row, field
+    order = [row.index(f"payload.{f}") for f in
+             ("last_contact", "name", "company", "email", "priority", "status", "next_followup", "source", "note")]
+    assert order == sorted(order)
+    assert "getRange(newRow, 1, 1, rowData.length)" in qa and "Columns A-I" in qa
+    assert "getRange(newRow, UUID_COL).setValue(payload.sheet_uuid" in qa
+    assert re.search(r"const UUID_COL = 10;", gs)
+    us = _gs_action_block(gs, "update_status")
+    assert "findRecordBySheetUuid(ss, sheetUuid)" in us and "transposeRowValues(rowValues" in us
+    finder = gs[gs.index("function findRecordBySheetUuid"):]
+    assert "for (const tabName of ALL_TABS)" in finder[:finder.index("\n}\n")]
+    assert "const ALL_TABS = Object.keys(TAB_MAP);" in gs and '"Carmen Hot": "PEOPLE"' in gs
+    for action in ("set_status", "update_snooze", "append_note"):
+        assert "findRecordBySheetUuid(ss, sheetUuid)" in _gs_action_block(gs, action), action

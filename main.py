@@ -7908,6 +7908,49 @@ def _live_crm_contact(email):
     return tab, body
 
 
+def _create_hot_contact_on_exchange(sender, email, subject, thread_id, internal_date_ms):
+    """Create ONE Carmen Hot row for a person the CRM has never seen who replied in a thread Kevin
+    sent in. Caller has already confirmed absence on every tab via _live_crm_contact. The write is
+    direct (log_to_sheets_crm), not the outbox, which a Render deploy wipes. Returns "promoted"
+    or "". next_followup is always a real date: Code.gs turns "" into +14 days."""
+    name = display_name_from_sender(sender)
+    if not name or name.strip().lower() == email.lower() or name == "Unknown":
+        name = name_from_email_local_part(email)
+    company = (company_domain_of(email) or "").split(".")[0].title()
+    today = datetime.now().date()
+    exchange_date = hot_promotion.exchange_date_from_internal_ms(internal_date_ms, today)
+    new_uuid = str(uuid.uuid4())
+    payload = build_crm_payload(
+        "quick_add",
+        target_code="CH",
+        sheet_uuid=new_uuid,
+        first_contact=today.strftime("%Y-%m-%d"),
+        last_contact=exchange_date.strftime("%Y-%m-%d"),
+        name=name,
+        company=company,
+        email=email,
+        priority=9,
+        status=CARMEN_HOT_DEFAULT_STATUS,
+        next_followup=hot_promotion.hot_followup_date(exchange_date),
+        source="Auto-promoted: two-way exchange",
+        note=hot_promotion.promotion_note(exchange_date, "create", None, subject),
+    )
+    if not log_to_sheets_crm(payload, max_retries=1, alert_on_exhaustion=False):
+        logging.error(f"[HOT PROMOTE] quick_add to Carmen Hot failed for {email}; no row created")
+        link = f"https://mail.google.com/mail/u/0/#inbox/{thread_id}"
+        send_telegram_message(
+            TELEGRAM_CHAT_ID,
+            f"\u26a0\ufe0f Could not add {html.escape(name)} ({html.escape(email)}) to Hot; "
+            f"<a href='{link}'>open the thread</a> and /promote by hand.")
+        return ""
+    record_captured_contact(new_uuid, "Carmen Hot", name, company, email)
+    log_daily_activity("notes_logged")
+    send_telegram_message(TELEGRAM_CHAT_ID, hot_promotion.promotion_alert_html(
+        name, email, company, "create", None, exchange_date, subject))
+    logging.info(f"[HOT PROMOTE] created {email} in Carmen Hot (new contact)")
+    return "promoted"
+
+
 def promote_to_hot_on_exchange(crm_match, sender, header_list, status_label, subject,
                                thread_id, access_token, internal_date_ms):
     """Move a verified CRM contact into Carmen Hot once the thread holds their reply AND a
@@ -7932,8 +7975,12 @@ def promote_to_hot_on_exchange(crm_match, sender, header_list, status_label, sub
     if decision.action == "none":
         logging.info(f"[HOT PROMOTE] skip: {decision.reason} ({email or sender})")
         return "already_hot" if decision.reason == "already_hot" else ""
-    if decision.action != "move":
-        # "create" (person not in the CRM) is TASK-229; a verified sender should not reach it.
+    if decision.action == "create" and not str((crm_match or {}).get("sheet_uuid") or "").strip():
+        # Unverified sender (domain match / thread participant / stranger) the CRM has never heard of.
+        return _create_hot_contact_on_exchange(sender, email, subject, thread_id, internal_date_ms)
+    if decision.action != "move" or not str((crm_match or {}).get("sheet_uuid") or "").strip():
+        # An unverified caller (no sheet_uuid) only ever creates; a "move" for it is left alone.
+        # A VERIFIED sender (cached sheet_uuid) the live CRM cannot find: never create a second row.
         logging.info(f"[HOT PROMOTE] skip: {decision.reason} ({email})")
         return ""
 
@@ -8642,6 +8689,15 @@ def check_inbound_gmail_replies():
             # Follow-up bump for every verified reply; Carmen Cold move + dated note for a live
             # human conversation (GENERAL). Never changes the alert text below - this is what makes
             # the *system* treat the thread as a priority, not a second notification.
+            if is_unverified and status_label == "GENERAL" and not str(crm_match.get("sheet_uuid") or "").strip():
+                # Separate from the verified path: creates a Hot row only. No stage, outcome or
+                # reply-routing write is made for an unresolved sender.
+                try:
+                    promote_to_hot_on_exchange(
+                        crm_match, sender, header_list, status_label, subject,
+                        thread_id, access_token, internal_date_ms)
+                except Exception as e:
+                    logging.error(f"Unverified Hot promotion error ({msg_id}): {e}")
             if not is_unverified:
                 try:
                     promoted = ""
