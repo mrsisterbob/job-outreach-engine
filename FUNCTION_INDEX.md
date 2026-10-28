@@ -1029,22 +1029,24 @@ grep -i "contact" FUNCTION_INDEX.md
 | 43 | `build` | _(no docstring)_ |
 | 60 | `main` | _(no docstring)_ |
 
-## `scripts/measure_board_systems.py` — 12 defs, 298 lines
+## `scripts/measure_board_systems.py` — 14 defs, 324 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 57 | `_get` | _(no docstring)_ |
-| 65 | `_json` | _(no docstring)_ |
-| 72 | `probe_url` | _(no docstring)_ |
-| 83 | `judge` | (hit, board_name) for one endpoint response. hit is None when there was no answer at all. |
-| 116 | `_get_url` | _(no docstring)_ |
-| 124 | `_unanswered` | _(no docstring)_ |
-| 128 | `measure` | Cache record for one company: 6 board probes + at most 3 careers fetches (9 requests). |
-| 188 | `load_cache` | Read the cache; a corrupt or unreadable file is ignored with a message, never fatal. |
-| 202 | `save_cache` | Atomic write: temp file in the same directory, then os.replace. |
-| 210 | `mismatch` | True when a board's own name does not match the company's slug. |
-| 217 | `report` | _(no docstring)_ |
-| 239 | `main` | _(no docstring)_ |
+| 58 | `_get` | _(no docstring)_ |
+| 66 | `_json` | _(no docstring)_ |
+| 73 | `probe_url` | _(no docstring)_ |
+| 84 | `judge` | (hit, board_name) for one endpoint response. hit is None when there was no answer at all. |
+| 117 | `_get_url` | _(no docstring)_ |
+| 125 | `_board_url` | host + path of the URL that decided the bucket; no scheme, query string or fragment. |
+| 134 | `_record_vendor` | Set bucket and, for a vendor bucket, where it was found (+ Workday tenant/wdN/site shape). |
+| 147 | `_unanswered` | _(no docstring)_ |
+| 151 | `measure` | Cache record for one company: 6 board probes + at most 3 careers fetches (9 requests). |
+| 212 | `load_cache` | Read the cache; a corrupt or unreadable file is ignored with a message, never fatal. |
+| 226 | `save_cache` | Atomic write: temp file in the same directory, then os.replace. |
+| 234 | `mismatch` | True when a board's own name does not match the company's slug. |
+| 241 | `report` | _(no docstring)_ |
+| 265 | `main` | _(no docstring)_ |
 
 ## `scripts/score_source.py` — 2 defs, 99 lines
 
@@ -1270,4 +1272,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**981 definitions across 54 files + Code.gs.**
+**983 definitions across 54 files + Code.gs.**
