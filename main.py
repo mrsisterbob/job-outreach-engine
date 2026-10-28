@@ -16121,6 +16121,23 @@ def run_warm_radar_scan(chat_id=None):
                             try:
                                 apify_kept_by_company, apify_stats = apify_feed.split_rows(
                                     apify_result.rows, apify_picked_names, normalize_company_for_match)
+                                # Learn from the rows before they are screened (best effort, never fails the
+                                # scan): the feed source per company that has kept rows, and a Workday triple
+                                # (UNVERIFIED: a posting link proves a posting; /w's own scan is the check).
+                                try:
+                                    for _an, _summary in apify_feed.summarize_feed_sources(apify_kept_by_company).items():
+                                        _ajobs = apify_kept_by_company.get(_an) or []
+                                        if not _ajobs:
+                                            continue
+                                        feed_source_upsert(apify_key_by_name.get(_an) or normalize_company_for_match(_an),
+                                                           _summary["source_domain"], _summary["job_board"], _summary["rows"])
+                                        for _aj in _ajobs:
+                                            _ajob = dict(_aj, employer_name=_an)
+                                            if record_workday_board_from_posting(
+                                                    _ajob, warm_contacts.get(normalize_company_for_match(_an))):
+                                                break
+                                except Exception as e:
+                                    logging.error(f"Warm Radar Apify learn raised {type(e).__name__}")
                                 apify_all_jobs = [j for jobs in apify_kept_by_company.values() for j in jobs]
                                 # The seen filter runs AFTER billing, as the Hirebase block does.
                                 apify_already = apify_seen_filter([j["job_id"] for j in apify_all_jobs])

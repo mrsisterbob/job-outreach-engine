@@ -22053,3 +22053,85 @@ def test_apify_closing_money_under_a_cent_shows_three_decimals(monkeypatch):
     monkeypatch.setattr(m.apify_feed, "actual_cost", lambda n: 0.004)
     _h, text = _apify_closing_run(monkeypatch, [_apify_row("Smallfry Inc", "Finance Analyst", 1)])
     assert "$0.004 this run" in text, text
+
+
+# ---- /w learns each Apify company's source domain and Workday board (TASK-204) ----
+
+_APIFY_LEARN_WD = "fifththird/wd5/FifthThird_Careers"
+
+
+def _apify_learn_wd_row(org="Smallfry Inc"):
+    row = _apify_row(org, "Finance Analyst", 1, domain="fifththird.wd5.myworkdayjobs.com")
+    row["url"] = "https://fifththird.wd5.myworkdayjobs.com/en-US/FifthThird_Careers/job/Troy-MI/Finance-Analyst_R1"
+    return row
+
+
+def _apify_learn_stored_triple(name):
+    with m.get_db_conn() as conn:
+        r = conn.execute("SELECT workday_board FROM company_identities WHERE normalized_name = ?",
+                         (m.normalize_company_for_match(name),)).fetchone()
+    return (r[0] or "") if r else ""
+
+
+def _apify_learn_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_feed_source")
+        conn.execute("UPDATE company_identities SET workday_board = NULL WHERE normalized_name = ?",
+                     (m.normalize_company_for_match("Smallfry Inc"),))
+        conn.commit()
+
+
+def test_apify_learn_workday_row_is_scanned_free_on_the_next_run(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = [_apify_learn_wd_row()]
+    wd_calls = []
+    monkeypatch.setattr(m, "fetch_workday_jobs", lambda board: wd_calls.append(board) or [])
+    h.run()
+    assert len(h.apify_posts) == 1
+    assert _apify_learn_stored_triple("Smallfry Inc") == _APIFY_LEARN_WD
+    src = m.feed_source_read()[m.normalize_company_for_match("Smallfry Inc")]
+    assert src[:3] == ("fifththird.wd5.myworkdayjobs.com", "workday", 1), src
+    assert wd_calls == []
+    h.run()
+    assert len(h.apify_posts) == 1, "company must not be sent to Apify again"
+    assert wd_calls == [_APIFY_LEARN_WD], wd_calls
+
+
+def test_apify_learn_non_workday_domain_stores_blank_board_and_no_triple(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
+    h.run()
+    assert len(h.apify_posts) == 1
+    src = m.feed_source_read()[m.normalize_company_for_match("Smallfry Inc")]
+    assert src[0] == "careers.smallfryinc.com" and src[1] == "", src
+    assert _apify_learn_stored_triple("Smallfry Inc") == ""
+
+
+def test_apify_learn_stored_triple_is_not_overwritten(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = [_apify_learn_wd_row()]
+    # Seed a hand-added triple; with a board the company is no longer an Apify candidate, so call
+    # the learn path by pre-seeding after the identity exists but forcing the candidate via the helper.
+    assert m.set_company_workday_board("Smallfry Inc", "hand/wd1/Added")
+    job = {"employer_name": "Smallfry Inc", "job_apply_link": h.apify_rows[0]["url"]}
+    contact = m.get_warm_crm_contacts().get(m.normalize_company_for_match("Smallfry Inc"))
+    assert contact
+    assert m.record_workday_board_from_posting(job, contact) == ""
+    assert _apify_learn_stored_triple("Smallfry Inc") == "hand/wd1/Added"
+
+
+def test_apify_learn_company_with_zero_rows_writes_nothing(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = []
+    h.run()
+    assert len(h.apify_posts) == 1
+    assert m.feed_source_read().get(m.normalize_company_for_match("Smallfry Inc")) is None
+    assert _apify_learn_stored_triple("Smallfry Inc") == ""
