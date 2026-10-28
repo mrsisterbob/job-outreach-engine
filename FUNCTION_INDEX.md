@@ -151,7 +151,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 224 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 239 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
-## `hirebase_feed.py` — 24 defs, 524 lines
+## `hirebase_feed.py` — 25 defs, 600 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -159,26 +159,27 @@ grep -i "contact" FUNCTION_INDEX.md
 | 53 | `slug_guesses` | At most 2 distinct slugs: plain name first ('Fifth Third Bank' -> fifth-third-bank), then the |
 | 64 | `_clamp` | _(no docstring)_ |
 | 72 | `build_search_body` | Search body. Exact company_slugs only; no title or exclusion filter (none is known to exist). |
-| 86 | `_strip_html` | Tag removal plus entity unescape; block-ish tags become spaces so words do not fuse. |
-| 93 | `_loc_fields` | _(no docstring)_ |
-| 105 | `_pick_location` | The Michigan filter may leak and rows list several places: first Michigan entry, else the |
-| 119 | `_text` | _(no docstring)_ |
-| 125 | `parse_job` | One Hirebase job -> JSearch-shaped posting dict, or None when title, company_name, slug, |
-| 157 | `_squash` | _(no docstring)_ |
-| 161 | `job_belongs_to` | True only when company_slug is exactly one of `slugs` AND the normalized job company name |
-| 178 | `split_jobs` | One company per call -> (kept, stats); stats = returned / malformed / kept / unmatched. |
-| 204 | `get_key` | Stripped HIREBASE_API_KEY from the given environment mapping, or None. Environment only. |
-| 210 | `fetch_company_jobs` | ONE Hirebase search request. status is "ok", "errored" or "unconfigured". |
-| 270 | `_plan_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
-| 281 | `_ledger_marks` | (last_ok, newest_ok_jobs, ever_rows) per key. errored jobs is a RESERVED limit, never rows. |
-| 304 | `_empty_benched` | _(no docstring)_ |
-| 308 | `first_search_was_empty` | True when key's newest ok search returned zero rows and it has never returned a row. |
-| 316 | `plan_hirebase_run` | Pure spend guard: which no-board companies to search, each with days_ago and limit. |
-| 399 | `build_company_search_body` | Exactly company_name, page, limit (unknown fields 422). Blank name -> None. |
-| 407 | `fetch_company_rows` | ONE Company Search request. status "ok" (rows may be [] = honest no-match) or "errored". |
-| 443 | `_host` | _(no docstring)_ |
-| 450 | `pick_company_row` | The one row that really is `name`, or None. Never falls back to row 1. |
-| 478 | `plan_company_lookups` | Which companies may get a Company Search lookup this run. |
+| 91 | `_strip_html` | Tag removal plus entity unescape; block-ish tags become spaces so words do not fuse. |
+| 98 | `_loc_fields` | _(no docstring)_ |
+| 110 | `_pick_location` | The Michigan filter may leak and rows list several places: first Michigan entry, else the |
+| 124 | `_text` | _(no docstring)_ |
+| 130 | `parse_job` | One Hirebase job -> JSearch-shaped posting dict, or None when title, company_name, slug, |
+| 162 | `_squash` | _(no docstring)_ |
+| 166 | `job_belongs_to` | True only when company_slug is exactly one of `slugs` AND the normalized job company name |
+| 183 | `split_jobs` | One company per call -> (kept, stats); stats = returned / malformed / kept / unmatched. |
+| 209 | `get_key` | Stripped HIREBASE_API_KEY from the given environment mapping, or None. Environment only. |
+| 215 | `fetch_company_jobs` | ONE Hirebase search request. status is "ok", "errored" or "unconfigured". |
+| 292 | `_ledger_rows` | Normalize ledger rows to (ts, jobs, status, key, page, days_ago). |
+| 306 | `_plan_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
+| 317 | `_ledger_marks` | (last_ok, newest_ok_jobs, ever_rows) per key. errored jobs is a RESERVED limit, never rows. |
+| 340 | `_empty_benched` | _(no docstring)_ |
+| 344 | `first_search_was_empty` | True when key's newest ok search returned zero rows and it has never returned a row. |
+| 352 | `plan_hirebase_run` | Pure spend guard: which no-board companies to search, each with days_ago and limit. |
+| 475 | `build_company_search_body` | Exactly company_name, page, limit (unknown fields 422). Blank name -> None. |
+| 483 | `fetch_company_rows` | ONE Company Search request. status "ok" (rows may be [] = honest no-match) or "errored". |
+| 519 | `_host` | _(no docstring)_ |
+| 526 | `pick_company_row` | The one row that really is `name`, or None. Never falls back to row 1. |
+| 554 | `plan_company_lookups` | Which companies may get a Company Search lookup this run. |
 
 ## `hirebase_registry.py` — 3 defs, 75 lines
 
@@ -1166,4 +1167,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**912 definitions across 47 files + Code.gs.**
+**913 definitions across 47 files + Code.gs.**
