@@ -158,7 +158,7 @@ def _squash(text):
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
 
 
-def job_belongs_to(job, company_name, slugs, normalize):
+def job_belongs_to(job, company_name, slugs, normalize, name_optional=False):
     """True only when company_slug is exactly one of `slugs` AND the normalized job company name
     equals the normalized warm company name (strict: siblings like Haworth International fail)."""
     if not isinstance(job, dict):
@@ -166,6 +166,8 @@ def job_belongs_to(job, company_name, slugs, normalize):
     slug = job.get(JOB_KEYS["company_slug"])
     if not isinstance(slug, str) or slug not in set(slugs or ()):
         return False
+    if name_optional:
+        return True
     target = _squash(normalize(company_name))
     theirs = job.get(JOB_KEYS["company_name"])
     if not target or not isinstance(theirs, str):
@@ -173,8 +175,12 @@ def job_belongs_to(job, company_name, slugs, normalize):
     return _squash(normalize(theirs)) == target
 
 
-def split_jobs(jobs, company_name, slugs, normalize):
-    """One company per call -> (kept, stats); stats = returned / malformed / kept / unmatched."""
+def split_jobs(jobs, company_name, slugs, normalize, trusted_slugs=()):
+    """One company per call -> (kept, stats); stats = returned / malformed / kept / unmatched.
+
+    A row whose company_slug is in `trusted_slugs` (a registry slug, verified against the company)
+    passes on the slug alone; any other row keeps the strict slug-plus-name rule."""
+    trusted = set(trusted_slugs or ())
     kept = []
     stats = {"returned": 0, "malformed": 0, "kept": 0, "unmatched": 0}
     for job in jobs or []:
@@ -182,7 +188,8 @@ def split_jobs(jobs, company_name, slugs, normalize):
         parsed = parse_job(job)
         if parsed is None:
             stats["malformed"] += 1
-        elif job_belongs_to(job, company_name, slugs, normalize):
+        elif (job.get(JOB_KEYS["company_slug"]) in trusted and isinstance(job.get(JOB_KEYS["company_slug"]), str)
+              and job_belongs_to(job, company_name, slugs, normalize, name_optional=True))                 or job_belongs_to(job, company_name, slugs, normalize):
             kept.append(parsed)
             stats["kept"] += 1
         else:

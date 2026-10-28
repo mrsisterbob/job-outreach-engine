@@ -7073,7 +7073,7 @@ def test_t_warns_when_target_queries_is_empty(monkeypatch, sourcing_filters):
                      (json.dumps(["acme"]),))
         conn.commit()
     _dispatch("/t")
-    assert any("target_queries is empty" in s for s in sent)
+    assert any("target_queries is empty" in s for s in sent), sent
     assert any("Scanning 0 target rules" in s for s in sent)
 
 
@@ -15237,7 +15237,7 @@ def test_pipeline_refuses_on_db_error(monkeypatch, sourcing_filters):
                      (json.dumps(["acme"]),))
         conn.commit()
     _dispatch("/t")
-    assert any("target_queries is empty" in s for s in sent) and ran == [2]
+    assert any("target_queries is empty" in s for s in sent), sent and ran == [2]
 
     # (4) get_filter on a failing database: default returned, one db_error alert across two calls
     alerts.clear()
@@ -20469,6 +20469,7 @@ def _hirebase_hook_harness(monkeypatch, nobody=None, key="hbkey"):
     _hirebase_store_clear()
     with m.get_db_conn() as conn:
         conn.execute("DELETE FROM apify_seen_jobs")
+        conn.execute("DELETE FROM hirebase_slug_registry")
         conn.commit()
     h.posts, h.feed = [], []
 
@@ -21008,7 +21009,7 @@ def test_hirebase_e2e_key_never_leaks(monkeypatch, caplog):
 
     monkeypatch.setattr(m.requests, "post", boom)
     _hb_backdate("nopeboard labs", m.timedelta(days=5))
-    _hb_backdate("smallfry inc", m.timedelta(days=5))
+    _hb_backdate(m.normalize_company_for_match("Smallfry Inc"), m.timedelta(days=5))
     texts.append(h.run())
     assert h.posts and all(kw["headers"]["x-api-key"] == secret for _u, kw in h.posts)
     for url, kw in h.posts:
@@ -21162,3 +21163,132 @@ def test_hirebase_empty_e2e_company_that_once_returned_rows_retries_after_4_days
     h.posts.clear()
     h.run()
     assert "nopeboard-labs" in _hb_slugs(h), "an earlier row-returning search keeps the 3-day retry"
+
+
+# ---- /w reads the Hirebase slug registry before it searches (TASK-191) ----
+
+def _slugreg_rows():
+    with m.get_db_conn() as conn:
+        return {r[0]: tuple(r[1:]) for r in conn.execute(
+            "SELECT company_key, slug, status, checked_at FROM hirebase_slug_registry")}
+
+
+def _slugreg_clear():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM hirebase_slug_registry")
+        conn.commit()
+
+
+def _slugreg_job(org, slug, n):
+    job = _hirebase_job(org, "Operations Analyst", n)
+    job["company_slug"] = slug
+    return job
+
+
+def test_hirebase_slugreg_upsert_read_round_trip_and_rejects_bad_rows():
+    _slugreg_clear()
+    assert m.hirebase_registry_upsert("acme", "acme-co", "covered") is True
+    assert m.hirebase_registry_upsert("acme", "acme-two", "no_jobs") is True   # refresh in place
+    assert m.hirebase_registry_upsert("ghost", "", "unknown") is True
+    got = m.hirebase_registry_read()
+    assert got["acme"].slug == "acme-two" and got["acme"].status == "no_jobs" and got["ghost"].status == "unknown"
+    assert m.hirebase_registry_upsert("bad", "x", "maybe") is False
+    assert m.hirebase_registry_upsert("bad", "", "covered") is False
+    assert m.hirebase_registry_upsert("bad", "  ", "no_jobs") is False
+    assert "bad" not in m.hirebase_registry_read()
+
+
+def test_hirebase_slugreg_db_error_makes_read_none_and_upsert_false(monkeypatch):
+    def boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "get_db_conn", boom)
+    assert m.hirebase_registry_read() is None
+    assert m.hirebase_registry_upsert("acme", "acme-co", "covered") is False
+    assert m.hirebase_registry_seed() == 0
+
+
+def test_hirebase_slugreg_seed_never_overwrites_and_restores_a_lost_disk():
+    _slugreg_clear()
+    assert m.hirebase_registry_seed() == 4
+    rows = _slugreg_rows()
+    k = m.normalize_company_for_match
+    assert rows[k("Steelcase")][1] == "no_jobs" and rows[k("Trinity Health")][:2] == ("trinity-health-system", "no_jobs")
+    assert rows[k("Haworth")][1] == "covered" and rows[k("Fifth Third Bank")][1] == "covered"
+    assert m.hirebase_registry_upsert(k("Haworth"), "haworth-other", "covered")
+    assert m.hirebase_registry_seed() == 0
+    assert _slugreg_rows()[k("Haworth")][0] == "haworth-other"
+    _slugreg_clear()
+    assert m.hirebase_registry_seed() == 4 and len(_slugreg_rows()) == 4
+
+
+def test_hirebase_slugreg_known_slug_is_searched_exactly_and_trusted_on_name(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Trinity Health": 3})
+    m.hirebase_registry_upsert(m.normalize_company_for_match("Trinity Health"), "trinity-health-system", "covered")
+    h.feed = [_slugreg_job("Trinity Health System", "trinity-health-system", 1)]
+    h.run()
+    assert [kw["json"]["company_slugs"] for _u, kw in h.posts] == [["trinity-health-system"]], h.posts
+    assert h.cards == ["Operations Analyst"], h.cards
+
+
+def test_hirebase_slugreg_fresh_no_jobs_company_is_skipped_and_the_slot_goes_to_the_next(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Steelcase": 3, "Freshco Labs": 1})
+    m.hirebase_registry_seed()
+    h.run()
+    slugs = _hb_slugs(h)
+    assert "steelcase" not in slugs and "freshco-labs" in slugs, h.posts
+    assert [r[2] for r in _hirebase_ledger_rows()] == ["freshco labs"]
+
+
+def test_hirebase_slugreg_expired_no_jobs_entry_is_searched_again_with_its_slug(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Steelcase": 3})
+    m.hirebase_registry_seed()
+    old = (m.datetime.now(m.timezone.utc) - m.timedelta(days=46)).isoformat()
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE hirebase_slug_registry SET checked_at = ? WHERE company_key = ?", (old, m.normalize_company_for_match("Steelcase")))
+        conn.commit()
+    h.run()
+    assert [kw["json"]["company_slugs"] for _u, kw in h.posts] == [["steelcase"]], h.posts
+
+
+def test_hirebase_slugreg_write_path_covered_row_is_stored_and_used_by_the_second_run(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Smallfry Inc": 2})
+    h.feed = [_slugreg_job("Smallfry Inc", "smallfry", 1)]
+    h.run()
+    assert h.posts[0][1]["json"]["company_slugs"] == ["smallfry-inc", "smallfry"]
+    row = _slugreg_rows()[m.normalize_company_for_match("Smallfry Inc")]
+    assert row[0] == "smallfry" and row[1] == "covered", row
+    _hb_backdate(m.normalize_company_for_match("Smallfry Inc"), m.timedelta(days=5))
+    h.posts.clear()
+    h.run()
+    assert [kw["json"]["company_slugs"] for _u, kw in h.posts] == [["smallfry"]], h.posts
+
+
+def test_hirebase_slugreg_registry_slug_zero_stores_no_jobs_but_guessed_zero_stores_nothing(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Freshco Labs": 3, "Nopeboard Labs": 1})
+    m.hirebase_registry_upsert(m.normalize_company_for_match("Freshco Labs"), "freshco-x", "covered")
+    h.feed = []
+    h.run()
+    rows = _slugreg_rows()
+    assert rows[m.normalize_company_for_match("Freshco Labs")][:2] == ("freshco-x", "no_jobs"), rows
+    assert m.normalize_company_for_match("Nopeboard Labs") not in rows, rows
+    assert "nopeboard-labs" in _hb_slugs(h)
+
+
+def test_hirebase_slugreg_unreadable_registry_runs_as_before_and_all_plans_share_one_list(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, {"Steelcase": 3, "Freshco Labs": 1})
+    m.hirebase_registry_seed()
+    seen = []
+    real = m.hirebase_feed.plan_hirebase_run
+    def spy(cands, *a, **kw):
+        seen.append(list(cands))
+        return real(cands, *a, **kw)
+    monkeypatch.setattr(m.hirebase_feed, "plan_hirebase_run", spy)
+    h.run()
+    assert len(seen) >= 3 and all(c == seen[0] for c in seen), seen
+    assert all("steelcase" not in [x[0] for x in c] for c in seen)
+    assert "steelcase" not in _hb_slugs(h)
+    monkeypatch.setattr(m, "hirebase_registry_read", lambda: None)
+    seen.clear()
+    h.posts.clear()
+    h.run()   # no registry: Steelcase plans as before this task, with its guessed slug
+    assert "steelcase" in _hb_slugs(h) and any("steelcase" in [x[0] for x in c] for c in seen), h.posts
