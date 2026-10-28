@@ -13575,13 +13575,55 @@ def test_visit_alert_ingest_switch_ceiling_batch_and_analytics_off(analytics_env
     assert len(analytics_env) == 10
     m._VISIT_ALERT_GATE.reset()
     del analytics_env[:]
-    _ingest([_view(path="/a"), _view(path="/b"), _view(path="/c")])
+    _ingest([_view(path="/"), _view(path="/job-engine"), _view(path="/lattice")])
     assert len(analytics_env) == 1
     m._VISIT_ALERT_GATE.reset()
     del analytics_env[:]
     monkeypatch.setenv("ANALYTICS_ENABLED", "false")
     _ingest([_view()])
     assert analytics_env == []
+
+
+_PROBE_PATHS = ["/.env", "/wp-login.php", "/admin", "/.git/config", "/phpmyadmin/index.php"]
+
+
+def test_visit_probe_ingest_probes_stored_as_probe_and_only_real_view_alerts(analytics_env):
+    views = [_view(ip=f"198.51.100.{i}", path=p) for i, p in enumerate(_PROBE_PATHS)]
+    views.append(_view(ip="203.0.113.50", path="/"))
+    assert _ingest(views).get_json()["stored"] == len(views)
+    assert [(r[2], r[5]) for r in _stored_rows()] == [(p, "probe") for p in _PROBE_PATHS] + [("/", None)]
+    assert len(analytics_env) == 1
+
+
+def test_visit_probe_ingest_probe_alone_sends_no_alert_and_is_stored(analytics_env):
+    _ingest([_view(ip=f"198.51.100.{i}", path=p) for i, p in enumerate(_PROBE_PATHS)])
+    assert analytics_env == []
+    rows = _stored_rows()
+    assert len(rows) == len(_PROBE_PATHS)
+    assert {r[5] for r in rows} == {"probe"}
+
+
+def test_visit_probe_ingest_standup_counts_human_as_visitor_and_probes_as_filtered(analytics_env):
+    views = [_view(ip=f"198.51.100.{i}", path=p) for i, p in enumerate(_PROBE_PATHS)]
+    views.append(_view(ip="203.0.113.50", path="/"))
+    _ingest(views)
+    line = m.site_visitor_standup_line()
+    assert "1 visitor (24h)" in line
+    assert f"{len(_PROBE_PATHS)} bot hits filtered" in line
+
+
+def test_visit_probe_ingest_real_page_with_query_is_still_a_person_and_alerts(analytics_env):
+    _ingest([_view(path="/job-engine?r=abc")])
+    rows = _stored_rows()
+    assert [(r[2], r[5]) for r in rows] == [("/job-engine", None)]
+    assert len(analytics_env) == 1
+
+
+def test_visit_probe_ingest_probes_do_not_consume_the_hourly_ceiling(analytics_env):
+    _ingest([_view(ip=f"192.0.2.{i}", path=f"/.env{i}") for i in range(30)])
+    assert analytics_env == []
+    _ingest([_view(ip="203.0.113.60", path="/")])
+    assert len(analytics_env) == 1
 
 
 def test_visit_alert_ingest_old_backlog_view_alerts_nobody(analytics_env):
