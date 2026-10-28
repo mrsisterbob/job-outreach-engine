@@ -40,6 +40,7 @@ import warm_stage_samples
 import warm_michigan
 import role_region
 import visit_alert
+from source_config import parse_source_config
 from resume_engine import compile_resume_pdf, compile_cover_letter_pdf, filter_ats_bullets, TRACK_BULLET_POOL_KEYS
 from track_registry import (
     TRACK_PROMPT_LINE, TRACK_TRIGGER_GUIDANCE, normalize_track, pool_key_for,
@@ -1852,6 +1853,56 @@ def hydrate_filters_from_sheets():
         logging.info(f"Hydrated {len(remote_filters)} filters from Google Sheets System_Config")
     except Exception as e:
         logging.error(f"Filter Hydration Error: {e}")
+
+SOURCE_CONFIG_KEYS = (
+    "source_hirebase_enabled", "source_hirebase_companies_per_run", "source_hirebase_monthly_jobs",
+    "source_apify_enabled", "source_apify_companies_per_run", "source_apify_monthly_usd",
+)
+_SOURCE_CONFIG_MISSING = object()
+
+def source_config_read():
+    """(SourceConfig, origin): the per-source on/off and budgets from the System_Config sheet, read now.
+
+    origin is "sheet" (good read), "last seen" (sheet unreadable; values a past read or the boot
+    hydration stored locally) or "defaults" (unreadable and nothing ever stored). A good read
+    mirrors the six raw values into search_filters locally (never set_filter: no write back to the
+    sheet); a key missing from the sheet is deleted locally so the default returns. Never raises.
+    """
+    try:
+        remote = None
+        try:
+            res = crm_get({"action": "load_system_config"})
+            if res is not None and res.status_code == 200:
+                body = res.json()
+                if isinstance(body, dict) and body.get("status") == "success" and isinstance(body.get("filters"), dict):
+                    remote = body["filters"]
+        except Exception as e:
+            logging.error(f"source_config_read: sheet read failed ({type(e).__name__})")
+            remote = None
+        if remote is not None:
+            raw = {k: remote[k] for k in SOURCE_CONFIG_KEYS if k in remote}
+            try:
+                with get_db_conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for k in SOURCE_CONFIG_KEYS:
+                        if k in raw:
+                            conn.execute("INSERT OR REPLACE INTO search_filters (key, value_json) VALUES (?, ?)",
+                                         (k, json.dumps(raw[k])))
+                        else:
+                            conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+                    conn.commit()
+            except Exception as e:
+                logging.error(f"source_config_read: local store failed ({type(e).__name__})")
+            return parse_source_config(raw), "sheet"
+        stored = {}
+        for k in SOURCE_CONFIG_KEYS:
+            v = get_filter(k, _SOURCE_CONFIG_MISSING)
+            if v is not _SOURCE_CONFIG_MISSING:
+                stored[k] = v
+        return parse_source_config(stored), ("last seen" if stored else "defaults")
+    except Exception as e:
+        logging.error(f"source_config_read: failed ({type(e).__name__})")
+        return parse_source_config({}), "defaults"
 
 def restore_core_sourcing_filters():
     """Put target_queries back from DEFAULT_SEARCH_FILTERS if it is missing, not a list, or empty.
