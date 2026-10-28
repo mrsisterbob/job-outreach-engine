@@ -175,6 +175,14 @@ grep -i "contact" FUNCTION_INDEX.md
 | 301 | `first_search_was_empty` | True when key's newest ok search returned zero rows and it has never returned a row. |
 | 309 | `plan_hirebase_run` | Pure spend guard: which no-board companies to search, each with days_ago and limit. |
 
+## `hirebase_registry.py` — 3 defs, 75 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 19 | `_age_days` | Days since checked_at; a bad or future timestamp counts as now (age 0). |
+| 31 | `route_company` | What /w does next: search_slug, skip, or search_guesses (with or without a lookup). |
+| 53 | `parse_seed` | Seed JSON text -> (entries, rejected). Bad elements are counted and dropped. Never raises. |
+
 ## `linkedin_import.py` — 15 defs, 382 lines
 
 | Line | Name | Summary |
@@ -1129,4 +1137,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**885 definitions across 45 files + Code.gs.**
+**888 definitions across 46 files + Code.gs.**
