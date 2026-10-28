@@ -1456,6 +1456,16 @@ def init_db():
             job_id TEXT PRIMARY KEY,
             seen_at TEXT NOT NULL
         )""")
+        # Which board an Apify feed row came from, per company. Separate from hirebase_slug_registry
+        # on purpose: that table's rows carry routing meaning (unknown suppresses, no_jobs skips).
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_feed_source (
+            company_key TEXT PRIMARY KEY,
+            source_domain TEXT NOT NULL DEFAULT '',
+            job_board TEXT NOT NULL DEFAULT '',
+            rows INTEGER NOT NULL DEFAULT 0,
+            checked_at TEXT NOT NULL
+        )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS query_pagination (
             query_text TEXT PRIMARY KEY,
@@ -3218,6 +3228,47 @@ def hirebase_registry_upsert(key, slug, status, now=None):
         return True
     except Exception as e:
         logging.error(f"Hirebase Registry Upsert Error: {type(e).__name__}")
+        return False
+
+def feed_source_read():
+    """Return {company_key: (source_domain, job_board, rows, checked_at)} from company_feed_source, or
+    None on a DB error (None, never {}: an unreadable table must not read as nothing recorded)."""
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT company_key, source_domain, job_board, rows, checked_at FROM company_feed_source").fetchall()
+        return {r[0]: (r[1], r[2], r[3], r[4]) for r in rows}
+    except Exception as e:
+        logging.error(f"Feed Source Read Error: {type(e).__name__}")
+        return None
+
+def feed_source_upsert(company_key, source_domain, job_board, rows, now=None):
+    """Insert or replace one company_feed_source row. A blank source_domain never erases a stored
+    non-blank one. True on success; False (never raises) on a blank key or a DB error."""
+    try:
+        key = str(company_key or "").strip()
+        if not key:
+            return False
+        domain = str(source_domain or "").strip()
+        board = str(job_board or "").strip()
+        try:
+            count = int(rows or 0)
+        except (TypeError, ValueError):
+            count = 0
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        with get_db_conn() as conn:
+            conn.execute(
+                "INSERT INTO company_feed_source (company_key, source_domain, job_board, rows, checked_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(company_key) DO UPDATE SET "
+                "source_domain = CASE WHEN excluded.source_domain = '' THEN company_feed_source.source_domain "
+                "ELSE excluded.source_domain END, job_board = excluded.job_board, "
+                "rows = excluded.rows, checked_at = excluded.checked_at",
+                (key, domain, board, count, now.isoformat()))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Feed Source Upsert Error: {type(e).__name__}")
         return False
 
 HIREBASE_SLUG_SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hirebase_slug_seed.json")
