@@ -371,3 +371,154 @@ def plan_hirebase_run(candidates, ledger, now, per_run=HIREBASE_COMPANIES_PER_RU
     if not picks:
         return HirebasePlan([], month_used, usable_left, 0, "nothing_eligible")
     return HirebasePlan(picks, month_used, usable_left, usable_left - remaining, "")
+
+
+# ---- Company Search (find the real company row; TASK-192) ------------------------------------
+# WHAT IS MEASURED AND WHAT IS NOT. Everything about this endpoint comes from the Hirebase docs
+# page read 2026-10-27, NOT from a real call we made: POST /v2/hirebase/companies/search, header
+# x-api-key; unknown body fields return 422; optional body fields query, company_name ("exact or
+# partial"), keywords, company_link, parent_company, page, limit (default 10, max 100), sort_by;
+# there is no slug filter and no job-count field; response companies[] with company_name,
+# company_slug, company_link, aliases, parent_company, subsidiaries, linkedin_link, score, plus
+# total_count, page, limit, total_pages; billed as m_company_api_calls, 1 unit per company row
+# returned. Kevin's 7 of 50 after three runs at limit 3 fits per-row billing but one test cannot
+# separate it from per-call billing. The first real run is the measurement; TASK-194 logs the
+# meter delta. MEASURED by Kevin 2026-10-27: "corewell" returned the subsidiary "Corewell Health
+# Urgent Care" as row 1, so row 1 is not always the parent.
+COMPANY_SEARCH_URL = "https://api.hirebase.org/v2/hirebase/companies/search"  # docs, not measured by us
+COMPANY_LOOKUP_LIMIT = 2     # DESIGN CHOICE
+COMPANY_MONTHLY_UNITS = 24   # DESIGN CHOICE: about half the Free plan's 50, leaving the rest for Kevin's own Playground use
+COMPANY_LOOKUPS_PER_RUN = 3  # DESIGN CHOICE
+COMPANY_RETRY_DAYS = 7       # DESIGN CHOICE
+COMPANY_WINDOW_DAYS = 30
+
+CompanyResult = namedtuple("CompanyResult", "status rows error")
+CompanyLookupPlan = namedtuple("CompanyLookupPlan", "picks month_units_used usable_left skip_reason")
+
+
+def build_company_search_body(name, limit=COMPANY_LOOKUP_LIMIT):
+    """Exactly company_name, page, limit (unknown fields 422). Blank name -> None."""
+    text = str(name or "").strip()
+    if not text:
+        return None
+    return {"company_name": text, "page": 1, "limit": _clamp(limit, 1, COMPANY_LOOKUP_LIMIT)}
+
+
+def fetch_company_rows(name, api_key, post=None, timeout=30):
+    """ONE Company Search request. status "ok" (rows may be [] = honest no-match) or "errored".
+
+    Errored: no key or blank name, a raising post, non-2xx, bad JSON, companies missing or not a
+    list, or a non-empty list where no row has a non-empty string company_slug. error is the
+    exception class name or the HTTP status only, never the key, URL, body or response text.
+    """
+    body = build_company_search_body(name)
+    if body is None:
+        return CompanyResult("errored", [], "blank name")
+    if not api_key:
+        return CompanyResult("errored", [], "no api key")
+    if post is None:
+        import requests
+        post = requests.post
+    try:
+        resp = post(COMPANY_SEARCH_URL, json=body, headers={"x-api-key": api_key}, timeout=timeout)
+    except Exception as exc:
+        return CompanyResult("errored", [], type(exc).__name__)
+    code = getattr(resp, "status_code", None)
+    if not isinstance(code, int) or isinstance(code, bool) or not 200 <= code < 300:
+        return CompanyResult("errored", [], "http status %s" % (code,))
+    try:
+        data = resp.json()
+    except Exception as exc:
+        return CompanyResult("errored", [], type(exc).__name__)
+    companies = data.get("companies") if isinstance(data, dict) else None
+    if not isinstance(companies, list):
+        return CompanyResult("errored", [], "companies missing or not a list")
+    rows = [r for r in companies if isinstance(r, dict)]
+    if companies and not any(isinstance(r.get("company_slug"), str) and r["company_slug"].strip()
+                             for r in rows):
+        return CompanyResult("errored", [], "no row has a company_slug")
+    return CompanyResult("ok", rows, "")
+
+
+def _host(link):
+    text = str(link or "").strip().lower()
+    text = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text)
+    host = re.split(r"[/?#]", text, maxsplit=1)[0].split("@")[-1].split(":")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def pick_company_row(rows, name, normalize, known_domain=None):
+    """The one row that really is `name`, or None. Never falls back to row 1.
+
+    Match: host of company_link equals known_domain, OR normalize(company_name) equals
+    normalize(name), OR a string in aliases does. Malformed aliases are ignored. Several matching
+    rows with different slugs are ambiguous -> None.
+    """
+    want = normalize(name)
+    domain = _host(known_domain) if known_domain else ""
+    hits = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        slug = row.get("company_slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        ok = bool(domain) and _host(row.get("company_link")) == domain
+        if not ok and want and isinstance(row.get("company_name"), str):
+            ok = normalize(row["company_name"]) == want
+        if not ok and want and isinstance(row.get("aliases"), list):
+            ok = any(isinstance(a, str) and normalize(a) == want for a in row["aliases"])
+        if ok:
+            hits.append(row)
+    if len({h["company_slug"] for h in hits}) != 1:
+        return None
+    return hits[0]
+
+
+def plan_company_lookups(candidates, ledger, now, *, per_run=COMPANY_LOOKUPS_PER_RUN,
+                         monthly_units=COMPANY_MONTHLY_UNITS, retry_days=COMPANY_RETRY_DAYS,
+                         limit=COMPANY_LOOKUP_LIMIT):
+    """Which companies may get a Company Search lookup this run.
+
+    candidates: (key, display, people), already filtered by the caller. ledger: (spent_at, units,
+    status, company_key). month_units_used sums units over ok AND errored rows in the trailing 30
+    days (a failed call may have billed). Each pick reserves `limit` units. A key with any ledger
+    row in the last retry_days is skipped. Biggest network first, ties by key.
+
+    ARITHMETIC on design constants (not measurements): 24 units a month at 2 rows per lookup is at
+    most 12 lookups a month, 24 if every lookup returns one row. 160-180 no-board companies is many
+    months, which is why TASK-194 only looks up companies whose job search came back empty, biggest
+    network first.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    window = timedelta(days=COMPANY_WINDOW_DAYS)
+    retry = timedelta(days=retry_days)
+    used = 0
+    recent = set()
+    for spent_at, units, status, key in ledger or []:
+        dt = _plan_ts(spent_at, now)
+        if status in ("ok", "errored") and now - dt <= window:
+            try:
+                used += max(0, int(units))
+            except (ValueError, TypeError, OverflowError):
+                used += monthly_units  # unparseable: assume the worst
+        if now - dt < retry:
+            recent.add(key)
+    usable_left = max(0, monthly_units - used)
+    cands = list(candidates or [])
+    if not cands:
+        return CompanyLookupPlan([], used, usable_left, "no candidates")
+    eligible = [c for c in cands if c[0] not in recent]
+    if not eligible:
+        return CompanyLookupPlan([], used, usable_left, "all recently tried")
+    eligible.sort(key=lambda c: (-(c[2] or 0), c[0]))
+    picks, remaining = [], usable_left
+    for key, display, people in eligible:
+        if len(picks) >= per_run or remaining < limit:
+            break
+        picks.append((key, display, people))
+        remaining -= limit
+    if not picks:
+        return CompanyLookupPlan([], used, usable_left, "monthly cap")
+    return CompanyLookupPlan(picks, used, usable_left, "")

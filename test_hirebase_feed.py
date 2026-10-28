@@ -350,3 +350,176 @@ def test_hirebase_slugreg_sibling_slug_fails_even_under_a_trusted_slug():
     row = _slugreg_row("Haworth International", "haworth-international")
     kept, st = hf.split_jobs([row], "Haworth", ["haworth"], norm, trusted_slugs=["haworth"])
     assert kept == [] and st["unmatched"] == 1
+
+
+# ---- Company Search (TASK-192) ----
+NOW_C = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+
+
+class FakeResp:
+    def __init__(self, code=200, data=None, bad_json=False):
+        self.status_code = code
+        self._data = data
+        self._bad = bad_json
+        self.text = "BODYSECRET"
+
+    def json(self):
+        if self._bad:
+            raise ValueError("BODYSECRET")
+        return self._data
+
+
+def _post_returning(resp):
+    return lambda url, **kw: resp
+
+
+def _row(name, slug, **over):
+    r = {"company_name": name, "company_slug": slug, "company_link": "https://www.%s.com/" % slug,
+         "aliases": []}
+    r.update(over)
+    return r
+
+
+def _ago(days):
+    return (NOW_C - timedelta(days=days)).isoformat()
+
+
+def test_hirebase_company_body_exact_keys_and_clamp():
+    b = hf.build_company_search_body("Corewell Health", limit=99)
+    assert set(b) == {"company_name", "page", "limit"} and b["page"] == 1 and b["limit"] == 2
+    assert hf.build_company_search_body("X", limit=0)["limit"] == 1
+    assert hf.build_company_search_body("X", limit=1)["limit"] == 1
+
+
+def test_hirebase_company_body_blank_is_none():
+    assert hf.build_company_search_body("   ") is None
+    assert hf.build_company_search_body(None) is None
+
+
+def test_hirebase_company_fetch_ok_rows_and_drops_non_dicts():
+    seen = {}
+
+    def post(url, **kw):
+        seen.update(url=url, **kw)
+        return FakeResp(200, {"companies": [_row("A", "a"), "junk", 3]})
+    res = hf.fetch_company_rows("A", "SECRET-123", post=post)
+    assert res.status == "ok" and len(res.rows) == 1
+    assert seen["json"] == {"company_name": "A", "page": 1, "limit": 2}
+    assert seen["headers"] == {"x-api-key": "SECRET-123"}
+
+
+def test_hirebase_company_fetch_ok_empty_is_not_error():
+    res = hf.fetch_company_rows("A", "k", post=_post_returning(FakeResp(200, {"companies": []})))
+    assert res.status == "ok" and res.rows == [] and res.error == ""
+
+
+def test_hirebase_company_fetch_errors_by_status():
+    for code in (401, 422):
+        res = hf.fetch_company_rows("A", "k", post=_post_returning(FakeResp(code, {})))
+        assert res.status == "errored" and res.error == "http status %d" % code and res.rows == []
+
+
+def test_hirebase_company_fetch_errored_on_raise_and_bad_json():
+    def boom(url, **kw):
+        raise RuntimeError("SECRET-123 " + url)
+    r1 = hf.fetch_company_rows("A", "SECRET-123", post=boom)
+    assert r1.status == "errored" and r1.error == "RuntimeError"
+    r2 = hf.fetch_company_rows("A", "k", post=_post_returning(FakeResp(200, bad_json=True)))
+    assert r2.status == "errored" and r2.error == "ValueError"
+
+
+def test_hirebase_company_fetch_errored_on_bad_shapes():
+    for data in ({}, {"companies": {"a": 1}}, {"companies": None}, [1]):
+        res = hf.fetch_company_rows("A", "k", post=_post_returning(FakeResp(200, data)))
+        assert res.status == "errored", data
+    slugless = {"companies": [{"company_name": "A"}, {"company_name": "B", "company_slug": ""}]}
+    res = hf.fetch_company_rows("A", "k", post=_post_returning(FakeResp(200, slugless)))
+    assert res.status == "errored"
+
+
+def test_hirebase_company_error_text_leaks_nothing():
+    def boom(url, **kw):
+        raise RuntimeError("SECRET-123 " + url)
+    outs = [hf.fetch_company_rows("A", "SECRET-123", post=boom),
+            hf.fetch_company_rows("A", "SECRET-123", post=_post_returning(FakeResp(500, {}))),
+            hf.fetch_company_rows("A", "SECRET-123", post=_post_returning(FakeResp(200, bad_json=True)))]
+    for res in outs:
+        assert "SECRET-123" not in res.error and "api.hirebase" not in res.error
+        assert "BODYSECRET" not in res.error
+
+
+def test_hirebase_company_pick_exact_name():
+    rows = [_row("Haworth Inc.", "haworth")]
+    assert hf.pick_company_row(rows, "Haworth", norm)["company_slug"] == "haworth"
+
+
+def test_hirebase_company_pick_by_alias():
+    rows = [_row("Zeta Holdings", "zeta", aliases=["Acme Corp"])]
+    assert hf.pick_company_row(rows, "Acme", norm)["company_slug"] == "zeta"
+
+
+def test_hirebase_company_pick_by_domain():
+    rows = [_row("Different Name", "dn", company_link="https://www.acme.com/about")]
+    assert hf.pick_company_row(rows, "Acme", norm) is None
+    got = hf.pick_company_row(rows, "Acme", norm, known_domain="http://ACME.com")
+    assert got["company_slug"] == "dn"
+
+
+def test_hirebase_company_pick_corewell_subsidiary_first():
+    rows = [_row("Corewell Health Urgent Care", "corewell-health-urgent-care-se"),
+            _row("Corewell Health", "corewell-health")]
+    assert hf.pick_company_row(rows, "corewell health", lambda s: norm(s).lower())["company_slug"] == "corewell-health"
+
+
+def test_hirebase_company_pick_ambiguous_and_no_match():
+    two = [_row("Acme", "acme-1"), _row("Acme Inc", "acme-2")]
+    assert hf.pick_company_row(two, "Acme", norm) is None
+    same = [_row("Acme", "acme"), _row("Acme Inc", "acme")]
+    assert hf.pick_company_row(same, "Acme", norm)["company_slug"] == "acme"
+    assert hf.pick_company_row([_row("Other", "other")], "Acme", norm) is None
+    assert hf.pick_company_row([], "Acme", norm) is None
+
+
+def test_hirebase_company_pick_malformed_aliases_ignored():
+    for bad in ("Acme", 5, {"a": "Acme"}, [None, 3], None):
+        rows = [_row("Zeta", "zeta", aliases=bad)]
+        assert hf.pick_company_row(rows, "Acme", norm) is None
+
+
+def test_hirebase_company_plan_cap_math():
+    ledger = [(_ago(2), 22, "ok", "old")]
+    plan = hf.plan_company_lookups([("a", "A", 5), ("b", "B", 4)], ledger, NOW_C)
+    assert plan.month_units_used == 22 and plan.usable_left == 2
+    assert [p[0] for p in plan.picks] == ["a"] and plan.skip_reason == ""
+
+
+def test_hirebase_company_plan_errored_counts_and_monthly_cap():
+    ledger = [(_ago(2), 12, "ok", "x"), (_ago(3), 12, "errored", "y")]
+    plan = hf.plan_company_lookups([("a", "A", 5)], ledger, NOW_C)
+    assert plan.month_units_used == 24 and plan.picks == [] and plan.skip_reason == "monthly cap"
+
+
+def test_hirebase_company_plan_old_rows_leave_window():
+    plan = hf.plan_company_lookups([("a", "A", 1)], [(_ago(31), 24, "ok", "x")], NOW_C)
+    assert plan.month_units_used == 0 and len(plan.picks) == 1
+
+
+def test_hirebase_company_plan_retry_skip_includes_errored():
+    ledger = [(_ago(1), 2, "errored", "a"), (_ago(8), 2, "ok", "b")]
+    plan = hf.plan_company_lookups([("a", "A", 9), ("b", "B", 1)], ledger, NOW_C)
+    assert [p[0] for p in plan.picks] == ["b"]
+    only = hf.plan_company_lookups([("a", "A", 9)], ledger, NOW_C)
+    assert only.picks == [] and only.skip_reason == "all recently tried"
+
+
+def test_hirebase_company_plan_per_run_and_ordering():
+    cands = [("c", "C", 3), ("a", "A", 3), ("z", "Z", 10), ("b", "B", 1)]
+    plan = hf.plan_company_lookups(cands, [], NOW_C)
+    assert [p[0] for p in plan.picks] == ["z", "a", "c"]
+    plan1 = hf.plan_company_lookups(cands, [], NOW_C, per_run=1)
+    assert [p[0] for p in plan1.picks] == ["z"]
+
+
+def test_hirebase_company_plan_skip_reasons():
+    assert hf.plan_company_lookups([], [], NOW_C).skip_reason == "no candidates"
+    assert hf.plan_company_lookups([("a", "A", 1)], [], NOW_C).skip_reason == ""
