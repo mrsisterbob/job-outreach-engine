@@ -699,7 +699,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 26 | `_norm_email` | _(no docstring)_ |
 | 30 | `collect_open_followups` | snapshots: {run_date "YYYY-MM-DD": result dict as saved by save_followup_queue_snapshot} |
 
-## `pipeline_utils.py` — 120 defs, 3,249 lines
+## `pipeline_utils.py` — 121 defs, 3,270 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -802,27 +802,28 @@ grep -i "contact" FUNCTION_INDEX.md
 | 2550 | `public_followup_ladder` | The sequencer's follow-up offsets for the public site's date planner. |
 | 2566 | `public_location_counts` | Aggregate (city, state, is_remote) rows into the public screened_locations block. |
 | 2597 | `shape_public_dashboard` | Arrange build_public_dashboard()'s raw readings into the public payload. |
-| 2686 | `classify_visit` | What kind of pageview this is: None for a person, else 'self' / 'preview' / 'health' / |
-| 2705 | `visit_bot_flag` | The stored bot column: None for a person, else classify_visit()'s kind, with the unfurling |
-| 2722 | `normalize_referrer_host` | Bare external host of a Referer header, or '' for none / same-site / unparseable. |
-| 2749 | `is_job_market_referrer` | _(no docstring)_ |
-| 2754 | `daily_visitor_id` | 16-hex HMAC-SHA256 of ip\|user-agent under today's salt. Same visitor, same day -> same id; |
-| 2761 | `summarize_visits` | rows: (visitor_id, path, referrer, bot) for one window. Returns counts by DISTINCT visitor: |
-| 2786 | `format_visitor_line` | The standup's one analytics line. Referrers lead - they are the signal; the raw count is |
-| 2824 | `validate_lead` | (lead_dict, None) or (None, error_message) for one submitted lead. |
-| 2845 | `format_leads_messages` | The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are |
-| 2880 | `format_lead_alert` | The one Telegram message sent when a lead is committed. Pure. |
-| 2923 | `parse_reference_args` | `Name \| email \| phone \| Work \| years \| Org \| City` -> (reference dict, None) or (None, error). |
-| 2947 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
-| 2982 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
-| 2987 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
-| 3034 | `is_banned_employer` | True when the employer name matches a BANNED_EMPLOYER_PATTERNS whole-word regex. |
-| 3111 | `_word_alternation` | One case-insensitive regex matching any of `words` (or its plural) as whole words. |
-| 3120 | `sales_title_is_selling_role` | True when a title with the word "sales" in it names a selling role, False when it names a |
-| 3133 | `is_off_direction_title` | True when the job title names IT admin, infrastructure, help desk, security ops or data center work. |
-| 3210 | `is_industrial_title` | True when the title names industrial, robotics or plant-maintenance work (not process automation). |
-| 3221 | `industrial_term_hits` | Distinct industrial / material-handling vocabulary found in a job description. |
-| 3229 | `required_degree_is_technical_trade` | True when a degree clause names only technical-trade fields (mechatronics, mechanical, electrical...). |
+| 2694 | `is_site_page` | True when path is one of montelattice.com's real pages. Query and fragment are dropped; |
+| 2703 | `classify_visit` | What kind of pageview this is: None for a person, else 'self' / 'preview' / 'health' / |
+| 2726 | `visit_bot_flag` | The stored bot column: None for a person, else classify_visit()'s kind, with the unfurling |
+| 2743 | `normalize_referrer_host` | Bare external host of a Referer header, or '' for none / same-site / unparseable. |
+| 2770 | `is_job_market_referrer` | _(no docstring)_ |
+| 2775 | `daily_visitor_id` | 16-hex HMAC-SHA256 of ip\|user-agent under today's salt. Same visitor, same day -> same id; |
+| 2782 | `summarize_visits` | rows: (visitor_id, path, referrer, bot) for one window. Returns counts by DISTINCT visitor: |
+| 2807 | `format_visitor_line` | The standup's one analytics line. Referrers lead - they are the signal; the raw count is |
+| 2845 | `validate_lead` | (lead_dict, None) or (None, error_message) for one submitted lead. |
+| 2866 | `format_leads_messages` | The /leads Telegram reply as a list of messages, each within Telegram's max_chars. rows are |
+| 2901 | `format_lead_alert` | The one Telegram message sent when a lead is committed. Pure. |
+| 2944 | `parse_reference_args` | `Name \| email \| phone \| Work \| years \| Org \| City` -> (reference dict, None) or (None, error). |
+| 2968 | `format_references_card` | The /refs reply: one block per reference, every form field in its own <code> span so a |
+| 3003 | `_utf16_len` | Telegram measures entity offsets in UTF-16 code units, not Python characters. |
+| 3008 | `retag_card_routing` | The card's text and entities with its 🧭 routing tag rewritten, or None if it has no tag. |
+| 3055 | `is_banned_employer` | True when the employer name matches a BANNED_EMPLOYER_PATTERNS whole-word regex. |
+| 3132 | `_word_alternation` | One case-insensitive regex matching any of `words` (or its plural) as whole words. |
+| 3141 | `sales_title_is_selling_role` | True when a title with the word "sales" in it names a selling role, False when it names a |
+| 3154 | `is_off_direction_title` | True when the job title names IT admin, infrastructure, help desk, security ops or data center work. |
+| 3231 | `is_industrial_title` | True when the title names industrial, robotics or plant-maintenance work (not process automation). |
+| 3242 | `industrial_term_hits` | Distinct industrial / material-handling vocabulary found in a job description. |
+| 3250 | `required_degree_is_technical_trade` | True when a degree clause names only technical-trade fields (mechatronics, mechanical, electrical...). |
 
 ## `queue_baseline.py` — 9 defs, 224 lines
 
@@ -1172,4 +1173,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**918 definitions across 47 files + Code.gs.**
+**919 definitions across 47 files + Code.gs.**
