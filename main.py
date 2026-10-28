@@ -35,6 +35,7 @@ import apify_feed
 import hirebase_feed
 import hirebase_registry
 import warm_screen_plan
+import warm_stage_samples
 import warm_michigan
 import role_region
 import visit_alert
@@ -1349,6 +1350,13 @@ def init_db():
             job_hash TEXT PRIMARY KEY,
             screened_at TEXT,
             outcome TEXT
+        )""")
+        # /w stage samples: one row per /w run (JSON of a StageSampler snapshot), newest 5 kept, so
+        # /wstages can show where role diversity dies without a Render shell.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS warm_stage_samples (
+            run_at TEXT NOT NULL,
+            snapshot TEXT NOT NULL
         )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS company_cooldown (
@@ -15333,6 +15341,37 @@ def _warm_screen_memo_read(job_hashes):
     return out
 
 
+WARM_STAGE_SAMPLES_KEEP = 5   # runs kept in warm_stage_samples
+
+
+def _warm_stage_samples_write(snapshot):
+    """Store one run's stage snapshot and keep only the newest WARM_STAGE_SAMPLES_KEEP rows. Never raises."""
+    try:
+        run_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT INTO warm_stage_samples (run_at, snapshot) VALUES (?, ?)",
+                         (run_at, json.dumps(snapshot)))
+            conn.execute("DELETE FROM warm_stage_samples WHERE rowid NOT IN "
+                         "(SELECT rowid FROM warm_stage_samples ORDER BY run_at DESC, rowid DESC LIMIT ?)",
+                         (WARM_STAGE_SAMPLES_KEEP,))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Warm Stage Samples Write Error: {type(e).__name__}: {e}")
+        return False
+
+
+def _warm_stage_samples_read(nth=1):
+    """(run_at, snapshot dict) of the nth newest /w run, or None when there is none."""
+    with get_db_conn() as conn:
+        row = conn.execute("SELECT run_at, snapshot FROM warm_stage_samples "
+                           "ORDER BY run_at DESC, rowid DESC LIMIT 1 OFFSET ?", (max(1, nth) - 1,)).fetchone()
+    if not row:
+        return None
+    return row[0], json.loads(row[1])
+
+
 def _warm_screen_memo_write(job_hashes, outcome):
     """Record that the /w screen decided `outcome` ('rejected' or 'digest') on these roles today."""
     hashes = [h for h in dict.fromkeys(job_hashes) if h]
@@ -15588,6 +15627,14 @@ def run_warm_radar_scan(chat_id=None):
         remote_hashes = set()
         referral_pending = {}   # company key -> best contact + the roles that were LISTED this run
         screen_trace = FunnelTrace()   # why the role screen (passes_strict_filter) dropped roles this run
+        stage_sampler = warm_stage_samples.StageSampler()
+
+        def _note_stage(stage, company, title, detail=""):
+            """Sample a role at a stage. A sampler error must never fail or alter a scan."""
+            try:
+                stage_sampler.note(stage, company, title, detail)
+            except Exception:
+                pass
         screen_dropped = set()         # hashes the role screen already counted (a duplicate posting counts once)
         groups = {}             # company key -> {"contact", "company", "roles": [surviving roles]}
         board_index = 0
@@ -15629,6 +15676,7 @@ def run_warm_radar_scan(chat_id=None):
             if job_hash in seen_hashes or is_role_tracked(company, title):
                 return
 
+            # Postings that cannot be attributed to a warm contact (below) are not in the sample: they are not /w's.
             # Tie the posting back to its warm contact by the slug baked into its job_id
             # (gh_/lever_/ashby_<slug>_...), falling back to a normalized-name match on the ATS
             # employer label. Postings we can't attribute to a warm contact aren't /w's to surface.
@@ -15651,14 +15699,17 @@ def run_warm_radar_scan(chat_id=None):
                 return
             if jsearch_keys is not None and normalize_company_for_match(company) not in jsearch_keys:
                 return   # a JSearch posting is kept only when its employer IS one of the companies searched
+            _note_stage("pulled", company, title)
 
             # The title gate /t uses (one shared function). A filtered role is counted, never stamped
             # into seen_jobs (same reason _add_candidate does not): the rule can change and the role
             # should be seen again.
-            if title_rejection_reason(title):
+            title_reason = title_rejection_reason(title)
+            if title_reason:
                 if job_hash not in filtered_hashes:
                     filtered_hashes.add(job_hash)
                     title_filtered += 1
+                    _note_stage("title_filter", company, title, title_reason)
                 return
 
             # The region/language gate (role_region): the one location rule /w has. It drops only
@@ -15669,6 +15720,7 @@ def run_warm_radar_scan(chat_id=None):
                 if job_hash not in region_hashes:
                     region_hashes.add(job_hash)
                     region_filtered += 1
+                    _note_stage("region", company, title, verdict)
                 return
 
             # Pure Remote roles are not Michigan in-person roles. The shared Michigan rule below lets
@@ -15676,6 +15728,8 @@ def run_warm_radar_scan(chat_id=None):
             # job_is_remote is the posting source's flag; a hybrid role flagged remote without the
             # word "hybrid" in its location is dropped (errs toward dropping). Never stamped.
             if warm_michigan.is_pure_remote(job):
+                if job_hash not in remote_hashes:
+                    _note_stage("remote", company, title, str(job.get("job_city") or "")[:40])
                 remote_hashes.add(job_hash)
                 return
 
@@ -15685,9 +15739,16 @@ def run_warm_radar_scan(chat_id=None):
             # A dropped role is counted by reason and never stamped, like the title gate.
             if job_hash in screen_dropped:
                 return
+            _reasons_before = dict(screen_trace.reasons)
             if not passes_strict_filter(job, trace=screen_trace, check_geography=True,
                                         check_company_suppression=False):
                 screen_dropped.add(job_hash)
+                try:
+                    _why_dropped = next((k for k, v in screen_trace.reasons.items()
+                                         if v > _reasons_before.get(k, 0)), "")
+                except Exception:
+                    _why_dropped = ""
+                _note_stage("michigan_screen", company, title, _why_dropped)
                 return
 
             seen_hashes.add(job_hash)
@@ -15981,6 +16042,10 @@ def run_warm_radar_scan(chat_id=None):
 
         plan = warm_screen_plan.choose_outputs(scored)
         rejected_hashes = [r["job_hash"] for r in ai_rejected] + [i["job_hash"] for i in plan["rejected"]]
+        for _r in ai_rejected:
+            _note_stage("ai_screen", _r["company"], _r["title"], "no score")
+        for _i in plan["rejected"]:
+            _note_stage("ai_screen", _i["company"], _i["title"], f"score {_i['pre_boost']}")
         if rejected_hashes:
             _warm_screen_memo_write(rejected_hashes, "rejected")
 
@@ -16041,6 +16106,7 @@ def run_warm_radar_scan(chat_id=None):
         # Roles whose card went: stamp, count, and collect for the referral ask.
         sent_by_group = {}
         for item in sent_items:
+            _note_stage("card", item["company"], item["title"], f"score {item['final']}")
             save_seen_job_db(item["job_hash"])
             match_count += 1
             sent_by_group.setdefault(item["company_key"], []).append(item)
@@ -16186,6 +16252,7 @@ def run_warm_radar_scan(chat_id=None):
                              f"applied to in the last {warm_screen_plan.APPLIED_SKIP_DAYS} days ({names_text})")
             lines += _skipped_report()
             send_telegram_message(chat_id, "\n".join(lines))
+        _warm_stage_samples_write(stage_sampler.snapshot())
         return match_count
     finally:
         if lookup_now:
@@ -16554,6 +16621,25 @@ def process_webhook_payload_async(data):
                 return
             for chunk in format_leads_messages(rows, limit, TELEGRAM_MAX_MESSAGE_CHARS):
                 send_telegram_message(chat_id, chunk)
+            return
+        # /wstages [1-5]: the last /w run's per-stage title samples (read-only).
+        if text == "/wstages" or text.startswith("/wstages "):
+            arg = text[len("/wstages"):].strip()
+            if arg and not (arg.isdigit() and 1 <= int(arg) <= WARM_STAGE_SAMPLES_KEEP):
+                send_telegram_message(chat_id, "❌ <b>Usage:</b> <code>/wstages</code> or "
+                                      f"<code>/wstages 2</code> (a number 1-{WARM_STAGE_SAMPLES_KEEP}, 1 = newest run)")
+                return
+            try:
+                found = _warm_stage_samples_read(int(arg) if arg else 1)
+            except Exception as e:
+                logging.error(f"/wstages read failed: {type(e).__name__}: {e}")
+                send_telegram_message(chat_id, "❌ Could not read the /w stage samples.")
+                return
+            if not found or warm_stage_samples.snapshot_is_empty(found[1]):
+                send_telegram_message(chat_id, "No /w run recorded yet.")
+                return
+            send_telegram_message(chat_id, warm_stage_samples.format_stage_report(
+                found[1], "/w run #%d, %s" % (int(arg) if arg else 1, str(found[0])[:16])))
             return
         # NOT "/dead" - that is the swipe-reply that kills the replied-to row (see below).
         if text == "/usage" or text.startswith("/usage "):
@@ -18618,7 +18704,8 @@ def process_webhook_payload_async(data):
                 "/overdue - Full overdue list (the morning digest shows only the 10 most overdue)\n"
                 "/owed - Every follow-up still owed (last 14 days), count + links\n"
                 "/owedx - Dismiss every open follow-up (CRM untouched; /owedx undo restores)\n"
-                "/refer - Pending referral asks from /w, 5 per page (/refer 2, /refer sent &lt;id&gt;)\n\n"
+                "/refer - Pending referral asks from /w, 5 per page (/refer 2, /refer sent &lt;id&gt;)\n"
+                "/wstages - Last /w run: sample titles at each stage (/wstages 2 = the run before)\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
