@@ -191,6 +191,12 @@ HELP = {
         "How often you actually use each command, over a week, month, 90 days or all time.",
         "/usage month",
     ),
+    "/wstages": (
+        "Shows the last /w run's sample titles at each stage: pulled, title filter, US/English, "
+        "Remote, Michigan screen, AI screen and card. /wstages 2 shows the run before, and the "
+        "number can be 1-5. Read-only.",
+        "/wstages 2",
+    ),
     "/streak": (
         "The daily outreach scorecard - what you sent today and whether the streak held. "
         "/daily is the same thing.",

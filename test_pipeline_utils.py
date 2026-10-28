@@ -2277,6 +2277,20 @@ def test_trailing_slash_help_answers_and_resolves_aliases():
     assert "/help" in unknown
 
 
+def test_wstages_help_entry_is_real_not_the_fallback():
+    import command_help as ch
+    assert "/wstages" in ch.HELP
+    reply = ch.lookup_command_help("/wstages/")
+    assert "No per-command help" not in reply
+    assert "<code>/wstages 2</code>" in reply
+
+
+def test_wstages_help_never_swallows_a_real_invocation():
+    import command_help as ch
+    assert ch.lookup_command_help("/wstages") is None
+    assert ch.lookup_command_help("/wstages 2") is None
+
+
 def test_every_help_entry_has_prose_and_an_example():
     """An entry that is a bare restatement of the command name is not help. This exists because
     the /help wall was already confusing - a thin entry here would be the same failure again."""
