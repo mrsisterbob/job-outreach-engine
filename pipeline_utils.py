@@ -2683,10 +2683,29 @@ CRAWLER_AGENT_TOKENS = ("googlebot", "bingbot", "duckduckbot", "yandex", "baidus
 _GENERIC_BOT = re.compile(r"(bot|crawler|spider|crawl|scraper)(?:[/ ;)+(-]|$)")
 
 
-def classify_visit(user_agent, ip, is_self, ignore_ips=()):
+# The site's own routes (montelattice-site/main.py) are the source of truth; this copy drifts when
+# a page is added there. The first symptom of drift is a real new page being stored as a bot.
+SITE_PAGE_PATHS = frozenset({
+    "/", "/lattice", "/code", "/job-engine", "/docfiler", "/crypto", "/budget", "/budget/login",
+    "/budget/logout", "/console", "/console/login", "/console/logout", "/console/demo"})
+SITE_PAGE_PREFIXES = ("/resume/",)
+
+
+def is_site_page(path):
+    """True when path is one of montelattice.com's real pages. Query and fragment are dropped;
+    matching is case-sensitive and exact (Flask: /Lattice and /code/ are 404s). A non-string or
+    empty path counts as '/', which is what the ingest defaults a missing path to."""
+    p = path.strip() if isinstance(path, str) else ""
+    p = p.split("?", 1)[0].split("#", 1)[0] or "/"
+    return p in SITE_PAGE_PATHS or any(p.startswith(x) for x in SITE_PAGE_PREFIXES)
+
+
+def classify_visit(user_agent, ip, is_self, ignore_ips=(), path=None):
     """What kind of pageview this is: None for a person, else 'self' / 'preview' / 'health' /
-    'crawler'. Checked in that order, so Kevin's own traffic never counts as a bot and a link
-    preview is never lost among crawlers. An empty user agent is a script, not a browser."""
+    'crawler' / 'probe'. Checked in that order, so Kevin's own traffic never counts as a bot and a
+    link preview is never lost among crawlers. An empty user agent is a script, not a browser.
+    'probe' is last: a would-be person asking for a path that is not a site page (/.env). path=None
+    skips that check."""
     if is_self or (ip and ip in set(ignore_ips or ())):
         return "self"
     ua = str(user_agent or "").strip().lower()
@@ -2699,13 +2718,15 @@ def classify_visit(user_agent, ip, is_self, ignore_ips=()):
         return "health"
     if any(t in ua for t in CRAWLER_AGENT_TOKENS) or _GENERIC_BOT.search(ua):
         return "crawler"
+    if path is not None and not is_site_page(path):
+        return "probe"
     return None
 
 
-def visit_bot_flag(user_agent, ip, is_self, ignore_ips=()):
+def visit_bot_flag(user_agent, ip, is_self, ignore_ips=(), path=None):
     """The stored bot column: None for a person, else classify_visit()'s kind, with the unfurling
     app appended for previews ('preview:LinkedIn') so the standup can name who shared the link."""
-    kind = classify_visit(user_agent, ip, is_self, ignore_ips)
+    kind = classify_visit(user_agent, ip, is_self, ignore_ips, path)
     if kind != "preview":
         return kind
     ua = str(user_agent or "").lower()
