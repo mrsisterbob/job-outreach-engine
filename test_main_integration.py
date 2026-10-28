@@ -20473,6 +20473,11 @@ def _hirebase_hook_harness(monkeypatch, nobody=None, key="hbkey"):
         conn.commit()
     h.posts, h.feed = [], []
 
+    class _CompanyEmpty:
+        status_code = 200
+        def json(self):
+            return {"companies": []}
+
     class _Resp:
         status_code = 200
         def __init__(self, jobs):
@@ -20481,6 +20486,8 @@ def _hirebase_hook_harness(monkeypatch, nobody=None, key="hbkey"):
             return {"jobs": self.jobs, "total_count": len(self.jobs)}
 
     def fake_post(url, **kw):
+        if url.endswith("/companies/search"):   # TASK-194 Company Search lookups: an honest no-match, kept out of h.posts
+            return _CompanyEmpty()
         h.posts.append((url, kw))
         slugs = set(kw["json"]["company_slugs"])
         return _Resp([j for j in h.feed if j["company_slug"] in slugs])
@@ -20897,6 +20904,8 @@ def _hb_set_post(h, monkeypatch, total_extra=None):
             return {"jobs": self.jobs, "total_count": self.total}
 
     def post(url, **kw):
+        if url.endswith("/companies/search"):   # TASK-194: Company Search is an honest no-match here, kept out of h.posts
+            return type("_C", (), {"status_code": 200, "json": lambda self: {"companies": []}})()
         h.posts.append((url, kw))
         slugs = set(kw["json"]["company_slugs"])
         rows = [j for j in h.feed if j["company_slug"] in slugs]
@@ -21363,3 +21372,167 @@ def test_hirebase_companyledger_feeds_planner_and_reservation_lowers_usable_left
     after = m.hirebase_feed.plan_company_lookups(cands, m.hirebase_company_ledger_read(), now)
     assert after.usable_left == before.usable_left - 2
     assert [p[0] for p in after.picks] == ["zeta"]
+
+
+# ---- /w looks up the real Hirebase slug for companies whose first search came back empty (TASK-194) ----
+
+def _lookupstep_harness(monkeypatch, nobody, key="hbkey"):
+    h = _hirebase_hook_harness(monkeypatch, nobody, key=key)
+    _hirebase_companyledger_clear()
+    h.company_posts, h.company_rows, h.company_status = [], {}, 200
+    jobs_post = m.requests.post
+
+    class _CResp:
+        def __init__(self, code, rows):
+            self.status_code, self.rows = code, rows
+        def json(self):
+            return {"companies": self.rows}
+
+    def router(url, **kw):
+        if url.endswith("/companies/search"):
+            h.company_posts.append((url, kw))
+            if h.company_status != 200:
+                return _CResp(h.company_status, [])
+            return _CResp(200, h.company_rows.get(kw["json"]["company_name"], []))
+        return jobs_post(url, **kw)
+
+    monkeypatch.setattr(m.requests, "post", router)
+    return h
+
+
+def _lookupstep_empty_first_search(h):
+    h.feed = []
+    h.run()
+    h.company_posts.clear()
+    h.posts.clear()
+
+
+def _lookupstep_ledger():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT units, status, company_key FROM hirebase_company_ledger ORDER BY id").fetchall()
+
+
+def _trinity_rows():
+    return [{"company_slug": "trinity-health-sub", "company_name": "Trinity Health Mid-Atlantic", "aliases": []},
+            {"company_slug": "trinity-health-system", "company_name": "Trinity Health", "aliases": []}]
+
+
+def test_hirebase_lookupstep_trinity_style_resolves_slug_and_searches_it_same_run(monkeypatch):
+    h = _lookupstep_harness(monkeypatch, {"Trinity Health": 5})
+    _lookupstep_empty_first_search(h)
+    h.company_rows["Trinity Health"] = _trinity_rows()
+    h.feed = [_slugreg_job("Trinity Health System", "trinity-health-system", 1)]
+    text = h.run()
+    assert len(h.company_posts) == 1, h.company_posts
+    row = _slugreg_rows()[m.normalize_company_for_match("Trinity Health")]
+    assert row[0] == "trinity-health-system" and row[1] == "covered", row
+    assert [kw["json"]["company_slugs"] for _u, kw in h.posts] == [["trinity-health-system"]], h.posts
+    assert "Hirebase company lookups: 1 resolved, 0 no match" in text and f"of {m.hirebase_feed.COMPANY_MONTHLY_UNITS} units" in text, text
+
+
+def test_hirebase_lookupstep_never_searched_company_makes_no_company_call(monkeypatch):
+    h = _lookupstep_harness(monkeypatch, {"Trinity Health": 5})
+    h.company_rows["Trinity Health"] = _trinity_rows()
+    h.run()
+    assert h.company_posts == [] and _lookupstep_ledger() == []
+    assert "trinity-health" in _hb_slugs(h)   # the guessed-slug search came first
+
+
+def test_hirebase_lookupstep_seeded_company_makes_no_lookup(monkeypatch):
+    h = _lookupstep_harness(monkeypatch, {"Steelcase": 5})
+    m.hirebase_registry_seed()
+    _lookupstep_empty_first_search(h)
+    h.run()
+    assert h.company_posts == []
+
+
+def test_hirebase_lookupstep_per_run_cap(monkeypatch):
+    names = {f"Bigco{c} Labs": 9 - i for i, c in enumerate("ABCDE")}
+    h = _lookupstep_harness(monkeypatch, names)
+    _lookupstep_empty_first_search(h)
+    h.run()
+    assert len(h.company_posts) == m.hirebase_feed.COMPANY_LOOKUPS_PER_RUN, h.company_posts
+
+
+def test_hirebase_lookupstep_monthly_cap_blocks_and_says_so(monkeypatch):
+    h = _lookupstep_harness(monkeypatch, {"Trinity Health": 5})
+    _lookupstep_empty_first_search(h)
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO hirebase_company_ledger (spent_at, units, status, company_key) VALUES (?, 23, 'ok', 'other')",
+                     (m.datetime.now(m.timezone.utc).isoformat(),))
+        conn.commit()
+    text = h.run()
+    assert h.company_posts == []
+    assert "monthly cap reached" in text, text
+    assert sum(r[0] for r in _lookupstep_ledger()) <= m.hirebase_feed.COMPANY_MONTHLY_UNITS
+
+
+def test_hirebase_lookupstep_no_match_stores_unknown_and_is_not_asked_again(monkeypatch):
+    h = _lookupstep_harness(monkeypatch, {"Trinity Health": 5})
+    _lookupstep_empty_first_search(h)
+    h.company_rows["Trinity Health"] = [{"company_slug": "other-co", "company_name": "Other Co", "aliases": []}]
+    text = h.run()
+    row = _slugreg_rows()[m.normalize_company_for_match("Trinity Health")]
+    assert row[0] == "" and row[1] == "unknown", row
+    assert len(h.company_posts) == 1 and "0 resolved, 1 no match" in text, text
+    h.company_posts.clear()
+    day_ago = (m.datetime.now(m.timezone.utc) - m.timedelta(days=1)).isoformat()
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE hirebase_company_ledger SET spent_at = ?", (day_ago,))
+        conn.execute("UPDATE hirebase_slug_registry SET checked_at = ?", (day_ago,))
+        conn.commit()
+    h.run()
+    assert h.company_posts == []
+
+
+def test_hirebase_lookupstep_errored_lookup_stops_step_and_w_still_completes(monkeypatch):
+    h = _lookupstep_harness(monkeypatch, {"Alpha Labs": 9, "Beta Labs": 8})
+    _lookupstep_empty_first_search(h)
+    h.company_status = 500
+    text = h.run()
+    assert len(h.company_posts) == 1, h.company_posts
+    assert _slugreg_rows() == {}
+    led = _lookupstep_ledger()
+    assert len(led) == 1 and led[0][1] == "errored" and led[0][0] == m.hirebase_feed.COMPANY_LOOKUP_LIMIT, led
+    assert "Hirebase company lookups:" in text and "1 errored" in text, text
+
+
+def test_hirebase_lookupstep_write_path_second_run_reads_stored_registry_and_ledger(monkeypatch):
+    h = _lookupstep_harness(monkeypatch, {"Trinity Health": 5})
+    _lookupstep_empty_first_search(h)
+    h.company_rows["Trinity Health"] = _trinity_rows()
+    h.feed = [_slugreg_job("Trinity Health System", "trinity-health-system", 1)]
+    h.run()
+    first = len(h.company_posts)
+    _hb_backdate(m.normalize_company_for_match("Trinity Health"), m.timedelta(days=5))
+    old = (m.datetime.now(m.timezone.utc) - m.timedelta(days=8)).isoformat()
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE hirebase_company_ledger SET spent_at = ?", (old,))
+        conn.commit()
+    h.company_posts.clear()
+    h.posts.clear()
+    h.run()
+    assert first == 1 and h.company_posts == []
+    assert [kw["json"]["company_slugs"] for _u, kw in h.posts] == [["trinity-health-system"]], h.posts
+
+
+def test_hirebase_lookupstep_secret_key_appears_nowhere(monkeypatch, caplog):
+    h = _lookupstep_harness(monkeypatch, {"Trinity Health": 5}, key="SECRET-LOOKUP-123")
+    _lookupstep_empty_first_search(h)
+    h.company_rows["Trinity Health"] = _trinity_rows()
+    with caplog.at_level("DEBUG"):
+        text = h.run()
+    assert "SECRET-LOOKUP-123" not in text and "SECRET-LOOKUP-123" not in caplog.text
+    assert "SECRET-LOOKUP-123" not in repr(_lookupstep_ledger()) and "SECRET-LOOKUP-123" not in repr(_slugreg_rows())
+    assert len(h.company_posts) == 1
+
+
+def test_hirebase_lookupstep_disabled_safely_without_key_or_ledger(monkeypatch):
+    h = _lookupstep_harness(monkeypatch, {"Trinity Health": 5}, key=None)
+    h.run()
+    assert h.company_posts == []
+    h2 = _lookupstep_harness(monkeypatch, {"Trinity Health": 5})
+    _lookupstep_empty_first_search(h2)
+    monkeypatch.setattr(m, "hirebase_company_ledger_read", lambda now=None: None)
+    h2.run()
+    assert h2.company_posts == []

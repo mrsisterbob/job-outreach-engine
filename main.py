@@ -3256,6 +3256,60 @@ def hirebase_route_candidates(candidates, registry, ledger, now):
                 unbench.add(key)
     return kept, slug_map, frozenset(unbench)
 
+def hirebase_company_lookup_step(no_board_candidates, jobs_ledger, api_key, now):
+    """Spend a few Company Search lookups on the biggest-network companies whose first job search came
+    back empty, store the matched real slug in the registry. Returns a dict: resolved (set of keys),
+    no_match, errored, attempted, blocked, units_used. Never raises; any failure leaves the registry
+    and ledger as they were and /w continues without it. The key is only handed to fetch_company_rows."""
+    out = {"resolved": set(), "no_match": 0, "errored": 0, "attempted": 0, "blocked": False, "units_used": None}
+    try:
+        registry = hirebase_registry_read()
+        company_ledger = hirebase_company_ledger_read(now)
+        if registry is None or company_ledger is None or not api_key:
+            return out
+        # Companies never searched at all are NOT eligible: they get one guessed-slug job search first. That
+        # search is free of the company meter, and its empty answer is what tells us a lookup is worth a unit
+        # (the Company Search meter is 50 units a month on the Free plan; 160+ no-board companies cannot all be looked up).
+        eligible = []
+        for cand in no_board_candidates:
+            key = cand[0]
+            if not hirebase_feed.first_search_was_empty(key, jobs_ledger, now):
+                continue
+            entry = registry.get(key)
+            if entry is not None:
+                route = hirebase_registry.route_company(entry, now)
+                if str(entry.slug or "").strip() or entry.status != "unknown" or not route.needs_lookup:
+                    continue
+            eligible.append(cand)
+        plan = hirebase_feed.plan_company_lookups(eligible, company_ledger, now)
+        if eligible and not plan.picks and plan.usable_left < hirebase_feed.COMPANY_LOOKUP_LIMIT:
+            out["blocked"] = True
+        for key, display, _people in plan.picks:
+            row_id = hirebase_company_ledger_reserve(key, hirebase_feed.COMPANY_LOOKUP_LIMIT, now)
+            if row_id is None:
+                break
+            out["attempted"] += 1
+            result = hirebase_feed.fetch_company_rows(display, api_key)
+            hirebase_company_ledger_settle(row_id, result.status, len(result.rows))
+            if result.status != "ok":
+                out["errored"] += 1
+                break   # a failing endpoint must not burn the rest of the cap
+            row = hirebase_feed.pick_company_row(result.rows, display, normalize_company_for_match)
+            if row is not None:
+                hirebase_registry_upsert(key, row["company_slug"], "covered", now)
+                out["resolved"].add(key)
+            else:
+                hirebase_registry_upsert(key, "", "unknown", now)
+                out["no_match"] += 1
+        after = hirebase_company_ledger_read(now)
+        if after is not None:
+            window = timedelta(days=hirebase_feed.COMPANY_WINDOW_DAYS)
+            out["units_used"] = sum(max(0, int(r[1])) for r in after
+                                    if r[2] in ("ok", "errored") and now - hirebase_feed._plan_ts(r[0], now) <= window)
+    except Exception as e:
+        logging.error(f"Hirebase company lookup step raised {type(e).__name__}")
+    return out
+
 def apify_seen_filter(job_ids):
     """Return the subset of job_ids already stored. A read error returns an empty set (a repeat card
     beats a lost job)."""
@@ -15489,15 +15543,19 @@ def run_warm_radar_scan(chat_id=None):
         hirebase_candidates = list(no_board_candidates)   # the registry-filtered list; ALL THREE plan calls use it
         hirebase_registry_slugs = {}   # key -> registry slug to search exactly
         hirebase_unbench = frozenset()
+        hirebase_lookup = None   # the company-lookup step's result dict, for the closing line
         if hirebase_key and no_board_candidates:
             _hirebase_ledger_preview = hirebase_ledger_read()
             if _hirebase_ledger_preview is not None:
+                hirebase_lookup = hirebase_company_lookup_step(no_board_candidates, _hirebase_ledger_preview,
+                                                               hirebase_key, datetime.now(timezone.utc))
                 try:
                     hirebase_candidates, hirebase_registry_slugs, hirebase_unbench = hirebase_route_candidates(
                         no_board_candidates, hirebase_registry_read(), _hirebase_ledger_preview, datetime.now(timezone.utc))
                 except Exception as e:
                     logging.error(f"Warm Radar Hirebase registry routing raised {type(e).__name__}")
                     hirebase_candidates, hirebase_registry_slugs, hirebase_unbench = list(no_board_candidates), {}, frozenset()
+                hirebase_unbench = frozenset(hirebase_unbench) | frozenset(hirebase_lookup["resolved"])
                 hirebase_preview = hirebase_feed.plan_hirebase_run(hirebase_candidates, _hirebase_ledger_preview, datetime.now(timezone.utc),
                                                                    unbench_keys=hirebase_unbench).picks
         if not slug_to_contact and not wd_to_contact and not jsearch_preview and not hirebase_preview:
@@ -16113,6 +16171,15 @@ def run_warm_radar_scan(chat_id=None):
                              f"{hirebase_stats['kept']} kept, {hirebase_jobs_used_this_run} used this run, "
                              f"{hb_month_used} of {hirebase_feed.HIREBASE_MONTHLY_JOBS} used this month "
                              f"({hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
+            if hirebase_lookup and (hirebase_lookup["attempted"] or hirebase_lookup["blocked"]):
+                if hirebase_lookup["blocked"]:
+                    lines.append("Hirebase company lookups: monthly cap reached")
+                else:
+                    lines.append(f"Hirebase company lookups: {len(hirebase_lookup['resolved'])} resolved, "
+                                 f"{hirebase_lookup['no_match']} no match"
+                                 + (f", {hirebase_lookup['errored']} errored" if hirebase_lookup["errored"] else "")
+                                 + f", {hirebase_lookup['units_used'] if hirebase_lookup['units_used'] is not None else '?'} of "
+                                 f"{hirebase_feed.COMPANY_MONTHLY_UNITS} units used this month")
             if applied_skipped:
                 names_text, _used = _warm_radar_name_list(sorted(applied_skipped), 5)
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
