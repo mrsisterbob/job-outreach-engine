@@ -15931,6 +15931,7 @@ def run_warm_radar_scan(chat_id=None):
         hirebase_err_detail = ""
         hirebase_picked_names = []
         hirebase_hash_to_ids = {}   # job_hash -> hirebase job ids, so only settled roles are marked seen
+        hirebase_searched = {}      # company key -> (outcome, returned, kept); read by the Apify fallthrough
         if hirebase_key:
             try:
                 hirebase_plan = None
@@ -16001,6 +16002,7 @@ def run_warm_radar_scan(chat_id=None):
                         if hirebase_outcome == "errored":
                             hirebase_status = "errored"
                             hirebase_per_company.append((pick_name, "errored", 0, 0))
+                            hirebase_searched[pick_key] = ("errored", 0, 0)
                             hirebase_errored_reserved = hirebase_limit
                             hirebase_err_detail = str(getattr(hirebase_result, "error", "") or "exception")
                             logging.error(f"Warm Radar Hirebase call errored: {getattr(hirebase_result, 'error', 'raised')}")
@@ -16012,6 +16014,7 @@ def run_warm_radar_scan(chat_id=None):
                             for stat_key in hirebase_stats:
                                 hirebase_stats[stat_key] += co_stats.get(stat_key, 0)
                             hirebase_per_company.append((pick_name, hirebase_outcome, returned_n, len(kept_jobs)))
+                            hirebase_searched[pick_key] = (hirebase_outcome, returned_n, len(kept_jobs))
                             if hirebase_outcome == "capped":
                                 hirebase_capped_cos.append((pick_name, hirebase_limit))
                             try:   # what this search learned goes back to the registry; a failure never fails the scan
@@ -16046,6 +16049,93 @@ def run_warm_radar_scan(chat_id=None):
             except Exception as e:
                 hirebase_status = "errored"
                 logging.error(f"Warm Radar Hirebase block raised {type(e).__name__}")
+
+        # APIFY FEED. At most ONE batched call per run, for the no-board companies Hirebase could not answer.
+        # The ledger row is reserved under _APIFY_LOCK BEFORE the request. Errors are never "no jobs": an errored
+        # call marks nothing seen and records nothing. Nothing here can fail the scan; unconfigured, down or over
+        # budget leaves /w exactly as it was.
+        apify_status = "unconfigured"
+        apify_picked_names = []
+        apify_stats = {"returned": 0, "malformed": 0, "kept": 0, "unmatched": 0}
+        apify_rows_returned = 0
+        apify_spent_usd = None
+        apify_month_before = 0.0
+        apify_collected = 0
+        apify_kept_by_company = {}
+        apify_key_by_name = {}
+        apify_hash_to_ids = {}   # job_hash -> apify job ids, so only settled roles are marked seen
+        try:
+            apify_token = apify_feed.get_token(os.environ)
+            if apify_token and no_board_candidates:
+                apify_status = "skipped"
+                _reg = hirebase_registry_read()
+                if _reg is None:
+                    apify_status = "registry_unreadable"
+                else:
+                    apify_cands = apify_feed.fallthrough_candidates(
+                        no_board_candidates, hirebase_searched, {k: (e.slug, e.status) for k, e in _reg.items()})
+                    apify_plan = None
+                    apify_row_id = None
+                    with _APIFY_LOCK:
+                        apify_ledger_now = apify_ledger_read()
+                        if apify_ledger_now is None:
+                            apify_status = "ledger_unreadable"
+                        else:
+                            _plan = apify_feed.plan_apify_run(apify_cands, apify_ledger_now, datetime.now(timezone.utc))
+                            apify_month_before = _plan.month_spent_usd
+                            if _plan.skip_reason or not _plan.picks:
+                                apify_status = _plan.skip_reason or "nothing_eligible"
+                            else:
+                                apify_row_id = apify_ledger_reserve([pk[0] for pk in _plan.picks], _plan.worst_case_usd)
+                                if apify_row_id is None:
+                                    apify_status = "reserve_failed"
+                                else:
+                                    apify_plan = _plan
+                    if apify_plan is not None:
+                        apify_picked_names = [pk[1] for pk in apify_plan.picks]
+                        apify_picked_keys = {pk[0] for pk in apify_plan.picks}
+                        apify_key_by_name = {pk[1]: pk[0] for pk in apify_plan.picks}
+                        apify_result = None
+                        try:
+                            apify_result = apify_feed.fetch_feed(
+                                apify_feed.build_run_input(apify_picked_names, apify_plan.limit), apify_token, requests.post)
+                        except Exception as e:
+                            logging.error(f"Warm Radar Apify request raised {type(e).__name__}")
+                        if apify_result is not None and apify_result.status == "ok":
+                            apify_status = "ok"
+                            apify_rows_returned = len(apify_result.rows)
+                            apify_spent_usd = apify_feed.actual_cost(apify_rows_returned)
+                            apify_ledger_settle(apify_row_id, apify_spent_usd, "ok")
+                        else:
+                            apify_status = "errored"
+                            apify_spent_usd = apify_plan.worst_case_usd   # a failed call may still have billed
+                            apify_ledger_settle(apify_row_id, apify_plan.worst_case_usd, "errored")
+                            logging.error(f"Warm Radar Apify call errored: {getattr(apify_result, 'error', 'raised')}")
+                        if apify_status == "ok":
+                            try:
+                                apify_kept_by_company, apify_stats = apify_feed.split_rows(
+                                    apify_result.rows, apify_picked_names, normalize_company_for_match)
+                                apify_all_jobs = [j for jobs in apify_kept_by_company.values() for j in jobs]
+                                # The seen filter runs AFTER billing, as the Hirebase block does.
+                                apify_already = apify_seen_filter([j["job_id"] for j in apify_all_jobs])
+                                for apify_name, apify_jobs in apify_kept_by_company.items():
+                                    for job in apify_jobs:
+                                        if job["job_id"] in apify_already:
+                                            continue
+                                        try:
+                                            job = dict(job, employer_name=apify_name)
+                                            apify_hash_to_ids.setdefault(
+                                                generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
+                                            apify_collected += 1
+                                            _collect_posting(job, jsearch_keys=apify_picked_keys)
+                                        except Exception as e:
+                                            logging.error(f"Warm Radar Apify posting error: {type(e).__name__}")
+                                _trim_group_jobs()
+                            except Exception as e:
+                                logging.error(f"Warm Radar Apify screen feed raised {type(e).__name__}")
+        except Exception as e:
+            apify_status = "errored"
+            logging.error(f"Warm Radar Apify block raised {type(e).__name__}")
 
         # SCREEN + OUTPUT. Nothing has been stamped, cached, sent or written yet. A role leaves a
         # trace (seen_jobs stamp, referral-ask role) ONLY after what lists it was accepted: its card
@@ -16167,6 +16257,13 @@ def run_warm_radar_scan(chat_id=None):
                 apify_seen_mark([jid for hsh in settled for jid in hirebase_hash_to_ids.get(hsh, ())])
             except Exception as e:
                 logging.error(f"Warm Radar Hirebase seen mark failed: {type(e).__name__}")
+        if apify_hash_to_ids:
+            try:
+                settled = ({i["job_hash"] for i in sent_items} | {i["job_hash"] for i in digest_sent}
+                           | set(rejected_hashes))
+                apify_seen_mark([jid for hsh in settled for jid in apify_hash_to_ids.get(hsh, ())])
+            except Exception as e:
+                logging.error(f"Warm Radar Apify seen mark failed: {type(e).__name__}")
 
         # Roles whose card went: stamp, count, and collect for the referral ask.
         sent_by_group = {}
