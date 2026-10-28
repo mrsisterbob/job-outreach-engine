@@ -151,7 +151,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 224 | `parse_help_request` | Return the command a trailing-slash request is asking about, or None. |
 | 239 | `lookup_command_help` | Return formatted help for a `/cmd/` request, or None if this is not one. |
 
-## `hirebase_feed.py` — 19 defs, 373 lines
+## `hirebase_feed.py` — 24 defs, 524 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -174,6 +174,11 @@ grep -i "contact" FUNCTION_INDEX.md
 | 304 | `_empty_benched` | _(no docstring)_ |
 | 308 | `first_search_was_empty` | True when key's newest ok search returned zero rows and it has never returned a row. |
 | 316 | `plan_hirebase_run` | Pure spend guard: which no-board companies to search, each with days_ago and limit. |
+| 399 | `build_company_search_body` | Exactly company_name, page, limit (unknown fields 422). Blank name -> None. |
+| 407 | `fetch_company_rows` | ONE Company Search request. status "ok" (rows may be [] = honest no-match) or "errored". |
+| 443 | `_host` | _(no docstring)_ |
+| 450 | `pick_company_row` | The one row that really is `name`, or None. Never falls back to row 1. |
+| 478 | `plan_company_lookups` | Which companies may get a Company Search lookup this run. |
 
 ## `hirebase_registry.py` — 3 defs, 75 lines
 
@@ -1141,4 +1146,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**892 definitions across 46 files + Code.gs.**
+**897 definitions across 46 files + Code.gs.**
