@@ -34,6 +34,7 @@ import warm_jsearch_plan
 import apify_feed
 import hirebase_feed
 import hirebase_registry
+import resolve_plan
 import warm_screen_plan
 import warm_stage_samples
 import warm_michigan
@@ -1465,6 +1466,18 @@ def init_db():
             job_board TEXT NOT NULL DEFAULT '',
             rows INTEGER NOT NULL DEFAULT 0,
             checked_at TEXT NOT NULL
+        )""")
+        # What the last paid resolution attempt for (company, source) came back as, and when it may be
+        # tried again. Separate from hirebase_slug_registry and company_feed_source on purpose: their
+        # rows carry routing meaning or record only what a feed returned.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_resolution (
+            company_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            attempted_at TEXT NOT NULL,
+            next_eligible_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (company_key, source)
         )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS query_pagination (
@@ -3269,6 +3282,48 @@ def feed_source_upsert(company_key, source_domain, job_board, rows, now=None):
         return True
     except Exception as e:
         logging.error(f"Feed Source Upsert Error: {type(e).__name__}")
+        return False
+
+def resolution_read():
+    """Return {(company_key, source): (outcome, attempted_at, next_eligible_at)} from company_resolution,
+    or None on a DB error (None, never {}: an unreadable table must not read as nothing tried yet,
+    or every cooldown would vanish)."""
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT company_key, source, outcome, attempted_at, next_eligible_at FROM company_resolution").fetchall()
+        return {(r[0], r[1]): (r[2], r[3], r[4]) for r in rows}
+    except Exception as e:
+        logging.error(f"Resolution Read Error: {type(e).__name__}")
+        return None
+
+def resolution_record(company_key, source, outcome, now=None, force=False):
+    """Replace the company_resolution row for (company_key, source). next_eligible_at comes from
+    resolve_plan.next_eligible. A stored "resolved" row is kept against a later "empty"/"error"
+    unless force=True. True when written; False (never raises) on a blank key/source, an unknown
+    outcome, a kept resolved row, or a DB error."""
+    try:
+        key = str(company_key or "").strip()
+        src = str(source or "").strip()
+        if not key or not src or outcome not in (resolve_plan.RESOLVED, resolve_plan.EMPTY, resolve_plan.ERROR):
+            return False
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        with get_db_conn() as conn:
+            if not force and outcome != resolve_plan.RESOLVED:
+                row = conn.execute(
+                    "SELECT outcome FROM company_resolution WHERE company_key = ? AND source = ?",
+                    (key, src)).fetchone()
+                if row and row[0] == resolve_plan.RESOLVED:
+                    return False
+            conn.execute(
+                "INSERT OR REPLACE INTO company_resolution "
+                "(company_key, source, outcome, attempted_at, next_eligible_at) VALUES (?, ?, ?, ?, ?)",
+                (key, src, outcome, now.isoformat(), resolve_plan.next_eligible(outcome, now)))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Resolution Record Error: {type(e).__name__}")
         return False
 
 HIREBASE_SLUG_SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hirebase_slug_seed.json")
