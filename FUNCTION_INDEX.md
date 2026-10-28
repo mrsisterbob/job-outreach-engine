@@ -1001,6 +1001,12 @@ grep -i "contact" FUNCTION_INDEX.md
 | 30 | `_write_tsv` | _(no docstring)_ |
 | 35 | `main` | _(no docstring)_ |
 
+## `scripts/build_warm_sample.py` — 1 defs, 37 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 20 | `main` | _(no docstring)_ |
+
 ## `scripts/clean_crm_contacts.py` — 2 defs, 95 lines
 
 | Line | Name | Summary |
@@ -1165,6 +1171,19 @@ grep -i "contact" FUNCTION_INDEX.md
 | 17 | `is_pure_remote` | True when the role is Remote with no on-site/hybrid wording. Never raises. |
 | 31 | `reason_words` | Plain-words label for a screen reason code (unknown codes pass through). |
 
+## `warm_sample.py` — 8 defs, 166 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 33 | `employer_like` | {key: entry} for the companies that look like employers. |
+| 39 | `_row` | _(no docstring)_ |
+| 49 | `build_sample` | (rows, report) from a parse_rows/read_files companies dict. |
+| 84 | `_inside` | _(no docstring)_ |
+| 92 | `write_sample` | Write the CSV atomically. Returns (ok, reason); reason is '' on success. |
+| 117 | `read_sample` | Rows in file order. Raises ValueError on a missing column, an unknown tier, or tier row |
+| 143 | `format_report` | Printable lines. Counts only, never a company name. |
+| 158 | `run` | The CLI body. Returns (exit_code, printable_lines). |
+
 ## `warm_screen_plan.py` — 7 defs, 123 lines
 
 | Line | Name | Summary |
@@ -1223,4 +1242,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**954 definitions across 50 files + Code.gs.**
+**963 definitions across 52 files + Code.gs.**
