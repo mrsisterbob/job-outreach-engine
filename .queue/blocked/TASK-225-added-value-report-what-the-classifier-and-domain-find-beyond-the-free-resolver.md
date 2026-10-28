@@ -22,3 +22,4 @@ A command runs the unwired board-system classifier and domain logic over the 60-
 
 ## Log
 
+- BLOCKED by worker: dependency TASK-223 not done (needs its RESULT CSV, which needs the real sample and live network); also needs the real sample file. No build attempted.
