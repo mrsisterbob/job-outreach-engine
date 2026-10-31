@@ -24,3 +24,5 @@ Block, and write nothing, if either is missing: this task imports `build_info` a
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 10 passed; suites 1940 passed, 1 skipped. No existing test edited (added autouse fixture _clear_warm_run_reports_between_tests). /health now returns build; nothing calls the store from /w yet.

@@ -23761,3 +23761,91 @@ def test_standup_held_the_visitor_line_is_unchanged_when_held_rows_exist(monkeyp
     after = [ln for ln in _standup_text(monkeypatch).splitlines() if "montelattice.com" in ln]
     assert before == after and before
     _clear_tray()
+
+
+# ---- warm_run_reports store (newest 10) and the build in /health (TASK-260) ----
+
+@pytest.fixture(autouse=True)
+def _clear_warm_run_reports_between_tests():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM warm_run_reports")
+        conn.commit()
+    yield
+
+
+def _run_snapshot(n, commit="a" * 40, source="git"):
+    rec = m.run_report.RunRecorder(f"run-{n:03d}", f"2026-10-{n:02d} 08:00:00", {"commit": commit, "short": commit[:7], "source": source})
+    rec.note_source_call("apify", f"Acme {n}", status="ok", returned=2, kept=2)
+    return rec.snapshot()
+
+
+def test_warm_run_report_write_then_read_round_trips_snapshot_detail_and_commit():
+    snap = _run_snapshot(5)
+    assert m._warm_run_report_write(snap, "full closing text") is True
+    got = m._warm_run_report_read()
+    assert got["run_id"] == "run-005" and got["snapshot"] == snap and got["detail"] == "full closing text"
+    assert (got["commit_sha"], got["commit_source"]) == ("a" * 40, "git") and got["run_at"] == "2026-10-05 08:00:00"
+
+
+def test_warm_run_report_the_eleventh_write_deletes_the_oldest():
+    for n in range(1, 12):
+        assert m._warm_run_report_write(_run_snapshot(n), f"d{n}")
+    ids = [r[0] for r in m._warm_run_report_list(20)]
+    assert len(ids) == 10 and ids[0] == "run-011" and "run-001" not in ids and ids[-1] == "run-002"
+
+
+def test_warm_run_report_the_same_run_id_twice_leaves_one_row_with_the_newer_content():
+    m._warm_run_report_write(_run_snapshot(3), "old")
+    m._warm_run_report_write(_run_snapshot(3, commit="b" * 40), "new")
+    assert len(m._warm_run_report_list()) == 1
+    got = m._warm_run_report_read()
+    assert got["detail"] == "new" and got["commit_sha"] == "b" * 40
+
+
+def test_warm_run_report_nth_two_returns_the_previous_run():
+    m._warm_run_report_write(_run_snapshot(1), "one")
+    m._warm_run_report_write(_run_snapshot(2), "two")
+    assert m._warm_run_report_read(2)["run_id"] == "run-001" and m._warm_run_report_read(3) is None
+
+
+def test_warm_run_report_read_on_an_empty_table_is_none():
+    assert m._warm_run_report_read() is None and m._warm_run_report_list() == []
+
+
+def test_warm_run_report_a_seventy_thousand_character_detail_is_stored_cut_with_the_marker():
+    detail = "".join(f"line {i:05d}\n" for i in range(7000))[:70000]
+    m._warm_run_report_write(_run_snapshot(1), detail)
+    stored = m._warm_run_report_read()["detail"]
+    assert stored.startswith(detail[:60000]) and stored.endswith("... (cut at 60,000 characters)")
+    assert len(stored) == 60000 + 1 + len("... (cut at 60,000 characters)")
+    m._warm_run_report_write(_run_snapshot(2), "short")
+    assert m._warm_run_report_read()["detail"] == "short"
+
+
+def test_warm_run_report_a_failing_write_returns_false_and_logs_no_snapshot_text(monkeypatch, caplog):
+    monkeypatch.setattr(m, "get_db_conn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down SECRETSNAPSHOT")))
+    snap = _run_snapshot(1)
+    snap["problems"] = ["SECRETSNAPSHOT"]
+    assert m._warm_run_report_write(snap, "SECRETDETAIL") is False
+    assert "SECRETSNAPSHOT" not in caplog.text and "SECRETDETAIL" not in caplog.text and "RuntimeError" in caplog.text
+
+
+def test_warm_run_report_a_failing_read_propagates(monkeypatch):
+    monkeypatch.setattr(m, "get_db_conn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    with pytest.raises(RuntimeError):
+        m._warm_run_report_read()
+
+
+def test_warm_run_report_health_reports_the_build_and_keeps_its_old_keys():
+    with m.app.test_client() as client:
+        body = client.get("/health").get_json()
+    assert set(body["build"]) == {"commit", "short", "source"}
+    assert {"status", "mode", "elapsed_ms", "persistence"} <= set(body) and body["status"] == "ok"
+
+
+def test_warm_run_report_build_info_is_unknown_when_env_file_and_git_all_fail():
+    def boom(*a):
+        raise RuntimeError("nope")
+    info = m._compute_build_info(environ={}, read_file=boom, run_git=boom)
+    assert info == {"commit": "", "short": "", "source": "unknown"}
+    assert m._compute_build_info(environ={"RENDER_GIT_COMMIT": "c" * 40}, read_file=boom, run_git=boom)["source"] == "env:RENDER_GIT_COMMIT"

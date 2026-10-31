@@ -36,6 +36,9 @@ import apify_feed
 import hirebase_feed
 import hirebase_registry
 import resolve_plan
+import build_info
+import run_report
+import subprocess
 import inbound_hold
 import warm_screen_plan
 import warm_stage_samples
@@ -1362,6 +1365,15 @@ def init_db():
         )""")
         # /w stage samples: one row per /w run (JSON of a StageSampler snapshot), newest 5 kept, so
         # /wstages can show where role diversity dies without a Render shell.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS warm_run_reports (
+            run_id TEXT PRIMARY KEY,
+            run_at TEXT NOT NULL,
+            commit_sha TEXT NOT NULL DEFAULT '',
+            commit_source TEXT NOT NULL DEFAULT '',
+            snapshot TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT ''
+        )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS warm_stage_samples (
             run_at TEXT NOT NULL,
@@ -15957,6 +15969,84 @@ def _warm_stage_samples_read(nth=1):
     return row[0], json.loads(row[1])
 
 
+WARM_RUN_REPORTS_KEEP = 10   # DESIGN CHOICE, not a measurement: runs kept in warm_run_reports
+WARM_RUN_REPORT_DETAIL_MAX = 60000   # DESIGN CHOICE, not a measurement
+_WARM_RUN_REPORT_CUT = "... (cut at 60,000 characters)"
+
+
+def _warm_run_report_write(snapshot, detail_text):
+    """Store one run's run_report snapshot + full closing text; keep the newest WARM_RUN_REPORTS_KEEP. True/False, never
+    raises. The same run_id twice replaces the row. A failure logs the exception class only (no body)."""
+    try:
+        snap = snapshot if isinstance(snapshot, dict) else {}
+        build = snap.get("build") if isinstance(snap.get("build"), dict) else {}
+        run_at = str(snap.get("started_at") or "") or datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        run_id = str(snap.get("run_id") or "") or run_at
+        detail = str(detail_text or "")
+        if len(detail) > WARM_RUN_REPORT_DETAIL_MAX:
+            detail = detail[:WARM_RUN_REPORT_DETAIL_MAX] + "\n" + _WARM_RUN_REPORT_CUT
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR REPLACE INTO warm_run_reports (run_id, run_at, commit_sha, commit_source, snapshot, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, run_at, str(build.get("commit") or ""), str(build.get("source") or ""), json.dumps(snap), detail))
+            conn.execute("DELETE FROM warm_run_reports WHERE rowid NOT IN "
+                         "(SELECT rowid FROM warm_run_reports ORDER BY run_at DESC, rowid DESC LIMIT ?)",
+                         (WARM_RUN_REPORTS_KEEP,))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Warm Run Report Write Error: {type(e).__name__}")
+        return False
+
+
+def _warm_run_report_read(nth=1):
+    """The nth newest run report as a dict, or None when there is none. A read error RAISES: an unreadable store must
+    not look like 'no run recorded'."""
+    with get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT run_id, run_at, commit_sha, commit_source, snapshot, detail FROM warm_run_reports "
+            "ORDER BY run_at DESC, rowid DESC LIMIT 1 OFFSET ?", (max(1, int(nth)) - 1,)).fetchone()
+    if not row:
+        return None
+    return {"run_id": row[0], "run_at": row[1], "commit_sha": row[2], "commit_source": row[3],
+            "snapshot": json.loads(row[4]), "detail": row[5]}
+
+
+def _warm_run_report_list(limit=10):
+    """Newest first [(run_id, run_at, commit_sha)]. Raises on a read error."""
+    with get_db_conn() as conn:
+        return [tuple(r) for r in conn.execute(
+            "SELECT run_id, run_at, commit_sha FROM warm_run_reports ORDER BY run_at DESC, rowid DESC LIMIT ?",
+            (int(limit),)).fetchall()]
+
+
+def _compute_build_info(environ=None, read_file=None, run_git=None):
+    """Which commit this process is running (build_info.running_commit with real file/git readers). Called once at
+    import, never in a request. Never raises: any failure leaves source "unknown"."""
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def _read(name):
+        with open(os.path.join(here, name), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def _git(args):
+        out = subprocess.run(["git", *args], cwd=here, capture_output=True, text=True, timeout=3)
+        if out.returncode != 0:
+            raise RuntimeError("git failed")
+        return out.stdout
+
+    try:
+        return build_info.running_commit(os.environ if environ is None else environ,
+                                         read_file=read_file or _read, run_git=run_git or _git)
+    except Exception:
+        return {"commit": "", "short": "", "source": "unknown"}
+
+
+BUILD_INFO = _compute_build_info()
+
+
 def _warm_screen_memo_write(job_hashes, outcome):
     """Record that the /w screen decided `outcome` ('rejected' or 'digest') on these roles today."""
     hashes = [h for h in dict.fromkeys(job_hashes) if h]
@@ -19857,6 +19947,7 @@ def health_check():
             "mode": mode,
             "elapsed_ms": round(elapsed_ms, 2),
             "persistence": persistence,
+            "build": {"commit": BUILD_INFO["commit"], "short": BUILD_INFO["short"], "source": BUILD_INFO["source"]},
         }), 200
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
