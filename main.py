@@ -16007,6 +16007,14 @@ def run_warm_radar_scan(chat_id=None):
         # Hirebase feed (sibling of JSearch): preview only, to let a Kevin with no cached boards reach the hook.
         # The real plan is made again under _HIREBASE_LOCK further down. No key: nothing is planned or read.
         hirebase_key = hirebase_feed.get_key(os.environ)
+        # System_Config, read once per /w (TASK-238's Apify hook reuses `source_cfg`). Never raises.
+        source_cfg, _source_cfg_origin = source_config_read()
+        hirebase_off_by_sheet = bool(hirebase_key) and not source_cfg.hirebase_on
+        if hirebase_off_by_sheet:
+            hirebase_key = None   # off in the sheet: runs exactly as if there were no key
+        hirebase_plan_kw = {"per_run": source_cfg.hirebase_per_run, "monthly": source_cfg.hirebase_monthly_jobs}
+        hirebase_resolve_keys = set()   # keys offered as RESOLVE picks this run; only these get a company_resolution row
+        hirebase_resolution_unreadable = False
         hirebase_preview = []
         hirebase_candidates = list(no_board_candidates)   # the registry-filtered list; ALL THREE plan calls use it
         hirebase_registry_slugs = {}   # key -> registry slug to search exactly
@@ -16024,8 +16032,38 @@ def run_warm_radar_scan(chat_id=None):
                     logging.error(f"Warm Radar Hirebase registry routing raised {type(e).__name__}")
                     hirebase_candidates, hirebase_registry_slugs, hirebase_unbench = list(no_board_candidates), {}, frozenset()
                 hirebase_unbench = frozenset(hirebase_unbench) | frozenset(hirebase_lookup["resolved"])
+                # Reserve a share of the run for UNRESOLVED companies (TASK-237). Both planners sort heaviest-first, so
+                # without this trim 8 heavy known companies push every unresolved one out again; the scan side is
+                # PRE-PLANNED here (writes nothing) because a scan company inside its retry gap would otherwise burn a
+                # slot the real planner then skips. Known limits: hirebase_company_lookup_step keeps its own picks and
+                # 24-unit budget and is not reordered; a resolve pick Hirebase cannot afford this month is recorded as nothing.
+                try:
+                    _res_now = datetime.now(timezone.utc)
+                    _resolution = resolution_read()
+                    if _resolution is None:
+                        hirebase_resolution_unreadable = True   # cooldowns unknown: resolving would re-bill the heavy companies
+                    else:
+                        _pool = [c for c in hirebase_candidates
+                                 if c[0] not in hirebase_registry_slugs and _resolution.get((c[0], "hirebase"), ("",))[0] != resolve_plan.RESOLVED]
+                        _pool_keys = {c[0] for c in _pool}
+                        _scan_pool = [c for c in hirebase_candidates if c[0] not in _pool_keys]
+                        _per_run = source_cfg.hirebase_per_run
+                        _reserved = min(len(_pool), math.ceil(_per_run * resolve_plan.RESERVED_SHARE))
+                        _resolve_picks = resolve_plan.plan_resolution(_pool, _resolution, "hirebase", frozenset(), _reserved, _res_now)
+                        _scan_kw = dict(hirebase_plan_kw, per_run=max(0, _per_run - len(_resolve_picks)))
+                        _scan_keys = ({pk[0] for pk in hirebase_feed.plan_hirebase_run(
+                            _scan_pool, _hirebase_ledger_preview, _res_now, unbench_keys=hirebase_unbench, **_scan_kw).picks}
+                            if _scan_pool else set())   # nothing to scan: no pre-pass
+                        if len(_scan_keys) + len(_resolve_picks) < _per_run:   # back-fill an unused scan slot with more unresolved ones
+                            _resolve_picks = resolve_plan.plan_resolution(
+                                _pool, _resolution, "hirebase", frozenset(), _per_run - len(_scan_keys), _res_now)
+                        hirebase_candidates = [c for c in _scan_pool if c[0] in _scan_keys] + list(_resolve_picks)
+                        hirebase_resolve_keys = {c[0] for c in _resolve_picks}
+                except Exception as e:
+                    logging.error(f"Warm Radar Hirebase resolution trim raised {type(e).__name__}")
+                    hirebase_resolve_keys = set()
                 hirebase_preview = hirebase_feed.plan_hirebase_run(hirebase_candidates, _hirebase_ledger_preview, datetime.now(timezone.utc),
-                                                                   unbench_keys=hirebase_unbench).picks
+                                                                   unbench_keys=hirebase_unbench, **hirebase_plan_kw).picks
         if not slug_to_contact and not wd_to_contact and not jsearch_preview and not hirebase_preview:
             if chat_id:
                 lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm companies has a cached job board yet."]
@@ -16310,7 +16348,7 @@ def run_warm_radar_scan(chat_id=None):
                         hirebase_status = "ledger_unreadable"
                     else:
                         hirebase_plan = hirebase_feed.plan_hirebase_run(hirebase_candidates, hirebase_ledger_now, datetime.now(timezone.utc),
-                                                                         unbench_keys=hirebase_unbench)
+                                                                         unbench_keys=hirebase_unbench, **hirebase_plan_kw)
                         hirebase_month_before = hirebase_plan.month_used
                         if hirebase_plan.skip_reason or not hirebase_plan.picks:
                             hirebase_status = hirebase_plan.skip_reason or "nothing_eligible"
@@ -16342,7 +16380,7 @@ def run_warm_radar_scan(chat_id=None):
                                     hirebase_status = "ledger_unreadable"
                                     break
                                 hirebase_replan = hirebase_feed.plan_hirebase_run(hirebase_candidates, hirebase_ledger_now, datetime.now(timezone.utc),
-                                                                         unbench_keys=hirebase_unbench)
+                                                                         unbench_keys=hirebase_unbench, **hirebase_plan_kw)
                                 hirebase_mine = [pk for pk in hirebase_replan.picks if pk[0] == pick_key]
                                 if not hirebase_mine:
                                     continue
@@ -16419,6 +16457,15 @@ def run_warm_radar_scan(chat_id=None):
             except Exception as e:
                 hirebase_status = "errored"
                 logging.error(f"Warm Radar Hirebase block raised {type(e).__name__}")
+
+        # Remember what Hirebase answered for each company offered as a RESOLVE pick (TASK-237). A company outside
+        # hirebase_resolve_keys, or one the loop never reached (it stops at the first error), records nothing.
+        # resolution_record never raises; a failed write is logged by class there and never stops the run.
+        for _rk, (_ro, _rret, _rkept) in list(hirebase_searched.items()):
+            if _rk not in hirebase_resolve_keys:
+                continue
+            resolution_record(_rk, "hirebase", resolve_plan.ERROR if _ro == "errored"
+                              else resolve_plan.RESOLVED if _rkept > 0 else resolve_plan.EMPTY)
 
         # APIFY FEED. At most ONE batched call per run, for the no-board companies Hirebase could not answer.
         # The ledger row is reserved under _APIFY_LOCK BEFORE the request. Errors are never "no jobs": an errored
@@ -16765,9 +16812,15 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(jsearch_line)
             # Hirebase. The meter is account-wide: Kevin's own Playground use makes the real meter higher than
             # this line, which counts only what the ledger saw. Errored, nothing found and found never merge.
+            if hirebase_off_by_sheet:
+                lines.append("Hirebase: off in System_Config")
+            if source_cfg.problems:
+                lines.append(html.escape("System_Config ignored: " + "; ".join(str(p) for p in source_cfg.problems)))
+            if hirebase_resolution_unreadable:
+                lines.append("Hirebase: resolution memory unreadable, companies searched as before")
             if hirebase_status == "monthly_cap":
                 lines.append(f"Hirebase skipped: monthly job budget used ({hirebase_month_before} of "
-                             f"{hirebase_feed.HIREBASE_MONTHLY_JOBS}, {hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
+                             f"{source_cfg.hirebase_monthly_jobs}, {hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
             elif hirebase_per_company:
                 hb_rows = hirebase_ledger_read() or []
                 hb_now = datetime.now(timezone.utc)
@@ -16788,7 +16841,7 @@ def run_warm_radar_scan(chat_id=None):
                                  f"{hirebase_errored_reserved} jobs reserved against the month")
                 lines.append(f"Hirebase: {len(hirebase_picked_names)} companies, {hirebase_jobs_used_this_run} jobs returned, "
                              f"{hirebase_stats['kept']} kept, {hirebase_jobs_used_this_run} used this run, "
-                             f"{hb_month_used} of {hirebase_feed.HIREBASE_MONTHLY_JOBS} used this month "
+                             f"{hb_month_used} of {source_cfg.hirebase_monthly_jobs} used this month "
                              f"({hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
             if hirebase_lookup and (hirebase_lookup["attempted"] or hirebase_lookup["blocked"]):
                 if hirebase_lookup["blocked"]:

@@ -45,6 +45,15 @@ import warm_screen_plan  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _clear_company_resolution_between_tests():
+    """clean_tables does not truncate company_resolution, so a row one test recorded would change what the next sees."""
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def clean_tables():
     """Truncate the tables under test before every test so cases don't bleed into each other."""
     with m.get_db_conn() as conn:
@@ -20969,6 +20978,9 @@ def test_hirebase_e2e_errored_reads_differently_from_nothing_found(monkeypatch):
     errored = h.run()
     assert "Hirebase errored for Nopeboard Labs" in errored and "nothing found" not in errored, errored
     assert "0 companies not searched" in errored and "jobs reserved against the month" in errored
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h2 = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
     h2.feed = []
     empty = h2.run()
@@ -21190,12 +21202,18 @@ def test_hirebase_empty_e2e_zero_row_company_is_not_requested_again_next_day(mon
     with m.get_db_conn() as conn:
         conn.execute("DELETE FROM hirebase_jobs_ledger WHERE company_key = ?", ("freshco labs",))
         conn.commit()
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h.posts.clear()
     h.run()
     slugs = _hb_slugs(h)
     assert "nopeboard-labs" not in slugs, slugs
     assert "freshco-labs" in slugs, slugs
     _hb_backdate("nopeboard labs", m.timedelta(days=15))
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h.posts.clear()
     h.run()
     assert "nopeboard-labs" in _hb_slugs(h)
@@ -21342,6 +21360,9 @@ def test_hirebase_slugreg_unreadable_registry_runs_as_before_and_all_plans_share
     monkeypatch.setattr(m, "hirebase_registry_read", lambda: None)
     seen.clear()
     h.posts.clear()
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h.run()   # no registry: Steelcase plans as before this task, with its guessed slug
     assert "steelcase" in _hb_slugs(h) and any("steelcase" in [x[0] for x in c] for c in seen), h.posts
 
@@ -21970,6 +21991,9 @@ def test_apify_wire_no_token_makes_no_apify_post_and_run_equals_apify_absent(mon
     h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
     with_rows = h.run()
     assert h.apify_posts == [] and _apify_ledger() == [] and h.cards == []
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h2 = _apify_wire_harness(monkeypatch, token=None)
     h2.feed = []
     assert h2.run() == with_rows
@@ -22013,6 +22037,9 @@ def test_apify_wire_token_never_appears_in_logs(monkeypatch, caplog):
     import logging as _lg
     caplog.set_level(_lg.DEBUG)
     for mode in ("ok", "raise", "500"):
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM company_resolution")
+            conn.commit()
         h = _apify_wire_harness(monkeypatch)
         h.feed = []
         h.apify_mode = mode
@@ -22993,3 +23020,135 @@ def test_hot_promote_untracked_code_gs_contract_quick_add_ch_and_uuid_lookups():
     assert "const ALL_TABS = Object.keys(TAB_MAP);" in gs and '"Carmen Hot": "PEOPLE"' in gs
     for action in ("set_status", "update_snooze", "append_note"):
         assert "findRecordBySheetUuid(ss, sheetUuid)" in _gs_action_block(gs, action), action
+
+
+# ---- /w reserves Hirebase turns for UNRESOLVED companies and remembers each answer (TASK-237) ----
+
+def _resolve_names(n, heavy=0):
+    """n no-board companies of descending weight: 'Resco00 Labs' heaviest."""
+    return {f"Resco{i:02d} Labs": (4 if i < heavy else 3 if i < max(heavy, n // 2) else 2) for i in range(n)}
+
+
+def _searched_keys(h):
+    return [kw["json"]["company_slugs"][0].replace("-", " ") for _u, kw in h.posts]
+
+
+def _resolution_rows():
+    with m.get_db_conn() as conn:
+        return {r[0]: r[1:] for r in conn.execute(
+            "SELECT company_key, outcome, attempted_at, next_eligible_at FROM company_resolution WHERE source = 'hirebase'")}
+
+
+def test_resolve_hirebase_zero_row_companies_store_empty_and_run_two_searches_different_ones(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(20))
+    h.feed = []
+    h.run()
+    first = _searched_keys(h)
+    assert len(first) == 8 and first == sorted(first), first   # per_run companies, heaviest first
+    rows = _resolution_rows()
+    assert set(rows) == set(first) and {v[0] for v in rows.values()} == {"empty"}, rows
+    h.posts.clear()
+    h.run()
+    second = _searched_keys(h)
+    assert len(second) == 8 and not set(first) & set(second), (first, second)
+    assert set(_resolution_rows()) == set(first) | set(second)
+
+
+def test_resolve_hirebase_errored_company_is_stored_error_a_day_out_and_not_searched_on_run_two(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(12))
+
+    def boom(url, **kw):
+        if url.endswith("/companies/search"):
+            return type("_C", (), {"status_code": 200, "json": lambda self: {"companies": []}})()
+        h.posts.append((url, kw))
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    h.run()
+    bad = _searched_keys(h)
+    assert len(bad) == 1, bad   # the first error stops the loop; the rest are not recorded
+    rows = _resolution_rows()
+    assert set(rows) == set(bad) and rows[bad[0]][0] == "error", rows
+    attempted = m.datetime.fromisoformat(rows[bad[0]][1])
+    nxt = m.datetime.fromisoformat(rows[bad[0]][2])
+    assert m.timedelta(hours=23) < nxt - attempted < m.timedelta(hours=25), (attempted, nxt)
+    _hb_set_post(h, monkeypatch)
+    h.posts.clear()
+    h.run()
+    assert bad[0] not in _searched_keys(h)
+
+
+def test_resolve_hirebase_company_with_rows_is_resolved_and_rescanned_without_a_reserved_slot(monkeypatch):
+    names = {"Nopeboard Labs": 6, **{f"Filler{i:02d} Labs": 2 for i in range(12)}}
+    h = _hirebase_hook_harness(monkeypatch, names)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    first = _searched_keys(h)
+    assert first[0] == "nopeboard labs" and len(first) == 8, first
+    rows = _resolution_rows()
+    assert rows["nopeboard labs"][0] == "resolved"
+    assert {rows[k][0] for k in first[1:]} == {"empty"}
+    _hb_backdate("nopeboard labs", m.timedelta(days=5))
+    h.posts.clear()
+    h.run()
+    second = _searched_keys(h)
+    untouched = {f"filler{i:02d} labs" for i in range(12)} - set(first)
+    assert "nopeboard labs" in second, second
+    assert set(second) - {"nopeboard labs"} == untouched, (second, untouched)
+
+
+def test_resolve_hirebase_heavy_known_companies_do_not_push_out_the_reserved_unresolved_share(monkeypatch):
+    names = {**{f"Heavy{i} Labs": 9 for i in range(8)}, **{f"Newco{i} Labs": 1 for i in range(5)}}
+    h = _hirebase_hook_harness(monkeypatch, names)
+    for i in range(8):
+        assert m.resolution_record(f"heavy{i} labs", "hirebase", "resolved")
+    h.feed = []
+    h.run()
+    searched = _searched_keys(h)
+    new = [k for k in searched if k.startswith("newco")]
+    assert len(searched) == 8 and len(new) == 4, searched   # ceil(8 * 0.5) reserved for unresolved
+    assert len([k for k in searched if k.startswith("heavy")]) == 4
+
+
+def test_resolve_hirebase_sheet_switch_off_makes_zero_calls_and_says_so(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(10))
+    h.feed = []
+
+    class _Sheet:
+        status_code = 200
+        def json(self):
+            return {"status": "success", "filters": {"source_hirebase_enabled": False}}
+
+    monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: _Sheet())
+    try:
+        text = h.run()
+    finally:
+        with m.get_db_conn() as conn:
+            for k in m.SOURCE_CONFIG_KEYS:
+                conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+            conn.commit()
+    assert h.posts == [] and _hirebase_ledger_rows() == [], h.posts
+    assert "Hirebase: off in System_Config" in text, text
+    assert _resolution_rows() == {}
+
+
+def test_resolve_hirebase_unreadable_resolution_memory_runs_as_before_and_says_so(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(20))
+    h.feed = []
+    monkeypatch.setattr(m, "resolution_read", lambda: None)
+    text = h.run()
+    searched = _searched_keys(h)
+    assert len(searched) == 8 and searched == sorted(searched), searched
+    assert "resolution memory unreadable" in text, text
+    assert _resolution_rows() == {}
+
+
+def test_resolve_hirebase_cooldown_expiry_through_the_real_writer(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(3))
+    h.feed = []
+    now = m.datetime.now(m.timezone.utc)
+    m.resolution_record("resco00 labs", "hirebase", "empty", now=now - m.timedelta(days=46))   # 45-day cooldown over
+    m.resolution_record("resco01 labs", "hirebase", "empty", now=now - m.timedelta(days=44))   # still cooling
+    h.run()
+    searched = set(_searched_keys(h))
+    assert "resco00 labs" in searched and "resco01 labs" not in searched and "resco02 labs" in searched, searched
