@@ -25,3 +25,5 @@ Block, and write nothing, if it is not: 238 rewrites the Apify block and the clo
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 7 passed; suites 1935 passed, 1 skipped. No existing test edited. FLAGGED DECISION for Kevin (not built): a cut-off batch still stamps every picked company as fed for APIFY_COMPANY_RETRY_DAYS (7), because the ledger row stays ok; a company whose rows were cut off is not re-asked for a week. A follow-up could stamp only companies that had kept rows.

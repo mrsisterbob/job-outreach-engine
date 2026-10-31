@@ -16870,6 +16870,8 @@ def run_warm_radar_scan(chat_id=None):
         apify_picked_names = []
         apify_stats = {"returned": 0, "malformed": 0, "kept": 0, "unmatched": 0}
         apify_rows_returned = 0
+        apify_capped = False   # the answer hit the request limit (fetch_feed owns the test); only an ok call can set it
+        apify_limit_sent = 0
         apify_spent_usd = None
         apify_month_before = 0.0
         apify_collected = 0
@@ -16956,6 +16958,10 @@ def run_warm_radar_scan(chat_id=None):
                         if apify_result is not None and apify_result.status == "ok":
                             apify_status = "ok"
                             apify_rows_returned = len(apify_result.rows)
+                            apify_capped, apify_limit_sent = bool(apify_result.capped), apify_plan.limit
+                            if apify_capped:
+                                logging.warning(f"Warm Radar Apify answer hit the request limit (rows == limit): possibly cut off "
+                                                f"({apify_rows_returned} rows, limit {apify_limit_sent})")
                             apify_spent_usd = apify_feed.actual_cost(apify_rows_returned)
                             apify_ledger_settle(apify_row_id, apify_spent_usd, "ok")
                         else:
@@ -17341,8 +17347,13 @@ def run_warm_radar_scan(chat_id=None):
                 ap_empty = [n for n in apify_picked_names if not apify_kept_by_company.get(n)]
                 if ap_empty:
                     names_text, _used = _warm_radar_name_list(ap_empty, 5)
-                    lines.append(f"Searched Apify, no rows for: {names_text} (the feed may not cover them; "
-                                 "that is not the same as no jobs)")
+                    lines.append(f"Searched Apify, no rows for: {names_text} " + (
+                        "(the answer was cut off, so these may have rows that were not returned; that is not the same as no jobs)"
+                        if apify_capped else "(the feed may not cover them; that is not the same as no jobs)"))
+                if apify_capped:
+                    lines.append(f"Apify possibly cut off: {apify_rows_returned} rows returned and the request limit was "
+                                 f"{apify_limit_sent}; {apify_stats['kept']} kept are what came back, which may not be "
+                                 "everything the feed holds for these companies")
                 lines.append(f"Apify: {len(apify_picked_names)} companies, {apify_rows_returned} rows returned, "
                              f"{apify_stats['kept']} kept, {_usd_text(apify_spent_usd)} this run, "
                              f"{_usd_text(apify_month_before + apify_spent_usd)} of "

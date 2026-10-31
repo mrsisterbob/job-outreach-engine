@@ -24120,3 +24120,72 @@ def test_wrun_command_help_entry_is_real_and_the_bare_command_is_not_swallowed(m
     assert "No per-command help" not in reply and "/wrun Haworth" in reply
     assert ch.lookup_command_help("/wrun") is None and ch.lookup_command_help("/wrun full") is None
     assert "/wrun - Last /w run" in open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()
+
+
+# ---- /w says when the Apify answer hit the request limit (TASK-264) ----
+
+def _cutoff_rows(per_company, extra=0):
+    """per_company: {org: n rows}; extra: rows belonging to no picked company."""
+    rows = []
+    for org, n in per_company.items():
+        rows += [_apify_row(org, f"Analyst {i}", i) for i in range(n)]
+    rows += [_apify_row("Stranger Corp", f"Other {i}", i) for i in range(extra)]
+    return rows
+
+
+def test_apify_cutoff_exactly_the_limit_prints_its_own_line_before_the_apify_line(monkeypatch):
+    rows = _cutoff_rows({"Nopeboard Labs": 100, "Smallfry Inc": 86}, extra=14)
+    h, text = _apify_closing_run(monkeypatch, rows)
+    lines = text.splitlines()
+    cut = [i for i, ln in enumerate(lines) if ln.startswith("Apify possibly cut off: 200 rows returned and the request limit was 200")]
+    main_line = [i for i, ln in enumerate(lines) if ln.startswith("Apify: 2 companies, 200 rows returned, ")]
+    assert len(cut) == 1 and len(main_line) == 1 and cut[0] < main_line[0], text
+    assert "186 kept are what came back" in lines[cut[0]]
+
+
+def test_apify_cutoff_one_row_under_the_limit_says_nothing(monkeypatch):
+    _h, text = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 100, "Smallfry Inc": 99}))
+    assert "cut off" not in text and "Apify: 2 companies, 199 rows returned, " in text
+
+
+def test_apify_cutoff_a_bigger_batch_names_its_own_limit(monkeypatch):
+    five = {f"Cutco{i} Labs": 3 for i in range(5)}
+    rows = _cutoff_rows({k: 50 for k in five})
+    _h, text = _apify_closing_run(monkeypatch, rows, nobody=five)
+    assert "Apify possibly cut off: 250 rows returned and the request limit was 250" in text
+    _h2, text2 = _apify_closing_run(monkeypatch, rows[:-1], nobody=five)
+    assert "cut off" not in text2
+
+
+def test_apify_cutoff_a_capped_run_rewords_the_no_rows_line_and_an_uncapped_one_keeps_it(monkeypatch):
+    _h, capped = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}))
+    no_rows = [ln for ln in capped.splitlines() if ln.startswith("Searched Apify, no rows for:")][0]
+    assert "Smallfry Inc" in no_rows and "the answer was cut off, so these may have rows that were not returned" in no_rows
+    with m.get_db_conn() as conn:   # run 1 stored Apify's answers; a fresh start for the uncapped comparison run
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
+    _h2, plain = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 5}))
+    old = [ln for ln in plain.splitlines() if ln.startswith("Searched Apify, no rows for:")][0]
+    assert old == "Searched Apify, no rows for: Smallfry Inc (the feed may not cover them; that is not the same as no jobs)"
+
+
+def test_apify_cutoff_an_errored_call_and_a_missing_token_print_no_cutoff_line(monkeypatch):
+    _h, errored = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}), mode="500")
+    assert "Apify errored" in errored and "cut off" not in errored
+    _h2, off = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}), token=None)
+    assert "cut off" not in off
+
+
+def test_apify_cutoff_the_ledger_row_stays_ok_at_the_cost_of_the_rows(monkeypatch):
+    _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}))
+    (row,) = _apify_ledger()
+    assert row[1] == "ok" and abs(row[0] - m.apify_feed.actual_cost(200)) < 1e-9
+
+
+def test_apify_cutoff_warns_once_and_never_logs_the_token(monkeypatch, caplog):
+    import logging as _lg
+    caplog.set_level(_lg.DEBUG)
+    _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}))
+    warnings = [r for r in caplog.records if "hit the request limit" in r.getMessage()]
+    assert len(warnings) == 1 and "200 rows, limit 200" in warnings[0].getMessage()
+    assert _APIFY_TEST_TOKEN not in caplog.text
