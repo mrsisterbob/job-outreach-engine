@@ -36,6 +36,7 @@ import apify_feed
 import hirebase_feed
 import hirebase_registry
 import resolve_plan
+import inbound_hold
 import warm_screen_plan
 import warm_stage_samples
 import warm_michigan
@@ -830,6 +831,10 @@ EMAIL_REQUIRE_DIRECT_REPLY = os.environ.get("EMAIL_REQUIRE_DIRECT_REPLY", "False
 # tray but not sent to Telegram - see inbound_sender_screen_reason(). "permissive" restores the old
 # alert-every-stranger behaviour, as a Render dashboard flip rather than a redeploy.
 INBOUND_ALERT_MODE = os.environ.get("INBOUND_ALERT_MODE", "strict").strip().lower()
+# What to do with mail from a sender with no CRM identity that is not a reply, a hiring signal or a rejection:
+# "hold" (default) logs it in the tray as state='held' and sends no alert; "alert" restores the old alert-every-stranger
+# behaviour. A Render dashboard flip, not a redeploy. INBOUND_ALERT_MODE=permissive also disables holding.
+INBOUND_UNSOLICITED_MODE = inbound_hold.parse_mode(os.environ.get("INBOUND_UNSOLICITED_MODE", ""))
 # 50 chars dropped "Hi Kevin, got a sec?" and "Can we talk tomorrow at 2?" - the shortest replies
 # are often the warmest, because a busy human writing back types one line. The gate exists to skip
 # empty auto-acknowledgements, not brevity, and bulk is already handled structurally by the sender
@@ -8314,6 +8319,46 @@ def record_inbound_thread(thread_id, sender_email, sender_name, company, subject
         return True, 1
 
 
+def record_held_thread(thread_id, sender_email, sender_name, subject, snippet, reason, status_label):
+    """Log an unsolicited mail in the tray as state='held' (no alert). True when written, False (never raises) on a DB
+    error. Not record_inbound_thread: its update path sets state='open', which would put held mail into /inbox.
+    An existing row only gets message_count/last_seen/subject/snippet bumped; state and alerted never change."""
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT message_count FROM inbound_threads WHERE thread_id = ?", (thread_id,)).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE inbound_threads SET last_seen = CURRENT_TIMESTAMP, message_count = ?, subject = ?, snippet = ? "
+                    "WHERE thread_id = ?", (int(row[0] or 1) + 1, subject, snippet, thread_id))
+            else:
+                conn.execute(
+                    "INSERT INTO inbound_threads (thread_id, sender_email, sender_name, company, subject, snippet, "
+                    "status_label, match_reason, sheet_uuid, is_tier1, state, alerted) "
+                    "VALUES (?, ?, ?, 'Unknown', ?, ?, ?, ?, '', 0, 'held', 0)",
+                    (thread_id, sender_email, sender_name, subject, snippet, status_label, "held: " + str(reason)))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Inbound held-thread write error ({thread_id}): {type(e).__name__}")
+        return False
+
+
+def held_inbound_since(hours=24):
+    """[(sender_name, sender_email, subject)] of held mail first seen in the window, newest first; None on a DB error
+    (not []: unknown must not read as zero). Read-only."""
+    try:
+        with read_only_db():
+            with get_db_conn() as conn:
+                rows = conn.execute(
+                    "SELECT sender_name, sender_email, subject FROM inbound_threads WHERE state = 'held' "
+                    "AND first_seen >= datetime('now', ?) ORDER BY first_seen DESC, rowid DESC",
+                    (f"-{int(hours)} hours",)).fetchall()
+        return [tuple(r) for r in rows]
+    except Exception as e:
+        logging.error(f"Held inbound read error: {type(e).__name__}")
+        return None
+
+
 def mark_inbound_thread_alerted(thread_id):
     """Record that Telegram accepted an alert for this thread. Never raises."""
     try:
@@ -8799,6 +8844,19 @@ def check_inbound_gmail_replies():
                 # is not a defect; it is the outcome the outreach exists to produce. So it alerts,
                 # and it alerts with an empty sheet_uuid so every CRM branch below skips itself:
                 # guessing which row a stranger belongs to would be worse than the original bug.
+                # Unless it is unsolicited mail (no reply headers, no hiring signal): then it is HELD, logged in the
+                # tray as state='held' and not pinged. See inbound_hold for the rule.
+                held_reason = inbound_hold.hold_reason(
+                    is_tier1=is_tier1, status_label=status_label, in_reply_to=in_reply_to, references=references,
+                    subject=subject, mode="alert" if INBOUND_ALERT_MODE == "permissive" else INBOUND_UNSOLICITED_MODE)
+                if held_reason:
+                    held_address = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender or "")
+                    if record_held_thread(thread_id, held_address.group(0).lower() if held_address else "",
+                                          display_name_from_sender(sender), subject, snippet, held_reason, status_label):
+                        logging.info(f"[HELD] {sender} - {held_reason}; recorded in tray as held, no alert")
+                        requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+                    # A failed tray write leaves the mail UNREAD so the next poll retries; either way no alert.
+                    continue
                 is_unverified = True
                 match_reason = "interview signal" if is_tier1 else "unknown sender"
                 crm_match = {
@@ -9963,7 +10021,7 @@ def get_weekly_build_log_counts(days=7):
             with get_db_conn() as conn:
                 counts["replies"] = int(conn.execute(
                     "SELECT COUNT(*) FROM inbound_threads WHERE first_seen >= datetime('now', ?) "
-                    "AND COALESCE(status_label, '') != 'REJECTION'", (window,)).fetchone()[0])
+                    "AND COALESCE(status_label, '') != 'REJECTION' AND COALESCE(state, '') != 'held'", (window,)).fetchone()[0])
     except Exception as e:
         logging.error(f"Build Log Reply Read Error ({days}d): {e}")
     return counts

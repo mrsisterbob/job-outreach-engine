@@ -23544,3 +23544,147 @@ def test_ats_store_sheet_keys_are_read_and_an_empty_sheet_leaves_the_resolver_of
             for k in m.SOURCE_CONFIG_KEYS:
                 conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
             conn.commit()
+
+
+# ---- unsolicited mail from an unknown sender is held in the tray and never pings (TASK-255) ----
+
+@pytest.fixture(autouse=True)
+def _inbound_unsolicited_legacy_mode(request, monkeypatch):
+    """Older poll tests assert that a stranger alerts (the rule before holding existed); the inbound_hold tests set
+    "hold" themselves."""
+    if "inbound_hold" not in request.node.name:
+        monkeypatch.setattr(m, "INBOUND_UNSOLICITED_MODE", "alert")
+    yield
+
+
+_COLD_SENDER = "Dana Reed <dana.reed@growthmail-partners.com>"
+_COLD_SUBJECT = "Quick question about your services"
+_COLD_BODY = "Hi Kevin, I wanted to introduce our lead generation service for professionals."
+
+
+def _hold_poll(monkeypatch, messages, mode="hold", **kw):
+    monkeypatch.setattr(m, "INBOUND_UNSOLICITED_MODE", mode)
+    monkeypatch.setattr(m, "route_rejection_to_died", lambda *a, **k: "")
+    _clear_tray()
+    return _run_poll_with_fake_gmail(monkeypatch, messages, real_tray=True, **kw)
+
+
+def _tray_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT thread_id, state, match_reason, message_count, alerted FROM inbound_threads").fetchall()
+
+
+def test_inbound_hold_unsolicited_stranger_sends_no_alert_is_marked_read_and_is_recorded_held(monkeypatch):
+    alerts, marked = _hold_poll(monkeypatch, [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)])
+    assert alerts == [] and marked == ["cold"]
+    assert _tray_rows() == [("thread-cold", "held", "held: unsolicited, not a reply", 1, 0)]
+    _clear_tray()
+
+
+def test_inbound_hold_re_subject_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("re1", _COLD_SENDER, "Re: Kevin Miller", _COLD_BODY)])
+    assert len(alerts) == 1 and _tray_rows()[0][1] == "open"
+    _clear_tray()
+
+
+def test_inbound_hold_in_reply_to_header_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("irt", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY,
+                                                         extra_headers={"In-Reply-To": "<abc@mail.gmail.com>"})])
+    assert len(alerts) == 1
+    _clear_tray()
+
+
+def test_inbound_hold_references_header_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("ref", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY,
+                                                         extra_headers={"References": "<abc@mail.gmail.com>"})])
+    assert len(alerts) == 1
+    _clear_tray()
+
+
+def test_inbound_hold_interview_wording_with_no_reply_headers_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message(
+        "iv", "Sam Lee <sam.lee@acmehiring.com>", "Next steps",
+        "We would like to schedule an interview with you next week. Please send your availability.")])
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    _clear_tray()
+
+
+def test_inbound_hold_calendar_invite_with_no_reply_headers_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("cal", FITTERMAN_SENDER, FITTERMAN_SUBJECT, FITTERMAN_SNIPPET,
+                                                         ics=FITTERMAN_ICS)])
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    _clear_tray()
+
+
+def test_inbound_hold_stranger_rejection_with_no_reply_headers_alerts_and_routes(monkeypatch):
+    routed = []
+    monkeypatch.setattr(m, "INBOUND_UNSOLICITED_MODE", "hold")
+    monkeypatch.setattr(m, "route_rejection_to_died", lambda *a, **k: routed.append(a) or "")
+    _clear_tray()
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [_gmail_message(
+        "rj", "Pat Kim <pat.kim@trinityhealth.org>", "Update on your application",
+        "Unfortunately, we have decided to move forward with other candidates.")], real_tray=True)
+    assert len(alerts) == 1 and "Rejection" in alerts[0] and len(routed) == 1
+    _clear_tray()
+
+
+def test_inbound_hold_second_message_on_a_held_thread_bumps_the_count_and_stays_held(monkeypatch):
+    msgs = [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)]
+    _hold_poll(monkeypatch, msgs)
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, msgs, real_tray=True)
+    assert alerts == []
+    assert _tray_rows() == [("thread-cold", "held", "held: unsolicited, not a reply", 2, 0)]
+    _clear_tray()
+
+
+def test_inbound_hold_failing_tray_write_leaves_the_mail_unread_and_sends_nothing(monkeypatch):
+    monkeypatch.setattr(m, "record_held_thread", lambda *a, **k: False)
+    alerts, marked = _hold_poll(monkeypatch, [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)])
+    assert alerts == [] and marked == [] and _tray_rows() == []
+
+
+def test_inbound_hold_alert_mode_alerts_and_writes_no_held_row(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)], mode="alert")
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    _clear_tray()
+
+
+def test_inbound_hold_held_rows_stay_out_of_inbox_and_the_reply_count(monkeypatch):
+    before = m.get_weekly_build_log_counts(7)["replies"]
+    _hold_poll(monkeypatch, [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)])
+    assert m.get_open_inbound_threads() == []
+    assert m.get_weekly_build_log_counts(7)["replies"] == before
+    _clear_tray()
+
+
+def test_inbound_hold_verified_contact_and_thread_participant_are_never_held(monkeypatch):
+    monkeypatch.setattr(m, "record_application_outcome", lambda *a, **k: None)
+    monkeypatch.setattr(m, "route_inbound_reply_to_crm", lambda *a, **k: None)
+    contact = {"name": "Dana", "company": "Career.io", "tab": "Carmen Cold", "sheet_uuid": ""}
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("v", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)],
+                           crm_lookup=lambda sender: contact)
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("p", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)], thread_started=True)
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    _clear_tray()
+
+
+def test_inbound_hold_held_inbound_since_lists_newest_first_honours_the_window_and_none_on_error(monkeypatch):
+    _clear_tray()
+    assert m.record_held_thread("t1", "a@x.com", "Ann", "First", "s", "unsolicited, not a reply", "")
+    assert m.record_held_thread("t2", "b@x.com", "Bob", "Second", "s", "unsolicited, not a reply", "")
+    assert m.record_held_thread("t3", "c@x.com", "Cy", "Old", "s", "unsolicited, not a reply", "")
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE inbound_threads SET first_seen = datetime('now', '-2 days') WHERE thread_id = 't3'")
+        conn.execute("UPDATE inbound_threads SET first_seen = datetime('now', '-1 hours') WHERE thread_id = 't1'")
+        conn.commit()
+    assert m.held_inbound_since(24) == [("Bob", "b@x.com", "Second"), ("Ann", "a@x.com", "First")]
+    monkeypatch.setattr(m, "get_db_conn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    assert m.held_inbound_since(24) is None
+    monkeypatch.undo()
+    _clear_tray()
+
+
+def test_inbound_hold_default_mode_is_hold_for_an_empty_environment():
+    assert m.inbound_hold.parse_mode("") == "hold" and m.inbound_hold.parse_mode(None) == "hold"
+    assert m.inbound_hold.DEFAULT_MODE == "hold"

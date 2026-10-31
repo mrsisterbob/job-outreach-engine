@@ -26,3 +26,5 @@ Block, and write nothing, if it is not: this task imports `inbound_hold`.
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 14 passed; suites 1925 passed, 1 skipped. No existing test edited (autouse fixture _inbound_unsolicited_legacy_mode sets alert mode for non-inbound_hold tests). FLAG: an unsolicited first-contact recruiter mail with no reply headers or hiring words is now held (standup, TASK-256) instead of pinging; INBOUND_UNSOLICITED_MODE=alert reverses it. test_a_cold_recruiter_with_no_interview_vocabulary_still_alerts still passes (its mail is "Re: Kevin Miller"). NOTICED, not changed: screened: rows are still counted as replies in get_weekly_build_log_counts.
