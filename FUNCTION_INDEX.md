@@ -1066,6 +1066,20 @@ grep -i "contact" FUNCTION_INDEX.md
 | 43 | `build` | _(no docstring)_ |
 | 60 | `main` | _(no docstring)_ |
 
+## `scripts/measure_added_value.py` — 9 defs, 204 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 37 | `read_free` | {company_key: system} from a RESULT CSV (company_key,system,token). |
+| 43 | `extras_of` | Board systems measure() found for a company, in order, deduplicated. |
+| 51 | `ceiling_bucket` | _(no docstring)_ |
+| 63 | `classify` | One company's joined record. |
+| 86 | `summarize` | _(no docstring)_ |
+| 105 | `report_lines` | _(no docstring)_ |
+| 131 | `write_result` | _(no docstring)_ |
+| 149 | `run` | _(no docstring)_ |
+| 167 | `main` | _(no docstring)_ |
+
 ## `scripts/measure_ats_endpoints.py` — 6 defs, 210 lines
 
 | Line | Name | Summary |
@@ -1341,4 +1355,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1027 definitions across 59 files + Code.gs.**
+**1036 definitions across 60 files + Code.gs.**
