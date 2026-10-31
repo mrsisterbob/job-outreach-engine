@@ -1756,6 +1756,17 @@ def init_db():
             bot TEXT
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_site_visits_time ON site_visits(visited_at)")
+        # tag -> contact label for per-contact site links. A site_visits.tag is stored only when it maps to a row here.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS visit_tags (
+            tag TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        try:
+            conn.execute("ALTER TABLE site_visits ADD COLUMN tag TEXT")
+        except sqlite3.OperationalError:
+            pass   # column already exists
         # Inbound leads from contact forms (section 12b). The site has no persistent disk, so this
         # table is the only durable copy of a submission. source names the form it came from.
         conn.execute("""
@@ -20559,6 +20570,48 @@ def _visit_timestamp(value):
         return None
 
 
+def visit_tag_create(label, now=None):
+    """The tag for a contact label, creating it if needed. The label is trimmed, whitespace-collapsed and capped
+    at 80 chars; blank -> None. The same label again returns the EXISTING tag. Retries on a PK collision.
+    None on a DB error (never raises)."""
+    try:
+        text = " ".join(str(label or "").split())[:80]
+        if not text:
+            return None
+        now = now or datetime.now(timezone.utc)
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT tag FROM visit_tags WHERE label = ? ORDER BY created_at LIMIT 1", (text,)).fetchone()
+            if row:
+                return row[0]
+            for _ in range(5):
+                tag = visit_alert.new_tag()
+                try:
+                    conn.execute("INSERT INTO visit_tags (tag, label, created_at) VALUES (?, ?, ?)",
+                                 (tag, text, now.isoformat()))
+                    conn.commit()
+                    return tag
+                except sqlite3.IntegrityError:
+                    continue
+        return None
+    except Exception as e:
+        logging.error(f"Visit Tag Create Error: {type(e).__name__}")
+        return None
+
+
+def visit_tag_lookup(tag):
+    """The contact label for a tag, or None. None on a read error too: an unreadable table must not read as a person."""
+    try:
+        t = visit_alert.valid_tag(tag)
+        if not t:
+            return None
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT label FROM visit_tags WHERE tag = ?", (t,)).fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        logging.error(f"Visit Tag Lookup Error: {type(e).__name__}")
+        return None
+
+
 def record_site_visits(views, day=None, alerts=None):
     """Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and
     ua fields of each view are read here and dropped - only (visited_at, path, visitor_id,
@@ -20573,21 +20626,26 @@ def record_site_visits(views, day=None, alerts=None):
             continue
         ip, ua = str(v.get("ip") or ""), str(v.get("ua") or "")
         path = str(v.get("path") or "/").split("?", 1)[0][:200]
+        # Optional per-contact tag (the site forwards the `r` query parameter as "tag"). Stored only when it maps to a
+        # known contact, so a guessed tag names nobody. Never stored or logged with the ip.
+        label = visit_tag_lookup(visit_alert.valid_tag(v.get("tag"))) if v.get("tag") else None
         rows.append((
             _visit_timestamp(v.get("ts")), path, daily_visitor_id(ip, ua, salt),
             normalize_referrer_host(v.get("referrer"), own) or None,
             visit_bot_flag(ua, ip, bool(v.get("self")), ignore, path=path),
+            visit_alert.valid_tag(v.get("tag")) if label else None,
+            label,
         ))
     if not rows:
         return 0
     with get_db_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.executemany(
-            "INSERT INTO site_visits (visited_at, path, visitor_id, referrer, bot) "
-            "VALUES (COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)", rows)
+            "INSERT INTO site_visits (visited_at, path, visitor_id, referrer, bot, tag) "
+            "VALUES (COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?)", [r[:6] for r in rows])
         conn.commit()
     if alerts is not None:
-        alerts.extend(rows)
+        alerts.extend(r[:5] + (r[6],) for r in rows)   # the alert gets the contact label, never the tag
     return len(rows)
 
 
@@ -20630,10 +20688,10 @@ def _visit_when_text(visited_at):
         return dt.strftime("%a %b %d, %I:%M %p UTC").replace(" 0", " ")
 
 
-def _send_visit_alert(when_text, path, referrer):
+def _send_visit_alert(when_text, path, referrer, who=None):
     """Runs off the request thread. A failed send is logged (class name only) and not retried."""
     try:
-        if not send_telegram_message(TELEGRAM_CHAT_ID, visit_alert.format_visit_alert(when_text, path, referrer)):
+        if not send_telegram_message(TELEGRAM_CHAT_ID, visit_alert.format_visit_alert(when_text, path, referrer, who=who)):
             logging.error("[ANALYTICS] visit alert was not delivered to Telegram")
     except Exception as e:
         logging.error(f"[ANALYTICS] visit alert send raised {type(e).__name__}")
@@ -20641,7 +20699,9 @@ def _send_visit_alert(when_text, path, referrer):
 
 def _start_visit_alerts(candidates):
     """Gate each stored view on the request thread, queue the send of each admitted one."""
-    for visited_at, path, visitor_id, referrer, bot in candidates:
+    # Known limit: the gate allows one alert per visitor per 10 minutes, so a visitor who opens an untagged page first
+    # and the tagged link second inside that window is not re-alerted. A tagged link is nearly always the first page.
+    for visited_at, path, visitor_id, referrer, bot, who in candidates:
         try:
             view_epoch = (datetime.strptime(visited_at, "%Y-%m-%d %H:%M:%S")
                           .replace(tzinfo=timezone.utc).timestamp()) if visited_at else None
@@ -20651,7 +20711,7 @@ def _start_visit_alerts(candidates):
         if not ok:
             continue
         when_text = _visit_when_text(visited_at)
-        _spawn_background(lambda w=when_text, p=path, r=referrer: _send_visit_alert(w, p, r))
+        _spawn_background(lambda w=when_text, p=path, r=referrer, who=who: _send_visit_alert(w, p, r, who))
 
 
 @app.route("/analytics/ingest", methods=["POST"])

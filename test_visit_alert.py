@@ -111,3 +111,23 @@ def test_visit_alert_geo_who_under_title_and_escaped():
     assert "Opened by" not in va.format_visit_alert("t", "/", "", who="  ")
     capped = va.format_visit_alert("t", "/", "", place="p" * 500, org="o" * 500, who="w" * 500)
     assert "w" * 81 not in capped and "p" * 81 not in capped and "o" * 81 not in capped
+
+
+def test_visit_alert_tag_valid_accepts_good_in_any_case_and_rejects_bad():
+    assert va.valid_tag("Ab3dEf7h") == "ab3def7h"
+    assert va.valid_tag("abcdef") == "abcdef" and va.valid_tag("a" * 12) == "a" * 12
+    for bad in ("../x", "<script>", "a" * 200, "abc", None, 12345678, "", "abc def9", "a" * 13):
+        assert va.valid_tag(bad) == "", bad
+
+
+def test_visit_alert_tag_new_is_eight_chars_from_the_allowed_alphabet_and_differs():
+    a, b = va.new_tag(), va.new_tag()
+    assert len(a) == len(b) == 8 and a != b
+    assert not set(a + b) & set("0o1li") and va.valid_tag(a) == a
+
+
+def test_visit_alert_tag_new_uses_the_given_rng():
+    class _R:
+        def choice(self, seq):
+            return seq[0]
+    assert va.new_tag(_R()) == "a" * 8

@@ -23,3 +23,5 @@ Both halves fail now (observed 2026-10-28): `test_visit_alert.py -k visit_alert_
 - Tests: pure (`-k visit_alert_tag`, at least 3): `valid_tag` accepts a good tag in any case and rejects `../x`, `<script>`, a 200-character string, `abc`, `None`; `new_tag` is 8 characters, only the allowed alphabet, and two calls differ. Integration (`-k visit_tag_ingest`, at least 5; drive `/analytics/ingest` through the Flask client and read back `site_visits` and the fake Telegram text): a known tag -> "Opened by Jane Doe" in the alert and the row's tag stored; an unknown well-formed tag -> no "Opened by" line, row tag NULL; a malformed tag -> same as none; a tagged probe path -> no alert; a `visit_tags` read error -> the alert still goes out with no "Opened by" line; a label containing `<b>` is escaped; a view with no `tag` key produces today's alert exactly.
 
 ## Log
+
+- 2026-10-31 cloud worker: built; verify 3 + 8 passed; full suites 1879 passed, 1 skipped (incl. test_visit_alert.py). No existing test edited.

@@ -23279,3 +23279,85 @@ def test_resolve_apify_sheet_dollar_budget_below_one_runs_worst_case_sends_nothi
     assert h.apify_posts == [], h.apify_posts
     assert "Apify skipped: monthly budget used" in text, text
     assert _APIFY_TEST_TOKEN not in text
+
+
+# ---- /analytics/ingest reads a per-contact tag and the alert names who opened the site (TASK-239) ----
+
+def _tagged_view(tag, **kw):
+    v = _view(**kw)
+    v["tag"] = tag
+    return v
+
+
+def _tag_rows():
+    with m.get_db_conn() as conn:
+        return [r[0] for r in conn.execute("SELECT tag FROM site_visits ORDER BY id").fetchall()]
+
+
+@pytest.fixture
+def visit_tag_env(analytics_env):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM visit_tags")
+        conn.commit()
+    return analytics_env
+
+
+def test_visit_tag_ingest_known_tag_names_the_contact_and_is_stored(visit_tag_env):
+    tag = m.visit_tag_create("Jane Doe")
+    assert _ingest([_tagged_view(tag.upper())]).status_code == 200
+    assert "Opened by Jane Doe" in visit_tag_env[0], visit_tag_env
+    assert _tag_rows() == [tag]
+
+
+def test_visit_tag_ingest_unknown_well_formed_tag_names_nobody_and_stores_null(visit_tag_env):
+    m.visit_tag_create("Jane Doe")
+    assert _ingest([_tagged_view("zzzzzzzz")]).status_code == 200
+    assert len(visit_tag_env) == 1 and "Opened by" not in visit_tag_env[0]
+    assert _tag_rows() == [None]
+
+
+def test_visit_tag_ingest_malformed_tag_reads_as_none(visit_tag_env):
+    assert _ingest([_tagged_view("../x<script>")]).status_code == 200
+    assert len(visit_tag_env) == 1 and "Opened by" not in visit_tag_env[0]
+    assert _tag_rows() == [None]
+
+
+def test_visit_tag_ingest_tagged_probe_path_sends_no_alert(visit_tag_env):
+    tag = m.visit_tag_create("Jane Doe")
+    assert _ingest([_tagged_view(tag, path="/.env")]).status_code == 200
+    assert visit_tag_env == []
+
+
+def test_visit_tag_ingest_unreadable_tag_table_still_alerts_without_a_name(visit_tag_env):
+    tag = m.visit_tag_create("Jane Doe")
+    with m.get_db_conn() as conn:
+        conn.execute("ALTER TABLE visit_tags RENAME TO visit_tags_away")
+        conn.commit()
+    try:
+        assert _ingest([_tagged_view(tag)]).status_code == 200
+    finally:
+        with m.get_db_conn() as conn:
+            conn.execute("ALTER TABLE visit_tags_away RENAME TO visit_tags")
+            conn.commit()
+    assert len(visit_tag_env) == 1 and "Opened by" not in visit_tag_env[0]
+    assert _tag_rows() == [None]
+
+
+def test_visit_tag_ingest_label_with_markup_is_escaped(visit_tag_env):
+    tag = m.visit_tag_create("Jane <b>Doe</b>")
+    _ingest([_tagged_view(tag)])
+    assert "Jane &lt;b&gt;Doe&lt;/b&gt;" in visit_tag_env[0] and "<b>Doe" not in visit_tag_env[0]
+
+
+def test_visit_tag_ingest_view_without_a_tag_key_alerts_exactly_as_before(visit_tag_env):
+    _ingest([_view()])
+    assert len(visit_tag_env) == 1
+    assert visit_tag_env[0].splitlines()[0].startswith("👀") and "👤" not in visit_tag_env[0]
+    assert "Opened by" not in visit_tag_env[0] and _tag_rows() == [None]
+
+
+def test_visit_tag_ingest_create_is_idempotent_per_label_and_refuses_blank(visit_tag_env):
+    a = m.visit_tag_create("  Jane   Doe ")
+    assert a and m.visit_tag_create("Jane Doe") == a
+    assert m.visit_tag_create("   ") is None and m.visit_tag_lookup(a) == "Jane Doe"
+    assert m.visit_tag_lookup("zzzzzzzz") is None
