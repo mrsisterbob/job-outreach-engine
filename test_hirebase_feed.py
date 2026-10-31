@@ -617,3 +617,32 @@ def test_hirebase_capped_total_pages_bounded_over_three_rounds(monkeypatch):
             requests.append(page)
             ledger.append((now.isoformat(), n, "capped" if res.capped else "ok", key, page, days))
     assert requests == [1, 2] and len(requests) <= hf.HIREBASE_MAX_PAGES_PER_WINDOW
+
+
+def test_hirebase_dropped_names_an_unmatched_job_lands_in_dropped_with_its_returned_name():
+    sib = make_job(company_slug="haworth-international", company_name="Haworth International")
+    dropped = []
+    kept, stats = hf.split_jobs([make_job(), sib], "Haworth Inc.", ["haworth"], norm, dropped=dropped)
+    assert stats["kept"] == 1 and stats["unmatched"] == 1
+    assert dropped == [("Haworth International", "no_match")]
+
+
+def test_hirebase_dropped_names_malformed_gives_an_empty_name_and_counts_add_up():
+    jobs = [make_job(), make_job(platform_job_id=None), "junk", make_job(company_slug="other", company_name="Other Co")]
+    dropped = []
+    kept, stats = hf.split_jobs(jobs, "Haworth Inc.", ["haworth"], norm, dropped=dropped)
+    assert len(dropped) == stats["unmatched"] + stats["malformed"] == 3
+    assert dropped.count(("", "malformed")) == 2 and ("Other Co", "no_match") in dropped
+
+
+def test_hirebase_dropped_names_none_and_empty_list_give_the_same_kept_and_stats():
+    jobs = [make_job(), make_job(company_slug="other", company_name="Other Co"), make_job(job_title="")]
+    assert hf.split_jobs(jobs, "Haworth Inc.", ["haworth"], norm) == hf.split_jobs(
+        jobs, "Haworth Inc.", ["haworth"], norm, dropped=[])
+
+
+def test_hirebase_dropped_names_a_non_list_is_ignored_without_raising():
+    jobs = [make_job(company_slug="other", company_name="Other Co")]
+    for bad in ((), "text", {}, 5):
+        kept, stats = hf.split_jobs(jobs, "Haworth Inc.", ["haworth"], norm, dropped=bad)
+        assert stats["unmatched"] == 1

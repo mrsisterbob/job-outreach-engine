@@ -100,7 +100,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 229 | `to_sheet_row` | The 12-column Carmen Warm row: date, name, company, email, priority, status, blank, URL, |
 | 240 | `build_master` | Classify every person. Returns {"people": [(status, person)], "rows": {handle: sheet row |
 
-## `apify_feed.py` — 16 defs, 342 lines
+## `apify_feed.py` — 17 defs, 352 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -111,15 +111,16 @@ grep -i "contact" FUNCTION_INDEX.md
 | 101 | `parse_row` | One feed row -> JSearch-shaped posting dict, or None when id, title, organization or url is missing. |
 | 130 | `_squash` | _(no docstring)_ |
 | 134 | `row_belongs_to` | True only when the normalized organization equals the company (strict: siblings like Haworth |
-| 160 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
-| 193 | `get_token` | Stripped APIFY_TOKEN from the given environment mapping, or None. Environment only: no default, no file. |
-| 199 | `fetch_feed` | One batched feed call. status is "ok", "errored" or "unconfigured". |
-| 242 | `actual_cost` | Billed cost of a run (MEASURED formula): excluded rows are free, zero rows is the flat fee. |
-| 247 | `_parse_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
-| 258 | `plan_apify_run` | Decide the one batched call: which companies, what limit, worst-case cost. |
-| 308 | `fallthrough_candidates` | Subset of candidates ((key, display, people)), same order, that Hirebase could not answer. |
-| 325 | `domain_board` | 'workday' for a host ending .myworkdayjobs.com, else ''. Other boards' domains are unmeasured. |
-| 331 | `summarize_feed_sources` | kept dict from split_rows -> display name -> {source_domain, job_board, rows}. |
+| 160 | `_note_dropped` | Append (returned_name, reason) to the caller's list. Only a real list is appended to; anything else is ignored. |
+| 166 | `split_rows` | -> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched). |
+| 203 | `get_token` | Stripped APIFY_TOKEN from the given environment mapping, or None. Environment only: no default, no file. |
+| 209 | `fetch_feed` | One batched feed call. status is "ok", "errored" or "unconfigured". |
+| 252 | `actual_cost` | Billed cost of a run (MEASURED formula): excluded rows are free, zero rows is the flat fee. |
+| 257 | `_parse_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
+| 268 | `plan_apify_run` | Decide the one batched call: which companies, what limit, worst-case cost. |
+| 318 | `fallthrough_candidates` | Subset of candidates ((key, display, people)), same order, that Hirebase could not answer. |
+| 335 | `domain_board` | 'workday' for a host ending .myworkdayjobs.com, else ''. Other boards' domains are unmeasured. |
+| 341 | `summarize_feed_sources` | kept dict from split_rows -> display name -> {source_domain, job_board, rows}. |
 
 ## `ats_endpoint_report.py` — 13 defs, 199 lines
 
@@ -199,7 +200,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 176 | `covered_contact_share` | (covered_contacts, total_contacts): sums contacts, never counts records. |
 | 190 | `record_row` | Sheet row in COMPANIES_HEADER order: all text, covered as yes/no, never None. |
 
-## `hirebase_feed.py` — 25 defs, 600 lines
+## `hirebase_feed.py` — 25 defs, 606 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -215,19 +216,19 @@ grep -i "contact" FUNCTION_INDEX.md
 | 162 | `_squash` | _(no docstring)_ |
 | 166 | `job_belongs_to` | True only when company_slug is exactly one of `slugs` AND the normalized job company name |
 | 183 | `split_jobs` | One company per call -> (kept, stats); stats = returned / malformed / kept / unmatched. |
-| 209 | `get_key` | Stripped HIREBASE_API_KEY from the given environment mapping, or None. Environment only. |
-| 215 | `fetch_company_jobs` | ONE Hirebase search request. status is "ok", "errored" or "unconfigured". |
-| 292 | `_ledger_rows` | Normalize ledger rows to (ts, jobs, status, key, page, days_ago). |
-| 306 | `_plan_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
-| 317 | `_ledger_marks` | (last_ok, newest_ok_jobs, ever_rows) per key. errored jobs is a RESERVED limit, never rows. |
-| 340 | `_empty_benched` | _(no docstring)_ |
-| 344 | `first_search_was_empty` | True when key's newest ok search returned zero rows and it has never returned a row. |
-| 352 | `plan_hirebase_run` | Pure spend guard: which no-board companies to search, each with days_ago and limit. |
-| 475 | `build_company_search_body` | Exactly company_name, page, limit (unknown fields 422). Blank name -> None. |
-| 483 | `fetch_company_rows` | ONE Company Search request. status "ok" (rows may be [] = honest no-match) or "errored". |
-| 519 | `_host` | _(no docstring)_ |
-| 526 | `pick_company_row` | The one row that really is `name`, or None. Never falls back to row 1. |
-| 554 | `plan_company_lookups` | Which companies may get a Company Search lookup this run. |
+| 215 | `get_key` | Stripped HIREBASE_API_KEY from the given environment mapping, or None. Environment only. |
+| 221 | `fetch_company_jobs` | ONE Hirebase search request. status is "ok", "errored" or "unconfigured". |
+| 298 | `_ledger_rows` | Normalize ledger rows to (ts, jobs, status, key, page, days_ago). |
+| 312 | `_plan_ts` | Aware-UTC datetime; malformed or future timestamps count as `now`. |
+| 323 | `_ledger_marks` | (last_ok, newest_ok_jobs, ever_rows) per key. errored jobs is a RESERVED limit, never rows. |
+| 346 | `_empty_benched` | _(no docstring)_ |
+| 350 | `first_search_was_empty` | True when key's newest ok search returned zero rows and it has never returned a row. |
+| 358 | `plan_hirebase_run` | Pure spend guard: which no-board companies to search, each with days_ago and limit. |
+| 481 | `build_company_search_body` | Exactly company_name, page, limit (unknown fields 422). Blank name -> None. |
+| 489 | `fetch_company_rows` | ONE Company Search request. status "ok" (rows may be [] = honest no-match) or "errored". |
+| 525 | `_host` | _(no docstring)_ |
+| 532 | `pick_company_row` | The one row that really is `name`, or None. Never falls back to row 1. |
+| 560 | `plan_company_lookups` | Which companies may get a Company Search lookup this run. |
 
 ## `hirebase_registry.py` — 3 defs, 75 lines
 
@@ -1053,6 +1054,37 @@ grep -i "contact" FUNCTION_INDEX.md
 | 210 | `role_rank_key` | Sort key inside one company: roles a track rule fires on first, then a positively read US or |
 | 216 | `company_order_key` | Sort key for which companies get a message when the run cap bites: contact priority |
 
+## `run_report.py` — 26 defs, 359 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 35 | `source_from_job_id` | greenhouse / lever / ashby / workday / hirebase / apify by job_id prefix (the ones _collect_posting uses); |
+| 46 | `_clean` | _(no docstring)_ |
+| 50 | `_esc` | _(no docstring)_ |
+| 54 | `_norm` | _(no docstring)_ |
+| 58 | `_label` | _(no docstring)_ |
+| 62 | `_new_source` | _(no docstring)_ |
+| 67 | `RunRecorder` | _(no docstring)_ |
+| 68 | `RunRecorder.__init__` | _(no docstring)_ |
+| 75 | `RunRecorder._company` | _(no docstring)_ |
+| 87 | `RunRecorder._src` | _(no docstring)_ |
+| 93 | `RunRecorder._name_seen` | _(no docstring)_ |
+| 105 | `RunRecorder.note_source_call` | _(no docstring)_ |
+| 129 | `RunRecorder.note_posting` | _(no docstring)_ |
+| 139 | `RunRecorder.note_outcome` | _(no docstring)_ |
+| 150 | `RunRecorder.note_problem` | _(no docstring)_ |
+| 159 | `RunRecorder.set_counts` | _(no docstring)_ |
+| 166 | `RunRecorder.snapshot` | _(no docstring)_ |
+| 179 | `_cut` | Cut to `limit` characters ending in "..." without leaving a broken tag or entity: tags are stripped from a |
+| 189 | `_build_line` | _(no docstring)_ |
+| 195 | `_sources_line` | _(no docstring)_ |
+| 215 | `compose_short` | The short Telegram message: at most 12 lines and 1,400 characters, ALWAYS. Order: headline, screened line, |
+| 257 | `_find_company` | _(no docstring)_ |
+| 270 | `render_company` | Text for ONE company: case-insensitive exact name, else a unique prefix/substring; several matches list the |
+| 311 | `chunk` | Pieces of at most `limit` characters, split on line boundaries (so never inside an HTML tag). A single line |
+| 331 | `render_full` | _(no docstring)_ |
+| 335 | `render_overview` | Message-sized strings: a header (run id, start, build) then one line per company, sorted by name: |
+
 ## `score_rules.py` — 6 defs, 136 lines
 
 | Line | Name | Summary |
@@ -1395,4 +1427,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1066 definitions across 62 files + Code.gs.**
+**1093 definitions across 63 files + Code.gs.**

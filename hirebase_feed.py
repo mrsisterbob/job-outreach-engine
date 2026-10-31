@@ -180,8 +180,10 @@ def job_belongs_to(job, company_name, slugs, normalize, name_optional=False):
     return _squash(normalize(theirs)) == target
 
 
-def split_jobs(jobs, company_name, slugs, normalize, trusted_slugs=()):
+def split_jobs(jobs, company_name, slugs, normalize, trusted_slugs=(), dropped=None):
     """One company per call -> (kept, stats); stats = returned / malformed / kept / unmatched.
+    dropped: an optional caller-owned list that gets (returned_name, reason) for every dropped job: "no_match", or
+    ("", "malformed") when nothing could be read. A non-list is ignored. Appending is the only mutation.
 
     A row whose company_slug is in `trusted_slugs` (a registry slug, verified against the company)
     passes on the slug alone; any other row keeps the strict slug-plus-name rule."""
@@ -193,12 +195,16 @@ def split_jobs(jobs, company_name, slugs, normalize, trusted_slugs=()):
         parsed = parse_job(job)
         if parsed is None:
             stats["malformed"] += 1
+            if isinstance(dropped, list):
+                dropped.append(("", "malformed"))
         elif (job.get(JOB_KEYS["company_slug"]) in trusted and isinstance(job.get(JOB_KEYS["company_slug"]), str)
               and job_belongs_to(job, company_name, slugs, normalize, name_optional=True))                 or job_belongs_to(job, company_name, slugs, normalize):
             kept.append(parsed)
             stats["kept"] += 1
         else:
             stats["unmatched"] += 1
+            if isinstance(dropped, list):
+                dropped.append((str(parsed.get("employer_name") or "").strip(), "no_match"))
     return kept, stats
 
 

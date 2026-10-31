@@ -20,3 +20,5 @@ verify: python -m pytest test_apify_feed.py test_hirebase_feed.py -q -p no:cache
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 9 + 125 passed; main suites 1895 passed, 1 skipped. No existing test edited. Note: claimed_by_several is unreachable through split_rows today (it de-duplicates company names on their normalized form first), so its test simulates a normalize that changes between the two passes.

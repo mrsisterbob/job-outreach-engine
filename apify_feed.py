@@ -157,8 +157,16 @@ def row_belongs_to(row, company_name, normalize):
     return any(x in _squash(t) for x in needles for t in texts)
 
 
-def split_rows(rows, company_names, normalize):
-    """-> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched)."""
+def _note_dropped(dropped, name, reason):
+    """Append (returned_name, reason) to the caller's list. Only a real list is appended to; anything else is ignored."""
+    if isinstance(dropped, list):
+        dropped.append((str(name or "").strip(), reason))
+
+
+def split_rows(rows, company_names, normalize, dropped=None):
+    """-> (kept_by_company, stats). A row claimed by two companies is kept for neither (unmatched).
+    dropped: an optional caller-owned list that gets (returned_name, reason) for every dropped row: "no_match",
+    "claimed_by_several", or ("", "malformed") when nothing could be read. Appending is the only mutation."""
     kept = {}
     seen, names = set(), []
     for c in company_names:   # a company listed twice (or spelled two ways) must not own a row twice
@@ -173,6 +181,7 @@ def split_rows(rows, company_names, normalize):
         parsed = parse_row(row)
         if parsed is None:
             stats["malformed"] += 1
+            _note_dropped(dropped, "", "malformed")
             continue
         owners = [c for c in company_names if row_belongs_to(row, c, normalize)]
         if len(owners) == 1:
@@ -180,6 +189,7 @@ def split_rows(rows, company_names, normalize):
             stats["kept"] += 1
         else:
             stats["unmatched"] += 1
+            _note_dropped(dropped, parsed.get("employer_name"), "claimed_by_several" if len(owners) > 1 else "no_match")
     return kept, stats
 
 
