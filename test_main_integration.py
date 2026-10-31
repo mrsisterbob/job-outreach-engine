@@ -23435,3 +23435,112 @@ def test_vlink_db_write_failure_replies_could_not_save_and_no_link(monkeypatch, 
             conn.execute("ALTER TABLE visit_tags_away RENAME TO visit_tags")
             conn.commit()
     assert "Could not save" in reply and "?r=" not in reply
+
+
+# ---- ATS resolver storage: found boards, its own spend ledger, 'bought' board writer, sheet keys (TASK-244) ----
+
+@pytest.fixture(autouse=True)
+def _clear_ats_resolver_tables_between_tests():
+    """clean_tables does not truncate these, so a row from one test would silently change the next."""
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_board_found")
+        conn.execute("DELETE FROM ats_resolver_ledger")
+        conn.commit()
+    yield
+
+
+def _ats_identity(name):
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT ats_slug, workday_board, board_system, board_source FROM company_identities "
+                            "WHERE normalized_name = ?", (m.normalize_company_for_match(name),)).fetchone()
+
+
+def test_ats_store_found_board_round_trips_all_fields():
+    now = m.datetime(2026, 10, 1, tzinfo=m.timezone.utc)
+    assert m.board_found_record("acme", "Acme Inc", "greenhouse", "acmeco", "https://boards.greenhouse.io/acmeco",
+                                "greenhouse", "acmeco", now=now)
+    assert m.board_found_read()["acme"] == ("greenhouse", "acmeco", "https://boards.greenhouse.io/acmeco",
+                                            "greenhouse", "acmeco", now.isoformat())
+    assert m.board_found_record("", "x", "greenhouse", "t", "u") is False
+    assert m.board_found_record("k", "x", "", "t", "u") is False
+
+
+def test_ats_store_scannable_greenhouse_board_is_visible_to_w_as_bought():
+    assert m.remember_found_board("Acme Inc", "acme", "greenhouse", "acmeco", "u", "greenhouse", "acmeco") == "scannable"
+    assert _ats_identity("Acme Inc") == ("acmeco", None, "greenhouse", "bought")
+    assert ("Acme Inc", "acmeco", "greenhouse") in m.list_bought_boards()
+
+
+def test_ats_store_workday_triple_lands_in_workday_board_and_a_malformed_one_changes_nothing():
+    assert m.remember_found_board("Wd Co", "wd co", "workday", "t", "u", "workday", "wdco/wd5/Careers") == "scannable"
+    assert _ats_identity("Wd Co") == (None, "wdco/wd5/Careers", "workday", "bought")
+    assert m.remember_found_board("Bad Co", "bad co", "workday", "t", "u", "workday", "badco/wd5") == "known_not_scannable"
+    assert _ats_identity("Bad Co") is None and "bad co" in m.board_found_read()
+
+
+def test_ats_store_platform_w_cannot_scan_writes_only_the_found_board_row():
+    assert m.remember_found_board("Odd Co", "odd co", "icims", "t", "u", "", "") == "known_not_scannable"
+    assert _ats_identity("Odd Co") is None and m.board_found_read()["odd co"][0] == "icims"
+
+
+def test_ats_store_company_with_a_board_already_keeps_it():
+    m.upsert_company_identity("Have Co", ats_slug="haveco", board_system="greenhouse", board_source="own")
+    assert m.remember_found_board("Have Co", "have co", "lever", "other", "u", "lever", "other") == "kept_existing"
+    assert _ats_identity("Have Co") == ("haveco", None, "greenhouse", "own")
+    assert m.board_found_read()["have co"][1] == "other"
+
+
+def test_ats_store_switch_off_clears_what_it_added_and_leaves_an_own_row():
+    m.remember_found_board("Acme Inc", "acme", "greenhouse", "acmeco", "u", "greenhouse", "acmeco")
+    m.upsert_company_identity("Own Co", ats_slug="ownco", board_system="greenhouse", board_source="own")
+    assert m.switch_off_bought_boards() == 1
+    assert _ats_identity("Acme Inc") == (None, None, None, "bought")
+    assert _ats_identity("Own Co") == ("ownco", None, "greenhouse", "own")
+
+
+def test_ats_store_ledger_reserve_settle_and_month_spend():
+    rid = m.ats_resolver_ledger_reserve(["a", "b"], 1.25)
+    rows = m.ats_resolver_ledger_read()
+    assert [(r[1], r[2], r[3]) for r in rows] == [(1.25, "errored", ["a", "b"])]
+    assert m.ats_resolver_ledger_settle(rid, 0.4, "ok") is True
+    assert [(r[1], r[2]) for r in m.ats_resolver_ledger_read()] == [(0.4, "ok")]
+    now = m.datetime.now(m.timezone.utc)
+    old = (now - m.timedelta(days=40)).isoformat()
+    ledger = [(old, 9.0, "ok", []), (now.isoformat(), 2.0, "errored", []), (now.isoformat(), 0.5, "ok", [])]
+    assert m.ats_resolver_month_spent(ledger, now) == 2.5
+    assert m.ats_resolver_month_spent(None, now) is None
+    assert m.ats_resolver_ledger_reserve(["a"], -1) is None and m.ats_resolver_ledger_settle(rid, 1, "bad") is False
+    with m.get_db_conn() as conn:
+        conn.execute("ALTER TABLE ats_resolver_ledger RENAME TO ats_resolver_ledger_away")
+        conn.commit()
+    try:
+        assert m.ats_resolver_ledger_read() is None
+    finally:
+        with m.get_db_conn() as conn:
+            conn.execute("ALTER TABLE ats_resolver_ledger_away RENAME TO ats_resolver_ledger")
+            conn.commit()
+
+
+def test_ats_store_sheet_keys_are_read_and_an_empty_sheet_leaves_the_resolver_off(monkeypatch):
+    for k in ("source_ats_resolver_enabled", "source_ats_resolver_companies_per_run", "source_ats_resolver_monthly_usd"):
+        assert k in m.SOURCE_CONFIG_KEYS
+
+    class _Sheet:
+        def __init__(self, filters):
+            self.status_code, self._f = 200, filters
+        def json(self):
+            return {"status": "success", "filters": self._f}
+
+    try:
+        monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: _Sheet({}))
+        cfg, origin = m.source_config_read()
+        assert origin == "sheet" and cfg.resolver_on is False and cfg.resolver_enabled is False
+        monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: _Sheet(
+            {"source_ats_resolver_enabled": "on", "source_ats_resolver_monthly_usd": 4, "source_ats_resolver_companies_per_run": 2}))
+        cfg, _o = m.source_config_read()
+        assert (cfg.resolver_on, cfg.resolver_per_run, cfg.resolver_monthly_usd) == (True, 2, 4.0)
+    finally:
+        with m.get_db_conn() as conn:
+            for k in m.SOURCE_CONFIG_KEYS:
+                conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+            conn.commit()

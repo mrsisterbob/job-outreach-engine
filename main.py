@@ -1482,6 +1482,30 @@ def init_db():
             next_eligible_at TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (company_key, source)
         )""")
+        # ATS board resolver storage. company_board_found remembers each board the actor found (platform, token, url);
+        # board_system/board_ref are blank when the platform is one /w cannot scan. ats_resolver_ledger is its OWN
+        # spend ledger, NOT apify_feed_ledger: apify_feed.plan_apify_run reads that table's rows to learn when a company
+        # was last fed (last_ok) and would make a company the resolver touched wait 7 days for Apify, and the prices differ.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_board_found (
+            company_key TEXT PRIMARY KEY,
+            display_name TEXT,
+            platform TEXT,
+            token TEXT,
+            url TEXT,
+            board_system TEXT,
+            board_ref TEXT,
+            source TEXT,
+            found_at TEXT
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ats_resolver_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spent_at TEXT,
+            usd REAL,
+            status TEXT,
+            company_keys TEXT
+        )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS query_pagination (
             query_text TEXT PRIMARY KEY,
@@ -1870,6 +1894,7 @@ def hydrate_filters_from_sheets():
 SOURCE_CONFIG_KEYS = (
     "source_hirebase_enabled", "source_hirebase_companies_per_run", "source_hirebase_monthly_jobs",
     "source_apify_enabled", "source_apify_companies_per_run", "source_apify_monthly_usd",
+    "source_ats_resolver_enabled", "source_ats_resolver_companies_per_run", "source_ats_resolver_monthly_usd",
 )
 _SOURCE_CONFIG_MISSING = object()
 
@@ -3162,6 +3187,81 @@ def apify_ledger_settle(row_id, usd, status):
         logging.error(f"Apify Ledger Settle Error (row {row_id}): {e}")
         return False
 
+def ats_resolver_ledger_read():
+    """Return [(iso_ts, usd, status, [company_keys])] for the trailing 60 days. None on a read error, so the caller spends nothing."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=APIFY_LEDGER_KEEP_DAYS)).isoformat()
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT spent_at, usd, status, company_keys FROM ats_resolver_ledger WHERE spent_at >= ? ORDER BY id",
+                (cutoff,)).fetchall()
+    except Exception as e:
+        logging.error(f"ATS Resolver Ledger Read Error: {type(e).__name__}")
+        return None
+    out = []
+    for r in rows:
+        try:
+            keys = json.loads(r[3])
+            if not isinstance(keys, list):
+                raise ValueError("company_keys is not a list")
+        except Exception as e:
+            logging.error(f"ATS Resolver Ledger Row Keys Unreadable (kept, usd counted): {type(e).__name__}")
+            keys = []
+        out.append((r[0], r[1], r[2], keys))
+    return out
+
+def ats_resolver_ledger_reserve(company_keys, worst_case_usd, now=None):
+    """Write the spend BEFORE the call, as status 'errored' (spent, outcome unknown). Row id, or None when the write failed."""
+    if not _apify_usd_ok(worst_case_usd):
+        logging.error(f"ATS Resolver Ledger Reserve rejected usd={worst_case_usd!r}")
+        return None
+    now = now or datetime.now(timezone.utc)
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    try:
+        with get_db_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO ats_resolver_ledger (spent_at, usd, status, company_keys) VALUES (?, ?, 'errored', ?)",
+                (now.isoformat(), float(worst_case_usd), json.dumps(list(company_keys))))
+            conn.commit()
+            return cur.lastrowid
+    except Exception as e:
+        logging.error(f"ATS Resolver Ledger Reserve Error: {type(e).__name__}")
+        return None
+
+def ats_resolver_ledger_settle(row_id, usd, status):
+    """Update a reserved row to the real cost and 'ok' or 'errored'. Never raises; True if a row changed."""
+    if status not in ("ok", "errored") or not _apify_usd_ok(usd):
+        return False
+    try:
+        with get_db_conn() as conn:
+            cur = conn.execute("UPDATE ats_resolver_ledger SET usd = ?, status = ? WHERE id = ?",
+                               (float(usd), status, row_id))
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"ATS Resolver Ledger Settle Error (row {row_id}): {type(e).__name__}")
+        return False
+
+def ats_resolver_month_spent(ledger, now):
+    """Dollars in `ledger` rows of the same UTC month as `now` (errored rows count: a failed call may have billed).
+    None when `ledger` is None (unreadable), never 0.0."""
+    if ledger is None:
+        return None
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    total = 0.0
+    for ts, usd, _status, _keys in ledger:
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            dt = now   # unreadable stamp: count it, never grant budget
+        if (dt.year, dt.month) == (now.year, now.month):
+            try:
+                total += max(0.0, float(usd))
+            except (TypeError, ValueError):
+                total += float("inf")
+    return total
+
 def hirebase_ledger_read():
     """Return [(iso_ts, jobs, status, company_key, page, days_ago)] for the trailing 60 days
     (days_ago 0 = unknown). None on a read error, so the caller spends nothing."""
@@ -4129,6 +4229,67 @@ def list_bought_boards():
             "FROM company_identities WHERE board_source = 'bought' ORDER BY display_name").fetchall()
     return [tuple(r) for r in rows]
 
+
+def board_found_record(company_key, display, platform, token, url, board_system="", board_ref="", now=None):
+    """INSERT OR REPLACE the board the resolver found for a company. False (never raises) on a blank key or platform or a DB error."""
+    try:
+        key, plat = str(company_key or "").strip(), str(platform or "").strip()
+        if not key or not plat:
+            return False
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        with get_db_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO company_board_found "
+                "(company_key, display_name, platform, token, url, board_system, board_ref, source, found_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ats_resolver', ?)",
+                (key, str(display or ""), plat, str(token or ""), str(url or ""),
+                 str(board_system or ""), str(board_ref or ""), now.isoformat()))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Board Found Record Error: {type(e).__name__}")
+        return False
+
+def board_found_read():
+    """{company_key: (platform, token, url, board_system, board_ref, found_at)}, or None on a DB error."""
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT company_key, platform, token, url, board_system, board_ref, found_at FROM company_board_found").fetchall()
+        return {r[0]: tuple(r[1:]) for r in rows}
+    except Exception as e:
+        logging.error(f"Board Found Read Error: {type(e).__name__}")
+        return None
+
+def remember_found_board(display, company_key, platform, token, url, board_system, board_ref):
+    """Store a resolver-found board and, when /w can scan it and the company has no board yet, make it visible to /w
+    as a 'bought' board. Returns "scannable", "known_not_scannable", "kept_existing" or "failed".
+    upsert_company_identity writes COALESCE(?, ats_slug), so a new value would OVERWRITE a stored slug or triple:
+    the identity row is read first and an existing board is never replaced."""
+    if not board_found_record(company_key, display, platform, token, url, board_system, board_ref):
+        return "failed"
+    system, ref = str(board_system or "").strip().lower(), str(board_ref or "").strip()
+    if not system or not ref:
+        return "known_not_scannable"
+    if system == "workday":
+        if not valid_workday_triple(ref):
+            return "known_not_scannable"
+    elif system not in ("greenhouse", "lever", "ashby", "smartrecruiters"):
+        return "known_not_scannable"
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT ats_slug, workday_board FROM company_identities WHERE normalized_name = ?",
+                               (normalize_company_for_match(display),)).fetchone()
+    except Exception as e:
+        logging.error(f"Remember Found Board Read Error: {type(e).__name__}")
+        return "failed"
+    if row and (row[0] or row[1]):
+        return "kept_existing"
+    ok = upsert_company_identity(display, ats_slug=None if system == "workday" else ref,
+                                 workday_board=ref if system == "workday" else None,
+                                 board_system=system, board_source="bought")
+    return "scannable" if ok else "failed"
 
 def switch_off_bought_boards():
     """Clear ats_slug, workday_board and board_system on 'bought' rows ONLY, so /w stops scanning

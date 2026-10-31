@@ -22,3 +22,5 @@ The engine has the storage the ATS resolver needs and nothing else: a table that
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 8 passed; full suites 1927 passed, 1 skipped. No existing test edited.
