@@ -24015,3 +24015,108 @@ def test_warm_closing_short_the_scan_result_is_the_same_in_short_and_full_mode(m
         return h.cards, [p.get("rows") and len(p["rows"]) for p in h.payloads], stage[1] if stage else None
 
     assert scenario("short") == scenario("full")
+
+
+# ---- /wrun fetches a run's report, one company's detail, or the full text on demand (TASK-262) ----
+
+def _wrun(monkeypatch, text):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    _dispatch(text)
+    return sent
+
+
+def _store_wrun_runs(detail="DETAIL LINE ONE\nDETAIL LINE TWO"):
+    rec = m.run_report.RunRecorder("run-A", "2026-10-30 08:00:00", {"commit": "a" * 40, "short": "aaaaaaa", "source": "git"})
+    rec.note_source_call("greenhouse", "Older Co", status="ok", returned=1, kept=1)
+    assert m._warm_run_report_write(rec.snapshot(), "OLD RUN TEXT")
+    rec = m.run_report.RunRecorder("run-B", "2026-10-31 08:00:00", {"commit": "b" * 40, "short": "bbbbbbb", "source": "git"})
+    rec.note_source_call("apify", "Haworth Inc.", status="ok", returned=3, kept=1,
+                         dropped=[("Haworth International", "no_match"), ("Haworth International", "no_match")])
+    rec.note_posting("apify", "Haworth Inc.", "Haworth Inc.")
+    rec.note_source_call("apify", "Hayes Corp", status="empty")
+    rec.note_source_call("apify", "Hay Group", status="empty")
+    assert m._warm_run_report_write(rec.snapshot(), detail)
+
+
+def test_wrun_command_overview_lists_each_company_and_flags_the_haworth_difference(monkeypatch):
+    _store_wrun_runs()
+    text = "\n".join(_wrun(monkeypatch, "/wrun"))
+    assert "run-B" in text and "Haworth Inc. — apify" in text and "sent≠returned: Haworth International" in text
+
+
+def test_wrun_command_company_shows_source_sent_returned_and_the_drop_reason(monkeypatch):
+    _store_wrun_runs()
+    (reply,) = _wrun(monkeypatch, "/wrun haworth")
+    assert 'Apify: sent "Haworth Inc."' in reply and '"Haworth International" (no_match) ×2' in reply
+
+
+def test_wrun_command_full_returns_the_stored_text_with_a_build_header(monkeypatch):
+    _store_wrun_runs()
+    (reply,) = _wrun(monkeypatch, "/wrun full")
+    assert reply.startswith("run run-B, build bbbbbbb") and "DETAIL LINE ONE\nDETAIL LINE TWO" in reply
+
+
+def test_wrun_command_a_number_picks_the_run_before_and_bad_arguments_give_usage(monkeypatch):
+    _store_wrun_runs()
+    assert "run-A" in "\n".join(_wrun(monkeypatch, "/wrun 2")) and "Older Co" in "\n".join(_wrun(monkeypatch, "/wrun 2"))
+    assert "OLD RUN TEXT" in _wrun(monkeypatch, "/wrun full 2")[0]
+    assert "Older Co" in _wrun(monkeypatch, "/wrun older #2")[0]
+    for bad in ("/wrun 11", "/wrun 0", "/wrun full x", "/wrun full 11", "/wrun older #11"):
+        (reply,) = _wrun(monkeypatch, bad)
+        assert "Usage" in reply, bad
+
+
+def test_wrun_command_with_no_runs_says_none_recorded(monkeypatch):
+    assert _wrun(monkeypatch, "/wrun") == ["No /w run recorded yet."]
+
+
+def test_wrun_command_a_store_read_error_says_so_without_a_traceback(monkeypatch):
+    def boom(nth=1):
+        raise RuntimeError("secret db path /var/x")
+    monkeypatch.setattr(m, "_warm_run_report_read", boom)
+    assert _wrun(monkeypatch, "/wrun") == ["❌ Could not read the /w run reports."]
+
+
+def test_wrun_command_ambiguous_query_lists_candidates_and_an_unknown_one_names_the_run(monkeypatch):
+    _store_wrun_runs()
+    (amb,) = _wrun(monkeypatch, "/wrun hay")
+    assert "Several companies match" in amb and "Hayes Corp" in amb and "Hay Group" in amb
+    (none,) = _wrun(monkeypatch, "/wrun zzz")
+    assert 'No company matching "zzz" in run run-B' in none
+
+
+def test_wrun_command_a_twelve_thousand_character_text_comes_back_in_capped_pieces(monkeypatch):
+    big = "\n".join(f"detail line {i:04d} " + "x" * 100 for i in range(110))
+    assert len(big) > 12000
+    _store_wrun_runs(detail=big)
+    sent = _wrun(monkeypatch, "/wrun full")
+    assert len(sent) <= 6 and all(len(x) <= 3500 for x in sent)
+    big2 = "\n".join(f"detail line {i:05d} " + "x" * 100 for i in range(600))
+    _store_wrun_runs(detail=big2[:60000])
+    sent = _wrun(monkeypatch, "/wrun full")
+    assert len(sent) == 7 and "more characters" in sent[-1] and "<company>" not in sent[-1]
+
+
+def test_wrun_command_writes_nothing_and_makes_no_http_call(monkeypatch):
+    _store_wrun_runs()
+    tables = ("warm_run_reports", "inbound_threads", "site_visits", "warm_stage_samples", "company_resolution", "jobs")
+
+    def counts():
+        with m.get_db_conn() as conn:
+            return [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables]
+    before, http = counts(), []
+    for name in ("get", "post"):
+        monkeypatch.setattr(m.requests, name, lambda *a, **k: http.append(a) or (_ for _ in ()).throw(AssertionError("http")))
+    for cmd in ("/wrun", "/wrun haworth", "/wrun full", "/wrun 2"):
+        _wrun(monkeypatch, cmd)
+    assert counts() == before and http == []
+
+
+def test_wrun_command_help_entry_is_real_and_the_bare_command_is_not_swallowed(monkeypatch):
+    import command_help as ch
+    reply = ch.lookup_command_help("/wrun/")
+    assert "No per-command help" not in reply and "/wrun Haworth" in reply
+    assert ch.lookup_command_help("/wrun") is None and ch.lookup_command_help("/wrun full") is None
+    assert "/wrun - Last /w run" in open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()

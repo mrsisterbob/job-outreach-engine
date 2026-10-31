@@ -23,3 +23,5 @@ Block, and write nothing, if either is missing: this task uses `run_report.rende
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 10 passed; suites 1953 passed, 1 skipped. No existing test edited. /wrun added to the /help list beside /wstages and to command_help.HELP.

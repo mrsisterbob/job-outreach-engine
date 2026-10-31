@@ -203,6 +203,12 @@ HELP = {
         "the same link. /vlink alone lists the links made and how many times each was opened.",
         "/vlink Jane Doe",
     ),
+    "/wrun": (
+        "Shows a saved /w run company by company: which source answered, the name that was sent and the names that "
+        "came back. /wrun Haworth shows one company, /wrun full gives the whole closing text, and /wrun 2 picks the "
+        "run before. Read-only.",
+        "/wrun Haworth  -> sent, returned and dropped names for Haworth\n/wrun  -> every company in the newest run\n/wrun full  -> the full closing text",
+    ),
     "/streak": (
         "The daily outreach scorecard - what you sent today and whether the streak held. "
         "/daily is the same thing.",

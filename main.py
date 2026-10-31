@@ -16020,6 +16020,44 @@ def _warm_run_report_read(nth=1):
             "snapshot": json.loads(row[4]), "detail": row[5]}
 
 
+_WRUN_USAGE = ("❌ <b>Usage:</b> <code>/wrun</code> (newest run), <code>/wrun 2</code> (the run before, 1-10), "
+               "<code>/wrun &lt;company&gt;</code> (add <code>#2</code> for the run before), <code>/wrun full</code>")
+_WRUN_MAX_MESSAGES = 6   # DESIGN CHOICE, not a measurement
+
+
+def _wrun_parse(arg):
+    """("overview", n) | ("full", n) | ("company", name, n) | ("usage",) from the text after /wrun."""
+    arg = (arg or "").strip()
+    keep = WARM_RUN_REPORTS_KEEP
+    if not arg:
+        return ("overview", 1)
+    if arg.isdigit():
+        return ("overview", int(arg)) if 1 <= int(arg) <= keep else ("usage",)
+    low = arg.lower()
+    if low == "full" or low.startswith("full "):
+        rest = arg[4:].strip()
+        if not rest:
+            return ("full", 1)
+        return ("full", int(rest)) if rest.isdigit() and 1 <= int(rest) <= keep else ("usage",)
+    n = 1
+    match = re.search(r"\s#(\d+)$", arg)
+    if match:
+        n = int(match.group(1))
+        arg = arg[:match.start()].strip()
+        if not 1 <= n <= keep:
+            return ("usage",)
+    return ("company", arg, n) if arg else ("usage",)
+
+
+def _wrun_send(chat_id, pieces):
+    """Send at most _WRUN_MAX_MESSAGES pieces; say how much was left out instead of flooding the chat."""
+    for piece in pieces[:_WRUN_MAX_MESSAGES]:
+        send_telegram_message(chat_id, piece)
+    left = sum(len(x) for x in pieces[_WRUN_MAX_MESSAGES:])
+    if left:
+        send_telegram_message(chat_id, f"... ({left} more characters, use /wrun &lt;company&gt;)")
+
+
 def _warm_run_report_list(limit=10):
     """Newest first [(run_id, run_at, commit_sha)]. Raises on a read error."""
     with get_db_conn() as conn:
@@ -17757,6 +17795,31 @@ def process_webhook_payload_async(data):
                 return
             send_telegram_message(chat_id, f"🔗 {html.escape(name)}: {SITE_PUBLIC_URL}/?r={tag}\n"
                                   f"When they open it you get \"Opened by {html.escape(name)}\".")
+            return
+        # /wrun [n | full | <company>]: a /w run's saved per-company report (read-only, spends nothing).
+        if text == "/wrun" or text.startswith("/wrun "):
+            parsed = _wrun_parse(text[len("/wrun"):])
+            if parsed[0] == "usage":
+                send_telegram_message(chat_id, _WRUN_USAGE)
+                return
+            try:
+                report = _warm_run_report_read(parsed[-1])
+            except Exception as e:
+                logging.error(f"/wrun read failed: {type(e).__name__}")
+                send_telegram_message(chat_id, "❌ Could not read the /w run reports.")
+                return
+            if not report:
+                send_telegram_message(chat_id, "No /w run recorded yet.")
+                return
+            snapshot = report["snapshot"]
+            if parsed[0] == "overview":
+                _wrun_send(chat_id, run_report.render_overview(snapshot))
+            elif parsed[0] == "company":
+                send_telegram_message(chat_id, run_report.render_company(snapshot, parsed[1]))
+            else:
+                header = (f"run {html.escape(str(report['run_id']))}, build "
+                          f"{html.escape(str(report['commit_sha'])[:7]) or 'unknown'}")
+                _wrun_send(chat_id, run_report.chunk(header + "\n" + report["detail"]))
             return
         # /wstages [1-5]: the last /w run's per-stage title samples (read-only).
         if text == "/wstages" or text.startswith("/wstages "):
@@ -19844,6 +19907,7 @@ def process_webhook_payload_async(data):
                 "/owedx - Dismiss every open follow-up (CRM untouched; /owedx undo restores)\n"
                 "/refer - Pending referral asks from /w, 5 per page (/refer 2, /refer sent &lt;id&gt;)\n"
                 "/wstages - Last /w run: sample titles at each stage (/wstages 2 = the run before)\n"
+                "/wrun - Last /w run, per company: which source answered and what names came back (/wrun Haworth, /wrun full)\n"
                 "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
