@@ -1066,6 +1066,17 @@ grep -i "contact" FUNCTION_INDEX.md
 | 43 | `build` | _(no docstring)_ |
 | 60 | `main` | _(no docstring)_ |
 
+## `scripts/measure_ats_endpoints.py` — 6 defs, 210 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 71 | `_default_get` | _(no docstring)_ |
+| 76 | `_default_post` | _(no docstring)_ |
+| 81 | `_inside` | _(no docstring)_ |
+| 89 | `_record` | _(no docstring)_ |
+| 110 | `_lines_for` | Plain lines for one measured system (reuses render_report's line, never rewrites it). |
+| 124 | `run` | _(no docstring)_ |
+
 ## `scripts/measure_board_systems.py` — 14 defs, 324 lines
 
 | Line | Name | Summary |
@@ -1309,4 +1320,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1010 definitions across 56 files + Code.gs.**
+**1016 definitions across 57 files + Code.gs.**
