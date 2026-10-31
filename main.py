@@ -38,6 +38,7 @@ import hirebase_registry
 import resolve_plan
 import build_info
 import run_report
+import site_traffic
 import subprocess
 import inbound_hold
 import warm_screen_plan
@@ -17777,6 +17778,31 @@ def process_webhook_payload_async(data):
             for chunk in format_leads_messages(rows, limit, TELEGRAM_MAX_MESSAGE_CHARS):
                 send_telegram_message(chat_id, chunk)
             return
+        # /monte [N]: where site visits came from and what each group viewed (read-only).
+        if text == "/monte" or text.startswith("/monte "):
+            arg = text[len("/monte"):].strip()
+            if arg and not (arg.isdigit() and 1 <= int(arg) <= 90):
+                send_telegram_message(chat_id, "📊 Usage: /monte (last 7 days) or /monte 30 (1-90)")
+                return
+            days = int(arg or 7)
+            if not analytics_enabled():
+                send_telegram_message(chat_id, "Site analytics is switched off (ANALYTICS_ENABLED).")
+                return
+            try:
+                visit_rows = get_site_visit_rows_dated(days)
+            except Exception as e:
+                logging.error(f"/monte visit read failed: {type(e).__name__}")
+                send_telegram_message(chat_id, "Could not read the site visit log.")
+                return
+            try:
+                lead_times = get_lead_times(days)
+            except Exception as e:
+                logging.error(f"/monte lead read failed: {type(e).__name__}")
+                lead_times = None   # the report prints "unknown", never a made-up zero
+            report = site_traffic.build_report(visit_rows, datetime.now(timezone.utc), days, lead_times)
+            for piece in site_traffic.render_report(report):
+                send_telegram_message(chat_id, piece)
+            return
         # /vlink [name]: a per-contact site link (creates the tag the first time), or the list of links made.
         if text == "/vlink" or text.startswith("/vlink "):
             name = " ".join(text[len("/vlink"):].split())
@@ -19918,6 +19944,7 @@ def process_webhook_payload_async(data):
                 "/owedx - Dismiss every open follow-up (CRM untouched; /owedx undo restores)\n"
                 "/refer - Pending referral asks from /w, 5 per page (/refer 2, /refer sent &lt;id&gt;)\n"
                 "/wstages - Last /w run: sample titles at each stage (/wstages 2 = the run before)\n"
+                "/monte - Where site visits came from and what each group viewed (/monte 30 = last 30 days)\n"
                 "/wrun - Last /w run, per company: which source answered and what names came back (/wrun Haworth, /wrun full)\n"
                 "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
@@ -21249,6 +21276,22 @@ def analytics_ingest():
         logging.error(f"[ANALYTICS] visit alerts failed: {type(e).__name__}")
     _maybe_prune_site_visits()
     return jsonify({"status": "ok", "stored": stored}), 200
+
+
+def get_site_visit_rows_dated(days):
+    """READ-ONLY. (visited_at, visitor_id, path, referrer, bot) for the trailing `days` days plus one extra day (the
+    site_traffic module cuts the exact window in its own time zone). Raises on a read error."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT visited_at, visitor_id, path, referrer, bot FROM site_visits WHERE visited_at >= datetime('now', ?) "
+            "ORDER BY visited_at, id", (f"-{int(days) + 1} days",)).fetchall()
+
+
+def get_lead_times(days):
+    """READ-ONLY. received_at strings of contact-form submissions in the trailing `days` days plus one. Raises on error."""
+    with get_db_conn() as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT received_at FROM inbound_leads WHERE received_at >= datetime('now', ?)", (f"-{int(days) + 1} days",)).fetchall()]
 
 
 def get_site_visit_rows(hours=24):

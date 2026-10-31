@@ -24189,3 +24189,154 @@ def test_apify_cutoff_warns_once_and_never_logs_the_token(monkeypatch, caplog):
     warnings = [r for r in caplog.records if "hit the request limit" in r.getMessage()]
     assert len(warnings) == 1 and "200 rows, limit 200" in warnings[0].getMessage()
     assert _APIFY_TEST_TOKEN not in caplog.text
+
+
+# ---- /monte shows where site visits came from and what each group viewed (TASK-266) ----
+
+_GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+_LINKEDINBOT_UA = "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)"
+
+
+def _monte(monkeypatch, text):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    _dispatch(text)
+    return sent
+
+
+@pytest.fixture
+def monte_env(analytics_env, monkeypatch):
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: None)   # ingest alerts are not under test
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_leads")
+        conn.commit()
+    yield
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_leads")
+        conn.commit()
+
+
+def _monte_ingest_mix():
+    views = [
+        _view(ip="198.51.100.1", path="/", referrer="https://www.linkedin.com/feed/"),
+        _view(ip="198.51.100.1", path="/job-engine"),
+        _view(ip="198.51.100.2", path="/"),
+        _view(ip="198.51.100.3", path="/resume/Kevin_Miller.pdf", referrer="https://www.google.com/"),
+        _view(ip="198.51.100.4", ua=_LINKEDINBOT_UA, path="/"),
+        _view(ip="198.51.100.5", ua=_GOOGLEBOT_UA, path="/"),
+        _view(ip="198.51.100.6", path="/.env"),
+    ]
+    assert _ingest(views).status_code == 200
+
+
+def _table_counts():
+    with m.get_db_conn() as conn:
+        return [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("site_visits", "inbound_leads", "visit_tags", "warm_run_reports")]
+
+
+def test_monte_command_groups_real_ingested_visits_by_source_and_page(monkeypatch, monte_env):
+    _monte_ingest_mix()
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "LinkedIn: 1 visitor · Home 1 · Resume 0 · Job Engine 1" in text
+    assert "Direct: 1 visitor · Home 1" in text
+    assert "Search: 1 visitor · Home 0 · Resume 1" in text
+    assert "Link previews: 1 visitor-day · 1 hit (LinkedIn 1)" in text
+    assert "Crawlers: 1 visitor-day" in text and "Probes: 1 visitor-day" in text
+
+
+def test_monte_command_an_own_site_referrer_is_stored_as_none_and_filed_under_direct(monkeypatch, monte_env):
+    assert _ingest([_view(ip="198.51.100.9", path="/job-engine", referrer="https://montelattice.com/")]).status_code == 200
+    assert _stored_rows()[0][4] is None
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "Direct: 1 visitor" in text and "Direct also holds visits that arrived from your own pages" in text
+
+
+def test_monte_command_a_self_view_is_the_self_category_not_a_visitor(monkeypatch, monte_env):
+    assert _ingest([_view(ip="198.51.100.10", is_self=True)]).status_code == 200
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "You (self): 1 visitor-day" in text and "Direct: " not in text.split("Bots and scanners")[0]
+
+
+def test_monte_command_n_days_widens_the_window(monkeypatch, monte_env):
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO site_visits (visited_at, path, visitor_id, referrer, bot) "
+                     "VALUES (datetime('now', '-20 days'), '/', 'oldvisitor0001', NULL, NULL)")
+        conn.commit()
+    assert "Direct: " not in "\n".join(_monte(monkeypatch, "/monte"))
+    assert "Direct: 1 visitor" in "\n".join(_monte(monkeypatch, "/monte 30"))
+
+
+@pytest.mark.parametrize("arg", ["abc", "0", "91", "-3", "7 8"])
+def test_monte_command_bad_arguments_give_usage_and_read_nothing(monkeypatch, monte_env, arg):
+    def boom(days):
+        raise AssertionError("must not read")
+    monkeypatch.setattr(m, "get_site_visit_rows_dated", boom)
+    (reply,) = _monte(monkeypatch, f"/monte {arg}")
+    assert reply == "📊 Usage: /monte (last 7 days) or /monte 30 (1-90)"
+
+
+def test_monte_command_an_empty_table_says_no_pageviews_and_keeps_the_cannot_know_block(monkeypatch, monte_env):
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "No pageviews stored for this window" in text and "What this cannot know" in text
+    assert all(s in text for s in m.site_traffic.CANNOT_KNOW)
+
+
+def test_monte_command_a_failing_visit_read_is_one_plain_line_and_a_failing_lead_read_still_reports(monkeypatch, monte_env):
+    _monte_ingest_mix()
+
+    def boom(days):
+        raise RuntimeError("secret path /var/db")
+    monkeypatch.setattr(m, "get_site_visit_rows_dated", boom)
+    assert _monte(monkeypatch, "/monte") == ["Could not read the site visit log."]
+    monkeypatch.undo()
+    monkeypatch.setenv("ANALYTICS_ENABLED", "true")
+    monkeypatch.setattr(m, "get_lead_times", boom)
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "Contact form submissions: unknown (could not be read)" in text and "Contact form submissions: 0" not in text
+    assert "LinkedIn: 1 visitor" in text
+
+
+def test_monte_command_contact_form_submissions_are_counted_and_not_attributed(monkeypatch, monte_env):
+    with m.get_db_conn() as conn:
+        for i in range(2):
+            conn.execute("INSERT INTO inbound_leads (source, name, email, message) VALUES ('docfiler', ?, ?, 'hi')", (f"N{i}", f"n{i}@x.com"))
+        conn.commit()
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "Contact form submissions: 2 (cannot be tied to a source)" in text
+
+
+def test_monte_command_switched_off_analytics_replies_so_and_reads_nothing(monkeypatch, monte_env):
+    monkeypatch.setenv("ANALYTICS_ENABLED", "false")
+
+    def boom(days):
+        raise AssertionError("must not read")
+    monkeypatch.setattr(m, "get_site_visit_rows_dated", boom)
+    assert _monte(monkeypatch, "/monte") == ["Site analytics is switched off (ANALYTICS_ENABLED)."]
+
+
+def test_monte_command_writes_nothing_and_makes_no_http_call(monkeypatch, monte_env):
+    _monte_ingest_mix()
+    before, http = _table_counts(), []
+    for name in ("get", "post"):
+        monkeypatch.setattr(m.requests, name, lambda *a, **k: http.append(a) or (_ for _ in ()).throw(AssertionError("http")))
+    for cmd in ("/monte", "/monte 30"):
+        _monte(monkeypatch, cmd)
+    assert _table_counts() == before and http == []
+
+
+def test_monte_command_help_entry_is_real_and_the_bare_command_is_not_swallowed(monkeypatch):
+    import command_help as ch
+    reply = ch.lookup_command_help("/monte/")
+    assert "No per-command help" not in reply and "/monte 30" in reply
+    assert ch.lookup_command_help("/monte") is None and ch.lookup_command_help("/monte 30") is None
+    assert "/monte - Where site visits" in open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()
+
+
+def test_monte_command_no_visitor_id_reaches_any_message(monkeypatch, monte_env):
+    _monte_ingest_mix()
+    with m.get_db_conn() as conn:
+        ids = [r[0] for r in conn.execute("SELECT visitor_id FROM site_visits").fetchall()]
+    assert ids
+    text = "\n".join(_monte(monkeypatch, "/monte") + _monte(monkeypatch, "/monte 30"))
+    assert not any(i in text for i in ids)

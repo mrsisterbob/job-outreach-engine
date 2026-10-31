@@ -24,3 +24,5 @@ Block, and write nothing, if it is not: this task imports `site_traffic`.
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 16 passed; suites 1983 passed, 1 skipped. No existing test edited. /monte added to the /help list and command_help.HELP.

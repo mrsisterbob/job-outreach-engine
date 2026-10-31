@@ -203,6 +203,11 @@ HELP = {
         "the same link. /vlink alone lists the links made and how many times each was opened.",
         "/vlink Jane Doe",
     ),
+    "/monte": (
+        "Shows where visits to montelattice.com came from (direct, LinkedIn, search, email and chat, other sites, bots) "
+        "and which pages each group viewed, day by day, with what the numbers cannot know. Read-only.",
+        "/monte  -> the last 7 days\n/monte 30  -> the last 30 days (1-90)",
+    ),
     "/wrun": (
         "Shows a saved /w run company by company: which source answered, the name that was sent and the names that "
         "came back. /wrun Haworth shows one company, /wrun full gives the whole closing text, and /wrun 2 picks the "
