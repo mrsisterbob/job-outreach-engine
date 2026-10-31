@@ -120,3 +120,43 @@ def test_source_config_ats_resolver_keys_leave_the_older_sources_unchanged():
     for f in ("hirebase_enabled", "hirebase_per_run", "hirebase_monthly_jobs",
               "apify_enabled", "apify_per_run", "apify_monthly_usd"):
         assert getattr(base, f) == getattr(both, f), f
+
+
+def test_source_config_apify_plan_empty_config_is_free_with_no_problem():
+    c = sc.parse_source_config({})
+    assert c.apify_plan == "free" and c.problems == ()
+    assert sc.parse_source_config({"source_apify_plan": "  "}).apify_plan == "free"
+
+
+@pytest.mark.parametrize("raw", ["Starter ", "STARTER", "starter"])
+def test_source_config_apify_plan_starter_is_case_and_space_insensitive(raw):
+    c = sc.parse_source_config({"source_apify_plan": raw})
+    assert c.apify_plan == "starter" and c.problems == ()
+
+
+def test_source_config_apify_plan_unknown_name_falls_back_to_free_and_names_the_key():
+    c = sc.parse_source_config({"source_apify_plan": "enterprise"})
+    assert c.apify_plan == "free"
+    assert any("source_apify_plan" in x for x in c.problems), c.problems
+
+
+@pytest.mark.parametrize("raw", [19, True, 1.5])
+def test_source_config_apify_plan_a_number_or_bool_falls_back_to_free_with_a_problem(raw):
+    c = sc.parse_source_config({"source_apify_plan": raw})
+    assert c.apify_plan == "free" and any("source_apify_plan" in x for x in c.problems)
+
+
+def test_source_config_apify_plan_leaves_the_older_sources_unchanged():
+    base = sc.parse_source_config({"source_apify_monthly_usd": 4, "source_hirebase_enabled": "off"})
+    both = sc.parse_source_config({"source_apify_monthly_usd": 4, "source_hirebase_enabled": "off",
+                                   "source_apify_plan": "starter"})
+    for f in ("hirebase_enabled", "hirebase_per_run", "hirebase_monthly_jobs",
+              "apify_enabled", "apify_per_run", "apify_monthly_usd", "resolver_enabled"):
+        assert getattr(base, f) == getattr(both, f), f
+
+
+def test_source_config_apify_plan_names_equal_the_apify_feed_pricing_keys():
+    import apify_feed
+    if not hasattr(apify_feed, "PRICING"):
+        pytest.skip("apify_feed.PRICING does not exist yet (TASK-248 is not merged)")
+    assert set(sc.APIFY_PLANS) == set(apify_feed.PRICING)

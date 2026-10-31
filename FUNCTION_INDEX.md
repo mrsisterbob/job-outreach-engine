@@ -1145,18 +1145,19 @@ grep -i "contact" FUNCTION_INDEX.md
 | 76 | `fit_one_line` | Flatten [(label, desc)] pairs into ONE line of skill names no longer than max_chars. |
 | 100 | `fit_labeled_lines` | Keep each (label, desc) pair its own line, none longer than max_line_chars. |
 
-## `source_config.py` — 8 defs, 117 lines
+## `source_config.py` — 9 defs, 133 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 28 | `SourceConfig` | _(no docstring)_ |
-| 41 | `SourceConfig.hirebase_on` | _(no docstring)_ |
-| 45 | `SourceConfig.apify_on` | _(no docstring)_ |
-| 49 | `SourceConfig.resolver_on` | _(no docstring)_ |
-| 53 | `_unset` | _(no docstring)_ |
-| 57 | `_parse_bool` | _(no docstring)_ |
-| 72 | `_parse_number` | _(no docstring)_ |
-| 95 | `parse_source_config` | Raw System_Config dict (or None) -> SourceConfig; bad values fall back and are listed. |
+| 31 | `SourceConfig` | _(no docstring)_ |
+| 45 | `SourceConfig.hirebase_on` | _(no docstring)_ |
+| 49 | `SourceConfig.apify_on` | _(no docstring)_ |
+| 53 | `SourceConfig.resolver_on` | _(no docstring)_ |
+| 57 | `_unset` | _(no docstring)_ |
+| 61 | `_parse_bool` | _(no docstring)_ |
+| 76 | `_parse_number` | _(no docstring)_ |
+| 99 | `_parse_plan` | _(no docstring)_ |
+| 110 | `parse_source_config` | Raw System_Config dict (or None) -> SourceConfig; bad values fall back and are listed. |
 
 ## `source_scoring.py` — 16 defs, 226 lines
 
@@ -1178,6 +1179,22 @@ grep -i "contact" FUNCTION_INDEX.md
 | 187 | `_per_hit` | _(no docstring)_ |
 | 191 | `format_report` | Printable lines. scores: {source: score(...)}; cost/seconds: {source: float} or None. |
 | 212 | `write_truth_template` | Write the labelling CSV (system and token blank). Returns (ok, reason). |
+
+## `spend_view.py` — 11 defs, 145 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 21 | `_ts` | Aware-UTC datetime; malformed or future timestamps count as `now` (never as an old month). |
+| 31 | `_utc` | _(no docstring)_ |
+| 35 | `_ledger_month_usd` | Sum of this UTC month's rows, errored ones included (a failed call may still have billed). An unparseable |
+| 52 | `_dollar_row` | _(no docstring)_ |
+| 73 | `_count_row` | _(no docstring)_ |
+| 82 | `build_rows` | One SpendRow per source that is on. A source argument of None (off, or not built) produces no row. |
+| 99 | `_usd_text` | _(no docstring)_ |
+| 103 | `_num` | _(no docstring)_ |
+| 109 | `render_lines` | One line per row, e.g. `Apify Feed: $0.60 this run, $1.35 of $10.00 this month ($8.65 left, console)`. |
+| 138 | `at_cap` | Source names whose `left` is exactly 0. A None left is NOT at cap and NOT ok: see unknown_sources. |
+| 143 | `unknown_sources` | Source names whose month figure could not be read. |
 
 ## `summary_figures.py` — 4 defs, 51 lines
 
@@ -1354,4 +1371,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1040 definitions across 59 files + Code.gs.**
+**1052 definitions across 60 files + Code.gs.**

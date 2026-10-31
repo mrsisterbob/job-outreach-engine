@@ -18,3 +18,5 @@ verify: python -m pytest test_source_config.py -q -p no:cacheprovider -k apify_p
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 9 passed, 1 skipped (the PRICING-keys test skips: TASK-248 is blocked, so apify_feed.PRICING does not exist); suites 1915 passed, 2 skipped. Re-run that test once TASK-248 lands.
