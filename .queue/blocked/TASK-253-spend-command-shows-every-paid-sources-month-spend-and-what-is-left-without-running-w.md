@@ -21,3 +21,5 @@ Block, and write nothing, if it is not. This task reuses the helper TASK-252 bui
 
 ## Log
 
+
+- 2026-10-31 cloud worker: BLOCKED - depends on TASK-252, which is blocked. Nothing written.

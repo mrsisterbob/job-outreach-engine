@@ -23,3 +23,5 @@ Block, and write nothing, if any is missing. 245 and 246 add the resolver's loop
 
 ## Log
 
+
+- 2026-10-31 cloud worker: BLOCKED - depends on TASK-245 and TASK-246 (blocked), TASK-252 (blocked). Nothing written.

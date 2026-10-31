@@ -25,3 +25,5 @@ Block, and write nothing, if any is missing. TASK-237, 238 and 245 are not built
 
 ## Log
 
+
+- 2026-10-31 cloud worker: BLOCKED - depends on TASK-245 and TASK-248 (both in blocked/) and TASK-250 (not in done/). Nothing written.
