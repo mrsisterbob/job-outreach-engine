@@ -1122,6 +1122,21 @@ grep -i "contact" FUNCTION_INDEX.md
 | 176 | `write_result` | _(no docstring)_ |
 | 194 | `main` | _(no docstring)_ |
 
+## `scripts/measure_workday_fetch.py` — 10 defs, 237 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 33 | `BudgetExceeded` | The request budget (per tenant or whole run) is spent. |
+| 37 | `parse_board` | 'tenant/wdN/site' -> (tenant, wd, site); ValueError when malformed (same shape check as |
+| 46 | `make_post` | Return post(limit, offset, search) -> {status, json, text, error}. status is None for no answer. |
+| 70 | `budgeted` | Wrap post so at most `limit_count` calls go out; `shared` is a one-item list holding the |
+| 86 | `_postings` | _(no docstring)_ |
+| 92 | `_total` | _(no docstring)_ |
+| 97 | `page_all` | Page by offset += 20. Ends on: 'empty' (HTTP 200, zero postings), 'error' (non-200), |
+| 138 | `measure_tenant` | Run every measurement for one tenant through `post`. Returns a plain dict of numbers. |
+| 183 | `format_tenant` | _(no docstring)_ |
+| 209 | `main` | _(no docstring)_ |
+
 ## `scripts/score_source.py` — 2 defs, 99 lines
 
 | Line | Name | Summary |
@@ -1355,4 +1370,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1036 definitions across 60 files + Code.gs.**
+**1046 definitions across 61 files + Code.gs.**
