@@ -26,3 +26,5 @@ A pure module `site_traffic.py` turns stored pageview rows into a source-by-dest
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 32 passed (pure new module, nothing existing touched; full suites not re-run). Imports run_report.chunk (TASK-258, in done/) instead of a local chunker. LinkedIn host lines carry the job-market star too, because linkedin.com is in pipeline_utils.JOB_MARKET_REFERRERS.
