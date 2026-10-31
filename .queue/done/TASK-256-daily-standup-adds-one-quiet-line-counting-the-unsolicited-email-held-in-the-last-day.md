@@ -23,3 +23,5 @@ Block, and write nothing, if either is missing: this task uses `inbound_hold.for
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 7 passed; suites 1932 passed, 1 skipped. No existing test edited. NOTE for Kevin: the Tuesday hub (morning_digest_loop) replaces this standup on Tuesdays and carries neither the visitor line nor the held line.

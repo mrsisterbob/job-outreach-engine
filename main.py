@@ -10198,6 +10198,16 @@ def _standup_visitor_line():
     line = site_visitor_standup_line()
     return f"{line}\n" if line else ""
 
+def _standup_held_line():
+    """The held-mail line plus its newline, or '' on a quiet day. Never raises (the standup must send regardless): a
+    failed read says the count is unavailable instead of showing zero."""
+    try:
+        line = inbound_hold.format_held_line(held_inbound_since(24))
+    except Exception as e:
+        logging.error(f"[STANDUP] held-mail line failed: {type(e).__name__}")
+        line = inbound_hold.format_held_line(None)
+    return f"{line}\n" if line else ""
+
 def send_daily_standup(chat_id):
     """Send the compact 08:30 standup used on every non-Tuesday morning."""
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -10223,7 +10233,7 @@ def send_daily_standup(chat_id):
         f"🔥 <b>Active Streak:</b> {streak} days\n"
         f"🎯 <b>Today's Staged Goal:</b> {activity['drafts_staged']} / 5\n"
         f"⚠️ <b>Overdue Actions:</b> {overdue_count}\n"
-        f"{_standup_visitor_line()}\n"
+        f"{_standup_visitor_line()}{_standup_held_line()}\n"
         f"📊 <a href='{brief_url}'>Full brief</a> · <code>/s</code> overdue · <code>/t</code> search"
     )
     # Job links that died since the last digest. Reported once each (notified flag), so a posting

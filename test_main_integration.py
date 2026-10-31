@@ -23688,3 +23688,76 @@ def test_inbound_hold_held_inbound_since_lists_newest_first_honours_the_window_a
 def test_inbound_hold_default_mode_is_hold_for_an_empty_environment():
     assert m.inbound_hold.parse_mode("") == "hold" and m.inbound_hold.parse_mode(None) == "hold"
     assert m.inbound_hold.DEFAULT_MODE == "hold"
+
+
+# ---- the 08:30 standup counts the unsolicited email held in the last day (TASK-256) ----
+
+def _hold_rows(names):
+    _clear_tray()
+    for i, (name, subject) in enumerate(names):
+        assert m.record_held_thread(f"th{i}", f"s{i}@x.com", name, subject, "SECRET SNIPPET BODY", "unsolicited, not a reply", "")
+        with m.get_db_conn() as conn:   # distinct, ordered first_seen so "newest first" is testable
+            conn.execute("UPDATE inbound_threads SET first_seen = datetime('now', ?) WHERE thread_id = ?",
+                         (f"-{len(names) - i} minutes", f"th{i}"))
+            conn.commit()
+
+
+def test_standup_held_three_rows_are_counted_and_named_without_snippet_text(monkeypatch, analytics_env):
+    _hold_rows([("Ann", "One"), ("Bob", "Two"), ("Cy", "Three")])
+    text = _standup_text(monkeypatch)
+    assert "3 unsolicited emails held, not pinged" in text
+    assert all(n in text for n in ("Ann", "Bob", "Cy")) and "SECRET SNIPPET" not in text
+    _clear_tray()
+
+
+def test_standup_held_none_held_adds_nothing_and_matches_a_run_with_no_held_rows(monkeypatch, analytics_env):
+    _clear_tray()
+    text = _standup_text(monkeypatch)
+    assert "held" not in text and "📪" not in text
+    _hold_rows([("Ann", "One")])
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_threads WHERE state = 'held'")
+        conn.commit()
+    assert _standup_text(monkeypatch) == text
+    _clear_tray()
+
+
+def test_standup_held_five_rows_name_the_newest_three_and_count_the_rest(monkeypatch, analytics_env):
+    _hold_rows([(f"P{i}", f"S{i}") for i in range(5)])
+    line = [ln for ln in _standup_text(monkeypatch).splitlines() if "📪" in ln][0]
+    assert "5 unsolicited emails" in line and "(+2 more)" in line
+    assert line.index("P4") < line.index("P3") < line.index("P2") and "P1" not in line
+    _clear_tray()
+
+
+def test_standup_held_a_row_older_than_a_day_is_not_counted(monkeypatch, analytics_env):
+    _hold_rows([("Old", "Stale"), ("New", "Fresh")])
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE inbound_threads SET first_seen = datetime('now', '-30 hours') WHERE thread_id = 'th0'")
+        conn.commit()
+    text = _standup_text(monkeypatch)
+    assert "1 unsolicited email held" in text and "Stale" not in text
+    _clear_tray()
+
+
+def test_standup_held_a_failing_read_still_sends_and_says_unavailable(monkeypatch, analytics_env):
+    def boom(hours=24):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "held_inbound_since", boom)
+    assert "held-mail count unavailable" in _standup_text(monkeypatch)
+
+
+def test_standup_held_an_html_special_sender_name_is_escaped(monkeypatch, analytics_env):
+    _hold_rows([("<b>Evil</b>", "<i>x</i>")])
+    text = _standup_text(monkeypatch)
+    assert "<b>Evil</b>" not in text and "&lt;b&gt;Evil" in text and "<i>x</i>" not in text
+    _clear_tray()
+
+
+def test_standup_held_the_visitor_line_is_unchanged_when_held_rows_exist(monkeypatch, analytics_env):
+    _clear_tray()
+    before = [ln for ln in _standup_text(monkeypatch).splitlines() if "montelattice.com" in ln]
+    _hold_rows([("Ann", "One")])
+    after = [ln for ln in _standup_text(monkeypatch).splitlines() if "montelattice.com" in ln]
+    assert before == after and before
+    _clear_tray()
