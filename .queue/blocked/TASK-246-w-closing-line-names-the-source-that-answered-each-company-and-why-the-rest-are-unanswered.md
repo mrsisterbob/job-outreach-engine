@@ -24,3 +24,5 @@ Block, and write nothing, if any is missing: each of them adds a stage whose out
 
 ## Log
 
+
+- 2026-10-31 cloud worker: BLOCKED - depends on TASK-245, which is blocked (needs TASK-242, not in done/). Nothing written.

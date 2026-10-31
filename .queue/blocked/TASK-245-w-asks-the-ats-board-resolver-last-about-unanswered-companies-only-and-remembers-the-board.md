@@ -26,3 +26,5 @@ Block, and write nothing, if any is missing. TASK-237 and TASK-238 are not built
 
 ## Log
 
+
+- 2026-10-31 cloud worker: BLOCKED - depends on TASK-242, which is not in done/ (ats_resolver.py and fixtures/ats_resolver_run.json do not exist; TASK-241/242 are not in this queue batch). Nothing written.
