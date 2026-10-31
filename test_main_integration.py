@@ -23152,3 +23152,130 @@ def test_resolve_hirebase_cooldown_expiry_through_the_real_writer(monkeypatch):
     h.run()
     searched = set(_searched_keys(h))
     assert "resco00 labs" in searched and "resco01 labs" not in searched and "resco02 labs" in searched, searched
+
+
+# ---- /w gives unresolved companies a reserved Apify turn and Apify sees Hirebase's empties (TASK-238) ----
+
+def _apify_resolution_rows():
+    with m.get_db_conn() as conn:
+        return {r[0]: r[1:] for r in conn.execute(
+            "SELECT company_key, outcome, attempted_at, next_eligible_at FROM company_resolution WHERE source = 'apify'")}
+
+
+def _apify_sent(h):
+    return [n for _u, kw in h.apify_posts for n in kw["json"]["organizationSearch"]]
+
+
+def _sheet_config(monkeypatch, **filters):
+    class _Sheet:
+        status_code = 200
+        def json(self):
+            return {"status": "success", "filters": filters}
+    monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: _Sheet())
+
+
+def _clear_source_config_store():
+    with m.get_db_conn() as conn:
+        for k in m.SOURCE_CONFIG_KEYS:
+            conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+        conn.commit()
+
+
+def test_resolve_apify_hirebase_empty_company_in_cooldown_is_still_sent_to_apify(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3}, token=None)
+    h.feed = []
+    h.run()   # run 1: no Apify token; Hirebase answers empty and stores it
+    assert m.resolution_read()[("nopeboard labs", "hirebase")][0] == "empty"
+    monkeypatch.setenv("APIFY_TOKEN", _APIFY_TEST_TOKEN)
+    h.posts.clear()
+    h.run()
+    assert h.posts == [], "run 2 must not search Hirebase: the empty row is in cooldown"
+    assert _apify_sent(h) == ["Nopeboard Labs"], h.apify_posts
+
+
+def test_resolve_apify_twenty_empty_companies_run_two_sends_different_ones(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, _resolve_names(20))
+    h.feed = []
+    h.run()
+    first = _apify_sent(h)
+    assert len(first) == 8, first
+    rows = _apify_resolution_rows()
+    assert {v[0] for v in rows.values()} == {"empty"} and len(rows) == 8, rows
+    h.apify_posts.clear()
+    h.run()
+    second = _apify_sent(h)
+    assert len(second) == 8 and not set(first) & set(second), (first, second)
+
+
+def test_resolve_apify_errored_call_stores_error_waits_a_day_and_marks_nothing_seen(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = []
+    h.apify_mode = "500"
+    h.apify_rows = [_apify_row("Nopeboard Labs", "Ops Analyst", 1)]
+    text = h.run()
+    assert "Apify errored" in text and h.cards == []
+    rows = _apify_resolution_rows()
+    assert rows["nopeboard labs"][0] == "error", rows
+    gap = m.datetime.fromisoformat(rows["nopeboard labs"][2]) - m.datetime.fromisoformat(rows["nopeboard labs"][1])
+    assert m.timedelta(hours=23) < gap < m.timedelta(hours=25), gap
+    assert m.apify_seen_filter(["apify_nopeboardlabs1"]) == set()
+    h.apify_mode = "ok"
+    h.run()
+    assert len(h.apify_posts) == 1, "inside the one-day cooldown Apify is not called again"
+
+
+def test_resolve_apify_workday_company_is_resolved_then_scanned_as_a_board(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = [_apify_learn_wd_row()]
+    wd_calls = []
+    monkeypatch.setattr(m, "fetch_workday_jobs", lambda board: wd_calls.append(board) or [])
+    h.run()
+    assert _apify_resolution_rows()[m.normalize_company_for_match("Smallfry Inc")][0] == "resolved", _apify_resolution_rows()
+    assert _apify_learn_stored_triple("Smallfry Inc") == _APIFY_LEARN_WD
+    h.run()
+    assert len(h.apify_posts) == 1 and wd_calls == [_APIFY_LEARN_WD], (h.apify_posts, wd_calls)
+
+
+def test_resolve_apify_sheet_switch_off_makes_zero_calls_and_says_so(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = []
+    _sheet_config(monkeypatch, source_apify_enabled=False)
+    try:
+        text = h.run()
+    finally:
+        _clear_source_config_store()
+    assert h.apify_posts == [] and _apify_ledger() == [], h.apify_posts
+    assert "Apify: off in System_Config" in text, text
+    assert len(h.posts) >= 1   # Hirebase is unaffected
+    assert _apify_resolution_rows() == {}
+
+
+def test_resolve_apify_hirebase_errored_company_never_reaches_apify(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    router = m.requests.post
+
+    def hb_boom(url, **kw):
+        if "api.apify.com" in url or url.endswith("/companies/search"):
+            return router(url, **kw)
+        raise RuntimeError("hirebase down")
+
+    monkeypatch.setattr(m.requests, "post", hb_boom)
+    h.run()
+    assert m.resolution_read()[("nopeboard labs", "hirebase")][0] == "error"
+    h.run()
+    assert h.apify_posts == [] and _apify_resolution_rows() == {}
+
+
+def test_resolve_apify_sheet_dollar_budget_below_one_runs_worst_case_sends_nothing_and_says_so(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = []
+    _sheet_config(monkeypatch, source_apify_monthly_usd=0.0001)
+    try:
+        text = h.run()
+    finally:
+        _clear_source_config_store()
+    assert h.apify_posts == [], h.apify_posts
+    assert "Apify skipped: monthly budget used" in text, text
+    assert _APIFY_TEST_TOKEN not in text

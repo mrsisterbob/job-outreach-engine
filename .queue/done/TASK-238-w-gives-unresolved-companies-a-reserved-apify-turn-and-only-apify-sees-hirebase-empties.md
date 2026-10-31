@@ -24,3 +24,5 @@ The Apify fall-through sees every company Hirebase answered with zero rows (this
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 7 passed; full suites 1850 passed, 1 skipped. No existing test edited.

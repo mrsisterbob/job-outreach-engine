@@ -16483,16 +16483,42 @@ def run_warm_radar_scan(chat_id=None):
         apify_kept_by_company = {}
         apify_key_by_name = {}
         apify_hash_to_ids = {}   # job_hash -> apify job ids, so only settled roles are marked seen
+        apify_resolve_keys = set()   # keys offered as RESOLVE picks; only these get a company_resolution row
+        apify_resolved_count = 0
+        apify_resolve_searched = 0
         try:
             apify_token = apify_feed.get_token(os.environ)
-            if apify_token and no_board_candidates:
+            if apify_token and not source_cfg.apify_on:
+                apify_status = "off"   # off in System_Config: no ledger read, no call
+            elif apify_token and no_board_candidates:
                 apify_status = "skipped"
                 _reg = hirebase_registry_read()
+                _apify_resolution = resolution_read() if _reg is not None else None
                 if _reg is None:
                     apify_status = "registry_unreadable"
+                elif _apify_resolution is None:
+                    apify_status = "resolution_unreadable"   # cooldowns unknown: do not guess, do not bill
                 else:
-                    apify_cands = apify_feed.fallthrough_candidates(
+                    # Pool = what Hirebase could not answer: this run's zero-row/registry fall-through (TASK-202) PLUS every
+                    # company Hirebase earlier recorded "empty" (it sits in a Hirebase cooldown and is not searched again,
+                    # so only the stored row says it is unanswered). An "error" row is unknown, never empty.
+                    _fall = apify_feed.fallthrough_candidates(
                         no_board_candidates, hirebase_searched, {k: (e.slug, e.status) for k, e in _reg.items()})
+                    _pool, _pool_seen = [], set()
+                    for _c in list(_fall) + [c for c in no_board_candidates
+                                             if _apify_resolution.get((c[0], "hirebase"), ("",))[0] == resolve_plan.EMPTY]:
+                        if _c[0] not in _pool_seen:
+                            _pool_seen.add(_c[0])
+                            _pool.append(_c)
+                    _a_resolve = [c for c in _pool if _apify_resolution.get((c[0], "apify"), ("",))[0] != resolve_plan.RESOLVED]
+                    _a_resolve_keys = {c[0] for c in _a_resolve}
+                    _a_scan = [c for c in _pool if c[0] not in _a_resolve_keys]
+                    _a_per_run = source_cfg.apify_per_run
+                    _a_ceiling = source_cfg.apify_monthly_usd
+                    _a_now = datetime.now(timezone.utc)
+                    _a_picks = resolve_plan.plan_resolution(
+                        _a_resolve, _apify_resolution, "apify", frozenset(),
+                        min(len(_a_resolve), math.ceil(_a_per_run * resolve_plan.RESERVED_SHARE)), _a_now)
                     apify_plan = None
                     apify_row_id = None
                     with _APIFY_LOCK:
@@ -16500,7 +16526,19 @@ def run_warm_radar_scan(chat_id=None):
                         if apify_ledger_now is None:
                             apify_status = "ledger_unreadable"
                         else:
-                            _plan = apify_feed.plan_apify_run(apify_cands, apify_ledger_now, datetime.now(timezone.utc))
+                            # plan_apify_run sorts heaviest-first and keeps a 7-day retry, so without this trim 8 heavy
+                            # known companies would starve the unresolved tail again. The scan side is pre-planned (writes
+                            # nothing) to learn which scan companies it would really search.
+                            _a_scan_keys = ({pk[0] for pk in apify_feed.plan_apify_run(
+                                _a_scan, apify_ledger_now, _a_now, per_run=max(0, _a_per_run - len(_a_picks)),
+                                ceiling_usd=_a_ceiling).picks} if _a_scan else set())
+                            if len(_a_scan_keys) + len(_a_picks) < _a_per_run:   # back-fill an unused scan slot
+                                _a_picks = resolve_plan.plan_resolution(
+                                    _a_resolve, _apify_resolution, "apify", frozenset(), _a_per_run - len(_a_scan_keys), _a_now)
+                            apify_resolve_keys = {c[0] for c in _a_picks}
+                            apify_cands = [c for c in _a_scan if c[0] in _a_scan_keys] + list(_a_picks)
+                            _plan = apify_feed.plan_apify_run(apify_cands, apify_ledger_now, _a_now,
+                                                              per_run=_a_per_run, ceiling_usd=_a_ceiling)
                             apify_month_before = _plan.month_spent_usd
                             if _plan.skip_reason or not _plan.picks:
                                 apify_status = _plan.skip_reason or "nothing_eligible"
@@ -16532,6 +16570,9 @@ def run_warm_radar_scan(chat_id=None):
                             apify_err_detail = getattr(apify_result, "error", "") or "request raised"
                             apify_ledger_settle(apify_row_id, apify_plan.worst_case_usd, "errored")
                             logging.error(f"Warm Radar Apify call errored: {getattr(apify_result, 'error', 'raised')}")
+                            for _pk in apify_plan.picks:   # an errored call is unknown, never empty
+                                if _pk[0] in apify_resolve_keys:
+                                    resolution_record(_pk[0], "apify", resolve_plan.ERROR)
                         if apify_status == "ok":
                             try:
                                 apify_kept_by_company, apify_stats = apify_feed.split_rows(
@@ -16553,6 +16594,12 @@ def run_warm_radar_scan(chat_id=None):
                                                 break
                                 except Exception as e:
                                     logging.error(f"Warm Radar Apify learn raised {type(e).__name__}")
+                                for _pk in apify_plan.picks:   # settled: rows kept -> resolved; none kept -> the feed does not cover it
+                                    if _pk[0] in apify_resolve_keys:
+                                        _got = bool(apify_kept_by_company.get(_pk[1]))
+                                        apify_resolve_searched += 1
+                                        apify_resolved_count += 1 if _got else 0
+                                        resolution_record(_pk[0], "apify", resolve_plan.RESOLVED if _got else resolve_plan.EMPTY)
                                 apify_all_jobs = [j for jobs in apify_kept_by_company.values() for j in jobs]
                                 # The seen filter runs AFTER billing, as the Hirebase block does.
                                 apify_already = apify_seen_filter([j["job_id"] for j in apify_all_jobs])
@@ -16856,7 +16903,11 @@ def run_warm_radar_scan(chat_id=None):
             # registry / ledger / reserve are NOT silent: Apify was configured and could not run.
             def _usd_text(v):
                 return f"${v:.3f}" if 0 < v < 0.01 else f"${v:.2f}"
-            if apify_status == "registry_unreadable":
+            if apify_status == "off":
+                lines.append("Apify: off in System_Config")
+            elif apify_status == "resolution_unreadable":
+                lines.append("Apify skipped: resolution memory unreadable, nothing was spent")
+            elif apify_status == "registry_unreadable":
                 lines.append("Apify skipped: registry unreadable, nothing was spent")
             elif apify_status == "ledger_unreadable":
                 lines.append("Apify skipped: ledger unreadable, nothing was spent")
@@ -16864,7 +16915,7 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append("Apify skipped: could not record the spend first, nothing was spent")
             elif apify_status == "monthly_ceiling":
                 lines.append(f"Apify skipped: monthly budget used ({_usd_text(apify_month_before)} of "
-                             f"{_usd_text(apify_feed.APIFY_MONTHLY_CEILING_USD)})")
+                             f"{_usd_text(source_cfg.apify_monthly_usd)})")
             elif apify_status == "errored":
                 lines.append(f"Apify errored ({html.escape(apify_err_detail or 'unknown')}); "
                              f"{len(apify_picked_names)} companies not searched, retried on a later run; "
@@ -16878,9 +16929,11 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(f"Apify: {len(apify_picked_names)} companies, {apify_rows_returned} rows returned, "
                              f"{apify_stats['kept']} kept, {_usd_text(apify_spent_usd)} this run, "
                              f"{_usd_text(apify_month_before + apify_spent_usd)} of "
-                             f"{_usd_text(apify_feed.APIFY_MONTHLY_CEILING_USD)} this month "
+                             f"{_usd_text(source_cfg.apify_monthly_usd)} this month "
                              "(counts only what the ledger saw, not console runs)")
-            if apify_status != "unconfigured":
+            if apify_resolve_searched:
+                lines.append(f"Apify resolved {apify_resolved_count} of {apify_resolve_searched} companies this run")
+            if apify_status not in ("unconfigured", "off"):
                 hb_unmatched = [n for n, _st, ret, kp in hirebase_per_company if ret > 0 and kp == 0]
                 if hb_unmatched:
                     names_text, _used = _warm_radar_name_list(hb_unmatched, 5)
