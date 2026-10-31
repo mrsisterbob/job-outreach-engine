@@ -1199,6 +1199,15 @@ grep -i "contact" FUNCTION_INDEX.md
 | 68 | `format_visit_alert` | Telegram HTML text: time, path (cut to 100 chars) and referrer host, plus optional extras. |
 | 96 | `visit_alerts_enabled` | VISIT_ALERTS_ENABLED, default on; read per call. |
 
+## `visit_geo.py` — 4 defs, 97 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 28 | `Geo` | _(no docstring)_ |
+| 55 | `lookup_url` | URL for requests.get, or None unless ip is a globally routable address. |
+| 66 | `company_org` | The name, or "" for a consumer/mobile ISP or hosting/cloud provider. |
+| 76 | `parse_reply` | Turn a provider reply into Geo(place, org). Any failure is Geo("", ""). |
+
 ## `warm_big_companies.py` — 2 defs, 55 lines
 
 | Line | Name | Summary |
@@ -1320,4 +1329,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1016 definitions across 57 files + Code.gs.**
+**1020 definitions across 58 files + Code.gs.**
