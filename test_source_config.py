@@ -76,3 +76,47 @@ def test_source_config_float_per_run_rounds_down():
 def test_source_config_never_raises_on_junk():
     c = sc.parse_source_config({"source_apify_enabled": [1], "source_apify_monthly_usd": {"a": 1}})
     assert c is not None and len(c.problems) == 2
+
+
+def test_source_config_ats_resolver_empty_config_is_off_with_the_default_budget():
+    c = sc.parse_source_config({})
+    assert (c.resolver_enabled, c.resolver_per_run, c.resolver_monthly_usd) == (False, 3, 2.00)
+    assert c.resolver_on is False and c.problems == ()
+
+
+@pytest.mark.parametrize("raw", ["on", True, "true", 1, "1", " Yes "])
+def test_source_config_ats_resolver_on_values_enable_it(raw):
+    c = sc.parse_source_config({"source_ats_resolver_enabled": raw})
+    assert c.resolver_enabled is True and c.resolver_on is True and c.problems == ()
+
+
+def test_source_config_ats_resolver_bad_boolean_falls_back_to_off_and_names_the_key():
+    c = sc.parse_source_config({"source_ats_resolver_enabled": "maybe"})
+    assert c.resolver_enabled is False
+    assert any("source_ats_resolver_enabled" in x for x in c.problems), c.problems
+
+
+def test_source_config_ats_resolver_monthly_above_max_clamps_and_says_so():
+    c = sc.parse_source_config({"source_ats_resolver_enabled": True, "source_ats_resolver_monthly_usd": "50"})
+    assert c.resolver_monthly_usd == sc.MAX_ATS_RESOLVER_MONTHLY_USD == 10.00
+    assert any("source_ats_resolver_monthly_usd" in x and "clamped" in x for x in c.problems), c.problems
+
+
+def test_source_config_ats_resolver_per_run_clamps_to_the_shared_maximum():
+    c = sc.parse_source_config({"source_ats_resolver_companies_per_run": 99})
+    assert c.resolver_per_run == sc.MAX_COMPANIES_PER_RUN
+
+
+@pytest.mark.parametrize("key", ["source_ats_resolver_monthly_usd", "source_ats_resolver_companies_per_run"])
+def test_source_config_ats_resolver_zero_budget_or_count_is_off_even_when_enabled(key):
+    c = sc.parse_source_config({"source_ats_resolver_enabled": True, key: 0})
+    assert c.resolver_enabled is True and c.resolver_on is False
+
+
+def test_source_config_ats_resolver_keys_leave_the_older_sources_unchanged():
+    base = sc.parse_source_config({"source_apify_monthly_usd": 4, "source_hirebase_enabled": "off"})
+    both = sc.parse_source_config({"source_apify_monthly_usd": 4, "source_hirebase_enabled": "off",
+                                   "source_ats_resolver_enabled": True, "source_ats_resolver_monthly_usd": 5})
+    for f in ("hirebase_enabled", "hirebase_per_run", "hirebase_monthly_jobs",
+              "apify_enabled", "apify_per_run", "apify_monthly_usd"):
+        assert getattr(base, f) == getattr(both, f), f

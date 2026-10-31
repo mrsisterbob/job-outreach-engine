@@ -13,6 +13,12 @@ from hirebase_feed import HIREBASE_COMPANIES_PER_RUN, HIREBASE_MONTHLY_JOBS
 MAX_COMPANIES_PER_RUN = 20  # DESIGN CHOICE, not a measurement
 MAX_HIREBASE_MONTHLY_JOBS = HIREBASE_MONTHLY_JOBS  # MEASURED: the Free plan's cap
 MAX_APIFY_MONTHLY_USD = 25.00  # DESIGN CHOICE, not a measurement
+# The ATS resolver's defaults live here, not in ats_resolver (which this module must not import). OFF by default:
+# the actor's price is unmeasured, so a paid source never spends before Kevin turns it on.
+ATS_RESOLVER_DEFAULT_ENABLED = False  # DESIGN CHOICE, not a measurement
+ATS_RESOLVER_DEFAULT_PER_RUN = 3  # DESIGN CHOICE, not a measurement
+ATS_RESOLVER_DEFAULT_MONTHLY_USD = 2.00  # DESIGN CHOICE, not a measurement
+MAX_ATS_RESOLVER_MONTHLY_USD = 10.00  # DESIGN CHOICE, not a measurement
 
 _TRUE = {"true", "on", "yes", "1"}
 _FALSE = {"false", "off", "no", "0"}
@@ -26,6 +32,9 @@ class SourceConfig:
     apify_enabled: bool
     apify_per_run: int
     apify_monthly_usd: float
+    resolver_enabled: bool
+    resolver_per_run: int
+    resolver_monthly_usd: float
     problems: tuple = ()
 
     @property
@@ -35,6 +44,10 @@ class SourceConfig:
     @property
     def apify_on(self):
         return self.apify_enabled and self.apify_monthly_usd > 0 and self.apify_per_run > 0
+
+    @property
+    def resolver_on(self):
+        return self.resolver_enabled and self.resolver_monthly_usd > 0 and self.resolver_per_run > 0
 
 
 def _unset(raw):
@@ -95,5 +108,10 @@ def parse_source_config(filters):
                                     APIFY_COMPANIES_PER_RUN, MAX_COMPANIES_PER_RUN, p, True),
         apify_monthly_usd=_parse_number(filters, "source_apify_monthly_usd",
                                         APIFY_MONTHLY_CEILING_USD, MAX_APIFY_MONTHLY_USD, p, False),
+        resolver_enabled=_parse_bool(filters, "source_ats_resolver_enabled", ATS_RESOLVER_DEFAULT_ENABLED, p),
+        resolver_per_run=_parse_number(filters, "source_ats_resolver_companies_per_run",
+                                       ATS_RESOLVER_DEFAULT_PER_RUN, MAX_COMPANIES_PER_RUN, p, True),
+        resolver_monthly_usd=_parse_number(filters, "source_ats_resolver_monthly_usd",
+                                           ATS_RESOLVER_DEFAULT_MONTHLY_USD, MAX_ATS_RESOLVER_MONTHLY_USD, p, False),
         problems=tuple(p),
     )
