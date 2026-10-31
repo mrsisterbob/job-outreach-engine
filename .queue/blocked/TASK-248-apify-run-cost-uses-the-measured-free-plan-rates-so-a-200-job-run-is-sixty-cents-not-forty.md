@@ -23,3 +23,5 @@ They assert Starter dollar figures and must now say which plan they mean. Edit o
 
 ## Log
 
+
+- 2026-10-31 cloud worker: BLOCKED - verify passes (54 passed in test_apify_feed.py) but the full suite shows 2 failures in test_main_integration.py, which this task may not edit: test_apify_closing_success_prints_spend_with_exact_dollars_and_ceiling and test_apify_closing_money_under_a_cent_shows_three_decimals (they hard-code Starter dollar figures through main.py). Work saved as .queue/blocked/TASK-248.patch; source files reverted.

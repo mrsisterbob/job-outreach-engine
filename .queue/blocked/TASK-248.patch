@@ -1,0 +1,165 @@
+diff --git a/apify_feed.py b/apify_feed.py
+index 3d31e9c..f8d0046 100644
+--- a/apify_feed.py
++++ b/apify_feed.py
+@@ -14,11 +14,14 @@ from datetime import datetime, timedelta, timezone
+ from urllib.parse import urlparse
+ 
+ ACTOR_ID = "fantastic-jobs~career-site-job-listing-feed"  # the API form uses "~"; from the actor URL
+-# Free plan (the only MEASURED numbers, 4 runs matched to the cent, memory apify-feed-measured-facts.md):
+-#   start fee 0.10, per job 0.0025.
+-# Starter plan below: Kevin-reported from the Starter pricing page, NOT verified by a billed run.
+-START_FEE_USD = 0.001  # $0.001 per run start (Starter)
+-PER_JOB_USD = 0.002    # $2.00 per 1,000 jobs (Starter)
++Pricing = namedtuple("Pricing", "start_fee per_job")
++PRICING = {
++    # MEASURED, 4 runs matched to the cent, 2026-10-26 (memory apify-feed-measured-facts)
++    "free": Pricing(0.10, 0.0025),
++    # Kevin-reported from the Starter pricing page, NOT verified by a billed run
++    "starter": Pricing(0.001, 0.002),
++}
++DEFAULT_PLAN = "free"
+ LIMIT_MIN = 200        # MEASURED: the actor refuses a lower limit
+ LIMIT_PER_COMPANY = 50  # NOT measured: three data points were 46, 81, 148 jobs per company; change freely
+ # Full strings: the exclusion appears to match whole words, so "CSR" alone would not remove "CSR/Teller".
+@@ -231,7 +234,7 @@ def fetch_feed(run_input, token, http_post, timeout=240):
+ # warm_jsearch_plan.plan_warm_jsearch.
+ APIFY_COMPANIES_PER_RUN = 8  # DESIGN CHOICE, not a measurement: the size of Kevin's measured test batch
+ # DESIGN CHOICE, not a measurement: the worst case of one run at 8 companies (limit 400) is
+-# 0.001 + 0.002 * 400 = $0.801. NOT checked: whether the $19 plan includes $19 of usage credit, and the
++# $1.10 on the Free plan (0.10 + 0.0025 * 400; $0.801 on Starter). NOT checked: whether the $19 plan includes $19 of usage credit, and the
+ # ledger only sees /w spend, not Kevin's console use.
+ APIFY_MONTHLY_CEILING_USD = 10.00
+ APIFY_COMPANY_RETRY_DAYS = 7  # DESIGN CHOICE, not a measurement: a re-search bills every old row again (no date filter)
+@@ -239,9 +242,16 @@ APIFY_COMPANY_RETRY_DAYS = 7  # DESIGN CHOICE, not a measurement: a re-search bi
+ ApifyPlan = namedtuple("ApifyPlan", "picks limit worst_case_usd month_spent_usd month_left_usd skip_reason")
+ 
+ 
+-def actual_cost(rows_returned):
+-    """Billed cost of a run (MEASURED formula): excluded rows are free, zero rows is the flat fee."""
+-    return START_FEE_USD + PER_JOB_USD * rows_returned
++def actual_cost(rows_returned, plan=DEFAULT_PLAN):
++    """Billed cost of a run (MEASURED formula): excluded rows are free, zero rows is the flat fee.
++    An unknown plan name prices as Free (the higher price, so it can only over-reserve). Never raises:
++    a negative or non-integer row count counts as 0."""
++    price = PRICING.get(plan) or PRICING[DEFAULT_PLAN]
++    try:
++        rows = int(rows_returned) if not isinstance(rows_returned, bool) and rows_returned == int(rows_returned) else 0
++    except (TypeError, ValueError, OverflowError):
++        rows = 0
++    return price.start_fee + price.per_job * max(0, rows)
+ 
+ 
+ def _parse_ts(ts, now):
+@@ -256,7 +266,8 @@ def _parse_ts(ts, now):
+ 
+ 
+ def plan_apify_run(candidates, ledger, now, per_run=APIFY_COMPANIES_PER_RUN,
+-                   ceiling_usd=APIFY_MONTHLY_CEILING_USD, retry_days=APIFY_COMPANY_RETRY_DAYS):
++                   ceiling_usd=APIFY_MONTHLY_CEILING_USD, retry_days=APIFY_COMPANY_RETRY_DAYS,
++                   plan=DEFAULT_PLAN):
+     """Decide the one batched call: which companies, what limit, worst-case cost.
+ 
+     candidates: iterable of (company_key, display_name, contact_count)
+@@ -294,7 +305,7 @@ def plan_apify_run(candidates, ledger, now, per_run=APIFY_COMPANIES_PER_RUN,
+ 
+     while True:
+         limit = max(LIMIT_MIN, LIMIT_PER_COMPANY * len(picks))
+-        worst = actual_cost(limit)
++        worst = actual_cost(limit, plan)
+         if round(worst - room, 9) <= 0:
+             return ApifyPlan(picks, limit, worst, month_spent, max(0.0, room - worst), "")
+         if len(picks) > 1 and LIMIT_PER_COMPANY * (len(picks) - 1) >= LIMIT_MIN:
+diff --git a/test_apify_feed.py b/test_apify_feed.py
+index 7981a4b..1a1c05c 100644
+--- a/test_apify_feed.py
++++ b/test_apify_feed.py
+@@ -1,3 +1,4 @@
++import pytest
+ import re
+ from datetime import datetime, timedelta, timezone
+ 
+@@ -225,7 +226,7 @@ def test_apify_plan_biggest_network_first_ties_by_key():
+ def test_apify_plan_limit_scales_but_not_below_min():
+     assert af.plan_apify_run(_cands(2), [], NOW).limit == 200
+     assert af.plan_apify_run(_cands(8), [], NOW).limit == 400
+-    p = af.plan_apify_run(_cands(8), [], NOW)
++    p = af.plan_apify_run(_cands(8), [], NOW, plan="starter")
+     assert abs(p.worst_case_usd - (0.001 + 0.002 * 400)) < 1e-9
+ 
+ 
+@@ -252,13 +253,13 @@ def test_apify_plan_month_rollover_ignores_last_month():
+ 
+ def test_apify_plan_ceiling_too_low_for_min_run():
+     ledger = [(_ago(0), 9.80, "ok", ["x"])]  # room 0.20 < 0.401
+-    plan = af.plan_apify_run(_cands(3), ledger, NOW)
++    plan = af.plan_apify_run(_cands(3), ledger, NOW, plan="starter")
+     assert plan.picks == [] and plan.skip_reason == "monthly_ceiling"
+ 
+ 
+ def test_apify_plan_shrinks_picks_to_fit_ceiling():
+     ledger = [(_ago(0), 9.20, "ok", ["x"])]  # room 0.80: 8 picks (400) cost 0.801, 7 picks (350) cost 0.701
+-    plan = af.plan_apify_run(_cands(8), ledger, NOW)
++    plan = af.plan_apify_run(_cands(8), ledger, NOW, plan="starter")
+     assert len(plan.picks) == 7 and plan.limit == 350
+     assert [k for k, _ in plan.picks] == ["co00", "co01", "co02", "co03", "co04", "co05", "co06"]
+     assert plan.worst_case_usd <= 0.80 + 1e-9
+@@ -276,12 +277,12 @@ def test_apify_plan_unparseable_usd_spends_whole_ceiling():
+ 
+ 
+ def test_apify_plan_actual_cost():
+-    assert abs(af.actual_cost(0) - 0.001) < 1e-9
+-    assert abs(af.actual_cost(200) - 0.401) < 1e-9
++    assert abs(af.actual_cost(0, plan="starter") - 0.001) < 1e-9
++    assert abs(af.actual_cost(200, plan="starter") - 0.401) < 1e-9
+ 
+ 
+ def test_apify_fallthrough_prices_and_ceiling():
+-    assert af.START_FEE_USD == 0.001 and af.PER_JOB_USD == 0.002
++    assert af.PRICING["starter"] == (0.001, 0.002)
+     assert af.APIFY_MONTHLY_CEILING_USD == 10.00
+ 
+ 
+@@ -338,3 +339,42 @@ def test_apify_fallthrough_summarize_sources():
+     assert out["B"] == {"source_domain": "x.myworkdayjobs.com", "job_board": "workday", "rows": 3}
+     assert out["C"] == {"source_domain": "", "job_board": "", "rows": 1}
+     assert af.summarize_feed_sources({}) == {}
++
++
++@pytest.mark.parametrize("rows,console", [(81, 0.303), (148, 0.470), (46, 0.215), (200, 0.600)])
++def test_apify_pricing_free_plan_matches_the_measured_console_runs(rows, console):
++    assert abs(af.actual_cost(rows) - console) < 0.001
++
++
++def test_apify_pricing_free_is_the_default_and_zero_rows_cost_the_flat_fee():
++    assert abs(af.actual_cost(200) - 0.60) < 1e-9 and abs(af.actual_cost(0) - 0.10) < 1e-9
++    assert af.DEFAULT_PLAN == "free" and af.PRICING["free"] == (0.10, 0.0025)
++
++
++def test_apify_pricing_starter_is_available_only_when_named():
++    assert abs(af.actual_cost(200, plan="starter") - 0.401) < 1e-9
++
++
++def test_apify_pricing_unknown_plan_prices_as_free_and_bad_rows_count_zero():
++    assert af.actual_cost(200, plan="platinum") == af.actual_cost(200)
++    assert af.actual_cost(200, plan=None) == af.actual_cost(200)
++    assert af.actual_cost(-5) == af.actual_cost(0) and af.actual_cost("x") == af.actual_cost(0)
++    assert af.actual_cost(2.5) == af.actual_cost(0)
++
++
++def test_apify_pricing_eight_company_worst_case_is_1_10_free_and_0_801_starter():
++    assert abs(af.plan_apify_run(_cands(8), [], NOW).worst_case_usd - 1.10) < 1e-9
++    assert abs(af.plan_apify_run(_cands(8), [], NOW, plan="starter").worst_case_usd - 0.801) < 1e-9
++
++
++def test_apify_pricing_a_room_that_fitted_eight_on_starter_drops_picks_on_free():
++    ledger = [(_ago(0), 9.00, "ok", ["x"])]   # room 1.00
++    assert len(af.plan_apify_run(_cands(8), ledger, NOW, plan="starter").picks) == 8
++    assert len(af.plan_apify_run(_cands(8), ledger, NOW).picks) < 8
++
++
++def test_apify_pricing_a_200_job_ledger_row_leaves_nine_forty_of_ten():
++    ledger = [(_ago(0), af.actual_cost(200), "ok", ["x"])]
++    plan = af.plan_apify_run(_cands(1), ledger, NOW)
++    assert abs(plan.month_spent_usd - 0.60) < 1e-9
++    assert abs((af.APIFY_MONTHLY_CEILING_USD - plan.month_spent_usd) - 9.40) < 1e-9
