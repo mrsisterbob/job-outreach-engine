@@ -23849,3 +23849,169 @@ def test_warm_run_report_build_info_is_unknown_when_env_file_and_git_all_fail():
     info = m._compute_build_info(environ={}, read_file=boom, run_git=boom)
     assert info == {"commit": "", "short": "", "source": "unknown"}
     assert m._compute_build_info(environ={"RENDER_GIT_COMMIT": "c" * 40}, read_file=boom, run_git=boom)["source"] == "env:RENDER_GIT_COMMIT"
+
+
+# ---- /w saves its full text and per-company record, and sends a short closing message (TASK-261) ----
+
+@pytest.fixture(autouse=True)
+def _warm_closing_full_legacy(request, monkeypatch):
+    """About 30 older tests read the long closing text through the harness; they run with the old (full) message. The
+    warm_closing_short tests set the mode themselves."""
+    if "warm_closing_short" not in request.node.name:
+        monkeypatch.setattr(m, "WARM_CLOSING_MODE", "full")
+    yield
+
+
+def _closing(h):
+    return h.messages[-1]
+
+
+def _many_company_run(monkeypatch, mode="short", n=20):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", mode)
+    h = _apify_wire_harness(monkeypatch, _resolve_names(n))
+    h.feed = []
+    h.apify_rows = [_apify_row("Resco00 Labs", "Finance Analyst", 1)]
+    h.run()
+    return h
+
+
+def test_warm_closing_short_default_mode_is_at_most_twelve_lines_and_1400_characters(monkeypatch):
+    h = _many_company_run(monkeypatch)
+    short = _closing(h)
+    assert len(short.splitlines()) <= 12 and len(short) <= 1400, short
+    detail = m._warm_run_report_read()["detail"]
+    assert len(detail.splitlines()) > len(short.splitlines()), (detail, short)
+
+
+def test_warm_closing_short_full_mode_sends_the_long_text_and_stores_exactly_that(monkeypatch):
+    h = _many_company_run(monkeypatch, mode="full")
+    assert _closing(h) == m._warm_run_report_read()["detail"]
+    assert "Detail: /wrun" not in _closing(h)
+
+
+def test_warm_closing_short_stored_detail_has_lines_the_short_message_lacks(monkeypatch):
+    h = _many_company_run(monkeypatch)
+    short_lines = set(_closing(h).splitlines())
+    detail_lines = m._warm_run_report_read()["detail"].splitlines()
+    assert [ln for ln in detail_lines if ln not in short_lines]
+    assert detail_lines[0].startswith("🏁 Warm scan complete") and detail_lines[0] in short_lines
+
+
+def test_warm_closing_short_ends_with_the_detail_hint_and_names_the_build(monkeypatch):
+    monkeypatch.setattr(m, "BUILD_INFO", {"commit": "abcdef1234567890" * 2 + "abcdef12", "short": "abcdef1", "source": "git"})
+    h = _many_company_run(monkeypatch, n=3)
+    short = _closing(h)
+    assert short.splitlines()[-1].startswith("Detail: /wrun") and "Build abcdef1 (git)" in short
+    monkeypatch.setattr(m, "BUILD_INFO", {"commit": "", "short": "", "source": "unknown"})
+    h2 = _many_company_run(monkeypatch, n=3)
+    assert "Build unknown" in _closing(h2)
+
+
+def test_warm_closing_short_haworth_case_keeps_the_sent_name_and_both_returned_names(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _apify_wire_harness(monkeypatch, {"Haworth Inc.": 3})
+    h.feed = []
+    h.apify_rows = [_apify_row("Haworth Inc.", "Finance Analyst", 1), _apify_row("Haworth International", "Analyst", 2)]
+    h.run()
+    snap = m._warm_run_report_read()["snapshot"]
+    e = [c for c in snap["companies"] if c["name"] == "Haworth Inc."][0]["sources"]["apify"]
+    assert e["sent"] == "Haworth Inc." and e["kept"] == 1
+    assert set(e["returned_names"]) == {"Haworth Inc.", "Haworth International"}
+    assert "Haworth International" in m.run_report.render_company(snap, "Haworth Inc.")
+
+
+def test_warm_closing_short_a_greenhouse_posting_is_counted_under_greenhouse_for_its_company(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _warm_title_harness(monkeypatch, ["Operations Analyst"])
+    h.run()
+    snap = m._warm_run_report_read()["snapshot"]
+    acme = [c for c in snap["companies"] if c["name"] == "Acme Robotics"][0]
+    assert acme["sources"]["greenhouse"]["postings"] == 1
+
+
+def test_warm_closing_short_a_hirebase_posting_is_counted_under_hirebase(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    snap = m._warm_run_report_read()["snapshot"]
+    e = [c for c in snap["companies"] if c["name"] == "Nopeboard Labs"][0]["sources"]["hirebase"]
+    assert e["postings"] == 1 and e["kept"] == 1 and e["sent"] == "Nopeboard Labs"
+
+
+def test_warm_closing_short_a_failed_store_write_sends_the_full_text_with_a_note(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    monkeypatch.setattr(m, "_warm_run_report_write", lambda snapshot, detail: False)
+    h = _apify_wire_harness(monkeypatch, _resolve_names(5))
+    h.feed = []
+    h.run()
+    text = _closing(h)
+    assert text.endswith("Detail not saved (store write failed); this is the full text.")
+    assert text.startswith("🏁 Warm scan complete") and "Detail: /wrun" not in text
+
+
+def test_warm_closing_short_a_raising_recorder_changes_nothing_else(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _warm_title_harness(monkeypatch, ["Operations Analyst"])
+
+    def boom(self, *a, **k):
+        raise RuntimeError("recorder bug")
+
+    monkeypatch.setattr(m.run_report.RunRecorder, "note_posting", boom)
+    h.run()
+    assert h.cards == ["Operations Analyst"]
+    assert "Warm scan complete" in _closing(h)
+
+
+def test_warm_closing_short_the_private_returned_name_key_never_leaves_the_collector(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    cards = []
+    monkeypatch.setattr(m, "send_telegram_card", lambda job, *a, **kw: cards.append(dict(job)) or True)
+    hashed = []
+    real_hash = m.generate_dedup_hash
+    monkeypatch.setattr(m, "generate_dedup_hash", lambda *a, **k: hashed.append(a) or real_hash(*a, **k))
+    h.run()
+    assert cards and all("_returned_name" not in c for c in cards)
+    assert all("_returned_name" not in json.dumps(p, default=str) for p in h.payloads) if hasattr(h, "payloads") else True
+    assert hashed and all("_returned_name" not in str(a) for a in hashed)
+
+
+def test_warm_closing_short_an_errored_hirebase_call_reaches_the_phone_and_the_snapshot(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+
+    def boom(url, **kw):
+        if url.endswith("/companies/search"):
+            return type("_C", (), {"status_code": 200, "json": lambda self: {"companies": []}})()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    h.run()
+    assert "errored" in _closing(h).lower() and "Nopeboard Labs" in _closing(h)
+    e = [c for c in m._warm_run_report_read()["snapshot"]["companies"] if c["name"] == "Nopeboard Labs"][0]["sources"]["hirebase"]
+    assert e["status"] == "errored"
+
+
+def test_warm_closing_short_early_return_paths_stay_one_short_message_and_write_no_report(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"])
+    h.run()
+    assert "has a cached job board yet" in _closing(h)
+    assert m._warm_run_report_list() == []
+
+
+def test_warm_closing_short_the_scan_result_is_the_same_in_short_and_full_mode(monkeypatch):
+    def scenario(mode):
+        with m.get_db_conn() as conn:
+            for table in ("seen_jobs", "seen_content_hashes", "died_roles", "jobs", "warm_stage_samples", "warm_screen_memo"):
+                conn.execute(f"DELETE FROM {table}")
+            conn.commit()
+        monkeypatch.setattr(m, "WARM_CLOSING_MODE", mode)
+        h = _warm_title_harness(monkeypatch, ["Operations Analyst", "Reporting Analyst"])
+        h.run()
+        stage = m._warm_stage_samples_read()
+        return h.cards, [p.get("rows") and len(p["rows"]) for p in h.payloads], stage[1] if stage else None
+
+    assert scenario("short") == scenario("full")

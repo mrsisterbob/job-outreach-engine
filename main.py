@@ -15969,6 +15969,12 @@ def _warm_stage_samples_read(nth=1):
     return row[0], json.loads(row[1])
 
 
+# "short" (default): /w's closing Telegram message is run_report.compose_short (12 lines at most) and the full text is
+# stored for /wrun. "full" restores the old long message. A Render dashboard flip, not a redeploy.
+WARM_CLOSING_MODE = "full" if os.environ.get("WARM_CLOSING_MODE", "").strip().lower() == "full" else "short"
+# Closing-message lines that must reach the phone even in the short message (matched case-insensitively).
+_ATTENTION_MARKERS = ("could not be fetched", "errored", "skipped", "cap", "budget", "held back", "withheld",
+                      "left unscored", "unreadable", "cut off")
 WARM_RUN_REPORTS_KEEP = 10   # DESIGN CHOICE, not a measurement: runs kept in warm_run_reports
 WARM_RUN_REPORT_DETAIL_MAX = 60000   # DESIGN CHOICE, not a measurement
 _WARM_RUN_REPORT_CUT = "... (cut at 60,000 characters)"
@@ -16425,6 +16431,17 @@ def run_warm_radar_scan(chat_id=None):
         referral_pending = {}   # company key -> best contact + the roles that were LISTED this run
         screen_trace = FunnelTrace()   # why the role screen (passes_strict_filter) dropped roles this run
         stage_sampler = warm_stage_samples.StageSampler()
+        # One recorder per run (run_report): which source each posting came from, the name asked versus every name that
+        # came back. It does no I/O until the end, and recording must never fail or slow the scan.
+        _run_started = datetime.now(timezone.utc)
+        run_recorder = run_report.RunRecorder(
+            f"{_run_started.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:4]}", _run_started.strftime("%Y-%m-%d %H:%M:%S"), BUILD_INFO)
+
+        def _record(method, *args, **kwargs):
+            try:
+                getattr(run_recorder, method)(*args, **kwargs)
+            except Exception as e:
+                logging.error(f"Warm Radar run report {method} raised {type(e).__name__}")
 
         def _note_stage(stage, company, title, detail=""):
             """Sample a role at a stage. A sampler error must never fail or alter a scan."""
@@ -16463,6 +16480,11 @@ def run_warm_radar_scan(chat_id=None):
             """PASS 1 for ONE posting, board or JSearch: every gate and the grouping, one code path.
             jsearch_keys (set of company keys), when given, drops a posting whose employer is not one of them."""
             nonlocal board_index, title_filtered, region_filtered
+            # The Hirebase/Apify loops stash the name the SOURCE returned under a private key before they overwrite
+            # employer_name with the sent name. Read it here and drop it, so it never reaches a card, a hash or the CRM.
+            returned_name = job.get("_returned_name") or job.get("employer_name") or ""
+            if "_returned_name" in job:
+                job = {k: v for k, v in job.items() if k != "_returned_name"}
             company = job.get("employer_name") or ""
             title = job.get("job_title") or ""
             if is_banned_employer(company):
@@ -16497,6 +16519,7 @@ def run_warm_radar_scan(chat_id=None):
             if jsearch_keys is not None and normalize_company_for_match(company) not in jsearch_keys:
                 return   # a JSearch posting is kept only when its employer IS one of the companies searched
             _note_stage("pulled", company, title)
+            _record("note_posting", run_report.source_from_job_id(job_id), contact.get("raw_company") or company, returned_name)
 
             # The title gate /t uses (one shared function). A filtered role is counted, never stamped
             # into seen_jobs (same reason _add_candidate does not): the rule can change and the role
@@ -16739,6 +16762,7 @@ def run_warm_radar_scan(chat_id=None):
                         if hirebase_outcome == "errored":
                             hirebase_status = "errored"
                             hirebase_per_company.append((pick_name, "errored", 0, 0))
+                            _record("note_source_call", "hirebase", pick_name, status="errored", error=str(getattr(hirebase_result, "error", "") or "exception"))
                             hirebase_searched[pick_key] = ("errored", 0, 0)
                             hirebase_errored_reserved = hirebase_limit
                             hirebase_err_detail = str(getattr(hirebase_result, "error", "") or "exception")
@@ -16746,8 +16770,11 @@ def run_warm_radar_scan(chat_id=None):
                             break
                         hirebase_jobs_used_this_run += returned_n
                         try:
+                            _hb_dropped = []
                             kept_jobs, co_stats = hirebase_feed.split_jobs(hirebase_result.jobs, pick_name, hirebase_slugs, normalize_company_for_match,
-                                                                           trusted_slugs=hirebase_trusted)
+                                                                           trusted_slugs=hirebase_trusted, dropped=_hb_dropped)
+                            _record("note_source_call", "hirebase", pick_name, status="empty" if returned_n == 0 else "ok",
+                                    returned=returned_n, kept=len(kept_jobs), dropped=_hb_dropped)
                             for stat_key in hirebase_stats:
                                 hirebase_stats[stat_key] += co_stats.get(stat_key, 0)
                             hirebase_per_company.append((pick_name, hirebase_outcome, returned_n, len(kept_jobs)))
@@ -16774,7 +16801,7 @@ def run_warm_radar_scan(chat_id=None):
                                     continue
                                 try:
                                     if hirebase_trusted:   # slug verified against the company: attribute to the warm company's name
-                                        job = dict(job, employer_name=pick_name)
+                                        job = dict(job, employer_name=pick_name, _returned_name=job.get("employer_name"))
                                     hirebase_hash_to_ids.setdefault(
                                         generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
                                     hirebase_collected += 1
@@ -16899,14 +16926,36 @@ def run_warm_radar_scan(chat_id=None):
                             apify_reserved_usd = apify_plan.worst_case_usd
                             apify_err_detail = getattr(apify_result, "error", "") or "request raised"
                             apify_ledger_settle(apify_row_id, apify_plan.worst_case_usd, "errored")
+                            for _an in apify_picked_names:
+                                _record("note_source_call", "apify", _an, status="errored", error=str(apify_err_detail))
                             logging.error(f"Warm Radar Apify call errored: {getattr(apify_result, 'error', 'raised')}")
                             for _pk in apify_plan.picks:   # an errored call is unknown, never empty
                                 if _pk[0] in apify_resolve_keys:
                                     resolution_record(_pk[0], "apify", resolve_plan.ERROR)
                         if apify_status == "ok":
                             try:
+                                _ap_dropped = []
                                 apify_kept_by_company, apify_stats = apify_feed.split_rows(
-                                    apify_result.rows, apify_picked_names, normalize_company_for_match)
+                                    apify_result.rows, apify_picked_names, normalize_company_for_match, dropped=_ap_dropped)
+                                # A dropped row belongs to the BATCH, not to one company. It is shown under the picked company
+                                # whose name it shares the longest start with ("Haworth International" -> "Haworth Inc.");
+                                # a row that shares none is reported once as a problem instead of guessed onto a company.
+                                _ap_squash = lambda t: re.sub(r"[^a-z0-9]", "", str(t or "").lower())
+                                _ap_by_pick, _ap_loose = {n: [] for n in apify_picked_names}, []
+                                for _dn, _dr in _ap_dropped:
+                                    _best = max(apify_picked_names, key=lambda n: len(os.path.commonprefix([_ap_squash(n), _ap_squash(_dn)])), default=None)
+                                    if _best and len(os.path.commonprefix([_ap_squash(_best), _ap_squash(_dn)])) >= 4:
+                                        _ap_by_pick[_best].append((_dn, _dr))
+                                    else:
+                                        _ap_loose.append((_dn, _dr))
+                                for _an in apify_picked_names:
+                                    _akept = len(apify_kept_by_company.get(_an) or [])
+                                    _record("note_source_call", "apify", _an, status="ok" if _akept else "empty",
+                                            returned=_akept + len(_ap_by_pick[_an]), kept=_akept, dropped=_ap_by_pick[_an])
+                                _record("set_counts", apify_rows_returned=len(apify_result.rows), apify_dropped_unattributed=len(_ap_loose))
+                                if _ap_loose:
+                                    _record("note_problem", "Apify rows dropped, no company to show them under: "
+                                            + ", ".join(sorted({f"{n or '(unreadable)'} ({r})" for n, r in _ap_loose})[:5]))
                                 # Learn from the rows before they are screened (best effort, never fails the
                                 # scan): the feed source per company that has kept rows, and a Workday triple
                                 # (UNVERIFIED: a posting link proves a posting; /w's own scan is the check).
@@ -16938,7 +16987,7 @@ def run_warm_radar_scan(chat_id=None):
                                         if job["job_id"] in apify_already:
                                             continue
                                         try:
-                                            job = dict(job, employer_name=apify_name)
+                                            job = dict(job, employer_name=apify_name, _returned_name=job.get("employer_name"))
                                             apify_hash_to_ids.setdefault(
                                                 generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
                                             apify_collected += 1
@@ -17276,7 +17325,32 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
                              f"applied to in the last {warm_screen_plan.APPLIED_SKIP_DAYS} days ({names_text})")
             lines += _skipped_report()
-            send_telegram_message(chat_id, "\n".join(lines))
+            # Save the full text and the per-company record FIRST: an unsaved run falls back to the full message, so no
+            # detail is ever lost silently. The old long text is the stored detail, verbatim.
+            _record("set_counts", boards_scanned=len(scanned_slugs), boards_total=len(all_slugs), screened=len(to_screen),
+                    cards=len(sent_items), digest=len(digest_sent), below_70=len(rejected_hashes), held=held_roles,
+                    failed=len(failed_roles))
+            for _item in sent_items:
+                _record("note_outcome", _item.get("company"), cards=1)
+            for _item in digest_sent:
+                _record("note_outcome", _item.get("company"), digest=1)
+            detail_text = "\n".join(lines)
+            saved = False
+            snapshot = {}
+            try:
+                snapshot = run_recorder.snapshot()
+                saved = _warm_run_report_write(snapshot, detail_text)
+            except Exception as e:
+                logging.error(f"Warm Radar run report save raised {type(e).__name__}")
+            if WARM_CLOSING_MODE == "full" or not saved:
+                send_telegram_message(chat_id, detail_text + (
+                    "" if saved or WARM_CLOSING_MODE == "full" else
+                    "\nDetail not saved (store write failed); this is the full text."))
+            else:
+                money = [ln for ln in lines if ln.startswith(("Hirebase: ", "Apify: "))]
+                attention = [ln for ln in lines[1:] if ln not in money and any(mk in ln.lower() for mk in _ATTENTION_MARKERS)]
+                send_telegram_message(chat_id, run_report.compose_short(
+                    snapshot, headline=lines[0], money_line=" · ".join(money), attention=attention))
         _warm_stage_samples_write(stage_sampler.snapshot())
         return match_count
     finally:

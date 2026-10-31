@@ -38,3 +38,5 @@ Block, and write nothing, if any is missing. 237 and 238 rewrite the Hirebase an
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 13 passed; suites 2078 passed, 1 skipped. No existing test edited (autouse _warm_closing_full_legacy sets full mode for older tests). Deviations: (1) run_report counts are ints, so Apify dropped rows are shown under the picked company that shares the longest name start (Haworth International under Haworth Inc.), else once as a problem, not in counts as the task text said; (2) money_line joins the Hirebase:/Apify: summary lines with " · " so the 12-line cap holds.
