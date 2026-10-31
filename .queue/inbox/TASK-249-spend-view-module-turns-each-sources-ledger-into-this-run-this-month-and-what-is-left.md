@@ -1,0 +1,25 @@
+---
+id: TASK-249
+scope: spend_view.py, test_spend_view.py
+verify: python -m pytest test_spend_view.py -q -p no:cacheprovider 2>&1 | tail -n 1 | grep -E "^(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}) passed" | grep -Ev "failed|error"
+---
+
+## Target
+A pure module `spend_view.py` takes what each paid `/w` source has spent (Hirebase jobs, Hirebase company lookups, the Apify Feed in dollars, later the ATS resolver in dollars), the sheet's caps, and this run's spend, and returns one `SpendRow` per source (unit, this run, this month, cap, left, and where the figure came from) plus the printable lines, so every source is shown the same way and a figure that cannot be read is shown as unknown and never as zero.
+
+## Proof it is needed
+`python -m pytest test_spend_view.py -q -p no:cacheprovider` on 2026-10-31 (main at 099d737): `ERROR: file or directory not found: test_spend_view.py`, exit 4, so the verify exits 1. Pass-regex proven able to pass: `python -m pytest test_apify_feed.py -q -p no:cacheprovider` ends `44 passed` and matches `^(1[0-9]|[2-9][0-9]|[1-9][0-9]{2,}) passed`. Today each source reports itself in its own words inside `run_warm_radar_scan`'s closing block (`Hirebase: ... used this month` and `Apify: ... this month` near main.py:16789-16830), the Apify line compares against the constant `APIFY_MONTHLY_CEILING_USD` and not the sheet's cap, Hirebase company lookups are a third meter on a third line, and there is no view of what is left.
+
+## Notes
+- Search first: `grep -i -E "spend|ledger|month" FUNCTION_INDEX.md`. Pure: no I/O, no clock reads (`now` passed in), no import from `main`. It may import `source_config` for the `SourceConfig` field names only if that keeps it simpler; passing plain numbers is preferred so tests stay hand-built.
+- `SpendRow = namedtuple("SpendRow", "source unit this_run this_month cap left basis note")`. `unit` is `"jobs"`, `"units"` or `"usd"`. `this_run`, `this_month`, `cap` and `left` are numbers or `None` (None means unknown). `basis` is one of `"ledger"` (what `/w` itself recorded), `"console"` (read from the Apify account) or `"unknown"`. `note` is short plain text or `""`.
+- `build_rows(hirebase, hirebase_lookups, apify, resolver, run, now)`: each source argument is a small dict or `None`; `None` means the source is off or not built and produces NO row. Hirebase: `{"month_used": int|None, "cap": int, "held_back": int}`; its `left` is `cap - held_back - month_used` floored at 0, and `note` says `held back N`. Lookups: `{"month_units": int|None, "cap": int}`. Apify and resolver: `{"ledger_rows": [(iso_ts, usd, status, keys)] | None, "console_month_usd": float | None, "cap_usd": float}`. `run` is `{source: amount_this_run}`.
+- **Month spend rule (the point of the module):** for the dollar sources, `this_month` = the larger of the ledger's current-UTC-month sum (errored rows count: a failed call may still have billed) and `console_month_usd` when it is known; `basis` is `"console"` when the console figure was the larger or the only one, `"ledger"` when the ledger was and there was no console figure, and `note` says `console is higher by $X (runs outside /w)` when the console figure exceeds the ledger by more than half a cent. A ledger that is `None` and no console figure: `this_month = None`, `left = None`, `basis = "unknown"`, `note = "ledger unreadable"`. Unknown never becomes 0.
+- `left` for dollars = `cap - this_month` floored at 0, or `None` when unknown. A cap of 0 is `left = 0` and `note = "off"`.
+- `render_lines(rows)` -> one line per row: `Hirebase: 12 jobs this run, 140 of 500 this month (360 left, 40 held back)`; `Apify Feed: $0.60 this run, $1.35 of $10.00 this month ($8.65 left, console)`; unknown figures print `unknown`, never `0` or `$0.00`. Dollars print two decimals, or three when under one cent (the existing `_usd_text` rule in main.py near line 16800). A row whose cap is reached ends with `, CAP REACHED`.
+- `at_cap(rows)` -> the set of source names with `left == 0` (a `None` left is NOT at cap and NOT ok: it is reported separately by `unknown_sources(rows)`), for the caller that decides whether to call.
+- Never name or value anything `no_jobs`: a source with spend of zero this month shows `$0.00 of $10.00`, which is a measured zero only when `basis` is not `unknown`.
+- Tests (`test_spend_view.py`, at least 10, all hand-built inputs): (1) Hirebase left subtracts the held-back reserve; (2) Hirebase `month_used None` gives unknown, not 0; (3) Apify month = ledger sum when no console figure, basis `ledger`; (4) a console figure above the ledger wins, basis `console`, and the note names the difference; (5) a ledger above the console wins and the note stays empty; (6) an old-month ledger row is not counted; (7) an `errored` ledger row counts as spent; (8) ledger None with no console: unknown, `left None`, line says `unknown`; (9) cap 0 gives `off`; (10) `at_cap` and `unknown_sources` partition correctly; (11) a `None` source argument produces no row; (12) the real 2026-10-26 case: one `ok` row of $0.60 and cap 10 gives `$0.60 ... $9.40 left`.
+
+## Log
+
