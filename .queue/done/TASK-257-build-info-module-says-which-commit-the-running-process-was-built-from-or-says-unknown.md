@@ -20,3 +20,5 @@ A pure module `build_info.py` that answers "which commit is this process running
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 10 passed (pure new module, nothing existing touched; full suites not re-run). UNVERIFIED: RENDER_GIT_COMMIT is recalled from Render docs; Kevin checks /health after the next deploy (the source field says which path answered).
