@@ -1096,6 +1096,18 @@ grep -i "contact" FUNCTION_INDEX.md
 | 241 | `report` | _(no docstring)_ |
 | 265 | `main` | _(no docstring)_ |
 
+## `scripts/measure_free_resolver.py` — 7 defs, 228 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 35 | `_system_of` | _(no docstring)_ |
+| 42 | `CrmCallAttempted` | A CRM call during a read-only run: never swallowed by the per-company guard. |
+| 46 | `_crm_stub` | _(no docstring)_ |
+| 50 | `run_measure` | Measure `rows` (sample rows) through m.auto_expand_ats_slug. Returns a result dict. |
+| 146 | `report_lines` | _(no docstring)_ |
+| 176 | `write_result` | _(no docstring)_ |
+| 194 | `main` | _(no docstring)_ |
+
 ## `scripts/score_source.py` — 2 defs, 99 lines
 
 | Line | Name | Summary |
@@ -1329,4 +1341,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1020 definitions across 58 files + Code.gs.**
+**1027 definitions across 59 files + Code.gs.**
