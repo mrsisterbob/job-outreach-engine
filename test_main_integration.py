@@ -23361,3 +23361,77 @@ def test_visit_tag_ingest_create_is_idempotent_per_label_and_refuses_blank(visit
     assert a and m.visit_tag_create("Jane Doe") == a
     assert m.visit_tag_create("   ") is None and m.visit_tag_lookup(a) == "Jane Doe"
     assert m.visit_tag_lookup("zzzzzzzz") is None
+
+
+# ---- /vlink makes a per-contact link and lists the ones made (TASK-240) ----
+
+def _vlink(monkeypatch, text):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    _dispatch(text)
+    return sent
+
+
+@pytest.fixture
+def vlink_env(analytics_env):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM visit_tags")
+        conn.commit()
+    return analytics_env
+
+
+def _vlink_tags():
+    with m.get_db_conn() as conn:
+        return {r[0]: r[1] for r in conn.execute("SELECT tag, label FROM visit_tags").fetchall()}
+
+
+def test_vlink_first_call_creates_a_tag_and_returns_its_link(monkeypatch, vlink_env):
+    (reply,) = _vlink(monkeypatch, "/vlink Jane Doe")
+    tags = _vlink_tags()
+    assert len(tags) == 1
+    (tag, label), = tags.items()
+    assert label == "Jane Doe" and f"https://montelattice.com/?r={tag}" in reply
+    assert "Opened by Jane Doe" in reply
+
+
+def test_vlink_same_name_again_returns_the_same_link_and_adds_no_row(monkeypatch, vlink_env):
+    first = _vlink(monkeypatch, "/vlink Jane Doe")[0]
+    second = _vlink(monkeypatch, "/vlink  Jane   Doe ")[0]
+    assert first == second and len(_vlink_tags()) == 1
+
+
+def test_vlink_two_names_get_different_links(monkeypatch, vlink_env):
+    _vlink(monkeypatch, "/vlink Jane Doe")
+    _vlink(monkeypatch, "/vlink John Roe")
+    assert len(_vlink_tags()) == 2 and len(set(_vlink_tags())) == 2
+
+
+def test_vlink_alone_lists_links_with_the_opened_count(monkeypatch, vlink_env):
+    assert "No links made yet" in _vlink(monkeypatch, "/vlink")[0]
+    _vlink(monkeypatch, "/vlink Jane <b>Doe</b>")
+    jane = [t for t, l in _vlink_tags().items()][0]
+    _vlink(monkeypatch, "/vlink John Roe")
+    assert _ingest([_tagged_view(jane, ip="203.0.113.1"), _tagged_view(jane, ip="203.0.113.2")]).status_code == 200
+    (listing,) = _vlink(monkeypatch, "/vlink")
+    assert f"?r={jane} — opened 2 times" in listing, listing
+    assert "opened 0 times" in listing and "Jane &lt;b&gt;Doe&lt;/b&gt;" in listing
+
+
+def test_vlink_blank_or_overlong_name_creates_nothing(monkeypatch, vlink_env):
+    assert "No links made yet" in _vlink(monkeypatch, "/vlink   ")[0]
+    assert "80 characters" in _vlink(monkeypatch, "/vlink " + "x" * 81)[0]
+    assert _vlink_tags() == {}
+
+
+def test_vlink_db_write_failure_replies_could_not_save_and_no_link(monkeypatch, vlink_env):
+    with m.get_db_conn() as conn:
+        conn.execute("ALTER TABLE visit_tags RENAME TO visit_tags_away")
+        conn.commit()
+    try:
+        (reply,) = _vlink(monkeypatch, "/vlink Jane Doe")
+    finally:
+        with m.get_db_conn() as conn:
+            conn.execute("ALTER TABLE visit_tags_away RENAME TO visit_tags")
+            conn.commit()
+    assert "Could not save" in reply and "?r=" not in reply

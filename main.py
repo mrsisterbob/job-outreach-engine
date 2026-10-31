@@ -17335,6 +17335,36 @@ def process_webhook_payload_async(data):
             for chunk in format_leads_messages(rows, limit, TELEGRAM_MAX_MESSAGE_CHARS):
                 send_telegram_message(chat_id, chunk)
             return
+        # /vlink [name]: a per-contact site link (creates the tag the first time), or the list of links made.
+        if text == "/vlink" or text.startswith("/vlink "):
+            name = " ".join(text[len("/vlink"):].split())
+            usage = "<code>/vlink Jane Doe</code> makes (or shows) Jane's link to the site."
+            if not name:
+                try:
+                    made = visit_tag_list(20)
+                except Exception as e:
+                    logging.error(f"/vlink list failed: {type(e).__name__}")
+                    send_telegram_message(chat_id, "❌ Could not read the links.")
+                    return
+                if not made:
+                    send_telegram_message(chat_id, "No links made yet. " + usage)
+                    return
+                lines = ["🔗 <b>Links made</b> (newest first)"]
+                for label, tag, opened in made:
+                    lines.append(f"{html.escape(label)} — {SITE_PUBLIC_URL}/?r={tag} — "
+                                 f"opened {opened} time{'' if opened == 1 else 's'}")
+                send_telegram_message(chat_id, "\n".join(lines))
+                return
+            if len(name) > 80:
+                send_telegram_message(chat_id, "❌ That name is over 80 characters. " + usage)
+                return
+            tag = visit_tag_create(name)
+            if not tag:
+                send_telegram_message(chat_id, "❌ Could not save that link, so none was made. Try again.")
+                return
+            send_telegram_message(chat_id, f"🔗 {html.escape(name)}: {SITE_PUBLIC_URL}/?r={tag}\n"
+                                  f"When they open it you get \"Opened by {html.escape(name)}\".")
+            return
         # /wstages [1-5]: the last /w run's per-stage title samples (read-only).
         if text == "/wstages" or text.startswith("/wstages "):
             arg = text[len("/wstages"):].strip()
@@ -19420,7 +19450,8 @@ def process_webhook_payload_async(data):
                 "/owed - Every follow-up still owed (last 14 days), count + links\n"
                 "/owedx - Dismiss every open follow-up (CRM untouched; /owedx undo restores)\n"
                 "/refer - Pending referral asks from /w, 5 per page (/refer 2, /refer sent &lt;id&gt;)\n"
-                "/wstages - Last /w run: sample titles at each stage (/wstages 2 = the run before)\n\n"
+                "/wstages - Last /w run: sample titles at each stage (/wstages 2 = the run before)\n"
+                "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
@@ -20610,6 +20641,18 @@ def visit_tag_lookup(tag):
     except Exception as e:
         logging.error(f"Visit Tag Lookup Error: {type(e).__name__}")
         return None
+
+
+SITE_PUBLIC_URL = "https://montelattice.com"
+
+
+def visit_tag_list(limit=20):
+    """[(label, tag, opened_count)] for the `limit` most recent visit tags, newest first. opened_count is the number of
+    site_visits rows carrying that tag. Raises on a DB error (the /vlink handler turns that into a short reply)."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT t.label, t.tag, (SELECT COUNT(*) FROM site_visits v WHERE v.tag = t.tag) "
+            "FROM visit_tags t ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?", (int(limit),)).fetchall()
 
 
 def record_site_visits(views, day=None, alerts=None):

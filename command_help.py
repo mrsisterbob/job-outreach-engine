@@ -197,6 +197,12 @@ HELP = {
         "number can be 1-5. Read-only.",
         "/wstages 2",
     ),
+    "/vlink": (
+        "Makes a personal link to montelattice.com for one contact (https://montelattice.com/?r=...). "
+        "When they open it you get an alert that says who opened it. Asking again for the same name gives "
+        "the same link. /vlink alone lists the links made and how many times each was opened.",
+        "/vlink Jane Doe",
+    ),
     "/streak": (
         "The daily outreach scorecard - what you sent today and whether the streak held. "
         "/daily is the same thing.",
