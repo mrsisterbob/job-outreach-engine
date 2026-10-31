@@ -159,6 +159,16 @@ grep -i "contact" FUNCTION_INDEX.md
 | 134 | `build_index` | _(no docstring)_ |
 | 188 | `main` | _(no docstring)_ |
 
+## `build_info.py` — 5 defs, 68 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 19 | `_clean` | A 7-40 character lower-case hex string, or "" (empty, `HEAD`, an error sentence, a non-string). |
+| 27 | `_first_line` | _(no docstring)_ |
+| 31 | `_answer` | _(no docstring)_ |
+| 35 | `running_commit` | {"commit", "short", "source"} from, in order: environ RENDER_GIT_COMMIT, the first line of the file |
+| 63 | `format_build` | `build abc1234 (env:RENDER_GIT_COMMIT)`, or `build unknown (set on Render: see /health)` (never claims a commit). |
+
 ## `build_log.py` — 1 defs, 63 lines
 
 | Line | Name | Summary |
@@ -1385,4 +1395,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1061 definitions across 61 files + Code.gs.**
+**1066 definitions across 62 files + Code.gs.**

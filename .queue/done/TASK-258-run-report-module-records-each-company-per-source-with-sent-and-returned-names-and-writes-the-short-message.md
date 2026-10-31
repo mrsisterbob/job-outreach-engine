@@ -27,3 +27,5 @@ A pure module `run_report.py` holds one `/w` run's per-company facts (which sour
 
 ## Log
 
+
+- 2026-10-31 cloud worker: built; verify 25 passed (pure new module, nothing existing touched; full suites not re-run). Note: the detail hint prints `&lt;company&gt;` because the short message is sent as Telegram HTML.
