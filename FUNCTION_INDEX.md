@@ -944,6 +944,22 @@ grep -i "contact" FUNCTION_INDEX.md
 | 150 | `baseline_needed` | (needed, reason). False only when EVERY skip condition holds; any doubt is True. |
 | 188 | `main` | _(no docstring)_ |
 
+## `queue_cloud.py` — 11 defs, 212 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 22 | `parse_task_numbers` | Sorted unique ints from '227', 'TASK-227', 'task-227' or a range '227-229'. |
+| 47 | `_matches` | _(no docstring)_ |
+| 55 | `task_file_for` | The one file named TASK-<number>-*.md, None when none, ValueError when several. |
+| 68 | `is_held` | True when HELD FOR KEVIN is a heading or starts a line; mid-sentence does not count. |
+| 73 | `plan_send` | _(no docstring)_ |
+| 120 | `send_line` | _(no docstring)_ |
+| 127 | `commit_message` | _(no docstring)_ |
+| 138 | `push_line` | _(no docstring)_ |
+| 142 | `_squash` | _(no docstring)_ |
+| 146 | `block_reason_line` | First line of why a task was blocked, from the last BLOCKED bullet in its Log. |
+| 169 | `plan_pull` | _(no docstring)_ |
+
 ## `referral_asks.py` — 23 defs, 424 lines
 
 | Line | Name | Summary |
@@ -1482,4 +1498,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1133 definitions across 66 files + Code.gs.**
+**1144 definitions across 67 files + Code.gs.**
