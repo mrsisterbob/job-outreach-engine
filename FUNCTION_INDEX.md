@@ -122,6 +122,17 @@ grep -i "contact" FUNCTION_INDEX.md
 | 335 | `domain_board` | 'workday' for a host ending .myworkdayjobs.com, else ''. Other boards' domains are unmeasured. |
 | 341 | `summarize_feed_sources` | kept dict from split_rows -> display name -> {source_domain, job_board, rows}. |
 
+## `apify_usage_report.py` — 6 defs, 108 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 13 | `_type_name` | _(no docstring)_ |
+| 31 | `field_paths` | Sorted [(path, type_name, value_or_None)]. Value kept only for int, float and bool. |
+| 54 | `money_candidates` | Numeric paths whose last segment names usd/usage/cost/spent/credit. Candidates, not confirmed. |
+| 66 | `_scrub_str` | _(no docstring)_ |
+| 74 | `scrub` | Copy safe to commit: numbers, bools, nulls, dict keys, lists kept; free text replaced. |
+| 85 | `render_report` | Printable lines. A result is a dict: status (int or None), error (class name or None), |
+
 ## `ats_endpoint_report.py` — 13 defs, 199 lines
 
 | Line | Name | Summary |
@@ -1181,6 +1192,18 @@ grep -i "contact" FUNCTION_INDEX.md
 | 149 | `run` | _(no docstring)_ |
 | 167 | `main` | _(no docstring)_ |
 
+## `scripts/measure_apify_usage.py` — 7 defs, 146 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 33 | `_default_get` | _(no docstring)_ |
+| 38 | `_inside` | _(no docstring)_ |
+| 46 | `_slug` | _(no docstring)_ |
+| 51 | `_redact` | _(no docstring)_ |
+| 56 | `_write_new` | _(no docstring)_ |
+| 68 | `run` | _(no docstring)_ |
+| 141 | `main` | _(no docstring)_ |
+
 ## `scripts/measure_ats_endpoints.py` — 6 defs, 210 lines
 
 | Line | Name | Summary |
@@ -1545,4 +1568,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1171 definitions across 71 files + Code.gs.**
+**1184 definitions across 73 files + Code.gs.**
