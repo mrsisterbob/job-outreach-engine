@@ -45,6 +45,15 @@ import warm_screen_plan  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _clear_company_resolution_between_tests():
+    """clean_tables does not truncate company_resolution, so a row one test recorded would change what the next sees."""
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def clean_tables():
     """Truncate the tables under test before every test so cases don't bleed into each other."""
     with m.get_db_conn() as conn:
@@ -20969,6 +20978,9 @@ def test_hirebase_e2e_errored_reads_differently_from_nothing_found(monkeypatch):
     errored = h.run()
     assert "Hirebase errored for Nopeboard Labs" in errored and "nothing found" not in errored, errored
     assert "0 companies not searched" in errored and "jobs reserved against the month" in errored
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h2 = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
     h2.feed = []
     empty = h2.run()
@@ -21190,12 +21202,18 @@ def test_hirebase_empty_e2e_zero_row_company_is_not_requested_again_next_day(mon
     with m.get_db_conn() as conn:
         conn.execute("DELETE FROM hirebase_jobs_ledger WHERE company_key = ?", ("freshco labs",))
         conn.commit()
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h.posts.clear()
     h.run()
     slugs = _hb_slugs(h)
     assert "nopeboard-labs" not in slugs, slugs
     assert "freshco-labs" in slugs, slugs
     _hb_backdate("nopeboard labs", m.timedelta(days=15))
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h.posts.clear()
     h.run()
     assert "nopeboard-labs" in _hb_slugs(h)
@@ -21342,6 +21360,9 @@ def test_hirebase_slugreg_unreadable_registry_runs_as_before_and_all_plans_share
     monkeypatch.setattr(m, "hirebase_registry_read", lambda: None)
     seen.clear()
     h.posts.clear()
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h.run()   # no registry: Steelcase plans as before this task, with its guessed slug
     assert "steelcase" in _hb_slugs(h) and any("steelcase" in [x[0] for x in c] for c in seen), h.posts
 
@@ -21970,6 +21991,9 @@ def test_apify_wire_no_token_makes_no_apify_post_and_run_equals_apify_absent(mon
     h.apify_rows = [_apify_row("Smallfry Inc", "Finance Analyst", 1)]
     with_rows = h.run()
     assert h.apify_posts == [] and _apify_ledger() == [] and h.cards == []
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
     h2 = _apify_wire_harness(monkeypatch, token=None)
     h2.feed = []
     assert h2.run() == with_rows
@@ -22013,6 +22037,9 @@ def test_apify_wire_token_never_appears_in_logs(monkeypatch, caplog):
     import logging as _lg
     caplog.set_level(_lg.DEBUG)
     for mode in ("ok", "raise", "500"):
+        with m.get_db_conn() as conn:
+            conn.execute("DELETE FROM company_resolution")
+            conn.commit()
         h = _apify_wire_harness(monkeypatch)
         h.feed = []
         h.apify_mode = mode
@@ -22993,3 +23020,1323 @@ def test_hot_promote_untracked_code_gs_contract_quick_add_ch_and_uuid_lookups():
     assert "const ALL_TABS = Object.keys(TAB_MAP);" in gs and '"Carmen Hot": "PEOPLE"' in gs
     for action in ("set_status", "update_snooze", "append_note"):
         assert "findRecordBySheetUuid(ss, sheetUuid)" in _gs_action_block(gs, action), action
+
+
+# ---- /w reserves Hirebase turns for UNRESOLVED companies and remembers each answer (TASK-237) ----
+
+def _resolve_names(n, heavy=0):
+    """n no-board companies of descending weight: 'Resco00 Labs' heaviest."""
+    return {f"Resco{i:02d} Labs": (4 if i < heavy else 3 if i < max(heavy, n // 2) else 2) for i in range(n)}
+
+
+def _searched_keys(h):
+    return [kw["json"]["company_slugs"][0].replace("-", " ") for _u, kw in h.posts]
+
+
+def _resolution_rows():
+    with m.get_db_conn() as conn:
+        return {r[0]: r[1:] for r in conn.execute(
+            "SELECT company_key, outcome, attempted_at, next_eligible_at FROM company_resolution WHERE source = 'hirebase'")}
+
+
+def test_resolve_hirebase_zero_row_companies_store_empty_and_run_two_searches_different_ones(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(20))
+    h.feed = []
+    h.run()
+    first = _searched_keys(h)
+    assert len(first) == 8 and first == sorted(first), first   # per_run companies, heaviest first
+    rows = _resolution_rows()
+    assert set(rows) == set(first) and {v[0] for v in rows.values()} == {"empty"}, rows
+    h.posts.clear()
+    h.run()
+    second = _searched_keys(h)
+    assert len(second) == 8 and not set(first) & set(second), (first, second)
+    assert set(_resolution_rows()) == set(first) | set(second)
+
+
+def test_resolve_hirebase_errored_company_is_stored_error_a_day_out_and_not_searched_on_run_two(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(12))
+
+    def boom(url, **kw):
+        if url.endswith("/companies/search"):
+            return type("_C", (), {"status_code": 200, "json": lambda self: {"companies": []}})()
+        h.posts.append((url, kw))
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    h.run()
+    bad = _searched_keys(h)
+    assert len(bad) == 1, bad   # the first error stops the loop; the rest are not recorded
+    rows = _resolution_rows()
+    assert set(rows) == set(bad) and rows[bad[0]][0] == "error", rows
+    attempted = m.datetime.fromisoformat(rows[bad[0]][1])
+    nxt = m.datetime.fromisoformat(rows[bad[0]][2])
+    assert m.timedelta(hours=23) < nxt - attempted < m.timedelta(hours=25), (attempted, nxt)
+    _hb_set_post(h, monkeypatch)
+    h.posts.clear()
+    h.run()
+    assert bad[0] not in _searched_keys(h)
+
+
+def test_resolve_hirebase_company_with_rows_is_resolved_and_rescanned_without_a_reserved_slot(monkeypatch):
+    names = {"Nopeboard Labs": 6, **{f"Filler{i:02d} Labs": 2 for i in range(12)}}
+    h = _hirebase_hook_harness(monkeypatch, names)
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    first = _searched_keys(h)
+    assert first[0] == "nopeboard labs" and len(first) == 8, first
+    rows = _resolution_rows()
+    assert rows["nopeboard labs"][0] == "resolved"
+    assert {rows[k][0] for k in first[1:]} == {"empty"}
+    _hb_backdate("nopeboard labs", m.timedelta(days=5))
+    h.posts.clear()
+    h.run()
+    second = _searched_keys(h)
+    untouched = {f"filler{i:02d} labs" for i in range(12)} - set(first)
+    assert "nopeboard labs" in second, second
+    assert set(second) - {"nopeboard labs"} == untouched, (second, untouched)
+
+
+def test_resolve_hirebase_heavy_known_companies_do_not_push_out_the_reserved_unresolved_share(monkeypatch):
+    names = {**{f"Heavy{i} Labs": 9 for i in range(8)}, **{f"Newco{i} Labs": 1 for i in range(5)}}
+    h = _hirebase_hook_harness(monkeypatch, names)
+    for i in range(8):
+        assert m.resolution_record(f"heavy{i} labs", "hirebase", "resolved")
+    h.feed = []
+    h.run()
+    searched = _searched_keys(h)
+    new = [k for k in searched if k.startswith("newco")]
+    assert len(searched) == 8 and len(new) == 4, searched   # ceil(8 * 0.5) reserved for unresolved
+    assert len([k for k in searched if k.startswith("heavy")]) == 4
+
+
+def test_resolve_hirebase_sheet_switch_off_makes_zero_calls_and_says_so(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(10))
+    h.feed = []
+
+    class _Sheet:
+        status_code = 200
+        def json(self):
+            return {"status": "success", "filters": {"source_hirebase_enabled": False}}
+
+    monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: _Sheet())
+    try:
+        text = h.run()
+    finally:
+        with m.get_db_conn() as conn:
+            for k in m.SOURCE_CONFIG_KEYS:
+                conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+            conn.commit()
+    assert h.posts == [] and _hirebase_ledger_rows() == [], h.posts
+    assert "Hirebase: off in System_Config" in text, text
+    assert _resolution_rows() == {}
+
+
+def test_resolve_hirebase_unreadable_resolution_memory_runs_as_before_and_says_so(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(20))
+    h.feed = []
+    monkeypatch.setattr(m, "resolution_read", lambda: None)
+    text = h.run()
+    searched = _searched_keys(h)
+    assert len(searched) == 8 and searched == sorted(searched), searched
+    assert "resolution memory unreadable" in text, text
+    assert _resolution_rows() == {}
+
+
+def test_resolve_hirebase_cooldown_expiry_through_the_real_writer(monkeypatch):
+    h = _hirebase_hook_harness(monkeypatch, _resolve_names(3))
+    h.feed = []
+    now = m.datetime.now(m.timezone.utc)
+    m.resolution_record("resco00 labs", "hirebase", "empty", now=now - m.timedelta(days=46))   # 45-day cooldown over
+    m.resolution_record("resco01 labs", "hirebase", "empty", now=now - m.timedelta(days=44))   # still cooling
+    h.run()
+    searched = set(_searched_keys(h))
+    assert "resco00 labs" in searched and "resco01 labs" not in searched and "resco02 labs" in searched, searched
+
+
+# ---- /w gives unresolved companies a reserved Apify turn and Apify sees Hirebase's empties (TASK-238) ----
+
+def _apify_resolution_rows():
+    with m.get_db_conn() as conn:
+        return {r[0]: r[1:] for r in conn.execute(
+            "SELECT company_key, outcome, attempted_at, next_eligible_at FROM company_resolution WHERE source = 'apify'")}
+
+
+def _apify_sent(h):
+    return [n for _u, kw in h.apify_posts for n in kw["json"]["organizationSearch"]]
+
+
+def _sheet_config(monkeypatch, **filters):
+    class _Sheet:
+        status_code = 200
+        def json(self):
+            return {"status": "success", "filters": filters}
+    monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: _Sheet())
+
+
+def _clear_source_config_store():
+    with m.get_db_conn() as conn:
+        for k in m.SOURCE_CONFIG_KEYS:
+            conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+        conn.commit()
+
+
+def test_resolve_apify_hirebase_empty_company_in_cooldown_is_still_sent_to_apify(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3}, token=None)
+    h.feed = []
+    h.run()   # run 1: no Apify token; Hirebase answers empty and stores it
+    assert m.resolution_read()[("nopeboard labs", "hirebase")][0] == "empty"
+    monkeypatch.setenv("APIFY_TOKEN", _APIFY_TEST_TOKEN)
+    h.posts.clear()
+    h.run()
+    assert h.posts == [], "run 2 must not search Hirebase: the empty row is in cooldown"
+    assert _apify_sent(h) == ["Nopeboard Labs"], h.apify_posts
+
+
+def test_resolve_apify_twenty_empty_companies_run_two_sends_different_ones(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, _resolve_names(20))
+    h.feed = []
+    h.run()
+    first = _apify_sent(h)
+    assert len(first) == 8, first
+    rows = _apify_resolution_rows()
+    assert {v[0] for v in rows.values()} == {"empty"} and len(rows) == 8, rows
+    h.apify_posts.clear()
+    h.run()
+    second = _apify_sent(h)
+    assert len(second) == 8 and not set(first) & set(second), (first, second)
+
+
+def test_resolve_apify_errored_call_stores_error_waits_a_day_and_marks_nothing_seen(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = []
+    h.apify_mode = "500"
+    h.apify_rows = [_apify_row("Nopeboard Labs", "Ops Analyst", 1)]
+    text = h.run()
+    assert "Apify errored" in text and h.cards == []
+    rows = _apify_resolution_rows()
+    assert rows["nopeboard labs"][0] == "error", rows
+    gap = m.datetime.fromisoformat(rows["nopeboard labs"][2]) - m.datetime.fromisoformat(rows["nopeboard labs"][1])
+    assert m.timedelta(hours=23) < gap < m.timedelta(hours=25), gap
+    assert m.apify_seen_filter(["apify_nopeboardlabs1"]) == set()
+    h.apify_mode = "ok"
+    h.run()
+    assert len(h.apify_posts) == 1, "inside the one-day cooldown Apify is not called again"
+
+
+def test_resolve_apify_workday_company_is_resolved_then_scanned_as_a_board(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Smallfry Inc": 2})
+    _apify_learn_clear()
+    h.feed = []
+    h.apify_rows = [_apify_learn_wd_row()]
+    wd_calls = []
+    monkeypatch.setattr(m, "fetch_workday_jobs", lambda board: wd_calls.append(board) or [])
+    h.run()
+    assert _apify_resolution_rows()[m.normalize_company_for_match("Smallfry Inc")][0] == "resolved", _apify_resolution_rows()
+    assert _apify_learn_stored_triple("Smallfry Inc") == _APIFY_LEARN_WD
+    h.run()
+    assert len(h.apify_posts) == 1 and wd_calls == [_APIFY_LEARN_WD], (h.apify_posts, wd_calls)
+
+
+def test_resolve_apify_sheet_switch_off_makes_zero_calls_and_says_so(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = []
+    _sheet_config(monkeypatch, source_apify_enabled=False)
+    try:
+        text = h.run()
+    finally:
+        _clear_source_config_store()
+    assert h.apify_posts == [] and _apify_ledger() == [], h.apify_posts
+    assert "Apify: off in System_Config" in text, text
+    assert len(h.posts) >= 1   # Hirebase is unaffected
+    assert _apify_resolution_rows() == {}
+
+
+def test_resolve_apify_hirebase_errored_company_never_reaches_apify(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    router = m.requests.post
+
+    def hb_boom(url, **kw):
+        if "api.apify.com" in url or url.endswith("/companies/search"):
+            return router(url, **kw)
+        raise RuntimeError("hirebase down")
+
+    monkeypatch.setattr(m.requests, "post", hb_boom)
+    h.run()
+    assert m.resolution_read()[("nopeboard labs", "hirebase")][0] == "error"
+    h.run()
+    assert h.apify_posts == [] and _apify_resolution_rows() == {}
+
+
+def test_resolve_apify_sheet_dollar_budget_below_one_runs_worst_case_sends_nothing_and_says_so(monkeypatch):
+    h = _apify_wire_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = []
+    _sheet_config(monkeypatch, source_apify_monthly_usd=0.0001)
+    try:
+        text = h.run()
+    finally:
+        _clear_source_config_store()
+    assert h.apify_posts == [], h.apify_posts
+    assert "Apify skipped: monthly budget used" in text, text
+    assert _APIFY_TEST_TOKEN not in text
+
+
+# ---- /analytics/ingest reads a per-contact tag and the alert names who opened the site (TASK-239) ----
+
+def _tagged_view(tag, **kw):
+    v = _view(**kw)
+    v["tag"] = tag
+    return v
+
+
+def _tag_rows():
+    with m.get_db_conn() as conn:
+        return [r[0] for r in conn.execute("SELECT tag FROM site_visits ORDER BY id").fetchall()]
+
+
+@pytest.fixture
+def visit_tag_env(analytics_env):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM visit_tags")
+        conn.commit()
+    return analytics_env
+
+
+def test_visit_tag_ingest_known_tag_names_the_contact_and_is_stored(visit_tag_env):
+    tag = m.visit_tag_create("Jane Doe")
+    assert _ingest([_tagged_view(tag.upper())]).status_code == 200
+    assert "Opened by Jane Doe" in visit_tag_env[0], visit_tag_env
+    assert _tag_rows() == [tag]
+
+
+def test_visit_tag_ingest_unknown_well_formed_tag_names_nobody_and_stores_null(visit_tag_env):
+    m.visit_tag_create("Jane Doe")
+    assert _ingest([_tagged_view("zzzzzzzz")]).status_code == 200
+    assert len(visit_tag_env) == 1 and "Opened by" not in visit_tag_env[0]
+    assert _tag_rows() == [None]
+
+
+def test_visit_tag_ingest_malformed_tag_reads_as_none(visit_tag_env):
+    assert _ingest([_tagged_view("../x<script>")]).status_code == 200
+    assert len(visit_tag_env) == 1 and "Opened by" not in visit_tag_env[0]
+    assert _tag_rows() == [None]
+
+
+def test_visit_tag_ingest_tagged_probe_path_sends_no_alert(visit_tag_env):
+    tag = m.visit_tag_create("Jane Doe")
+    assert _ingest([_tagged_view(tag, path="/.env")]).status_code == 200
+    assert visit_tag_env == []
+
+
+def test_visit_tag_ingest_unreadable_tag_table_still_alerts_without_a_name(visit_tag_env):
+    tag = m.visit_tag_create("Jane Doe")
+    with m.get_db_conn() as conn:
+        conn.execute("ALTER TABLE visit_tags RENAME TO visit_tags_away")
+        conn.commit()
+    try:
+        assert _ingest([_tagged_view(tag)]).status_code == 200
+    finally:
+        with m.get_db_conn() as conn:
+            conn.execute("ALTER TABLE visit_tags_away RENAME TO visit_tags")
+            conn.commit()
+    assert len(visit_tag_env) == 1 and "Opened by" not in visit_tag_env[0]
+    assert _tag_rows() == [None]
+
+
+def test_visit_tag_ingest_label_with_markup_is_escaped(visit_tag_env):
+    tag = m.visit_tag_create("Jane <b>Doe</b>")
+    _ingest([_tagged_view(tag)])
+    assert "Jane &lt;b&gt;Doe&lt;/b&gt;" in visit_tag_env[0] and "<b>Doe" not in visit_tag_env[0]
+
+
+def test_visit_tag_ingest_view_without_a_tag_key_alerts_exactly_as_before(visit_tag_env):
+    _ingest([_view()])
+    assert len(visit_tag_env) == 1
+    assert visit_tag_env[0].splitlines()[0].startswith("👀") and "👤" not in visit_tag_env[0]
+    assert "Opened by" not in visit_tag_env[0] and _tag_rows() == [None]
+
+
+def test_visit_tag_ingest_create_is_idempotent_per_label_and_refuses_blank(visit_tag_env):
+    a = m.visit_tag_create("  Jane   Doe ")
+    assert a and m.visit_tag_create("Jane Doe") == a
+    assert m.visit_tag_create("   ") is None and m.visit_tag_lookup(a) == "Jane Doe"
+    assert m.visit_tag_lookup("zzzzzzzz") is None
+
+
+# ---- /vlink makes a per-contact link and lists the ones made (TASK-240) ----
+
+def _vlink(monkeypatch, text):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    _dispatch(text)
+    return sent
+
+
+@pytest.fixture
+def vlink_env(analytics_env):
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM visit_tags")
+        conn.commit()
+    return analytics_env
+
+
+def _vlink_tags():
+    with m.get_db_conn() as conn:
+        return {r[0]: r[1] for r in conn.execute("SELECT tag, label FROM visit_tags").fetchall()}
+
+
+def test_vlink_first_call_creates_a_tag_and_returns_its_link(monkeypatch, vlink_env):
+    (reply,) = _vlink(monkeypatch, "/vlink Jane Doe")
+    tags = _vlink_tags()
+    assert len(tags) == 1
+    (tag, label), = tags.items()
+    assert label == "Jane Doe" and f"https://montelattice.com/?r={tag}" in reply
+    assert "Opened by Jane Doe" in reply
+
+
+def test_vlink_same_name_again_returns_the_same_link_and_adds_no_row(monkeypatch, vlink_env):
+    first = _vlink(monkeypatch, "/vlink Jane Doe")[0]
+    second = _vlink(monkeypatch, "/vlink  Jane   Doe ")[0]
+    assert first == second and len(_vlink_tags()) == 1
+
+
+def test_vlink_two_names_get_different_links(monkeypatch, vlink_env):
+    _vlink(monkeypatch, "/vlink Jane Doe")
+    _vlink(monkeypatch, "/vlink John Roe")
+    assert len(_vlink_tags()) == 2 and len(set(_vlink_tags())) == 2
+
+
+def test_vlink_alone_lists_links_with_the_opened_count(monkeypatch, vlink_env):
+    assert "No links made yet" in _vlink(monkeypatch, "/vlink")[0]
+    _vlink(monkeypatch, "/vlink Jane <b>Doe</b>")
+    jane = [t for t, l in _vlink_tags().items()][0]
+    _vlink(monkeypatch, "/vlink John Roe")
+    assert _ingest([_tagged_view(jane, ip="203.0.113.1"), _tagged_view(jane, ip="203.0.113.2")]).status_code == 200
+    (listing,) = _vlink(monkeypatch, "/vlink")
+    assert f"?r={jane} — opened 2 times" in listing, listing
+    assert "opened 0 times" in listing and "Jane &lt;b&gt;Doe&lt;/b&gt;" in listing
+
+
+def test_vlink_blank_or_overlong_name_creates_nothing(monkeypatch, vlink_env):
+    assert "No links made yet" in _vlink(monkeypatch, "/vlink   ")[0]
+    assert "80 characters" in _vlink(monkeypatch, "/vlink " + "x" * 81)[0]
+    assert _vlink_tags() == {}
+
+
+def test_vlink_db_write_failure_replies_could_not_save_and_no_link(monkeypatch, vlink_env):
+    with m.get_db_conn() as conn:
+        conn.execute("ALTER TABLE visit_tags RENAME TO visit_tags_away")
+        conn.commit()
+    try:
+        (reply,) = _vlink(monkeypatch, "/vlink Jane Doe")
+    finally:
+        with m.get_db_conn() as conn:
+            conn.execute("ALTER TABLE visit_tags_away RENAME TO visit_tags")
+            conn.commit()
+    assert "Could not save" in reply and "?r=" not in reply
+
+
+# ---- ATS resolver storage: found boards, its own spend ledger, 'bought' board writer, sheet keys (TASK-244) ----
+
+@pytest.fixture(autouse=True)
+def _clear_ats_resolver_tables_between_tests():
+    """clean_tables does not truncate these, so a row from one test would silently change the next."""
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM company_board_found")
+        conn.execute("DELETE FROM ats_resolver_ledger")
+        conn.commit()
+    yield
+
+
+def _ats_identity(name):
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT ats_slug, workday_board, board_system, board_source FROM company_identities "
+                            "WHERE normalized_name = ?", (m.normalize_company_for_match(name),)).fetchone()
+
+
+def test_ats_store_found_board_round_trips_all_fields():
+    now = m.datetime(2026, 10, 1, tzinfo=m.timezone.utc)
+    assert m.board_found_record("acme", "Acme Inc", "greenhouse", "acmeco", "https://boards.greenhouse.io/acmeco",
+                                "greenhouse", "acmeco", now=now)
+    assert m.board_found_read()["acme"] == ("greenhouse", "acmeco", "https://boards.greenhouse.io/acmeco",
+                                            "greenhouse", "acmeco", now.isoformat())
+    assert m.board_found_record("", "x", "greenhouse", "t", "u") is False
+    assert m.board_found_record("k", "x", "", "t", "u") is False
+
+
+def test_ats_store_scannable_greenhouse_board_is_visible_to_w_as_bought():
+    assert m.remember_found_board("Acme Inc", "acme", "greenhouse", "acmeco", "u", "greenhouse", "acmeco") == "scannable"
+    assert _ats_identity("Acme Inc") == ("acmeco", None, "greenhouse", "bought")
+    assert ("Acme Inc", "acmeco", "greenhouse") in m.list_bought_boards()
+
+
+def test_ats_store_workday_triple_lands_in_workday_board_and_a_malformed_one_changes_nothing():
+    assert m.remember_found_board("Wd Co", "wd co", "workday", "t", "u", "workday", "wdco/wd5/Careers") == "scannable"
+    assert _ats_identity("Wd Co") == (None, "wdco/wd5/Careers", "workday", "bought")
+    assert m.remember_found_board("Bad Co", "bad co", "workday", "t", "u", "workday", "badco/wd5") == "known_not_scannable"
+    assert _ats_identity("Bad Co") is None and "bad co" in m.board_found_read()
+
+
+def test_ats_store_platform_w_cannot_scan_writes_only_the_found_board_row():
+    assert m.remember_found_board("Odd Co", "odd co", "icims", "t", "u", "", "") == "known_not_scannable"
+    assert _ats_identity("Odd Co") is None and m.board_found_read()["odd co"][0] == "icims"
+
+
+def test_ats_store_company_with_a_board_already_keeps_it():
+    m.upsert_company_identity("Have Co", ats_slug="haveco", board_system="greenhouse", board_source="own")
+    assert m.remember_found_board("Have Co", "have co", "lever", "other", "u", "lever", "other") == "kept_existing"
+    assert _ats_identity("Have Co") == ("haveco", None, "greenhouse", "own")
+    assert m.board_found_read()["have co"][1] == "other"
+
+
+def test_ats_store_switch_off_clears_what_it_added_and_leaves_an_own_row():
+    m.remember_found_board("Acme Inc", "acme", "greenhouse", "acmeco", "u", "greenhouse", "acmeco")
+    m.upsert_company_identity("Own Co", ats_slug="ownco", board_system="greenhouse", board_source="own")
+    assert m.switch_off_bought_boards() == 1
+    assert _ats_identity("Acme Inc") == (None, None, None, "bought")
+    assert _ats_identity("Own Co") == ("ownco", None, "greenhouse", "own")
+
+
+def test_ats_store_ledger_reserve_settle_and_month_spend():
+    rid = m.ats_resolver_ledger_reserve(["a", "b"], 1.25)
+    rows = m.ats_resolver_ledger_read()
+    assert [(r[1], r[2], r[3]) for r in rows] == [(1.25, "errored", ["a", "b"])]
+    assert m.ats_resolver_ledger_settle(rid, 0.4, "ok") is True
+    assert [(r[1], r[2]) for r in m.ats_resolver_ledger_read()] == [(0.4, "ok")]
+    now = m.datetime.now(m.timezone.utc)
+    old = (now - m.timedelta(days=40)).isoformat()
+    ledger = [(old, 9.0, "ok", []), (now.isoformat(), 2.0, "errored", []), (now.isoformat(), 0.5, "ok", [])]
+    assert m.ats_resolver_month_spent(ledger, now) == 2.5
+    assert m.ats_resolver_month_spent(None, now) is None
+    assert m.ats_resolver_ledger_reserve(["a"], -1) is None and m.ats_resolver_ledger_settle(rid, 1, "bad") is False
+    with m.get_db_conn() as conn:
+        conn.execute("ALTER TABLE ats_resolver_ledger RENAME TO ats_resolver_ledger_away")
+        conn.commit()
+    try:
+        assert m.ats_resolver_ledger_read() is None
+    finally:
+        with m.get_db_conn() as conn:
+            conn.execute("ALTER TABLE ats_resolver_ledger_away RENAME TO ats_resolver_ledger")
+            conn.commit()
+
+
+def test_ats_store_sheet_keys_are_read_and_an_empty_sheet_leaves_the_resolver_off(monkeypatch):
+    for k in ("source_ats_resolver_enabled", "source_ats_resolver_companies_per_run", "source_ats_resolver_monthly_usd"):
+        assert k in m.SOURCE_CONFIG_KEYS
+
+    class _Sheet:
+        def __init__(self, filters):
+            self.status_code, self._f = 200, filters
+        def json(self):
+            return {"status": "success", "filters": self._f}
+
+    try:
+        monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: _Sheet({}))
+        cfg, origin = m.source_config_read()
+        assert origin == "sheet" and cfg.resolver_on is False and cfg.resolver_enabled is False
+        monkeypatch.setattr(m, "crm_get", lambda params, timeout=10: _Sheet(
+            {"source_ats_resolver_enabled": "on", "source_ats_resolver_monthly_usd": 4, "source_ats_resolver_companies_per_run": 2}))
+        cfg, _o = m.source_config_read()
+        assert (cfg.resolver_on, cfg.resolver_per_run, cfg.resolver_monthly_usd) == (True, 2, 4.0)
+    finally:
+        with m.get_db_conn() as conn:
+            for k in m.SOURCE_CONFIG_KEYS:
+                conn.execute("DELETE FROM search_filters WHERE key = ?", (k,))
+            conn.commit()
+
+
+# ---- unsolicited mail from an unknown sender is held in the tray and never pings (TASK-255) ----
+
+@pytest.fixture(autouse=True)
+def _inbound_unsolicited_legacy_mode(request, monkeypatch):
+    """Older poll tests assert that a stranger alerts (the rule before holding existed); the inbound_hold tests set
+    "hold" themselves."""
+    if "inbound_hold" not in request.node.name:
+        monkeypatch.setattr(m, "INBOUND_UNSOLICITED_MODE", "alert")
+    yield
+
+
+_COLD_SENDER = "Dana Reed <dana.reed@growthmail-partners.com>"
+_COLD_SUBJECT = "Quick question about your services"
+_COLD_BODY = "Hi Kevin, I wanted to introduce our lead generation service for professionals."
+
+
+def _hold_poll(monkeypatch, messages, mode="hold", **kw):
+    monkeypatch.setattr(m, "INBOUND_UNSOLICITED_MODE", mode)
+    monkeypatch.setattr(m, "route_rejection_to_died", lambda *a, **k: "")
+    _clear_tray()
+    return _run_poll_with_fake_gmail(monkeypatch, messages, real_tray=True, **kw)
+
+
+def _tray_rows():
+    with m.get_db_conn() as conn:
+        return conn.execute("SELECT thread_id, state, match_reason, message_count, alerted FROM inbound_threads").fetchall()
+
+
+def test_inbound_hold_unsolicited_stranger_sends_no_alert_is_marked_read_and_is_recorded_held(monkeypatch):
+    alerts, marked = _hold_poll(monkeypatch, [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)])
+    assert alerts == [] and marked == ["cold"]
+    assert _tray_rows() == [("thread-cold", "held", "held: unsolicited, not a reply", 1, 0)]
+    _clear_tray()
+
+
+def test_inbound_hold_re_subject_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("re1", _COLD_SENDER, "Re: Kevin Miller", _COLD_BODY)])
+    assert len(alerts) == 1 and _tray_rows()[0][1] == "open"
+    _clear_tray()
+
+
+def test_inbound_hold_in_reply_to_header_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("irt", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY,
+                                                         extra_headers={"In-Reply-To": "<abc@mail.gmail.com>"})])
+    assert len(alerts) == 1
+    _clear_tray()
+
+
+def test_inbound_hold_references_header_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("ref", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY,
+                                                         extra_headers={"References": "<abc@mail.gmail.com>"})])
+    assert len(alerts) == 1
+    _clear_tray()
+
+
+def test_inbound_hold_interview_wording_with_no_reply_headers_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message(
+        "iv", "Sam Lee <sam.lee@acmehiring.com>", "Next steps",
+        "We would like to schedule an interview with you next week. Please send your availability.")])
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    _clear_tray()
+
+
+def test_inbound_hold_calendar_invite_with_no_reply_headers_still_alerts(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("cal", FITTERMAN_SENDER, FITTERMAN_SUBJECT, FITTERMAN_SNIPPET,
+                                                         ics=FITTERMAN_ICS)])
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    _clear_tray()
+
+
+def test_inbound_hold_stranger_rejection_with_no_reply_headers_alerts_and_routes(monkeypatch):
+    routed = []
+    monkeypatch.setattr(m, "INBOUND_UNSOLICITED_MODE", "hold")
+    monkeypatch.setattr(m, "route_rejection_to_died", lambda *a, **k: routed.append(a) or "")
+    _clear_tray()
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [_gmail_message(
+        "rj", "Pat Kim <pat.kim@trinityhealth.org>", "Update on your application",
+        "Unfortunately, we have decided to move forward with other candidates.")], real_tray=True)
+    assert len(alerts) == 1 and "Rejection" in alerts[0] and len(routed) == 1
+    _clear_tray()
+
+
+def test_inbound_hold_second_message_on_a_held_thread_bumps_the_count_and_stays_held(monkeypatch):
+    msgs = [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)]
+    _hold_poll(monkeypatch, msgs)
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, msgs, real_tray=True)
+    assert alerts == []
+    assert _tray_rows() == [("thread-cold", "held", "held: unsolicited, not a reply", 2, 0)]
+    _clear_tray()
+
+
+def test_inbound_hold_failing_tray_write_leaves_the_mail_unread_and_sends_nothing(monkeypatch):
+    monkeypatch.setattr(m, "record_held_thread", lambda *a, **k: False)
+    alerts, marked = _hold_poll(monkeypatch, [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)])
+    assert alerts == [] and marked == [] and _tray_rows() == []
+
+
+def test_inbound_hold_alert_mode_alerts_and_writes_no_held_row(monkeypatch):
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)], mode="alert")
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    _clear_tray()
+
+
+def test_inbound_hold_held_rows_stay_out_of_inbox_and_the_reply_count(monkeypatch):
+    before = m.get_weekly_build_log_counts(7)["replies"]
+    _hold_poll(monkeypatch, [_gmail_message("cold", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)])
+    assert m.get_open_inbound_threads() == []
+    assert m.get_weekly_build_log_counts(7)["replies"] == before
+    _clear_tray()
+
+
+def test_inbound_hold_verified_contact_and_thread_participant_are_never_held(monkeypatch):
+    monkeypatch.setattr(m, "record_application_outcome", lambda *a, **k: None)
+    monkeypatch.setattr(m, "route_inbound_reply_to_crm", lambda *a, **k: None)
+    contact = {"name": "Dana", "company": "Career.io", "tab": "Carmen Cold", "sheet_uuid": ""}
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("v", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)],
+                           crm_lookup=lambda sender: contact)
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    alerts, _ = _hold_poll(monkeypatch, [_gmail_message("p", _COLD_SENDER, _COLD_SUBJECT, _COLD_BODY)], thread_started=True)
+    assert len(alerts) == 1 and not any(r[1] == "held" for r in _tray_rows())
+    _clear_tray()
+
+
+def test_inbound_hold_held_inbound_since_lists_newest_first_honours_the_window_and_none_on_error(monkeypatch):
+    _clear_tray()
+    assert m.record_held_thread("t1", "a@x.com", "Ann", "First", "s", "unsolicited, not a reply", "")
+    assert m.record_held_thread("t2", "b@x.com", "Bob", "Second", "s", "unsolicited, not a reply", "")
+    assert m.record_held_thread("t3", "c@x.com", "Cy", "Old", "s", "unsolicited, not a reply", "")
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE inbound_threads SET first_seen = datetime('now', '-2 days') WHERE thread_id = 't3'")
+        conn.execute("UPDATE inbound_threads SET first_seen = datetime('now', '-1 hours') WHERE thread_id = 't1'")
+        conn.commit()
+    assert m.held_inbound_since(24) == [("Bob", "b@x.com", "Second"), ("Ann", "a@x.com", "First")]
+    monkeypatch.setattr(m, "get_db_conn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    assert m.held_inbound_since(24) is None
+    monkeypatch.undo()
+    _clear_tray()
+
+
+def test_inbound_hold_default_mode_is_hold_for_an_empty_environment():
+    assert m.inbound_hold.parse_mode("") == "hold" and m.inbound_hold.parse_mode(None) == "hold"
+    assert m.inbound_hold.DEFAULT_MODE == "hold"
+
+
+# ---- the 08:30 standup counts the unsolicited email held in the last day (TASK-256) ----
+
+def _hold_rows(names):
+    _clear_tray()
+    for i, (name, subject) in enumerate(names):
+        assert m.record_held_thread(f"th{i}", f"s{i}@x.com", name, subject, "SECRET SNIPPET BODY", "unsolicited, not a reply", "")
+        with m.get_db_conn() as conn:   # distinct, ordered first_seen so "newest first" is testable
+            conn.execute("UPDATE inbound_threads SET first_seen = datetime('now', ?) WHERE thread_id = ?",
+                         (f"-{len(names) - i} minutes", f"th{i}"))
+            conn.commit()
+
+
+def test_standup_held_three_rows_are_counted_and_named_without_snippet_text(monkeypatch, analytics_env):
+    _hold_rows([("Ann", "One"), ("Bob", "Two"), ("Cy", "Three")])
+    text = _standup_text(monkeypatch)
+    assert "3 unsolicited emails held, not pinged" in text
+    assert all(n in text for n in ("Ann", "Bob", "Cy")) and "SECRET SNIPPET" not in text
+    _clear_tray()
+
+
+def test_standup_held_none_held_adds_nothing_and_matches_a_run_with_no_held_rows(monkeypatch, analytics_env):
+    _clear_tray()
+    text = _standup_text(monkeypatch)
+    assert "held" not in text and "📪" not in text
+    _hold_rows([("Ann", "One")])
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_threads WHERE state = 'held'")
+        conn.commit()
+    assert _standup_text(monkeypatch) == text
+    _clear_tray()
+
+
+def test_standup_held_five_rows_name_the_newest_three_and_count_the_rest(monkeypatch, analytics_env):
+    _hold_rows([(f"P{i}", f"S{i}") for i in range(5)])
+    line = [ln for ln in _standup_text(monkeypatch).splitlines() if "📪" in ln][0]
+    assert "5 unsolicited emails" in line and "(+2 more)" in line
+    assert line.index("P4") < line.index("P3") < line.index("P2") and "P1" not in line
+    _clear_tray()
+
+
+def test_standup_held_a_row_older_than_a_day_is_not_counted(monkeypatch, analytics_env):
+    _hold_rows([("Old", "Stale"), ("New", "Fresh")])
+    with m.get_db_conn() as conn:
+        conn.execute("UPDATE inbound_threads SET first_seen = datetime('now', '-30 hours') WHERE thread_id = 'th0'")
+        conn.commit()
+    text = _standup_text(monkeypatch)
+    assert "1 unsolicited email held" in text and "Stale" not in text
+    _clear_tray()
+
+
+def test_standup_held_a_failing_read_still_sends_and_says_unavailable(monkeypatch, analytics_env):
+    def boom(hours=24):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "held_inbound_since", boom)
+    assert "held-mail count unavailable" in _standup_text(monkeypatch)
+
+
+def test_standup_held_an_html_special_sender_name_is_escaped(monkeypatch, analytics_env):
+    _hold_rows([("<b>Evil</b>", "<i>x</i>")])
+    text = _standup_text(monkeypatch)
+    assert "<b>Evil</b>" not in text and "&lt;b&gt;Evil" in text and "<i>x</i>" not in text
+    _clear_tray()
+
+
+def test_standup_held_the_visitor_line_is_unchanged_when_held_rows_exist(monkeypatch, analytics_env):
+    _clear_tray()
+    before = [ln for ln in _standup_text(monkeypatch).splitlines() if "montelattice.com" in ln]
+    _hold_rows([("Ann", "One")])
+    after = [ln for ln in _standup_text(monkeypatch).splitlines() if "montelattice.com" in ln]
+    assert before == after and before
+    _clear_tray()
+
+
+# ---- warm_run_reports store (newest 10) and the build in /health (TASK-260) ----
+
+@pytest.fixture(autouse=True)
+def _clear_warm_run_reports_between_tests():
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM warm_run_reports")
+        conn.commit()
+    yield
+
+
+def _run_snapshot(n, commit="a" * 40, source="git"):
+    rec = m.run_report.RunRecorder(f"run-{n:03d}", f"2026-10-{n:02d} 08:00:00", {"commit": commit, "short": commit[:7], "source": source})
+    rec.note_source_call("apify", f"Acme {n}", status="ok", returned=2, kept=2)
+    return rec.snapshot()
+
+
+def test_warm_run_report_write_then_read_round_trips_snapshot_detail_and_commit():
+    snap = _run_snapshot(5)
+    assert m._warm_run_report_write(snap, "full closing text") is True
+    got = m._warm_run_report_read()
+    assert got["run_id"] == "run-005" and got["snapshot"] == snap and got["detail"] == "full closing text"
+    assert (got["commit_sha"], got["commit_source"]) == ("a" * 40, "git") and got["run_at"] == "2026-10-05 08:00:00"
+
+
+def test_warm_run_report_the_eleventh_write_deletes_the_oldest():
+    for n in range(1, 12):
+        assert m._warm_run_report_write(_run_snapshot(n), f"d{n}")
+    ids = [r[0] for r in m._warm_run_report_list(20)]
+    assert len(ids) == 10 and ids[0] == "run-011" and "run-001" not in ids and ids[-1] == "run-002"
+
+
+def test_warm_run_report_the_same_run_id_twice_leaves_one_row_with_the_newer_content():
+    m._warm_run_report_write(_run_snapshot(3), "old")
+    m._warm_run_report_write(_run_snapshot(3, commit="b" * 40), "new")
+    assert len(m._warm_run_report_list()) == 1
+    got = m._warm_run_report_read()
+    assert got["detail"] == "new" and got["commit_sha"] == "b" * 40
+
+
+def test_warm_run_report_nth_two_returns_the_previous_run():
+    m._warm_run_report_write(_run_snapshot(1), "one")
+    m._warm_run_report_write(_run_snapshot(2), "two")
+    assert m._warm_run_report_read(2)["run_id"] == "run-001" and m._warm_run_report_read(3) is None
+
+
+def test_warm_run_report_read_on_an_empty_table_is_none():
+    assert m._warm_run_report_read() is None and m._warm_run_report_list() == []
+
+
+def test_warm_run_report_a_seventy_thousand_character_detail_is_stored_cut_with_the_marker():
+    detail = "".join(f"line {i:05d}\n" for i in range(7000))[:70000]
+    m._warm_run_report_write(_run_snapshot(1), detail)
+    stored = m._warm_run_report_read()["detail"]
+    assert stored.startswith(detail[:60000]) and stored.endswith("... (cut at 60,000 characters)")
+    assert len(stored) == 60000 + 1 + len("... (cut at 60,000 characters)")
+    m._warm_run_report_write(_run_snapshot(2), "short")
+    assert m._warm_run_report_read()["detail"] == "short"
+
+
+def test_warm_run_report_a_failing_write_returns_false_and_logs_no_snapshot_text(monkeypatch, caplog):
+    monkeypatch.setattr(m, "get_db_conn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down SECRETSNAPSHOT")))
+    snap = _run_snapshot(1)
+    snap["problems"] = ["SECRETSNAPSHOT"]
+    assert m._warm_run_report_write(snap, "SECRETDETAIL") is False
+    assert "SECRETSNAPSHOT" not in caplog.text and "SECRETDETAIL" not in caplog.text and "RuntimeError" in caplog.text
+
+
+def test_warm_run_report_a_failing_read_propagates(monkeypatch):
+    monkeypatch.setattr(m, "get_db_conn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    with pytest.raises(RuntimeError):
+        m._warm_run_report_read()
+
+
+def test_warm_run_report_health_reports_the_build_and_keeps_its_old_keys():
+    with m.app.test_client() as client:
+        body = client.get("/health").get_json()
+    assert set(body["build"]) == {"commit", "short", "source"}
+    assert {"status", "mode", "elapsed_ms", "persistence"} <= set(body) and body["status"] == "ok"
+
+
+def test_warm_run_report_build_info_is_unknown_when_env_file_and_git_all_fail():
+    def boom(*a):
+        raise RuntimeError("nope")
+    info = m._compute_build_info(environ={}, read_file=boom, run_git=boom)
+    assert info == {"commit": "", "short": "", "source": "unknown"}
+    assert m._compute_build_info(environ={"RENDER_GIT_COMMIT": "c" * 40}, read_file=boom, run_git=boom)["source"] == "env:RENDER_GIT_COMMIT"
+
+
+# ---- /w saves its full text and per-company record, and sends a short closing message (TASK-261) ----
+
+@pytest.fixture(autouse=True)
+def _warm_closing_full_legacy(request, monkeypatch):
+    """About 30 older tests read the long closing text through the harness; they run with the old (full) message. The
+    warm_closing_short tests set the mode themselves."""
+    if "warm_closing_short" not in request.node.name:
+        monkeypatch.setattr(m, "WARM_CLOSING_MODE", "full")
+    yield
+
+
+def _closing(h):
+    return h.messages[-1]
+
+
+def _many_company_run(monkeypatch, mode="short", n=20):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", mode)
+    h = _apify_wire_harness(monkeypatch, _resolve_names(n))
+    h.feed = []
+    h.apify_rows = [_apify_row("Resco00 Labs", "Finance Analyst", 1)]
+    h.run()
+    return h
+
+
+def test_warm_closing_short_default_mode_is_at_most_twelve_lines_and_1400_characters(monkeypatch):
+    h = _many_company_run(monkeypatch)
+    short = _closing(h)
+    assert len(short.splitlines()) <= 12 and len(short) <= 1400, short
+    detail = m._warm_run_report_read()["detail"]
+    assert len(detail.splitlines()) > len(short.splitlines()), (detail, short)
+
+
+def test_warm_closing_short_full_mode_sends_the_long_text_and_stores_exactly_that(monkeypatch):
+    h = _many_company_run(monkeypatch, mode="full")
+    assert _closing(h) == m._warm_run_report_read()["detail"]
+    assert "Detail: /wrun" not in _closing(h)
+
+
+def test_warm_closing_short_stored_detail_has_lines_the_short_message_lacks(monkeypatch):
+    h = _many_company_run(monkeypatch)
+    short_lines = set(_closing(h).splitlines())
+    detail_lines = m._warm_run_report_read()["detail"].splitlines()
+    assert [ln for ln in detail_lines if ln not in short_lines]
+    assert detail_lines[0].startswith("🏁 Warm scan complete") and detail_lines[0] in short_lines
+
+
+def test_warm_closing_short_ends_with_the_detail_hint_and_names_the_build(monkeypatch):
+    monkeypatch.setattr(m, "BUILD_INFO", {"commit": "abcdef1234567890" * 2 + "abcdef12", "short": "abcdef1", "source": "git"})
+    h = _many_company_run(monkeypatch, n=3)
+    short = _closing(h)
+    assert short.splitlines()[-1].startswith("Detail: /wrun") and "Build abcdef1 (git)" in short
+    monkeypatch.setattr(m, "BUILD_INFO", {"commit": "", "short": "", "source": "unknown"})
+    h2 = _many_company_run(monkeypatch, n=3)
+    assert "Build unknown" in _closing(h2)
+
+
+def test_warm_closing_short_haworth_case_keeps_the_sent_name_and_both_returned_names(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _apify_wire_harness(monkeypatch, {"Haworth Inc.": 3})
+    h.feed = []
+    h.apify_rows = [_apify_row("Haworth Inc.", "Finance Analyst", 1), _apify_row("Haworth International", "Analyst", 2)]
+    h.run()
+    snap = m._warm_run_report_read()["snapshot"]
+    e = [c for c in snap["companies"] if c["name"] == "Haworth Inc."][0]["sources"]["apify"]
+    assert e["sent"] == "Haworth Inc." and e["kept"] == 1
+    assert set(e["returned_names"]) == {"Haworth Inc.", "Haworth International"}
+    assert "Haworth International" in m.run_report.render_company(snap, "Haworth Inc.")
+
+
+def test_warm_closing_short_a_greenhouse_posting_is_counted_under_greenhouse_for_its_company(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _warm_title_harness(monkeypatch, ["Operations Analyst"])
+    h.run()
+    snap = m._warm_run_report_read()["snapshot"]
+    acme = [c for c in snap["companies"] if c["name"] == "Acme Robotics"][0]
+    assert acme["sources"]["greenhouse"]["postings"] == 1
+
+
+def test_warm_closing_short_a_hirebase_posting_is_counted_under_hirebase(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    h.run()
+    snap = m._warm_run_report_read()["snapshot"]
+    e = [c for c in snap["companies"] if c["name"] == "Nopeboard Labs"][0]["sources"]["hirebase"]
+    assert e["postings"] == 1 and e["kept"] == 1 and e["sent"] == "Nopeboard Labs"
+
+
+def test_warm_closing_short_a_failed_store_write_sends_the_full_text_with_a_note(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    monkeypatch.setattr(m, "_warm_run_report_write", lambda snapshot, detail: False)
+    h = _apify_wire_harness(monkeypatch, _resolve_names(5))
+    h.feed = []
+    h.run()
+    text = _closing(h)
+    assert text.endswith("Detail not saved (store write failed); this is the full text.")
+    assert text.startswith("🏁 Warm scan complete") and "Detail: /wrun" not in text
+
+
+def test_warm_closing_short_a_raising_recorder_changes_nothing_else(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _warm_title_harness(monkeypatch, ["Operations Analyst"])
+
+    def boom(self, *a, **k):
+        raise RuntimeError("recorder bug")
+
+    monkeypatch.setattr(m.run_report.RunRecorder, "note_posting", boom)
+    h.run()
+    assert h.cards == ["Operations Analyst"]
+    assert "Warm scan complete" in _closing(h)
+
+
+def test_warm_closing_short_the_private_returned_name_key_never_leaves_the_collector(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+    h.feed = [_hirebase_job("Nopeboard Labs", "Operations Analyst", 1)]
+    cards = []
+    monkeypatch.setattr(m, "send_telegram_card", lambda job, *a, **kw: cards.append(dict(job)) or True)
+    hashed = []
+    real_hash = m.generate_dedup_hash
+    monkeypatch.setattr(m, "generate_dedup_hash", lambda *a, **k: hashed.append(a) or real_hash(*a, **k))
+    h.run()
+    assert cards and all("_returned_name" not in c for c in cards)
+    assert all("_returned_name" not in json.dumps(p, default=str) for p in h.payloads) if hasattr(h, "payloads") else True
+    assert hashed and all("_returned_name" not in str(a) for a in hashed)
+
+
+def test_warm_closing_short_an_errored_hirebase_call_reaches_the_phone_and_the_snapshot(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _hirebase_hook_harness(monkeypatch, {"Nopeboard Labs": 3})
+
+    def boom(url, **kw):
+        if url.endswith("/companies/search"):
+            return type("_C", (), {"status_code": 200, "json": lambda self: {"companies": []}})()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m.requests, "post", boom)
+    h.run()
+    assert "errored" in _closing(h).lower() and "Nopeboard Labs" in _closing(h)
+    e = [c for c in m._warm_run_report_read()["snapshot"]["companies"] if c["name"] == "Nopeboard Labs"][0]["sources"]["hirebase"]
+    assert e["status"] == "errored"
+
+
+def test_warm_closing_short_early_return_paths_stay_one_short_message_and_write_no_report(monkeypatch):
+    monkeypatch.setattr(m, "WARM_CLOSING_MODE", "short")
+    h = _WarmRadarHarness(monkeypatch, ["Acme Robotics"])
+    h.run()
+    assert "has a cached job board yet" in _closing(h)
+    assert m._warm_run_report_list() == []
+
+
+def test_warm_closing_short_the_scan_result_is_the_same_in_short_and_full_mode(monkeypatch):
+    def scenario(mode):
+        with m.get_db_conn() as conn:
+            for table in ("seen_jobs", "seen_content_hashes", "died_roles", "jobs", "warm_stage_samples", "warm_screen_memo"):
+                conn.execute(f"DELETE FROM {table}")
+            conn.commit()
+        monkeypatch.setattr(m, "WARM_CLOSING_MODE", mode)
+        h = _warm_title_harness(monkeypatch, ["Operations Analyst", "Reporting Analyst"])
+        h.run()
+        stage = m._warm_stage_samples_read()
+        return h.cards, [p.get("rows") and len(p["rows"]) for p in h.payloads], stage[1] if stage else None
+
+    assert scenario("short") == scenario("full")
+
+
+# ---- /wrun fetches a run's report, one company's detail, or the full text on demand (TASK-262) ----
+
+def _wrun(monkeypatch, text):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    _dispatch(text)
+    return sent
+
+
+def _store_wrun_runs(detail="DETAIL LINE ONE\nDETAIL LINE TWO"):
+    rec = m.run_report.RunRecorder("run-A", "2026-10-30 08:00:00", {"commit": "a" * 40, "short": "aaaaaaa", "source": "git"})
+    rec.note_source_call("greenhouse", "Older Co", status="ok", returned=1, kept=1)
+    assert m._warm_run_report_write(rec.snapshot(), "OLD RUN TEXT")
+    rec = m.run_report.RunRecorder("run-B", "2026-10-31 08:00:00", {"commit": "b" * 40, "short": "bbbbbbb", "source": "git"})
+    rec.note_source_call("apify", "Haworth Inc.", status="ok", returned=3, kept=1,
+                         dropped=[("Haworth International", "no_match"), ("Haworth International", "no_match")])
+    rec.note_posting("apify", "Haworth Inc.", "Haworth Inc.")
+    rec.note_source_call("apify", "Hayes Corp", status="empty")
+    rec.note_source_call("apify", "Hay Group", status="empty")
+    assert m._warm_run_report_write(rec.snapshot(), detail)
+
+
+def test_wrun_command_overview_lists_each_company_and_flags_the_haworth_difference(monkeypatch):
+    _store_wrun_runs()
+    text = "\n".join(_wrun(monkeypatch, "/wrun"))
+    assert "run-B" in text and "Haworth Inc. — apify" in text and "sent≠returned: Haworth International" in text
+
+
+def test_wrun_command_company_shows_source_sent_returned_and_the_drop_reason(monkeypatch):
+    _store_wrun_runs()
+    (reply,) = _wrun(monkeypatch, "/wrun haworth")
+    assert 'Apify: sent "Haworth Inc."' in reply and '"Haworth International" (no_match) ×2' in reply
+
+
+def test_wrun_command_full_returns_the_stored_text_with_a_build_header(monkeypatch):
+    _store_wrun_runs()
+    (reply,) = _wrun(monkeypatch, "/wrun full")
+    assert reply.startswith("run run-B, build bbbbbbb") and "DETAIL LINE ONE\nDETAIL LINE TWO" in reply
+
+
+def test_wrun_command_a_number_picks_the_run_before_and_bad_arguments_give_usage(monkeypatch):
+    _store_wrun_runs()
+    assert "run-A" in "\n".join(_wrun(monkeypatch, "/wrun 2")) and "Older Co" in "\n".join(_wrun(monkeypatch, "/wrun 2"))
+    assert "OLD RUN TEXT" in _wrun(monkeypatch, "/wrun full 2")[0]
+    assert "Older Co" in _wrun(monkeypatch, "/wrun older #2")[0]
+    for bad in ("/wrun 11", "/wrun 0", "/wrun full x", "/wrun full 11", "/wrun older #11"):
+        (reply,) = _wrun(monkeypatch, bad)
+        assert "Usage" in reply, bad
+
+
+def test_wrun_command_with_no_runs_says_none_recorded(monkeypatch):
+    assert _wrun(monkeypatch, "/wrun") == ["No /w run recorded yet."]
+
+
+def test_wrun_command_a_store_read_error_says_so_without_a_traceback(monkeypatch):
+    def boom(nth=1):
+        raise RuntimeError("secret db path /var/x")
+    monkeypatch.setattr(m, "_warm_run_report_read", boom)
+    assert _wrun(monkeypatch, "/wrun") == ["❌ Could not read the /w run reports."]
+
+
+def test_wrun_command_ambiguous_query_lists_candidates_and_an_unknown_one_names_the_run(monkeypatch):
+    _store_wrun_runs()
+    (amb,) = _wrun(monkeypatch, "/wrun hay")
+    assert "Several companies match" in amb and "Hayes Corp" in amb and "Hay Group" in amb
+    (none,) = _wrun(monkeypatch, "/wrun zzz")
+    assert 'No company matching "zzz" in run run-B' in none
+
+
+def test_wrun_command_a_twelve_thousand_character_text_comes_back_in_capped_pieces(monkeypatch):
+    big = "\n".join(f"detail line {i:04d} " + "x" * 100 for i in range(110))
+    assert len(big) > 12000
+    _store_wrun_runs(detail=big)
+    sent = _wrun(monkeypatch, "/wrun full")
+    assert len(sent) <= 6 and all(len(x) <= 3500 for x in sent)
+    big2 = "\n".join(f"detail line {i:05d} " + "x" * 100 for i in range(600))
+    _store_wrun_runs(detail=big2[:60000])
+    sent = _wrun(monkeypatch, "/wrun full")
+    assert len(sent) == 7 and "more characters" in sent[-1] and "<company>" not in sent[-1]
+
+
+def test_wrun_command_writes_nothing_and_makes_no_http_call(monkeypatch):
+    _store_wrun_runs()
+    tables = ("warm_run_reports", "inbound_threads", "site_visits", "warm_stage_samples", "company_resolution", "jobs")
+
+    def counts():
+        with m.get_db_conn() as conn:
+            return [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables]
+    before, http = counts(), []
+    for name in ("get", "post"):
+        monkeypatch.setattr(m.requests, name, lambda *a, **k: http.append(a) or (_ for _ in ()).throw(AssertionError("http")))
+    for cmd in ("/wrun", "/wrun haworth", "/wrun full", "/wrun 2"):
+        _wrun(monkeypatch, cmd)
+    assert counts() == before and http == []
+
+
+def test_wrun_command_help_entry_is_real_and_the_bare_command_is_not_swallowed(monkeypatch):
+    import command_help as ch
+    reply = ch.lookup_command_help("/wrun/")
+    assert "No per-command help" not in reply and "/wrun Haworth" in reply
+    assert ch.lookup_command_help("/wrun") is None and ch.lookup_command_help("/wrun full") is None
+    assert "/wrun - Last /w run" in open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()
+
+
+# ---- /w says when the Apify answer hit the request limit (TASK-264) ----
+
+def _cutoff_rows(per_company, extra=0):
+    """per_company: {org: n rows}; extra: rows belonging to no picked company."""
+    rows = []
+    for org, n in per_company.items():
+        rows += [_apify_row(org, f"Analyst {i}", i) for i in range(n)]
+    rows += [_apify_row("Stranger Corp", f"Other {i}", i) for i in range(extra)]
+    return rows
+
+
+def test_apify_cutoff_exactly_the_limit_prints_its_own_line_before_the_apify_line(monkeypatch):
+    rows = _cutoff_rows({"Nopeboard Labs": 100, "Smallfry Inc": 86}, extra=14)
+    h, text = _apify_closing_run(monkeypatch, rows)
+    lines = text.splitlines()
+    cut = [i for i, ln in enumerate(lines) if ln.startswith("Apify possibly cut off: 200 rows returned and the request limit was 200")]
+    main_line = [i for i, ln in enumerate(lines) if ln.startswith("Apify: 2 companies, 200 rows returned, ")]
+    assert len(cut) == 1 and len(main_line) == 1 and cut[0] < main_line[0], text
+    assert "186 kept are what came back" in lines[cut[0]]
+
+
+def test_apify_cutoff_one_row_under_the_limit_says_nothing(monkeypatch):
+    _h, text = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 100, "Smallfry Inc": 99}))
+    assert "cut off" not in text and "Apify: 2 companies, 199 rows returned, " in text
+
+
+def test_apify_cutoff_a_bigger_batch_names_its_own_limit(monkeypatch):
+    five = {f"Cutco{i} Labs": 3 for i in range(5)}
+    rows = _cutoff_rows({k: 50 for k in five})
+    _h, text = _apify_closing_run(monkeypatch, rows, nobody=five)
+    assert "Apify possibly cut off: 250 rows returned and the request limit was 250" in text
+    _h2, text2 = _apify_closing_run(monkeypatch, rows[:-1], nobody=five)
+    assert "cut off" not in text2
+
+
+def test_apify_cutoff_a_capped_run_rewords_the_no_rows_line_and_an_uncapped_one_keeps_it(monkeypatch):
+    _h, capped = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}))
+    no_rows = [ln for ln in capped.splitlines() if ln.startswith("Searched Apify, no rows for:")][0]
+    assert "Smallfry Inc" in no_rows and "the answer was cut off, so these may have rows that were not returned" in no_rows
+    with m.get_db_conn() as conn:   # run 1 stored Apify's answers; a fresh start for the uncapped comparison run
+        conn.execute("DELETE FROM company_resolution")
+        conn.commit()
+    _h2, plain = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 5}))
+    old = [ln for ln in plain.splitlines() if ln.startswith("Searched Apify, no rows for:")][0]
+    assert old == "Searched Apify, no rows for: Smallfry Inc (the feed may not cover them; that is not the same as no jobs)"
+
+
+def test_apify_cutoff_an_errored_call_and_a_missing_token_print_no_cutoff_line(monkeypatch):
+    _h, errored = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}), mode="500")
+    assert "Apify errored" in errored and "cut off" not in errored
+    _h2, off = _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}), token=None)
+    assert "cut off" not in off
+
+
+def test_apify_cutoff_the_ledger_row_stays_ok_at_the_cost_of_the_rows(monkeypatch):
+    _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}))
+    (row,) = _apify_ledger()
+    assert row[1] == "ok" and abs(row[0] - m.apify_feed.actual_cost(200)) < 1e-9
+
+
+def test_apify_cutoff_warns_once_and_never_logs_the_token(monkeypatch, caplog):
+    import logging as _lg
+    caplog.set_level(_lg.DEBUG)
+    _apify_closing_run(monkeypatch, _cutoff_rows({"Nopeboard Labs": 200}))
+    warnings = [r for r in caplog.records if "hit the request limit" in r.getMessage()]
+    assert len(warnings) == 1 and "200 rows, limit 200" in warnings[0].getMessage()
+    assert _APIFY_TEST_TOKEN not in caplog.text
+
+
+# ---- /monte shows where site visits came from and what each group viewed (TASK-266) ----
+
+_GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+_LINKEDINBOT_UA = "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)"
+
+
+def _monte(monkeypatch, text):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, **k: sent.append(t))
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    _dispatch(text)
+    return sent
+
+
+@pytest.fixture
+def monte_env(analytics_env, monkeypatch):
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: None)   # ingest alerts are not under test
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_leads")
+        conn.commit()
+    yield
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM inbound_leads")
+        conn.commit()
+
+
+def _monte_ingest_mix():
+    views = [
+        _view(ip="198.51.100.1", path="/", referrer="https://www.linkedin.com/feed/"),
+        _view(ip="198.51.100.1", path="/job-engine"),
+        _view(ip="198.51.100.2", path="/"),
+        _view(ip="198.51.100.3", path="/resume/Kevin_Miller.pdf", referrer="https://www.google.com/"),
+        _view(ip="198.51.100.4", ua=_LINKEDINBOT_UA, path="/"),
+        _view(ip="198.51.100.5", ua=_GOOGLEBOT_UA, path="/"),
+        _view(ip="198.51.100.6", path="/.env"),
+    ]
+    assert _ingest(views).status_code == 200
+
+
+def _table_counts():
+    with m.get_db_conn() as conn:
+        return [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("site_visits", "inbound_leads", "visit_tags", "warm_run_reports")]
+
+
+def test_monte_command_groups_real_ingested_visits_by_source_and_page(monkeypatch, monte_env):
+    _monte_ingest_mix()
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "LinkedIn: 1 visitor · Home 1 · Resume 0 · Job Engine 1" in text
+    assert "Direct: 1 visitor · Home 1" in text
+    assert "Search: 1 visitor · Home 0 · Resume 1" in text
+    assert "Link previews: 1 visitor-day · 1 hit (LinkedIn 1)" in text
+    assert "Crawlers: 1 visitor-day" in text and "Probes: 1 visitor-day" in text
+
+
+def test_monte_command_an_own_site_referrer_is_stored_as_none_and_filed_under_direct(monkeypatch, monte_env):
+    assert _ingest([_view(ip="198.51.100.9", path="/job-engine", referrer="https://montelattice.com/")]).status_code == 200
+    assert _stored_rows()[0][4] is None
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "Direct: 1 visitor" in text and "Direct also holds visits that arrived from your own pages" in text
+
+
+def test_monte_command_a_self_view_is_the_self_category_not_a_visitor(monkeypatch, monte_env):
+    assert _ingest([_view(ip="198.51.100.10", is_self=True)]).status_code == 200
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "You (self): 1 visitor-day" in text and "Direct: " not in text.split("Bots and scanners")[0]
+
+
+def test_monte_command_n_days_widens_the_window(monkeypatch, monte_env):
+    with m.get_db_conn() as conn:
+        conn.execute("INSERT INTO site_visits (visited_at, path, visitor_id, referrer, bot) "
+                     "VALUES (datetime('now', '-20 days'), '/', 'oldvisitor0001', NULL, NULL)")
+        conn.commit()
+    assert "Direct: " not in "\n".join(_monte(monkeypatch, "/monte"))
+    assert "Direct: 1 visitor" in "\n".join(_monte(monkeypatch, "/monte 30"))
+
+
+@pytest.mark.parametrize("arg", ["abc", "0", "91", "-3", "7 8"])
+def test_monte_command_bad_arguments_give_usage_and_read_nothing(monkeypatch, monte_env, arg):
+    def boom(days):
+        raise AssertionError("must not read")
+    monkeypatch.setattr(m, "get_site_visit_rows_dated", boom)
+    (reply,) = _monte(monkeypatch, f"/monte {arg}")
+    assert reply == "📊 Usage: /monte (last 7 days) or /monte 30 (1-90)"
+
+
+def test_monte_command_an_empty_table_says_no_pageviews_and_keeps_the_cannot_know_block(monkeypatch, monte_env):
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "No pageviews stored for this window" in text and "What this cannot know" in text
+    assert all(s in text for s in m.site_traffic.CANNOT_KNOW)
+
+
+def test_monte_command_a_failing_visit_read_is_one_plain_line_and_a_failing_lead_read_still_reports(monkeypatch, monte_env):
+    _monte_ingest_mix()
+
+    def boom(days):
+        raise RuntimeError("secret path /var/db")
+    monkeypatch.setattr(m, "get_site_visit_rows_dated", boom)
+    assert _monte(monkeypatch, "/monte") == ["Could not read the site visit log."]
+    monkeypatch.undo()
+    monkeypatch.setenv("ANALYTICS_ENABLED", "true")
+    monkeypatch.setattr(m, "get_lead_times", boom)
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "Contact form submissions: unknown (could not be read)" in text and "Contact form submissions: 0" not in text
+    assert "LinkedIn: 1 visitor" in text
+
+
+def test_monte_command_contact_form_submissions_are_counted_and_not_attributed(monkeypatch, monte_env):
+    with m.get_db_conn() as conn:
+        for i in range(2):
+            conn.execute("INSERT INTO inbound_leads (source, name, email, message) VALUES ('docfiler', ?, ?, 'hi')", (f"N{i}", f"n{i}@x.com"))
+        conn.commit()
+    text = "\n".join(_monte(monkeypatch, "/monte"))
+    assert "Contact form submissions: 2 (cannot be tied to a source)" in text
+
+
+def test_monte_command_switched_off_analytics_replies_so_and_reads_nothing(monkeypatch, monte_env):
+    monkeypatch.setenv("ANALYTICS_ENABLED", "false")
+
+    def boom(days):
+        raise AssertionError("must not read")
+    monkeypatch.setattr(m, "get_site_visit_rows_dated", boom)
+    assert _monte(monkeypatch, "/monte") == ["Site analytics is switched off (ANALYTICS_ENABLED)."]
+
+
+def test_monte_command_writes_nothing_and_makes_no_http_call(monkeypatch, monte_env):
+    _monte_ingest_mix()
+    before, http = _table_counts(), []
+    for name in ("get", "post"):
+        monkeypatch.setattr(m.requests, name, lambda *a, **k: http.append(a) or (_ for _ in ()).throw(AssertionError("http")))
+    for cmd in ("/monte", "/monte 30"):
+        _monte(monkeypatch, cmd)
+    assert _table_counts() == before and http == []
+
+
+def test_monte_command_help_entry_is_real_and_the_bare_command_is_not_swallowed(monkeypatch):
+    import command_help as ch
+    reply = ch.lookup_command_help("/monte/")
+    assert "No per-command help" not in reply and "/monte 30" in reply
+    assert ch.lookup_command_help("/monte") is None and ch.lookup_command_help("/monte 30") is None
+    assert "/monte - Where site visits" in open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()
+
+
+def test_monte_command_no_visitor_id_reaches_any_message(monkeypatch, monte_env):
+    _monte_ingest_mix()
+    with m.get_db_conn() as conn:
+        ids = [r[0] for r in conn.execute("SELECT visitor_id FROM site_visits").fetchall()]
+    assert ids
+    text = "\n".join(_monte(monkeypatch, "/monte") + _monte(monkeypatch, "/monte 30"))
+    assert not any(i in text for i in ids)

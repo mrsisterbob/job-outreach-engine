@@ -197,6 +197,23 @@ HELP = {
         "number can be 1-5. Read-only.",
         "/wstages 2",
     ),
+    "/vlink": (
+        "Makes a personal link to montelattice.com for one contact (https://montelattice.com/?r=...). "
+        "When they open it you get an alert that says who opened it. Asking again for the same name gives "
+        "the same link. /vlink alone lists the links made and how many times each was opened.",
+        "/vlink Jane Doe",
+    ),
+    "/monte": (
+        "Shows where visits to montelattice.com came from (direct, LinkedIn, search, email and chat, other sites, bots) "
+        "and which pages each group viewed, day by day, with what the numbers cannot know. Read-only.",
+        "/monte  -> the last 7 days\n/monte 30  -> the last 30 days (1-90)",
+    ),
+    "/wrun": (
+        "Shows a saved /w run company by company: which source answered, the name that was sent and the names that "
+        "came back. /wrun Haworth shows one company, /wrun full gives the whole closing text, and /wrun 2 picks the "
+        "run before. Read-only.",
+        "/wrun Haworth  -> sent, returned and dropped names for Haworth\n/wrun  -> every company in the newest run\n/wrun full  -> the full closing text",
+    ),
     "/streak": (
         "The daily outreach scorecard - what you sent today and whether the streak held. "
         "/daily is the same thing.",

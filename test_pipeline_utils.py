@@ -4244,3 +4244,16 @@ def test_visit_probe_counts_as_bot_not_visitor():
     summary = pu.summarize_visits(rows)
     assert summary["visitors"] == 1 and summary["bots"] == {"probe": 1}
     assert "1 bot hit filtered" in pu.format_visitor_line(summary)
+
+
+def test_vlink_help_is_a_real_entry_and_mentions_the_link():
+    import command_help as ch
+    text = ch.lookup_command_help("/vlink/")
+    assert text and "No per-command help" not in text
+    assert "?r=" in text
+
+
+def test_vlink_help_bare_command_is_not_swallowed():
+    import command_help as ch
+    assert ch.lookup_command_help("/vlink") is None
+    assert ch.lookup_command_help("/vlink Jane Doe") is None
