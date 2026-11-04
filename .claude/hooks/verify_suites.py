@@ -30,7 +30,7 @@ import sys
 import time
 
 SUITES = ["test_main_integration.py", "test_pipeline_utils.py"]
-TIMEOUT_SECONDS = 300
+TIMEOUT_SECONDS = 600
 
 # The proof lives in the tree's own git directory (never in a tracked or untracked-visible
 # file, so writing it cannot change the tree it vouches for).

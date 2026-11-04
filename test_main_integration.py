@@ -21017,7 +21017,7 @@ def test_hirebase_e2e_second_run_plans_from_the_stored_ledger(monkeypatch):
     assert len(h.posts) == 3, h.posts
     first_capco = [kw["json"] for _u, kw in h.posts if kw["json"]["company_slugs"][0] == "capco-labs"][0]
     assert "cut off" in first
-    run1_month = _hb_month_sum()
+    run1_total = sum(r[1] for r in m.hirebase_ledger_read())
     _hb_backdate("nopeboard labs", m.timedelta(days=4, hours=23))
     _hb_backdate("capco labs", m.timedelta(days=4, hours=23))
     _hb_backdate("freshco labs", m.timedelta(days=1))
@@ -21027,7 +21027,9 @@ def test_hirebase_e2e_second_run_plans_from_the_stored_ledger(monkeypatch):
     assert "freshco-labs" not in by_slug, "an ok row 1 day old must not be requested"
     assert by_slug["nopeboard-labs"]["days_ago"] == 6, by_slug
     assert by_slug["capco-labs"]["days_ago"] == first_capco["days_ago"], (by_slug, first_capco)
-    assert _hb_month_sum() > run1_month
+    # Backdating run 1 by ~5 days moves its rows into last month when today is the 1st-5th, so the
+    # month sum alone can't show growth; compare the all-time sum instead.
+    assert sum(r[1] for r in m.hirebase_ledger_read()) > run1_total
     assert f"{_hb_month_sum()} of 500 used this month" in second, second
 
 
