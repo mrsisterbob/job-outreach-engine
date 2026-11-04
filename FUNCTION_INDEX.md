@@ -1227,6 +1227,20 @@ grep -i "contact" FUNCTION_INDEX.md
 | 183 | `format_tenant` | _(no docstring)_ |
 | 209 | `main` | _(no docstring)_ |
 
+## `scripts/queue_to_cloud.py` — 9 defs, 176 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 23 | `run_git` | Seam: tests replace this to force a failure part-way. |
+| 28 | `_out` | _(no docstring)_ |
+| 32 | `_git_ok` | _(no docstring)_ |
+| 39 | `_ls_local` | _(no docstring)_ |
+| 43 | `_branch_names` | _(no docstring)_ |
+| 50 | `_branch_text` | _(no docstring)_ |
+| 55 | `main` | _(no docstring)_ |
+| 123 | `_rebase_failed` | _(no docstring)_ |
+| 137 | `_send` | _(no docstring)_ |
+
 ## `scripts/score_source.py` — 2 defs, 99 lines
 
 | Line | Name | Summary |
@@ -1498,4 +1512,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1144 definitions across 67 files + Code.gs.**
+**1153 definitions across 68 files + Code.gs.**
