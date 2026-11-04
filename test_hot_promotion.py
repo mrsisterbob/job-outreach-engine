@@ -176,3 +176,83 @@ def test_bare_string_own_and_ats_are_not_iterated_per_character():
     assert hp.sender_disqualifier("kevin@example.org", "kevin@example.org") == "own_address"
     assert hp.sender_disqualifier("jane@acme.myworkday.com", [], "myworkday.com") == "ats_domain"
     assert hp.sender_disqualifier("jane@acme.com", "kevin@example.org", "myworkday.com") == ""
+
+
+def _m(mid, sent=False, t=None):
+    d = {"id": mid, "labelIds": ["SENT"] if sent else ["INBOX"]}
+    if t is not None:
+        d["internalDate"] = str(t)
+    return d
+
+
+def test_kevin_sent_before_their_first_then_kevin_reply_false():
+    assert hp.kevin_sent_before([_m("a", t=100), _m("k", True, 200)], "a", "100") is False
+
+
+def test_kevin_sent_before_kevin_first_true():
+    assert hp.kevin_sent_before([_m("k", True, 100), _m("a", t=200)], "a", "200") is True
+
+
+def test_kevin_sent_before_middle_kevin_processing_later_true():
+    msgs = [_m("t1", t=100), _m("k", True, 200), _m("t2", t=300)]
+    assert hp.kevin_sent_before(msgs, "t2", "300") is True
+
+
+def test_kevin_sent_before_middle_kevin_processing_earlier_false():
+    msgs = [_m("t1", t=100), _m("k", True, 200), _m("t2", t=300)]
+    assert hp.kevin_sent_before(msgs, "t1", "100") is False
+
+
+def test_kevin_sent_before_equal_times_false():
+    assert hp.kevin_sent_before([_m("k", True, 100), _m("a", t=100)], "a", "100") is False
+
+
+def test_kevin_sent_before_no_times_uses_position():
+    assert hp.kevin_sent_before([_m("k", True), _m("a")], "a", None) is True
+    assert hp.kevin_sent_before([_m("a"), _m("k", True)], "a", None) is False
+
+
+def test_kevin_sent_before_only_inbound_has_time_falls_to_position():
+    assert hp.kevin_sent_before([_m("k", True), _m("a", t=100)], "a", "100") is True
+    assert hp.kevin_sent_before([_m("a", t=100), _m("k", True)], "a", "100") is False
+
+
+def test_kevin_sent_before_inbound_itself_sent_alone_false():
+    assert hp.kevin_sent_before([_m("a", True, 100)], "a", "100") is False
+
+
+def test_kevin_sent_before_inbound_not_in_list_uses_argument_time():
+    assert hp.kevin_sent_before([_m("k", True, 100)], "zzz", "200") is True
+    assert hp.kevin_sent_before([_m("k", True, 300)], "zzz", 200) is False
+
+
+def test_kevin_sent_before_inbound_not_in_list_no_time_false():
+    assert hp.kevin_sent_before([_m("k", True), _m("a")], "zzz", None) is False
+    assert hp.kevin_sent_before([_m("k", True), _m("a")], "", None) is False
+
+
+@pytest.mark.parametrize("messages", [
+    [], None, "text", 5, {"id": "k"}, ["x", None, 3],
+    [{"id": "k", "labelIds": None}], [{"id": "k", "labelIds": "SENT"}],
+])
+def test_kevin_sent_before_junk_input_false(messages):
+    assert hp.kevin_sent_before(messages, "a", "100") is False
+
+
+@pytest.mark.parametrize("bad", ["abc", -5, True, ""])
+def test_kevin_sent_before_bad_time_is_unknown(bad):
+    sent_first = [{"id": "k", "labelIds": ["SENT"], "internalDate": bad}, _m("a", t=100)]
+    sent_last = [_m("a", t=100), {"id": "k", "labelIds": ["SENT"], "internalDate": bad}]
+    assert hp.kevin_sent_before(sent_first, "a", "100") is True
+    assert hp.kevin_sent_before(sent_last, "a", "100") is False
+    assert hp.kevin_sent_before([_m("k", True, 50)], "zzz", bad) is False
+
+
+def test_kevin_sent_before_returns_real_bool():
+    assert hp.kevin_sent_before([_m("k", True, 1), _m("a", t=2)], "a", "2") is True
+    assert hp.kevin_sent_before([_m("a", t=2)], "a", "2") is False
+
+
+def test_kevin_sent_before_two_kevin_messages_one_before_one_after():
+    msgs = [_m("k1", True, 100), _m("a", t=200), _m("k2", True, 300)]
+    assert hp.kevin_sent_before(msgs, "a", "200") is True
