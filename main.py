@@ -7668,6 +7668,34 @@ def is_thread_kevin_started(thread_id, access_token):
         return False
 
 
+def kevin_sent_before_message(thread_id, access_token, message_id, internal_date_ms):
+    """True when this thread holds a message Kevin SENT before the message being processed.
+
+    Same request and errs-toward-False contract as is_thread_kevin_started, but the answer is
+    order-aware (hot_promotion.kevin_sent_before). Used by the Carmen Hot promotion only.
+    """
+    if not thread_id or not access_token:
+        return False
+    try:
+        res = requests.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"format": "minimal"},
+            timeout=10,
+        )
+        if res.status_code != 200:
+            logging.info(f"Hot order check: HTTP {res.status_code} for thread {thread_id}")
+            return False
+        messages = res.json().get("messages", [])
+        before = hot_promotion.kevin_sent_before(messages, message_id, internal_date_ms)
+        if not before and any("SENT" in ((m or {}).get("labelIds") or []) for m in messages if isinstance(m, dict)):
+            logging.info(f"[HOT PROMOTE] thread has a Kevin message but none before this one ({thread_id})")
+        return before
+    except Exception as e:
+        logging.error(f"Hot order check error ({thread_id}): {e}")
+        return False
+
+
 def _gmail_header_value(header_list, name, default=""):
     """One header off a Gmail payload, matched case-insensitively.
 
@@ -8142,7 +8170,7 @@ def _create_hot_contact_on_exchange(sender, email, subject, thread_id, internal_
 
 
 def promote_to_hot_on_exchange(crm_match, sender, header_list, status_label, subject,
-                               thread_id, access_token, internal_date_ms):
+                               thread_id, access_token, internal_date_ms, message_id=""):
     """Move a verified CRM contact into Carmen Hot once the thread holds their reply AND a
     message Kevin sent (Kevin's rule, 2026-10-28). Returns "promoted", "already_hot" or "".
 
@@ -8157,7 +8185,7 @@ def promote_to_hot_on_exchange(crm_match, sender, header_list, status_label, sub
         sender, [GMAIL_USER or ""], ATS_ROBOT_DOMAINS, hot_promotion.auto_reply_flag(headers_lc))
     kevin_sent = False
     if not disqualifier and status_label == "GENERAL":
-        kevin_sent = is_thread_kevin_started(thread_id, access_token)
+        kevin_sent = kevin_sent_before_message(thread_id, access_token, message_id, internal_date_ms)
     live_tab, live = hot_promotion.LOOKUP_FAILED, {}
     if not disqualifier and status_label == "GENERAL" and kevin_sent:
         live_tab, live = _live_crm_contact(email)
@@ -8938,7 +8966,7 @@ def check_inbound_gmail_replies():
                 try:
                     promote_to_hot_on_exchange(
                         crm_match, sender, header_list, status_label, subject,
-                        thread_id, access_token, internal_date_ms)
+                        thread_id, access_token, internal_date_ms, message_id=msg_id)
                 except Exception as e:
                     logging.error(f"Unverified Hot promotion error ({msg_id}): {e}")
             if not is_unverified:
@@ -8947,7 +8975,7 @@ def check_inbound_gmail_replies():
                     if str(crm_match.get("sheet_uuid") or "").strip():
                         promoted = promote_to_hot_on_exchange(
                             crm_match, sender, header_list, status_label, subject,
-                            thread_id, access_token, internal_date_ms)
+                            thread_id, access_token, internal_date_ms, message_id=msg_id)
                     # A promoted / already-Hot row must not be routed: the outbox would pull it
                     # back to Carmen Cold and overwrite the +7 day date.
                     if not promoted:
