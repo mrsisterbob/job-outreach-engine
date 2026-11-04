@@ -140,6 +140,17 @@ grep -i "contact" FUNCTION_INDEX.md
 | 167 | `_frac` | _(no docstring)_ |
 | 171 | `render_report` | Lines in UNFETCHED_SYSTEMS order, then one plain-words summary line. |
 
+## `ats_resolver_report.py` — 6 defs, 105 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 12 | `_cut` | _(no docstring)_ |
+| 17 | `_blank` | _(no docstring)_ |
+| 21 | `_empty` | _(no docstring)_ |
+| 26 | `census` | Census dict for a reply. Anything that is not a non-empty list of dicts gets a note, never a crash. |
+| 77 | `_tally_lines` | _(no docstring)_ |
+| 85 | `render_census` | Printable lines for a census dict. |
+
 ## `board_system_classifier.py` — 4 defs, 76 lines
 
 | Line | Name | Summary |
@@ -1181,6 +1192,15 @@ grep -i "contact" FUNCTION_INDEX.md
 | 110 | `_lines_for` | Plain lines for one measured system (reuses render_report's line, never rewrites it). |
 | 124 | `run` | _(no docstring)_ |
 
+## `scripts/measure_ats_resolver.py` — 4 defs, 123 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 28 | `_default_post` | _(no docstring)_ |
+| 33 | `_inside` | _(no docstring)_ |
+| 41 | `run` | _(no docstring)_ |
+| 118 | `main` | _(no docstring)_ |
+
 ## `scripts/measure_board_systems.py` — 14 defs, 324 lines
 
 | Line | Name | Summary |
@@ -1525,4 +1545,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1161 definitions across 69 files + Code.gs.**
+**1171 definitions across 71 files + Code.gs.**
