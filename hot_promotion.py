@@ -108,6 +108,62 @@ def decide_promotion(status_label, kevin_sent_in_thread, live_tab, disqualifier=
     return PromotionDecision("none", "unknown_tab")
 
 
+def _known_ms(value):
+    """A non-negative integer epoch-ms from an int or digit string, else None (unknown)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def kevin_sent_before(messages, message_id, internal_date_ms):
+    """True when the Gmail thread holds a message Kevin SENT strictly BEFORE the inbound one.
+
+    messages is the `messages` list of a threads.get response (id, labelIds, maybe internalDate
+    as an epoch-ms string); message_id is the inbound message's Gmail id (may be ""); and
+    internal_date_ms is that message's own internalDate. The inbound message never counts as
+    Kevin's, even when it carries SENT. Order per SENT message: both times known -> sent time
+    strictly less than inbound time; otherwise list position, only when the inbound message is
+    in the list by id (Gmail returns thread messages oldest first: UNVERIFIED in this repo);
+    otherwise it does not count.
+
+    internalDate being present on format=minimal thread messages is UNVERIFIED in this repo
+    (recalled from Gmail's resource shape; nothing in main.py or the fakes reads it from
+    threads.get), which is why the position rule exists. Unknown order errs toward False (no
+    promotion), the same direction as is_thread_kevin_started. Never raises; returns a bool.
+    """
+    if not isinstance(messages, list):
+        return False
+    entries = [m for m in messages if isinstance(m, dict)]
+    inbound_idx = None
+    inbound_ms = _known_ms(internal_date_ms)
+    if message_id:
+        for i, m in enumerate(entries):
+            if m.get("id") == message_id:
+                inbound_idx = i
+                own_ms = _known_ms(m.get("internalDate"))
+                if own_ms is not None:
+                    inbound_ms = own_ms
+                break
+    for i, m in enumerate(entries):
+        labels = m.get("labelIds")
+        if not isinstance(labels, list) or "SENT" not in labels:
+            continue
+        if message_id and m.get("id") == message_id:
+            continue
+        sent_ms = _known_ms(m.get("internalDate"))
+        if sent_ms is not None and inbound_ms is not None:
+            if sent_ms < inbound_ms:
+                return True
+            continue
+        if inbound_idx is not None and i < inbound_idx:
+            return True
+    return False
+
+
 def exchange_date_from_internal_ms(internal_date_ms, fallback):
     """Local date of a Gmail internalDate (epoch ms); fallback when missing or unparseable."""
     try:
