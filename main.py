@@ -36,6 +36,11 @@ import apify_feed
 import hirebase_feed
 import hirebase_registry
 import resolve_plan
+import build_info
+import run_report
+import site_traffic
+import subprocess
+import inbound_hold
 import warm_screen_plan
 import warm_stage_samples
 import warm_michigan
@@ -830,6 +835,10 @@ EMAIL_REQUIRE_DIRECT_REPLY = os.environ.get("EMAIL_REQUIRE_DIRECT_REPLY", "False
 # tray but not sent to Telegram - see inbound_sender_screen_reason(). "permissive" restores the old
 # alert-every-stranger behaviour, as a Render dashboard flip rather than a redeploy.
 INBOUND_ALERT_MODE = os.environ.get("INBOUND_ALERT_MODE", "strict").strip().lower()
+# What to do with mail from a sender with no CRM identity that is not a reply, a hiring signal or a rejection:
+# "hold" (default) logs it in the tray as state='held' and sends no alert; "alert" restores the old alert-every-stranger
+# behaviour. A Render dashboard flip, not a redeploy. INBOUND_ALERT_MODE=permissive also disables holding.
+INBOUND_UNSOLICITED_MODE = inbound_hold.parse_mode(os.environ.get("INBOUND_UNSOLICITED_MODE", ""))
 # 50 chars dropped "Hi Kevin, got a sec?" and "Can we talk tomorrow at 2?" - the shortest replies
 # are often the warmest, because a busy human writing back types one line. The gate exists to skip
 # empty auto-acknowledgements, not brevity, and bulk is already handled structurally by the sender
@@ -1358,6 +1367,15 @@ def init_db():
         # /w stage samples: one row per /w run (JSON of a StageSampler snapshot), newest 5 kept, so
         # /wstages can show where role diversity dies without a Render shell.
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS warm_run_reports (
+            run_id TEXT PRIMARY KEY,
+            run_at TEXT NOT NULL,
+            commit_sha TEXT NOT NULL DEFAULT '',
+            commit_source TEXT NOT NULL DEFAULT '',
+            snapshot TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT ''
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS warm_stage_samples (
             run_at TEXT NOT NULL,
             snapshot TEXT NOT NULL
@@ -1481,6 +1499,30 @@ def init_db():
             attempted_at TEXT NOT NULL,
             next_eligible_at TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (company_key, source)
+        )""")
+        # ATS board resolver storage. company_board_found remembers each board the actor found (platform, token, url);
+        # board_system/board_ref are blank when the platform is one /w cannot scan. ats_resolver_ledger is its OWN
+        # spend ledger, NOT apify_feed_ledger: apify_feed.plan_apify_run reads that table's rows to learn when a company
+        # was last fed (last_ok) and would make a company the resolver touched wait 7 days for Apify, and the prices differ.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS company_board_found (
+            company_key TEXT PRIMARY KEY,
+            display_name TEXT,
+            platform TEXT,
+            token TEXT,
+            url TEXT,
+            board_system TEXT,
+            board_ref TEXT,
+            source TEXT,
+            found_at TEXT
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ats_resolver_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spent_at TEXT,
+            usd REAL,
+            status TEXT,
+            company_keys TEXT
         )""")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS query_pagination (
@@ -1756,6 +1798,17 @@ def init_db():
             bot TEXT
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_site_visits_time ON site_visits(visited_at)")
+        # tag -> contact label for per-contact site links. A site_visits.tag is stored only when it maps to a row here.
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS visit_tags (
+            tag TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        try:
+            conn.execute("ALTER TABLE site_visits ADD COLUMN tag TEXT")
+        except sqlite3.OperationalError:
+            pass   # column already exists
         # Inbound leads from contact forms (section 12b). The site has no persistent disk, so this
         # table is the only durable copy of a submission. source names the form it came from.
         conn.execute("""
@@ -1859,6 +1912,7 @@ def hydrate_filters_from_sheets():
 SOURCE_CONFIG_KEYS = (
     "source_hirebase_enabled", "source_hirebase_companies_per_run", "source_hirebase_monthly_jobs",
     "source_apify_enabled", "source_apify_companies_per_run", "source_apify_monthly_usd",
+    "source_ats_resolver_enabled", "source_ats_resolver_companies_per_run", "source_ats_resolver_monthly_usd",
 )
 _SOURCE_CONFIG_MISSING = object()
 
@@ -3151,6 +3205,81 @@ def apify_ledger_settle(row_id, usd, status):
         logging.error(f"Apify Ledger Settle Error (row {row_id}): {e}")
         return False
 
+def ats_resolver_ledger_read():
+    """Return [(iso_ts, usd, status, [company_keys])] for the trailing 60 days. None on a read error, so the caller spends nothing."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=APIFY_LEDGER_KEEP_DAYS)).isoformat()
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT spent_at, usd, status, company_keys FROM ats_resolver_ledger WHERE spent_at >= ? ORDER BY id",
+                (cutoff,)).fetchall()
+    except Exception as e:
+        logging.error(f"ATS Resolver Ledger Read Error: {type(e).__name__}")
+        return None
+    out = []
+    for r in rows:
+        try:
+            keys = json.loads(r[3])
+            if not isinstance(keys, list):
+                raise ValueError("company_keys is not a list")
+        except Exception as e:
+            logging.error(f"ATS Resolver Ledger Row Keys Unreadable (kept, usd counted): {type(e).__name__}")
+            keys = []
+        out.append((r[0], r[1], r[2], keys))
+    return out
+
+def ats_resolver_ledger_reserve(company_keys, worst_case_usd, now=None):
+    """Write the spend BEFORE the call, as status 'errored' (spent, outcome unknown). Row id, or None when the write failed."""
+    if not _apify_usd_ok(worst_case_usd):
+        logging.error(f"ATS Resolver Ledger Reserve rejected usd={worst_case_usd!r}")
+        return None
+    now = now or datetime.now(timezone.utc)
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    try:
+        with get_db_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO ats_resolver_ledger (spent_at, usd, status, company_keys) VALUES (?, ?, 'errored', ?)",
+                (now.isoformat(), float(worst_case_usd), json.dumps(list(company_keys))))
+            conn.commit()
+            return cur.lastrowid
+    except Exception as e:
+        logging.error(f"ATS Resolver Ledger Reserve Error: {type(e).__name__}")
+        return None
+
+def ats_resolver_ledger_settle(row_id, usd, status):
+    """Update a reserved row to the real cost and 'ok' or 'errored'. Never raises; True if a row changed."""
+    if status not in ("ok", "errored") or not _apify_usd_ok(usd):
+        return False
+    try:
+        with get_db_conn() as conn:
+            cur = conn.execute("UPDATE ats_resolver_ledger SET usd = ?, status = ? WHERE id = ?",
+                               (float(usd), status, row_id))
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"ATS Resolver Ledger Settle Error (row {row_id}): {type(e).__name__}")
+        return False
+
+def ats_resolver_month_spent(ledger, now):
+    """Dollars in `ledger` rows of the same UTC month as `now` (errored rows count: a failed call may have billed).
+    None when `ledger` is None (unreadable), never 0.0."""
+    if ledger is None:
+        return None
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    total = 0.0
+    for ts, usd, _status, _keys in ledger:
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            dt = now   # unreadable stamp: count it, never grant budget
+        if (dt.year, dt.month) == (now.year, now.month):
+            try:
+                total += max(0.0, float(usd))
+            except (TypeError, ValueError):
+                total += float("inf")
+    return total
+
 def hirebase_ledger_read():
     """Return [(iso_ts, jobs, status, company_key, page, days_ago)] for the trailing 60 days
     (days_ago 0 = unknown). None on a read error, so the caller spends nothing."""
@@ -4118,6 +4247,67 @@ def list_bought_boards():
             "FROM company_identities WHERE board_source = 'bought' ORDER BY display_name").fetchall()
     return [tuple(r) for r in rows]
 
+
+def board_found_record(company_key, display, platform, token, url, board_system="", board_ref="", now=None):
+    """INSERT OR REPLACE the board the resolver found for a company. False (never raises) on a blank key or platform or a DB error."""
+    try:
+        key, plat = str(company_key or "").strip(), str(platform or "").strip()
+        if not key or not plat:
+            return False
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        with get_db_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO company_board_found "
+                "(company_key, display_name, platform, token, url, board_system, board_ref, source, found_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ats_resolver', ?)",
+                (key, str(display or ""), plat, str(token or ""), str(url or ""),
+                 str(board_system or ""), str(board_ref or ""), now.isoformat()))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Board Found Record Error: {type(e).__name__}")
+        return False
+
+def board_found_read():
+    """{company_key: (platform, token, url, board_system, board_ref, found_at)}, or None on a DB error."""
+    try:
+        with get_db_conn() as conn:
+            rows = conn.execute(
+                "SELECT company_key, platform, token, url, board_system, board_ref, found_at FROM company_board_found").fetchall()
+        return {r[0]: tuple(r[1:]) for r in rows}
+    except Exception as e:
+        logging.error(f"Board Found Read Error: {type(e).__name__}")
+        return None
+
+def remember_found_board(display, company_key, platform, token, url, board_system, board_ref):
+    """Store a resolver-found board and, when /w can scan it and the company has no board yet, make it visible to /w
+    as a 'bought' board. Returns "scannable", "known_not_scannable", "kept_existing" or "failed".
+    upsert_company_identity writes COALESCE(?, ats_slug), so a new value would OVERWRITE a stored slug or triple:
+    the identity row is read first and an existing board is never replaced."""
+    if not board_found_record(company_key, display, platform, token, url, board_system, board_ref):
+        return "failed"
+    system, ref = str(board_system or "").strip().lower(), str(board_ref or "").strip()
+    if not system or not ref:
+        return "known_not_scannable"
+    if system == "workday":
+        if not valid_workday_triple(ref):
+            return "known_not_scannable"
+    elif system not in ("greenhouse", "lever", "ashby", "smartrecruiters"):
+        return "known_not_scannable"
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT ats_slug, workday_board FROM company_identities WHERE normalized_name = ?",
+                               (normalize_company_for_match(display),)).fetchone()
+    except Exception as e:
+        logging.error(f"Remember Found Board Read Error: {type(e).__name__}")
+        return "failed"
+    if row and (row[0] or row[1]):
+        return "kept_existing"
+    ok = upsert_company_identity(display, ats_slug=None if system == "workday" else ref,
+                                 workday_board=ref if system == "workday" else None,
+                                 board_system=system, board_source="bought")
+    return "scannable" if ok else "failed"
 
 def switch_off_bought_boards():
     """Clear ats_slug, workday_board and board_system on 'bought' rows ONLY, so /w stops scanning
@@ -8142,6 +8332,46 @@ def record_inbound_thread(thread_id, sender_email, sender_name, company, subject
         return True, 1
 
 
+def record_held_thread(thread_id, sender_email, sender_name, subject, snippet, reason, status_label):
+    """Log an unsolicited mail in the tray as state='held' (no alert). True when written, False (never raises) on a DB
+    error. Not record_inbound_thread: its update path sets state='open', which would put held mail into /inbox.
+    An existing row only gets message_count/last_seen/subject/snippet bumped; state and alerted never change."""
+    try:
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT message_count FROM inbound_threads WHERE thread_id = ?", (thread_id,)).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE inbound_threads SET last_seen = CURRENT_TIMESTAMP, message_count = ?, subject = ?, snippet = ? "
+                    "WHERE thread_id = ?", (int(row[0] or 1) + 1, subject, snippet, thread_id))
+            else:
+                conn.execute(
+                    "INSERT INTO inbound_threads (thread_id, sender_email, sender_name, company, subject, snippet, "
+                    "status_label, match_reason, sheet_uuid, is_tier1, state, alerted) "
+                    "VALUES (?, ?, ?, 'Unknown', ?, ?, ?, ?, '', 0, 'held', 0)",
+                    (thread_id, sender_email, sender_name, subject, snippet, status_label, "held: " + str(reason)))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Inbound held-thread write error ({thread_id}): {type(e).__name__}")
+        return False
+
+
+def held_inbound_since(hours=24):
+    """[(sender_name, sender_email, subject)] of held mail first seen in the window, newest first; None on a DB error
+    (not []: unknown must not read as zero). Read-only."""
+    try:
+        with read_only_db():
+            with get_db_conn() as conn:
+                rows = conn.execute(
+                    "SELECT sender_name, sender_email, subject FROM inbound_threads WHERE state = 'held' "
+                    "AND first_seen >= datetime('now', ?) ORDER BY first_seen DESC, rowid DESC",
+                    (f"-{int(hours)} hours",)).fetchall()
+        return [tuple(r) for r in rows]
+    except Exception as e:
+        logging.error(f"Held inbound read error: {type(e).__name__}")
+        return None
+
+
 def mark_inbound_thread_alerted(thread_id):
     """Record that Telegram accepted an alert for this thread. Never raises."""
     try:
@@ -8627,6 +8857,19 @@ def check_inbound_gmail_replies():
                 # is not a defect; it is the outcome the outreach exists to produce. So it alerts,
                 # and it alerts with an empty sheet_uuid so every CRM branch below skips itself:
                 # guessing which row a stranger belongs to would be worse than the original bug.
+                # Unless it is unsolicited mail (no reply headers, no hiring signal): then it is HELD, logged in the
+                # tray as state='held' and not pinged. See inbound_hold for the rule.
+                held_reason = inbound_hold.hold_reason(
+                    is_tier1=is_tier1, status_label=status_label, in_reply_to=in_reply_to, references=references,
+                    subject=subject, mode="alert" if INBOUND_ALERT_MODE == "permissive" else INBOUND_UNSOLICITED_MODE)
+                if held_reason:
+                    held_address = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", sender or "")
+                    if record_held_thread(thread_id, held_address.group(0).lower() if held_address else "",
+                                          display_name_from_sender(sender), subject, snippet, held_reason, status_label):
+                        logging.info(f"[HELD] {sender} - {held_reason}; recorded in tray as held, no alert")
+                        requests.post(modify_url, headers=headers, json={"removeLabelIds": ["UNREAD"]}, timeout=10)
+                    # A failed tray write leaves the mail UNREAD so the next poll retries; either way no alert.
+                    continue
                 is_unverified = True
                 match_reason = "interview signal" if is_tier1 else "unknown sender"
                 crm_match = {
@@ -9791,7 +10034,7 @@ def get_weekly_build_log_counts(days=7):
             with get_db_conn() as conn:
                 counts["replies"] = int(conn.execute(
                     "SELECT COUNT(*) FROM inbound_threads WHERE first_seen >= datetime('now', ?) "
-                    "AND COALESCE(status_label, '') != 'REJECTION'", (window,)).fetchone()[0])
+                    "AND COALESCE(status_label, '') != 'REJECTION' AND COALESCE(state, '') != 'held'", (window,)).fetchone()[0])
     except Exception as e:
         logging.error(f"Build Log Reply Read Error ({days}d): {e}")
     return counts
@@ -9968,6 +10211,16 @@ def _standup_visitor_line():
     line = site_visitor_standup_line()
     return f"{line}\n" if line else ""
 
+def _standup_held_line():
+    """The held-mail line plus its newline, or '' on a quiet day. Never raises (the standup must send regardless): a
+    failed read says the count is unavailable instead of showing zero."""
+    try:
+        line = inbound_hold.format_held_line(held_inbound_since(24))
+    except Exception as e:
+        logging.error(f"[STANDUP] held-mail line failed: {type(e).__name__}")
+        line = inbound_hold.format_held_line(None)
+    return f"{line}\n" if line else ""
+
 def send_daily_standup(chat_id):
     """Send the compact 08:30 standup used on every non-Tuesday morning."""
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -9993,7 +10246,7 @@ def send_daily_standup(chat_id):
         f"🔥 <b>Active Streak:</b> {streak} days\n"
         f"🎯 <b>Today's Staged Goal:</b> {activity['drafts_staged']} / 5\n"
         f"⚠️ <b>Overdue Actions:</b> {overdue_count}\n"
-        f"{_standup_visitor_line()}\n"
+        f"{_standup_visitor_line()}{_standup_held_line()}\n"
         f"📊 <a href='{brief_url}'>Full brief</a> · <code>/s</code> overdue · <code>/t</code> search"
     )
     # Job links that died since the last digest. Reported once each (notified flag), so a posting
@@ -15717,6 +15970,128 @@ def _warm_stage_samples_read(nth=1):
     return row[0], json.loads(row[1])
 
 
+# "short" (default): /w's closing Telegram message is run_report.compose_short (12 lines at most) and the full text is
+# stored for /wrun. "full" restores the old long message. A Render dashboard flip, not a redeploy.
+WARM_CLOSING_MODE = "full" if os.environ.get("WARM_CLOSING_MODE", "").strip().lower() == "full" else "short"
+# Closing-message lines that must reach the phone even in the short message (matched case-insensitively).
+_ATTENTION_MARKERS = ("could not be fetched", "errored", "skipped", "cap", "budget", "held back", "withheld",
+                      "left unscored", "unreadable", "cut off")
+WARM_RUN_REPORTS_KEEP = 10   # DESIGN CHOICE, not a measurement: runs kept in warm_run_reports
+WARM_RUN_REPORT_DETAIL_MAX = 60000   # DESIGN CHOICE, not a measurement
+_WARM_RUN_REPORT_CUT = "... (cut at 60,000 characters)"
+
+
+def _warm_run_report_write(snapshot, detail_text):
+    """Store one run's run_report snapshot + full closing text; keep the newest WARM_RUN_REPORTS_KEEP. True/False, never
+    raises. The same run_id twice replaces the row. A failure logs the exception class only (no body)."""
+    try:
+        snap = snapshot if isinstance(snapshot, dict) else {}
+        build = snap.get("build") if isinstance(snap.get("build"), dict) else {}
+        run_at = str(snap.get("started_at") or "") or datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        run_id = str(snap.get("run_id") or "") or run_at
+        detail = str(detail_text or "")
+        if len(detail) > WARM_RUN_REPORT_DETAIL_MAX:
+            detail = detail[:WARM_RUN_REPORT_DETAIL_MAX] + "\n" + _WARM_RUN_REPORT_CUT
+        with get_db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR REPLACE INTO warm_run_reports (run_id, run_at, commit_sha, commit_source, snapshot, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, run_at, str(build.get("commit") or ""), str(build.get("source") or ""), json.dumps(snap), detail))
+            conn.execute("DELETE FROM warm_run_reports WHERE rowid NOT IN "
+                         "(SELECT rowid FROM warm_run_reports ORDER BY run_at DESC, rowid DESC LIMIT ?)",
+                         (WARM_RUN_REPORTS_KEEP,))
+            conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Warm Run Report Write Error: {type(e).__name__}")
+        return False
+
+
+def _warm_run_report_read(nth=1):
+    """The nth newest run report as a dict, or None when there is none. A read error RAISES: an unreadable store must
+    not look like 'no run recorded'."""
+    with get_db_conn() as conn:
+        row = conn.execute(
+            "SELECT run_id, run_at, commit_sha, commit_source, snapshot, detail FROM warm_run_reports "
+            "ORDER BY run_at DESC, rowid DESC LIMIT 1 OFFSET ?", (max(1, int(nth)) - 1,)).fetchone()
+    if not row:
+        return None
+    return {"run_id": row[0], "run_at": row[1], "commit_sha": row[2], "commit_source": row[3],
+            "snapshot": json.loads(row[4]), "detail": row[5]}
+
+
+_WRUN_USAGE = ("❌ <b>Usage:</b> <code>/wrun</code> (newest run), <code>/wrun 2</code> (the run before, 1-10), "
+               "<code>/wrun &lt;company&gt;</code> (add <code>#2</code> for the run before), <code>/wrun full</code>")
+_WRUN_MAX_MESSAGES = 6   # DESIGN CHOICE, not a measurement
+
+
+def _wrun_parse(arg):
+    """("overview", n) | ("full", n) | ("company", name, n) | ("usage",) from the text after /wrun."""
+    arg = (arg or "").strip()
+    keep = WARM_RUN_REPORTS_KEEP
+    if not arg:
+        return ("overview", 1)
+    if arg.isdigit():
+        return ("overview", int(arg)) if 1 <= int(arg) <= keep else ("usage",)
+    low = arg.lower()
+    if low == "full" or low.startswith("full "):
+        rest = arg[4:].strip()
+        if not rest:
+            return ("full", 1)
+        return ("full", int(rest)) if rest.isdigit() and 1 <= int(rest) <= keep else ("usage",)
+    n = 1
+    match = re.search(r"\s#(\d+)$", arg)
+    if match:
+        n = int(match.group(1))
+        arg = arg[:match.start()].strip()
+        if not 1 <= n <= keep:
+            return ("usage",)
+    return ("company", arg, n) if arg else ("usage",)
+
+
+def _wrun_send(chat_id, pieces):
+    """Send at most _WRUN_MAX_MESSAGES pieces; say how much was left out instead of flooding the chat."""
+    for piece in pieces[:_WRUN_MAX_MESSAGES]:
+        send_telegram_message(chat_id, piece)
+    left = sum(len(x) for x in pieces[_WRUN_MAX_MESSAGES:])
+    if left:
+        send_telegram_message(chat_id, f"... ({left} more characters, use /wrun &lt;company&gt;)")
+
+
+def _warm_run_report_list(limit=10):
+    """Newest first [(run_id, run_at, commit_sha)]. Raises on a read error."""
+    with get_db_conn() as conn:
+        return [tuple(r) for r in conn.execute(
+            "SELECT run_id, run_at, commit_sha FROM warm_run_reports ORDER BY run_at DESC, rowid DESC LIMIT ?",
+            (int(limit),)).fetchall()]
+
+
+def _compute_build_info(environ=None, read_file=None, run_git=None):
+    """Which commit this process is running (build_info.running_commit with real file/git readers). Called once at
+    import, never in a request. Never raises: any failure leaves source "unknown"."""
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def _read(name):
+        with open(os.path.join(here, name), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def _git(args):
+        out = subprocess.run(["git", *args], cwd=here, capture_output=True, text=True, timeout=3)
+        if out.returncode != 0:
+            raise RuntimeError("git failed")
+        return out.stdout
+
+    try:
+        return build_info.running_commit(os.environ if environ is None else environ,
+                                         read_file=read_file or _read, run_git=run_git or _git)
+    except Exception:
+        return {"commit": "", "short": "", "source": "unknown"}
+
+
+BUILD_INFO = _compute_build_info()
+
+
 def _warm_screen_memo_write(job_hashes, outcome):
     """Record that the /w screen decided `outcome` ('rejected' or 'digest') on these roles today."""
     hashes = [h for h in dict.fromkeys(job_hashes) if h]
@@ -16007,6 +16382,14 @@ def run_warm_radar_scan(chat_id=None):
         # Hirebase feed (sibling of JSearch): preview only, to let a Kevin with no cached boards reach the hook.
         # The real plan is made again under _HIREBASE_LOCK further down. No key: nothing is planned or read.
         hirebase_key = hirebase_feed.get_key(os.environ)
+        # System_Config, read once per /w (TASK-238's Apify hook reuses `source_cfg`). Never raises.
+        source_cfg, _source_cfg_origin = source_config_read()
+        hirebase_off_by_sheet = bool(hirebase_key) and not source_cfg.hirebase_on
+        if hirebase_off_by_sheet:
+            hirebase_key = None   # off in the sheet: runs exactly as if there were no key
+        hirebase_plan_kw = {"per_run": source_cfg.hirebase_per_run, "monthly": source_cfg.hirebase_monthly_jobs}
+        hirebase_resolve_keys = set()   # keys offered as RESOLVE picks this run; only these get a company_resolution row
+        hirebase_resolution_unreadable = False
         hirebase_preview = []
         hirebase_candidates = list(no_board_candidates)   # the registry-filtered list; ALL THREE plan calls use it
         hirebase_registry_slugs = {}   # key -> registry slug to search exactly
@@ -16024,8 +16407,38 @@ def run_warm_radar_scan(chat_id=None):
                     logging.error(f"Warm Radar Hirebase registry routing raised {type(e).__name__}")
                     hirebase_candidates, hirebase_registry_slugs, hirebase_unbench = list(no_board_candidates), {}, frozenset()
                 hirebase_unbench = frozenset(hirebase_unbench) | frozenset(hirebase_lookup["resolved"])
+                # Reserve a share of the run for UNRESOLVED companies (TASK-237). Both planners sort heaviest-first, so
+                # without this trim 8 heavy known companies push every unresolved one out again; the scan side is
+                # PRE-PLANNED here (writes nothing) because a scan company inside its retry gap would otherwise burn a
+                # slot the real planner then skips. Known limits: hirebase_company_lookup_step keeps its own picks and
+                # 24-unit budget and is not reordered; a resolve pick Hirebase cannot afford this month is recorded as nothing.
+                try:
+                    _res_now = datetime.now(timezone.utc)
+                    _resolution = resolution_read()
+                    if _resolution is None:
+                        hirebase_resolution_unreadable = True   # cooldowns unknown: resolving would re-bill the heavy companies
+                    else:
+                        _pool = [c for c in hirebase_candidates
+                                 if c[0] not in hirebase_registry_slugs and _resolution.get((c[0], "hirebase"), ("",))[0] != resolve_plan.RESOLVED]
+                        _pool_keys = {c[0] for c in _pool}
+                        _scan_pool = [c for c in hirebase_candidates if c[0] not in _pool_keys]
+                        _per_run = source_cfg.hirebase_per_run
+                        _reserved = min(len(_pool), math.ceil(_per_run * resolve_plan.RESERVED_SHARE))
+                        _resolve_picks = resolve_plan.plan_resolution(_pool, _resolution, "hirebase", frozenset(), _reserved, _res_now)
+                        _scan_kw = dict(hirebase_plan_kw, per_run=max(0, _per_run - len(_resolve_picks)))
+                        _scan_keys = ({pk[0] for pk in hirebase_feed.plan_hirebase_run(
+                            _scan_pool, _hirebase_ledger_preview, _res_now, unbench_keys=hirebase_unbench, **_scan_kw).picks}
+                            if _scan_pool else set())   # nothing to scan: no pre-pass
+                        if len(_scan_keys) + len(_resolve_picks) < _per_run:   # back-fill an unused scan slot with more unresolved ones
+                            _resolve_picks = resolve_plan.plan_resolution(
+                                _pool, _resolution, "hirebase", frozenset(), _per_run - len(_scan_keys), _res_now)
+                        hirebase_candidates = [c for c in _scan_pool if c[0] in _scan_keys] + list(_resolve_picks)
+                        hirebase_resolve_keys = {c[0] for c in _resolve_picks}
+                except Exception as e:
+                    logging.error(f"Warm Radar Hirebase resolution trim raised {type(e).__name__}")
+                    hirebase_resolve_keys = set()
                 hirebase_preview = hirebase_feed.plan_hirebase_run(hirebase_candidates, _hirebase_ledger_preview, datetime.now(timezone.utc),
-                                                                   unbench_keys=hirebase_unbench).picks
+                                                                   unbench_keys=hirebase_unbench, **hirebase_plan_kw).picks
         if not slug_to_contact and not wd_to_contact and not jsearch_preview and not hirebase_preview:
             if chat_id:
                 lines = [f"🔭 <b>Warm Radar:</b> none of your {len(warm_contacts)} warm companies has a cached job board yet."]
@@ -16057,6 +16470,17 @@ def run_warm_radar_scan(chat_id=None):
         referral_pending = {}   # company key -> best contact + the roles that were LISTED this run
         screen_trace = FunnelTrace()   # why the role screen (passes_strict_filter) dropped roles this run
         stage_sampler = warm_stage_samples.StageSampler()
+        # One recorder per run (run_report): which source each posting came from, the name asked versus every name that
+        # came back. It does no I/O until the end, and recording must never fail or slow the scan.
+        _run_started = datetime.now(timezone.utc)
+        run_recorder = run_report.RunRecorder(
+            f"{_run_started.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:4]}", _run_started.strftime("%Y-%m-%d %H:%M:%S"), BUILD_INFO)
+
+        def _record(method, *args, **kwargs):
+            try:
+                getattr(run_recorder, method)(*args, **kwargs)
+            except Exception as e:
+                logging.error(f"Warm Radar run report {method} raised {type(e).__name__}")
 
         def _note_stage(stage, company, title, detail=""):
             """Sample a role at a stage. A sampler error must never fail or alter a scan."""
@@ -16095,6 +16519,11 @@ def run_warm_radar_scan(chat_id=None):
             """PASS 1 for ONE posting, board or JSearch: every gate and the grouping, one code path.
             jsearch_keys (set of company keys), when given, drops a posting whose employer is not one of them."""
             nonlocal board_index, title_filtered, region_filtered
+            # The Hirebase/Apify loops stash the name the SOURCE returned under a private key before they overwrite
+            # employer_name with the sent name. Read it here and drop it, so it never reaches a card, a hash or the CRM.
+            returned_name = job.get("_returned_name") or job.get("employer_name") or ""
+            if "_returned_name" in job:
+                job = {k: v for k, v in job.items() if k != "_returned_name"}
             company = job.get("employer_name") or ""
             title = job.get("job_title") or ""
             if is_banned_employer(company):
@@ -16129,6 +16558,7 @@ def run_warm_radar_scan(chat_id=None):
             if jsearch_keys is not None and normalize_company_for_match(company) not in jsearch_keys:
                 return   # a JSearch posting is kept only when its employer IS one of the companies searched
             _note_stage("pulled", company, title)
+            _record("note_posting", run_report.source_from_job_id(job_id), contact.get("raw_company") or company, returned_name)
 
             # The title gate /t uses (one shared function). A filtered role is counted, never stamped
             # into seen_jobs (same reason _add_candidate does not): the rule can change and the role
@@ -16310,7 +16740,7 @@ def run_warm_radar_scan(chat_id=None):
                         hirebase_status = "ledger_unreadable"
                     else:
                         hirebase_plan = hirebase_feed.plan_hirebase_run(hirebase_candidates, hirebase_ledger_now, datetime.now(timezone.utc),
-                                                                         unbench_keys=hirebase_unbench)
+                                                                         unbench_keys=hirebase_unbench, **hirebase_plan_kw)
                         hirebase_month_before = hirebase_plan.month_used
                         if hirebase_plan.skip_reason or not hirebase_plan.picks:
                             hirebase_status = hirebase_plan.skip_reason or "nothing_eligible"
@@ -16342,7 +16772,7 @@ def run_warm_radar_scan(chat_id=None):
                                     hirebase_status = "ledger_unreadable"
                                     break
                                 hirebase_replan = hirebase_feed.plan_hirebase_run(hirebase_candidates, hirebase_ledger_now, datetime.now(timezone.utc),
-                                                                         unbench_keys=hirebase_unbench)
+                                                                         unbench_keys=hirebase_unbench, **hirebase_plan_kw)
                                 hirebase_mine = [pk for pk in hirebase_replan.picks if pk[0] == pick_key]
                                 if not hirebase_mine:
                                     continue
@@ -16371,6 +16801,7 @@ def run_warm_radar_scan(chat_id=None):
                         if hirebase_outcome == "errored":
                             hirebase_status = "errored"
                             hirebase_per_company.append((pick_name, "errored", 0, 0))
+                            _record("note_source_call", "hirebase", pick_name, status="errored", error=str(getattr(hirebase_result, "error", "") or "exception"))
                             hirebase_searched[pick_key] = ("errored", 0, 0)
                             hirebase_errored_reserved = hirebase_limit
                             hirebase_err_detail = str(getattr(hirebase_result, "error", "") or "exception")
@@ -16378,8 +16809,11 @@ def run_warm_radar_scan(chat_id=None):
                             break
                         hirebase_jobs_used_this_run += returned_n
                         try:
+                            _hb_dropped = []
                             kept_jobs, co_stats = hirebase_feed.split_jobs(hirebase_result.jobs, pick_name, hirebase_slugs, normalize_company_for_match,
-                                                                           trusted_slugs=hirebase_trusted)
+                                                                           trusted_slugs=hirebase_trusted, dropped=_hb_dropped)
+                            _record("note_source_call", "hirebase", pick_name, status="empty" if returned_n == 0 else "ok",
+                                    returned=returned_n, kept=len(kept_jobs), dropped=_hb_dropped)
                             for stat_key in hirebase_stats:
                                 hirebase_stats[stat_key] += co_stats.get(stat_key, 0)
                             hirebase_per_company.append((pick_name, hirebase_outcome, returned_n, len(kept_jobs)))
@@ -16406,7 +16840,7 @@ def run_warm_radar_scan(chat_id=None):
                                     continue
                                 try:
                                     if hirebase_trusted:   # slug verified against the company: attribute to the warm company's name
-                                        job = dict(job, employer_name=pick_name)
+                                        job = dict(job, employer_name=pick_name, _returned_name=job.get("employer_name"))
                                     hirebase_hash_to_ids.setdefault(
                                         generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
                                     hirebase_collected += 1
@@ -16420,6 +16854,15 @@ def run_warm_radar_scan(chat_id=None):
                 hirebase_status = "errored"
                 logging.error(f"Warm Radar Hirebase block raised {type(e).__name__}")
 
+        # Remember what Hirebase answered for each company offered as a RESOLVE pick (TASK-237). A company outside
+        # hirebase_resolve_keys, or one the loop never reached (it stops at the first error), records nothing.
+        # resolution_record never raises; a failed write is logged by class there and never stops the run.
+        for _rk, (_ro, _rret, _rkept) in list(hirebase_searched.items()):
+            if _rk not in hirebase_resolve_keys:
+                continue
+            resolution_record(_rk, "hirebase", resolve_plan.ERROR if _ro == "errored"
+                              else resolve_plan.RESOLVED if _rkept > 0 else resolve_plan.EMPTY)
+
         # APIFY FEED. At most ONE batched call per run, for the no-board companies Hirebase could not answer.
         # The ledger row is reserved under _APIFY_LOCK BEFORE the request. Errors are never "no jobs": an errored
         # call marks nothing seen and records nothing. Nothing here can fail the scan; unconfigured, down or over
@@ -16428,6 +16871,8 @@ def run_warm_radar_scan(chat_id=None):
         apify_picked_names = []
         apify_stats = {"returned": 0, "malformed": 0, "kept": 0, "unmatched": 0}
         apify_rows_returned = 0
+        apify_capped = False   # the answer hit the request limit (fetch_feed owns the test); only an ok call can set it
+        apify_limit_sent = 0
         apify_spent_usd = None
         apify_month_before = 0.0
         apify_collected = 0
@@ -16436,16 +16881,42 @@ def run_warm_radar_scan(chat_id=None):
         apify_kept_by_company = {}
         apify_key_by_name = {}
         apify_hash_to_ids = {}   # job_hash -> apify job ids, so only settled roles are marked seen
+        apify_resolve_keys = set()   # keys offered as RESOLVE picks; only these get a company_resolution row
+        apify_resolved_count = 0
+        apify_resolve_searched = 0
         try:
             apify_token = apify_feed.get_token(os.environ)
-            if apify_token and no_board_candidates:
+            if apify_token and not source_cfg.apify_on:
+                apify_status = "off"   # off in System_Config: no ledger read, no call
+            elif apify_token and no_board_candidates:
                 apify_status = "skipped"
                 _reg = hirebase_registry_read()
+                _apify_resolution = resolution_read() if _reg is not None else None
                 if _reg is None:
                     apify_status = "registry_unreadable"
+                elif _apify_resolution is None:
+                    apify_status = "resolution_unreadable"   # cooldowns unknown: do not guess, do not bill
                 else:
-                    apify_cands = apify_feed.fallthrough_candidates(
+                    # Pool = what Hirebase could not answer: this run's zero-row/registry fall-through (TASK-202) PLUS every
+                    # company Hirebase earlier recorded "empty" (it sits in a Hirebase cooldown and is not searched again,
+                    # so only the stored row says it is unanswered). An "error" row is unknown, never empty.
+                    _fall = apify_feed.fallthrough_candidates(
                         no_board_candidates, hirebase_searched, {k: (e.slug, e.status) for k, e in _reg.items()})
+                    _pool, _pool_seen = [], set()
+                    for _c in list(_fall) + [c for c in no_board_candidates
+                                             if _apify_resolution.get((c[0], "hirebase"), ("",))[0] == resolve_plan.EMPTY]:
+                        if _c[0] not in _pool_seen:
+                            _pool_seen.add(_c[0])
+                            _pool.append(_c)
+                    _a_resolve = [c for c in _pool if _apify_resolution.get((c[0], "apify"), ("",))[0] != resolve_plan.RESOLVED]
+                    _a_resolve_keys = {c[0] for c in _a_resolve}
+                    _a_scan = [c for c in _pool if c[0] not in _a_resolve_keys]
+                    _a_per_run = source_cfg.apify_per_run
+                    _a_ceiling = source_cfg.apify_monthly_usd
+                    _a_now = datetime.now(timezone.utc)
+                    _a_picks = resolve_plan.plan_resolution(
+                        _a_resolve, _apify_resolution, "apify", frozenset(),
+                        min(len(_a_resolve), math.ceil(_a_per_run * resolve_plan.RESERVED_SHARE)), _a_now)
                     apify_plan = None
                     apify_row_id = None
                     with _APIFY_LOCK:
@@ -16453,7 +16924,19 @@ def run_warm_radar_scan(chat_id=None):
                         if apify_ledger_now is None:
                             apify_status = "ledger_unreadable"
                         else:
-                            _plan = apify_feed.plan_apify_run(apify_cands, apify_ledger_now, datetime.now(timezone.utc))
+                            # plan_apify_run sorts heaviest-first and keeps a 7-day retry, so without this trim 8 heavy
+                            # known companies would starve the unresolved tail again. The scan side is pre-planned (writes
+                            # nothing) to learn which scan companies it would really search.
+                            _a_scan_keys = ({pk[0] for pk in apify_feed.plan_apify_run(
+                                _a_scan, apify_ledger_now, _a_now, per_run=max(0, _a_per_run - len(_a_picks)),
+                                ceiling_usd=_a_ceiling).picks} if _a_scan else set())
+                            if len(_a_scan_keys) + len(_a_picks) < _a_per_run:   # back-fill an unused scan slot
+                                _a_picks = resolve_plan.plan_resolution(
+                                    _a_resolve, _apify_resolution, "apify", frozenset(), _a_per_run - len(_a_scan_keys), _a_now)
+                            apify_resolve_keys = {c[0] for c in _a_picks}
+                            apify_cands = [c for c in _a_scan if c[0] in _a_scan_keys] + list(_a_picks)
+                            _plan = apify_feed.plan_apify_run(apify_cands, apify_ledger_now, _a_now,
+                                                              per_run=_a_per_run, ceiling_usd=_a_ceiling)
                             apify_month_before = _plan.month_spent_usd
                             if _plan.skip_reason or not _plan.picks:
                                 apify_status = _plan.skip_reason or "nothing_eligible"
@@ -16476,6 +16959,10 @@ def run_warm_radar_scan(chat_id=None):
                         if apify_result is not None and apify_result.status == "ok":
                             apify_status = "ok"
                             apify_rows_returned = len(apify_result.rows)
+                            apify_capped, apify_limit_sent = bool(apify_result.capped), apify_plan.limit
+                            if apify_capped:
+                                logging.warning(f"Warm Radar Apify answer hit the request limit (rows == limit): possibly cut off "
+                                                f"({apify_rows_returned} rows, limit {apify_limit_sent})")
                             apify_spent_usd = apify_feed.actual_cost(apify_rows_returned)
                             apify_ledger_settle(apify_row_id, apify_spent_usd, "ok")
                         else:
@@ -16484,11 +16971,36 @@ def run_warm_radar_scan(chat_id=None):
                             apify_reserved_usd = apify_plan.worst_case_usd
                             apify_err_detail = getattr(apify_result, "error", "") or "request raised"
                             apify_ledger_settle(apify_row_id, apify_plan.worst_case_usd, "errored")
+                            for _an in apify_picked_names:
+                                _record("note_source_call", "apify", _an, status="errored", error=str(apify_err_detail))
                             logging.error(f"Warm Radar Apify call errored: {getattr(apify_result, 'error', 'raised')}")
+                            for _pk in apify_plan.picks:   # an errored call is unknown, never empty
+                                if _pk[0] in apify_resolve_keys:
+                                    resolution_record(_pk[0], "apify", resolve_plan.ERROR)
                         if apify_status == "ok":
                             try:
+                                _ap_dropped = []
                                 apify_kept_by_company, apify_stats = apify_feed.split_rows(
-                                    apify_result.rows, apify_picked_names, normalize_company_for_match)
+                                    apify_result.rows, apify_picked_names, normalize_company_for_match, dropped=_ap_dropped)
+                                # A dropped row belongs to the BATCH, not to one company. It is shown under the picked company
+                                # whose name it shares the longest start with ("Haworth International" -> "Haworth Inc.");
+                                # a row that shares none is reported once as a problem instead of guessed onto a company.
+                                _ap_squash = lambda t: re.sub(r"[^a-z0-9]", "", str(t or "").lower())
+                                _ap_by_pick, _ap_loose = {n: [] for n in apify_picked_names}, []
+                                for _dn, _dr in _ap_dropped:
+                                    _best = max(apify_picked_names, key=lambda n: len(os.path.commonprefix([_ap_squash(n), _ap_squash(_dn)])), default=None)
+                                    if _best and len(os.path.commonprefix([_ap_squash(_best), _ap_squash(_dn)])) >= 4:
+                                        _ap_by_pick[_best].append((_dn, _dr))
+                                    else:
+                                        _ap_loose.append((_dn, _dr))
+                                for _an in apify_picked_names:
+                                    _akept = len(apify_kept_by_company.get(_an) or [])
+                                    _record("note_source_call", "apify", _an, status="ok" if _akept else "empty",
+                                            returned=_akept + len(_ap_by_pick[_an]), kept=_akept, dropped=_ap_by_pick[_an])
+                                _record("set_counts", apify_rows_returned=len(apify_result.rows), apify_dropped_unattributed=len(_ap_loose))
+                                if _ap_loose:
+                                    _record("note_problem", "Apify rows dropped, no company to show them under: "
+                                            + ", ".join(sorted({f"{n or '(unreadable)'} ({r})" for n, r in _ap_loose})[:5]))
                                 # Learn from the rows before they are screened (best effort, never fails the
                                 # scan): the feed source per company that has kept rows, and a Workday triple
                                 # (UNVERIFIED: a posting link proves a posting; /w's own scan is the check).
@@ -16506,6 +17018,12 @@ def run_warm_radar_scan(chat_id=None):
                                                 break
                                 except Exception as e:
                                     logging.error(f"Warm Radar Apify learn raised {type(e).__name__}")
+                                for _pk in apify_plan.picks:   # settled: rows kept -> resolved; none kept -> the feed does not cover it
+                                    if _pk[0] in apify_resolve_keys:
+                                        _got = bool(apify_kept_by_company.get(_pk[1]))
+                                        apify_resolve_searched += 1
+                                        apify_resolved_count += 1 if _got else 0
+                                        resolution_record(_pk[0], "apify", resolve_plan.RESOLVED if _got else resolve_plan.EMPTY)
                                 apify_all_jobs = [j for jobs in apify_kept_by_company.values() for j in jobs]
                                 # The seen filter runs AFTER billing, as the Hirebase block does.
                                 apify_already = apify_seen_filter([j["job_id"] for j in apify_all_jobs])
@@ -16514,7 +17032,7 @@ def run_warm_radar_scan(chat_id=None):
                                         if job["job_id"] in apify_already:
                                             continue
                                         try:
-                                            job = dict(job, employer_name=apify_name)
+                                            job = dict(job, employer_name=apify_name, _returned_name=job.get("employer_name"))
                                             apify_hash_to_ids.setdefault(
                                                 generate_dedup_hash(job["employer_name"], job["job_title"]), []).append(job["job_id"])
                                             apify_collected += 1
@@ -16765,9 +17283,15 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(jsearch_line)
             # Hirebase. The meter is account-wide: Kevin's own Playground use makes the real meter higher than
             # this line, which counts only what the ledger saw. Errored, nothing found and found never merge.
+            if hirebase_off_by_sheet:
+                lines.append("Hirebase: off in System_Config")
+            if source_cfg.problems:
+                lines.append(html.escape("System_Config ignored: " + "; ".join(str(p) for p in source_cfg.problems)))
+            if hirebase_resolution_unreadable:
+                lines.append("Hirebase: resolution memory unreadable, companies searched as before")
             if hirebase_status == "monthly_cap":
                 lines.append(f"Hirebase skipped: monthly job budget used ({hirebase_month_before} of "
-                             f"{hirebase_feed.HIREBASE_MONTHLY_JOBS}, {hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
+                             f"{source_cfg.hirebase_monthly_jobs}, {hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
             elif hirebase_per_company:
                 hb_rows = hirebase_ledger_read() or []
                 hb_now = datetime.now(timezone.utc)
@@ -16788,7 +17312,7 @@ def run_warm_radar_scan(chat_id=None):
                                  f"{hirebase_errored_reserved} jobs reserved against the month")
                 lines.append(f"Hirebase: {len(hirebase_picked_names)} companies, {hirebase_jobs_used_this_run} jobs returned, "
                              f"{hirebase_stats['kept']} kept, {hirebase_jobs_used_this_run} used this run, "
-                             f"{hb_month_used} of {hirebase_feed.HIREBASE_MONTHLY_JOBS} used this month "
+                             f"{hb_month_used} of {source_cfg.hirebase_monthly_jobs} used this month "
                              f"({hirebase_feed.HIREBASE_RESERVE_JOBS} held back)")
             if hirebase_lookup and (hirebase_lookup["attempted"] or hirebase_lookup["blocked"]):
                 if hirebase_lookup["blocked"]:
@@ -16803,7 +17327,11 @@ def run_warm_radar_scan(chat_id=None):
             # registry / ledger / reserve are NOT silent: Apify was configured and could not run.
             def _usd_text(v):
                 return f"${v:.3f}" if 0 < v < 0.01 else f"${v:.2f}"
-            if apify_status == "registry_unreadable":
+            if apify_status == "off":
+                lines.append("Apify: off in System_Config")
+            elif apify_status == "resolution_unreadable":
+                lines.append("Apify skipped: resolution memory unreadable, nothing was spent")
+            elif apify_status == "registry_unreadable":
                 lines.append("Apify skipped: registry unreadable, nothing was spent")
             elif apify_status == "ledger_unreadable":
                 lines.append("Apify skipped: ledger unreadable, nothing was spent")
@@ -16811,7 +17339,7 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append("Apify skipped: could not record the spend first, nothing was spent")
             elif apify_status == "monthly_ceiling":
                 lines.append(f"Apify skipped: monthly budget used ({_usd_text(apify_month_before)} of "
-                             f"{_usd_text(apify_feed.APIFY_MONTHLY_CEILING_USD)})")
+                             f"{_usd_text(source_cfg.apify_monthly_usd)})")
             elif apify_status == "errored":
                 lines.append(f"Apify errored ({html.escape(apify_err_detail or 'unknown')}); "
                              f"{len(apify_picked_names)} companies not searched, retried on a later run; "
@@ -16820,14 +17348,21 @@ def run_warm_radar_scan(chat_id=None):
                 ap_empty = [n for n in apify_picked_names if not apify_kept_by_company.get(n)]
                 if ap_empty:
                     names_text, _used = _warm_radar_name_list(ap_empty, 5)
-                    lines.append(f"Searched Apify, no rows for: {names_text} (the feed may not cover them; "
-                                 "that is not the same as no jobs)")
+                    lines.append(f"Searched Apify, no rows for: {names_text} " + (
+                        "(the answer was cut off, so these may have rows that were not returned; that is not the same as no jobs)"
+                        if apify_capped else "(the feed may not cover them; that is not the same as no jobs)"))
+                if apify_capped:
+                    lines.append(f"Apify possibly cut off: {apify_rows_returned} rows returned and the request limit was "
+                                 f"{apify_limit_sent}; {apify_stats['kept']} kept are what came back, which may not be "
+                                 "everything the feed holds for these companies")
                 lines.append(f"Apify: {len(apify_picked_names)} companies, {apify_rows_returned} rows returned, "
                              f"{apify_stats['kept']} kept, {_usd_text(apify_spent_usd)} this run, "
                              f"{_usd_text(apify_month_before + apify_spent_usd)} of "
-                             f"{_usd_text(apify_feed.APIFY_MONTHLY_CEILING_USD)} this month "
+                             f"{_usd_text(source_cfg.apify_monthly_usd)} this month "
                              "(counts only what the ledger saw, not console runs)")
-            if apify_status != "unconfigured":
+            if apify_resolve_searched:
+                lines.append(f"Apify resolved {apify_resolved_count} of {apify_resolve_searched} companies this run")
+            if apify_status not in ("unconfigured", "off"):
                 hb_unmatched = [n for n, _st, ret, kp in hirebase_per_company if ret > 0 and kp == 0]
                 if hb_unmatched:
                     names_text, _used = _warm_radar_name_list(hb_unmatched, 5)
@@ -16840,7 +17375,32 @@ def run_warm_radar_scan(chat_id=None):
                 lines.append(f"{len(applied_skipped)} compan{'y' if len(applied_skipped) == 1 else 'ies'} skipped: "
                              f"applied to in the last {warm_screen_plan.APPLIED_SKIP_DAYS} days ({names_text})")
             lines += _skipped_report()
-            send_telegram_message(chat_id, "\n".join(lines))
+            # Save the full text and the per-company record FIRST: an unsaved run falls back to the full message, so no
+            # detail is ever lost silently. The old long text is the stored detail, verbatim.
+            _record("set_counts", boards_scanned=len(scanned_slugs), boards_total=len(all_slugs), screened=len(to_screen),
+                    cards=len(sent_items), digest=len(digest_sent), below_70=len(rejected_hashes), held=held_roles,
+                    failed=len(failed_roles))
+            for _item in sent_items:
+                _record("note_outcome", _item.get("company"), cards=1)
+            for _item in digest_sent:
+                _record("note_outcome", _item.get("company"), digest=1)
+            detail_text = "\n".join(lines)
+            saved = False
+            snapshot = {}
+            try:
+                snapshot = run_recorder.snapshot()
+                saved = _warm_run_report_write(snapshot, detail_text)
+            except Exception as e:
+                logging.error(f"Warm Radar run report save raised {type(e).__name__}")
+            if WARM_CLOSING_MODE == "full" or not saved:
+                send_telegram_message(chat_id, detail_text + (
+                    "" if saved or WARM_CLOSING_MODE == "full" else
+                    "\nDetail not saved (store write failed); this is the full text."))
+            else:
+                money = [ln for ln in lines if ln.startswith(("Hirebase: ", "Apify: "))]
+                attention = [ln for ln in lines[1:] if ln not in money and any(mk in ln.lower() for mk in _ATTENTION_MARKERS)]
+                send_telegram_message(chat_id, run_report.compose_short(
+                    snapshot, headline=lines[0], money_line=" · ".join(money), attention=attention))
         _warm_stage_samples_write(stage_sampler.snapshot())
         return match_count
     finally:
@@ -17217,6 +17777,86 @@ def process_webhook_payload_async(data):
                 return
             for chunk in format_leads_messages(rows, limit, TELEGRAM_MAX_MESSAGE_CHARS):
                 send_telegram_message(chat_id, chunk)
+            return
+        # /monte [N]: where site visits came from and what each group viewed (read-only).
+        if text == "/monte" or text.startswith("/monte "):
+            arg = text[len("/monte"):].strip()
+            if arg and not (arg.isdigit() and 1 <= int(arg) <= 90):
+                send_telegram_message(chat_id, "📊 Usage: /monte (last 7 days) or /monte 30 (1-90)")
+                return
+            days = int(arg or 7)
+            if not analytics_enabled():
+                send_telegram_message(chat_id, "Site analytics is switched off (ANALYTICS_ENABLED).")
+                return
+            try:
+                visit_rows = get_site_visit_rows_dated(days)
+            except Exception as e:
+                logging.error(f"/monte visit read failed: {type(e).__name__}")
+                send_telegram_message(chat_id, "Could not read the site visit log.")
+                return
+            try:
+                lead_times = get_lead_times(days)
+            except Exception as e:
+                logging.error(f"/monte lead read failed: {type(e).__name__}")
+                lead_times = None   # the report prints "unknown", never a made-up zero
+            report = site_traffic.build_report(visit_rows, datetime.now(timezone.utc), days, lead_times)
+            for piece in site_traffic.render_report(report):
+                send_telegram_message(chat_id, piece)
+            return
+        # /vlink [name]: a per-contact site link (creates the tag the first time), or the list of links made.
+        if text == "/vlink" or text.startswith("/vlink "):
+            name = " ".join(text[len("/vlink"):].split())
+            usage = "<code>/vlink Jane Doe</code> makes (or shows) Jane's link to the site."
+            if not name:
+                try:
+                    made = visit_tag_list(20)
+                except Exception as e:
+                    logging.error(f"/vlink list failed: {type(e).__name__}")
+                    send_telegram_message(chat_id, "❌ Could not read the links.")
+                    return
+                if not made:
+                    send_telegram_message(chat_id, "No links made yet. " + usage)
+                    return
+                lines = ["🔗 <b>Links made</b> (newest first)"]
+                for label, tag, opened in made:
+                    lines.append(f"{html.escape(label)} — {SITE_PUBLIC_URL}/?r={tag} — "
+                                 f"opened {opened} time{'' if opened == 1 else 's'}")
+                send_telegram_message(chat_id, "\n".join(lines))
+                return
+            if len(name) > 80:
+                send_telegram_message(chat_id, "❌ That name is over 80 characters. " + usage)
+                return
+            tag = visit_tag_create(name)
+            if not tag:
+                send_telegram_message(chat_id, "❌ Could not save that link, so none was made. Try again.")
+                return
+            send_telegram_message(chat_id, f"🔗 {html.escape(name)}: {SITE_PUBLIC_URL}/?r={tag}\n"
+                                  f"When they open it you get \"Opened by {html.escape(name)}\".")
+            return
+        # /wrun [n | full | <company>]: a /w run's saved per-company report (read-only, spends nothing).
+        if text == "/wrun" or text.startswith("/wrun "):
+            parsed = _wrun_parse(text[len("/wrun"):])
+            if parsed[0] == "usage":
+                send_telegram_message(chat_id, _WRUN_USAGE)
+                return
+            try:
+                report = _warm_run_report_read(parsed[-1])
+            except Exception as e:
+                logging.error(f"/wrun read failed: {type(e).__name__}")
+                send_telegram_message(chat_id, "❌ Could not read the /w run reports.")
+                return
+            if not report:
+                send_telegram_message(chat_id, "No /w run recorded yet.")
+                return
+            snapshot = report["snapshot"]
+            if parsed[0] == "overview":
+                _wrun_send(chat_id, run_report.render_overview(snapshot))
+            elif parsed[0] == "company":
+                send_telegram_message(chat_id, run_report.render_company(snapshot, parsed[1]))
+            else:
+                header = (f"run {html.escape(str(report['run_id']))}, build "
+                          f"{html.escape(str(report['commit_sha'])[:7]) or 'unknown'}")
+                _wrun_send(chat_id, run_report.chunk(header + "\n" + report["detail"]))
             return
         # /wstages [1-5]: the last /w run's per-stage title samples (read-only).
         if text == "/wstages" or text.startswith("/wstages "):
@@ -19303,7 +19943,10 @@ def process_webhook_payload_async(data):
                 "/owed - Every follow-up still owed (last 14 days), count + links\n"
                 "/owedx - Dismiss every open follow-up (CRM untouched; /owedx undo restores)\n"
                 "/refer - Pending referral asks from /w, 5 per page (/refer 2, /refer sent &lt;id&gt;)\n"
-                "/wstages - Last /w run: sample titles at each stage (/wstages 2 = the run before)\n\n"
+                "/wstages - Last /w run: sample titles at each stage (/wstages 2 = the run before)\n"
+                "/monte - Where site visits came from and what each group viewed (/monte 30 = last 30 days)\n"
+                "/wrun - Last /w run, per company: which source answered and what names came back (/wrun Haworth, /wrun full)\n"
+                "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
                 "/efficiency - View Input to Interview Golden Ratio\n"
@@ -19480,6 +20123,7 @@ def health_check():
             "mode": mode,
             "elapsed_ms": round(elapsed_ms, 2),
             "persistence": persistence,
+            "build": {"commit": BUILD_INFO["commit"], "short": BUILD_INFO["short"], "source": BUILD_INFO["source"]},
         }), 200
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
@@ -20453,6 +21097,60 @@ def _visit_timestamp(value):
         return None
 
 
+def visit_tag_create(label, now=None):
+    """The tag for a contact label, creating it if needed. The label is trimmed, whitespace-collapsed and capped
+    at 80 chars; blank -> None. The same label again returns the EXISTING tag. Retries on a PK collision.
+    None on a DB error (never raises)."""
+    try:
+        text = " ".join(str(label or "").split())[:80]
+        if not text:
+            return None
+        now = now or datetime.now(timezone.utc)
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT tag FROM visit_tags WHERE label = ? ORDER BY created_at LIMIT 1", (text,)).fetchone()
+            if row:
+                return row[0]
+            for _ in range(5):
+                tag = visit_alert.new_tag()
+                try:
+                    conn.execute("INSERT INTO visit_tags (tag, label, created_at) VALUES (?, ?, ?)",
+                                 (tag, text, now.isoformat()))
+                    conn.commit()
+                    return tag
+                except sqlite3.IntegrityError:
+                    continue
+        return None
+    except Exception as e:
+        logging.error(f"Visit Tag Create Error: {type(e).__name__}")
+        return None
+
+
+def visit_tag_lookup(tag):
+    """The contact label for a tag, or None. None on a read error too: an unreadable table must not read as a person."""
+    try:
+        t = visit_alert.valid_tag(tag)
+        if not t:
+            return None
+        with get_db_conn() as conn:
+            row = conn.execute("SELECT label FROM visit_tags WHERE tag = ?", (t,)).fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        logging.error(f"Visit Tag Lookup Error: {type(e).__name__}")
+        return None
+
+
+SITE_PUBLIC_URL = "https://montelattice.com"
+
+
+def visit_tag_list(limit=20):
+    """[(label, tag, opened_count)] for the `limit` most recent visit tags, newest first. opened_count is the number of
+    site_visits rows carrying that tag. Raises on a DB error (the /vlink handler turns that into a short reply)."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT t.label, t.tag, (SELECT COUNT(*) FROM site_visits v WHERE v.tag = t.tag) "
+            "FROM visit_tags t ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?", (int(limit),)).fetchall()
+
+
 def record_site_visits(views, day=None, alerts=None):
     """Classify, hash and store a batch of forwarded pageviews. Returns rows written. The ip and
     ua fields of each view are read here and dropped - only (visited_at, path, visitor_id,
@@ -20467,21 +21165,26 @@ def record_site_visits(views, day=None, alerts=None):
             continue
         ip, ua = str(v.get("ip") or ""), str(v.get("ua") or "")
         path = str(v.get("path") or "/").split("?", 1)[0][:200]
+        # Optional per-contact tag (the site forwards the `r` query parameter as "tag"). Stored only when it maps to a
+        # known contact, so a guessed tag names nobody. Never stored or logged with the ip.
+        label = visit_tag_lookup(visit_alert.valid_tag(v.get("tag"))) if v.get("tag") else None
         rows.append((
             _visit_timestamp(v.get("ts")), path, daily_visitor_id(ip, ua, salt),
             normalize_referrer_host(v.get("referrer"), own) or None,
             visit_bot_flag(ua, ip, bool(v.get("self")), ignore, path=path),
+            visit_alert.valid_tag(v.get("tag")) if label else None,
+            label,
         ))
     if not rows:
         return 0
     with get_db_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.executemany(
-            "INSERT INTO site_visits (visited_at, path, visitor_id, referrer, bot) "
-            "VALUES (COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)", rows)
+            "INSERT INTO site_visits (visited_at, path, visitor_id, referrer, bot, tag) "
+            "VALUES (COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?)", [r[:6] for r in rows])
         conn.commit()
     if alerts is not None:
-        alerts.extend(rows)
+        alerts.extend(r[:5] + (r[6],) for r in rows)   # the alert gets the contact label, never the tag
     return len(rows)
 
 
@@ -20524,10 +21227,10 @@ def _visit_when_text(visited_at):
         return dt.strftime("%a %b %d, %I:%M %p UTC").replace(" 0", " ")
 
 
-def _send_visit_alert(when_text, path, referrer):
+def _send_visit_alert(when_text, path, referrer, who=None):
     """Runs off the request thread. A failed send is logged (class name only) and not retried."""
     try:
-        if not send_telegram_message(TELEGRAM_CHAT_ID, visit_alert.format_visit_alert(when_text, path, referrer)):
+        if not send_telegram_message(TELEGRAM_CHAT_ID, visit_alert.format_visit_alert(when_text, path, referrer, who=who)):
             logging.error("[ANALYTICS] visit alert was not delivered to Telegram")
     except Exception as e:
         logging.error(f"[ANALYTICS] visit alert send raised {type(e).__name__}")
@@ -20535,7 +21238,9 @@ def _send_visit_alert(when_text, path, referrer):
 
 def _start_visit_alerts(candidates):
     """Gate each stored view on the request thread, queue the send of each admitted one."""
-    for visited_at, path, visitor_id, referrer, bot in candidates:
+    # Known limit: the gate allows one alert per visitor per 10 minutes, so a visitor who opens an untagged page first
+    # and the tagged link second inside that window is not re-alerted. A tagged link is nearly always the first page.
+    for visited_at, path, visitor_id, referrer, bot, who in candidates:
         try:
             view_epoch = (datetime.strptime(visited_at, "%Y-%m-%d %H:%M:%S")
                           .replace(tzinfo=timezone.utc).timestamp()) if visited_at else None
@@ -20545,7 +21250,7 @@ def _start_visit_alerts(candidates):
         if not ok:
             continue
         when_text = _visit_when_text(visited_at)
-        _spawn_background(lambda w=when_text, p=path, r=referrer: _send_visit_alert(w, p, r))
+        _spawn_background(lambda w=when_text, p=path, r=referrer, who=who: _send_visit_alert(w, p, r, who))
 
 
 @app.route("/analytics/ingest", methods=["POST"])
@@ -20571,6 +21276,22 @@ def analytics_ingest():
         logging.error(f"[ANALYTICS] visit alerts failed: {type(e).__name__}")
     _maybe_prune_site_visits()
     return jsonify({"status": "ok", "stored": stored}), 200
+
+
+def get_site_visit_rows_dated(days):
+    """READ-ONLY. (visited_at, visitor_id, path, referrer, bot) for the trailing `days` days plus one extra day (the
+    site_traffic module cuts the exact window in its own time zone). Raises on a read error."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT visited_at, visitor_id, path, referrer, bot FROM site_visits WHERE visited_at >= datetime('now', ?) "
+            "ORDER BY visited_at, id", (f"-{int(days) + 1} days",)).fetchall()
+
+
+def get_lead_times(days):
+    """READ-ONLY. received_at strings of contact-form submissions in the trailing `days` days plus one. Raises on error."""
+    with get_db_conn() as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT received_at FROM inbound_leads WHERE received_at >= datetime('now', ?)", (f"-{int(days) + 1} days",)).fetchall()]
 
 
 def get_site_visit_rows(hours=24):

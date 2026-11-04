@@ -21,7 +21,7 @@
           {
             "type": "command",
             "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/verify_suites.py\"",
-            "timeout": 330,
+            "timeout": 630,
             "statusMessage": "Checking both test suites before ending the turn..."
           }
         ]

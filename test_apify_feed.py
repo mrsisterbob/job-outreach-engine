@@ -338,3 +338,51 @@ def test_apify_fallthrough_summarize_sources():
     assert out["B"] == {"source_domain": "x.myworkdayjobs.com", "job_board": "workday", "rows": 3}
     assert out["C"] == {"source_domain": "", "job_board": "", "rows": 1}
     assert af.summarize_feed_sources({}) == {}
+
+
+def _every_row_is_dropped_or_kept_once(rows, companies):
+    dropped = []
+    kept, stats = af.split_rows(rows, companies, norm, dropped=dropped)
+    assert stats["kept"] + len(dropped) == stats["returned"]
+    assert len(dropped) == stats["unmatched"] + stats["malformed"]
+    return kept, stats, dropped
+
+
+def test_apify_dropped_names_the_haworth_case_lists_the_name_that_came_back():
+    rows = [_row(), _row(id="2", organization="Haworth International")]
+    kept, stats, dropped = _every_row_is_dropped_or_kept_once(rows, ["Haworth Inc."])
+    assert [r["employer_name"] for r in kept["Haworth Inc."]] == ["Haworth Inc."]
+    assert dropped == [("Haworth International", "no_match")]
+
+
+def test_apify_dropped_names_a_row_claimed_by_several_companies_says_so():
+    # split_rows de-duplicates company names on their normalized form, so two owners can only arise from a
+    # normalize that changes between the de-duplication pass and the ownership pass: simulate exactly that.
+    calls = {"n": 0}
+
+    def shifting(name):
+        calls["n"] += 1
+        return f"{name}-x" if calls["n"] <= 2 else "haworth"
+    dropped = []
+    kept, stats = af.split_rows([_row(organization="Haworth")], ["A1", "A2"], shifting, dropped=dropped)
+    assert kept == {} and stats["unmatched"] == 1
+    assert dropped == [("Haworth", "claimed_by_several")]
+
+
+def test_apify_dropped_names_a_malformed_row_gives_an_empty_name():
+    _kept, stats, dropped = _every_row_is_dropped_or_kept_once([_row(title=None), "junk", _row()], ["Haworth Inc."])
+    assert stats["malformed"] == 2 and dropped == [("", "malformed"), ("", "malformed")]
+
+
+def test_apify_dropped_names_none_and_empty_list_give_the_same_kept_and_stats():
+    rows = [_row(), _row(id="2", organization="Other Co"), _row(title=None)]
+    assert af.split_rows(rows, ["Haworth Inc."], norm) == af.split_rows(rows, ["Haworth Inc."], norm, dropped=[])
+    assert af.split_rows(rows, ["Haworth Inc."], norm) == af.split_rows(rows, ["Haworth Inc."], norm, dropped=None)
+
+
+def test_apify_dropped_names_a_non_list_is_ignored_without_raising():
+    rows = [_row(id="2", organization="Other Co")]
+    for bad in ((), "text", {}, 5):
+        kept, stats = af.split_rows(rows, ["Haworth Inc."], norm, dropped=bad)
+        assert stats["unmatched"] == 1
+    assert bad == 5

@@ -8,6 +8,8 @@ or visitor id can reach it.
 from __future__ import annotations
 
 import html
+import re
+import secrets
 import threading
 
 VISIT_ALERT_WINDOW_SECONDS = 600  # DESIGN CHOICE, not a measurement
@@ -63,6 +65,26 @@ class VisitAlertGate:
             self._last[visitor_id] = now
             self._alerts.append(now)
             return True, ""
+
+
+_TAG_RE = re.compile(r"^[a-z0-9]{6,12}$")
+_TAG_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"   # lowercase letters and digits without 0 o 1 l i
+TAG_LENGTH = 8
+
+
+def valid_tag(text):
+    """The lowercased tag when it is 6-12 lowercase letters/digits (any input case), else "". Never raises."""
+    if not isinstance(text, str):
+        return ""
+    t = text.strip().lower()
+    return t if _TAG_RE.match(t) else ""
+
+
+def new_tag(rng=None):
+    """An 8-character random tag over the unambiguous alphabet. Random on purpose: a guessable tag like
+    `jane` would let anyone fake being her in the alert. rng: an object with .choice, for tests."""
+    pick = (rng or secrets.SystemRandom()).choice
+    return "".join(pick(_TAG_ALPHABET) for _ in range(TAG_LENGTH))
 
 
 def format_visit_alert(when_text, path, referrer, place=None, org="", who=None):
