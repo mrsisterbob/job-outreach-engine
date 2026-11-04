@@ -8301,6 +8301,10 @@ def _b64url(text):
     return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
 
 
+_REAL_IS_THREAD_KEVIN_STARTED = m.is_thread_kevin_started
+_REAL_KEVIN_SENT_BEFORE_MESSAGE = m.kevin_sent_before_message
+
+
 def _gmail_message(msg_id, sender, subject, snippet, extra_headers=None, ics=None, age_seconds=7200):
     """One Gmail messages.get(format=full) response, shaped the way the real API returns it."""
     headers = [{"name": "From", "value": sender}, {"name": "Subject", "value": subject}]
@@ -8341,7 +8345,8 @@ def _fake_tray_recorder(tray_state):
 
 def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_started=False,
                               spam_messages=None, tray_state=None, delivery_fails=False,
-                              shadow_messages=None, domain_match=None, real_tray=False):
+                              shadow_messages=None, domain_match=None, real_tray=False,
+                              thread_messages=None, thread_mode="ok", thread_calls=None):
     """Drive the real check_inbound_gmail_replies() against a faked Gmail API.
 
     `messages` answers the label:INBOX query, `spam_messages` the label:SPAM one and
@@ -8378,6 +8383,12 @@ def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_sta
     monkeypatch.setattr(m, "is_verified_crm_contact", crm_lookup or (lambda sender: None))
     monkeypatch.setattr(m, "match_unknown_sender_to_crm_company", domain_match or (lambda sender: None))
     monkeypatch.setattr(m, "is_thread_kevin_started", lambda tid, token: thread_started)
+    monkeypatch.setattr(m, "kevin_sent_before_message",
+                        lambda tid, token, message_id, internal_date_ms: thread_started)
+    if thread_messages is not None:
+        # the REAL helpers run against the fake threads.get below
+        monkeypatch.setattr(m, "is_thread_kevin_started", _REAL_IS_THREAD_KEVIN_STARTED)
+        monkeypatch.setattr(m, "kevin_sent_before_message", _REAL_KEVIN_SENT_BEFORE_MESSAGE)
 
     inbox_by_id = {msg["id"]: msg for msg in messages}
     spam_by_id = {msg["id"]: msg for msg in (spam_messages or [])}
@@ -8394,6 +8405,17 @@ def _run_poll_with_fake_gmail(monkeypatch, messages, crm_lookup=None, thread_sta
             return self._body
 
     def fake_get(url, **kwargs):
+        if thread_messages is not None and "/threads/" in url:
+            tid = url.rsplit("/", 1)[-1]
+            if thread_calls is not None:
+                thread_calls.append(tid)
+            if isinstance(thread_mode, Exception):
+                raise thread_mode
+            if thread_mode != "ok":
+                bad = _Res({})
+                bad.status_code = thread_mode
+                return bad
+            return _Res({"id": tid, "messages": thread_messages.get(tid, [])})
         if url.endswith("/messages"):
             query = (kwargs.get("params") or {}).get("q", "")
             if "label:SPAM" in query:
@@ -22680,15 +22702,31 @@ class _HotResp:
 
 
 def _hot_poll(monkeypatch, world, snippet=_HOT_SNIPPET, sender=_HOT_SENDER, kevin_sent=True,
-              extra_headers=None, msg_id="hot1", age_seconds=3 * 86400):
+              extra_headers=None, msg_id="hot1", age_seconds=3 * 86400,
+              thread_messages=None, thread_mode="ok", thread_calls=None):
     # A fixed internalDate several days back makes exchange + 7 differ from today + 7; the age
     # ceiling would otherwise drop a 3-day-old message before it reached the CRM branch.
     monkeypatch.setattr(m, "INBOUND_ALERT_MAX_AGE_SECONDS", 10 * 86400)
     msg = _gmail_message(msg_id, sender, "Re: Operations role", snippet,
                          extra_headers=extra_headers, age_seconds=age_seconds)
-    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [msg], crm_lookup=world.crm_lookup,
-                                          thread_started=kevin_sent)
     ms = int(msg["internalDate"])
+    resolved = None
+    if thread_messages is not None:
+        resolved = {}
+        for tid, steps in thread_messages.items():
+            out = []
+            for e in steps:
+                e = dict(e)
+                rel = e.pop("_rel", None)
+                if rel is not None:
+                    e["internalDate"] = str(ms + rel)
+                if e.pop("_me", False):
+                    e["id"] = msg_id
+                out.append(e)
+            resolved[tid] = out
+    alerts, _ = _run_poll_with_fake_gmail(monkeypatch, [msg], crm_lookup=world.crm_lookup,
+                                          thread_started=kevin_sent, thread_messages=resolved,
+                                          thread_mode=thread_mode, thread_calls=thread_calls)
     return alerts, datetime.fromtimestamp(ms / 1000).date()
 
 
@@ -24342,3 +24380,151 @@ def test_monte_command_no_visitor_id_reaches_any_message(monkeypatch, monte_env)
     assert ids
     text = "\n".join(_monte(monkeypatch, "/monte") + _monte(monkeypatch, "/monte 30"))
     assert not any(i in text for i in ids)
+
+
+# ---- TASK-268: Carmen Hot needs the message to come AFTER one Kevin sent -------------------------
+
+def _hot_thread(*steps):
+    """steps: ("me"|"them"|"kevin", rel_ms|None). "me" is the processed message; rel is relative
+    to its internalDate; None serves the entry without an internalDate."""
+    out = []
+    for i, (who, rel) in enumerate(steps):
+        e = {"id": f"t{i}", "labelIds": ["SENT"] if who == "kevin" else ["INBOX"]}
+        if who == "me":
+            e["_me"] = True
+        if rel is not None:
+            e["_rel"] = rel
+        out.append(e)
+    return out
+
+
+_HT = "thread-hot1"
+_ME, _BEFORE, _AFTER = ("me", 0), ("kevin", -3600_000), ("kevin", 3600_000)
+
+
+def _ordinary_alerts(alerts):
+    return [a for a in alerts if "New Gmail Reply!" in a]
+
+
+@pytest.mark.parametrize("tab", ["Carmen Cold", "Carmen Warm"])
+def test_hot_order_kevin_only_after_inbound_not_promoted(monkeypatch, tab):
+    world = _HotWorld(monkeypatch, tab)
+    alerts, _ = _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_ME, _AFTER)})
+    assert world.tab_of("dana") == tab
+    assert not any(p["action"] == "update_status" for p in world.posts)
+    assert not _hot_alerts(alerts)
+    assert len(_ordinary_alerts(alerts)) == 1
+
+
+@pytest.mark.parametrize("tab", ["Carmen Cold", "Carmen Warm"])
+@pytest.mark.parametrize("steps", [
+    (_BEFORE, _ME),
+    (("them", -7200_000), _BEFORE, _ME),
+    (_BEFORE, _ME, _AFTER),
+], ids=["kevin-first", "them-kevin-me", "kevin-me-kevin"])
+def test_hot_order_kevin_earlier_promotes(monkeypatch, tab, steps):
+    world = _HotWorld(monkeypatch, tab)
+    alerts, _ = _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(*steps)})
+    assert world.tab_of("dana") == "Carmen Hot"
+    assert world.count_rows() == 1
+    assert len(_hot_alerts(alerts)) == 1
+
+
+def test_hot_order_second_message_after_kevin_reply_promotes(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_ME, _AFTER)})
+    assert world.tab_of("dana") == "Carmen Cold"
+    alerts, _ = _hot_poll(monkeypatch, world, msg_id="hot2", thread_messages={
+        "thread-hot2": _hot_thread(("them", -7200_000), ("kevin", -3600_000), _ME)})
+    assert world.tab_of("dana") == "Carmen Hot"
+    assert world.count_rows() == 1 and len(_hot_alerts(alerts)) == 1
+
+
+def test_hot_order_stranger_kevin_only_after_creates_nothing(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, _ = _unt_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_ME, _AFTER)})
+    assert world.total() == 0
+    assert not any(p["action"] == "quick_add" for p in world.posts)
+    assert not _hot_alerts(alerts)
+    assert any("Unverified Reply (thread participant)" in a for a in alerts)
+
+
+def test_hot_order_stranger_kevin_earlier_creates_one_row(monkeypatch):
+    world = _UntrackedWorld(monkeypatch)
+    alerts, _ = _unt_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_BEFORE, _ME)})
+    assert world.total() == 1 and len(world.tabs["CH"]) == 1
+    assert len([p for p in world.posts if p["action"] == "quick_add"]) == 1
+    assert len(_hot_alerts(alerts)) == 1
+
+
+@pytest.mark.parametrize("steps,moved", [
+    ([("kevin", None), ("me", None)], True),
+    ([("me", None), ("kevin", None)], False),
+], ids=["kevin-first-by-position", "kevin-second-by-position"])
+def test_hot_order_no_internaldate_uses_position(monkeypatch, steps, moved):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(*steps)})
+    assert world.tab_of("dana") == ("Carmen Hot" if moved else "Carmen Cold")
+
+
+@pytest.mark.parametrize("mode", [500, RuntimeError("gmail down")], ids=["http500", "raises"])
+def test_hot_order_thread_fetch_failure_moves_nothing(monkeypatch, mode):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    alerts, _ = _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_BEFORE, _ME)},
+                          thread_mode=mode)
+    assert world.tab_of("dana") == "Carmen Cold"
+    assert not any(p["action"] == "update_status" for p in world.posts)
+    assert not _hot_alerts(alerts) and len(_ordinary_alerts(alerts)) == 1
+
+
+def test_hot_order_request_counts(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    calls = []
+    _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_BEFORE, _ME)}, thread_calls=calls)
+    assert len(calls) == 1
+    uworld = _UntrackedWorld(monkeypatch)
+    ucalls = []
+    _unt_poll(monkeypatch, uworld, thread_messages={_HT: _hot_thread(_BEFORE, _ME)}, thread_calls=ucalls)
+    assert 1 <= len(ucalls) <= 2
+
+
+def test_hot_order_already_hot_failing_check_is_routed_not_moved(monkeypatch):
+    world = _HotWorld(monkeypatch, "Carmen Hot")
+    alerts, _ = _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_ME, _AFTER)})
+    assert world.tab_of("dana") == "Carmen Hot" and world.count_rows() == 1
+    assert not any(p["action"] == "update_status" for p in world.posts)
+    assert not _hot_alerts(alerts)
+    # same path a Hot contact takes when Kevin never replied: route_inbound_reply_to_crm ran
+    assert world.enqueued, "routing writes expected (follow-up date / reply note)"
+    assert all(e["action"] != "update_status" for e in world.enqueued)
+
+
+def test_hot_order_direct_call_without_message_id(monkeypatch):
+    sent_ms = 1_700_000_000_000
+    thread = {"messages": [{"id": "k1", "labelIds": ["SENT"], "internalDate": str(sent_ms)}]}
+
+    class _R:
+        status_code = 200
+
+        def json(self):
+            return thread
+
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    monkeypatch.setattr(m.requests, "get", lambda url, **kw: _R())
+    monkeypatch.setattr(m, "send_telegram_message", lambda *a, **k: 1)
+    sender = "Dana Lee <dana@acmecorp.com>"
+    out = m.promote_to_hot_on_exchange(world.crm_lookup(sender), sender, [], "GENERAL", "Re: x",
+                                       "th", "tok", str(sent_ms + 60_000))
+    assert out == "promoted" and world.tab_of("dana") == "Carmen Hot"
+    world2 = _HotWorld(monkeypatch, "Carmen Cold")
+    out2 = m.promote_to_hot_on_exchange(world2.crm_lookup(sender), sender, [], "GENERAL", "Re: x",
+                                        "th", "tok", "")
+    assert out2 == "" and world2.tab_of("dana") == "Carmen Cold"
+
+
+def test_hot_order_log_line_without_address_or_subject(monkeypatch, caplog):
+    world = _HotWorld(monkeypatch, "Carmen Cold")
+    with caplog.at_level("INFO"):
+        _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_ME, _AFTER)})
+    line = [l for l in caplog.text.splitlines() if "thread has a Kevin message but none before this one" in l]
+    assert line and all("acmecorp.com" not in l and "Operations role" not in l for l in line)
