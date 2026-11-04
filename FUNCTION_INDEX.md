@@ -1227,6 +1227,19 @@ grep -i "contact" FUNCTION_INDEX.md
 | 183 | `format_tenant` | _(no docstring)_ |
 | 209 | `main` | _(no docstring)_ |
 
+## `scripts/queue_from_cloud.py` — 8 defs, 169 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 29 | `run_git` | Seam: tests may replace this to force a failure. |
+| 35 | `_out` | _(no docstring)_ |
+| 39 | `_ls_local` | _(no docstring)_ |
+| 43 | `_branch_files` | {folder: [names]} for .queue/<folder>/*.md on the branch. RuntimeError on git failure. |
+| 56 | `_branch_bytes` | _(no docstring)_ |
+| 64 | `_merged_numbers` | _(no docstring)_ |
+| 86 | `_write_atomic` | _(no docstring)_ |
+| 99 | `main` | _(no docstring)_ |
+
 ## `scripts/queue_to_cloud.py` — 9 defs, 176 lines
 
 | Line | Name | Summary |
@@ -1512,4 +1525,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1153 definitions across 68 files + Code.gs.**
+**1161 definitions across 69 files + Code.gs.**
