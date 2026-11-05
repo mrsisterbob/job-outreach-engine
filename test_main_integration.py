@@ -24528,3 +24528,117 @@ def test_hot_order_log_line_without_address_or_subject(monkeypatch, caplog):
         _hot_poll(monkeypatch, world, thread_messages={_HT: _hot_thread(_ME, _AFTER)})
     line = [l for l in caplog.text.splitlines() if "thread has a Kevin message but none before this one" in l]
     assert line and all("acmecorp.com" not in l and "Operations role" not in l for l in line)
+
+
+# ---- Personal snapshots: /snapshots/ingest ----
+
+_SNAP_TOKEN = "snap-test-token"
+_GOOD_SNAP = {"kind": "money", "total_spent": 1234.5, "by_category": [{"name": "food", "amount": 300}]}
+
+
+@pytest.fixture
+def snap_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PERSONAL_SNAPSHOT_DIR", str(tmp_path))
+    monkeypatch.setenv("SNAPSHOT_INGEST_TOKEN", _SNAP_TOKEN)
+    yield tmp_path
+
+
+def _post_snap(payload=None, headers=None, data=None):
+    hdrs = {"X-Snapshot-Token": _SNAP_TOKEN} if headers is None else headers
+    with m.app.test_client() as client:
+        if data is not None:
+            return client.post("/snapshots/ingest", data=data, headers=hdrs, content_type="application/json")
+        return client.post("/snapshots/ingest", json=payload, headers=hdrs)
+
+
+def test_snapshot_ingest_good_post_is_stored_with_server_stamp(snap_env):
+    import personal_snapshots as ps
+    r = _post_snap(_GOOD_SNAP)
+    assert r.status_code == 200
+    stamp = r.get_json()["received_at"]
+    latest = ps.load_latest()
+    assert latest["total_spent"] == 1234.5 and latest["kind"] == "money"
+    assert latest["received_at"] == stamp
+    parsed = datetime.fromisoformat(stamp)
+    assert parsed.utcoffset() == timedelta(0)
+
+
+def test_snapshot_ingest_overwrites_a_caller_supplied_received_at(snap_env):
+    import personal_snapshots as ps
+    r = _post_snap(dict(_GOOD_SNAP, received_at="1999-01-01T00:00:00+00:00"))
+    assert r.status_code == 200
+    assert ps.load_latest()["received_at"] == r.get_json()["received_at"] != "1999-01-01T00:00:00+00:00"
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-Snapshot-Token": "wrong"}, {"X-Snapshot-Token": ""}])
+def test_snapshot_ingest_rejects_a_missing_or_wrong_token(snap_env, headers):
+    import personal_snapshots as ps
+    assert _post_snap(_GOOD_SNAP, headers=headers).status_code == 403
+    assert ps.list_snapshots() == []
+
+
+def test_snapshot_ingest_refuses_everything_when_the_token_is_unset(snap_env, monkeypatch):
+    import personal_snapshots as ps
+    monkeypatch.delenv("SNAPSHOT_INGEST_TOKEN")
+    for headers in ({}, {"X-Snapshot-Token": ""}, {"X-Snapshot-Token": _SNAP_TOKEN}):
+        assert _post_snap(_GOOD_SNAP, headers=headers).status_code == 503
+    assert ps.list_snapshots() == []
+
+
+def test_snapshot_ingest_rejects_non_object_bodies(snap_env):
+    import personal_snapshots as ps
+    assert _post_snap(data="not json at all").status_code == 400
+    assert _post_snap([1, 2, 3]).status_code == 400
+    assert _post_snap({}).status_code == 400
+    assert ps.list_snapshots() == []
+
+
+@pytest.mark.parametrize("bad", [
+    {"kind": "money", "merchant_name": "Starbucks"},
+    {"by_category": [{"transactions": [{"amount": 3}]}]},
+])
+def test_snapshot_ingest_forbidden_keys_store_nothing_and_keep_the_latest(snap_env, bad):
+    import personal_snapshots as ps
+    assert _post_snap(_GOOD_SNAP).status_code == 200
+    before = ps.list_snapshots()
+    latest = ps.load_latest()
+    r = _post_snap(bad)
+    assert r.status_code == 400 and r.get_json()["status"] == "invalid"
+    assert ps.list_snapshots() == before
+    assert ps.load_latest() == latest
+
+
+def test_snapshot_ingest_forbidden_key_with_nothing_stored_yet(snap_env):
+    import personal_snapshots as ps
+    assert _post_snap({"merchant_name": "x"}).status_code == 400
+    assert ps.list_snapshots() == []
+
+
+def test_snapshot_ingest_oversized_body_is_413(snap_env):
+    import personal_snapshots as ps
+    r = _post_snap({"kind": "money", "blob": "x" * (70 * 1024)})
+    assert r.status_code == 413
+    assert ps.list_snapshots() == []
+
+
+def test_snapshot_ingest_two_posts_two_files_and_retention_through_the_route(snap_env, monkeypatch):
+    import personal_snapshots as ps
+    assert _post_snap(dict(_GOOD_SNAP, n=1)).status_code == 200
+    assert _post_snap(dict(_GOOD_SNAP, n=2)).status_code == 200
+    assert len(ps.list_snapshots()) == 2 and ps.load_latest()["n"] == 2
+    monkeypatch.setenv("PERSONAL_SNAPSHOT_KEEP", "2")
+    assert _post_snap(dict(_GOOD_SNAP, n=3)).status_code == 200
+    assert len(ps.list_snapshots()) == 2 and ps.load_latest()["n"] == 3
+
+
+def test_snapshot_ingest_auth_runs_before_body_validation(snap_env):
+    import personal_snapshots as ps
+    assert _post_snap({"merchant_name": "x"}, headers={"X-Snapshot-Token": "wrong"}).status_code == 403
+    assert _post_snap(data="garbage", headers={}).status_code == 403
+    assert ps.list_snapshots() == []
+
+
+def test_snapshot_ingest_response_does_not_leak_the_disk_path(snap_env):
+    r = _post_snap(_GOOD_SNAP)
+    assert str(snap_env) not in r.get_data(as_text=True)
+    assert set(r.get_json()) == {"status", "received_at"}
