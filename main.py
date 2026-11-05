@@ -3,6 +3,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import concurrent.futures as _cf
 import hmac
+import personal_snapshots
 import html
 import io
 import json
@@ -123,6 +124,12 @@ if not os.environ.get("LEAD_INGEST_TOKEN"):
     logging.warning(
         "[CONFIG WARNING] LEAD_INGEST_TOKEN is unset - /leads/ingest will refuse every lead with 503, "
         "so contact-form submissions from montelattice.com cannot be stored."
+    )
+# Its own token on purpose: the PC holds it and it must not be able to do anything else.
+if not os.environ.get("SNAPSHOT_INGEST_TOKEN"):
+    logging.warning(
+        "[CONFIG WARNING] SNAPSHOT_INGEST_TOKEN is unset - /snapshots/ingest will refuse every snapshot with 503, "
+        "so personal snapshots pushed from the PC cannot be stored."
     )
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
@@ -21507,6 +21514,42 @@ def leads_ingest():
     logging.info(f"[LEADS] stored lead #{lead_id} from {lead['source']}")
     _start_lead_alert(lead_id, alert_lead)
     return jsonify({"status": "ok", "id": lead_id}), 200
+
+
+_SNAPSHOT_MAX_BYTES = 64 * 1024
+
+
+@app.route("/snapshots/ingest", methods=["POST"])
+def snapshots_ingest():
+    """One personal money-or-time snapshot pushed from Kevin's PC. Authenticated with
+    SNAPSHOT_INGEST_TOKEN (header X-Snapshot-Token), checked before the body is parsed.
+    The server stamps received_at itself and overwrites any the caller sent."""
+    token = os.environ.get("SNAPSHOT_INGEST_TOKEN", "")
+    if not token:
+        logging.warning("[CONFIG WARNING] SNAPSHOT_INGEST_TOKEN is unset - refusing a snapshot.")
+        return jsonify({"status": "disabled"}), 503
+    supplied = request.headers.get("X-Snapshot-Token", "")
+    if not hmac.compare_digest(supplied.encode(), token.encode()):
+        return jsonify({"status": "forbidden"}), 403
+    if request.content_length is not None and request.content_length > _SNAPSHOT_MAX_BYTES:
+        return jsonify({"status": "invalid", "error": "too large"}), 413
+    raw = request.get_data(cache=True)
+    if len(raw) > _SNAPSHOT_MAX_BYTES:
+        return jsonify({"status": "invalid", "error": "too large"}), 413
+    snapshot = request.get_json(silent=True)
+    if not isinstance(snapshot, dict) or not snapshot:
+        return jsonify({"status": "invalid", "error": "body must be a non-empty JSON object"}), 400
+    received_at = datetime.now(timezone.utc).isoformat()
+    snapshot["received_at"] = received_at
+    try:
+        personal_snapshots.save_snapshot(snapshot)
+    except personal_snapshots.SnapshotRejected as e:
+        return jsonify({"status": "invalid", "error": str(e)}), 400
+    except Exception as e:
+        logging.error(f"[SNAPSHOTS] write failed: {e}")
+        return jsonify({"status": "error"}), 500
+    logging.info("[SNAPSHOTS] stored a personal snapshot")
+    return jsonify({"status": "ok", "received_at": received_at}), 200
 
 
 # ==============================================================================

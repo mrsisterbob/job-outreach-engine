@@ -45,6 +45,8 @@ services:
         value: /var/data/personal_snapshots
 
       # --- Secrets: set each in the dashboard (Environment tab) so they never land in git ---
+      - key: SNAPSHOT_INGEST_TOKEN
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
