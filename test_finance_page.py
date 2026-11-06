@@ -183,3 +183,155 @@ def test_bad_received_at_and_naive_now_do_not_raise():
     v = fm.build_finance_view([snap], NOW)
     p = fp.render_finance_page(v, NOW.replace(tzinfo=None), NONCE)
     assert "Latest upload received 3h ago" in p
+
+
+# ---- TASK-280: plan editor ----
+import hours_plan as hp
+
+EDIT = {"plan_url": "/finance/plan", "exp": 1788123457, "sig": "SIGVALUEzz9Qk"}
+
+
+def plan_view(tmp_path, monkeypatch, cats=("Sleep", "Work", "Gym"), hours=(56, 100, 12)):
+    monkeypatch.setenv("PERSONAL_PLAN_DIR", str(tmp_path))
+    hp.save_plan([{"category": c, "hours": h} for c, h in zip(cats, hours)], list(cats), None, now=NOW)
+    snap = {"received_at": iso(5), "time": {"as_of": iso(2), "actual": [{"category": c, "hours": 10} for c in cats]}}
+    return fm.build_finance_view([snap], NOW, plan=hp.load_plan())
+
+
+def epage(view, edit=EDIT):
+    return fp.render_finance_page(view, NOW, NONCE, edit)
+
+
+def script_of(p):
+    return re.findall(r"<script nonce=[^>]*>(.*?)</script>", p, re.S)[0]
+
+
+def test_plan_edit_embeds_credential_and_container(tmp_path, monkeypatch):
+    p = epage(plan_view(tmp_path, monkeypatch))
+    d = json.loads(embedded(p))
+    assert d["edit"] == EDIT
+    assert d["time"]["editable_categories"] == ["Sleep", "Work", "Gym"]
+    assert 'id="plan-editor"' in p and "data-save" in p and ">Save<" in p and ">Reset<" in p
+    assert "Plan saved" in p and "(version 1)" in p
+
+
+def test_plan_edit_none_equals_read_only(tmp_path, monkeypatch):
+    v = plan_view(tmp_path, monkeypatch)
+    p = epage(v, None)
+    assert p == fp.render_finance_page(v, NOW, NONCE)
+    for bad in ('type="range"', "Save", "plan_url", "plan-editor"):
+        assert bad not in p
+
+
+def test_plan_edit_bad_inputs_render_read_only(tmp_path, monkeypatch):
+    v = plan_view(tmp_path, monkeypatch)
+    plain = fp.render_finance_page(v, NOW, NONCE)
+    no_time = view_of(money=money())
+    empty_cats = json.loads(json.dumps(v))
+    empty_cats["time"]["editable_categories"] = []
+    for view, edit in ((no_time, EDIT), (empty_cats, EDIT), (v, {"plan_url": "/x"}), (v, "x"), (v, []),
+                       (v, dict(EDIT, exp="soon")), (v, dict(EDIT, exp=True)), (v, dict(EDIT, sig="")),
+                       (v, dict(EDIT, plan_url=None))):
+        p = epage(view, edit)
+        assert "plan-editor" not in p and 'type="range"' not in p and "plan_url" not in p
+    assert epage(v, {"plan_url": "/x"}) == plain
+
+
+def test_plan_edit_credential_appears_once_only_in_blob(tmp_path, monkeypatch):
+    p = epage(plan_view(tmp_path, monkeypatch))
+    assert p.count(EDIT["sig"]) == 1 and p.count(str(EDIT["exp"])) == 1
+    assert EDIT["sig"] in embedded(p) and str(EDIT["exp"]) in embedded(p)
+    assert p.count("financelink") == 1 and "financelink" in script_of(p)
+    assert "<form" not in p and 'type="hidden"' not in p and "href=" not in p
+
+
+def test_plan_edit_escaping(tmp_path, monkeypatch):
+    evil = "</script><b>" + chr(0x2028) + "x"
+    cats = (evil, "Work")
+    v = plan_view(tmp_path, monkeypatch, cats=cats, hours=(60, 108))
+    p = epage(v)
+    assert evil not in p and "&lt;/script&gt;&lt;b&gt;" in p
+    assert p.count("</script>") == 2  # only our two real closing tags
+    raw = embedded(p)
+    assert chr(0x2028) not in raw and r"\u2028" in raw
+    assert json.loads(raw)["time"]["editable_categories"][0] == evil
+
+
+def test_plan_edit_structure(tmp_path, monkeypatch):
+    p = epage(plan_view(tmp_path, monkeypatch))
+    for tag in re.findall(r"<(?:script|style)\b[^>]*>", p):
+        assert f'nonce="{NONCE}"' in tag
+    for bad in ("http", "<link", "<img", "src=", "innerHTML", "eval", "new Function", "document.write"):
+        assert bad not in p, bad
+    assert len(script_of(p).strip().splitlines()) < 160
+    assert "function sumQuarters(values)" in script_of(p)
+
+
+def _node_run(code):
+    f = Path(__file__).with_name("_tmp_plan_edit.js")
+    try:
+        f.write_text(code, encoding="utf-8")
+        return subprocess.run(["node", str(f)], capture_output=True, text=True)
+    finally:
+        f.unlink(missing_ok=True)
+
+
+def test_plan_edit_sum_quarters_in_node(tmp_path, monkeypatch):
+    if not shutil.which("node"):
+        import pytest
+        pytest.skip("node not installed")
+    s = script_of(epage(plan_view(tmp_path, monkeypatch)))
+    harness = (s + "\n"
+               "var out = [sumQuarters([168]), sumQuarters([167.75]), sumQuarters([168.25]),\n"
+               "  sumQuarters(new Array(30).fill(5.6)), sumQuarters(['', 'x', null, -3, 0.1, 0.13])];\n"
+               "console.log(JSON.stringify(out));\n")
+    harness = "var document = {getElementById: function () { return null; }};\n" + harness
+    r = _node_run(harness)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == [672, 671, 673, 660, 1]
+
+
+def test_plan_edit_markup_counts(tmp_path, monkeypatch):
+    p = epage(plan_view(tmp_path, monkeypatch))
+    nums = re.findall(r'<input[^>]*type="number"[^>]*>', p)
+    rngs = re.findall(r'<input[^>]*type="range"[^>]*>', p)
+    assert len(nums) == 3 and len(rngs) == 3
+    for tag in nums + rngs:
+        assert 'step="0.25"' in tag and 'max="168"' in tag and 'min="0"' in tag
+    assert 'aria-live="polite"' in p
+
+
+def test_plan_edit_snapshot_source_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERSONAL_PLAN_DIR", str(tmp_path))
+    v = view_of(time=timesec())
+    p = epage(v)
+    assert "Plan taken from the last upload - save to keep your own" in p
+    assert "Plan saved" not in p
+
+
+def test_plan_edit_rejects_non_same_origin_url(tmp_path, monkeypatch):
+    v = plan_view(tmp_path, monkeypatch)
+    for bad in ("https://evil.example/finance/plan", "//evil.example/p", "finance/plan", "/\evil.example"):
+        p = epage(v, dict(EDIT, plan_url=bad))
+        assert "plan-editor" not in p and "evil.example" not in p and EDIT["sig"] not in p
+
+
+def test_plan_edit_input_order_follows_editable_categories(tmp_path, monkeypatch):
+    cats = ("Zeta", "Alpha", "Mid", "Beta")
+    p = epage(plan_view(tmp_path, monkeypatch, cats=cats, hours=(40, 40, 44, 44)))
+    labels = re.findall(r'<label for="pn\d+">(.*?)</label>', p)
+    assert labels == list(cats)
+    rows = re.findall(r'<div class="prow">(.*?)</div>', p)
+    assert len(rows) == 4
+    for i, (c, r) in enumerate(zip(cats, rows)):
+        assert f'id="pn{i}"' in r and f'aria-label="{c} hours"' in r and f'aria-label="{c} slider"' in r
+        assert r.index('type="number"') < r.index('type="range"')
+    assert json.loads(embedded(p))["time"]["editable_categories"] == list(cats)
+
+
+def test_plan_edit_script_guards_in_flight_and_bad_version(tmp_path, monkeypatch):
+    s = script_of(epage(plan_view(tmp_path, monkeypatch)))
+    assert "nums[i].disabled = busy" in s and "rngs[i].disabled = busy" in s and "resetBtn.disabled = busy" in s
+    assert "typeof j.version === 'number'" in s and "Saved, but reload the page" in s
+    assert s.index("if (!host) return;") < s.index("if (!(max > 0)) return;")
+    assert s.index("removeChild(host.firstChild)") < s.index("if (!(max > 0)) return;")
