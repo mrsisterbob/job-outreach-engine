@@ -309,7 +309,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 280 | `_name_company_key` | _(no docstring)_ |
 | 286 | `plan_import` | Clean, de-duplicate and map `rows`. `existing` is a list of PEOPLE-row dicts (name, |
 
-## `main.py` — 508 defs, 21,776 lines
+## `main.py` — 508 defs, 21,782 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -798,29 +798,29 @@ grep -i "contact" FUNCTION_INDEX.md
 | 21250 | `_visit_when_text` | The view time (UTC text from the site, else now) in America/Detroit, the zone the rest of |
 | 21265 | `_send_visit_alert` | Runs off the request thread. A failed send is logged (class name only) and not retried. |
 | 21274 | `_start_visit_alerts` | Gate each stored view on the request thread, queue the send of each admitted one. |
-| 21292 | `analytics_ingest` | Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN. |
-| 21316 | `get_site_visit_rows_dated` | READ-ONLY. (visited_at, visitor_id, path, referrer, bot) for the trailing `days` days plus one extra day (the |
-| 21325 | `get_lead_times` | READ-ONLY. received_at strings of contact-form submissions in the trailing `days` days plus one. Raises on error. |
-| 21332 | `get_site_visit_rows` | READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises |
-| 21342 | `site_visitor_standup_line` | The standup's analytics line, or '' when analytics is switched off. Never raises: a failed |
-| 21371 | `_lead_attempt_stamp` | Now as an explicit UTC 'YYYY-MM-DD HH:MM:SS' (the format datetime('now') writes, so the |
-| 21377 | `record_inbound_lead` | Commit one validated lead (see validate_lead). Returns (lead_id, is_new, alert_lead). |
-| 21422 | `_record_lead_alert_result` | Write a send's outcome on the row. Delivered: alerted_at is set regardless of who owns the |
-| 21447 | `_send_lead_alert` | Tell Kevin about a committed lead. Runs off the request thread (send_telegram_message can |
-| 21463 | `_start_lead_alert` | Queue the alert. If the thread cannot be started the claim made for it is released (only |
-| 21473 | `get_recent_leads` | READ-ONLY. (id, received_at, source, name, email, message), newest first. |
-| 21483 | `leads_ingest` | One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN. |
-| 21523 | `snapshots_ingest` | One personal money-or-time snapshot pushed from Kevin's PC. Authenticated with |
-| 21581 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
-| 21594 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
-| 21603 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
-| 21614 | `get_cached_job_locations` | READ-ONLY. (job_city, job_state, job_is_remote) for every cached job. Screened roles only. |
-| 21623 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
-| 21633 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
-| 21670 | `_cached_drafting_timing` | _(no docstring)_ |
-| 21688 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
-| 21724 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
-| 21731 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
+| 21296 | `analytics_ingest` | Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN. |
+| 21322 | `get_site_visit_rows_dated` | READ-ONLY. (visited_at, visitor_id, path, referrer, bot) for the trailing `days` days plus one extra day (the |
+| 21331 | `get_lead_times` | READ-ONLY. received_at strings of contact-form submissions in the trailing `days` days plus one. Raises on error. |
+| 21338 | `get_site_visit_rows` | READ-ONLY. (visitor_id, path, referrer, bot) for pageviews in the trailing window. Raises |
+| 21348 | `site_visitor_standup_line` | The standup's analytics line, or '' when analytics is switched off. Never raises: a failed |
+| 21377 | `_lead_attempt_stamp` | Now as an explicit UTC 'YYYY-MM-DD HH:MM:SS' (the format datetime('now') writes, so the |
+| 21383 | `record_inbound_lead` | Commit one validated lead (see validate_lead). Returns (lead_id, is_new, alert_lead). |
+| 21428 | `_record_lead_alert_result` | Write a send's outcome on the row. Delivered: alerted_at is set regardless of who owns the |
+| 21453 | `_send_lead_alert` | Tell Kevin about a committed lead. Runs off the request thread (send_telegram_message can |
+| 21469 | `_start_lead_alert` | Queue the alert. If the thread cannot be started the claim made for it is released (only |
+| 21479 | `get_recent_leads` | READ-ONLY. (id, received_at, source, name, email, message), newest first. |
+| 21489 | `leads_ingest` | One contact-form lead from montelattice.com. Authenticated with LEAD_INGEST_TOKEN. |
+| 21529 | `snapshots_ingest` | One personal money-or-time snapshot pushed from Kevin's PC. Authenticated with |
+| 21587 | `get_daily_metric_counts` | READ-ONLY. [(YYYY-MM-DD, event_type, count)] per day over the trailing `days`, for the |
+| 21600 | `get_metric_first_seen` | READ-ONLY. Date (YYYY-MM-DD) of the first row of `event_type`, or None if it never fired. |
+| 21609 | `get_cached_job_scoring` | READ-ONLY. (fit_score, track) for every cached job that carries a fit_score. The jobs |
+| 21620 | `get_cached_job_locations` | READ-ONLY. (job_city, job_state, job_is_remote) for every cached job. Screened roles only. |
+| 21629 | `get_latest_cached_job` | READ-ONLY. The most recently cached job dict, or None. |
+| 21639 | `measure_drafting_time` | Time the real /e drafting path, match -> sendable draft, against the newest cached role: |
+| 21676 | `_cached_drafting_timing` | _(no docstring)_ |
+| 21694 | `build_public_dashboard` | Read every public dashboard figure (read-only) and shape it. See section 11b's header. |
+| 21730 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
+| 21737 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
 
 ## `open_followups.py` — 3 defs, 118 lines
 
@@ -1442,7 +1442,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 50 | `build_stats_block` | _(no docstring)_ |
 | 61 | `main` | _(no docstring)_ |
 
-## `visit_alert.py` — 9 defs, 121 lines
+## `visit_alert.py` — 10 defs, 128 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -1455,6 +1455,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 83 | `new_tag` | An 8-character random tag over the unambiguous alphabet. Random on purpose: a guessable tag like |
 | 90 | `format_visit_alert` | Telegram HTML text: time, path (cut to 100 chars) and referrer host, plus optional extras. |
 | 118 | `visit_alerts_enabled` | VISIT_ALERTS_ENABLED, default on; read per call. |
+| 124 | `untagged_alerts_enabled` | VISIT_ALERTS_UNTAGGED, default OFF; read per call. On only for an explicit truthy value (1/true/yes/on). |
 
 ## `visit_geo.py` — 4 defs, 97 lines
 
@@ -1586,4 +1587,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1197 definitions across 74 files + Code.gs.**
+**1198 definitions across 74 files + Code.gs.**
