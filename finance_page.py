@@ -33,7 +33,7 @@ progress{width:100%;height:16px}
 .empty{text-align:center;padding:32px 16px}
 """
 
-_SCRIPT = """
+_SCRIPT_A = """
 (function () {
   var NS = 'ht' + 'tp://www.w3.org/2000/svg';
   var data;
@@ -68,21 +68,135 @@ _SCRIPT = """
     });
   }
   var time = data.time;
+  function maxOf(rows) {
+    var m = 0;
+    rows.forEach(function (r) { m = Math.max(m, r.planned || 0, r.actual || 0); });
+    return m;
+  }
+  function drawHours(r, i, max) {
+    var host = document.querySelector('[data-hours="' + i + '"]');
+    if (!host) return;
+    while (host.firstChild) host.removeChild(host.firstChild);
+    if (!(max > 0)) return;
+    var svg = mk(28, r.category + ': planned and actual hours');
+    if (typeof r.planned === 'number') rect(svg, 0, 0, r.planned / max * 100, 12, 'plan');
+    if (typeof r.actual === 'number') rect(svg, 0, 15, r.actual / max * 100, 12, 'act');
+    host.appendChild(svg);
+  }
   if (time) {
-    var max = 0;
-    (time.rows || []).forEach(function (r) {
-      max = Math.max(max, r.planned || 0, r.actual || 0);
+    var max = maxOf(time.rows || []);
+    (time.rows || []).forEach(function (r, i) { drawHours(r, i, max); });
+  }
+"""
+
+_SCRIPT = _SCRIPT_A + "})();\n"
+
+_SUMQ = """
+function snapQ(v) { var n = Number(v); return isFinite(n) ? Math.min(672, Math.max(0, Math.round(n * 4))) : 0; }
+function sumQuarters(values) {
+  var s = 0;
+  for (var i = 0; i < values.length; i++) s += snapQ(values[i]);
+  return s;
+}
+"""
+
+_EDITOR = """
+  var ed = data.edit, host = document.getElementById('plan-editor'), tpl = document.getElementById('plan-tpl');
+  if (!(ed && time && host && tpl && tpl.content)) return;
+  host.appendChild(tpl.content.cloneNode(true));
+  var cats = time.editable_categories || [], rows = time.rows || [];
+  var nums = host.querySelectorAll('input[type=number]'), rngs = host.querySelectorAll('input[type=range]');
+  var totalEl = host.querySelector('[data-total]'), msgEl = host.querySelector('[data-msg]');
+  var saveBtn = host.querySelector('[data-save]'), resetBtn = host.querySelector('[data-reset]');
+  var base = time.plan_version, busy = false, stale = false, q = [], loaded;
+  cats.forEach(function (c) {
+    var v = 0;
+    rows.forEach(function (r) { if (r.category === c && typeof r.planned === 'number') v = r.planned; });
+    q.push(snapQ(v));
+  });
+  loaded = q.slice();
+  function hv() { return q.map(function (x) { return x / 4; }); }
+  function say(t) { msgEl.textContent = t; }
+  function draw() {
+    var shown = rows.map(function (r) {
+      var k = cats.indexOf(r.category);
+      return {category: r.category, actual: r.actual, planned: k >= 0 ? q[k] / 4 : r.planned};
     });
-    (time.rows || []).forEach(function (r, i) {
-      var host = document.querySelector('[data-hours="' + i + '"]');
-      if (!host || !(max > 0)) return;
-      var svg = mk(28, r.category + ': planned and actual hours');
-      if (typeof r.planned === 'number') rect(svg, 0, 0, r.planned / max * 100, 12, 'plan');
-      if (typeof r.actual === 'number') rect(svg, 0, 15, r.actual / max * 100, 12, 'act');
-      host.appendChild(svg);
+    var m = maxOf(shown);
+    shown.forEach(function (r, i) { drawHours(r, i, m); });
+  }
+  function update() {
+    var tq = sumQuarters(hv()), d = 672 - tq, t;
+    if (d > 0) t = 'Total ' + (tq / 4) + ' h of 168 - ' + (d / 4) + ' h unassigned';
+    else if (d < 0) t = 'Total ' + (tq / 4) + ' h of 168 - ' + (-d / 4) + ' h over';
+    else t = 'Total 168 h - ready to save';
+    totalEl.textContent = t;
+    saveBtn.disabled = busy || stale || d !== 0;
+    resetBtn.disabled = busy;
+    cats.forEach(function (c, i) { nums[i].disabled = busy; rngs[i].disabled = busy; });
+    draw();
+  }
+  function sync() {
+    q.forEach(function (x, i) {
+      nums[i].value = x / 4; rngs[i].value = x / 4; nums[i].removeAttribute('aria-invalid');
     });
   }
-})();
+  cats.forEach(function (c, i) {
+    nums[i].addEventListener('input', function () {
+      var s = nums[i].value.trim(), bad = s === '' || isNaN(Number(s));
+      q[i] = snapQ(bad ? 0 : s);
+      rngs[i].value = q[i] / 4;
+      if (bad) nums[i].setAttribute('aria-invalid', 'true'); else nums[i].removeAttribute('aria-invalid');
+      say(bad ? 'An empty or non-numeric box counts as 0.' : '');
+      update();
+    });
+    nums[i].addEventListener('change', function () { nums[i].value = q[i] / 4; });
+    nums[i].addEventListener('keydown', function (e) { if (e.key === 'Enter') e.preventDefault(); });
+    rngs[i].addEventListener('input', function () {
+      q[i] = snapQ(rngs[i].value); nums[i].value = q[i] / 4;
+      nums[i].removeAttribute('aria-invalid'); say(''); update();
+    });
+  });
+  function done(t) { busy = false; say(t); update(); }
+  var FAIL = 'Could not save. Try again.';
+  saveBtn.addEventListener('click', function () {
+    if (busy || sumQuarters(hv()) !== 672) return;
+    busy = true; say('Saving...'); update();
+    var sent = q.slice();
+    fetch(ed.plan_url, {method: 'POST', credentials: 'omit', cache: 'no-store',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({exp: ed.exp, sig: ed.sig, base_version: base,
+        hours: cats.map(function (c, i) { return {category: c, hours: sent[i] / 4}; })})
+    }).then(function (r) {
+      var body = r.json().then(function (j) { return j || {}; }, function () { return {}; });
+      return body.then(function (j) {
+        if (r.status === 200) {
+          loaded = sent; q = sent.slice(); sync();
+          if (typeof j.version === 'number') { base = j.version; done('Saved.'); }
+          else { stale = true; done('Saved, but reload the page to continue editing.'); }
+        } else if (r.status === 400) done(j.error || FAIL);
+        else if (r.status === 409) done('This plan changed somewhere else. Reload the page to see it.');
+        else if (r.status === 404) done('This link has expired. Send /financelink again - your edits are still on screen.');
+        else done(FAIL);
+      });
+    }).catch(function () { done(FAIL); });
+  });
+  resetBtn.addEventListener('click', function () { q = loaded.slice(); sync(); say(''); update(); });
+  window.addEventListener('beforeunload', function (e) {
+    if (q.join() !== loaded.join()) { e.preventDefault(); e.returnValue = ''; }
+  });
+  sync(); update();
+"""
+
+_EDIT_CSS = """
+.prow{display:grid;grid-template-columns:1fr 6rem;gap:4px 12px;align-items:center;margin:12px 0}
+.prow label{grid-column:1/3;font-weight:600}
+.prow input{font:inherit;font-size:16px;min-height:44px;width:100%}
+.prow input[type=number]{grid-column:2;grid-row:2;padding:0 8px}
+.prow input[type=range]{grid-column:1;grid-row:2}
+.ptotal{font-weight:600}
+#plan-editor button{font:inherit;font-size:16px;min-height:44px;min-width:44px;padding:0 16px;margin:4px 8px 4px 0}
+input[aria-invalid=true]{outline:2px solid var(--bad)}
 """
 
 
@@ -242,7 +356,7 @@ def _gap_line(kind, total, gap):
     return f"{kind}: {_short(total)} h, {tail}"
 
 
-def _time_section(t):
+def _time_section(t, editor=""):
     out = ['<section id="time"><h2>168 hours</h2>']
     if t is None:
         out.append('<p class="mut">No time data uploaded yet.</p></section>')
@@ -265,8 +379,61 @@ def _time_section(t):
     out.append(f'<p>{_e(_gap_line("Actual", t.get("actual_total"), t.get("actual_gap")))}</p>')
     if (t.get("unreadable") or 0) > 0:
         out.append(f'<p class="mut">{_e(t["unreadable"])} rows could not be read</p>')
+    out.append(editor)
     out.append("</section>")
     return "".join(out)
+
+
+def _valid_edit(edit, view):
+    """(edit_fields, time_section_copy) when an editor may render, else (None, None)."""
+    t = view.get("time")
+    if not isinstance(edit, dict) or not isinstance(t, dict):
+        return None, None
+    url, exp, sig = edit.get("plan_url"), edit.get("exp"), edit.get("sig")
+    if not (isinstance(url, str) and url.startswith("/") and not url.startswith("//")
+            and "\\" not in url and isinstance(sig, str) and sig
+            and isinstance(exp, int) and not isinstance(exp, bool)):
+        return None, None
+    cats = t.get("editable_categories")
+    cats = [c for c in cats if isinstance(c, str) and c] if isinstance(cats, list) else []
+    if not cats:
+        return None, None
+    return {"plan_url": url, "exp": exp, "sig": sig}, dict(t, editable_categories=cats)
+
+
+def _plan_source_line(t, now):
+    src, ver = t.get("plan_source"), t.get("plan_version")
+    if src == "snapshot":
+        return "Plan taken from the last upload - save to keep your own"
+    if src != "saved":
+        return ""
+    vtxt = f" (version {ver})" if isinstance(ver, int) and not isinstance(ver, bool) else ""
+    dt = _parse_dt(t.get("plan_updated_at"))
+    if dt is None:
+        return f"Plan saved{vtxt}"
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    try:
+        ago = _ago_hours(max(0.0, (now - dt).total_seconds() / 3600.0))
+    except (TypeError, OverflowError):
+        return f"Plan saved{vtxt}"
+    return f"Plan saved {ago}{vtxt}"
+
+
+def _editor_html(t, now):
+    rows = []
+    for i, c in enumerate(t["editable_categories"]):
+        lab = _e(c)
+        rows.append(f'<div class="prow"><label for="pn{i}">{lab}</label>'
+                    f'<input id="pn{i}" type="number" step="0.25" min="0" max="168" inputmode="decimal" aria-label="{lab} hours">'
+                    f'<input type="range" step="0.25" min="0" max="168" aria-label="{lab} slider"></div>')
+    src = _plan_source_line(t, now)
+    srcp = f'<p class="mut">{_e(src)}</p>' if src else ""
+    return ('<div id="plan-editor"></div><template id="plan-tpl"><h3>Edit planned hours</h3>' + srcp
+            + "".join(rows)
+            + '<p class="ptotal" data-total aria-live="polite"></p><p class="mut" data-msg aria-live="polite"></p>'
+              '<button type="button" data-save disabled>Save</button>'
+              '<button type="button" data-reset>Reset</button></template>')
 
 
 def _json_for_script(view):
@@ -276,7 +443,7 @@ def _json_for_script(view):
     return s
 
 
-def render_finance_page(view, now, nonce):
+def render_finance_page(view, now, nonce, edit=None):
     n = _e(nonce)
     if not isinstance(view, dict):
         view = {"empty": True}
@@ -284,17 +451,22 @@ def render_finance_page(view, now, nonce):
     view["money"], view["time"] = _sec(view.get("money")), _sec(view.get("time"))
     if view["money"] is None and view["time"] is None:
         view["empty"] = True
+    edit_fields, edit_time = _valid_edit(edit, view)
+    if edit_fields:
+        view["time"], view["edit"] = edit_time, edit_fields
     head = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<meta name="robots" content="noindex,nofollow"><title>Finance</title>'
-            f'<style nonce="{n}">{_CSS}</style></head><body><main><h1>Finance</h1>')
+            f'<style nonce="{n}">{_CSS}{_EDIT_CSS if edit_fields else ""}</style></head><body><main><h1>Finance</h1>')
     if view.get("empty"):
         body = ('<section class="empty"><h2>Nothing uploaded yet.</h2>'
                 '<p>Snapshots are pushed from the PC, and this page fills in after the first one.</p>'
                 '</section>')
         return head + body + "</main></body></html>"
     body = (f'<p class="mut">{_e(_received_ago(view, now))}</p>'
-            + _money_section(view.get("money")) + _time_section(view.get("time")))
+            + _money_section(view.get("money"))
+            + _time_section(view.get("time"), _editor_html(view["time"], now) if edit_fields else ""))
+    script = (_SUMQ + _SCRIPT_A + _EDITOR + "})();\n") if edit_fields else _SCRIPT
     tail = (f'<script type="application/json" id="fin-data" nonce="{n}">{_json_for_script(view)}</script>'
-            f'<script nonce="{n}">{_SCRIPT}</script></main></body></html>')
+            f'<script nonce="{n}">{script}</script></main></body></html>')
     return head + body + tail
