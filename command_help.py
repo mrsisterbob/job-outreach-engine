@@ -207,6 +207,12 @@ HELP = {
         "Needs PAGE_LINK_SECRET set in the Render dashboard.",
         "/financelink",
     ),
+    "/life": (
+        "Replies with a short money-and-time summary from the newest uploaded snapshots (each section shows its own "
+        "data age) plus a fresh signed link to the finance page that expires in 15 minutes. Read-only, but the "
+        "figures are sent into this chat and stay in its history. Takes no argument.",
+        "/life",
+    ),
     "/vlink": (
         "Makes a personal link to montelattice.com for one contact (https://montelattice.com/?r=...). "
         "When they open it you get an alert that says who opened it. Asking again for the same name gives "

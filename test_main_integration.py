@@ -25354,3 +25354,128 @@ def test_plan_route_other_pages_unchanged(plan_env, monkeypatch):
     assert _mp_get(_mp_path(_mp_link(monkeypatch))).status_code == 200
     assert _mp_get("/money").status_code == 404
     assert _mp_get("/followups").status_code == 200 and _mp_get("/brief").status_code == 200
+
+
+# ---- /life command (TASK-283) ----
+
+@pytest.fixture
+def life_env(plan_env):
+    yield plan_env
+
+
+def _life(monkeypatch, text="/life"):
+    return _mp_link(monkeypatch, text)
+
+
+def _life_days_ago(n):
+    return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def test_life_cmd_replies_once_with_totals_hours_and_fresh_link(life_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(), "time": _fr_time()})
+    sent = _life(monkeypatch)
+    assert len(sent) == 1
+    text = html.unescape(sent[0])
+    assert "412" in text and "Emergency fund" in text and "5,200" in text.replace("5200", "5,200")
+    assert "56" in text and "49.5" in text
+    assert "/finance?" in text and text.rstrip().endswith("Expires in 15 minutes.")
+
+
+def test_life_cmd_link_opens_page_with_ingested_figure(life_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(), "time": _fr_time()})
+    path = _fr_path(_life(monkeypatch))
+    assert path
+    r = _mp_get(path)
+    assert r.status_code == 200 and "412" in r.get_data(as_text=True)
+
+
+def test_life_cmd_empty_store_says_no_data_and_no_link(life_env, monkeypatch):
+    sent = _life(monkeypatch)
+    assert len(sent) == 1
+    assert "No data yet" in sent[0] and "http" not in sent[0] and "/finance" not in sent[0]
+
+
+def test_life_cmd_sections_carry_their_own_age_and_stale_flag(life_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(as_of=_life_days_ago(10))})
+    _fr_ingest({"time": _fr_time()})
+    sent = _life(monkeypatch)
+    assert len(sent) == 1
+    text = sent[0]
+    assert "STALE" in text
+    assert "Money" in text and "Time" in text
+    assert "412" in text and "56" in text
+    assert text.lower().count("data") >= 2 or text.count("old") >= 1 or "age" in text.lower() or "day" in text.lower()
+
+
+def test_life_cmd_saved_plan_changes_planned_hours_like_finance(life_env, monkeypatch):
+    import hours_plan
+    _fr_ingest({"time": _fr_time()})
+    base = _life(monkeypatch)[0]
+    hours_plan.save_plan([{"category": "Sleep", "hours": 168}], ["Sleep"], None, datetime.now(timezone.utc))
+    again = _life(monkeypatch)[0]
+    page = _mp_get(_fr_path([again])).get_data(as_text=True)
+    assert again != base and "168" in again and "168" in page and "168" not in base
+
+
+def test_life_cmd_blank_secret_still_summarises_without_url(life_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(), "time": _fr_time()})
+    monkeypatch.setenv("PAGE_LINK_SECRET", "")
+    sent = _life(monkeypatch)
+    assert len(sent) == 1
+    assert "Link not configured" in sent[0] and "http" not in sent[0] and "412" in sent[0]
+
+
+def test_life_cmd_extra_text_gets_usage_and_other_commands_unswallowed(life_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(), "time": _fr_time()})
+    sent = _life(monkeypatch, "/life extra")
+    assert sent == ["Usage: /life (no arguments)."]
+    for cmd in ("/links", "/linksx"):
+        out = "\n".join(_life(monkeypatch, cmd))
+        assert "Money and time" not in out and "412" not in out and "Usage: /life" not in out
+
+
+def test_life_cmd_each_call_signs_a_fresh_link(life_env, monkeypatch):
+    _fr_ingest({"money": _fr_money()})
+    real = m.time.time()
+    monkeypatch.setattr(m.time, "time", lambda: real)
+    p1 = _fr_path(_life(monkeypatch))
+    monkeypatch.setattr(m.time, "time", lambda: real + 60)
+    p2 = _fr_path(_life(monkeypatch))
+    monkeypatch.undo() if False else None
+    assert p1 and p2 and p1 != p2
+    monkeypatch.setattr(m.time, "time", lambda: real + 61)
+    assert _mp_get(p1).status_code == 200 and _mp_get(p2).status_code == 200
+
+
+def test_life_cmd_load_failure_is_a_plain_message(life_env, monkeypatch, caplog):
+    import personal_snapshots
+    _fr_ingest({"money": _fr_money()})
+
+    def boom(n):
+        raise RuntimeError("secret-detail 412")
+    monkeypatch.setattr(personal_snapshots, "load_recent", boom)
+    sent = _life(monkeypatch)
+    assert sent == ["Could not build the life snapshot."]
+    assert "secret-detail" not in caplog.text and "Traceback" not in caplog.text
+
+
+def test_life_cmd_hostile_category_is_escaped(life_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(cat="<script>x</script>")})
+    out = "\n".join(_life(monkeypatch))
+    assert "<script>" not in out
+
+
+def test_life_cmd_help_entries_are_real_and_bare_command_not_swallowed():
+    import command_help as ch
+    reply = ch.lookup_command_help("/life/")
+    assert "No per-command help" not in reply
+    assert ch.lookup_command_help("/life") is None and ch.lookup_command_help("/life extra") is None
+    src = open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()
+    assert "/life - " in src
+
+
+def test_life_cmd_financelink_still_works_after_helper_refactor(life_env, monkeypatch):
+    sent = _mp_link(monkeypatch, "/financelink")
+    assert _fr_path(sent) and "Expires in 15 minutes." in sent[0]
+    monkeypatch.setenv("PAGE_LINK_SECRET", "")
+    assert "not configured" in "\n".join(_mp_link(monkeypatch, "/financelink"))
