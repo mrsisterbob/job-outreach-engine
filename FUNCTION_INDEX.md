@@ -233,20 +233,21 @@ grep -i "contact" FUNCTION_INDEX.md
 | 84 | `_ranked` | _(no docstring)_ |
 | 88 | `render_eyes` | A list of Telegram HTML strings, each under MESSAGE_LIMIT characters. |
 
-## `finance_model.py` — 10 defs, 218 lines
+## `finance_model.py` — 11 defs, 264 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 47 | `_num` | int/float only; not bool, not NaN/inf. Returns float or None. |
-| 55 | `_name` | _(no docstring)_ |
-| 64 | `_parse_as_of` | _(no docstring)_ |
-| 79 | `_freshness` | _(no docstring)_ |
-| 98 | `_label` | _(no docstring)_ |
-| 102 | `_rows` | _(no docstring)_ |
-| 107 | `_money` | _(no docstring)_ |
-| 160 | `_hours` | -> (dict category -> hours, unreadable) |
-| 176 | `_time` | _(no docstring)_ |
-| 204 | `build_finance_view` | Snapshots (newest first) + aware UTC `now` -> the /finance view model. |
+| 48 | `_num` | int/float only; not bool, not NaN/inf. Returns float or None. |
+| 56 | `_name` | _(no docstring)_ |
+| 65 | `_parse_as_of` | _(no docstring)_ |
+| 80 | `_freshness` | _(no docstring)_ |
+| 99 | `_label` | _(no docstring)_ |
+| 103 | `_rows` | _(no docstring)_ |
+| 108 | `_money` | _(no docstring)_ |
+| 161 | `_hours` | -> (dict category -> hours, unreadable) |
+| 177 | `_total` | Sum rounded to 0.1; exact via integer quarter-hours when every value is a quarter multiple. |
+| 191 | `_time` | `section` may be None (plan-only). `plan` is a dict with a list `hours`, or None. |
+| 238 | `build_finance_view` | Snapshots (newest first) + aware UTC `now` (+ saved plan dict or None) -> the view model. |
 
 ## `finance_page.py` — 18 defs, 300 lines
 
@@ -1682,4 +1683,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1263 definitions across 80 files + Code.gs.**
+**1264 definitions across 80 files + Code.gs.**
