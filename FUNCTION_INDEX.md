@@ -361,6 +361,21 @@ grep -i "contact" FUNCTION_INDEX.md
 | 54 | `_clean` | _(no docstring)_ |
 | 61 | `format_held_line` | The standup line. rows: [(sender_name, sender_email, subject)] newest first, or None (the read failed). |
 
+## `life_summary.py` — 10 defs, 169 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 23 | `_is_num` | _(no docstring)_ |
+| 27 | `_esc` | _(no docstring)_ |
+| 39 | `_money` | _(no docstring)_ |
+| 47 | `_hours` | _(no docstring)_ |
+| 57 | `_signed_hours` | _(no docstring)_ |
+| 62 | `_age_line` | None for a plan-only time section (model says: no stamp, never stale). |
+| 75 | `_skipped` | _(no docstring)_ |
+| 82 | `_money_lines` | _(no docstring)_ |
+| 115 | `_time_lines` | _(no docstring)_ |
+| 149 | `render_life_reply` | view: build_finance_view output or None. link: full URL or None. Returns Telegram-HTML. |
+
 ## `linkedin_import.py` — 15 defs, 382 lines
 
 | Line | Name | Summary |
@@ -1688,4 +1703,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1269 definitions across 80 files + Code.gs.**
+**1279 definitions across 81 files + Code.gs.**
