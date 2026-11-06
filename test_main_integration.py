@@ -24699,3 +24699,98 @@ def test_untagged_alert_standup_line_still_counts_silent_visits(visit_tag_env, m
     assert visit_tag_env == []
     line = m.site_visitor_standup_line()
     assert line and "quiet" not in line.lower()
+
+
+# ---- /eyes: the short "who just looked" view of stored visits (TASK-272) ----
+
+def _eyes(monkeypatch, text="/eyes"):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t))
+    monkeypatch.setattr(m, "record_command_usage", lambda *a, **k: None)
+    _dispatch(text)
+    return sent
+
+
+def _eyes_ts(days_ago):
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    return (_dt.now(_tz.utc) - _td(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+@pytest.fixture
+def eyes_env(analytics_env, monkeypatch):
+    monkeypatch.delenv("VISIT_ALERTS_UNTAGGED", raising=False)
+    with m.get_db_conn() as conn:
+        conn.execute("DELETE FROM visit_tags")
+        conn.commit()
+    return analytics_env
+
+
+def test_eyes_cmd_untagged_visit_sends_nothing_and_shows_in_eyes(monkeypatch, eyes_env):
+    assert _ingest([_view(path="/job-engine", referrer="https://www.linkedin.com/")]).status_code == 200
+    assert eyes_env == []
+    assert len(_stored_rows()) == 1
+    text = "\n".join(_eyes(monkeypatch))
+    assert "/job-engine" in text and "linkedin.com" in text
+    assert text.count("1 visitor,") == 2 and "1 visitors" not in text and "1 pageview" in text and "1 pageviews" not in text
+
+
+def test_eyes_cmd_tagged_visit_shows_label_not_tag(monkeypatch, eyes_env):
+    tag = m.visit_tag_create("Jane Doe")
+    _ingest([_tagged_view(tag)])
+    text = "\n".join(_eyes(monkeypatch))
+    assert "Jane Doe (1)" in text and tag not in text
+
+
+def test_eyes_cmd_label_is_escaped(monkeypatch, eyes_env):
+    tag = m.visit_tag_create("Jane <b>Doe</b>")
+    _ingest([_tagged_view(tag)])
+    text = "\n".join(_eyes(monkeypatch))
+    assert "Jane &lt;b&gt;Doe" in text and "Jane <b>Doe</b>" not in text
+
+
+def test_eyes_cmd_windows_use_the_visit_time(monkeypatch, eyes_env):
+    _ingest([_view(ip="203.0.113.1", path="/lattice", ts=_eyes_ts(3)), _view(ip="203.0.113.2", path="/docfiler", ts=_eyes_ts(10))])
+    text = "\n".join(_eyes(monkeypatch))
+    h24, d7 = text.split("Last 7 days")
+    assert "Last 24 hours</b>: no visits" in h24
+    assert "/lattice" in d7 and "/docfiler" not in text
+
+
+def test_eyes_cmd_bots_only_in_excluded_line(monkeypatch, eyes_env):
+    _ingest([_view(is_self=True), _view(ip="203.0.113.5", ua="Googlebot/2.1")])
+    text = "\n".join(_eyes(monkeypatch))
+    assert "no visits" in text and "2 bot or own-device views not counted" in text
+    assert " visitor" not in text
+
+
+def test_eyes_cmd_empty_and_switched_off(monkeypatch, eyes_env):
+    assert "no visits" in "\n".join(_eyes(monkeypatch))
+    monkeypatch.setenv("ANALYTICS_ENABLED", "false")
+    assert "switched off" in "\n".join(_eyes(monkeypatch))
+
+
+def test_eyes_cmd_read_failure_is_a_short_reply(monkeypatch, eyes_env):
+    def boom(days):
+        raise RuntimeError("db gone")
+    monkeypatch.setattr(m, "get_site_visit_rows_tagged", boom)
+    assert _eyes(monkeypatch) == ["Could not read the site visit log."]
+
+
+def test_eyes_cmd_argument_gets_usage(monkeypatch, eyes_env):
+    out = _eyes(monkeypatch, "/eyes 5")
+    assert len(out) == 1 and "Usage: /eyes" in out[0]
+
+
+def test_eyes_cmd_no_ip_ua_or_visitor_id_in_reply(monkeypatch, eyes_env):
+    _ingest([_view(ip="203.0.113.77", path="/x")])
+    with m.get_db_conn() as conn:
+        ids = [r[0] for r in conn.execute("SELECT visitor_id FROM site_visits").fetchall()]
+    text = "\n".join(_eyes(monkeypatch))
+    assert ids and not any(i in text for i in ids)
+    assert "203.0.113.77" not in text and _HUMAN_UA not in text
+
+
+def test_eyes_cmd_help_entry_is_real():
+    import command_help as ch
+    reply = ch.lookup_command_help("/eyes/")
+    assert "No per-command help" not in reply

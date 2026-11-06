@@ -203,6 +203,12 @@ HELP = {
         "the same link. /vlink alone lists the links made and how many times each was opened.",
         "/vlink Jane Doe",
     ),
+    "/eyes": (
+        "Shows who just looked at montelattice.com: for the last 24 hours and 7 days the visitors and pageviews, the "
+        "pages viewed, where people came from, the tagged-link visits by contact name, and the most recent visits. "
+        "Read-only; takes no argument.",
+        "/eyes",
+    ),
     "/monte": (
         "Shows where visits to montelattice.com came from (direct, LinkedIn, search, email and chat, other sites, bots) "
         "and which pages each group viewed, day by day, with what the numbers cannot know. Read-only.",
