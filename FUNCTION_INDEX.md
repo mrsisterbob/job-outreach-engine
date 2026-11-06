@@ -233,6 +233,21 @@ grep -i "contact" FUNCTION_INDEX.md
 | 84 | `_ranked` | _(no docstring)_ |
 | 88 | `render_eyes` | A list of Telegram HTML strings, each under MESSAGE_LIMIT characters. |
 
+## `finance_model.py` — 10 defs, 218 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 47 | `_num` | int/float only; not bool, not NaN/inf. Returns float or None. |
+| 55 | `_name` | _(no docstring)_ |
+| 64 | `_parse_as_of` | _(no docstring)_ |
+| 79 | `_freshness` | _(no docstring)_ |
+| 98 | `_label` | _(no docstring)_ |
+| 102 | `_rows` | _(no docstring)_ |
+| 107 | `_money` | _(no docstring)_ |
+| 160 | `_hours` | -> (dict category -> hours, unreadable) |
+| 176 | `_time` | _(no docstring)_ |
+| 204 | `build_finance_view` | Snapshots (newest first) + aware UTC `now` -> the /finance view model. |
+
 ## `hirebase_feed.py` — 25 defs, 606 lines
 
 | Line | Name | Summary |
@@ -1623,4 +1638,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1219 definitions across 77 files + Code.gs.**
+**1229 definitions across 78 files + Code.gs.**
