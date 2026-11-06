@@ -153,6 +153,14 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 # RENDER_EXTERNAL_URL into deployed web services automatically; BASE_URL is the manual override for
 # any other host, and localhost is the dev default.
 BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL") or "http://localhost:5000").rstrip("/")
+
+
+def _finance_link_url():
+    """A freshly signed 15-minute /finance URL, or None when PAGE_LINK_SECRET is blank. Never logged."""
+    link_secret = os.environ.get("PAGE_LINK_SECRET", "")
+    if not link_secret:
+        return None
+    return f"{BASE_URL}/finance?{signed_links.sign_path(link_secret, '/finance', int(time.time()))}"
 JSEARCH_URL = "https://api.openwebninja.com/jsearch/search"
 JSEARCH_TIMEOUT_SECONDS = 40  # see JSEARCH_SEMAPHORE - queued requests spend most of this waiting
 JSEARCH_MAX_RETRIES = 1  # additional attempts beyond the first, on timeout/429/5xx
@@ -17884,11 +17892,28 @@ def process_webhook_payload_async(data):
             if text != "/financelink":
                 send_telegram_message(chat_id, "<code>/financelink</code> takes no argument. It replies with a 15-minute link to the finance page.")
                 return
-            link_secret = os.environ.get("PAGE_LINK_SECRET", "")
-            if not link_secret:
+            fin_link = _finance_link_url()
+            if not fin_link:
                 send_telegram_message(chat_id, "PAGE_LINK_SECRET is not configured, so no link can be made. Set it in the Render dashboard environment.")
                 return
-            send_telegram_message(chat_id, html.escape(f"{BASE_URL}/finance?{signed_links.sign_path(link_secret, '/finance', int(time.time()))}") + "\nExpires in 15 minutes.")
+            send_telegram_message(chat_id, html.escape(fin_link) + "\nExpires in 15 minutes.")
+            return
+        # /life: money-and-time summary of the newest snapshots plus a fresh finance link. Read-only, local.
+        if text == "/life" or text.startswith("/life "):
+            if text != "/life":
+                send_telegram_message(chat_id, "Usage: /life (no arguments).")
+                return
+            try:
+                import life_summary, finance_model, personal_snapshots
+                now_utc = datetime.now(timezone.utc)
+                view = finance_model.build_finance_view(personal_snapshots.load_recent(30), now_utc,
+                                                        plan=hours_plan.load_plan())
+                reply = life_summary.render_life_reply(view, now_utc, _finance_link_url())
+            except Exception as e:
+                logging.error(f"/life failed: {type(e).__name__}")
+                send_telegram_message(chat_id, "Could not build the life snapshot.")
+                return
+            send_telegram_message(chat_id, reply)
             return
         # /vlink [name]: a per-contact site link (creates the tag the first time), or the list of links made.
         if text == "/vlink" or text.startswith("/vlink "):
@@ -20036,6 +20061,7 @@ def process_webhook_payload_async(data):
                 "/wrun - Last /w run, per company: which source answered and what names came back (/wrun Haworth, /wrun full)\n"
                 "/moneylink - A 15-minute signed link to the money page\n"
                 "/financelink - A 15-minute signed link to the finance page\n"
+                "/life - Money and time summary with each section's data age, plus a fresh 15-minute link to the finance page\n"
                 "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
