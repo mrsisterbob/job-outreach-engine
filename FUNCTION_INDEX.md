@@ -248,6 +248,29 @@ grep -i "contact" FUNCTION_INDEX.md
 | 176 | `_time` | _(no docstring)_ |
 | 204 | `build_finance_view` | Snapshots (newest first) + aware UTC `now` -> the /finance view model. |
 
+## `finance_page.py` — 18 defs, 300 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 89 | `_e` | _(no docstring)_ |
+| 93 | `_fmt` | One number formatter: thousands separators, minus for negatives, '-' for None. |
+| 104 | `_dicts` | _(no docstring)_ |
+| 108 | `_sec` | _(no docstring)_ |
+| 112 | `_short` | Hours without a forced decimal: 164 not 164.0, 1.5 stays 1.5. |
+| 118 | `_money` | _(no docstring)_ |
+| 122 | `_hrs` | _(no docstring)_ |
+| 126 | `_parse_dt` | _(no docstring)_ |
+| 136 | `_ago_hours` | _(no docstring)_ |
+| 146 | `_received_ago` | _(no docstring)_ |
+| 161 | `_stamp` | _(no docstring)_ |
+| 172 | `_cell` | _(no docstring)_ |
+| 177 | `_table` | head: list of (label, css); rows: list of lists of (text, css). |
+| 184 | `_money_section` | _(no docstring)_ |
+| 233 | `_gap_line` | _(no docstring)_ |
+| 245 | `_time_section` | _(no docstring)_ |
+| 272 | `_json_for_script` | _(no docstring)_ |
+| 279 | `render_finance_page` | _(no docstring)_ |
+
 ## `hirebase_feed.py` — 25 defs, 606 lines
 
 | Line | Name | Summary |
@@ -1638,4 +1661,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1229 definitions across 78 files + Code.gs.**
+**1247 definitions across 79 files + Code.gs.**
