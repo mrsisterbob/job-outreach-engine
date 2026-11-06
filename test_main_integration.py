@@ -13467,6 +13467,7 @@ def analytics_env(monkeypatch):
     m._analytics_last_prune["at"] = 0.0
     m._VISIT_ALERT_GATE.reset()
     monkeypatch.delenv("VISIT_ALERTS_ENABLED", raising=False)
+    monkeypatch.setenv("VISIT_ALERTS_UNTAGGED", "true")
     sent = []
     monkeypatch.setattr(m, "send_telegram_message", lambda cid, t, *a, **k: sent.append(t) or 1)
     yield sent
@@ -24642,3 +24643,59 @@ def test_snapshot_ingest_response_does_not_leak_the_disk_path(snap_env):
     r = _post_snap(_GOOD_SNAP)
     assert str(snap_env) not in r.get_data(as_text=True)
     assert set(r.get_json()) == {"status", "received_at"}
+
+
+# ---- untagged site visits do not ping Telegram by default (TASK-271) ----
+
+def test_untagged_alert_default_stores_row_but_sends_nothing(visit_tag_env, monkeypatch):
+    monkeypatch.delenv("VISIT_ALERTS_UNTAGGED", raising=False)
+    assert _ingest([_view()]).status_code == 200
+    assert len(_stored_rows()) == 1
+    assert visit_tag_env == []
+
+
+def test_untagged_alert_default_tagged_visit_still_pings(visit_tag_env, monkeypatch):
+    monkeypatch.delenv("VISIT_ALERTS_UNTAGGED", raising=False)
+    tag = m.visit_tag_create("Jane Doe")
+    assert _ingest([_tagged_view(tag)]).status_code == 200
+    assert _tag_rows() == [tag]
+    assert len(visit_tag_env) == 1 and "Opened by Jane Doe" in visit_tag_env[0]
+
+
+@pytest.mark.parametrize("val,pings", [("true", 1), ("1", 1), (None, 0), ("", 0), ("0", 0), ("false", 0), ("garbage", 0)])
+def test_untagged_alert_env_switch(visit_tag_env, monkeypatch, val, pings):
+    if val is None:
+        monkeypatch.delenv("VISIT_ALERTS_UNTAGGED", raising=False)
+    else:
+        monkeypatch.setenv("VISIT_ALERTS_UNTAGGED", val)
+    assert _ingest([_view()]).status_code == 200
+    assert len(visit_tag_env) == pings
+    assert len(_stored_rows()) == 1
+
+
+def test_untagged_alert_master_switch_off_silences_all_but_stores(visit_tag_env, monkeypatch):
+    monkeypatch.setenv("VISIT_ALERTS_UNTAGGED", "true")
+    monkeypatch.setenv("VISIT_ALERTS_ENABLED", "false")
+    tag = m.visit_tag_create("Jane Doe")
+    assert _ingest([_view(), _tagged_view(tag, ip="203.0.113.99")]).status_code == 200
+    assert visit_tag_env == []
+    assert len(_stored_rows()) == 2
+
+
+def test_untagged_alert_silent_visits_do_not_consume_the_gate(visit_tag_env, monkeypatch):
+    monkeypatch.delenv("VISIT_ALERTS_UNTAGGED", raising=False)
+    for i in range(12):
+        assert _ingest([_view(ip=f"198.51.100.{i + 1}")]).status_code == 200
+    assert visit_tag_env == []
+    tag = m.visit_tag_create("Jane Doe")
+    assert _ingest([_tagged_view(tag, ip="203.0.113.200")]).status_code == 200
+    assert len(visit_tag_env) == 1 and "Opened by Jane Doe" in visit_tag_env[0]
+    assert len(_stored_rows()) == 13
+
+
+def test_untagged_alert_standup_line_still_counts_silent_visits(visit_tag_env, monkeypatch):
+    monkeypatch.delenv("VISIT_ALERTS_UNTAGGED", raising=False)
+    assert _ingest([_view()]).status_code == 200
+    assert visit_tag_env == []
+    line = m.site_visitor_standup_line()
+    assert line and "quiet" not in line.lower()
