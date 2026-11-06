@@ -1343,6 +1343,14 @@ grep -i "contact" FUNCTION_INDEX.md
 | 29 | `time_one` | Returns (line, ok) for one tab. |
 | 53 | `main` | _(no docstring)_ |
 
+## `signed_links.py` — 3 defs, 45 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 9 | `make_signature` | URL-safe hex HMAC-SHA256 over f"{path}\n{expires_at}". |
+| 15 | `sign_path` | Return the query string 'exp=<epoch>&sig=<signature>'. |
+| 26 | `verify_link` | True only for an unexpired, untampered link for exactly this path. |
+
 ## `site_traffic.py` — 13 defs, 284 lines
 
 | Line | Name | Summary |
@@ -1599,4 +1607,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1205 definitions across 75 files + Code.gs.**
+**1208 definitions across 76 files + Code.gs.**
