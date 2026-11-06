@@ -8,6 +8,7 @@ import signed_links
 import money_page
 import finance_model
 import finance_page
+import hours_plan
 import secrets
 import html
 import io
@@ -21600,15 +21601,17 @@ def _money_response(body, status):
     return resp
 
 
-def _signed_page_gate(tag):
-    """Shared signed-link check for /money and /finance. None when the link is valid; otherwise
-    the identical empty 404 (never says why). The signature binds request.path."""
+def _signed_page_gate(tag, exp=None, sig=None):
+    """Shared signed-link check for /money, /finance and /finance/plan. None when the link is
+    valid; otherwise the identical empty 404 (never says why). The signature binds request.path.
+    exp/sig default to the query string; /finance/plan passes the ones from its JSON body."""
+    if exp is None and sig is None:
+        exp, sig = request.args.get("exp"), request.args.get("sig")
     secret = os.environ.get("PAGE_LINK_SECRET", "")
     if not secret:
         logging.warning("[%s] PAGE_LINK_SECRET is unset - refusing.", tag)
         return _money_response("", 404)
-    if not signed_links.verify_link(secret, request.path, request.args.get("exp"),
-                                    request.args.get("sig"), int(time.time())):
+    if not signed_links.verify_link(secret, request.path, exp, sig, int(time.time())):
         logging.info("[%s] link refused (missing, bad, wrong-path or expired)", tag)
         return _money_response("", 404)
     return None
@@ -21632,15 +21635,23 @@ def money_page_view():
 
 @app.route("/finance", methods=["GET"])
 def finance_page_view():
-    """Finance page from stored snapshots, behind the same signed link as /money. Read-only."""
+    """Finance page from stored snapshots, behind the same signed link as /money. The editor on it
+    saves through POST /finance/plan (hours_plan.save_plan) with a write credential embedded in the
+    page, signed for that path and expiring with the link."""
     denied = _signed_page_gate("FINANCE")
     if denied is not None:
         return denied
     try:
         now_utc = datetime.now(timezone.utc)
-        view = finance_model.build_finance_view(personal_snapshots.load_recent(30), now_utc)
+        view = finance_model.build_finance_view(personal_snapshots.load_recent(30), now_utc,
+                                                plan=hours_plan.load_plan())
         nonce = secrets.token_urlsafe(16)
-        body = finance_page.render_finance_page(view, now_utc, nonce)
+        # Same exp as the link that opened the page: editing never extends the window.
+        secret = os.environ.get("PAGE_LINK_SECRET", "")
+        exp = int(request.args.get("exp"))
+        edit = {"plan_url": "/finance/plan", "exp": exp,
+                "sig": signed_links.make_signature(secret, "/finance/plan", exp)}
+        body = finance_page.render_finance_page(view, now_utc, nonce, edit=edit)
     except Exception as e:
         logging.error("[FINANCE] page build failed: %s", type(e).__name__)
         return _money_response("Finance page unavailable.", 500)
@@ -21649,8 +21660,60 @@ def finance_page_view():
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Content-Security-Policy"] = (
         f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
-        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; connect-src 'self'")
     return resp
+
+
+_PLAN_MAX_BYTES = 16 * 1024
+
+
+def _plan_json(obj, status):
+    resp = jsonify(obj)
+    resp.status_code = status
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/finance/plan", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+def finance_plan_save():
+    """Save the edited weekly 168-hour plan. The credential (exp, sig) is in the JSON body, signed
+    for this exact path. Every auth failure, and every non-POST, is the identical empty 404."""
+    if request.method != "POST":
+        return _money_response("", 404)
+    # Pre-auth: a legit body is tiny, so anything over the cap is the empty 404 before it is parsed.
+    if request.content_length is not None and request.content_length > _PLAN_MAX_BYTES:
+        return _money_response("", 404)
+    raw = request.stream.read(_PLAN_MAX_BYTES + 1)
+    body = None
+    if request.mimetype == "application/json" and len(raw) <= _PLAN_MAX_BYTES:
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError, UnicodeDecodeError):
+            body = None
+    if not isinstance(body, dict):
+        return _money_response("", 404)
+    exp = body.get("exp")
+    exp = str(exp) if isinstance(exp, int) and not isinstance(exp, bool) else exp
+    denied = _signed_page_gate("FINANCE-PLAN", exp or "", body.get("sig") or "")
+    if denied is not None:
+        return denied
+    try:
+        now_utc = datetime.now(timezone.utc)
+        view = finance_model.build_finance_view(personal_snapshots.load_recent(30), now_utc,
+                                                plan=hours_plan.load_plan())
+        allowed = (view.get("time") or {}).get("editable_categories") or []
+        if not allowed:
+            return _plan_json({"status": "invalid", "error": "Nothing to edit yet."}, 400)
+        saved = hours_plan.save_plan(body.get("hours"), allowed, body.get("base_version"), now_utc)
+    except hours_plan.PlanInvalid as e:
+        return _plan_json({"status": "invalid", "error": str(e)}, 400)
+    except hours_plan.PlanConflict as e:
+        return _plan_json({"status": "conflict", "current_version": e.current_version}, 409)
+    except Exception as e:
+        logging.error("[FINANCE-PLAN] save failed: %s", type(e).__name__)
+        return _plan_json({"status": "error"}, 500)
+    return _plan_json({"status": "ok", "version": saved["version"],
+                       "updated_at": saved["updated_at"], "total": hours_plan.TOTAL_HOURS}, 200)
 
 
 @app.route("/snapshots/ingest", methods=["POST"])

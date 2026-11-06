@@ -25085,3 +25085,272 @@ def test_finance_route_financelink_extra_text_is_usage(money_env, monkeypatch):
     sent = _mp_link(monkeypatch, "/financelink extra")
     joined = "\n".join(sent)
     assert "takes no argument" in joined and "/finance?" not in joined
+
+
+# ---- POST /finance/plan (plan_route) ----
+
+@pytest.fixture
+def plan_env(money_env, monkeypatch, tmp_path_factory):
+    d = tmp_path_factory.mktemp("planstore")
+    monkeypatch.setenv("PERSONAL_PLAN_DIR", str(d))
+    yield d
+
+
+def _pr_time():
+    as_of = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {"as_of": as_of, "week_of": as_of,
+            "planned": [{"category": "Sleep", "hours": 56}, {"category": "Work", "hours": 40}],
+            "actual": [{"category": "Sleep", "hours": 49.5}, {"category": "Gym", "hours": 3}]}
+
+
+def _pr_seed(monkeypatch):
+    """Ingest a time snapshot, take the link from /financelink, fetch the page like the phone would."""
+    _fr_ingest({"time": _pr_time()})
+    link = _fr_path(_mp_link(monkeypatch, "/financelink"))
+    return link, _pr_page(link)
+
+
+def _pr_page(link):
+    r = _mp_get(link)
+    assert r.status_code == 200
+    return r
+
+
+def _pr_data(resp):
+    mt = re.search(r'id="fin-data"[^>]*>(.*?)</script>', resp.get_data(as_text=True), re.S)
+    return json.loads(mt.group(1))
+
+
+def _pr_cred(resp):
+    e = _pr_data(resp)["edit"]
+    return {"exp": e["exp"], "sig": e["sig"]}
+
+
+def _pr_hours(sleep=56, work=40, gym=72):
+    return [{"category": "Sleep", "hours": sleep}, {"category": "Work", "hours": work},
+            {"category": "Gym", "hours": gym}]
+
+
+def _pr_post(body=None, raw=None, ctype="application/json"):
+    with m.app.test_client() as client:
+        if raw is not None:
+            return client.post("/finance/plan", data=raw, content_type=ctype)
+        return client.post("/finance/plan", json=body)
+
+
+def _pr_save(cred, hours=None, base=None, **extra):
+    return _pr_post(dict(cred, hours=hours if hours is not None else _pr_hours(), base_version=base, **extra))
+
+
+def _pr_planfile(d):
+    return os.path.join(str(d), "hours_plan.json")
+
+
+def _pr_rows(resp):
+    return {r["category"]: r["planned"] for r in _pr_data(resp)["time"]["rows"]}
+
+
+def test_plan_route_valid_save_is_stored_and_shown_after_reload(plan_env, monkeypatch):
+    import hours_plan
+    link, page = _pr_seed(monkeypatch)
+    r = _pr_save(_pr_cred(page), _pr_hours(60, 36, 72))
+    j = r.get_json()
+    assert r.status_code == 200 and j["status"] == "ok" and j["version"] == 1 and j["total"] == 168
+    assert r.headers["Cache-Control"] == "no-store"
+    assert {e["category"]: e["hours"] for e in hours_plan.load_plan()["hours"]} == {"Sleep": 60, "Work": 36, "Gym": 72}
+    again = _mp_get(link)
+    d = _pr_data(again)
+    assert d["time"]["plan_version"] == 1 and _pr_rows(again) == {"Sleep": 60, "Work": 36, "Gym": 72}
+
+
+def test_plan_route_persists_across_module_reload(plan_env, monkeypatch):
+    import importlib
+    import hours_plan
+    link, page = _pr_seed(monkeypatch)
+    assert _pr_save(_pr_cred(page), _pr_hours(61, 35, 72)).status_code == 200
+    importlib.reload(hours_plan)
+    assert _pr_rows(_mp_get(link))["Sleep"] == 61
+
+
+@pytest.mark.parametrize("hours", [_pr_hours(55.75), _pr_hours(56.25)])
+def test_plan_route_wrong_total_is_400_and_writes_nothing(plan_env, monkeypatch, hours):
+    link, page = _pr_seed(monkeypatch)
+    r = _pr_save(_pr_cred(page), hours)
+    assert r.status_code == 400 and r.get_json()["status"] == "invalid"
+    assert "need 168" in r.get_json()["error"] and "0.25" in r.get_json()["error"]
+    assert not os.path.exists(_pr_planfile(plan_env))
+
+
+def test_plan_route_wrong_total_leaves_existing_plan_unchanged(plan_env, monkeypatch):
+    link, page = _pr_seed(monkeypatch)
+    cred = _pr_cred(page)
+    assert _pr_save(cred, _pr_hours(60, 36, 72)).status_code == 200
+    before = open(_pr_planfile(plan_env), "rb").read()
+    assert _pr_save(cred, _pr_hours(55.75), base=1).status_code == 400
+    assert open(_pr_planfile(plan_env), "rb").read() == before
+
+
+@pytest.mark.parametrize("hours", [
+    [{"category": "Sleep", "hours": 96}, {"category": "Work", "hours": 72}],
+    _pr_hours() + [{"category": "Chores", "hours": 0}],
+    _pr_hours() + [{"category": "Gym", "hours": 0}],
+    _pr_hours(gym=71.9),
+    _pr_hours(gym="72"),
+    _pr_hours(gym=True),
+])
+def test_plan_route_malformed_hours_are_400_and_write_nothing(plan_env, monkeypatch, hours):
+    link, page = _pr_seed(monkeypatch)
+    r = _pr_save(_pr_cred(page), hours)
+    assert r.status_code == 400 and r.get_json()["status"] == "invalid"
+    assert not os.path.exists(_pr_planfile(plan_env))
+
+
+def test_plan_route_stale_base_version_is_409(plan_env, monkeypatch):
+    link, page = _pr_seed(monkeypatch)
+    cred = _pr_cred(page)
+    assert _pr_save(cred, _pr_hours(60, 36, 72)).status_code == 200
+    before = open(_pr_planfile(plan_env), "rb").read()
+    for base in (None, 0):
+        r = _pr_save(cred, _pr_hours(50, 46, 72), base=base)
+        assert r.status_code == 409 and r.get_json() == {"status": "conflict", "current_version": 1}
+    assert open(_pr_planfile(plan_env), "rb").read() == before
+    assert _pr_save(cred, _pr_hours(50, 46, 72), base=1).get_json()["version"] == 2
+
+
+def test_plan_route_bad_credentials_are_identical_empty_404s(plan_env, monkeypatch):
+    import signed_links as sl
+    link, page = _pr_seed(monkeypatch)
+    cred = _pr_cred(page)
+    base = _mp_get("/money")
+    f_exp, f_sig = re.search(r"exp=(\d+)&sig=(\w+)", link).groups()
+    flip = cred["sig"][:-1] + ("0" if cred["sig"][-1] != "0" else "1")
+    now = int(time.time())
+    h = _pr_hours()
+    cases = [
+        _pr_post(raw=b"", ctype="application/json"),
+        _pr_post(raw=b"[1,2]"),
+        _pr_post(raw=json.dumps(dict(cred, hours=h)), ctype="text/plain"),
+        _pr_post({"hours": h}),
+        _pr_post(dict(cred, sig=flip, hours=h)),
+        _pr_post(dict(cred, exp=cred["exp"] + 60, hours=h)),
+        _pr_post({"exp": int(f_exp), "sig": f_sig, "hours": h}),
+        _pr_post({"exp": now + 600, "sig": sl.make_signature("other-secret", "/finance/plan", now + 600), "hours": h}),
+        _pr_post(dict(cred, exp=True, hours=h)),
+    ]
+    real = time.time
+    monkeypatch.setattr(m.time, "time", lambda: real() + 16 * 60)
+    cases.append(_pr_post(dict(cred, hours=h)))
+    for r in cases:
+        assert r.status_code == 404 and r.get_data() == b""
+        assert sorted(r.headers.items()) == sorted(base.headers.items())
+    assert not os.path.exists(_pr_planfile(plan_env))
+
+
+def test_plan_route_credential_expires_with_the_link(plan_env, monkeypatch):
+    link, page = _pr_seed(monkeypatch)
+    cred = _pr_cred(page)
+    exp = cred["exp"]
+    assert exp == int(re.search(r"exp=(\d+)", link).group(1))
+    monkeypatch.setattr(m.time, "time", lambda: exp - 1)
+    ok = _pr_save(cred, _pr_hours(60, 36, 72))
+    assert ok.status_code == 200
+    assert _pr_data(_mp_get(link))["edit"]["exp"] == exp
+    monkeypatch.setattr(m.time, "time", lambda: exp)
+    r = _pr_save(cred, _pr_hours(50, 46, 72), base=1)
+    assert r.status_code == 404 and r.get_data() == b""
+
+
+def test_plan_route_other_methods_are_the_empty_404_and_no_cors(plan_env, monkeypatch):
+    link, page = _pr_seed(monkeypatch)
+    base = _mp_get("/money")
+    with m.app.test_client() as client:
+        for fn in (client.get, client.put, client.delete, client.patch):
+            r = fn("/finance/plan")
+            assert r.status_code == 404 and r.get_data() == b""
+            assert sorted(r.headers.items()) == sorted(base.headers.items())
+        r = client.get("/finance/plan?" + link.split("?", 1)[1])
+        assert r.status_code == 404 and r.get_data() == b""
+        r = client.options("/finance/plan", headers={"Origin": "https://evil.example"})
+        assert not [k for k in r.headers.keys() if k.lower().startswith("access-control")]
+
+
+def test_plan_route_oversize_body_is_the_empty_404_before_auth(plan_env, monkeypatch):
+    link, page = _pr_seed(monkeypatch)
+    cred = _pr_cred(page)
+    base = _mp_get("/money")
+    pad = "x" * 20000
+    for body in (dict(cred, hours=_pr_hours(), pad=pad), dict(cred, sig="0" * 64, hours=_pr_hours(), pad=pad)):
+        r = _pr_post(body)
+        assert r.status_code == 404 and r.get_data() == b""
+        assert sorted(r.headers.items()) == sorted(base.headers.items())
+    assert not os.path.exists(_pr_planfile(plan_env))
+
+
+def test_plan_route_deeply_nested_body_is_the_empty_404_not_500(plan_env, monkeypatch):
+    base = _mp_get("/money")
+    for raw in (b"[" * 200000, b"[" * 10000, b"1" * 9000):
+        r = _pr_post(raw=raw)
+        assert r.status_code == 404 and r.get_data() == b""
+        assert sorted(r.headers.items()) == sorted(base.headers.items())
+
+
+def test_plan_route_non_dict_hours_and_huge_int_are_400_with_valid_auth(plan_env, monkeypatch):
+    link, page = _pr_seed(monkeypatch)
+    cred = _pr_cred(page)
+    for hours in ("lots", 5, {"Sleep": 168}, None, _pr_hours(gym=10 ** 40), _pr_hours(gym=-(10 ** 40))):
+        r = _pr_save(cred, hours) if hours is not None else _pr_post(dict(cred))
+        assert r.status_code == 400 and r.get_json()["status"] == "invalid"
+    assert not os.path.exists(_pr_planfile(plan_env))
+
+
+def test_plan_route_finance_csp_allows_self_connect_and_credential_only_in_json(plan_env, monkeypatch):
+    link, page = _pr_seed(monkeypatch)
+    csp = page.headers["Content-Security-Policy"]
+    nonce = re.search(r"script-src 'nonce-([^']+)'", csp).group(1)
+    assert "connect-src 'self'" in csp and f"style-src 'nonce-{nonce}'" in csp
+    body = page.get_data(as_text=True)
+    sig = _pr_cred(page)["sig"]
+    assert body.count(sig) == 1
+    blob = re.search(r'id="fin-data"[^>]*>(.*?)</script>', body, re.S).group(1)
+    assert sig in blob and "/finance/plan" in blob
+    assert "sig=" not in body
+
+
+def test_plan_route_secret_unset_is_404_even_with_earlier_credential(plan_env, monkeypatch):
+    link, page = _pr_seed(monkeypatch)
+    cred = _pr_cred(page)
+    monkeypatch.delenv("PAGE_LINK_SECRET")
+    r = _pr_save(cred)
+    assert r.status_code == 404 and r.get_data() == b""
+    assert not os.path.exists(_pr_planfile(plan_env))
+
+
+def test_plan_route_nothing_to_edit_yet_is_400_and_page_has_no_editor(plan_env, monkeypatch):
+    import signed_links as sl
+    link = _fr_path(_mp_link(monkeypatch, "/financelink"))
+    page = _mp_get(link)
+    assert page.status_code == 200 and "Nothing uploaded yet" in page.get_data(as_text=True)
+    assert "plan-editor" not in page.get_data(as_text=True)
+    q = sl.sign_path(_MP_SECRET, "/finance/plan", int(time.time()))
+    exp, sig = re.search(r"exp=(\d+)&sig=(\w+)", q).groups()
+    r = _pr_post({"exp": int(exp), "sig": sig, "hours": _pr_hours(), "base_version": None})
+    assert r.status_code == 400 and r.get_json() == {"status": "invalid", "error": "Nothing to edit yet."}
+
+
+def test_plan_route_unexpected_error_is_500_without_details(plan_env, monkeypatch):
+    import hours_plan
+    link, page = _pr_seed(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("/secret/disk/path leaked")
+    monkeypatch.setattr(hours_plan, "save_plan", boom)
+    r = _pr_save(_pr_cred(page))
+    assert r.status_code == 500 and r.get_json() == {"status": "error"}
+    assert "secret" not in r.get_data(as_text=True) and "Traceback" not in r.get_data(as_text=True)
+
+
+def test_plan_route_other_pages_unchanged(plan_env, monkeypatch):
+    _mp_store()
+    assert _mp_get(_mp_path(_mp_link(monkeypatch))).status_code == 200
+    assert _mp_get("/money").status_code == 404
+    assert _mp_get("/followups").status_code == 200 and _mp_get("/brief").status_code == 200
