@@ -6,6 +6,9 @@ import hmac
 import personal_snapshots
 import signed_links
 import money_page
+import finance_model
+import finance_page
+import secrets
 import html
 import io
 import json
@@ -17875,6 +17878,17 @@ def process_webhook_payload_async(data):
                 return
             send_telegram_message(chat_id, html.escape(f"{BASE_URL}/money?{signed_links.sign_path(link_secret, '/money', int(time.time()))}") + "\nExpires in 15 minutes.")
             return
+        # /financelink: a fresh signed 15-minute link to /finance. Never logs the link.
+        if text == "/financelink" or text.startswith("/financelink "):
+            if text != "/financelink":
+                send_telegram_message(chat_id, "<code>/financelink</code> takes no argument. It replies with a 15-minute link to the finance page.")
+                return
+            link_secret = os.environ.get("PAGE_LINK_SECRET", "")
+            if not link_secret:
+                send_telegram_message(chat_id, "PAGE_LINK_SECRET is not configured, so no link can be made. Set it in the Render dashboard environment.")
+                return
+            send_telegram_message(chat_id, html.escape(f"{BASE_URL}/finance?{signed_links.sign_path(link_secret, '/finance', int(time.time()))}") + "\nExpires in 15 minutes.")
+            return
         # /vlink [name]: a per-contact site link (creates the tag the first time), or the list of links made.
         if text == "/vlink" or text.startswith("/vlink "):
             name = " ".join(text[len("/vlink"):].split())
@@ -20020,6 +20034,7 @@ def process_webhook_payload_async(data):
                 "/eyes - Who just looked at the site: 24h and 7d visitors, pages, sources, tagged-link visits, recent visits\n"
                 "/wrun - Last /w run, per company: which source answered and what names came back (/wrun Haworth, /wrun full)\n"
                 "/moneylink - A 15-minute signed link to the money page\n"
+                "/financelink - A 15-minute signed link to the finance page\n"
                 "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
@@ -21585,18 +21600,27 @@ def _money_response(body, status):
     return resp
 
 
+def _signed_page_gate(tag):
+    """Shared signed-link check for /money and /finance. None when the link is valid; otherwise
+    the identical empty 404 (never says why). The signature binds request.path."""
+    secret = os.environ.get("PAGE_LINK_SECRET", "")
+    if not secret:
+        logging.warning("[%s] PAGE_LINK_SECRET is unset - refusing.", tag)
+        return _money_response("", 404)
+    if not signed_links.verify_link(secret, request.path, request.args.get("exp"),
+                                    request.args.get("sig"), int(time.time())):
+        logging.info("[%s] link refused (missing, bad, wrong-path or expired)", tag)
+        return _money_response("", 404)
+    return None
+
+
 @app.route("/money", methods=["GET"])
 def money_page_view():
     """Latest personal snapshot, behind a signed expiring link. Read-only. Every failure is the
     same empty 404 so the response never confirms the page exists or why a link failed."""
-    secret = os.environ.get("PAGE_LINK_SECRET", "")
-    if not secret:
-        logging.warning("[MONEY] PAGE_LINK_SECRET is unset - refusing /money.")
-        return _money_response("", 404)
-    if not signed_links.verify_link(secret, request.path, request.args.get("exp"),
-                                    request.args.get("sig"), int(time.time())):
-        logging.info("[MONEY] link refused (missing, bad, wrong-path or expired)")
-        return _money_response("", 404)
+    denied = _signed_page_gate("MONEY")
+    if denied is not None:
+        return denied
     # Newest snapshot that carries a money section: a newer time-only snapshot must not hide it.
     snap = next((s for s in personal_snapshots.load_recent(100)
                  if personal_snapshots._carries(s, "money")), None)
@@ -21604,6 +21628,29 @@ def money_page_view():
         return _money_response(_followups_page("Money", "<h2>Money</h2><p>No snapshot received yet.</p>"), 200)
     body = money_page.render_money_page(snap, datetime.now(timezone.utc))
     return _money_response(_followups_page("Money", body), 200)
+
+
+@app.route("/finance", methods=["GET"])
+def finance_page_view():
+    """Finance page from stored snapshots, behind the same signed link as /money. Read-only."""
+    denied = _signed_page_gate("FINANCE")
+    if denied is not None:
+        return denied
+    try:
+        now_utc = datetime.now(timezone.utc)
+        view = finance_model.build_finance_view(personal_snapshots.load_recent(30), now_utc)
+        nonce = secrets.token_urlsafe(16)
+        body = finance_page.render_finance_page(view, now_utc, nonce)
+    except Exception as e:
+        logging.error("[FINANCE] page build failed: %s", type(e).__name__)
+        return _money_response("Finance page unavailable.", 500)
+    resp = _money_response(body, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Content-Security-Policy"] = (
+        f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+    return resp
 
 
 @app.route("/snapshots/ingest", methods=["POST"])
