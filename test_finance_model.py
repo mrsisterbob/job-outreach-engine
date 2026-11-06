@@ -136,7 +136,9 @@ def test_finance_model_empty_inputs():
 MONEY_KEYS = {"as_of", "as_of_known", "age_hours", "stale", "received_at", "period", "buckets",
               "flow_total", "off_budget", "unreadable"}
 TIME_KEYS = {"as_of", "as_of_known", "age_hours", "stale", "received_at", "week_of", "rows",
-             "planned_total", "actual_total", "planned_gap", "actual_gap", "unreadable"}
+             "planned_total", "actual_total", "planned_gap", "actual_gap", "unreadable",
+             "plan_source", "plan_version", "plan_updated_at", "actual_available",
+             "editable_categories"}
 
 
 def test_finance_model_json_safe_and_only_documented_keys():
@@ -204,3 +206,107 @@ def test_finance_model_time_lists_capped_up_front():
 def test_finance_model_unparseable_as_of_not_echoed_raw():
     r = fm.build_finance_view([{"money": money(as_of="z" * 5000)}], NOW)["money"]
     assert r["as_of_known"] is False and len(r["as_of"]) <= 40
+
+
+# ---- TASK-279: saved plan feeds the PLANNED column ----
+import hours_plan  # noqa: E402  (test side only; finance_model itself must not import it)
+
+
+def _saved(tmp_path, monkeypatch, hours):
+    monkeypatch.setenv("PERSONAL_PLAN_DIR", str(tmp_path))
+    cats = [h["category"] for h in hours]
+    hours_plan.save_plan(hours, cats, None, now=NOW)
+    return hours_plan.load_plan()
+
+
+def _snap50():
+    return {"received_at": "R", "time": tsec(
+        planned=[{"category": "Sleep", "hours": 50}, {"category": "Work", "hours": 50}],
+        actual=[{"category": "Sleep", "hours": 45}, {"category": "Gym", "hours": 3}])}
+
+
+def test_plan_edit_saved_plan_overrides_snapshot_planned(tmp_path, monkeypatch):
+    plan = _saved(tmp_path, monkeypatch, [{"category": "Sleep", "hours": 70},
+                                          {"category": "Work", "hours": 98}])
+    t = fm.build_finance_view([_snap50()], NOW, plan)["time"]
+    rows = {r["category"]: r for r in t["rows"]}
+    assert rows["Sleep"]["planned"] == 70.0 and rows["Work"]["planned"] == 98.0
+    assert rows["Sleep"]["actual"] == 45.0 and rows["Sleep"]["delta"] == -25.0
+    assert t["plan_source"] == "saved" and t["plan_version"] == 1
+    assert t["plan_updated_at"] == plan["updated_at"]
+    old = fm.build_finance_view([_snap50()], NOW, None)["time"]
+    assert old["plan_source"] == "snapshot" and old["plan_version"] is None
+    assert {r["category"]: r["planned"] for r in old["rows"]}["Sleep"] == 50.0
+
+
+def test_plan_edit_categories_union_and_none_not_zero(tmp_path, monkeypatch):
+    plan = _saved(tmp_path, monkeypatch, [{"category": "Sleep", "hours": 100},
+                                          {"category": "Study", "hours": 68}])
+    t = fm.build_finance_view([_snap50()], NOW, plan)["time"]
+    rows = {r["category"]: r for r in t["rows"]}
+    assert rows["Study"]["actual"] is None and rows["Study"]["delta"] is None
+    assert rows["Gym"]["planned"] is None and rows["Gym"]["delta"] is None
+    assert "Work" not in rows
+    assert t["editable_categories"] == ["Sleep", "Study", "Gym"]
+
+
+def test_plan_edit_plan_only_no_snapshots(tmp_path, monkeypatch):
+    plan = _saved(tmp_path, monkeypatch, [{"category": "Sleep", "hours": 168}])
+    v = fm.build_finance_view([], NOW, plan)
+    t = v["time"]
+    assert v["empty"] is False and t is not None
+    assert t["actual_available"] is False and t["actual_total"] is None
+    assert t["received_at"] is None and t["stale"] is False and t["as_of_known"] is False
+    assert t["rows"][0]["actual"] is None
+    assert fm.build_finance_view([], NOW, None)["empty"] is True
+
+
+def test_plan_edit_168_is_exact(tmp_path, monkeypatch):
+    plan = _saved(tmp_path, monkeypatch, [{"category": "A", "hours": 55.25},
+                                          {"category": "B", "hours": 40.75},
+                                          {"category": "C", "hours": 72}])
+    t = fm.build_finance_view([_snap50()], NOW, plan)["time"]
+    assert t["planned_total"] == 168.0 and t["planned_gap"] == 0.0
+
+
+def test_plan_edit_garbage_plans_never_raise():
+    base = fm.build_finance_view([_snap50()], NOW)["time"]
+    for bad in ("x", {}, {"hours": "no"}, {"hours": [1, 2]}):
+        t = fm.build_finance_view([_snap50()], NOW, bad)["time"]
+        assert t["plan_source"] == "snapshot"
+        assert t["rows"] == base["rows"] and t["planned_total"] == base["planned_total"]
+        assert t["unreadable"] > base["unreadable"]
+
+
+def test_plan_edit_json_safe_and_no_passthrough(tmp_path, monkeypatch):
+    plan = _saved(tmp_path, monkeypatch, [{"category": "Sleep", "hours": 168}])
+    plan["hours"][0]["secret"] = "leak"
+    plan["extra"] = "leak2"
+    v = fm.build_finance_view([_snap50()], NOW, plan)
+    dumped = json.dumps(v, allow_nan=False)
+    assert set(v["time"]) == TIME_KEYS
+    assert "leak" not in dumped
+
+
+def test_plan_edit_source_has_no_forbidden_imports():
+    src = Path(fm.__file__).read_text(encoding="utf-8")
+    for mod in ("hours_plan", "personal_snapshots", "flask", "sqlite3"):
+        assert f"import {mod}" not in src and f"from {mod} " not in src
+
+
+def test_plan_edit_huge_hours_do_not_raise():
+    big = {"received_at": "R", "time": tsec(
+        planned=[{"category": "A", "hours": 1e308}, {"category": "B", "hours": 5}],
+        actual=[{"category": "A", "hours": 1e308}])}
+    t = fm.build_finance_view([big], NOW)["time"]
+    assert t["unreadable"] == 2 and t["actual_total"] is None
+    json.dumps(t, allow_nan=False)
+    plan = {"version": 1, "updated_at": "u", "hours": [{"category": "A", "hours": 1e308},
+                                                       {"category": "B", "hours": 168}]}
+    t = fm.build_finance_view([_snap50()], NOW, plan)["time"]
+    assert t["plan_source"] == "saved" and t["unreadable"] >= 1 and t["planned_total"] == 168.0
+    json.dumps(t, allow_nan=False)
+    two = {"time": tsec(planned=[{"category": "A", "hours": 9999}, {"category": "A", "hours": 9999}])}
+    t = fm.build_finance_view([two], NOW)["time"]
+    assert t["unreadable"] == 1 and t["planned_total"] == 9999.0
+    json.dumps(t, allow_nan=False)

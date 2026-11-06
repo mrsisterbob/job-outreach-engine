@@ -41,6 +41,7 @@ MAX_NAME_LEN = 60
 WEEK_HOURS = 168
 _FUTURE_SLACK = timedelta(days=1)
 _AS_OF_ECHO_CAP = 40
+MAX_HOURS_PER_ROW = 10000   # sane cap per row and per category sum; more is unreadable
 MAX_HOURS_ROWS = 200   # per planned/actual list; extras counted unreadable
 
 
@@ -166,43 +167,84 @@ def _hours(rows):
             bad += 1
             continue
         cat, h = _name(r.get("category")), _num(r.get("hours"))
-        if cat is None or h is None or h < 0:
+        if cat is None or h is None or h < 0 or h > MAX_HOURS_PER_ROW                 or out.get(cat, 0.0) + h > MAX_HOURS_PER_ROW:
             bad += 1
             continue
         out[cat] = out.get(cat, 0.0) + h
     return out, bad
 
 
-def _time(section, now, received_at):
+def _total(vals):
+    """Sum rounded to 0.1; exact via integer quarter-hours when every value is a quarter multiple."""
+    vals = list(vals)
+    if not vals:
+        return None
+    try:
+        qs = [v * 4 for v in vals]
+        if all(q == int(q) for q in qs):
+            return round(sum(int(q) for q in qs) / 4, 1)
+        return round(sum(vals), 1)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _time(section, now, received_at, plan=None):
+    """`section` may be None (plan-only). `plan` is a dict with a list `hours`, or None."""
     unreadable = 0
-    sides = []
-    for key in ("planned", "actual"):
-        h, bad = _hours(_rows(section, key))
+    sec = section if isinstance(section, dict) else {}
+    snap_planned, bad = _hours(_rows(sec, "planned"))
+    unreadable += bad
+    actual, bad = _hours(_rows(sec, "actual"))
+    unreadable += bad
+    if plan is not None:
+        planned, bad = _hours(plan["hours"])
         unreadable += bad
-        sides.append(h)
-    planned, actual = sides
+        source = "saved"
+    else:
+        planned = snap_planned
+        source = "snapshot" if planned else None
     all_cats = list(dict.fromkeys(list(planned) + list(actual)))
     unreadable += max(0, len(all_cats) - MAX_TIME_CATEGORIES)
     cats = all_cats[:MAX_TIME_CATEGORIES]
     # totals are summed over ALL readable categories, before the display cap
-    ptot = round(sum(planned.values()), 1) if planned else None
-    atot = round(sum(actual.values()), 1) if actual else None
+    ptot = _total(planned.values())
+    atot = _total(actual.values())
     rows = []
     for c in cats:
         p = round(planned[c], 1) if c in planned else None
         a = round(actual[c], 1) if c in actual else None
         d = round(actual[c] - planned[c], 1) if c in planned and c in actual else None
         rows.append({"category": c, "planned": p, "actual": a, "delta": d})
-    view = _freshness(section, now, TIME_STALE_AFTER_HOURS)
-    view.update({"received_at": received_at, "week_of": _label(section.get("week_of")),
+    if section is None:
+        # plan-only: the stamp is about actuals, which do not exist; the plan is never stale
+        view = {"as_of": None, "as_of_known": False, "age_hours": None, "stale": False}
+    else:
+        view = _freshness(sec, now, TIME_STALE_AFTER_HOURS)
+    ver = plan.get("version") if plan is not None else None
+    upd = plan.get("updated_at") if plan is not None else None
+    view.update({"received_at": received_at, "week_of": _label(sec.get("week_of")),
                  "rows": rows, "planned_total": ptot, "actual_total": atot,
                  "planned_gap": round(WEEK_HOURS - ptot, 1) if ptot is not None else None,
-                 "actual_gap": round(WEEK_HOURS - atot, 1) if atot is not None else None, "unreadable": unreadable})
+                 "actual_gap": round(WEEK_HOURS - atot, 1) if atot is not None else None,
+                 "unreadable": unreadable,
+                 "plan_source": source,
+                 "plan_version": ver if isinstance(ver, int) and not isinstance(ver, bool) else None,
+                 "plan_updated_at": _label(upd),
+                 "actual_available": bool(actual),
+                 "editable_categories": [r["category"] for r in rows]})
     return view
 
 
-def build_finance_view(snapshots, now):
-    """Snapshots (newest first) + aware UTC `now` -> the /finance view model."""
+def build_finance_view(snapshots, now, plan=None):
+    """Snapshots (newest first) + aware UTC `now` (+ saved plan dict or None) -> the view model.
+
+    A saved plan overrides the snapshot's `planned`: it is Kevin's decision made on the page and
+    a later PC push carrying an old `planned` must not undo it. Actuals always come from snapshots.
+    """
+    plan_ok = (isinstance(plan, dict) and isinstance(plan.get("hours"), list)
+               and all(isinstance(e, dict) for e in plan["hours"]))
+    plan_bad = 1 if (plan is not None and not plan_ok) else 0
+    use = plan if plan_ok else None
     money = time_ = None
     for snap in snapshots if isinstance(snapshots, list) else []:
         if not isinstance(snap, dict):
@@ -212,7 +254,11 @@ def build_finance_view(snapshots, now):
         if money is None and isinstance(snap.get("money"), dict):
             money = _money(snap["money"], now, ra)
         if time_ is None and isinstance(snap.get("time"), dict):
-            time_ = _time(snap["time"], now, ra)
+            time_ = _time(snap["time"], now, ra, use)
         if money is not None and time_ is not None:
             break
+    if time_ is None and use is not None:
+        time_ = _time(None, now, None, use)
+    if time_ is not None:
+        time_["unreadable"] += plan_bad
     return {"empty": money is None and time_ is None, "money": money, "time": time_}
