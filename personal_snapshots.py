@@ -1,7 +1,9 @@
 """Personal money-and-time snapshot store.
 
 One JSON file per snapshot in a directory on the persistent disk (never the jobs SQLite DB).
-Keeps the newest N, and refuses any snapshot carrying merchant-level or per-transaction keys.
+Keeps the newest N overall, plus the newest few snapshots carrying each section (money, time),
+so a frequent push of one kind can never delete the other kind. Worst case the directory holds
+snapshot_keep() + 2 * section_keep() files. Refuses any snapshot carrying merchant-level or per-transaction keys.
 Pure stdlib.
 """
 import json
@@ -10,6 +12,8 @@ import re
 from datetime import datetime, timezone
 
 SNAPSHOT_KEEP = 30
+SECTION_KEEP = 3
+_SECTIONS = ("money", "time")
 _FILE_PREFIX = "snapshot_"
 _FILE_SUFFIX = ".json"
 _FORBIDDEN = ("merchant", "payee", "vendor", "transaction", "txn",
@@ -36,6 +40,17 @@ def snapshot_keep() -> int:
     except ValueError:
         return SNAPSHOT_KEEP
     return n if n >= 1 else SNAPSHOT_KEEP
+
+
+def section_keep() -> int:
+    raw = os.environ.get("PERSONAL_SNAPSHOT_SECTION_KEEP")
+    if raw is None:
+        return SECTION_KEEP
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        return SECTION_KEEP
+    return n if n >= 1 else SECTION_KEEP
 
 
 def _normalize_key(key) -> str:
@@ -109,27 +124,75 @@ def save_snapshot(snapshot: dict, *, now=None) -> str:
     os.replace(tmp, path)
 
     existing = list_snapshots()
-    excess = len(existing) - snapshot_keep()
-    for old in existing:
-        if excess <= 0:
+    protected = {os.path.abspath(path)}
+    for p in existing[max(0, len(existing) - snapshot_keep()):]:
+        protected.add(os.path.abspath(p))
+    counts = {sec: 0 for sec in _SECTIONS}
+    limit = section_keep()
+    for p in reversed(existing):
+        if all(c >= limit for c in counts.values()):
             break
-        if os.path.abspath(old) == os.path.abspath(path):
+        data = _read_snapshot(p)
+        if data is None:
+            continue
+        for sec in _SECTIONS:
+            if _carries(data, sec) and counts[sec] < limit:
+                counts[sec] += 1
+                protected.add(os.path.abspath(p))
+    for old in existing:
+        if os.path.abspath(old) in protected:
             continue
         try:
             os.remove(old)
-            excess -= 1
         except OSError:
             pass
     return path
 
 
+def _carries(data, sec) -> bool:
+    """True when the snapshot has `sec` as a non-empty dict."""
+    v = data.get(sec)
+    return isinstance(v, dict) and bool(v)
+
+
+def _read_snapshot(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def load_latest():
     for path in reversed(list_snapshots()):
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict):
+        data = _read_snapshot(path)
+        if data is not None:
             return data
     return None
+
+
+def load_recent(limit: int = 30) -> list:
+    """Newest `limit` readable snapshots, newest first, plus the newest money and time
+    carriers if they fall outside that window (kept in file order)."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        limit = 30
+    limit = max(1, min(100, limit))
+    window = []   # (path, data) newest first
+    rest = []
+    for path in reversed(list_snapshots()):
+        data = _read_snapshot(path)
+        if data is None:
+            continue
+        (window if len(window) < limit else rest).append((path, data))
+    chosen = {p for p, _ in window}
+    extra = {}
+    for sec in _SECTIONS:
+        if any(_carries(d, sec) for _, d in window):
+            continue
+        for p, d in rest:
+            if _carries(d, sec):
+                extra[p] = d
+                break
+    out = window + [(p, d) for p, d in rest if p in extra and p not in chosen]
+    return [d for _, d in out]
