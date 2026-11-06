@@ -57,6 +57,8 @@ services:
         sync: false
       - key: CRM_SHARED_SECRET
         sync: false
+      - key: PAGE_LINK_SECRET
+        sync: false
       - key: RAPIDAPI_KEY
         sync: false
       - key: OPENWEBNINJA_KEY
