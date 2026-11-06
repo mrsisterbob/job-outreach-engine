@@ -24934,3 +24934,154 @@ def test_money_page_time_only_store_is_no_snapshot(money_env, monkeypatch):
 def test_money_page_moneylink_reply_escapes_ampersand(money_env, monkeypatch):
     sent = _mp_link(monkeypatch)
     assert "&amp;sig=" in "".join(sent)
+
+
+# ---- /finance page + /financelink ----
+
+def _fr_money(as_of=None, cat="Groceries"):
+    as_of = as_of or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {"as_of": as_of, "period": "2026-11",
+            "flow": [{"category": cat, "bucket": "Needs", "amount": 412.5}],
+            "off_budget": [{"name": "Emergency fund", "balance": 5200.0, "target": 10000.0}]}
+
+
+def _fr_time(as_of=None):
+    as_of = as_of or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {"as_of": as_of, "week_of": as_of,
+            "planned": [{"category": "Sleep", "hours": 56}],
+            "actual": [{"category": "Sleep", "hours": 49.5}]}
+
+
+def _fr_path(sent):
+    mt = re.search(r"https?://[^/\s]+(/finance\?\S+)", html.unescape("\n".join(sent)))
+    return mt.group(1) if mt else None
+
+
+def _fr_ingest(payload):
+    r = _post_snap(payload)
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+
+def test_finance_route_link_from_command_shows_ingested_values(money_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(), "time": _fr_time()})
+    sent = _mp_link(monkeypatch, "/financelink")
+    path = _fr_path(sent)
+    assert path
+    r = _mp_get(path)
+    body = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert "412" in body and "5,200" in body.replace("5200", "5,200") and "49.5" in body and "56" in body
+    assert r.headers["Content-Type"].startswith("text/html")
+
+
+def test_finance_route_empty_store_says_nothing_uploaded(money_env, monkeypatch):
+    path = _fr_path(_mp_link(monkeypatch, "/financelink"))
+    r = _mp_get(path)
+    assert r.status_code == 200 and "Nothing uploaded yet" in r.get_data(as_text=True)
+
+
+def test_finance_route_bad_links_are_identical_404s(money_env, monkeypatch):
+    import signed_links as sl
+    _fr_ingest({"money": _fr_money(cat="Zebrafood"), "time": _fr_time()})
+    base = _mp_get("/finance")
+    assert base.status_code == 404 and base.get_data() == b""
+    good = _fr_path(_mp_link(monkeypatch, "/financelink"))
+    exp, sig = re.search(r"exp=(\d+)&sig=(\w+)", good).groups()
+    now = int(time.time())
+    bads = [
+        f"/finance?exp={exp}&sig={sig[:-1]}{'0' if sig[-1] != '0' else '1'}",
+        f"/finance?exp={int(exp) + 60}&sig={sig}",
+        "/finance?" + sl.sign_path(_MP_SECRET, "/money", now),
+        "/finance?" + sl.sign_path("other-secret", "/finance", now),
+    ]
+    for p in bads:
+        r = _mp_get(p)
+        assert r.status_code == 404 and r.get_data() == b""
+        assert sorted(r.headers.items()) == sorted(base.headers.items())
+        assert "Zebrafood" not in r.get_data(as_text=True)
+    real = time.time
+    monkeypatch.setattr(m.time, "time", lambda: real() + 16 * 60)
+    r = _mp_get(good)
+    assert r.status_code == 404 and r.get_data() == b""
+    assert sorted(r.headers.items()) == sorted(base.headers.items())
+
+
+def test_finance_route_secret_unset_fails_closed(money_env, monkeypatch):
+    _fr_ingest({"money": _fr_money()})
+    path = _fr_path(_mp_link(monkeypatch, "/financelink"))
+    monkeypatch.delenv("PAGE_LINK_SECRET")
+    assert _mp_get(path).status_code == 404
+    sent = _mp_link(monkeypatch, "/financelink")
+    assert "not configured" in "\n".join(sent) and "/finance?" not in "\n".join(sent)
+
+
+def test_finance_route_two_ingests_each_section_keeps_own_stamp(money_env, monkeypatch):
+    old = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    _fr_ingest({"money": _fr_money(as_of=old, cat="Oldcat")})
+    _fr_ingest({"time": _fr_time()})
+    body = _mp_get(_fr_path(_mp_link(monkeypatch, "/financelink"))).get_data(as_text=True)
+    assert "Oldcat" in body and "Sleep" in body and old in body
+
+
+def test_finance_route_stale_money_labelled_fresh_time_not(money_env, monkeypatch):
+    old = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%d")
+    _fr_ingest({"money": _fr_money(as_of=old)})
+    _fr_ingest({"time": _fr_time()})
+    body = _mp_get(_fr_path(_mp_link(monkeypatch, "/financelink"))).get_data(as_text=True)
+    stamps = re.findall(r"<p class=\"stamp[^\"]*\">[^<]*</p>", body)
+    assert stamps and "STALE" in stamps[0] and "STALE" not in stamps[-1] and "as of" in stamps[-1]
+
+
+def test_finance_route_csp_nonce_and_headers(money_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(), "time": _fr_time()})
+    path = _fr_path(_mp_link(monkeypatch, "/financelink"))
+    r1, r2 = _mp_get(path), _mp_get(path)
+    nonces = []
+    for r in (r1, r2):
+        csp = r.headers["Content-Security-Policy"]
+        nonce = re.search(r"script-src 'nonce-([^']+)'", csp).group(1)
+        nonces.append(nonce)
+        assert f"style-src 'nonce-{nonce}'" in csp and "default-src 'none'" in csp
+        assert "frame-ancestors 'none'" in csp and "base-uri 'none'" in csp and "form-action 'none'" in csp
+        body = r.get_data(as_text=True)
+        assert f'<script nonce="{nonce}"' in body and f'<style nonce="{nonce}"' in body
+        assert r.headers["Cache-Control"] == "no-store"
+        assert r.headers["Referrer-Policy"] == "no-referrer"
+        assert r.headers["X-Robots-Tag"] == "noindex, nofollow"
+        assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert nonces[0] != nonces[1]
+
+
+def test_finance_route_hostile_category_is_escaped(money_env, monkeypatch):
+    _fr_ingest({"money": _fr_money(cat="<script>x</script>")})
+    body = _mp_get(_fr_path(_mp_link(monkeypatch, "/financelink"))).get_data(as_text=True)
+    assert "<script>x</script>" not in body
+
+
+def test_finance_route_render_failure_is_500_only_after_valid_link(money_env, monkeypatch):
+    import finance_page
+    _fr_ingest({"money": _fr_money(cat="Zebrafood")})
+    path = _fr_path(_mp_link(monkeypatch, "/financelink"))
+
+    def boom(*a, **k):
+        raise RuntimeError("secret detail Zebrafood")
+    monkeypatch.setattr(finance_page, "render_finance_page", boom)
+    r = _mp_get(path)
+    assert r.status_code == 500 and r.get_data(as_text=True) == "Finance page unavailable."
+    bad = _mp_get("/finance")
+    assert bad.status_code == 404 and bad.get_data() == b""
+
+
+def test_finance_route_money_gate_unchanged_and_other_pages_open(money_env, monkeypatch):
+    _mp_store()
+    good = _mp_path(_mp_link(monkeypatch))
+    assert _mp_get(good).status_code == 200
+    assert _mp_get("/money").status_code == 404
+    assert _mp_get("/followups").status_code != 404
+    assert _mp_get("/brief").status_code != 404
+
+
+def test_finance_route_financelink_extra_text_is_usage(money_env, monkeypatch):
+    sent = _mp_link(monkeypatch, "/financelink extra")
+    joined = "\n".join(sent)
+    assert "takes no argument" in joined and "/finance?" not in joined
