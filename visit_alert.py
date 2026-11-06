@@ -119,3 +119,10 @@ def visit_alerts_enabled(environ):
     """VISIT_ALERTS_ENABLED, default on; read per call."""
     raw = str(environ.get("VISIT_ALERTS_ENABLED", "") or "").strip().lower()
     return raw not in _OFF_VALUES
+
+
+def untagged_alerts_enabled(environ):
+    """VISIT_ALERTS_UNTAGGED, default OFF; read per call. On only for an explicit truthy value (1/true/yes/on).
+    Opposite of visit_alerts_enabled on purpose: an unset or garbled value must stay quiet."""
+    raw = str(environ.get("VISIT_ALERTS_UNTAGGED", "") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")

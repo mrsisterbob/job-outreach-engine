@@ -21275,7 +21275,11 @@ def _start_visit_alerts(candidates):
     """Gate each stored view on the request thread, queue the send of each admitted one."""
     # Known limit: the gate allows one alert per visitor per 10 minutes, so a visitor who opens an untagged page first
     # and the tagged link second inside that window is not re-alerted. A tagged link is nearly always the first page.
+    untagged_on = visit_alert.untagged_alerts_enabled(os.environ)
     for visited_at, path, visitor_id, referrer, bot, who in candidates:
+        # Filter BEFORE the gate: a silent untagged visit must not burn the hourly ceiling or the per-visitor window.
+        if not who and not untagged_on:
+            continue
         try:
             view_epoch = (datetime.strptime(visited_at, "%Y-%m-%d %H:%M:%S")
                           .replace(tzinfo=timezone.utc).timestamp()) if visited_at else None
@@ -21290,7 +21294,9 @@ def _start_visit_alerts(candidates):
 
 @app.route("/analytics/ingest", methods=["POST"])
 def analytics_ingest():
-    """Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN."""
+    """Pageviews forwarded by montelattice.com. Authenticated with ANALYTICS_INGEST_TOKEN.
+    Every visit is stored. Telegram pings: tagged-link visits always (unless VISIT_ALERTS_ENABLED is off); untagged
+    visits only when VISIT_ALERTS_UNTAGGED is truthy (default off)."""
     token = os.environ.get("ANALYTICS_INGEST_TOKEN", "")
     supplied = request.headers.get("X-Analytics-Token", "")
     if not token or not hmac.compare_digest(supplied.encode(), token.encode()):

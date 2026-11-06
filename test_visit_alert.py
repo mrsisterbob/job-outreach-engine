@@ -131,3 +131,11 @@ def test_visit_alert_tag_new_uses_the_given_rng():
         def choice(self, seq):
             return seq[0]
     assert va.new_tag(_R()) == "a" * 8
+
+
+def test_untagged_alert_env_default_off_and_truthy_set():
+    assert va.untagged_alerts_enabled({}) is False
+    for v in ("1", "true", "YES", " On ", "TRUE"):
+        assert va.untagged_alerts_enabled({"VISIT_ALERTS_UNTAGGED": v}) is True
+    for v in ("", "0", "false", "off", "garbage", "2"):
+        assert va.untagged_alerts_enabled({"VISIT_ALERTS_UNTAGGED": v}) is False
