@@ -40,6 +40,7 @@ import resolve_plan
 import build_info
 import run_report
 import site_traffic
+import eyes_report
 import subprocess
 import inbound_hold
 import warm_screen_plan
@@ -17838,6 +17839,23 @@ def process_webhook_payload_async(data):
             for piece in site_traffic.render_report(report):
                 send_telegram_message(chat_id, piece)
             return
+        # /eyes: the short "who just looked" view of the stored site visits (read-only, no argument).
+        if text == "/eyes" or text.startswith("/eyes "):
+            if text != "/eyes":
+                send_telegram_message(chat_id, "Usage: /eyes (takes no argument)")
+                return
+            if not analytics_enabled():
+                send_telegram_message(chat_id, "Site analytics is switched off (ANALYTICS_ENABLED).")
+                return
+            try:
+                eyes_rows = get_site_visit_rows_tagged(7)
+            except Exception as e:
+                logging.error(f"/eyes visit read failed: {type(e).__name__}")
+                send_telegram_message(chat_id, "Could not read the site visit log.")
+                return
+            for piece in eyes_report.render_eyes(eyes_report.build_eyes(eyes_rows, datetime.now(timezone.utc)), _visit_when_text):
+                send_telegram_message(chat_id, piece)
+            return
         # /vlink [name]: a per-contact site link (creates the tag the first time), or the list of links made.
         if text == "/vlink" or text.startswith("/vlink "):
             name = " ".join(text[len("/vlink"):].split())
@@ -19980,6 +19998,7 @@ def process_webhook_payload_async(data):
                 "/refer - Pending referral asks from /w, 5 per page (/refer 2, /refer sent &lt;id&gt;)\n"
                 "/wstages - Last /w run: sample titles at each stage (/wstages 2 = the run before)\n"
                 "/monte - Where site visits came from and what each group viewed (/monte 30 = last 30 days)\n"
+                "/eyes - Who just looked at the site: 24h and 7d visitors, pages, sources, tagged-link visits, recent visits\n"
                 "/wrun - Last /w run, per company: which source answered and what names came back (/wrun Haworth, /wrun full)\n"
                 "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
@@ -21326,6 +21345,16 @@ def get_site_visit_rows_dated(days):
         return conn.execute(
             "SELECT visited_at, visitor_id, path, referrer, bot FROM site_visits WHERE visited_at >= datetime('now', ?) "
             "ORDER BY visited_at, id", (f"-{int(days) + 1} days",)).fetchall()
+
+
+def get_site_visit_rows_tagged(days):
+    """READ-ONLY. (visited_at, visitor_id, path, referrer, bot, label) for the trailing `days` days plus one; label is
+    the tagged-link contact label (the raw tag is never returned). Raises on a read error."""
+    with get_db_conn() as conn:
+        return conn.execute(
+            "SELECT v.visited_at, v.visitor_id, v.path, v.referrer, v.bot, t.label FROM site_visits v "
+            "LEFT JOIN visit_tags t ON t.tag = v.tag WHERE v.visited_at >= datetime('now', ?) "
+            "ORDER BY v.visited_at, v.id", (f"-{int(days) + 1} days",)).fetchall()
 
 
 def get_lead_times(days):
