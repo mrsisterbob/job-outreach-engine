@@ -842,19 +842,23 @@ grep -i "contact" FUNCTION_INDEX.md
 | 26 | `_norm_email` | _(no docstring)_ |
 | 30 | `collect_open_followups` | snapshots: {run_date "YYYY-MM-DD": result dict as saved by save_followup_queue_snapshot} |
 
-## `personal_snapshots.py` — 9 defs, 135 lines
+## `personal_snapshots.py` — 13 defs, 198 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 19 | `SnapshotRejected` | Snapshot carries a forbidden key or is not storable. |
-| 23 | `snapshot_dir` | _(no docstring)_ |
-| 30 | `snapshot_keep` | _(no docstring)_ |
-| 41 | `_normalize_key` | _(no docstring)_ |
-| 47 | `_walk` | _(no docstring)_ |
-| 61 | `validate_snapshot` | _(no docstring)_ |
-| 76 | `list_snapshots` | _(no docstring)_ |
-| 86 | `save_snapshot` | _(no docstring)_ |
-| 126 | `load_latest` | _(no docstring)_ |
+| 23 | `SnapshotRejected` | Snapshot carries a forbidden key or is not storable. |
+| 27 | `snapshot_dir` | _(no docstring)_ |
+| 34 | `snapshot_keep` | _(no docstring)_ |
+| 45 | `section_keep` | _(no docstring)_ |
+| 56 | `_normalize_key` | _(no docstring)_ |
+| 62 | `_walk` | _(no docstring)_ |
+| 76 | `validate_snapshot` | _(no docstring)_ |
+| 91 | `list_snapshots` | _(no docstring)_ |
+| 101 | `save_snapshot` | _(no docstring)_ |
+| 152 | `_carries` | True when the snapshot has `sec` as a non-empty dict. |
+| 158 | `_read_snapshot` | _(no docstring)_ |
+| 167 | `load_latest` | _(no docstring)_ |
+| 175 | `load_recent` | Newest `limit` readable snapshots, newest first, plus the newest money and time |
 
 ## `pipeline_utils.py` — 121 defs, 3,270 lines
 
@@ -1607,4 +1611,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1208 definitions across 76 files + Code.gs.**
+**1212 definitions across 76 files + Code.gs.**
