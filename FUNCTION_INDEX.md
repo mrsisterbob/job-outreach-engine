@@ -327,6 +327,25 @@ grep -i "contact" FUNCTION_INDEX.md
 | 190 | `promotion_note` | One dated notes line; carmen_reply_anchor reads the marker back as the reply date. |
 | 199 | `promotion_alert_html` | Telegram HTML naming who was promoted to Carmen Hot and why. |
 
+## `hours_plan.py` — 14 defs, 216 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 31 | `PlanInvalid` | The plan cannot be saved; the message is user-showable. |
+| 35 | `PlanConflict` | The plan was saved elsewhere since the editor loaded it. |
+| 38 | `PlanConflict.__init__` | _(no docstring)_ |
+| 43 | `PlanStorageError` | The plan file could not be written (disk full, permissions, missing mount...). |
+| 47 | `_plan_dir` | _(no docstring)_ |
+| 55 | `_fmt` | _(no docstring)_ |
+| 60 | `_clean_allowed` | _(no docstring)_ |
+| 73 | `validate_plan` | Return normalized [{"category","hours"}] in allowed_categories order, or raise PlanInvalid. |
+| 111 | `_stored_ok` | A stored plan is only trusted if it still passes the same rules as a save. |
+| 130 | `_read` | _(no docstring)_ |
+| 145 | `load_plan` | Saved plan dict, or None. Falls back to the previous file when the main one is bad. |
+| 155 | `_write_tmp` | Unique tmp in the same dir, flushed and fsynced. Removed again if the write fails. |
+| 169 | `_unlink` | _(no docstring)_ |
+| 176 | `save_plan` | Validate, check base_version against the stored version, then write atomically. |
+
 ## `inbound_hold.py` — 6 defs, 79 lines
 
 | Line | Name | Summary |
@@ -1663,4 +1682,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1249 definitions across 79 files + Code.gs.**
+**1263 definitions across 80 files + Code.gs.**
