@@ -197,6 +197,11 @@ HELP = {
         "number can be 1-5. Read-only.",
         "/wstages 2",
     ),
+    "/moneylink": (
+        "Makes a signed link to your money page that expires in 15 minutes. Takes no argument. "
+        "Needs PAGE_LINK_SECRET set in the Render dashboard.",
+        "/moneylink",
+    ),
     "/vlink": (
         "Makes a personal link to montelattice.com for one contact (https://montelattice.com/?r=...). "
         "When they open it you get an alert that says who opened it. Asking again for the same name gives "

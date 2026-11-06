@@ -24794,3 +24794,143 @@ def test_eyes_cmd_help_entry_is_real():
     import command_help as ch
     reply = ch.lookup_command_help("/eyes/")
     assert "No per-command help" not in reply
+
+
+# ---- /money page + /moneylink ----
+
+_MP_SECRET = "money-page-test-secret"
+_MP_HEADERS = ("Cache-Control", "Referrer-Policy", "X-Robots-Tag")
+
+
+@pytest.fixture
+def money_env(monkeypatch, tmp_path):
+    import personal_snapshots as ps  # noqa: F401
+    monkeypatch.setenv("PERSONAL_SNAPSHOT_DIR", str(tmp_path))
+    monkeypatch.setenv("PAGE_LINK_SECRET", _MP_SECRET)
+    monkeypatch.setenv("SNAPSHOT_INGEST_TOKEN", _SNAP_TOKEN)
+    yield tmp_path
+
+
+def _mp_link(monkeypatch, text="/moneylink"):
+    sent = []
+    monkeypatch.setattr(m, "send_telegram_message", lambda cid, txt, **k: sent.append(txt))
+    _dispatch(text)
+    return sent
+
+
+def _mp_path(sent):
+    mt = re.search(r"https?://[^/\s]+(/money\?\S+)", html.unescape("\n".join(sent)))
+    return mt.group(1) if mt else None
+
+
+def _mp_get(path):
+    with m.app.test_client() as client:
+        return client.get(path)
+
+
+def _mp_store(payload=None):
+    r = _post_snap(payload or {"kind": "money", "money": {"total_spend": 1234, "note": "hello-marker"}})
+    assert r.status_code == 200
+
+
+def test_money_page_link_from_command_shows_ingested_snapshot(money_env, monkeypatch):
+    _mp_store()
+    path = _mp_path(_mp_link(monkeypatch))
+    assert path
+    r = _mp_get(path)
+    body = r.get_data(as_text=True)
+    assert r.status_code == 200 and "1234" in body and "hello-marker" in body and "received_at" in body
+
+
+def test_money_page_no_query_is_empty_404(money_env):
+    _mp_store()
+    r = _mp_get("/money")
+    assert r.status_code == 404 and r.get_data() == b"" 
+
+
+def test_money_page_bad_links_are_identical_404s(money_env, monkeypatch):
+    import signed_links as sl
+    _mp_store()
+    base = _mp_get("/money")
+    good = _mp_path(_mp_link(monkeypatch))
+    exp, sig = re.search(r"exp=(\d+)&sig=(\w+)", good).groups()
+    now = int(time.time())
+    bads = [
+        f"/money?exp={exp}&sig={sig[:-1]}{'0' if sig[-1] != '0' else '1'}",
+        f"/money?exp={int(exp) + 60}&sig={sig}",
+        "/money?" + sl.sign_path(_MP_SECRET, "/followups", now),
+        "/money?" + sl.sign_path("other-secret", "/money", now),
+    ]
+    for p in bads:
+        r = _mp_get(p)
+        assert r.status_code == base.status_code == 404
+        assert r.get_data() == b""
+        assert sorted(r.headers.items()) == sorted(base.headers.items())
+
+
+def test_money_page_expiry_window(money_env, monkeypatch):
+    _mp_store()
+    path = _mp_path(_mp_link(monkeypatch))
+    real = time.time
+    monkeypatch.setattr(m.time, "time", lambda: real() + 14 * 60)
+    assert _mp_get(path).status_code == 200
+    monkeypatch.setattr(m.time, "time", lambda: real() + 16 * 60)
+    assert _mp_get(path).status_code == 404
+
+
+def test_money_page_unset_secret_fails_closed(money_env, monkeypatch):
+    _mp_store()
+    path = _mp_path(_mp_link(monkeypatch))
+    monkeypatch.delenv("PAGE_LINK_SECRET")
+    assert _mp_get(path).status_code == 404
+    sent = _mp_link(monkeypatch)
+    text = "\n".join(sent)
+    assert "not configured" in text and "/money?" not in text
+
+
+def test_money_page_valid_link_empty_store(money_env, monkeypatch):
+    path = _mp_path(_mp_link(monkeypatch))
+    r = _mp_get(path)
+    assert r.status_code == 200 and "No snapshot received yet." in r.get_data(as_text=True)
+
+
+def test_money_page_escapes_and_has_security_headers(money_env, monkeypatch):
+    _mp_store({"kind": "money", "money": {"<script>k</script>": "<script>v</script>"}})
+    path = _mp_path(_mp_link(monkeypatch))
+    r = _mp_get(path)
+    body = r.get_data(as_text=True)
+    assert "<script>k" not in body and "<script>v" not in body and "&lt;script&gt;v" in body and "&lt;script&gt;k" in body
+    assert "exp=" not in body and "sig=" not in body
+    for r2 in (r, _mp_get("/money")):
+        assert r2.headers["Cache-Control"] == "no-store"
+        assert r2.headers["Referrer-Policy"] == "no-referrer"
+        assert r2.headers["X-Robots-Tag"] == "noindex, nofollow"
+
+
+def test_money_page_moneylink_extra_words_is_usage(money_env, monkeypatch):
+    sent = _mp_link(monkeypatch, "/moneylink extra words")
+    assert sent and "/money?" not in "\n".join(sent)
+
+
+def test_money_page_leaves_followups_and_brief_ungated(money_env):
+    assert _mp_get("/followups").status_code == 200
+    assert _mp_get("/brief").status_code == 200
+
+
+def test_money_page_newer_time_snapshot_does_not_hide_money(money_env, monkeypatch):
+    _mp_store({"kind": "money", "money": {"total_spend": 4321}})
+    assert _post_snap({"kind": "time", "time": {"hours": 7}}).status_code == 200
+    r = _mp_get(_mp_path(_mp_link(monkeypatch)))
+    body = r.get_data(as_text=True)
+    assert r.status_code == 200 and "4321" in body
+
+
+def test_money_page_time_only_store_is_no_snapshot(money_env, monkeypatch):
+    assert _post_snap({"kind": "time", "time": {"hours": 7}}).status_code == 200
+    body = _mp_get(_mp_path(_mp_link(monkeypatch))).get_data(as_text=True)
+    assert "No snapshot received yet." in body
+
+
+def test_money_page_moneylink_reply_escapes_ampersand(money_env, monkeypatch):
+    sent = _mp_link(monkeypatch)
+    assert "&amp;sig=" in "".join(sent)

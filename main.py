@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 import concurrent.futures as _cf
 import hmac
 import personal_snapshots
+import signed_links
+import money_page
 import html
 import io
 import json
@@ -131,6 +133,12 @@ if not os.environ.get("SNAPSHOT_INGEST_TOKEN"):
     logging.warning(
         "[CONFIG WARNING] SNAPSHOT_INGEST_TOKEN is unset - /snapshots/ingest will refuse every snapshot with 503, "
         "so personal snapshots pushed from the PC cannot be stored."
+    )
+# Read per request by /money and /moneylink; this check only warns at boot.
+if not os.environ.get("PAGE_LINK_SECRET"):
+    logging.warning(
+        "[CONFIG WARNING] PAGE_LINK_SECRET is unset - /money will answer 404 to every request "
+        "and /moneylink cannot make a link."
     )
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
@@ -17856,6 +17864,17 @@ def process_webhook_payload_async(data):
             for piece in eyes_report.render_eyes(eyes_report.build_eyes(eyes_rows, datetime.now(timezone.utc)), _visit_when_text):
                 send_telegram_message(chat_id, piece)
             return
+        # /moneylink: a fresh signed 15-minute link to /money. Never logs the link.
+        if text == "/moneylink" or text.startswith("/moneylink "):
+            if text != "/moneylink":
+                send_telegram_message(chat_id, "<code>/moneylink</code> takes no argument. It replies with a 15-minute link to the money page.")
+                return
+            link_secret = os.environ.get("PAGE_LINK_SECRET", "")
+            if not link_secret:
+                send_telegram_message(chat_id, "PAGE_LINK_SECRET is not configured, so no link can be made. Set it in the Render dashboard environment.")
+                return
+            send_telegram_message(chat_id, html.escape(f"{BASE_URL}/money?{signed_links.sign_path(link_secret, '/money', int(time.time()))}") + "\nExpires in 15 minutes.")
+            return
         # /vlink [name]: a per-contact site link (creates the tag the first time), or the list of links made.
         if text == "/vlink" or text.startswith("/vlink "):
             name = " ".join(text[len("/vlink"):].split())
@@ -20000,6 +20019,7 @@ def process_webhook_payload_async(data):
                 "/monte - Where site visits came from and what each group viewed (/monte 30 = last 30 days)\n"
                 "/eyes - Who just looked at the site: 24h and 7d visitors, pages, sources, tagged-link visits, recent visits\n"
                 "/wrun - Last /w run, per company: which source answered and what names came back (/wrun Haworth, /wrun full)\n"
+                "/moneylink - A 15-minute signed link to the money page\n"
                 "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
@@ -21552,6 +21572,38 @@ def leads_ingest():
 
 
 _SNAPSHOT_MAX_BYTES = 64 * 1024
+
+
+_MONEY_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                  "X-Robots-Tag": "noindex, nofollow"}
+
+
+def _money_response(body, status):
+    resp = Response(body, status, mimetype="text/html")
+    for k, v in _MONEY_HEADERS.items():
+        resp.headers[k] = v
+    return resp
+
+
+@app.route("/money", methods=["GET"])
+def money_page_view():
+    """Latest personal snapshot, behind a signed expiring link. Read-only. Every failure is the
+    same empty 404 so the response never confirms the page exists or why a link failed."""
+    secret = os.environ.get("PAGE_LINK_SECRET", "")
+    if not secret:
+        logging.warning("[MONEY] PAGE_LINK_SECRET is unset - refusing /money.")
+        return _money_response("", 404)
+    if not signed_links.verify_link(secret, request.path, request.args.get("exp"),
+                                    request.args.get("sig"), int(time.time())):
+        logging.info("[MONEY] link refused (missing, bad, wrong-path or expired)")
+        return _money_response("", 404)
+    # Newest snapshot that carries a money section: a newer time-only snapshot must not hide it.
+    snap = next((s for s in personal_snapshots.load_recent(100)
+                 if personal_snapshots._carries(s, "money")), None)
+    if not snap:
+        return _money_response(_followups_page("Money", "<h2>Money</h2><p>No snapshot received yet.</p>"), 200)
+    body = money_page.render_money_page(snap, datetime.now(timezone.utc))
+    return _money_response(_followups_page("Money", body), 200)
 
 
 @app.route("/snapshots/ingest", methods=["POST"])
