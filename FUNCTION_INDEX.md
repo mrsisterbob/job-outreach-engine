@@ -1434,6 +1434,18 @@ grep -i "contact" FUNCTION_INDEX.md
 | 183 | `format_tenant` | _(no docstring)_ |
 | 209 | `main` | _(no docstring)_ |
 
+## `scripts/push_actual_snapshot.py` — 7 defs, 190 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 35 | `_default_post` | _(no docstring)_ |
+| 40 | `find_budget_folders` | _(no docstring)_ |
+| 49 | `url_ok` | https://host[:port] (or http://localhost / 127.0.0.1); no userinfo, path, query or fragment. |
+| 65 | `_clean` | _(no docstring)_ |
+| 69 | `summary_lines` | _(no docstring)_ |
+| 109 | `push` | _(no docstring)_ |
+| 114 | `main` | _(no docstring)_ |
+
 ## `scripts/queue_from_cloud.py` — 8 defs, 169 lines
 
 | Line | Name | Summary |
@@ -1741,4 +1753,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1307 definitions across 83 files + Code.gs.**
+**1314 definitions across 84 files + Code.gs.**
