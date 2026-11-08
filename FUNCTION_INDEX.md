@@ -288,31 +288,37 @@ grep -i "contact" FUNCTION_INDEX.md
 | 276 | `_time` | `section` may be None (plan-only). `plan` is a dict with a list `hours`, or None. |
 | 371 | `build_finance_view` | Snapshots (newest first) + aware UTC `now` (+ saved plan dict or None) -> the view model. |
 
-## `finance_page.py` — 21 defs, 472 lines
+## `finance_page.py` — 27 defs, 611 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 203 | `_e` | _(no docstring)_ |
-| 207 | `_fmt` | One number formatter: thousands separators, minus for negatives, '-' for None. |
-| 218 | `_dicts` | _(no docstring)_ |
-| 222 | `_sec` | _(no docstring)_ |
-| 226 | `_short` | Hours without a forced decimal: 164 not 164.0, 1.5 stays 1.5. |
-| 232 | `_money` | _(no docstring)_ |
-| 236 | `_hrs` | _(no docstring)_ |
-| 240 | `_parse_dt` | _(no docstring)_ |
-| 250 | `_ago_hours` | _(no docstring)_ |
-| 260 | `_received_ago` | _(no docstring)_ |
-| 275 | `_stamp` | _(no docstring)_ |
-| 286 | `_cell` | _(no docstring)_ |
-| 291 | `_table` | head: list of (label, css); rows: list of lists of (text, css). |
-| 298 | `_money_section` | _(no docstring)_ |
-| 347 | `_gap_line` | _(no docstring)_ |
-| 359 | `_time_section` | _(no docstring)_ |
-| 387 | `_valid_edit` | (edit_fields, time_section_copy) when an editor may render, else (None, None). |
-| 404 | `_plan_source_line` | _(no docstring)_ |
-| 423 | `_editor_html` | _(no docstring)_ |
-| 439 | `_json_for_script` | _(no docstring)_ |
-| 446 | `render_finance_page` | _(no docstring)_ |
+| 257 | `_e` | _(no docstring)_ |
+| 261 | `_fmt` | One number formatter: thousands separators, minus for negatives, '-' for None. |
+| 272 | `_dicts` | _(no docstring)_ |
+| 276 | `_sec` | _(no docstring)_ |
+| 280 | `_short` | Hours without a forced decimal: 164 not 164.0, 1.5 stays 1.5. |
+| 286 | `_money` | _(no docstring)_ |
+| 290 | `_hrs` | _(no docstring)_ |
+| 294 | `_parse_dt` | _(no docstring)_ |
+| 304 | `_ago_hours` | _(no docstring)_ |
+| 314 | `_received_ago` | _(no docstring)_ |
+| 329 | `_stamp` | _(no docstring)_ |
+| 340 | `_cell` | _(no docstring)_ |
+| 345 | `_table` | head: list of (label, css); rows: list of lists of (text, css). |
+| 352 | `_money_section` | _(no docstring)_ |
+| 401 | `_gap_line` | _(no docstring)_ |
+| 417 | `_num` | _(no docstring)_ |
+| 421 | `_has_manual` | Real hand-logged data only: a zero-hour total with no entries keeps the page as it was. |
+| 429 | `_row_text` | _(no docstring)_ |
+| 437 | `_legend` | _(no docstring)_ |
+| 445 | `_totals_line` | _(no docstring)_ |
+| 462 | `_delta_cell` | _(no docstring)_ |
+| 468 | `_time_section` | _(no docstring)_ |
+| 518 | `_valid_edit` | (edit_fields, time_section_copy) when an editor may render, else (None, None). |
+| 535 | `_plan_source_line` | _(no docstring)_ |
+| 554 | `_editor_html` | _(no docstring)_ |
+| 570 | `_json_for_script` | _(no docstring)_ |
+| 577 | `render_finance_page` | _(no docstring)_ |
 
 ## `hirebase_feed.py` — 25 defs, 606 lines
 
@@ -1793,4 +1799,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1344 definitions across 86 files + Code.gs.**
+**1350 definitions across 86 files + Code.gs.**
