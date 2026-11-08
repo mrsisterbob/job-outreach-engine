@@ -1452,17 +1452,35 @@ grep -i "contact" FUNCTION_INDEX.md
 | 183 | `format_tenant` | _(no docstring)_ |
 | 209 | `main` | _(no docstring)_ |
 
-## `scripts/push_actual_snapshot.py` — 7 defs, 190 lines
+## `scripts/push_actual_snapshot.py` — 8 defs, 206 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 35 | `_default_post` | _(no docstring)_ |
-| 40 | `find_budget_folders` | _(no docstring)_ |
-| 49 | `url_ok` | https://host[:port] (or http://localhost / 127.0.0.1); no userinfo, path, query or fragment. |
-| 65 | `_clean` | _(no docstring)_ |
-| 69 | `summary_lines` | _(no docstring)_ |
-| 109 | `push` | _(no docstring)_ |
-| 114 | `main` | _(no docstring)_ |
+| 35 | `default_post` | _(no docstring)_ |
+| 43 | `find_budget_folders` | _(no docstring)_ |
+| 55 | `url_ok` | https://host[:port] (or http:// for http_hosts); no userinfo, path, query or fragment. |
+| 72 | `clean_text` | Strip control characters and cap the length of any text that came from outside. |
+| 80 | `summary_lines` | _(no docstring)_ |
+| 120 | `push` | _(no docstring)_ |
+| 125 | `report_reply` | Print the status line and the sentence for the engine's reply; return the exit code. |
+| 147 | `main` | _(no docstring)_ |
+
+## `scripts/push_time_snapshot.py` — 12 defs, 278 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 32 | `_aw_post_default` | _(no docstring)_ |
+| 37 | `_aw_get_default` | _(no docstring)_ |
+| 42 | `aw_url_ok` | Same-machine http only: reuses the engine URL check with a loopback-only host list. |
+| 47 | `_parse_z` | _(no docstring)_ |
+| 51 | `_is_timeout` | _(no docstring)_ |
+| 61 | `_is_conn_error` | _(no docstring)_ |
+| 74 | `_parse_created` | ISO timestamp -> aware datetime on any Python 3.x (fractions normalised to 6 digits, |
+| 85 | `_earliest_created` | (earliest `created` among afk/window buckets or None, number of unreadable dates). |
+| 105 | `_local_date` | _(no docstring)_ |
+| 113 | `_tz_available` | _(no docstring)_ |
+| 122 | `_load_config` | Return (buckets, app_buckets, source label) or None after printing problems. |
+| 145 | `main` | _(no docstring)_ |
 
 ## `scripts/queue_from_cloud.py` — 8 defs, 169 lines
 
@@ -1771,4 +1789,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1327 definitions across 85 files + Code.gs.**
+**1340 definitions across 86 files + Code.gs.**
