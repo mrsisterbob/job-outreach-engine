@@ -155,6 +155,19 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL") or "http://localhost:5000").rstrip("/")
 
 
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+
+def _build_finance_view_now(now=None):
+    """The one finance view builder: newest snapshots + saved plan + hand-logged hours.
+    Used by /finance, /finance/plan and /life so they can never disagree."""
+    import manual_hours
+    now = now or _now_utc()
+    return finance_model.build_finance_view(personal_snapshots.load_recent(30), now,
+                                            plan=hours_plan.load_plan(), manual=manual_hours.list_all())
+
+
 def _finance_link_url():
     """A freshly signed 15-minute /finance URL, or None when PAGE_LINK_SECRET is blank. Never logged."""
     link_secret = os.environ.get("PAGE_LINK_SECRET", "")
@@ -17898,16 +17911,64 @@ def process_webhook_payload_async(data):
                 return
             send_telegram_message(chat_id, html.escape(fin_link) + "\nExpires in 15 minutes.")
             return
-        # /life: money-and-time summary of the newest snapshots plus a fresh finance link. Read-only, local.
+        # /life: money-and-time summary of the newest snapshots plus a fresh finance link. Read-only, local,
+        # except `/life log <what> <how long>` and `/life undo`, which write only the local hand-logged file.
         if text == "/life" or text.startswith("/life "):
-            if text != "/life":
-                send_telegram_message(chat_id, "Usage: /life (no arguments).")
+            arg = " ".join(text[len("/life"):].split())
+            sub, _, rest = arg.partition(" ")
+            sub = sub.lower()
+            life_usage = ("Usage: /life (no arguments), /life log side work 2h, or /life undo. "
+                          "Hours typed with /life log are added on top of the PC's hours.")
+            if arg and sub not in ("log", "undo"):
+                send_telegram_message(chat_id, life_usage)
+                return
+            if sub == "undo":
+                if rest.strip():
+                    send_telegram_message(chat_id, life_usage)
+                    return
+                try:
+                    import manual_hours
+                    gone = manual_hours.remove_last()
+                except Exception as e:
+                    logging.error(f"/life undo failed: {type(e).__name__}")
+                    send_telegram_message(chat_id, "Could not undo that entry.")
+                    return
+                if not gone:
+                    send_telegram_message(chat_id, "Nothing logged to undo.")
+                else:
+                    send_telegram_message(chat_id, "Removed: " + html.escape(f"{gone['category']} {gone['hours']:g}h") + ".")
+                return
+            if sub == "log":
+                import manual_hours
+                if not rest.strip():
+                    send_telegram_message(chat_id, "Usage: /life log side work 2h\nAlso: /life log 30m reading")
+                    return
+                try:
+                    now_utc = _now_utc()
+                    view = _build_finance_view_now(now_utc)
+                    known = (view.get("time") or {}).get("editable_categories") or []
+                    _cat, _hrs, rounded = manual_hours.parse_log_text(rest)
+                    entry = manual_hours.log_entry(rest, known, now_utc)
+                    week_total = sum(e["hours"] for e in manual_hours.list_week(entry["week_start"]))
+                    wk = datetime.strptime(entry["week_start"], "%Y-%m-%d")
+                    reply = (f"Logged: {html.escape(entry['category'])} {entry['hours']:g}h "
+                             f"(week of {wk.strftime('%b')} {wk.day}). "
+                             f"By hand this week: {week_total:g} h. Undo with /life undo.")
+                    if rounded:
+                        reply += " Rounded to the nearest quarter hour."
+                except manual_hours.LogInvalid as e:
+                    send_telegram_message(chat_id, html.escape(str(e)) + "\nUsage: /life log side work 2h")
+                    return
+                except Exception as e:
+                    logging.error(f"/life log failed: {type(e).__name__}")
+                    send_telegram_message(chat_id, "Could not save that entry.")
+                    return
+                send_telegram_message(chat_id, reply)
                 return
             try:
-                import life_summary, finance_model, personal_snapshots
-                now_utc = datetime.now(timezone.utc)
-                view = finance_model.build_finance_view(personal_snapshots.load_recent(30), now_utc,
-                                                        plan=hours_plan.load_plan())
+                import life_summary
+                now_utc = _now_utc()
+                view = _build_finance_view_now(now_utc)
                 reply = life_summary.render_life_reply(view, now_utc, _finance_link_url())
             except Exception as e:
                 logging.error(f"/life failed: {type(e).__name__}")
@@ -20061,7 +20122,7 @@ def process_webhook_payload_async(data):
                 "/wrun - Last /w run, per company: which source answered and what names came back (/wrun Haworth, /wrun full)\n"
                 "/moneylink - A 15-minute signed link to the money page\n"
                 "/financelink - A 15-minute signed link to the finance page\n"
-                "/life - Money and time summary with each section's data age, plus a fresh 15-minute link to the finance page\n"
+                "/life - Money and time summary plus a fresh 15-minute finance link (/life log side work 2h adds hours by hand, /life undo removes the last)\n"
                 "/vlink - Per-contact site link (/vlink Jane Doe), or the links made and how often each was opened\n\n"
                 "<b>TELEMETRY:</b>\n"
                 "/health - View system telemetry and status\n"
@@ -21668,9 +21729,8 @@ def finance_page_view():
     if denied is not None:
         return denied
     try:
-        now_utc = datetime.now(timezone.utc)
-        view = finance_model.build_finance_view(personal_snapshots.load_recent(30), now_utc,
-                                                plan=hours_plan.load_plan())
+        now_utc = _now_utc()
+        view = _build_finance_view_now(now_utc)
         nonce = secrets.token_urlsafe(16)
         # Same exp as the link that opened the page: editing never extends the window.
         secret = os.environ.get("PAGE_LINK_SECRET", "")
@@ -21724,9 +21784,8 @@ def finance_plan_save():
     if denied is not None:
         return denied
     try:
-        now_utc = datetime.now(timezone.utc)
-        view = finance_model.build_finance_view(personal_snapshots.load_recent(30), now_utc,
-                                                plan=hours_plan.load_plan())
+        now_utc = _now_utc()
+        view = _build_finance_view_now(now_utc)
         allowed = (view.get("time") or {}).get("editable_categories") or []
         if not allowed:
             return _plan_json({"status": "invalid", "error": "Nothing to edit yet."}, 400)
