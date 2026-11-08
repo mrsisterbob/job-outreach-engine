@@ -25430,7 +25430,7 @@ def test_life_cmd_blank_secret_still_summarises_without_url(life_env, monkeypatc
 def test_life_cmd_extra_text_gets_usage_and_other_commands_unswallowed(life_env, monkeypatch):
     _fr_ingest({"money": _fr_money(), "time": _fr_time()})
     sent = _life(monkeypatch, "/life extra")
-    assert sent == ["Usage: /life (no arguments)."]
+    assert len(sent) == 1 and sent[0].startswith("Usage: /life (no arguments)")
     for cmd in ("/links", "/linksx"):
         out = "\n".join(_life(monkeypatch, cmd))
         assert "Money and time" not in out and "412" not in out and "Usage: /life" not in out
@@ -25481,3 +25481,164 @@ def test_life_cmd_financelink_still_works_after_helper_refactor(life_env, monkey
     assert _fr_path(sent) and "Expires in 15 minutes." in sent[0]
     monkeypatch.setenv("PAGE_LINK_SECRET", "")
     assert "not configured" in "\n".join(_mp_link(monkeypatch, "/financelink"))
+
+
+# ---- /life log and /life undo (TASK-288) ----
+
+@pytest.fixture
+def ll_env(plan_env, monkeypatch, tmp_path):
+    monkeypatch.setenv("PERSONAL_LOG_DIR", str(tmp_path / "handlog"))
+    yield tmp_path
+
+
+def _ll_week():
+    import manual_hours
+    return manual_hours.current_week_start(datetime.now(timezone.utc))
+
+
+def _ll_time():
+    d = _pr_time()
+    d["week_of"] = _ll_week()
+    return d
+
+
+def _ll_entries():
+    import manual_hours
+    return manual_hours.list_all()
+
+
+def test_life_cmd_log_stores_entry_and_replies(ll_env, monkeypatch):
+    _fr_ingest({"time": _ll_time()})
+    sent = _mp_link(monkeypatch, "/life log side work 2h")
+    assert len(sent) == 1 and "side work" in sent[0] and "2h" in sent[0] and "By hand this week: 2 h" in sent[0]
+    import manual_hours
+    ents = manual_hours.list_week(_ll_week())
+    assert len(ents) == 1 and ents[0]["category"] == "side work" and ents[0]["hours"] == 2
+
+
+def test_life_log_cmd_end_to_end_life_and_finance_page(ll_env, monkeypatch):
+    _fr_ingest({"time": _ll_time()})
+    _mp_link(monkeypatch, "/life log side work 2h")
+    sent = _mp_link(monkeypatch, "/life")
+    assert "2" in html.unescape(sent[0]) and "by hand" in sent[0]
+    page = _mp_get(_fr_path(sent)).get_data(as_text=True)
+    assert "side work" in page and "54.5" in page
+
+
+def test_life_log_cmd_matching_pc_category_files_under_it(ll_env, monkeypatch):
+    _fr_ingest({"time": _ll_time()})
+    sent = _mp_link(monkeypatch, "/life log sleep 1h")
+    assert "Sleep 1h" in sent[0]
+    assert _ll_entries()[0]["category"] == "Sleep"
+    page = _mp_get(_fr_path(_mp_link(monkeypatch, "/life"))).get_data(as_text=True)
+    assert "side work" not in page and "sleep 1h" not in page
+
+
+def test_life_log_cmd_plan_stays_valid(ll_env, monkeypatch):
+    import hours_plan
+    _fr_ingest({"time": _ll_time()})
+    page0 = _mp_get(_fr_path(_mp_link(monkeypatch, "/financelink")))
+    ok = _pr_save(_pr_cred(page0), _pr_hours())
+    assert ok.status_code == 200
+    before = hours_plan.load_plan()
+    assert before is not None and sum(before["hours"].values() if isinstance(before["hours"], dict)
+                                      else [r["hours"] for r in before["hours"]]) == 168
+    _mp_link(monkeypatch, "/life log side work 2h")
+    assert hours_plan.load_plan() == before
+    cred = _pr_cred(_mp_get(_fr_path(_mp_link(monkeypatch, "/financelink"))))
+    bad = _pr_save(cred, _pr_hours(gym=70) + [{"category": "side work", "hours": 2}], base=ok.get_json()["version"])
+    assert bad.status_code == 400
+    assert hours_plan.load_plan() == before
+    again = _pr_save(cred, _pr_hours(gym=72), base=ok.get_json()["version"])
+    assert again.status_code == 200
+
+
+def test_life_log_cmd_undo_removes_newest(ll_env, monkeypatch):
+    _fr_ingest({"time": _ll_time()})
+    _mp_link(monkeypatch, "/life log side work 2h")
+    _mp_link(monkeypatch, "/life log reading 1h")
+    assert _mp_link(monkeypatch, "/life undo") == ["Removed: reading 1h."]
+    assert [e["category"] for e in _ll_entries()] == ["side work"]
+    assert _mp_link(monkeypatch, "/life undo") == ["Removed: side work 2h."]
+    assert _mp_link(monkeypatch, "/life undo") == ["Nothing logged to undo."]
+    assert "by hand" not in _mp_link(monkeypatch, "/life")[0]
+
+
+@pytest.mark.parametrize("cmd", ["/life log side work", "/life log 2h", "/life log side work 2",
+                                 "/life log gym -1h", "/life log <b>x</b> 1h"])
+def test_life_log_cmd_bad_input_stores_nothing(ll_env, monkeypatch, cmd):
+    sent = _mp_link(monkeypatch, cmd)
+    assert len(sent) == 1 and "Usage: /life log side work 2h" in sent[0] and "<b>x" not in sent[0]
+    assert _ll_entries() == []
+
+
+def test_life_log_cmd_rounding(ll_env, monkeypatch):
+    sent = _mp_link(monkeypatch, "/life log reading 20m")
+    assert "Rounded to the nearest quarter hour." in sent[0]
+    assert _ll_entries()[0]["hours"] == 0.25
+
+
+def test_life_log_cmd_empty_and_unknown_subcommand(ll_env, monkeypatch):
+    for cmd in ("/life log", "/life foo", "/life   LOG  "):
+        sent = _mp_link(monkeypatch, cmd)
+        assert len(sent) == 1 and "/life log" in sent[0]
+    assert _ll_entries() == []
+    for cmd in ("/links", "/linksx"):
+        assert "Usage: /life" not in " ".join(_mp_link(monkeypatch, cmd))
+
+
+def test_life_log_cmd_case_and_spaces_tolerated(ll_env, monkeypatch):
+    sent = _mp_link(monkeypatch, "/life   LOG   side   work   2h")
+    assert "Logged: side work 2h" in sent[0]
+
+
+def test_life_log_cmd_persists_after_reload(ll_env, monkeypatch):
+    import importlib, manual_hours
+    _fr_ingest({"time": _ll_time()})
+    _mp_link(monkeypatch, "/life log side work 2h")
+    importlib.reload(manual_hours)
+    page = _mp_get(_fr_path(_mp_link(monkeypatch, "/financelink"))).get_data(as_text=True)
+    assert "side work" in page
+
+
+def test_life_log_cmd_storage_failure_is_plain(ll_env, monkeypatch, caplog):
+    import manual_hours
+    _fr_ingest({"time": _ll_time()})
+
+    def boom(*a, **k):
+        raise RuntimeError("/secret/path")
+    with monkeypatch.context() as mc:
+        mc.setattr(manual_hours, "log_entry", boom)
+        assert _mp_link(monkeypatch, "/life log side work 2h") == ["Could not save that entry."]
+        assert "secret" not in caplog.text
+    assert _ll_entries() == []
+    life = _mp_link(monkeypatch, "/life")
+    assert len(life) == 1 and "Life snapshot" in life[0] and "52.5" in life[0]
+    page = _mp_get(_fr_path(life))
+    assert page.status_code == 200
+
+
+def test_life_log_cmd_next_week_hidden_then_shown(ll_env, monkeypatch):
+    _fr_ingest({"time": _ll_time()})
+    _mp_link(monkeypatch, "/life log side work 2h")
+    later = datetime.now(timezone.utc) + timedelta(days=8)
+    monkeypatch.setattr(m, "_now_utc", lambda: later)
+    out = _mp_link(monkeypatch, "/life")[0]
+    assert len(_ll_entries()) == 1 and "side work" not in out
+
+
+def test_life_log_cmd_help_text(ll_env):
+    import command_help as ch
+    assert "No per-command help" not in ch.lookup_command_help("/life/")
+    assert "/life log side work 2h" in ch.lookup_command_help("/life/")
+    assert ch.lookup_command_help("/life") is None and ch.lookup_command_help("/life log x") is None
+    src = open(os.path.join(os.path.dirname(os.path.abspath(m.__file__)), "main.py"), encoding="utf-8").read()
+    assert "/life log side work 2h adds hours by hand" in src
+
+
+def test_life_log_cmd_finance_routes_unchanged(ll_env, monkeypatch):
+    _fr_ingest({"time": _ll_time()})
+    link = _fr_path(_mp_link(monkeypatch, "/financelink"))
+    page = _mp_get(link)
+    assert page.status_code == 200
+    assert _pr_save(_pr_cred(page)).status_code == 200

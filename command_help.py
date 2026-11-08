@@ -209,9 +209,11 @@ HELP = {
     ),
     "/life": (
         "Replies with a short money-and-time summary from the newest uploaded snapshots (each section shows its own "
-        "data age) plus a fresh signed link to the finance page that expires in 15 minutes. Read-only, but the "
-        "figures are sent into this chat and stay in its history. Takes no argument.",
-        "/life",
+        "data age) plus a fresh signed link to the finance page that expires in 15 minutes. The "
+        "figures are sent into this chat and stay in its history. "
+        "/life log side work 2h stores hours you did away from the PC for this week; they are added on top of the "
+        "PC's hours and show on the finance page and in /life. /life undo removes the last one typed.",
+        "/life log side work 2h\n/life undo",
     ),
     "/vlink": (
         "Makes a personal link to montelattice.com for one contact (https://montelattice.com/?r=...). "
