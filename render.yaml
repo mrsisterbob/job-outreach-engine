@@ -12,7 +12,7 @@
 # deploy silently resets all of it to zero rows, which makes cross-run dedup impossible and means
 # reply/interview rates can never accumulate past a single deploy cycle.
 #
-# The disk makes JOBS_DB_PATH, BACKUP_DIR and PERSONAL_SNAPSHOT_DIR and PERSONAL_PLAN_DIR point at storage that survives deploys and restarts.
+# The disk makes JOBS_DB_PATH, BACKUP_DIR and PERSONAL_SNAPSHOT_DIR, PERSONAL_PLAN_DIR and PERSONAL_LOG_DIR point at storage that survives deploys and restarts.
 # NOTE: persistent disks require a paid instance type - the free plan has no durable storage, so
 # on free the metrics keep resetting no matter what these variables say.
 services:
@@ -45,6 +45,8 @@ services:
         value: /var/data/personal_snapshots
       - key: PERSONAL_PLAN_DIR
         value: /var/data/personal_plan
+      - key: PERSONAL_LOG_DIR
+        value: /var/data/personal_log
 
       # --- Secrets: set each in the dashboard (Environment tab) so they never land in git ---
       - key: SNAPSHOT_INGEST_TOKEN
