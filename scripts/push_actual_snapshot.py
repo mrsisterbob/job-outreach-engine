@@ -32,9 +32,12 @@ REPLY_TEXT = {
 }
 
 
-def _default_post(*args, **kw):
+def default_post(*args, **kw):
     import requests
     return requests.post(*args, **kw)
+
+
+_default_post = default_post
 
 
 def find_budget_folders(home=None):
@@ -46,8 +49,12 @@ def find_budget_folders(home=None):
     return found
 
 
-def url_ok(url):
-    """https://host[:port] (or http://localhost / 127.0.0.1); no userinfo, path, query or fragment."""
+LOCAL_HOSTS = ("localhost", "127.0.0.1")
+
+
+def url_ok(url, http_hosts=LOCAL_HOSTS, allow_https=True):
+    """https://host[:port] (or http:// for http_hosts); no userinfo, path, query or fragment.
+    allow_https=False accepts only the http hosts (for a same-machine service)."""
     try:
         u = urlparse(url)
         u.port
@@ -57,13 +64,17 @@ def url_ok(url):
         return False
     if u.path not in ("", "/") or "@" in u.netloc:
         return False
-    if u.scheme == "https" and u.hostname:
+    if allow_https and u.scheme == "https" and u.hostname:
         return True
-    return u.scheme == "http" and u.hostname in ("localhost", "127.0.0.1")
+    return u.scheme == "http" and u.hostname in http_hosts
 
 
-def _clean(text, limit=200):
+def clean_text(text, limit=200):
+    """Strip control characters and cap the length of any text that came from outside."""
     return re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text))[:limit]
+
+
+_clean = clean_text
 
 
 def summary_lines(snapshot, report):
@@ -109,6 +120,28 @@ def summary_lines(snapshot, report):
 def push(snapshot, url, token, post=_default_post):
     return post(url.rstrip("/") + "/snapshots/ingest", json=snapshot,
                 headers={"X-Snapshot-Token": token}, timeout=20, allow_redirects=False)
+
+
+def report_reply(resp, out=print):
+    """Print the status line and the sentence for the engine's reply; return the exit code."""
+    code = resp.status_code
+    out(f"HTTP {code}")
+    if code == 200:
+        try:
+            out(f"received_at: {_clean(resp.json().get('received_at'), 64)}")
+        except Exception:
+            out("Unexpected reply body: the engine said 200 but sent no readable received_at.")
+        return 0
+    if code in REPLY_TEXT:
+        out(REPLY_TEXT[code])
+    elif code == 400:
+        try:
+            out(f"The engine rejected the snapshot: {_clean(resp.json().get('error'))}")
+        except Exception:
+            out("The engine rejected the snapshot (400).")
+    else:
+        out("Unexpected reply from the engine.")
+    return 1
 
 
 def main(argv=None, post=None):
@@ -166,24 +199,7 @@ def main(argv=None, post=None):
     except Exception as e:
         print(f"Send failed: {type(e).__name__}")
         return 1
-    code = resp.status_code
-    print(f"HTTP {code}")
-    if code == 200:
-        try:
-            print(f"received_at: {_clean(resp.json().get('received_at'), 64)}")
-        except Exception:
-            print("Unexpected reply body: the engine said 200 but sent no readable received_at.")
-        return 0
-    if code in REPLY_TEXT:
-        print(REPLY_TEXT[code])
-    elif code == 400:
-        try:
-            print(f"The engine rejected the snapshot: {_clean(resp.json().get('error'))}")
-        except Exception:
-            print("The engine rejected the snapshot (400).")
-    else:
-        print("Unexpected reply from the engine.")
-    return 1
+    return report_reply(resp)
 
 
 if __name__ == "__main__":
