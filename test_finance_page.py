@@ -335,3 +335,136 @@ def test_plan_edit_script_guards_in_flight_and_bad_version(tmp_path, monkeypatch
     assert "typeof j.version === 'number'" in s and "Saved, but reload the page" in s
     assert s.index("if (!host) return;") < s.index("if (!(max > 0)) return;")
     assert s.index("removeChild(host.firstChild)") < s.index("if (!(max > 0)) return;")
+
+
+# ---- hand-logged hours (TASK-286) ----
+import manual_hours as mh
+
+
+def manual_view(tmp_path, monkeypatch, texts=("Sleep 1h", "side work 2h"), time_=None, now=NOW):
+    monkeypatch.setenv("PERSONAL_LOG_DIR", str(tmp_path))
+    for t in texts:
+        mh.log_entry(t, ["Sleep", "Work"], now=now)
+    snap = {"received_at": iso(5)}
+    if time_ is not False:
+        snap["time"] = time_ if time_ is not None else timesec()
+    return fm.build_finance_view([snap], NOW, manual=mh.list_all())
+
+
+def test_manual_log_columns_and_footnote(tmp_path, monkeypatch):
+    p = page(manual_view(tmp_path, monkeypatch))
+    for s in ("By hand", "Total", "side work", "50.5", ">2.0<",
+              "By hand = typed with /life log. It is added on top of the PC&#x27;s hours, "
+              "so time the PC also tracked counts twice.",
+              "PC 171 h + by hand 3 h = 174 h, over 168 by 6 h"):
+        assert s in p, s
+
+
+def test_manual_log_absent_changes_nothing(tmp_path, monkeypatch):
+    v = manual_view(tmp_path, monkeypatch, texts=())
+    assert v["time"]["manual_total"] is None
+    stripped = {**v, "time": {k: x for k, x in v["time"].items()
+                              if k not in ("manual_total", "combined_total", "combined_gap", "manual_hidden_hours",
+                                           "manual_week", "manual_entries", "manual_latest_at")}}
+    stripped["time"]["rows"] = [{k: x for k, x in r.items() if k not in ("manual", "combined", "manual_only")}
+                                for r in v["time"]["rows"]]
+    a, b = page(v), page(stripped)
+    assert "By hand" not in a and "hatch" not in a and "barSegments" not in a
+    assert re.sub(r'<script type="application/json".*?</script>', "", a, flags=re.S) == \
+        re.sub(r'<script type="application/json".*?</script>', "", b, flags=re.S)
+
+
+def test_manual_log_hostile_category_escaped(tmp_path, monkeypatch):
+    v = manual_view(tmp_path, monkeypatch, texts=())
+    v["time"]["rows"].append({"category": "</script><b>x</b>", "planned": None, "actual": None, "delta": None,
+                              "manual": 2.0, "combined": 2.0, "manual_only": True})
+    v["time"]["manual_total"] = 2.0
+    p = page(v)
+    assert "&lt;/script&gt;&lt;b&gt;x&lt;/b&gt;" in p
+    assert "<b>x</b>" not in p
+    raw = embedded(p)
+    assert "<" not in raw and ">" not in raw
+    assert json.loads(raw)["time"]["rows"][-1]["category"] == "</script><b>x</b>"
+    assert p.count("&lt;/script&gt;&lt;b&gt;x&lt;/b&gt;") >= 3  # row label, legend, table
+
+
+def test_manual_log_manual_only_has_no_editor_row(tmp_path, monkeypatch):
+    v = manual_view(tmp_path, monkeypatch)
+    assert v["time"]["editable_categories"] == ["Sleep", "Work"]
+    p = epage(v)
+    assert p.count('type="number"') == 2 and p.count('type="range"') == 2
+    assert 'aria-label="side work' not in p
+    assert "Edit planned hours" in p
+
+
+def test_manual_log_structure(tmp_path, monkeypatch):
+    for p in (page(manual_view(tmp_path, monkeypatch)), epage(manual_view(tmp_path, monkeypatch))):
+        for tag in re.findall(r"<(?:script|style)\b[^>]*>", p):
+            assert f'nonce="{NONCE}"' in tag
+        for bad in ("http", "<link", "<img", "src=", "innerHTML", "eval", "new Function", "document.write"):
+            assert bad not in p, bad
+        s = script_of(p)
+        assert "'pattern'" in s and "barSegments" in s and "url(#hatch)" in p and "svg.lastChild" not in s
+        assert s.count("createElementNS(NS, 'pattern')") == 1
+        assert len(s.strip().splitlines()) < 180
+        assert len(re.findall(r"<script nonce=", p)) == 1
+
+
+def test_manual_log_pc_not_uploaded_and_hidden(tmp_path, monkeypatch):
+    v = manual_view(tmp_path, monkeypatch, time_=False)
+    p = page(v)
+    assert "PC hours not uploaded yet. By hand: 3 h" in p
+    assert " 0 h" not in p and ">0 h" not in p
+    monkeypatch.setenv("PERSONAL_LOG_DIR", str(tmp_path / "other"))
+    mh.log_entry("Sleep 1h", ["Sleep"], now=NOW)
+    old = dict(timesec(), week_of="2026-10-26")
+    v2 = fm.build_finance_view([{"received_at": iso(5), "time": old}], NOW, manual=mh.list_all())
+    assert v2["time"]["manual_hidden_hours"] > 0
+    assert "h logged this week is not shown yet - the PC has not pushed the new week." in page(v2)
+
+
+def test_manual_log_bar_segments_in_node(tmp_path, monkeypatch):
+    if not shutil.which("node"):
+        import pytest
+        pytest.skip("node not installed")
+    s = script_of(page(manual_view(tmp_path, monkeypatch)))
+    harness = ("var document = {getElementById: function () { return null; }};\n" + s + "\n"
+               "var a = barSegments(10, 4, 20), b = barSegments(3, 5, 10), c = barSegments('x', 1, 10);\n"
+               "console.log(JSON.stringify([a.pc + a.manual === a.total, a.total, a.manual,"
+               " b.pc + b.manual === b.total, b.manual, c, barSegments(5, 1, 0)]));\n")
+    r = _node_run(harness)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == [True, 50, 20, True, 30, None, None]
+
+
+def test_manual_log_delta_dash_without_pc(tmp_path, monkeypatch):
+    p = page(manual_view(tmp_path, monkeypatch))
+    cells = re.findall(r"<tr>(.*?)</tr>", p, re.S)
+    side = [c for c in cells if "side work" in c][0]
+    assert re.findall(r"<td[^>]*>(.*?)</td>", side) == ["side work", "-", "-", "2.0", "2.0", "-"]
+    p2 = page(manual_view(tmp_path, monkeypatch, time_=False))
+    assert "+" not in "".join(re.findall(r"<td[^>]*>(.*?)</td>", p2))
+    assert not re.search(r"<td[^>]*>-\d", p2)
+
+
+def test_manual_log_layout_legend_and_gap_labels(tmp_path, monkeypatch):
+    p = page(manual_view(tmp_path, monkeypatch))
+    assert '<table class="man6">' in p and "table.man6{min-width:34rem}" in p and "white-space:nowrap" in p
+    for s in ("top = Planned", "bottom solid = PC hours", "bottom hatched = hours typed by hand", "side work 2 h",
+              "PC only: 171 h, 3 h over 168", "by hand 2 h"):
+        assert s in p, s
+    assert "PC - h" not in p
+
+
+def test_manual_log_wording_unreadable_vs_absent(tmp_path, monkeypatch):
+    assert "PC hours not uploaded yet" in page(manual_view(tmp_path, monkeypatch, time_=False))
+    bad = {"as_of": iso(2), "week_of": "2026-11-02", "actual": [{"category": "x", "hours": "zz"}]}
+    p = page(manual_view(tmp_path, monkeypatch, time_=bad))
+    assert "PC hours could not be read" in p and "not uploaded yet" not in p
+
+
+def test_manual_log_zero_manual_keeps_page(tmp_path, monkeypatch):
+    v = manual_view(tmp_path, monkeypatch, texts=())
+    v["time"]["manual_total"] = 0.0
+    p = page(v)
+    assert "By hand" not in p and "man6" not in p and "barSegments" not in p

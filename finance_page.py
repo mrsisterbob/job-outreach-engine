@@ -33,7 +33,7 @@ progress{width:100%;height:16px}
 .empty{text-align:center;padding:32px 16px}
 """
 
-_SCRIPT_A = """
+_S_HEAD = """
 (function () {
   var NS = 'ht' + 'tp://www.w3.org/2000/svg';
   var data;
@@ -68,7 +68,9 @@ _SCRIPT_A = """
     });
   }
   var time = data.time;
-  function maxOf(rows) {
+"""
+
+_S_DRAW = """  function maxOf(rows) {
     var m = 0;
     rows.forEach(function (r) { m = Math.max(m, r.planned || 0, r.actual || 0); });
     return m;
@@ -83,12 +85,64 @@ _SCRIPT_A = """
     if (typeof r.actual === 'number') rect(svg, 0, 15, r.actual / max * 100, 12, 'act');
     host.appendChild(svg);
   }
-  if (time) {
+"""
+
+_S_TAIL = """  if (time) {
     var max = maxOf(time.rows || []);
     (time.rows || []).forEach(function (r, i) { drawHours(r, i, max); });
   }
 """
 
+_S_DRAW_MANUAL = """  function maxOf(rows) {
+    var m = 0;
+    rows.forEach(function (r) {
+      m = Math.max(m, r.planned || 0, typeof r.combined === 'number' ? r.combined : (r.actual || 0));
+    });
+    return m;
+  }
+  var defsDone = false;
+  function hatchDefs() {
+    if (defsDone) return;
+    defsDone = true;
+    var svg = document.createElementNS(NS, 'svg'), defs = document.createElementNS(NS, 'defs');
+    var p = document.createElementNS(NS, 'pattern'), l = document.createElementNS(NS, 'path');
+    svg.setAttribute('width', 0); svg.setAttribute('height', 0); svg.setAttribute('aria-hidden', 'true');
+    p.setAttribute('id', 'hatch'); p.setAttribute('patternUnits', 'userSpaceOnUse');
+    p.setAttribute('width', 6); p.setAttribute('height', 6); p.setAttribute('patternTransform', 'rotate(45)');
+    l.setAttribute('d', 'M0 0V6'); l.setAttribute('class', 'hatchp');
+    p.appendChild(l); defs.appendChild(p); svg.appendChild(defs); document.body.appendChild(svg);
+  }
+  function drawHours(r, i, max) {
+    var host = document.querySelector('[data-hours="' + i + '"]');
+    if (!host) return;
+    while (host.firstChild) host.removeChild(host.firstChild);
+    if (!(max > 0)) return;
+    hatchDefs();
+    var s = barSegments(typeof r.combined === 'number' ? r.combined : r.actual, r.manual, max);
+    var svg = mk(28, r.category + ': planned, PC and by-hand hours');
+    if (typeof r.planned === 'number') rect(svg, 0, 0, r.planned / max * 100, 12, 'plan');
+    if (s) {
+      rect(svg, 0, 15, s.pc, 12, 'act');
+      if (s.manual > 0) rect(svg, s.pc, 15, s.manual, 12, 'man');
+    }
+    host.appendChild(svg);
+  }
+"""
+
+_SEGS = """
+function barSegments(combined, manual, max) {
+  if (typeof combined !== 'number' || !(max > 0)) return null;
+  var m = Math.min(Math.max(typeof manual === 'number' ? manual : 0, 0), combined);
+  return {pc: (combined - m) / max * 100, manual: m / max * 100, total: combined / max * 100};
+}
+"""
+
+_MANUAL_CSS = """
+.hatchp{stroke:var(--b);stroke-width:2}.man{fill:url(#hatch);stroke:var(--b);stroke-width:1.5}
+table.man6{min-width:34rem}table.man6 td.n,table.man6 th.n{white-space:nowrap}
+"""
+
+_SCRIPT_A = _S_HEAD + _S_DRAW + _S_TAIL
 _SCRIPT = _SCRIPT_A + "})();\n"
 
 _SUMQ = """
@@ -288,11 +342,11 @@ def _cell(tag, text, css):
     return f"<{tag}{attr}>{_e(text)}</{tag}>"
 
 
-def _table(head, rows):
+def _table(head, rows, cls=""):
     """head: list of (label, css); rows: list of lists of (text, css)."""
     h = "".join(_cell("th", t, c) for t, c in head)
     body = "".join("<tr>" + "".join(_cell("td", t, c) for t, c in r) + "</tr>" for r in rows)
-    return f'<div class="wrap"><table><thead><tr>{h}</tr></thead><tbody>{body}</tbody></table></div>'
+    return f'<div class="wrap"><table{(' class="' + cls + '"') if cls else ""}><thead><tr>{h}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
 def _money_section(m):
@@ -356,6 +410,61 @@ def _gap_line(kind, total, gap):
     return f"{kind}: {_short(total)} h, {tail}"
 
 
+_FOOTNOTE = ("By hand = typed with /life log. It is added on top of the PC's hours, "
+             "so time the PC also tracked counts twice.")
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _has_manual(t):
+    """Real hand-logged data only: a zero-hour total with no entries keeps the page as it was."""
+    if not isinstance(t, dict) or not _num(t.get("manual_total")):
+        return False
+    ents = t.get("manual_entries")
+    return t["manual_total"] > 0 or (isinstance(ents, list) and len(ents) > 0)
+
+
+def _row_text(r):
+    if not _num(r.get("manual")):
+        return f"PC {_short(r.get('actual'))} h"
+    if r.get("manual_only") or not _num(r.get("actual")):
+        return f"by hand {_short(r.get('manual'))} h"
+    return f"PC {_short(r.get('actual'))} h + by hand {_short(r.get('manual'))} h = {_short(r.get('combined'))} h"
+
+
+def _legend(rows):
+    cats = [f"{r.get('category', '-')} {_short(r.get('manual'))} h" for r in rows if _num(r.get("manual"))]
+    txt = "Bars: top = Planned, bottom solid = PC hours, bottom hatched = hours typed by hand"
+    if cats:
+        txt += " (" + ", ".join(cats) + ")"
+    return f'<p class="mut">{_e(txt)}</p>'
+
+
+def _totals_line(t):
+    man = _short(t.get("manual_total"))
+    if not t.get("actual_available"):
+        if t.get("as_of_known") or (t.get("unreadable") or 0) > 0:
+            return f"PC hours could not be read. By hand: {man} h"
+        return f"PC hours not uploaded yet. By hand: {man} h"
+    gap = t.get("combined_gap")
+    line = f"PC {_short(t.get('actual_total'))} h + by hand {man} h = {_short(t.get('combined_total'))} h"
+    if not _num(gap):
+        return line
+    if gap > 0:
+        return f"{line}, {_short(gap)} h unlogged"
+    if gap < 0:
+        return f"{line}, over 168 by {_short(-gap)} h"
+    return f"{line}, exactly 168"
+
+
+def _delta_cell(r, pc_ok):
+    if not pc_ok or not _num(r.get("actual")) or r.get("manual_only"):
+        return "-"
+    return _hrs(r.get("delta"), True)
+
+
 def _time_section(t, editor=""):
     out = ['<section id="time"><h2>168 hours</h2>']
     if t is None:
@@ -368,15 +477,37 @@ def _time_section(t, editor=""):
     else:
         out.append("<h3>Planned vs actual</h3>")
         rows = [r if isinstance(r, dict) else {} for r in rows]
+        man = _has_manual(t)
+        if man:
+            out.append(_legend(rows))
         for i, r in enumerate(rows):
-            out.append(f'<div><strong>{_e(r.get("category", "-"))}</strong><div data-hours="{i}"></div></div>')
-        out.append(_table([("Category", ""), ("Planned", "n"), ("Actual", "n"), ("Delta", "n")],
-                          [[(r.get("category", "-"), ""), (_hrs(r.get("planned")), "n"), (_hrs(r.get("actual")), "n"),
-                            (_hrs(r.get("delta"), True), "n")] for r in rows]))
+            beside = f' <span class="mut">{_e(_row_text(r))}</span>' if man else ""
+            out.append(f'<div><strong>{_e(r.get("category", "-"))}</strong>{beside}<div data-hours="{i}"></div></div>')
+        if man:
+            out.append(_table([("Category", ""), ("Planned", "n"), ("Actual", "n"), ("By hand", "n"), ("Total", "n"),
+                               ("Delta", "n")],
+                              [[(r.get("category", "-"), ""),
+                                ("-" if r.get("manual_only") else _hrs(r.get("planned")), "n"),
+                                ("-" if r.get("manual_only") else _hrs(r.get("actual")), "n"),
+                                (_hrs(r.get("manual")), "n"), (_hrs(r.get("combined")), "n"),
+                                (_delta_cell(r, t.get("actual_available")), "n")] for r in rows], "man6"))
+            out.append(f'<p class="mut">{_e(_FOOTNOTE)}</p>')
+            out.append('<p class="mut">Delta is Total minus Planned, shown only where the PC has hours for the row.</p>')
+        else:
+            out.append(_table([("Category", ""), ("Planned", "n"), ("Actual", "n"), ("Delta", "n")],
+                              [[(r.get("category", "-"), ""), (_hrs(r.get("planned")), "n"), (_hrs(r.get("actual")), "n"),
+                                (_hrs(r.get("delta"), True), "n")] for r in rows]))
     if t.get("week_of"):
         out.append(f'<p class="mut">{_e("Week of: " + str(t["week_of"]))}</p>')
     out.append(f'<p>{_e(_gap_line("Planned", t.get("planned_total"), t.get("planned_gap")))}</p>')
-    out.append(f'<p>{_e(_gap_line("Actual", t.get("actual_total"), t.get("actual_gap")))}</p>')
+    if _has_manual(t):
+        out.append(f'<p>{_e(_totals_line(t))}</p>')
+        if t.get("actual_available"):
+            out.append(f'<p>{_e(_gap_line("PC only", t.get("actual_total"), t.get("actual_gap")))}</p>')
+    else:
+        out.append(f'<p>{_e(_gap_line("Actual", t.get("actual_total"), t.get("actual_gap")))}</p>')
+    if _num(t.get("manual_hidden_hours")) and t["manual_hidden_hours"] > 0:
+        out.append(f'<p class="mut">{_e(_short(t["manual_hidden_hours"]) + " h logged this week is not shown yet - the PC has not pushed the new week.")}</p>')
     if (t.get("unreadable") or 0) > 0:
         out.append(f'<p class="mut">{_e(t["unreadable"])} rows could not be read</p>')
     out.append(editor)
@@ -454,10 +585,11 @@ def render_finance_page(view, now, nonce, edit=None):
     edit_fields, edit_time = _valid_edit(edit, view)
     if edit_fields:
         view["time"], view["edit"] = edit_time, edit_fields
+    man = _has_manual(view.get("time"))
     head = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<meta name="robots" content="noindex,nofollow"><title>Finance</title>'
-            f'<style nonce="{n}">{_CSS}{_EDIT_CSS if edit_fields else ""}</style></head><body><main><h1>Finance</h1>')
+            f'<style nonce="{n}">{_CSS}{_EDIT_CSS if edit_fields else ""}{_MANUAL_CSS if man else ""}</style></head><body><main><h1>Finance</h1>')
     if view.get("empty"):
         body = ('<section class="empty"><h2>Nothing uploaded yet.</h2>'
                 '<p>Snapshots are pushed from the PC, and this page fills in after the first one.</p>'
@@ -466,7 +598,14 @@ def render_finance_page(view, now, nonce, edit=None):
     body = (f'<p class="mut">{_e(_received_ago(view, now))}</p>'
             + _money_section(view.get("money"))
             + _time_section(view.get("time"), _editor_html(view["time"], now) if edit_fields else ""))
-    script = (_SUMQ + _SCRIPT_A + _EDITOR + "})();\n") if edit_fields else _SCRIPT
+    if man:
+        sa = _S_HEAD + _S_DRAW_MANUAL + _S_TAIL
+        ed = _EDITOR.replace("actual: r.actual, planned",
+                             "actual: r.actual, combined: r.combined, manual: r.manual, planned")
+        assert ed != _EDITOR
+        script = _SEGS + ((_SUMQ + sa + ed + "})();\n") if edit_fields else sa + "})();\n")
+    else:
+        script = (_SUMQ + _SCRIPT_A + _EDITOR + "})();\n") if edit_fields else _SCRIPT
     tail = (f'<script type="application/json" id="fin-data" nonce="{n}">{_json_for_script(view)}</script>'
             f'<script nonce="{n}">{script}</script></main></body></html>')
     return head + body + tail
