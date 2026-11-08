@@ -77,6 +77,24 @@ grep -i "contact" FUNCTION_INDEX.md
 | 357 | `failure_summary` | The part of pytest's output that names what broke. |
 | 381 | `block` | _(no docstring)_ |
 
+## `activity_snapshot.py` — 13 defs, 260 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 60 | `_zone` | _(no docstring)_ |
+| 68 | `_z` | _(no docstring)_ |
+| 72 | `week_bounds` | Monday-to-Monday week containing `now`, in Detroit local time, as UTC instants. |
+| 89 | `build_query_body` | _(no docstring)_ |
+| 93 | `_is_num` | _(no docstring)_ |
+| 98 | `app_seconds_from_query` | /query/ response -> ({lower-cased app: seconds}, unreadable count). Never raises. |
+| 125 | `_collapse` | _(no docstring)_ |
+| 129 | `parse_category_config` | {"buckets": [...], "apps": {...}} -> (buckets, app_buckets). Raises ValueError listing |
+| 184 | `_canon_buckets` | Strip/collapse, drop non-str and blanks, dedupe case-insensitively, 'Other' last-resort. |
+| 199 | `_tally` | -> (bucket seconds, ignored seconds, {unmapped app: seconds}, unreadable count) |
+| 224 | `_resolve` | _(no docstring)_ |
+| 232 | `build_time_section` | _(no docstring)_ |
+| 248 | `describe_week` | Dry-run summary for the PC script. `apps_unmapped` names apps and is shown ONLY on the |
+
 ## `actual_snapshot.py` — 12 defs, 331 lines
 
 | Line | Name | Summary |
@@ -1753,4 +1771,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1314 definitions across 84 files + Code.gs.**
+**1327 definitions across 85 files + Code.gs.**
