@@ -25414,7 +25414,9 @@ def test_life_cmd_saved_plan_changes_planned_hours_like_finance(life_env, monkey
     hours_plan.save_plan([{"category": "Sleep", "hours": 168}], ["Sleep"], None, datetime.now(timezone.utc))
     again = _life(monkeypatch)[0]
     page = _mp_get(_fr_path([again])).get_data(as_text=True)
-    assert again != base and "168" in again and "168" in page and "168" not in base
+    # Match the planned-hours text, not a bare "168": the signed link's exp/sig can contain "168".
+    assert again != base and "planned 168 h" in again and "planned 168 h" not in base
+    assert "168" in page
 
 
 def test_life_cmd_blank_secret_still_summarises_without_url(life_env, monkeypatch):
