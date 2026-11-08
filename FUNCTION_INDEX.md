@@ -917,6 +917,26 @@ grep -i "contact" FUNCTION_INDEX.md
 | 21947 | `_public_funnel_stats` | PUBLIC_FUNNEL_STATS (default false): whether /public/dashboard carries reply/interview/offer. |
 | 21954 | `public_dashboard` | Public, unauthenticated, aggregate-only dashboard payload. Performs no writes. |
 
+## `manual_hours.py` — 15 defs, 240 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 47 | `LogInvalid` | The text cannot be logged; the message is user-showable. |
+| 51 | `_log_dir` | _(no docstring)_ |
+| 58 | `_zone` | _(no docstring)_ |
+| 70 | `_aware` | _(no docstring)_ |
+| 80 | `current_week_start` | The Detroit Monday (YYYY-MM-DD) of the week containing `now`. |
+| 86 | `parse_log_text` | Parse `<category> <duration>` or `<duration> <category>` -> (category, hours, rounded). |
+| 136 | `canonical_category` | The spelling from known_categories matching `name` case-insensitively, else `name`. |
+| 145 | `_entry_ok` | _(no docstring)_ |
+| 154 | `_read` | _(no docstring)_ |
+| 178 | `_write` | _(no docstring)_ |
+| 197 | `_q` | _(no docstring)_ |
+| 201 | `log_entry` | Parse, canonicalize, append and return the stored entry (ids never reused). |
+| 220 | `list_all` | _(no docstring)_ |
+| 225 | `list_week` | Entries of the given Monday week, oldest first. |
+| 230 | `remove_last` | Remove and return the newest entry (of that week if given), or None. |
+
 ## `money_page.py` — 5 defs, 86 lines
 
 | Line | Name | Summary |
@@ -1704,4 +1724,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1280 definitions across 81 files + Code.gs.**
+**1295 definitions across 82 files + Code.gs.**
