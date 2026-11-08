@@ -117,22 +117,32 @@ def _time_lines(t):
     head = f"Time (week of {week}): " if week else "Time: "
     head += f"planned {_hours(t.get('planned_total'))}"
     avail = t.get("actual_available") is True
+    mtot = t.get("manual_total")
+    by_hand = _is_num(mtot) and mtot > 0       # hand-logged hours present (TASK-287)
+    use_comb = by_hand and _is_num(t.get("combined_total")) and avail
     if avail:
-        head += f", actual {_hours(t.get('actual_total'))}"
+        head += f", actual {_hours(t.get('combined_total') if use_comb else t.get('actual_total'))}"
+        if by_hand:
+            head += f" ({_hours(mtot)} by hand)"
     if t.get("plan_source") == "saved":
         head += " (your saved plan)"
     lines = [head]
     if not avail:
-        lines.append("Actual hours not uploaded yet")
+        lines.append(f"PC hours not uploaded yet; {_hours(mtot)} logged by hand" if by_hand
+                     else "Actual hours not uploaded yet")
     else:
-        gap = t.get("actual_gap")
+        gap = t.get("combined_gap") if use_comb else t.get("actual_gap")
         if _is_num(gap):
             if gap < 0:
                 lines.append(f"Over 168 by {_hours(-gap)}")
             else:
                 lines.append(f"Unlogged: {_hours(gap)}")
+    hid = t.get("manual_hidden_hours")
+    if by_hand and _is_num(hid) and hid > 0:
+        lines.append(f"{_hours(hid)} logged this week will show once the PC pushes the new week.")
     rows = [r for r in (t.get("rows") if isinstance(t.get("rows"), list) else [])
-            if isinstance(r, dict) and _is_num(r.get("delta")) and r["delta"] != 0]
+            if isinstance(r, dict) and r.get("manual_only") is not True
+            and _is_num(r.get("delta")) and r["delta"] != 0]
     if rows:
         best = max(rows, key=lambda r: abs(r["delta"]))
         lines.append(f"Biggest gap: {_esc(best.get('category'))} "

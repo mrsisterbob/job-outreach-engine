@@ -191,3 +191,76 @@ def test_pct_rounded_and_clamped():
     m = money(off=[{"name": "A", "balance": 1, "target": 3}, {"name": "B", "balance": 5, "target": 2}])
     r = ls.render_life_reply(view(m=m), NOW, LINK)
     assert "A $1.00 (33%)" in r and "B $5.00 (100%)" in r
+
+
+# ---- TASK-287: hand-logged hours ----
+def _mlog(tmp_path, monkeypatch, *texts):
+    import manual_hours as mh
+    monkeypatch.setenv("PERSONAL_LOG_DIR", str(tmp_path))
+    for t in texts:
+        mh.log_entry(t, now=NOW)
+    return mh.list_all()
+
+
+def _mview(manual, t="default", now=NOW):
+    snaps = [{"received_at": NOW.isoformat(), "time": timesec() if t == "default" else t}] if t else []
+    return build_finance_view(snaps, now, None, manual)
+
+
+def test_manual_log_counts_in_actual_and_gap(tmp_path, monkeypatch):
+    m = _mlog(tmp_path, monkeypatch, "reading 3h")
+    r = ls.render_life_reply(_mview(m), NOW, LINK)
+    assert "actual 153.5 h (3 h by hand)" in r and "Unlogged: 14.5 h" in r
+    assert "PC" not in r
+
+
+def test_manual_log_absent_reply_unchanged(tmp_path, monkeypatch):
+    base = _mview(None)
+    stripped = _mview(None)
+    for k in ("manual_total", "combined_total", "combined_gap", "manual_hidden_hours"):
+        stripped["time"].pop(k, None)
+    r1 = ls.render_life_reply(base, NOW, LINK)
+    assert r1 == ls.render_life_reply(stripped, NOW, LINK)
+    assert "by hand" not in r1 and "actual 150.5 h" in r1 and "Unlogged: 17.5 h" in r1
+
+
+def test_manual_log_pc_not_uploaded(tmp_path, monkeypatch):
+    m = _mlog(tmp_path, monkeypatch, "reading 3h")
+    r = ls.render_life_reply(_mview(m, t=None), NOW, LINK)
+    assert "PC hours not uploaded yet; 3 h logged by hand" in r
+    assert "0 h" not in r.replace("168 h", "") and "Unlogged" not in r
+
+
+def test_manual_log_stale_pc_stays_stale(tmp_path, monkeypatch):
+    m = _mlog(tmp_path, monkeypatch, "reading 3h")
+    r = ls.render_life_reply(_mview(m, t=timesec(as_of=iso(400))), NOW, LINK)
+    assert "STALE" in r and "16 d ago" in r
+
+
+def test_manual_log_hostile_category_and_cap(tmp_path, monkeypatch):
+    texts = [f"<b>x</b>{i} 0.25h" for i in range(30)]
+    try:
+        m = _mlog(tmp_path, monkeypatch, *texts)
+    except Exception:
+        m = _mlog(tmp_path, monkeypatch, *[f"cat{i} 0.25h" for i in range(30)])
+    full = _mview(m)
+    r = ls.render_life_reply(
+        build_finance_view([{"received_at": NOW.isoformat(), "money": money(), "time": timesec()}],
+                           NOW, None, m), NOW, LINK)
+    assert "<b>x</b>" not in r and len(r) < 900
+    assert len(ls.render_life_reply(full, NOW, LINK)) < 900
+
+
+def test_manual_log_over_168_combined(tmp_path, monkeypatch):
+    t = timesec(actual=[{"category": "Sleep", "hours": 160}])
+    m = _mlog(tmp_path, monkeypatch, "reading 10h")
+    r = ls.render_life_reply(_mview(m, t=t), NOW, LINK)
+    assert "Over 168 by 2 h" in r and "actual 170 h (10 h by hand)" in r
+
+
+def test_manual_log_hidden_hours_line():
+    v = _mview(None)
+    v["time"].update({"manual_total": 3.0, "combined_total": 153.5, "combined_gap": 14.5,
+                      "manual_hidden_hours": 2.0})
+    r = ls.render_life_reply(v, NOW, LINK)
+    assert "2 h logged this week will show once the PC pushes the new week." in r
