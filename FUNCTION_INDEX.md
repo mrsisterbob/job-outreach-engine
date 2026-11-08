@@ -77,6 +77,23 @@ grep -i "contact" FUNCTION_INDEX.md
 | 357 | `failure_summary` | The part of pytest's output that names what broke. |
 | 381 | `block` | _(no docstring)_ |
 
+## `actual_snapshot.py` — 12 defs, 331 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 57 | `ExportError` | User-showable problem reading the export. |
+| 61 | `_name` | _(no docstring)_ |
+| 66 | `_check_db` | _(no docstring)_ |
+| 91 | `_copy_limited` | _(no docstring)_ |
+| 104 | `_copy_file` | _(no docstring)_ |
+| 117 | `_materialize` | Copy the database out of folder/zip/file into dest. Returns saved_at (aware UTC). |
+| 150 | `open_export` | Yield (read-only connection to a temp COPY, saved_at aware UTC). Cleans up always. |
+| 169 | `_cents` | Integer cents or None (NULL). Anything non-numeric is a bad export, not a crash. |
+| 182 | `_month_of` | _(no docstring)_ |
+| 191 | `build_money_section` | -> (section, report). See module docstring; counts only in report. |
+| 199 | `_build_money_section` | _(no docstring)_ |
+| 322 | `build_snapshot` | -> ({"money": section}, report), gated by personal_snapshots.validate_snapshot. |
+
 ## `alumni_master.py` — 18 defs, 259 lines
 
 | Line | Name | Summary |
@@ -1724,4 +1741,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1295 definitions across 82 files + Code.gs.**
+**1307 definitions across 83 files + Code.gs.**
