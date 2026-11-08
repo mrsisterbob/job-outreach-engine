@@ -268,21 +268,25 @@ grep -i "contact" FUNCTION_INDEX.md
 | 84 | `_ranked` | _(no docstring)_ |
 | 88 | `render_eyes` | A list of Telegram HTML strings, each under MESSAGE_LIMIT characters. |
 
-## `finance_model.py` — 11 defs, 264 lines
+## `finance_model.py` — 15 defs, 401 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 48 | `_num` | int/float only; not bool, not NaN/inf. Returns float or None. |
-| 56 | `_name` | _(no docstring)_ |
-| 65 | `_parse_as_of` | _(no docstring)_ |
-| 80 | `_freshness` | _(no docstring)_ |
-| 99 | `_label` | _(no docstring)_ |
-| 103 | `_rows` | _(no docstring)_ |
-| 108 | `_money` | _(no docstring)_ |
-| 161 | `_hours` | -> (dict category -> hours, unreadable) |
-| 177 | `_total` | Sum rounded to 0.1; exact via integer quarter-hours when every value is a quarter multiple. |
-| 191 | `_time` | `section` may be None (plan-only). `plan` is a dict with a list `hours`, or None. |
-| 238 | `build_finance_view` | Snapshots (newest first) + aware UTC `now` (+ saved plan dict or None) -> the view model. |
+| 58 | `_num` | int/float only; not bool, not NaN/inf. Returns float or None. |
+| 66 | `_name` | _(no docstring)_ |
+| 75 | `_parse_as_of` | _(no docstring)_ |
+| 90 | `_freshness` | _(no docstring)_ |
+| 109 | `_label` | _(no docstring)_ |
+| 113 | `_rows` | _(no docstring)_ |
+| 118 | `_money` | _(no docstring)_ |
+| 171 | `_hours` | -> (dict category -> hours, unreadable) |
+| 187 | `_total` | Sum rounded to 0.1; exact via integer quarter-hours when every value is a quarter multiple. |
+| 201 | `_norm` | _(no docstring)_ |
+| 205 | `_ymd` | YYYY-MM-DD string -> date, else None. |
+| 215 | `_detroit_monday` | _(no docstring)_ |
+| 232 | `_manual_scan` | -> dict: sums {norm: [display, [hours]]}, unreadable, hidden [hours], entries, latest. |
+| 276 | `_time` | `section` may be None (plan-only). `plan` is a dict with a list `hours`, or None. |
+| 371 | `build_finance_view` | Snapshots (newest first) + aware UTC `now` (+ saved plan dict or None) -> the view model. |
 
 ## `finance_page.py` — 21 defs, 472 lines
 
@@ -1789,4 +1793,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1340 definitions across 86 files + Code.gs.**
+**1344 definitions across 86 files + Code.gs.**
