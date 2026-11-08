@@ -406,7 +406,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 54 | `_clean` | _(no docstring)_ |
 | 61 | `format_held_line` | The standup line. rows: [(sender_name, sender_email, subject)] newest first, or None (the read failed). |
 
-## `life_summary.py` — 10 defs, 169 lines
+## `life_summary.py` — 10 defs, 179 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -419,7 +419,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 75 | `_skipped` | _(no docstring)_ |
 | 82 | `_money_lines` | _(no docstring)_ |
 | 115 | `_time_lines` | _(no docstring)_ |
-| 149 | `render_life_reply` | view: build_finance_view output or None. link: full URL or None. Returns Telegram-HTML. |
+| 159 | `render_life_reply` | view: build_finance_view output or None. link: full URL or None. Returns Telegram-HTML. |
 
 ## `linkedin_import.py` — 15 defs, 382 lines
 
