@@ -23,13 +23,21 @@ Category names are VALUES in lists, never dict keys, on purpose: the store rejec
 containing merchant, payee, vendor, transaction, txn, counterparty, memo, line_item. Everything
 is aggregate; a row is never one purchase.
 
+HAND-LOGGED HOURS (`manual=` list of {"id","logged_at","week_start","category","hours"}; the caller
+reads them, this module never imports manual_hours): for the week the time section covers they are
+shown beside the PC's hours (`manual`, `combined`), and the plan-vs-actual delta uses the combined
+figure. DOUBLE COUNTING IS DECIDED, NOT FIXED: the two are added blindly. Manual hours are for time
+the PC cannot see; if something ActivityWatch also recorded is logged by hand it counts twice. The
+page states this. A category that exists only because it was typed is a `manual_only` row and is
+never an editable plan bucket. Manual entries never make PC data fresh.
+
 Rules: each section comes from the newest snapshot where that key is a dict (a newer snapshot
 carrying only `time` never hides an older `money`). Staleness is per section from its own
 `as_of`, never from `received_at`. Bad rows are counted in `unreadable` and skipped, never
 zeroed. Nothing is rescaled to fit 168 hours. Only the documented fields reach the view.
 """
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 MONEY_STALE_AFTER_HOURS = 72    # DESIGN CHOICE, not a measurement
 TIME_STALE_AFTER_HOURS = 192    # DESIGN CHOICE, not a measurement (8 days)
@@ -43,6 +51,8 @@ _FUTURE_SLACK = timedelta(days=1)
 _AS_OF_ECHO_CAP = 40
 MAX_HOURS_PER_ROW = 10000   # sane cap per row and per category sum; more is unreadable
 MAX_HOURS_ROWS = 200   # per planned/actual list; extras counted unreadable
+MAX_MANUAL_ENTRIES = 1000   # hand-logged entries examined; extras counted unreadable
+MAX_MANUAL_SHOWN = 30
 
 
 def _num(v):
@@ -188,7 +198,82 @@ def _total(vals):
         return None
 
 
-def _time(section, now, received_at, plan=None):
+def _norm(name):
+    return " ".join(name.split()).casefold()
+
+
+def _ymd(v):
+    """YYYY-MM-DD string -> date, else None."""
+    if not isinstance(v, str) or len(v.strip()) != 10:
+        return None
+    try:
+        return date.fromisoformat(v.strip())
+    except ValueError:
+        return None
+
+
+def _detroit_monday(now):
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo("America/Detroit")
+    except Exception:
+        zone = timezone.utc
+    try:
+        if not isinstance(now, datetime):
+            raise TypeError
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        day = now.astimezone(zone).date()
+        return (day - timedelta(days=day.weekday())).isoformat()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _manual_scan(manual, week, current_week):
+    """-> dict: sums {norm: [display, [hours]]}, unreadable, hidden [hours], entries, latest."""
+    out = {"sums": {}, "unreadable": 0, "hidden": [], "entries": []}
+    if not isinstance(manual, list):
+        return out
+    out["unreadable"] += max(0, len(manual) - MAX_MANUAL_ENTRIES)
+
+    def _order(e):   # ascending id; entries without a usable id last (stable)
+        i = e.get("id") if isinstance(e, dict) else None
+        return (0, i) if isinstance(i, int) and not isinstance(i, bool) else (1, 0)
+
+    seen = set()
+    for e in sorted(manual[:MAX_MANUAL_ENTRIES], key=_order):
+        if not isinstance(e, dict):
+            out["unreadable"] += 1
+            continue
+        eid = e.get("id")
+        if isinstance(eid, int) and not isinstance(eid, bool):
+            if eid in seen:   # the same entry passed twice: dropped silently, first wins
+                continue
+            seen.add(eid)
+        cat, h, ws = _name(e.get("category")), _num(e.get("hours")), _ymd(e.get("week_start"))
+        if h is not None:
+            h = round(h, 2)   # sums are of 2dp values, so the listed entries add up to the total
+        if cat is None or h is None or h <= 0 or h > MAX_HOURS_PER_ROW or ws is None:
+            out["unreadable"] += 1
+            continue
+        wk = ws.isoformat()
+        at = _label(e.get("logged_at"))
+        if ws.weekday() != 0:   # valid date, not a Monday: never counted, never silent
+            out["hidden"].append(h)
+        elif wk == week:
+            slot = out["sums"].setdefault(_norm(cat), [" ".join(cat.split()), []])
+            if sum(slot[1]) + h > MAX_HOURS_PER_ROW:
+                out["unreadable"] += 1
+                continue
+            slot[1].append(h)
+            out["entries"].append((_parse_as_of(at),
+                                   {"category": cat, "hours": h, "logged_at": at}))
+        elif wk == current_week:
+            out["hidden"].append(h)
+    return out
+
+
+def _time(section, now, received_at, plan=None, manual=None):
     """`section` may be None (plan-only). `plan` is a dict with a list `hours`, or None."""
     unreadable = 0
     sec = section if isinstance(section, dict) else {}
@@ -206,15 +291,57 @@ def _time(section, now, received_at, plan=None):
     all_cats = list(dict.fromkeys(list(planned) + list(actual)))
     unreadable += max(0, len(all_cats) - MAX_TIME_CATEGORIES)
     cats = all_cats[:MAX_TIME_CATEGORIES]
+    # which week the hand-logged hours belong to
+    wk = _ymd(sec.get("week_of"))
+    cur = _detroit_monday(now)
+    week = wk.isoformat() if wk is not None else cur
+    scan = _manual_scan(manual, week, cur)
+    unreadable += scan["unreadable"]
+    sums = scan["sums"]
+    first = {}   # normalized name -> first category spelling already in the table
+    for c in all_cats:
+        first.setdefault(_norm(c), c)
+    msum = {}    # category spelling -> manual hours
+    extra = []   # manual-only categories (norm, display name, hours)
+    for k, (disp, hs) in sums.items():
+        total = _total(hs)
+        if k in first:
+            msum[first[k]] = total
+        else:
+            extra.append((k, disp, total))
+    # manual-only categories past the row cap are dropped from rows AND from the totals; their hours
+    # are reported in manual_hidden_hours so the totals always equal what the rows show
+    room = max(0, MAX_TIME_CATEGORIES - len(cats))
+    dropped = extra[room:]
+    extra = extra[:room]
+    dropped_keys = {k for k, _, _ in dropped}
     # totals are summed over ALL readable categories, before the display cap
     ptot = _total(planned.values())
     atot = _total(actual.values())
+    comb = {}
+    for c in all_cats:
+        a, m = actual.get(c), msum.get(c)
+        if a is not None or m is not None:
+            comb[c] = (a if a is not None else 0.0) + (m if m is not None else 0.0)
+    ctot = _total(list(comb.values()) + [m for _, _, m in extra])
+    mtot = _total(list(msum.values()) + [m for _, _, m in extra])
     rows = []
     for c in cats:
         p = round(planned[c], 1) if c in planned else None
         a = round(actual[c], 1) if c in actual else None
-        d = round(actual[c] - planned[c], 1) if c in planned and c in actual else None
-        rows.append({"category": c, "planned": p, "actual": a, "delta": d})
+        m = round(msum[c], 1) if c in msum else None
+        cb = round(comb[c], 1) if c in comb else None
+        d = round(comb[c] - planned[c], 1) if c in planned and c in comb else None
+        rows.append({"category": c, "planned": p, "actual": a, "delta": d,
+                     "manual": m, "combined": cb, "manual_only": False})
+    for _k, disp, m in extra:
+        rows.append({"category": disp, "planned": None, "actual": None, "delta": None,
+                     "manual": round(m, 1), "combined": round(m, 1), "manual_only": True})
+    _floor = datetime.min.replace(tzinfo=timezone.utc)
+    shown = sorted((t for t in scan["entries"] if _norm(t[1]["category"]) not in dropped_keys),
+                   key=lambda t: t[0] or _floor, reverse=True)
+    latest = next((e["logged_at"] for dt, e in shown if dt is not None), None)
+    hidden = _total(scan["hidden"] + [m for _, _, m in dropped])
     if section is None:
         # plan-only: the stamp is about actuals, which do not exist; the plan is never stale
         view = {"as_of": None, "as_of_known": False, "age_hours": None, "stale": False}
@@ -231,16 +358,24 @@ def _time(section, now, received_at, plan=None):
                  "plan_version": ver if isinstance(ver, int) and not isinstance(ver, bool) else None,
                  "plan_updated_at": _label(upd),
                  "actual_available": bool(actual),
-                 "editable_categories": [r["category"] for r in rows]})
+                 "editable_categories": [r["category"] for r in rows if not r["manual_only"]],
+                 "manual_total": mtot, "combined_total": ctot,
+                 "combined_gap": round(WEEK_HOURS - ctot, 1) if ctot is not None else None,
+                 "manual_hidden_hours": hidden if hidden is not None else 0.0,
+                 "manual_week": week if (sums or scan["hidden"]) else None,
+                 "manual_entries": [e for _, e in shown[:MAX_MANUAL_SHOWN]],
+                 "manual_latest_at": latest})
     return view
 
 
-def build_finance_view(snapshots, now, plan=None):
+def build_finance_view(snapshots, now, plan=None, manual=None):
     """Snapshots (newest first) + aware UTC `now` (+ saved plan dict or None) -> the view model.
 
     A saved plan overrides the snapshot's `planned`: it is Kevin's decision made on the page and
     a later PC push carrying an old `planned` must not undo it. Actuals always come from snapshots.
     """
+    if isinstance(now, datetime) and now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)   # contract says aware UTC; a naive one is read as UTC
     plan_ok = (isinstance(plan, dict) and isinstance(plan.get("hours"), list)
                and all(isinstance(e, dict) for e in plan["hours"]))
     plan_bad = 1 if (plan is not None and not plan_ok) else 0
@@ -254,11 +389,13 @@ def build_finance_view(snapshots, now, plan=None):
         if money is None and isinstance(snap.get("money"), dict):
             money = _money(snap["money"], now, ra)
         if time_ is None and isinstance(snap.get("time"), dict):
-            time_ = _time(snap["time"], now, ra, use)
+            time_ = _time(snap["time"], now, ra, use, manual)
         if money is not None and time_ is not None:
             break
-    if time_ is None and use is not None:
-        time_ = _time(None, now, None, use)
+    if time_ is None:
+        cand = _time(None, now, None, use, manual)
+        if use is not None or cand["manual_total"] is not None:
+            time_ = cand
     if time_ is not None:
         time_["unreadable"] += plan_bad
     return {"empty": money is None and time_ is None, "money": money, "time": time_}
