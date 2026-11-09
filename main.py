@@ -4,6 +4,9 @@ from concurrent.futures import ThreadPoolExecutor
 import concurrent.futures as _cf
 import hmac
 import personal_snapshots
+import presence_events
+from werkzeug.exceptions import HTTPException
+from werkzeug.wrappers import Request
 import signed_links
 import money_page
 import finance_model
@@ -137,6 +140,20 @@ if not os.environ.get("SNAPSHOT_INGEST_TOKEN"):
     logging.warning(
         "[CONFIG WARNING] SNAPSHOT_INGEST_TOKEN is unset - /snapshots/ingest will refuse every snapshot with 503, "
         "so personal snapshots pushed from the PC cannot be stored."
+    )
+# Its own token on purpose: the phone holds it and it must not be able to do anything else.
+if not os.environ.get("PRESENCE_TOKEN"):
+    logging.warning(
+        "[CONFIG WARNING] PRESENCE_TOKEN is unset - /presence/event will refuse every call with 503."
+    )
+try:
+    _boot_places = presence_events.parse_places(os.environ.get("PRESENCE_PLACES"))
+except Exception as _e:
+    _boot_places = {}
+    logging.warning("[CONFIG WARNING] PRESENCE_PLACES is invalid (%s).", type(_e).__name__)
+if not _boot_places:
+    logging.warning(
+        "[CONFIG WARNING] PRESENCE_PLACES is unset or invalid - /presence/event will refuse every call with 503."
     )
 # Read per request by /money and /moneylink; this check only warns at boot.
 if not os.environ.get("PAGE_LINK_SECRET"):
@@ -21832,6 +21849,72 @@ def snapshots_ingest():
         return jsonify({"status": "error"}), 500
     logging.info("[SNAPSHOTS] stored a personal snapshot")
     return jsonify({"status": "ok", "received_at": received_at}), 200
+
+
+def _presence_reply(status, code):
+    return jsonify({"status": status}), code
+
+
+@app.route("/presence/event", methods=["POST"])
+def presence_event():
+    """The phone's join/leave/tap call. Own token (header X-Presence-Token) checked before anything
+    is read or parsed; every reply is exactly {"status": word}. No network call is made here."""
+    token = os.environ.get("PRESENCE_TOKEN", "")
+    if not token.strip():
+        return _presence_reply("disabled", 503)
+    supplied = request.headers.get("X-Presence-Token", "")
+    if not hmac.compare_digest(supplied.encode("utf-8", "replace"), token.strip().encode("utf-8")):
+        return _presence_reply("forbidden", 403)
+    try:
+        places = presence_events.parse_places(os.environ.get("PRESENCE_PLACES"))
+    except Exception as e:
+        logging.warning("[PRESENCE] PRESENCE_PLACES invalid: %s", type(e).__name__)
+        return _presence_reply("disabled", 503)
+    if not places:
+        return _presence_reply("disabled", 503)
+    cap = presence_events.MAX_BODY_BYTES
+    if request.content_length is not None and request.content_length > cap:
+        return _presence_reply("invalid", 413)
+    try:
+        # Read at most cap+1 bytes straight from the WSGI input, so a body with no
+        # Content-Length (chunked) is never buffered whole; then parse from the capped copy.
+        env = dict(request.environ)
+        n = request.content_length if request.content_length is not None else cap + 1
+        raw = env["wsgi.input"].read(min(n, cap + 1)) if n else b""
+        if len(raw) > cap:
+            return _presence_reply("invalid", 413)
+        env["wsgi.input"] = io.BytesIO(raw)
+        env["CONTENT_LENGTH"] = str(len(raw))
+        env.pop("HTTP_TRANSFER_ENCODING", None)
+        capped = Request(env)
+        payload = capped.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = capped.form.to_dict()
+        place, event = presence_events.parse_event(payload, places)
+    except (presence_events.PresenceInvalid, RecursionError, ValueError, UnicodeDecodeError,
+            HTTPException):
+        return _presence_reply("invalid", 400)
+    except Exception as e:
+        logging.warning("[PRESENCE] body parse failed: %s", type(e).__name__)
+        return _presence_reply("invalid", 400)
+    try:
+        result = presence_events.record(place, event)
+    except presence_events.PresenceInvalid:
+        return _presence_reply("invalid", 400)
+    except OSError as e:
+        logging.error("[PRESENCE] write failed: %s", type(e).__name__)
+        return _presence_reply("error", 500)
+    except Exception as e:
+        logging.error("[PRESENCE] record failed: %s", type(e).__name__)
+        return _presence_reply("error", 500)
+    status = result.get("status")
+    if status == "ok":
+        return _presence_reply("ok", 200)
+    if status == "duplicate":
+        return _presence_reply("duplicate", 200)
+    if status == "rate_limited":
+        return _presence_reply("rate_limited", 429)
+    return _presence_reply("error", 500)
 
 
 # ==============================================================================
