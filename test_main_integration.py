@@ -25642,3 +25642,209 @@ def test_life_log_cmd_finance_routes_unchanged(ll_env, monkeypatch):
     page = _mp_get(link)
     assert page.status_code == 200
     assert _pr_save(_pr_cred(page)).status_code == 200
+
+
+# ---- presence route (TASK-297) ----
+import presence_events  # noqa: E402
+
+_PE_TOKEN = "presence-test-token-9931"
+_PE_PLACES = '{"library": "Job search"}'
+
+
+@pytest.fixture
+def presence_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PERSONAL_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("PRESENCE_TOKEN", _PE_TOKEN)
+    monkeypatch.setenv("PRESENCE_PLACES", _PE_PLACES)
+    return tmp_path
+
+
+def _pe_post(payload=None, headers=None, data=None, form=None):
+    hdrs = {"X-Presence-Token": _PE_TOKEN} if headers is None else headers
+    with m.app.test_client() as client:
+        if form is not None:
+            return client.post("/presence/event", data=form, headers=hdrs)
+        if data is not None:
+            return client.post("/presence/event", data=data, headers=hdrs, content_type="application/json")
+        return client.post("/presence/event", json=payload, headers=hdrs)
+
+
+def _pe_assert_clean(resp):
+    blob = (resp.get_data(as_text=True) + str(dict(resp.headers))).lower()
+    for bad in (_PE_TOKEN.lower(), "job search", "library", "toggl"):
+        assert bad not in blob
+
+
+def _pe_files(d):
+    return os.listdir(str(d))
+
+
+def test_presence_route_happy_path_records_and_replies_status_only(presence_env):
+    r = _pe_post({"place": "library", "event": "join"})
+    assert r.status_code == 200 and r.get_json() == {"status": "ok"}
+    got = presence_events.recent()
+    assert len(got) == 1 and got[0]["place"] == "library" and got[0]["event"] == "join"
+    _pe_assert_clean(r)
+
+
+def test_presence_route_form_body_works(presence_env):
+    r = _pe_post(form={"place": "library", "event": "join"})
+    assert r.status_code == 200 and r.get_json() == {"status": "ok"}
+    assert presence_events.recent()[0]["event"] == "join"
+
+
+@pytest.mark.parametrize("hdrs", [{}, {"X-Presence-Token": "wrong"}])
+def test_presence_route_bad_token_is_403_before_body_and_logs_nothing(presence_env, hdrs):
+    r = _pe_post(data="not json {{{", headers=hdrs)
+    assert r.status_code == 403 and r.get_json() == {"status": "forbidden"}
+    assert _pe_files(presence_env) == []
+    _pe_assert_clean(r)
+
+
+def test_presence_route_disabled_states_are_503_and_log_nothing(presence_env, monkeypatch):
+    ok = {"place": "library", "event": "join"}
+    monkeypatch.delenv("PRESENCE_TOKEN")
+    r1 = _pe_post(ok)
+    monkeypatch.setenv("PRESENCE_TOKEN", _PE_TOKEN)
+    monkeypatch.delenv("PRESENCE_PLACES")
+    r2 = _pe_post(ok)
+    monkeypatch.setenv("PRESENCE_PLACES", "{not json")
+    r3 = _pe_post(ok)
+    for r in (r1, r2, r3):
+        assert r.status_code == 503 and r.get_json() == {"status": "disabled"}
+        _pe_assert_clean(r)
+    assert _pe_files(presence_env) == []
+
+
+def test_presence_route_invalid_bodies_are_400_with_no_echo(presence_env):
+    canary = "ZZ-CANARY-4471"
+    resps = [
+        _pe_post({"place": "nowhere", "event": "join"}),
+        _pe_post({"place": canary, "event": "join"}),
+        _pe_post({"place": "library", "event": canary}),
+        _pe_post(data="[1, 2]"),
+        _pe_post(data=""),
+        _pe_post(data="[" * 500),
+    ]
+    for r in resps:
+        assert r.status_code == 400 and r.get_json() == {"status": "invalid"}
+        assert canary not in r.get_data(as_text=True)
+        _pe_assert_clean(r)
+    assert _pe_files(presence_env) == []
+
+
+def test_presence_route_oversized_body_is_413(presence_env):
+    big = '{"place": "library", "event": "join", "pad": "' + "x" * 5000 + '"}'
+    r = _pe_post(data=big)
+    assert r.status_code == 413 and r.get_json() == {"status": "invalid"}
+    assert _pe_files(presence_env) == []
+    _pe_assert_clean(r)
+
+
+def test_presence_route_duplicate_within_window_logs_one_line(presence_env):
+    a = _pe_post({"place": "library", "event": "join"})
+    b = _pe_post({"place": "library", "event": "join"})
+    assert a.get_json() == {"status": "ok"}
+    assert b.status_code == 200 and b.get_json() == {"status": "duplicate"}
+    assert len(presence_events.recent()) == 1
+    _pe_assert_clean(b)
+
+
+def test_presence_route_61st_event_in_an_hour_is_429(presence_env):
+    for i in range(60):
+        ev = "join" if i % 2 == 0 else "leave"
+        assert _pe_post({"place": "library", "event": ev}).status_code == 200
+    r = _pe_post({"place": "library", "event": "join"})
+    assert r.status_code == 429 and r.get_json() == {"status": "rate_limited"}
+    assert len(presence_events.recent(limit=500)) == 60
+    _pe_assert_clean(r)
+
+
+def test_presence_route_get_is_405(presence_env):
+    with m.app.test_client() as client:
+        r = client.get("/presence/event", headers={"X-Presence-Token": _PE_TOKEN})
+    assert r.status_code == 405
+
+
+def test_presence_route_join_then_leave_leaves_place_out(presence_env):
+    assert _pe_post({"place": "library", "event": "join"}).status_code == 200
+    assert presence_events.place_state("library") == "in"
+    assert _pe_post({"place": "library", "event": "leave"}).status_code == 200
+    assert presence_events.place_state("library") == "out"
+
+
+def test_presence_route_log_never_holds_token_or_header_name(presence_env):
+    _pe_post({"place": "library", "event": "join"})
+    text = "".join(open(os.path.join(str(presence_env), f), encoding="utf-8").read()
+                   for f in _pe_files(presence_env))
+    assert text and _PE_TOKEN not in text and "x-presence-token" not in text.lower()
+
+
+def test_presence_route_tap_json_form_and_duplicate(presence_env):
+    r = _pe_post({"place": "library", "event": "tap"})
+    assert r.status_code == 200 and r.get_json() == {"status": "ok"}
+    assert presence_events.recent()[0]["event"] == "tap"
+    r2 = _pe_post(form={"place": "library", "event": "tap"})
+    assert r2.status_code == 200 and r2.get_json() == {"status": "duplicate"}
+    assert len(presence_events.recent()) == 1
+
+
+@pytest.mark.parametrize("word", ["arrive", "TAPPED"])
+def test_presence_route_unknown_event_word_is_400_and_logs_nothing(presence_env, word):
+    r = _pe_post({"place": "library", "event": word})
+    assert r.status_code == 400 and r.get_json() == {"status": "invalid"}
+    assert _pe_files(presence_env) == []
+
+
+def test_presence_route_chunked_body_over_cap_is_413_and_reads_only_cap_plus_one(presence_env):
+    class _Spy(io.BytesIO):
+        asked = []
+
+        def read(self, n=-1):
+            _Spy.asked.append(n)
+            return super().read(n)
+
+    body = b'{"place": "library", "event": "join", "pad": "' + b"x" * 50000 + b'"}'
+    from werkzeug.test import EnvironBuilder
+    env = EnvironBuilder(path="/presence/event", method="POST",
+                         headers={"X-Presence-Token": _PE_TOKEN},
+                         content_type="application/json").get_environ()
+    env.pop("CONTENT_LENGTH", None)  # chunked-style: no Content-Length at all
+    env["wsgi.input"] = _Spy(body)
+    env["wsgi.input_terminated"] = True
+    seen = {}
+
+    def _start(status, headers, exc_info=None):
+        seen["status"] = status
+
+    out_body = b"".join(m.app.wsgi_app(env, _start))
+    assert seen["status"].startswith("413") and json.loads(out_body) == {"status": "invalid"}
+    assert _pe_files(presence_env) == []
+    assert _Spy.asked and max(_Spy.asked) <= presence_events.MAX_BODY_BYTES + 1
+
+
+def test_presence_route_env_token_with_trailing_whitespace_still_matches(presence_env, monkeypatch):
+    monkeypatch.setenv("PRESENCE_TOKEN", _PE_TOKEN + " \n")
+    r = _pe_post({"place": "library", "event": "join"})
+    assert r.status_code == 200 and r.get_json() == {"status": "ok"}
+
+
+def test_presence_route_malformed_multipart_is_400(presence_env):
+    with m.app.test_client() as client:
+        r = client.post("/presence/event", data=b"--zz\r\nbroken\r\n",
+                        headers={"X-Presence-Token": _PE_TOKEN},
+                        content_type="multipart/form-data; boundary=zz")
+    assert r.status_code == 400 and r.get_json() == {"status": "invalid"}
+    assert _pe_files(presence_env) == []
+
+
+def test_presence_route_unexpected_record_error_is_500_with_class_name_only(presence_env, monkeypatch, caplog):
+    def boom(place, event):
+        raise KeyError("ZZ-SECRET-5512")
+    monkeypatch.setattr(presence_events, "record", boom)
+    with caplog.at_level("DEBUG"):
+        r = _pe_post({"place": "library", "event": "join"})
+    assert r.status_code == 500 and r.get_json() == {"status": "error"}
+    assert "KeyError" in caplog.text
+    assert "ZZ-SECRET-5512" not in caplog.text and _PE_TOKEN not in caplog.text
+    assert "Traceback" not in caplog.text
