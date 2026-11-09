@@ -441,6 +441,15 @@ grep -i "contact" FUNCTION_INDEX.md
 | 280 | `_name_company_key` | _(no docstring)_ |
 | 286 | `plan_import` | Clean, de-duplicate and map `rows`. `existing` is a list of PEOPLE-row dicts (name, |
 
+## `local_http.py` — 4 defs, 47 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 14 | `_check_url` | Raise ValueError unless url is plain http to localhost, 127.0.0.1 or ::1. |
+| 32 | `_request` | _(no docstring)_ |
+| 42 | `local_post` | _(no docstring)_ |
+| 46 | `local_get` | _(no docstring)_ |
+
 ## `main.py` — 520 defs, 22,141 lines
 
 | Line | Name | Summary |
@@ -1855,4 +1864,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1391 definitions across 89 files + Code.gs.**
+**1395 definitions across 90 files + Code.gs.**
