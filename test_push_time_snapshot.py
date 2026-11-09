@@ -348,3 +348,104 @@ def test_missing_timezone_data_is_announced(monkeypatch):
     monkeypatch.setattr(P, "_tz_available", lambda: False)
     rc, out = run(["--dry-run"])
     assert "dates are shown in UTC" in out
+
+
+# ---- proxy bypass: ActivityWatch calls never reach a proxy; the engine post still may ----
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+_REAL_SOCKET = socket.socket
+_REAL_CREATE = socket.create_connection
+_REAL_POST = requests.post
+
+
+class _FakeServer:
+    def __init__(self, reply):
+        self.requests = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def _do(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(n)
+                outer.requests.append((self.command, self.path))
+                out = json.dumps(reply).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            do_GET = do_POST = _do
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def proxy_servers(monkeypatch):
+    # the autouse no_network fixture blocks sockets; these tests talk to loopback fakes only
+    monkeypatch.setattr(socket, "socket", _REAL_SOCKET)
+    monkeypatch.setattr(socket, "create_connection", _REAL_CREATE)
+    monkeypatch.setattr(requests, "post", _REAL_POST)
+    made = []
+
+    def make(reply):
+        s = _FakeServer(reply)
+        made.append(s)
+        return s
+
+    proxy = make({"ok": True})
+    for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(k, f"http://127.0.0.1:{proxy.port}")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    yield make, proxy
+    for s in made:
+        s.close()
+
+
+def test_proxy_default_aw_calls_bypass_proxy(proxy_servers, tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    make, proxy = proxy_servers
+
+
+    aw = make(events())
+    out = []
+    rc = P.main(["--dry-run", "--aw-url", f"http://127.0.0.1:{aw.port}"], now=NOW,
+                post=boom_post, out=out.append)
+    assert rc == 0, out
+    assert ("POST", "/api/0/query/") in aw.requests
+    assert ("GET", "/api/0/buckets/") in aw.requests
+    assert proxy.requests == []
+
+
+def test_proxy_control_requests_post_leaks_to_proxy(proxy_servers):
+    make, proxy = proxy_servers
+    aw = make([])
+    requests.post(f"http://localhost:{aw.port}/api/0/query/", json={}, timeout=5)
+    assert len(proxy.requests) == 1
+
+
+def test_proxy_engine_post_still_follows_proxy(proxy_servers):
+    make, proxy = proxy_servers
+    import push_actual_snapshot as pas
+    pas.default_post("http://engine.invalid/snapshots/ingest", json={}, timeout=5,
+                     allow_redirects=False)
+    assert [r[1] for r in proxy.requests] == ["http://engine.invalid/snapshots/ingest"]
+
+
+def test_proxy_default_function_source_has_no_requests_call():
+    src = (Path(__file__).parent / "scripts" / "push_time_snapshot.py").read_text(encoding="utf-8")
+    body = src.split("def _aw_post_default", 1)[1].split("def aw_url_ok", 1)[0]
+    assert "requests.post(" not in body and "requests.get(" not in body
+    assert body.count("local_http.") == 2

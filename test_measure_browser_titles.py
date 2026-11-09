@@ -267,3 +267,84 @@ def test_final_line_last():
         rc, out, _ = run(argv, payload)
         assert rc == 0
         assert out.splitlines()[-1].startswith("Nothing was saved or sent.")
+
+
+# ---- proxy bypass: the default ActivityWatch post must never reach a proxy ----
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class _FakeServer:
+    def __init__(self, reply):
+        self.requests = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def _do(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(n)
+                outer.requests.append((self.command, self.path))
+                out = json.dumps(reply).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            do_GET = do_POST = _do
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def proxy_servers(monkeypatch):
+    made = []
+
+    def make(reply):
+        s = _FakeServer(reply)
+        made.append(s)
+        return s
+
+    proxy = make({"ok": True})
+    for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(k, f"http://127.0.0.1:{proxy.port}")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    yield make, proxy
+    for s in made:
+        s.close()
+
+
+def test_default_post_bypasses_proxy(proxy_servers, capsys):
+    make, proxy = proxy_servers
+    aw = make(synthetic())
+    lines = []
+    rc = mbt.main(["--aw-url", f"http://localhost:{aw.port}"], now=NOW, out=lines.append)
+    assert rc == 0, lines
+    assert aw.requests == [("POST", "/api/0/query/")]
+    assert proxy.requests == []
+
+
+def test_proxy_control_requests_post_leaks_to_proxy(proxy_servers):
+    import requests
+    make, proxy = proxy_servers
+    aw = make([])
+    requests.post(f"http://localhost:{aw.port}/api/0/query/", json={}, timeout=5)
+    assert len(proxy.requests) == 1
+
+
+def test_proxy_default_function_source_has_no_requests_call():
+    src = (ROOT / "scripts" / "measure_browser_titles.py").read_text(encoding="utf-8")
+    body = src.split("def _aw_post_default", 1)[1].split("\ndef ", 1)[0]
+    assert "requests.post(" not in body and "requests.get(" not in body
+    assert "local_http" in body
