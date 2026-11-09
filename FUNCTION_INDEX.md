@@ -1469,7 +1469,7 @@ grep -i "contact" FUNCTION_INDEX.md
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 49 | `_aw_post_default` | _(no docstring)_ |
+| 50 | `_aw_post_default` | _(no docstring)_ |
 | 54 | `aw_url_ok` | Same-machine http only (the engine URL check with loopback hosts); any whitespace or |
 | 62 | `_collapse` | _(no docstring)_ |
 | 66 | `_parse_z` | _(no docstring)_ |
@@ -1540,22 +1540,22 @@ grep -i "contact" FUNCTION_INDEX.md
 | 125 | `report_reply` | Print the status line and the sentence for the engine's reply; return the exit code. |
 | 147 | `main` | _(no docstring)_ |
 
-## `scripts/push_time_snapshot.py` — 12 defs, 278 lines
+## `scripts/push_time_snapshot.py` — 12 defs, 277 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 32 | `_aw_post_default` | _(no docstring)_ |
+| 33 | `_aw_post_default` | _(no docstring)_ |
 | 37 | `_aw_get_default` | _(no docstring)_ |
-| 42 | `aw_url_ok` | Same-machine http only: reuses the engine URL check with a loopback-only host list. |
-| 47 | `_parse_z` | _(no docstring)_ |
-| 51 | `_is_timeout` | _(no docstring)_ |
-| 61 | `_is_conn_error` | _(no docstring)_ |
-| 74 | `_parse_created` | ISO timestamp -> aware datetime on any Python 3.x (fractions normalised to 6 digits, |
-| 85 | `_earliest_created` | (earliest `created` among afk/window buckets or None, number of unreadable dates). |
-| 105 | `_local_date` | _(no docstring)_ |
-| 113 | `_tz_available` | _(no docstring)_ |
-| 122 | `_load_config` | Return (buckets, app_buckets, source label) or None after printing problems. |
-| 145 | `main` | _(no docstring)_ |
+| 41 | `aw_url_ok` | Same-machine http only: reuses the engine URL check with a loopback-only host list. |
+| 46 | `_parse_z` | _(no docstring)_ |
+| 50 | `_is_timeout` | _(no docstring)_ |
+| 60 | `_is_conn_error` | _(no docstring)_ |
+| 73 | `_parse_created` | ISO timestamp -> aware datetime on any Python 3.x (fractions normalised to 6 digits, |
+| 84 | `_earliest_created` | (earliest `created` among afk/window buckets or None, number of unreadable dates). |
+| 104 | `_local_date` | _(no docstring)_ |
+| 112 | `_tz_available` | _(no docstring)_ |
+| 121 | `_load_config` | Return (buckets, app_buckets, source label) or None after printing problems. |
+| 144 | `main` | _(no docstring)_ |
 
 ## `scripts/queue_from_cloud.py` — 8 defs, 169 lines
 
