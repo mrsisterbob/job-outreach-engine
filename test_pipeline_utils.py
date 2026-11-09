@@ -4257,3 +4257,99 @@ def test_vlink_help_bare_command_is_not_swallowed():
     import command_help as ch
     assert ch.lookup_command_help("/vlink") is None
     assert ch.lookup_command_help("/vlink Jane Doe") is None
+
+
+# ---- _is_duplicate_of_other_job content-keyed cache (TASK-304) ----
+
+def _counting_matcher(monkeypatch, re_):
+    import difflib
+    calls = {"n": 0}
+
+    class Counting(difflib.SequenceMatcher):
+        def __init__(self, *a, **k):
+            calls["n"] += 1
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(re_.difflib, "SequenceMatcher", Counting)
+    return calls
+
+
+def test_duplicate_check_cache_second_call_does_no_difflib(monkeypatch):
+    import resume_engine as re_
+    calls = _counting_matcher(monkeypatch, re_)
+    others = ["alpha unique cache probe one", "beta unique cache probe two", "gamma unique cache probe 3"]
+    bullet = "zzz fresh cache probe bullet text 7431"
+    first = re_._is_duplicate_of_other_job(bullet, others)
+    assert 0 < calls["n"] <= len(others)
+    n = calls["n"]
+    assert re_._is_duplicate_of_other_job(bullet, list(others)) == first
+    assert calls["n"] == n
+
+
+def test_duplicate_check_cache_matches_uncached_reference():
+    import difflib
+    import resume_engine as re_
+
+    def ref(b, others):
+        t = str(b or "").lower()
+        return any(difflib.SequenceMatcher(None, t, str(o or "").lower()).ratio() >= re_._DUPLICATE_BULLET_RATIO
+                   for o in others)
+
+    base = "Built a pipeline that cut report time from four hours to ten minutes"
+    cases = [
+        (base, [base]),
+        (base, ["Managed a fleet of forklifts across three warehouses in Ohio"]),
+        (base.upper(), [base.lower()]),
+        ("", [base]),
+        (None, [base]),
+        (base, [None, base]),
+        (base, [None]),
+        (base, []),
+    ]
+    for _ in range(2):  # cold then warm
+        for b, o in cases:
+            assert re_._is_duplicate_of_other_job(b, o) == ref(b, o), (b, o)
+
+
+def test_duplicate_check_cache_hot_reload_and_inplace_mutation():
+    import resume_engine as re_
+    bullet = "Reconciled vendor invoices against purchase orders for a 40 person team zx9"
+    others = ["Something wholly different about forklifts and pallets in a warehouse"]
+    assert re_._is_duplicate_of_other_job(bullet, others) is False
+    assert re_._is_duplicate_of_other_job(bullet, others + [bullet]) is True
+    assert re_._is_duplicate_of_other_job(bullet, others) is False
+    others.append(bullet)  # same list object, changed in place
+    assert re_._is_duplicate_of_other_job(bullet, others) is True
+
+
+def test_duplicate_check_cache_threshold_cannot_leak(monkeypatch):
+    import resume_engine as re_
+    a = "Reduced churn by redesigning the onboarding flow for new accounts q81"
+    b = "Reduced churn by redesigning the onboarding flow for new users q81"
+    assert re_._is_duplicate_of_other_job(a, [b]) is True
+    monkeypatch.setattr(re_, "_DUPLICATE_BULLET_RATIO", 1.01)
+    assert re_._is_duplicate_of_other_job(a, [b]) is False
+
+
+def test_duplicate_check_cache_write_path_through_filter(monkeypatch):
+    import copy
+    import resume_engine as re_
+    first = re_.filter_ats_bullet_entries("d", [0, 1, 2], "conservative")
+    calls = _counting_matcher(monkeypatch, re_)
+    second = re_.filter_ats_bullet_entries("d", [0, 1, 2], "conservative")
+    assert second == first
+    assert calls["n"] == 0
+    target = re_.bullet_text(first[0])
+    bank = copy.deepcopy(re_.load_evidence_bank())
+    for job in bank["experience"]:
+        job["bullets"] = list(job.get("bullets", [])) + [target]
+    monkeypatch.setattr(re_, "load_evidence_bank", lambda: bank)
+    after = re_.filter_ats_bullet_entries("d", [0, 1, 2], "conservative")
+    assert target not in [re_.bullet_text(e) for e in after]
+
+
+def test_duplicate_check_cache_keeps_name_and_signature():
+    import inspect
+    import resume_engine as re_
+    assert list(inspect.signature(re_._is_duplicate_of_other_job).parameters) == ["bullet", "other_bullets"]
+    assert re_._is_duplicate_cached.cache_info().maxsize is not None

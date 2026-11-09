@@ -9,6 +9,7 @@ and bounds-checks against the actual bullet pool before rendering.
 """
 
 import difflib
+import functools
 import io
 import json
 import logging
@@ -209,12 +210,20 @@ def _bullets_of_other_jobs(evidence: dict) -> list:
     return _duplicate_check_targets(evidence, 0)
 
 
+@functools.lru_cache(maxsize=4096)
+def _is_duplicate_cached(text: str, others: tuple, ratio: float) -> bool:
+    """Pure core of the duplicate check. Keyed on CONTENT (lowered text, lowered others, and the
+    threshold), so a hot-reloaded or edited bank misses and a changed threshold cannot leak."""
+    return any(
+        difflib.SequenceMatcher(None, text, other).ratio() >= ratio
+        for other in others
+    )
+
+
 def _is_duplicate_of_other_job(bullet: str, other_bullets: list) -> bool:
     text = str(bullet or "").lower()
-    return any(
-        difflib.SequenceMatcher(None, text, str(other or "").lower()).ratio() >= _DUPLICATE_BULLET_RATIO
-        for other in other_bullets
-    )
+    others = tuple(str(other or "").lower() for other in other_bullets)
+    return _is_duplicate_cached(text, others, _DUPLICATE_BULLET_RATIO)
 
 
 def filter_ats_bullets(track: str = "a", bullet_indices: list = None, tone_mode: str = "conservative") -> list:
