@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import activity_snapshot as act  # noqa: E402
 import push_actual_snapshot as pas  # noqa: E402
+import local_http  # noqa: E402
 
 MAX_BUCKETS = 20
 MAX_KEYWORDS = 60
@@ -47,8 +48,7 @@ FINAL_LINE = ("Nothing was saved or sent. These hours come from your own PC; pas
 
 
 def _aw_post_default(url, **kw):
-    import requests
-    return requests.post(url, allow_redirects=False, **kw)
+    return local_http.local_post(url, **kw)
 
 
 def aw_url_ok(url):

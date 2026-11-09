@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import activity_snapshot as act  # noqa: E402
 import push_actual_snapshot as pas  # noqa: E402
+import local_http  # noqa: E402
 
 CAVEAT = ("ActivityWatch only sees this PC while it is on and you are at it. Sleep, gym, meals "
           "and time away are not in these hours - log them with /life log.")
@@ -30,13 +31,11 @@ LAST_WEEK_NOTE = ("The finance page shows the newest snapshot. Push the current 
 
 
 def _aw_post_default(url, **kw):
-    import requests
-    return requests.post(url, allow_redirects=False, **kw)
+    return local_http.local_post(url, **kw)
 
 
 def _aw_get_default(url, **kw):
-    import requests
-    return requests.get(url, allow_redirects=False, **kw)
+    return local_http.local_get(url, **kw)
 
 
 def aw_url_ok(url):
