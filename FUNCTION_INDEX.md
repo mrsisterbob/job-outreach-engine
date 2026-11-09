@@ -1456,6 +1456,22 @@ grep -i "contact" FUNCTION_INDEX.md
 | 241 | `report` | _(no docstring)_ |
 | 265 | `main` | _(no docstring)_ |
 
+## `scripts/measure_browser_titles.py` — 11 defs, 251 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 49 | `_aw_post_default` | _(no docstring)_ |
+| 54 | `aw_url_ok` | Same-machine http only (the engine URL check with loopback hosts); any whitespace or |
+| 62 | `_collapse` | _(no docstring)_ |
+| 66 | `_parse_z` | _(no docstring)_ |
+| 70 | `build_title_query` | _(no docstring)_ |
+| 77 | `load_keywords` | -> list of (bucket, [keywords]) in file order, or None when the file is refused. |
+| 107 | `browser_titles` | AW reply -> (rows, unreadable) with rows = {title: seconds}. Returns None when the reply |
+| 131 | `top_words` | _(no docstring)_ |
+| 139 | `match_buckets` | First match wins. -> ({bucket: seconds}, unmatched seconds). |
+| 154 | `_h` | _(no docstring)_ |
+| 158 | `main` | _(no docstring)_ |
+
 ## `scripts/measure_free_resolver.py` — 7 defs, 228 lines
 
 | Line | Name | Summary |
@@ -1839,4 +1855,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1380 definitions across 88 files + Code.gs.**
+**1391 definitions across 89 files + Code.gs.**
