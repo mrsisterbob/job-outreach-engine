@@ -1449,6 +1449,25 @@ grep -i "contact" FUNCTION_INDEX.md
 | 176 | `write_result` | _(no docstring)_ |
 | 194 | `main` | _(no docstring)_ |
 
+## `scripts/measure_toggl.py` — 14 defs, 444 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 45 | `_default_http` | _(no docstring)_ |
+| 52 | `_inside` | _(no docstring)_ |
+| 60 | `_basic` | _(no docstring)_ |
+| 66 | `_redactor` | _(no docstring)_ |
+| 82 | `_hours` | _(no docstring)_ |
+| 86 | `_keys` | _(no docstring)_ |
+| 92 | `_loads` | _(no docstring)_ |
+| 99 | `_num` | _(no docstring)_ |
+| 103 | `_scrub` | Keep structure, key names, non-id numbers, booleans, ISO timestamps; alias ids; blank text. |
+| 131 | `_utc` | _(no docstring)_ |
+| 138 | `analyse` | Pure: shape facts about a list of time-entry dicts. project_ids None = list not fetched. |
+| 179 | `reports_total_seconds` | Total seconds in a Reports v3 summary reply (shape recalled, UNVERIFIED), or None. |
+| 195 | `_write_new` | _(no docstring)_ |
+| 207 | `main` | _(no docstring)_ |
+
 ## `scripts/measure_workday_fetch.py` — 10 defs, 237 lines
 
 | Line | Name | Summary |
@@ -1801,4 +1820,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1352 definitions across 86 files + Code.gs.**
+**1366 definitions across 87 files + Code.gs.**
