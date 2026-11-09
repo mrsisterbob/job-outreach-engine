@@ -1146,6 +1146,23 @@ grep -i "contact" FUNCTION_INDEX.md
 | 3242 | `industrial_term_hits` | Distinct industrial / material-handling vocabulary found in a job description. |
 | 3250 | `required_degree_is_technical_trade` | True when a degree clause names only technical-trade fields (mechatronics, mechanical, electrical...). |
 
+## `presence_events.py` — 12 defs, 220 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 48 | `PresenceInvalid` | The input is not acceptable; the message is fixed and never echoes the input. |
+| 52 | `parse_places` | Env text -> {place key: label}. None/blank -> {}. Anything malformed raises. |
+| 79 | `parse_event` | Validate one call -> (place, event). Fixed messages, no echo of the input. |
+| 95 | `_aware` | _(no docstring)_ |
+| 105 | `_month_name` | _(no docstring)_ |
+| 109 | `_prev_month` | _(no docstring)_ |
+| 114 | `_read_file` | Valid entries of one file in file order; unreadable file or corrupt lines are skipped. |
+| 139 | `_load` | Entries from the previous and current month files, oldest first (file order). |
+| 148 | `_public` | _(no docstring)_ |
+| 152 | `record` | Log one event -> {"status": "ok"\|"duplicate"\|"rate_limited", ...}. OSError if unwritable. |
+| 200 | `recent` | Newest-first entries across the current and previous month; limit clamped to 1..500. |
+| 212 | `place_state` | "in" if the place's latest event is join/tap, "out" if leave, else "unknown". |
+
 ## `queue_baseline.py` — 9 defs, 224 lines
 
 | Line | Name | Summary |
@@ -1820,4 +1837,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1366 definitions across 87 files + Code.gs.**
+**1378 definitions across 88 files + Code.gs.**
