@@ -37,6 +37,12 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect_ex", blocked)
 
 
+MEASURED_400 = jl.dumps({
+    "error": "validation",
+    "error_description": "Key: 'StartTrackingPayload.Type' Error:Field validation for 'Type' failed on the 'required' tag",
+    "error_values": {"Type": "SECRET-TYPE-VALUE-9"}, "trace_id": "TRACE-ZZ-5512"}).encode()
+
+
 class FakeFocus:
     """Behaves like Focus as documented: start replaces a running timer, stop ends whatever runs,
     204 when idle."""
@@ -44,7 +50,8 @@ class FakeFocus:
     def __init__(self, replace=True, running=None, foreign_from=None, stop_status=200,
                  delete_status=204, stubborn=False, override=None, echo_auth=False, projects=None,
                  quota=None, raise_at=None, start_fail=None, delete_keeps_running=False,
-                 stop_fail_first=False):
+                 stop_fail_first=False, start_refuse=None):
+        self.start_refuse = start_refuse or {}   # nth start -> reply bytes, answered 400, nothing created
         self.replace = replace
         self.running = list(running or [])
         self.entries = {}
@@ -98,6 +105,10 @@ class FakeFocus:
             return 200, rh, jl.dumps(self._entry(i)).encode()
         if path.endswith("/tracking/start") and method == "POST":
             self.nstart += 1
+            if self.nstart in self.start_refuse:
+                return 400, rh, self.start_refuse[self.nstart]
+            if body.get("type") != "activity":
+                return 400, rh, MEASURED_400
             i = self.next_id
             self.next_id += 1
             fail = self.start_fail.get(self.nstart)
@@ -160,6 +171,8 @@ def env(monkeypatch):
 def run(tmp_path, fake, extra=(), yes=True, record=None):
     out = []
     rec = record or str(tmp_path / "rec")
+    if record is not None and Path(record).resolve() != Path(str(probe.ROOT / "zz_probe_rec")).resolve()             and not str(probe.MAIN_CHECKOUT) in str(record):
+        assert Path(record).resolve().is_relative_to(tmp_path.resolve()), "record path outside tmp_path"
     argv = ["--record", rec, "--org", "4001", "--workspace", "4002"] + list(extra)
     if yes:
         argv.append("--yes")
@@ -451,7 +464,7 @@ def test_scrubbed_file_hides_user_ints(tmp_path, env):
         assert bad not in sc
 
 
-def test_record_refused_in_any_git_tree(tmp_path, env):
+def test_record_refused_in_any_git_tree(tmp_path, env, monkeypatch):
     fake = FakeFocus()
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
@@ -461,9 +474,18 @@ def test_record_refused_in_any_git_tree(tmp_path, env):
     main_dir = probe.MAIN_CHECKOUT / "zz_probe_rec_never"
     code, text, _ = run(tmp_path, fake, record=str(main_dir))
     assert code == 2 and fake.calls == [] and not main_dir.exists()
-    sibling = probe.ROOT.parent / "TASK-zzz" / "rec"
+    # layout independent of where this checkout lives: everything under tmp_path
+    monkeypatch.setattr(probe, "ROOT", tmp_path / "wt" / "TASK-a")
+    monkeypatch.setattr(probe, "MAIN_CHECKOUT", tmp_path / "main")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    sibling = wt / "TASK-zzz" / "rec"
     code, text, _ = run(tmp_path, fake, record=str(sibling))
-    assert code == 2 and fake.calls == []
+    assert code == 0 and fake.calls          # no .git anywhere in tmp_path: accepted
+    (wt / ".git").mkdir()
+    fake2 = FakeFocus()
+    code, text, _ = run(tmp_path, fake2, record=str(wt / "TASK-yyy" / "rec"))
+    assert code == 2 and fake2.calls == [] and not (wt / "TASK-yyy").exists()
 
 
 def test_default_http_uses_session_without_env(monkeypatch):
@@ -508,3 +530,64 @@ def test_cleanup_stops_after_delete_then_rereads_current(tmp_path, env):
     fake2 = FakeFocus(stubborn=True)
     code, text, _ = run(tmp_path / "s", fake2)
     assert code == 1 and "current idle: other (status 200)" in text
+
+
+def starts_of(fake):
+    return [c for c in fake.calls if c["url"].endswith("/tracking/start")]
+
+
+def test_every_start_carries_the_required_type(tmp_path, env):
+    fake = FakeFocus()
+    code, text, _ = run(tmp_path, fake)
+    assert code == 0, text
+    ss = starts_of(fake)
+    assert len(ss) == 2 and all(c["json"].get("type") == "activity" for c in ss)
+    assert probe.START_TYPE == "activity"
+
+
+def test_measured_refusal_names_the_reason(tmp_path, env):
+    fake = FakeFocus(start_refuse={1: MEASURED_400})
+    code, text, _ = run(tmp_path, fake)
+    assert code == 1
+    assert "start A: refused (HTTP 400):" in text and "Type" in text and "required" in text
+    assert "without a project: refused" not in text
+    assert "error_values keys: Type" in text
+    assert "SECRET-TYPE-VALUE-9" not in text and "TRACE-ZZ-5512" not in text
+    assert not any(c["url"].endswith("/tracking/stop") or c["method"] == "DELETE" for c in fake.calls)
+
+
+def test_refusal_reason_is_sanitized_and_capped(tmp_path, env, capsys):
+    desc = "ZZ-CANARY-DESC-4471 " + TOKEN + " {bad}[x]!" + "q" * 400
+    reply = jl.dumps({"error": "validation", "error_description": desc,
+                      "trace_id": "TRACE-ZZ-5512"}).encode()
+    fake = FakeFocus(start_refuse={1: reply})
+    code, text, rec = run(tmp_path, fake)
+    assert code == 1
+    line = next(l for l in text.splitlines() if l.startswith("  start A: refused (HTTP 400): "))
+    reason = line[len("  start A: refused (HTTP 400): "):]
+    assert len(reason) <= 160
+    assert TOKEN not in text and "{" not in reason and "[" not in reason and "!" not in reason
+    assert "?" in reason
+    shown = text + capsys.readouterr().out + capsys.readouterr().err
+    scrubbed = "".join(f.read_text(encoding="utf-8") for f in rec.glob("*.scrubbed.json"))
+    assert "TRACE-ZZ-5512" not in shown and "TRACE-ZZ-5512" not in scrubbed
+    assert TOKEN not in scrubbed
+
+
+def test_refused_start_b_reports_and_cleans_up(tmp_path, env):
+    fake = FakeFocus(start_refuse={2: MEASURED_400})
+    code, text, _ = run(tmp_path, fake)
+    assert code == 1
+    assert "start B: refused (HTTP 400):" in text
+    dels = [c for c in fake.calls if c["method"] == "DELETE"]
+    assert len(dels) == 1 and dels[0]["url"].endswith("ids=7001")
+    for i, c in enumerate(fake.calls):
+        if c["url"].endswith("/tracking/stop"):
+            assert fake.calls[i - 1]["returned"] == "7001"
+
+
+def test_refused_delete_reads_as_a_finding(tmp_path, env):
+    fake = FakeFocus(delete_status=405)
+    code, text, _ = run(tmp_path, fake)
+    assert code == 1
+    assert "delete: refused (HTTP 405) - delete the two probe entries by hand in Focus" in text

@@ -47,6 +47,7 @@ MAX_REQUESTS = 14
 MIN_QUOTA = 14
 DESC_A = "probe A - safe to delete"
 DESC_B = "probe B - safe to delete"
+START_TYPE = "activity"      # required on start (measured: HTTP 400 without it); or "break"
 PLAN = ("Plan (nothing is sent without --yes):\n"
         "  1. check that no timer is running\n"
         "  2. optionally look up the project named by --project-name\n"
@@ -332,6 +333,24 @@ def main(argv=None, http=None, out=print, now=None):
     def ok(status):
         return isinstance(status, int) and 200 <= status < 300
 
+    def refusal(name, status, parsed):
+        """Report why a start was refused: the reply's own reason, sanitized; keys only, no values."""
+        if not isinstance(status, int):
+            m[name] = "request failed (no reply)"
+            return
+        reason = None
+        if isinstance(parsed, dict):
+            for k in ("error_description", "error"):
+                if isinstance(parsed.get(k), str) and parsed[k]:
+                    reason = parsed[k]
+                    break
+        reason = red(reason if reason is not None else "no reason in reply")[:160]
+        reason = re.sub(r"[^A-Za-z0-9 .,:;'_()<>=/-]", "?", reason)
+        m[name] = "refused (HTTP %s): %s" % (status, reason)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error_values"), dict):
+            m[name + " error_values keys"] = ", ".join(
+                re.sub(r"[^A-Za-z0-9 .,:;'_()<>=/-]", "?", str(k)) for k in sorted(parsed["error_values"], key=str))
+
     def current():
         s, rh, p = call("current", "GET", base + "/tracking/current")
         cid = _entry_id(p) if s == 200 else None
@@ -405,14 +424,17 @@ def main(argv=None, http=None, out=print, now=None):
                 say("Project not found.")
                 raise _Exit(1)
         # 3. start A
-        body_a = {"description": DESC_A, "start": _iso(clock())}
+        body_a = {"description": DESC_A, "start": _iso(clock()), "type": START_TYPE}
         if project_id is not None:
             body_a["project_id"] = project_id
         s, _, p = call("start A", "POST", base + "/tracking/start", body_a)
         a = _entry_id(p) if ok(s) else None
         e = _entry(p) if ok(s) else None
         label = "start with a project" if project_id is not None else "start without a project"
-        m[label] = "works" if ok(s) else "refused"
+        if ok(s):
+            m[label] = "works"
+        else:
+            refusal("start A", s, p)
         if not ok(s):
             # unknown outcome (timeout, 5xx, refusal): cleanup looks at `current` for a probe entry
             flags["unknown_entry"] = True
@@ -437,11 +459,13 @@ def main(argv=None, http=None, out=print, now=None):
             flags["bad"] = True
             return
         # 5. start B while A runs
-        body_b = {"description": DESC_B, "start": _iso(clock())}
+        body_b = {"description": DESC_B, "start": _iso(clock()), "type": START_TYPE}
         if project_id is not None:
             body_b["project_id"] = project_id
         s, _, p = call("start B", "POST", base + "/tracking/start", body_b)
         start_b_ok = ok(s)
+        if not start_b_ok:
+            refusal("start B", s, p)
         b = _entry_id(p) if start_b_ok else None
         if b is None:
             flags["unknown_entry"] = True     # unknown outcome until `current` says otherwise
@@ -524,7 +548,10 @@ def main(argv=None, http=None, out=print, now=None):
                 s, _, _ = call("delete", "DELETE", base + "/time-entries/bulk?ids=" + ",".join(ids),
                                force=True)
                 flags["delete_ok"] = ok(s)
-                m["delete"] = "status %s" % s
+                if ok(s):
+                    m["delete"] = "status %s" % s
+                else:
+                    m["delete"] = "refused (HTTP %s) - delete the two probe entries by hand in Focus" % s
             except _Abort:
                 m["delete"] = "not sent"
             except Exception:
