@@ -1536,28 +1536,28 @@ grep -i "contact" FUNCTION_INDEX.md
 | 183 | `format_tenant` | _(no docstring)_ |
 | 209 | `main` | _(no docstring)_ |
 
-## `scripts/probe_toggl_write.py` — 18 defs, 624 lines
+## `scripts/probe_toggl_write.py` — 18 defs, 651 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 74 | `_Exit` | _(no docstring)_ |
-| 75 | `_Exit.__init__` | _(no docstring)_ |
-| 80 | `_Abort` | _(no docstring)_ |
-| 84 | `_default_http` | _(no docstring)_ |
-| 97 | `_in_git_tree` | True if the resolved path, or any parent, is a git work tree (has a .git entry), or lies under |
-| 109 | `_inside` | _(no docstring)_ |
-| 117 | `_redactor` | Redact the key (raw, base64, json-escaped, URL-quoted forms) before anything is written. |
-| 138 | `_hide_ids` | _(no docstring)_ |
-| 145 | `_loads` | _(no docstring)_ |
-| 152 | `_num` | _(no docstring)_ |
-| 156 | `_idlike` | _(no docstring)_ |
-| 163 | `_scrub` | Keep structure, key names, small numbers, booleans, ISO timestamps; alias ids (any key named |
-| 186 | `_iso` | _(no docstring)_ |
-| 190 | `_write_new` | _(no docstring)_ |
-| 202 | `_entry` | The entry object of a reply: the bare dict, or one under "data". Else None. |
-| 211 | `_entry_id` | _(no docstring)_ |
-| 221 | `_items` | _(no docstring)_ |
-| 231 | `main` | _(no docstring)_ |
+| 75 | `_Exit` | _(no docstring)_ |
+| 76 | `_Exit.__init__` | _(no docstring)_ |
+| 81 | `_Abort` | _(no docstring)_ |
+| 85 | `_default_http` | _(no docstring)_ |
+| 98 | `_in_git_tree` | True if the resolved path, or any parent, is a git work tree (has a .git entry), or lies under |
+| 110 | `_inside` | _(no docstring)_ |
+| 118 | `_redactor` | Redact the key (raw, base64, json-escaped, URL-quoted forms) before anything is written. |
+| 139 | `_hide_ids` | _(no docstring)_ |
+| 146 | `_loads` | _(no docstring)_ |
+| 153 | `_num` | _(no docstring)_ |
+| 157 | `_idlike` | _(no docstring)_ |
+| 164 | `_scrub` | Keep structure, key names, small numbers, booleans, ISO timestamps; alias ids (any key named |
+| 187 | `_iso` | _(no docstring)_ |
+| 191 | `_write_new` | _(no docstring)_ |
+| 203 | `_entry` | The entry object of a reply: the bare dict, or one under "data". Else None. |
+| 212 | `_entry_id` | _(no docstring)_ |
+| 222 | `_items` | _(no docstring)_ |
+| 232 | `main` | _(no docstring)_ |
 
 ## `scripts/push_actual_snapshot.py` — 8 defs, 206 lines
 
