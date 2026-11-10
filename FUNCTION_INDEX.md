@@ -1706,6 +1706,24 @@ grep -i "contact" FUNCTION_INDEX.md
 | 30 | `figure_supported_by` | True when this one bullet carries the same figure. |
 | 49 | `figure_supported` | True when any rendered bullet carries the figure. |
 
+## `toggl_snapshot.py` — 13 defs, 243 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 43 | `TogglReplyError` | Toggl answered with something that is not a usable reply. |
+| 47 | `TogglTokenRejected` | Toggl rejected the API key. |
+| 51 | `_header` | _(no docstring)_ |
+| 60 | `check_reply` | Return None only for HTTP 200; raise for everything else (204 included). |
+| 84 | `_unwrap` | _(no docstring)_ |
+| 95 | `_parse_ts` | _(no docstring)_ |
+| 114 | `_good_duration` | _(no docstring)_ |
+| 119 | `_hashable` | _(no docstring)_ |
+| 127 | `_clean_name` | _(no docstring)_ |
+| 131 | `_tally` | _(no docstring)_ |
+| 211 | `_local_date` | _(no docstring)_ |
+| 218 | `build_toggl_section` | Build the `toggl` section. Raises TogglReplyError on a reply that is not wrapped data. |
+| 230 | `describe_week` | _(no docstring)_ |
+
 ## `track_registry.py` — 8 defs, 387 lines
 
 | Line | Name | Summary |
@@ -1873,4 +1891,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1404 definitions across 90 files + Code.gs.**
+**1417 definitions across 91 files + Code.gs.**
