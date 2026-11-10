@@ -1494,24 +1494,32 @@ grep -i "contact" FUNCTION_INDEX.md
 | 176 | `write_result` | _(no docstring)_ |
 | 194 | `main` | _(no docstring)_ |
 
-## `scripts/measure_toggl.py` — 14 defs, 444 lines
+## `scripts/measure_toggl.py` — 22 defs, 547 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
-| 45 | `_default_http` | _(no docstring)_ |
-| 52 | `_inside` | _(no docstring)_ |
-| 60 | `_basic` | _(no docstring)_ |
-| 66 | `_redactor` | _(no docstring)_ |
-| 82 | `_hours` | _(no docstring)_ |
-| 86 | `_keys` | _(no docstring)_ |
-| 92 | `_loads` | _(no docstring)_ |
-| 99 | `_num` | _(no docstring)_ |
-| 103 | `_scrub` | Keep structure, key names, non-id numbers, booleans, ISO timestamps; alias ids; blank text. |
-| 131 | `_utc` | _(no docstring)_ |
-| 138 | `analyse` | Pure: shape facts about a list of time-entry dicts. project_ids None = list not fetched. |
-| 179 | `reports_total_seconds` | Total seconds in a Reports v3 summary reply (shape recalled, UNVERIFIED), or None. |
-| 195 | `_write_new` | _(no docstring)_ |
-| 207 | `main` | _(no docstring)_ |
+| 52 | `_Limited` | _(no docstring)_ |
+| 53 | `_Limited.__init__` | _(no docstring)_ |
+| 58 | `_default_http` | _(no docstring)_ |
+| 65 | `_inside` | _(no docstring)_ |
+| 73 | `_redactor` | Redact the key before anything is truncated or written: raw, base64, json-escaped and |
+| 95 | `_hide_ids` | Whole-number match only, and only used on printed URLs/paths and error text, never on |
+| 104 | `_hours` | _(no docstring)_ |
+| 108 | `_keys` | _(no docstring)_ |
+| 114 | `_typed` | 'key (type), ...' for a dict: names and value type names only, never values. |
+| 119 | `_loads` | _(no docstring)_ |
+| 126 | `_num` | _(no docstring)_ |
+| 130 | `_items` | (list, holding key or None) for a bare list or an object holding one list; else (None, None). |
+| 141 | `_idlike` | _(no docstring)_ |
+| 145 | `_pid_key` | _(no docstring)_ |
+| 149 | `_scrub` | Keep structure, key names, non-id numbers, booleans, ISO timestamps; alias ids (int or string); |
+| 178 | `_utc` | _(no docstring)_ |
+| 185 | `pick_fields` | Which field names carry duration, start, end and project (UNVERIFIED names, looked up). |
+| 200 | `_duration` | _(no docstring)_ |
+| 210 | `analyse` | Pure: shape facts about time-entry dicts. project_ids None = list not fetched / has no ids. |
+| 253 | `_write_new` | _(no docstring)_ |
+| 265 | `main` | _(no docstring)_ |
+| 535 | `_first_values` | One example value per entry key (used only for its type name). |
 
 ## `scripts/measure_workday_fetch.py` — 10 defs, 237 lines
 
@@ -1865,4 +1873,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1396 definitions across 90 files + Code.gs.**
+**1404 definitions across 90 files + Code.gs.**
