@@ -10,7 +10,7 @@ import pytest
 import requests
 
 import local_http
-from local_http import local_get, local_post
+from local_http import local_delete, local_get, local_post
 
 
 class _Fake:
@@ -30,7 +30,7 @@ class _Fake:
                 outer.requests.append((self.command, self.path, body))
                 handler_fn(self, body)
 
-            do_GET = do_POST = _do
+            do_GET = do_POST = do_DELETE = _do
 
             def log_message(self, *a):
                 pass
@@ -124,7 +124,7 @@ REFUSED = [
 @pytest.mark.parametrize("url", REFUSED)
 def test_refused_urls(servers, proxy_env, url):
     aw = servers()
-    for fn in (local_post, local_get):
+    for fn in (local_post, local_get, local_delete):
         with pytest.raises(ValueError) as e:
             fn(url)
         assert str(e.value) == "local_http only talks to this machine"
@@ -158,7 +158,7 @@ def test_redirects_and_proxies_rejected(servers, proxy_env):
     u = f"http://localhost:{aw.port}/"
     for kw in ({"allow_redirects": True}, {"allow_redirects": False},
                {"proxies": {"http": "http://127.0.0.1:1"}}):
-        for fn in (local_post, local_get):
+        for fn in (local_post, local_get, local_delete):
             with pytest.raises(TypeError):
                 fn(u, **kw)
     assert aw.connections == 0 and proxy_env.connections == 0
@@ -197,3 +197,24 @@ def test_response_and_source(servers, proxy_env):
     assert not re.search(r"requests\.(get|post)\(", src)
     imports = re.findall(r"^\s*(?:import|from)\s+(\w+)", src, re.M)
     assert set(imports) <= {"urllib", "requests"}
+
+
+def test_delete_bypasses_proxy_with_control(servers, proxy_env):
+    aw = servers()
+    r = local_delete(f"http://localhost:{aw.port}/api/0/buckets/b/events/7", timeout=5)
+    assert r.status_code == 200
+    assert aw.requests[0][:2] == ("DELETE", "/api/0/buckets/b/events/7")
+    assert proxy_env.requests == [] and proxy_env.connections == 0
+    requests.delete(f"http://localhost:{aw.port}/x", timeout=5)
+    assert len(proxy_env.requests) == 1
+
+
+def test_delete_refuses_non_loopback_before_socket(servers, proxy_env):
+    aw = servers()
+    for url in ("http://example.com:5600/x", "https://localhost:5600/x"):
+        with pytest.raises(ValueError):
+            local_delete(url)
+    for kw in ({"allow_redirects": True}, {"proxies": {}}):
+        with pytest.raises(TypeError):
+            local_delete(f"http://localhost:{aw.port}/", **kw)
+    assert aw.connections == 0 and proxy_env.connections == 0

@@ -45,3 +45,7 @@ def local_post(url, **kw):
 
 def local_get(url, **kw):
     return _request("GET", url, kw)
+
+
+def local_delete(url, **kw):
+    return _request("DELETE", url, kw)
