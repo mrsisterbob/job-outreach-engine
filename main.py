@@ -5,6 +5,7 @@ import concurrent.futures as _cf
 import hmac
 import personal_snapshots
 import presence_events
+import presence_toggl
 from werkzeug.exceptions import HTTPException
 from werkzeug.wrappers import Request
 import signed_links
@@ -21909,6 +21910,10 @@ def presence_event():
         return _presence_reply("error", 500)
     status = result.get("status")
     if status == "ok":
+        try:
+            presence_toggl.dispatch(place, event)
+        except Exception as e:
+            logging.warning("[PRESENCE] toggl dispatch failed: %s", type(e).__name__)
         return _presence_reply("ok", 200)
     if status == "duplicate":
         return _presence_reply("duplicate", 200)

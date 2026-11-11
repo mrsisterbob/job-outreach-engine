@@ -25869,3 +25869,47 @@ def test_presence_route_unexpected_record_error_is_500_with_class_name_only(pres
     assert "KeyError" in caplog.text
     assert "ZZ-SECRET-5512" not in caplog.text and _PE_TOKEN not in caplog.text
     assert "Traceback" not in caplog.text
+
+
+# ---- presence -> toggl route (TASK-300) ----
+import presence_toggl  # noqa: E402
+
+
+@pytest.fixture
+def presence_toggl_calls(presence_env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(presence_toggl, "dispatch", lambda p, e: calls.append((p, e)))
+    return calls
+
+
+def test_presence_toggl_route_join_dispatches_once_and_reply_is_bare(presence_toggl_calls):
+    r = _pe_post({"place": "library", "event": "join"})
+    assert r.status_code == 200 and r.get_json() == {"status": "ok"}
+    assert presence_toggl_calls == [("library", "join")]
+
+
+def test_presence_toggl_route_non_ok_never_dispatches(presence_toggl_calls):
+    assert _pe_post({"place": "library", "event": "join"}).status_code == 200
+    assert _pe_post({"place": "library", "event": "join"}).get_json() == {"status": "duplicate"}
+    assert _pe_post({"place": "library", "event": "join"}, headers={"X-Presence-Token": "x"}).status_code == 403
+    assert _pe_post({"place": "nowhere", "event": "join"}).status_code == 400
+    assert presence_toggl_calls == [("library", "join")]
+
+
+def test_presence_toggl_route_rate_limited_never_dispatches(presence_toggl_calls, monkeypatch):
+    monkeypatch.setattr(presence_events, "record", lambda p, e: {"status": "rate_limited"})
+    assert _pe_post({"place": "library", "event": "join"}).status_code == 429
+    assert presence_toggl_calls == []
+
+
+def test_presence_toggl_route_dispatch_raising_keeps_200(presence_env, monkeypatch):
+    def boom(p, e):
+        raise RuntimeError("toggl exploded")
+    monkeypatch.setattr(presence_toggl, "dispatch", boom)
+    r = _pe_post({"place": "library", "event": "join"})
+    assert r.status_code == 200 and r.get_json() == {"status": "ok"}
+    _pe_assert_clean(r)
+
+
+def test_presence_toggl_route_reply_has_no_toggl_text(presence_toggl_calls):
+    _pe_assert_clean(_pe_post({"place": "library", "event": "tap"}))
