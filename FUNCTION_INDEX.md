@@ -1729,6 +1729,19 @@ grep -i "contact" FUNCTION_INDEX.md
 | 30 | `figure_supported_by` | True when this one bullet carries the same figure. |
 | 49 | `figure_supported` | True when any rendered bullet carries the figure. |
 
+## `toggl_aw_sync.py` — 8 defs, 190 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 34 | `_clean` | _(no docstring)_ |
+| 38 | `_iso_z` | _(no docstring)_ |
+| 43 | `_ms` | _(no docstring)_ |
+| 47 | `_finished_ok` | _(no docstring)_ |
+| 52 | `build_events` | Return (events, report). Both replies are the wrapped {"data": [...]} objects. |
+| 124 | `_ours` | _(no docstring)_ |
+| 133 | `_equal` | _(no docstring)_ |
+| 146 | `plan_sync` | Compare wanted events with the bucket's events; return the inserts and deletes. |
+
 ## `toggl_snapshot.py` — 13 defs, 243 lines
 
 | Line | Name | Summary |
@@ -1940,4 +1953,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1456 definitions across 93 files + Code.gs.**
+**1464 definitions across 94 files + Code.gs.**
