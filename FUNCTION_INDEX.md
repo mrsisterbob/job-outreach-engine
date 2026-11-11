@@ -1747,6 +1747,32 @@ grep -i "contact" FUNCTION_INDEX.md
 | 218 | `build_toggl_section` | Build the `toggl` section. Raises TogglReplyError on a reply that is not wrapped data. |
 | 230 | `describe_week` | _(no docstring)_ |
 
+## `toggl_timer.py` — 21 defs, 229 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 27 | `TogglError` | _(no docstring)_ |
+| 31 | `TogglTokenRejected` | _(no docstring)_ |
+| 35 | `TogglQuotaExceeded` | _(no docstring)_ |
+| 36 | `TogglQuotaExceeded.__init__` | _(no docstring)_ |
+| 42 | `TogglEntryGone` | _(no docstring)_ |
+| 46 | `TogglShapeError` | _(no docstring)_ |
+| 50 | `_default_http` | _(no docstring)_ |
+| 57 | `_check_ids` | _(no docstring)_ |
+| 63 | `_base` | _(no docstring)_ |
+| 68 | `_hdr` | _(no docstring)_ |
+| 75 | `_iso` | _(no docstring)_ |
+| 82 | `_parse_ts` | _(no docstring)_ |
+| 92 | `_call` | _(no docstring)_ |
+| 112 | `_raise_for` | _(no docstring)_ |
+| 139 | `_loads` | _(no docstring)_ |
+| 146 | `_reduce` | _(no docstring)_ |
+| 156 | `current` | _(no docstring)_ |
+| 166 | `_norm` | _(no docstring)_ |
+| 170 | `project_ids` | _(no docstring)_ |
+| 199 | `start` | _(no docstring)_ |
+| 212 | `stop` | _(no docstring)_ |
+
 ## `track_registry.py` — 8 defs, 387 lines
 
 | Line | Name | Summary |
@@ -1914,4 +1940,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1435 definitions across 92 files + Code.gs.**
+**1456 definitions across 93 files + Code.gs.**
