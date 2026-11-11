@@ -25687,6 +25687,27 @@ def test_presence_route_happy_path_records_and_replies_status_only(presence_env)
     _pe_assert_clean(r)
 
 
+def test_presence_route_cap_fourteen_keys_each_record(presence_env, monkeypatch):
+    keys = ["k%02d" % i for i in range(1, 14)] + ["job-search"]
+    monkeypatch.setenv("PRESENCE_PLACES", json.dumps({k: "Lbl %s" % k for k in keys}))
+    for k in keys:
+        r = _pe_post({"place": k, "event": "join"})
+        assert r.status_code == 200 and r.get_json() == {"status": "ok"}
+    got = presence_events.recent()
+    assert len(got) == 14 and {g["place"] for g in got} == set(keys)
+
+
+def test_presence_route_cap_31_keys_is_503_and_logs_nothing(presence_env, monkeypatch):
+    keys = ["k%02d" % i for i in range(31)]
+    monkeypatch.setenv("PRESENCE_PLACES", json.dumps({k: "Lbl %s" % k for k in keys}))
+    r = _pe_post({"place": "k00", "event": "join"})
+    assert r.status_code == 503 and r.get_json() == {"status": "disabled"}
+    _pe_assert_clean(r)
+    assert _pe_files(presence_env) == []
+    monkeypatch.setenv("PRESENCE_PLACES", json.dumps({k: "Lbl %s" % k for k in keys[:30]}))
+    assert _pe_post({"place": "k00", "event": "join"}).status_code == 200
+
+
 def test_presence_route_form_body_works(presence_env):
     r = _pe_post(form={"place": "library", "event": "join"})
     assert r.status_code == 200 and r.get_json() == {"status": "ok"}
