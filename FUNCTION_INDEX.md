@@ -441,7 +441,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 280 | `_name_company_key` | _(no docstring)_ |
 | 286 | `plan_import` | Clean, de-duplicate and map `rows`. `existing` is a list of PEOPLE-row dicts (name, |
 
-## `local_http.py` — 4 defs, 47 lines
+## `local_http.py` — 5 defs, 51 lines
 
 | Line | Name | Summary |
 | ---: | :--- | :--- |
@@ -449,6 +449,7 @@ grep -i "contact" FUNCTION_INDEX.md
 | 32 | `_request` | _(no docstring)_ |
 | 42 | `local_post` | _(no docstring)_ |
 | 46 | `local_get` | _(no docstring)_ |
+| 50 | `local_delete` | _(no docstring)_ |
 
 ## `main.py` — 520 defs, 22,141 lines
 
@@ -1632,6 +1633,23 @@ grep -i "contact" FUNCTION_INDEX.md
 | 29 | `time_one` | Returns (line, ok) for one tab. |
 | 53 | `main` | _(no docstring)_ |
 
+## `scripts/toggl_to_activitywatch.py` — 12 defs, 283 lines
+
+| Line | Name | Summary |
+| ---: | :--- | :--- |
+| 43 | `_default_http` | _(no docstring)_ |
+| 50 | `_aw_get_default` | _(no docstring)_ |
+| 54 | `_aw_post_default` | _(no docstring)_ |
+| 58 | `_aw_delete_default` | _(no docstring)_ |
+| 62 | `_iso_z` | _(no docstring)_ |
+| 66 | `_aw_url_ok` | _(no docstring)_ |
+| 75 | `_Stop` | _(no docstring)_ |
+| 76 | `_Stop.__init__` | _(no docstring)_ |
+| 80 | `_fetch_toggl` | Return (projects_reply, entries_reply). Raises TogglReplyError; at most 5 requests. |
+| 133 | `_aw_json` | _(no docstring)_ |
+| 140 | `main` | _(no docstring)_ |
+| 220 | `_run_aw` | _(no docstring)_ |
+
 ## `signed_links.py` — 3 defs, 45 lines
 
 | Line | Name | Summary |
@@ -1953,4 +1971,4 @@ Called from Python via `crm_post({"action": ...})` / `crm_get(...)`. Check here 
 
 ---
 
-**1464 definitions across 94 files + Code.gs.**
+**1477 definitions across 95 files + Code.gs.**
