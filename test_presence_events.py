@@ -34,7 +34,7 @@ def test_parse_places_valid_and_blank():
 
 @pytest.mark.parametrize("bad", [
     "ZZ-CANARY-4471 not json", '["ZZ-CANARY-4471"]',
-    json.dumps({"k%d" % i: "v" for i in range(11)}),
+    json.dumps({"k%d" % i: "v" for i in range(31)}),
     '{"ZZ-CANARY-4471": "v"}', json.dumps({"a" * 33: "v"}),
     '{"library": "  "}', json.dumps({"library": "x" * 41}), '{"library": 5}',
 ])
@@ -42,6 +42,29 @@ def test_parse_places_invalid(bad):
     with pytest.raises(pe.PresenceInvalid) as ei:
         pe.parse_places(bad)
     assert "CANARY" not in str(ei.value) and "library" not in str(ei.value)
+
+
+def test_parse_places_cap_accepts_exactly_30():
+    src = {"k%02d" % i: "label %d" % i for i in range(30)}
+    assert pe.parse_places(json.dumps(src)) == src
+
+
+def test_parse_places_cap_refuses_31_with_a_fixed_message():
+    src = {"k%02d" % i: "v%d" % i for i in range(31)}
+    src["k00"] = "ZZ-CANARY-4471"
+    with pytest.raises(pe.PresenceInvalid) as ei:
+        pe.parse_places(json.dumps(src))
+    msg = str(ei.value)
+    assert "CANARY" not in msg and "k00" not in msg and "k30" not in msg
+
+
+def test_parse_places_loads_fourteen_keys():
+    src = {"k%02d" % i: "Label   number  %d" % i for i in range(1, 14)}
+    src["job-search"] = "Some   spaced  label"
+    got = pe.parse_places(json.dumps(src))
+    assert list(got) == list(src)
+    assert got["k01"] == "Label number 1" and got["job-search"] == "Some spaced label"
+    assert len(got) == 14
 
 
 def test_parse_event_ok_and_failures():
