@@ -35,10 +35,11 @@ TIMEOUT_SECONDS = 600
 # The proof lives in the tree's own git directory (never in a tracked or untracked-visible
 # file, so writing it cannot change the tree it vouches for).
 PROOF_NAME = "verify_suites_proof.json"
-# The suites read the real clock (one test went red "from 8pm Eastern onward"), so a tree that
-# is byte-identical can still turn red later. A proof therefore expires; after this many
-# seconds the suites run again. The age comes from a timestamp inside the proof, not mtime.
-PROOF_TTL_SECONDS = 30 * 60
+# A proof used to expire after 30 minutes because some tests read the real clock. That made
+# every pure-chat turn after a quiet half hour re-run the full ~3.7 minute suite on an
+# unchanged tree (the VS Code "infinite loading"). A byte-identical tree with a green proof
+# now skips whatever its age; any edit changes the fingerprint and runs the suites. The
+# accepted tradeoff: a clock-dependent test can go stale until the next code change.
 # Rewritten by this very hook after a green run, and read by no test, so it must not count
 # as a change - otherwise the next Stop always sees a "changed" tree and the skip never fires.
 FINGERPRINT_IGNORED = {"FUNCTION_INDEX.md"}
@@ -133,7 +134,7 @@ def tree_fingerprint(tree):
     can change what the suites do without changing the fingerprint: a gitignored file the
     suites import or read (a local config, a generated module), and anything outside the
     tree - an installed, upgraded or removed package, or the Python itself. The skip trusts
-    the tree, not the environment; PROOF_TTL_SECONDS bounds how long that trust lasts.
+    the tree, not the environment, and does not expire.
     None (cannot list, cannot read) always means "run the suites".
     """
     try:
@@ -185,8 +186,8 @@ def _proof_path(tree):
 def proof_matches(tree, fingerprint, now=None):
     """True only when a readable, well-formed, unexpired proof for exactly this fingerprint exists.
 
-    Missing, unreadable, truncated, garbled, expired (older than PROOF_TTL_SECONDS) or
-    future-dated proofs all return False: the suites run.
+    Missing, unreadable, truncated, garbled or future-dated proofs all return False: the
+    suites run. Age alone never invalidates a proof.
     """
     try:
         now = time.time() if now is None else now
@@ -198,7 +199,7 @@ def proof_matches(tree, fingerprint, now=None):
         created = proof.get("created") if isinstance(proof, dict) else None
         if isinstance(created, bool) or not isinstance(created, (int, float)):
             return False
-        if not (0 <= now - created <= PROOF_TTL_SECONDS):
+        if now - created < 0:  # future-dated: clock moved or the file was forged
             return False
         return (proof.get("version") == 2
                 and isinstance(fingerprint, str) and proof.get("fingerprint") == fingerprint)

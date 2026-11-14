@@ -417,27 +417,24 @@ def _set_proof_age(repo, seconds_old):
         json.dump(data, handle)
 
 
-def test_hook_skips_unchanged_green_tree_an_expired_proof_reruns(tmp_path):
-    """The suites read the real clock, so an identical tree can turn red; proofs expire."""
-    hook = _load_hook()
+def test_hook_skips_unchanged_green_tree_an_old_proof_still_skips(tmp_path):
+    """A pure-chat turn on an unchanged tree must not re-run the suites, however old the proof."""
     repo = _make_proof_repo(tmp_path)
-    _stop(tmp_path, repo)
-    _set_proof_age(repo, hook.PROOF_TTL_SECONDS - 120)  # still fresh
-    assert _stop(tmp_path, repo) == (0, "")
-    _set_proof_age(repo, hook.PROOF_TTL_SECONDS + 60)  # expired
-    assert _stop(tmp_path, repo) == (1, "")
-    assert _stop(tmp_path, repo) == (0, "")  # and the rerun earned a fresh one
+    assert _stop(tmp_path, repo) == (1, "")  # first run earns the proof
+    for age in (120, 31 * 60, 3 * 24 * 3600):
+        _set_proof_age(repo, age)
+        assert _stop(tmp_path, repo) == (0, ""), age  # real main(): no pytest launched
+    (repo / "test_pipeline_utils.py").write_text(_TINY_SUITE + "\n# edit\n")
+    assert _stop(tmp_path, repo) == (1, "")  # a real edit still runs them
 
 
-def test_hook_skips_unchanged_green_tree_ttl_is_thirty_minutes_on_an_injected_clock(
-        tmp_path):
+def test_hook_skips_unchanged_green_tree_proof_age_on_an_injected_clock(tmp_path):
     hook = _load_hook()
     repo = _make_proof_repo(tmp_path)
     fingerprint = hook.tree_fingerprint(str(repo))
-    assert hook.PROOF_TTL_SECONDS == 30 * 60
     hook.write_proof(str(repo), fingerprint, now=1000.0)
     assert hook.proof_matches(str(repo), fingerprint, now=1000.0 + 29 * 60) is True
-    assert hook.proof_matches(str(repo), fingerprint, now=1000.0 + 31 * 60) is False
+    assert hook.proof_matches(str(repo), fingerprint, now=1000.0 + 90 * 24 * 3600) is True
     assert hook.proof_matches(str(repo), fingerprint, now=999.0) is False  # future-dated
 
 
